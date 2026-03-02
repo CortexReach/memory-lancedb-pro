@@ -10,7 +10,7 @@
 
 import OpenAI from "openai";
 import { createHash } from "node:crypto";
-import { smartChunk, ChunkResult } from "./chunker.js";
+import { smartChunk } from "./chunker.js";
 
 // ============================================================================
 // Embedding Cache (LRU with TTL)
@@ -300,7 +300,7 @@ export class Embedder {
             chunkResult.chunks.map(async (chunk, idx) => {
               try {
                 const embedding = await this.embedSingle(chunk, task);
-                return { embedding, metadata: chunkResult.metadatas[idx] };
+                return { embedding };
               } catch (chunkError) {
                 console.warn(`Failed to embed chunk ${idx}:`, chunkError);
                 throw chunkError;
@@ -310,13 +310,13 @@ export class Embedder {
 
           // Compute average embedding across chunks
           const avgEmbedding = chunkEmbeddings.reduce(
-            (sum, { embedding, metadata }) => {
+            (sum, { embedding }) => {
               for (let i = 0; i < embedding.length; i++) {
                 sum[i] += embedding[i];
               }
               return sum;
             },
-            new Array(embedding.length).fill(0)
+            new Array(this.dimensions).fill(0)
           );
 
           const finalEmbedding = avgEmbedding.map(v => v / chunkEmbeddings.length);
@@ -396,38 +396,36 @@ export class Embedder {
           
           const chunkResults = await Promise.all(
             validTexts.map(async (text, idx) => {
-              try {
-                const chunkResult = smartChunk(text, this._model);
-                const embeddings = [];
-                
-                for (const chunk of chunkResult.chunks) {
-                  const embedding = await this.embedSingle(chunk, task);
-                  embeddings.push(embedding);
-                }
-                
-                // Compute average embedding
-                const avgEmbedding = embeddings.reduce(
-                  (sum, embedding) => {
-                    for (let i = 0; i < embedding.length; i++) {
-                      sum[i] += embedding[i];
-                    }
-                    return sum;
-                  },
-                  new Array(embeddings[0]?.length || this.dimensions).fill(0)
-                );
-                
-                const finalEmbedding = avgEmbedding.map(v => v / embeddings.length);
-                
-                return { embedding: finalEmbedding, index: validIndices[idx], textLength: text.length };
-              } catch (chunkError) {
-                // If chunking fails, fall back to empty array
-                console.warn(`Chunking failed for text ${validIndices[idx]}, using empty embedding`);
-                return { embedding: [], index: validIndices[idx], textLength: validTexts[idx].length };
+              const chunkResult = smartChunk(text, this._model);
+              if (chunkResult.chunks.length === 0) {
+                throw new Error("Chunker produced no chunks");
               }
+
+              // Embed all chunks in parallel, then average.
+              const embeddings = await Promise.all(
+                chunkResult.chunks.map((chunk) => this.embedSingle(chunk, task))
+              );
+
+              const avgEmbedding = embeddings.reduce(
+                (sum, emb) => {
+                  for (let i = 0; i < emb.length; i++) {
+                    sum[i] += emb[i];
+                  }
+                  return sum;
+                },
+                new Array(this.dimensions).fill(0)
+              );
+
+              const finalEmbedding = avgEmbedding.map((v) => v / embeddings.length);
+
+              // Cache the averaged embedding for the original (long) text.
+              this._cache.set(text, task, finalEmbedding);
+
+              return { embedding: finalEmbedding, index: validIndices[idx] };
             })
           );
 
-          console.log(`Successfully chunked and embedded ${chunkResults.filter(r => r.embedding.length > 0).length} long documents`);
+          console.log(`Successfully chunked and embedded ${chunkResults.length} long documents`);
 
           // Build results array
           const results: number[][] = new Array(texts.length);
