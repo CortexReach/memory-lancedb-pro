@@ -23,7 +23,14 @@ interface ToolContext {
   store: MemoryStore;
   scopeManager: MemoryScopeManager;
   embedder: Embedder;
+  // NOTE: This value is set during plugin registration, but the real agent ID
+  // is only known at runtime per tool call.
   agentId?: string;
+}
+
+function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
+  if (typeof runtimeAgentId === "string" && runtimeAgentId.trim().length > 0) return runtimeAgentId;
+  return fallback;
 }
 
 // ============================================================================
@@ -68,7 +75,8 @@ export function registerMemoryRecallTool(api: OpenClawPluginApi, context: ToolCo
         scope: Type.Optional(Type.String({ description: "Specific memory scope to search in (optional)" })),
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, ctx) {
+        const agentId = resolveAgentId((ctx as any)?.agentId, context.agentId);
         const { query, limit = 5, scope, category } = params as {
           query: string;
           limit?: number;
@@ -80,9 +88,9 @@ export function registerMemoryRecallTool(api: OpenClawPluginApi, context: ToolCo
           const safeLimit = clampInt(limit, 1, 20);
 
           // Determine accessible scopes
-          let scopeFilter = context.scopeManager.getAccessibleScopes(context.agentId);
+          let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
-            if (context.scopeManager.isAccessible(scope, context.agentId)) {
+            if (context.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];
             } else {
               return {
@@ -151,7 +159,8 @@ export function registerMemoryStoreTool(api: OpenClawPluginApi, context: ToolCon
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
         scope: Type.Optional(Type.String({ description: "Memory scope (optional, defaults to agent scope)" })),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, ctx) {
+        const agentId = resolveAgentId((ctx as any)?.agentId, context.agentId);
         const {
           text,
           importance = 0.7,
@@ -166,10 +175,10 @@ export function registerMemoryStoreTool(api: OpenClawPluginApi, context: ToolCon
 
         try {
           // Determine target scope
-          let targetScope = scope || context.scopeManager.getDefaultScope(context.agentId);
+          let targetScope = scope || context.scopeManager.getDefaultScope(agentId);
 
           // Validate scope access
-          if (!context.scopeManager.isAccessible(targetScope, context.agentId)) {
+          if (!context.scopeManager.isAccessible(targetScope, agentId)) {
             return {
               content: [{ type: "text", text: `Access denied to scope: ${targetScope}` }],
               details: { error: "scope_access_denied", requestedScope: targetScope },
@@ -249,7 +258,8 @@ export function registerMemoryForgetTool(api: OpenClawPluginApi, context: ToolCo
         memoryId: Type.Optional(Type.String({ description: "Specific memory ID to delete" })),
         scope: Type.Optional(Type.String({ description: "Scope to search/delete from (optional)" })),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, ctx) {
+        const agentId = resolveAgentId((ctx as any)?.agentId, context.agentId);
         const { query, memoryId, scope } = params as {
           query?: string;
           memoryId?: string;
@@ -258,9 +268,9 @@ export function registerMemoryForgetTool(api: OpenClawPluginApi, context: ToolCo
 
         try {
           // Determine accessible scopes
-          let scopeFilter = context.scopeManager.getAccessibleScopes(context.agentId);
+          let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
-            if (context.scopeManager.isAccessible(scope, context.agentId)) {
+            if (context.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];
             } else {
               return {
@@ -359,7 +369,8 @@ export function registerMemoryUpdateTool(api: OpenClawPluginApi, context: ToolCo
         importance: Type.Optional(Type.Number({ description: "New importance score 0-1" })),
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, ctx) {
+        const agentId = resolveAgentId((ctx as any)?.agentId, context.agentId);
         const { memoryId, text, importance, category } = params as {
           memoryId: string;
           text?: string;
@@ -376,7 +387,7 @@ export function registerMemoryUpdateTool(api: OpenClawPluginApi, context: ToolCo
           }
 
           // Determine accessible scopes
-          const scopeFilter = context.scopeManager.getAccessibleScopes(context.agentId);
+          const scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
 
           // Resolve memoryId: if it doesn't look like a UUID, try search
           let resolvedId = memoryId;
@@ -470,14 +481,15 @@ export function registerMemoryStatsTool(api: OpenClawPluginApi, context: ToolCon
       parameters: Type.Object({
         scope: Type.Optional(Type.String({ description: "Specific scope to get stats for (optional)" })),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, ctx) {
+        const agentId = resolveAgentId((ctx as any)?.agentId, context.agentId);
         const { scope } = params as { scope?: string };
 
         try {
           // Determine accessible scopes
-          let scopeFilter = context.scopeManager.getAccessibleScopes(context.agentId);
+          let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
-            if (context.scopeManager.isAccessible(scope, context.agentId)) {
+            if (context.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];
             } else {
               return {
@@ -541,7 +553,8 @@ export function registerMemoryListTool(api: OpenClawPluginApi, context: ToolCont
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
         offset: Type.Optional(Type.Number({ description: "Number of memories to skip (default: 0)" })),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, ctx) {
+        const agentId = resolveAgentId((ctx as any)?.agentId, context.agentId);
         const {
           limit = 10,
           scope,
@@ -559,9 +572,9 @@ export function registerMemoryListTool(api: OpenClawPluginApi, context: ToolCont
           const safeOffset = clampInt(offset, 0, 1000);
 
           // Determine accessible scopes
-          let scopeFilter = context.scopeManager.getAccessibleScopes(context.agentId);
+          let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
-            if (context.scopeManager.isAccessible(scope, context.agentId)) {
+            if (context.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];
             } else {
               return {
