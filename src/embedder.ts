@@ -96,6 +96,8 @@ export interface EmbeddingConfig {
   taskPassage?: string;
   /** Optional flag to request normalized embeddings (provider-dependent, e.g. Jina v5) */
   normalized?: boolean;
+  /** Enable automatic chunking for documents exceeding context limits (default: true) */
+  chunking?: boolean;
 }
 
 // Known embedding model dimensions
@@ -108,7 +110,7 @@ const EMBEDDING_DIMENSIONS: Record<string, number> = {
   "mxbai-embed-large": 1024,
   "BAAI/bge-m3": 1024,
   "all-MiniLM-L6-v2": 384,
-  "all-mpnet-base-v2": 768,
+  "all-mpnet-base-v2": 512,
 
   // Jina v5
   "jina-embeddings-v5-text-small": 1024,
@@ -172,6 +174,8 @@ export class Embedder {
     this._taskPassage = config.taskPassage;
     this._normalized = config.normalized;
     this._requestDimensions = config.dimensions;
+    // Enable auto-chunking by default for better handling of long documents
+    this._autoChunk = config.chunking !== false;
 
     this.client = new OpenAI({
       apiKey: resolvedApiKey,
@@ -277,6 +281,58 @@ export class Embedder {
       this._cache.set(text, task, embedding);
       return embedding;
     } catch (error) {
+      // Check if this is a context length exceeded error and try chunking
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      const isContextError = /context|too long|exceed|length/i.test(errorMsg);
+
+      if (isContextError && this._autoChunk) {
+        try {
+          console.log(`Document exceeded context limit (${errorMsg}), attempting chunking...`);
+          const chunkResult = smartChunk(text, this._model);
+          
+          if (chunkResult.chunks.length === 0) {
+            throw new Error(`Failed to chunk document: ${errorMsg}`);
+          }
+
+          // Embed all chunks in parallel
+          console.log(`Split document into ${chunkResult.chunkCount} chunks for embedding`);
+          const chunkEmbeddings = await Promise.all(
+            chunkResult.chunks.map(async (chunk, idx) => {
+              try {
+                const embedding = await this.embedSingle(chunk, task);
+                return { embedding, metadata: chunkResult.metadatas[idx] };
+              } catch (chunkError) {
+                console.warn(`Failed to embed chunk ${idx}:`, chunkError);
+                throw chunkError;
+              }
+            })
+          );
+
+          // Compute average embedding across chunks
+          const avgEmbedding = chunkEmbeddings.reduce(
+            (sum, { embedding, metadata }) => {
+              for (let i = 0; i < embedding.length; i++) {
+                sum[i] += embedding[i];
+              }
+              return sum;
+            },
+            new Array(embedding.length).fill(0)
+          );
+
+          const finalEmbedding = avgEmbedding.map(v => v / chunkEmbeddings.length);
+          
+          // Cache the result for the original text (using its hash)
+          this._cache.set(text, task, finalEmbedding);
+          console.log(`Successfully embedded long document as ${chunkEmbeddings.length} averaged chunks`);
+          
+          return finalEmbedding;
+        } catch (chunkError) {
+          // If chunking fails, throw the original error
+          console.warn(`Chunking failed, using original error:`, chunkError);
+          throw new Error(`Failed to generate embedding: ${errorMsg}`, { cause: error });
+        }
+      }
+
       if (error instanceof Error) {
         throw new Error(`Failed to generate embedding: ${error.message}`, { cause: error });
       }
@@ -330,6 +386,73 @@ export class Embedder {
 
       return results;
     } catch (error) {
+      // Check if this is a context length exceeded error and try chunking each text
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      const isContextError = /context|too long|exceed|length/i.test(errorMsg);
+
+      if (isContextError && this._autoChunk) {
+        try {
+          console.log(`Batch embedding failed with context error, attempting chunking...`);
+          
+          const chunkResults = await Promise.all(
+            validTexts.map(async (text, idx) => {
+              try {
+                const chunkResult = smartChunk(text, this._model);
+                const embeddings = [];
+                
+                for (const chunk of chunkResult.chunks) {
+                  const embedding = await this.embedSingle(chunk, task);
+                  embeddings.push(embedding);
+                }
+                
+                // Compute average embedding
+                const avgEmbedding = embeddings.reduce(
+                  (sum, embedding) => {
+                    for (let i = 0; i < embedding.length; i++) {
+                      sum[i] += embedding[i];
+                    }
+                    return sum;
+                  },
+                  new Array(embeddings[0]?.length || this.dimensions).fill(0)
+                );
+                
+                const finalEmbedding = avgEmbedding.map(v => v / embeddings.length);
+                
+                return { embedding: finalEmbedding, index: validIndices[idx], textLength: text.length };
+              } catch (chunkError) {
+                // If chunking fails, fall back to empty array
+                console.warn(`Chunking failed for text ${validIndices[idx]}, using empty embedding`);
+                return { embedding: [], index: validIndices[idx], textLength: validTexts[idx].length };
+              }
+            })
+          );
+
+          console.log(`Successfully chunked and embedded ${chunkResults.filter(r => r.embedding.length > 0).length} long documents`);
+
+          // Build results array
+          const results: number[][] = new Array(texts.length);
+          chunkResults.forEach(({ embedding, index }) => {
+            if (embedding.length > 0) {
+              this.validateEmbedding(embedding);
+              results[index] = embedding;
+            } else {
+              results[index] = [];
+            }
+          });
+
+          // Fill empty arrays for invalid texts
+          for (let i = 0; i < texts.length; i++) {
+            if (!results[i]) {
+              results[i] = [];
+            }
+          }
+
+          return results;
+        } catch (chunkError) {
+          throw new Error(`Failed to embed documents after chunking attempt: ${errorMsg}`);
+        }
+      }
+
       if (error instanceof Error) {
         throw new Error(`Failed to generate batch embeddings: ${error.message}`, { cause: error });
       }

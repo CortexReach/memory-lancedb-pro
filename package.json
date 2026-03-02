@@ -1,7 +1,7 @@
 {
   "name": "memory-lancedb-pro",
-  "version": "1.0.20",
-  "description": "OpenClaw enhanced LanceDB memory plugin with hybrid retrieval (Vector + BM25), cross-encoder rerank, multi-scope isolation, and management CLI",
+  "version": "1.0.21",
+  "description": "OpenClaw enhanced LanceDB memory plugin with hybrid retrieval (Vector + BM25), cross-encoder rerank, multi-scope isolation, long-context chunking, and management CLI",
   "type": "module",
   "main": "index.ts",
   "keywords": [
@@ -14,7 +14,9 @@
     "hybrid-retrieval",
     "rerank",
     "ai-memory",
-    "long-term-memory"
+    "long-term-memory",
+    "chunking",
+    "long-context"
   ],
   "repository": {
     "type": "git",

@@ -1,8 +1,8 @@
 {
   "id": "memory-lancedb-pro",
   "name": "Memory (LanceDB Pro)",
-  "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, and management CLI",
-  "version": "1.0.20",
+  "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, long-context chunking, and management CLI",
+  "version": "1.0.21",
   "kind": "memory",
   "configSchema": {
     "type": "object",
@@ -40,6 +40,11 @@
           "normalized": {
             "type": "boolean",
             "description": "Request normalized embeddings when supported by the provider (e.g. Jina v5)"
+          },
+          "chunking": {
+            "type": "boolean",
+            "default": true,
+            "description": "Enable automatic chunking for documents exceeding embedding context limits"
           }
         },
         "required": [
@@ -260,6 +265,28 @@
       "help": "Override vector dimensions for custom models not in the built-in lookup table",
       "advanced": true
     },
+    "embedding.taskQuery": {
+      "label": "Query Task",
+      "placeholder": "retrieval.query",
+      "help": "Optional task selector for query embeddings (Jina: retrieval.query). If unset, no task field is sent.",
+      "advanced": true
+    },
+    "embedding.taskPassage": {
+      "label": "Passage Task",
+      "placeholder": "retrieval.passage",
+      "help": "Optional task selector for passage/document embeddings (Jina: retrieval.passage). If unset, no task field is sent.",
+      "advanced": true
+    },
+    "embedding.normalized": {
+      "label": "Normalized Embeddings",
+      "help": "Request normalized embeddings when the provider supports it (Jina v5). If unset, the field is not sent.",
+      "advanced": true
+    },
+    "embedding.chunking": {
+      "label": "Auto-Chunk Documents",
+      "help": "Automatically split long documents into chunks when they exceed embedding context limits. Set to false to disable and let the model fail on long documents.",
+      "advanced": true
+    },
     "dbPath": {
       "label": "Database Path",
       "placeholder": "~/.openclaw/memory/lancedb-pro",
@@ -338,6 +365,21 @@
       "help": "Number of candidates to fetch before fusion and reranking",
       "advanced": true
     },
+    "retrieval.lengthNormAnchor": {
+      "label": "Length Normalization Anchor",
+      "help": "Entries longer than this (chars) get score penalized to prevent long entries dominating. 0 = disabled.",
+      "advanced": true
+    },
+    "retrieval.hardMinScore": {
+      "label": "Hard Minimum Score",
+      "help": "Discard results below this score after all scoring stages. Higher = fewer but more relevant results.",
+      "advanced": true
+    },
+    "retrieval.timeDecayHalfLifeDays": {
+      "label": "Time Decay Half-Life",
+      "help": "Old entries lose score over this many days. Floor at 0.5x. 0 = disabled.",
+      "advanced": true
+    },
     "sessionMemory.enabled": {
       "label": "Session Memory",
       "help": "Store session summaries to LanceDB when /new is triggered (replaces built-in session-memory hook)"
@@ -365,38 +407,6 @@
     "enableManagementTools": {
       "label": "Management Tools",
       "help": "Enable memory_list and memory_stats tools for debugging and auditing",
-      "advanced": true
-    },
-    "retrieval.lengthNormAnchor": {
-      "label": "Length Normalization Anchor",
-      "help": "Entries longer than this (chars) get score penalized to prevent long entries dominating. 0 = disabled.",
-      "advanced": true
-    },
-    "retrieval.hardMinScore": {
-      "label": "Hard Minimum Score",
-      "help": "Discard results below this score after all scoring stages. Higher = fewer but more relevant results.",
-      "advanced": true
-    },
-    "retrieval.timeDecayHalfLifeDays": {
-      "label": "Time Decay Half-Life",
-      "help": "Old entries lose score over this many days. Floor at 0.5x. 0 = disabled.",
-      "advanced": true
-    },
-    "embedding.taskQuery": {
-      "label": "Query Task",
-      "placeholder": "retrieval.query",
-      "help": "Optional task selector for query embeddings (Jina: retrieval.query). If unset, no task field is sent.",
-      "advanced": true
-    },
-    "embedding.taskPassage": {
-      "label": "Passage Task",
-      "placeholder": "retrieval.passage",
-      "help": "Optional task selector for passage/document embeddings (Jina: retrieval.passage). If unset, no task field is sent.",
-      "advanced": true
-    },
-    "embedding.normalized": {
-      "label": "Normalized Embeddings",
-      "help": "Request normalized embeddings when the provider supports it (Jina v5). If unset, the field is not sent.",
       "advanced": true
     }
   }

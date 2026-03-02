@@ -1,6 +1,21 @@
 # Changelog
 
 
+## 1.0.21 (unreleased)
+
+*In development* - **Long Context Chunking**
+
+- **Feats**: Added automatic chunking for documents exceeding embedding context limits
+- **Feats**: Smart semantic-aware chunking at sentence boundaries with configurable overlap
+- **Feats**: Chunking adapts to different embedding model context limits (Jina, OpenAI, Gemini, etc.)
+- **Feats**: Parallel chunk embedding with averaged result for better semantic preservation
+- **Fixes**: Handles "Input length exceeds context length" errors gracefully
+- **Docs**: Added comprehensive documentation in docs/long-context-chunking.md
+
+Breaking changes: None. Backward compatible with existing configurations.
+
+---
+
 ## 1.0.20
 
 - Fix: reduce auto-capture noise by skipping memory-management prompts (delete/forget/cleanup memory entries).
