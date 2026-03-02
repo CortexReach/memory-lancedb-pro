@@ -1,6 +1,6 @@
 {
   "name": "memory-lancedb-pro",
-  "version": "1.0.16",
+  "version": "1.0.17",
   "description": "OpenClaw enhanced LanceDB memory plugin with hybrid retrieval (Vector + BM25), cross-encoder rerank, multi-scope isolation, and management CLI",
   "type": "module",
   "main": "index.ts",
