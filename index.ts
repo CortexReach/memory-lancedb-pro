@@ -894,7 +894,6 @@ function parsePluginConfig(value: unknown): PluginConfig {
   if (!apiKey || (Array.isArray(apiKey) && apiKey.length === 0)) {
     throw new Error("embedding.apiKey is required (set directly or via OPENAI_API_KEY env var)");
   }
-  }
 
   return {
     embedding: {
