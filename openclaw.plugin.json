@@ -87,6 +87,13 @@
         "default": 15,
         "description": "Minimum prompt length (in characters) to trigger auto-recall. Prompts shorter than this are skipped. Default: 15 for English, 6 for CJK."
       },
+      "autoRecallMinRepeated": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100,
+        "default": 0,
+        "description": "Minimum number of turns before the same memory can be recalled again in the same session. Set to 0 to disable deduplication (default behavior: inject all memories)."
+      },
       "captureAssistant": {
         "type": "boolean"
       },
@@ -332,6 +339,11 @@
     "autoRecallMinLength": {
       "label": "Auto-Recall Min Length",
       "help": "Minimum prompt length to trigger auto-recall (shorter prompts are skipped). Default: 15 chars for English, 6 for CJK.",
+      "advanced": true
+    },
+    "autoRecallMinRepeated": {
+      "label": "Auto-Recall Min Repeated",
+      "help": "Minimum number of conversation turns before a specific memory can be re-injected in the same session.",
       "advanced": true
     },
     "captureAssistant": {

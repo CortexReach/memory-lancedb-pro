@@ -416,6 +416,13 @@ const memoryLanceDBProPlugin = {
 
     const pluginVersion = getPluginVersion();
 
+    // Session-based recall history to prevent redundant injections
+    // Map<sessionId, Map<memoryId, turnIndex>>
+    const recallHistory = new Map<string, Map<string, number>>();
+
+    // Map<sessionId, turnCounter> - manual turn tracking per session
+    const turnCounter = new Map<string, number>();
+
     api.logger.info(
       `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`,
     );
@@ -468,6 +475,11 @@ const memoryLanceDBProPlugin = {
           return;
         }
 
+        // Manually increment turn counter for this session
+        const sessionId = ctx?.sessionId || "default";
+        const currentTurn = (turnCounter.get(sessionId) || 0) + 1;
+        turnCounter.set(sessionId, currentTurn);
+
         try {
           // Determine agent ID and accessible scopes
           const agentId = ctx?.agentId || "main";
@@ -484,7 +496,46 @@ const memoryLanceDBProPlugin = {
             return;
           }
 
-          const memoryContext = results
+          // Filter out redundant memories based on session history
+          const minRepeated = config.autoRecallMinRepeated ?? 0;
+
+          // Only enable dedup logic when minRepeated > 0
+          let finalResults = results;
+
+          if (minRepeated > 0) {
+            const sessionHistory = recallHistory.get(sessionId) || new Map<string, number>();
+            const filteredResults = results.filter((r) => {
+              const lastTurn = sessionHistory.get(r.entry.id) ?? -999;
+              const diff = currentTurn - lastTurn;
+              const isRedundant = diff < minRepeated;
+
+              if (isRedundant) {
+                api.logger.debug?.(
+                  `memory-lancedb-pro: skipping redundant memory ${r.entry.id.slice(0, 8)} (last seen at turn ${lastTurn}, current turn ${currentTurn}, min ${minRepeated})`,
+                );
+              }
+              return !isRedundant;
+            });
+
+            if (filteredResults.length === 0) {
+              if (results.length > 0) {
+                api.logger.info?.(
+                  `memory-lancedb-pro: all ${results.length} memories were filtered out due to redundancy policy`,
+                );
+              }
+              return;
+            }
+
+            // Update history with successfully injected memories
+            for (const r of filteredResults) {
+              sessionHistory.set(r.entry.id, currentTurn);
+            }
+            recallHistory.set(sessionId, sessionHistory);
+
+            finalResults = filteredResults;
+          }
+
+          const memoryContext = finalResults
             .map(
               (r) =>
                 `- [${r.entry.category}:${r.entry.scope}] ${sanitizeForContext(r.entry.text)} (${(r.score * 100).toFixed(0)}%${r.sources?.bm25 ? ", vector+BM25" : ""}${r.sources?.reranked ? "+reranked" : ""})`,
@@ -492,7 +543,7 @@ const memoryLanceDBProPlugin = {
             .join("\n");
 
           api.logger.info?.(
-            `memory-lancedb-pro: injecting ${results.length} memories into context for agent ${agentId}`,
+            `memory-lancedb-pro: injecting ${finalResults.length} memories into context for agent ${agentId}`,
           );
 
           return {
