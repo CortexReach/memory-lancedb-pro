@@ -197,12 +197,14 @@ export function computeEffectiveHalfLife(
  *
  * `recordAccess()` is synchronous (Map update only, no I/O). Pending deltas
  * accumulate until `flush()` is called (or by a future scheduled callback).
- * On flush, each pending entry is read from the store, its metadata is
- * merged with the accumulated access delta, and written back.
+ * On flush, each pending entry is read via `store.getById()`, its metadata
+ * is merged with the accumulated access delta, and written back via
+ * `store.update()`.
  */
 export class AccessTracker {
   private readonly pending: Map<string, number> = new Map();
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushPromise: Promise<void> | null = null;
   private readonly debounceMs: number;
   private readonly store: MemoryStore;
   private readonly logger: {
@@ -240,32 +242,35 @@ export class AccessTracker {
   /**
    * Flush pending access deltas to the store.
    *
-   * For each pending entry, reads the current metadata via store.update()
-   * with an empty updates object (acts as a "getById"), then merges the
-   * access delta and writes the updated metadata back.
+   * If a flush is already in progress, awaits the current flush to complete.
+   * If new pending data accumulated during the in-flight flush, a follow-up
+   * flush is automatically triggered.
    */
   async flush(): Promise<void> {
     this.clearTimer();
+
+    // If a flush is in progress, wait for it to finish
+    if (this.flushPromise) {
+      await this.flushPromise;
+      // After the in-flight flush completes, check if new data accumulated
+      if (this.pending.size > 0) {
+        return this.flush();
+      }
+      return;
+    }
+
     if (this.pending.size === 0) return;
 
-    const batch = new Map(this.pending);
-    this.pending.clear();
+    this.flushPromise = this.doFlush();
+    try {
+      await this.flushPromise;
+    } finally {
+      this.flushPromise = null;
+    }
 
-    for (const [id, delta] of batch) {
-      try {
-        // store.update(id, {}) reads existing row, applies no changes,
-        // and returns the current MemoryEntry (delete + re-add is a no-op).
-        const current = await this.store.update(id, {});
-        if (!current) continue;
-
-        const updatedMeta = buildUpdatedMetadata(current.metadata, delta);
-        await this.store.update(id, { metadata: updatedMeta });
-      } catch (err) {
-        this.logger.warn(
-          `access-tracker: write-back failed for ${id.slice(0, 8)}:`,
-          err,
-        );
-      }
+    // If new data accumulated during flush, schedule a follow-up
+    if (this.pending.size > 0) {
+      this.resetTimer();
     }
   }
 
@@ -274,12 +279,40 @@ export class AccessTracker {
    */
   destroy(): void {
     this.clearTimer();
+    if (this.pending.size > 0) {
+      this.logger.warn(
+        `access-tracker: destroying with ${this.pending.size} pending writes`,
+      );
+    }
     this.pending.clear();
   }
 
   // --------------------------------------------------------------------------
   // Internal helpers
   // --------------------------------------------------------------------------
+
+  private async doFlush(): Promise<void> {
+    const batch = new Map(this.pending);
+    this.pending.clear();
+
+    for (const [id, delta] of batch) {
+      try {
+        const current = await this.store.getById(id);
+        if (!current) continue;
+
+        const updatedMeta = buildUpdatedMetadata(current.metadata, delta);
+        await this.store.update(id, { metadata: updatedMeta });
+      } catch (err) {
+        // Requeue failed delta for retry on next flush
+        const existing = this.pending.get(id) ?? 0;
+        this.pending.set(id, existing + delta);
+        this.logger.warn(
+          `access-tracker: write-back failed for ${id.slice(0, 8)}:`,
+          err,
+        );
+      }
+    }
+  }
 
   private resetTimer(): void {
     this.clearTimer();

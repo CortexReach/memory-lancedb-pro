@@ -314,7 +314,7 @@ export class MemoryRetriever {
     }
 
     // Record access for reinforcement (manual recall only)
-    if (this.accessTracker && source !== "auto-recall" && results.length > 0) {
+    if (this.accessTracker && source === "manual" && results.length > 0) {
       this.accessTracker.recordAccess(results.map((r) => r.entry.id));
     }
 

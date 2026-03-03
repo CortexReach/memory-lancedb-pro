@@ -17,8 +17,16 @@ const {
 
 function createMockStore(entries = new Map()) {
   return {
+    /** @type {Array<{id: string}>} */
+    getByIdCalls: [],
     /** @type {Array<{id: string, updates: object}>} */
     updateCalls: [],
+    async getById(id) {
+      this.getByIdCalls.push({ id });
+      const entry = entries.get(id);
+      if (!entry) return null;
+      return { ...entry };
+    },
     async update(id, updates) {
       this.updateCalls.push({ id, updates });
       const entry = entries.get(id);
@@ -544,11 +552,13 @@ describe("AccessTracker flush integration", () => {
       // Pending should be empty after flush
       assert.equal(tracker.getPendingUpdates().size, 0);
 
-      // store.update should have been called:
-      //   2 read calls (empty updates) + 2 write calls (with metadata)
-      assert.equal(store.updateCalls.length, 4);
+      // getById should be called once per entry (pure read, no delete+add)
+      assert.equal(store.getByIdCalls.length, 2);
 
-      // Find the write-back calls (ones with metadata in updates)
+      // store.update should only have write calls (with metadata), no empty reads
+      assert.equal(store.updateCalls.length, 2);
+
+      // All update calls should have metadata (no empty {} reads)
       const writeCalls = store.updateCalls.filter((c) => c.updates.metadata);
       assert.equal(writeCalls.length, 2);
 
@@ -582,9 +592,9 @@ describe("AccessTracker flush integration", () => {
       tracker.recordAccess([missingId]);
       await tracker.flush();
 
-      // Should have tried to read, but no write-back
-      assert.equal(store.updateCalls.length, 1);
-      assert.deepEqual(store.updateCalls[0].updates, {});
+      // Should have tried getById, but no write-back via update
+      assert.equal(store.getByIdCalls.length, 1);
+      assert.equal(store.updateCalls.length, 0);
 
       // No warnings (null return is expected, not an error)
       assert.equal(logger.warnings.length, 0);
@@ -597,15 +607,18 @@ describe("AccessTracker flush integration", () => {
     const id1 = "dddddddd-1111-2222-3333-444444444444";
     const id2 = "eeeeeeee-1111-2222-3333-444444444444";
 
-    let callCount = 0;
+    let getByIdCallCount = 0;
     const failingStore = {
-      async update(id, updates) {
-        callCount++;
+      async getById(id) {
+        getByIdCallCount++;
         if (id === id1) {
           throw new Error("simulated store failure");
         }
         // id2 succeeds
         return { id, metadata: JSON.stringify({ accessCount: 0 }) };
+      },
+      async update(id, updates) {
+        return { id, metadata: updates.metadata || "{}" };
       },
     };
 
@@ -623,11 +636,124 @@ describe("AccessTracker flush integration", () => {
         `Warning should mention access-tracker, got: ${warningMsg}`,
       );
 
-      // id2 should have been processed (store was called for it)
-      assert.ok(callCount >= 2, "Store should have been called for both IDs");
+      // id2 should have been processed (getById was called for it)
+      assert.equal(getByIdCallCount, 2, "getById should have been called for both IDs");
     } finally {
       tracker.destroy();
     }
+  });
+
+  it("concurrent flush: second flush awaits first then processes accumulated data", async () => {
+    const id1 = "ffffffff-1111-2222-3333-444444444444";
+
+    let resolveFirst;
+    let getByIdCallCount = 0;
+    const slowStore = {
+      async getById(id) {
+        getByIdCallCount++;
+        if (getByIdCallCount === 1) {
+          // First getById blocks until we resolve
+          await new Promise((resolve) => { resolveFirst = resolve; });
+        }
+        return { id, metadata: JSON.stringify({ accessCount: 0 }) };
+      },
+      updateCalls: [],
+      async update(id, updates) {
+        this.updateCalls.push({ id, updates });
+        return { id, metadata: updates.metadata || "{}" };
+      },
+    };
+
+    const logger = createMockLogger();
+    const tracker = new AccessTracker({ store: slowStore, logger, debounceMs: 60_000 });
+    try {
+      tracker.recordAccess([id1]);
+
+      // Start first flush (will block on first store.getById)
+      const flush1 = tracker.flush();
+
+      // Record more while flush is in progress
+      tracker.recordAccess([id1]);
+
+      // Second flush should await the first, then process accumulated data
+      const flush2 = tracker.flush();
+
+      // Unblock the first flush
+      resolveFirst();
+      await flush1;
+      await flush2;
+
+      // Both flushes should have completed — no pending data left
+      assert.equal(tracker.getPendingUpdates().size, 0, "All data should be flushed");
+
+      // store.update should have been called twice (once per flush cycle)
+      assert.equal(slowStore.updateCalls.length, 2, "Two write-back cycles should have occurred");
+    } finally {
+      tracker.destroy();
+    }
+  });
+
+  it("flush requeues failed write-backs for retry on next flush", async () => {
+    const id1 = "gggggggg-1111-2222-3333-444444444444";
+
+    let failCount = 0;
+    const flakeyStore = {
+      getByIdCalls: [],
+      updateCalls: [],
+      async getById(id) {
+        this.getByIdCalls.push({ id });
+        failCount++;
+        if (failCount === 1) {
+          throw new Error("simulated transient failure");
+        }
+        return { id, metadata: JSON.stringify({ accessCount: 0 }) };
+      },
+      async update(id, updates) {
+        this.updateCalls.push({ id, updates });
+        return { id, metadata: updates.metadata || "{}" };
+      },
+    };
+
+    const logger = createMockLogger();
+    const tracker = new AccessTracker({ store: flakeyStore, logger, debounceMs: 60_000 });
+    try {
+      tracker.recordAccess([id1]); // delta=1
+
+      // First flush — getById fails, delta should be requeued
+      await tracker.flush();
+      assert.equal(tracker.getPendingUpdates().size, 1, "Failed delta should be requeued");
+      assert.equal(tracker.getPendingUpdates().get(id1), 1, "Requeued delta should be 1");
+      assert.ok(logger.warnings.length >= 1, "Should log a warning on failure");
+
+      // Second flush — getById succeeds this time
+      await tracker.flush();
+      assert.equal(tracker.getPendingUpdates().size, 0, "Requeued data should be flushed");
+      assert.equal(flakeyStore.updateCalls.length, 1, "Should have one successful write-back");
+    } finally {
+      tracker.destroy();
+    }
+  });
+
+  it("destroy warns when pending writes exist", () => {
+    const store = createMockStore();
+    const logger = createMockLogger();
+    const tracker = new AccessTracker({ store, logger, debounceMs: 60_000 });
+
+    tracker.recordAccess(["id-1", "id-2"]);
+    assert.equal(logger.warnings.length, 0);
+
+    tracker.destroy();
+
+    // Should have logged a warning about pending writes
+    assert.equal(logger.warnings.length, 1, "Should log one warning");
+    const warningMsg = String(logger.warnings[0][0]);
+    assert.ok(
+      warningMsg.includes("2 pending writes"),
+      `Warning should mention pending count, got: ${warningMsg}`,
+    );
+
+    // Pending should be cleared after destroy
+    assert.equal(tracker.getPendingUpdates().size, 0);
   });
 
   it("flush is a no-op when pending map is empty", async () => {

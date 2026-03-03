@@ -839,7 +839,15 @@ const memoryLanceDBProPlugin = {
         setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
       },
-      stop: () => {
+      stop: async () => {
+        // Flush pending access reinforcement data before shutdown
+        try {
+          await accessTracker.flush();
+        } catch (err) {
+          api.logger.warn("memory-lancedb-pro: flush failed on stop:", err);
+        }
+        accessTracker.destroy();
+
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
