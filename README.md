@@ -158,6 +158,54 @@ Filters out low-quality content at both auto-capture and tool-store stages:
   - Skips memory-management prompts (e.g. delete/forget/cleanup memory entries) to reduce noise
 - **Auto-Recall** (`before_agent_start` hook): Injects `<relevant-memories>` context (up to 3 entries)
 
+### 9. Graphiti Mirror Layer (MVP)
+
+- Keep LanceDB as the primary memory store.
+- Optionally mirror successful `memory_store` writes to Graphiti (`add_episode`) using `scope -> group_id`.
+- Expose graph-native recall via `memory_graph_recall` (separate from `memory_recall`).
+- Fail-open behavior: Graphiti outages do not fail `memory_store`.
+
+Minimal config:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "memory-lancedb-pro": {
+        "enabled": true,
+        "config": {
+          "graphiti": {
+            "enabled": true,
+            "baseUrl": "http://localhost:8000",
+            "transport": "auto",
+            "groupIdMode": "scope",
+            "timeoutMs": 4000,
+            "failOpen": true,
+            "write": {
+              "memoryStore": true,
+              "autoCapture": false,
+              "sessionSummary": false
+            },
+            "read": {
+              "enableGraphRecallTool": true,
+              "augmentMemoryRecall": false,
+              "topKNodes": 6,
+              "topKFacts": 10
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Rollback (instant):
+
+- Set `graphiti.enabled` to `false`.
+- Restart gateway.
+- LanceDB behavior remains unchanged.
+
 ### Prevent memories from showing up in replies
 
 Sometimes the model may accidentally echo the injected `<relevant-memories>` block in its response.

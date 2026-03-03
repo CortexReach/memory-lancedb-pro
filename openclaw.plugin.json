@@ -520,6 +520,32 @@
       "help": "Number of recent messages to include in session summaries",
       "advanced": true
     },
+    "graphiti.enabled": {
+      "label": "Enable Graphiti",
+      "help": "Mirror successful memory writes to Graphiti and enable graph recall tool",
+      "advanced": true
+    },
+    "graphiti.baseUrl": {
+      "label": "Graphiti Base URL",
+      "placeholder": "http://localhost:8000",
+      "help": "Base URL for Graphiti MCP server",
+      "advanced": true
+    },
+    "graphiti.groupIdMode": {
+      "label": "Graphiti Group Mapping",
+      "help": "Use memory scope as group_id, or force one fixed group",
+      "advanced": true
+    },
+    "graphiti.failOpen": {
+      "label": "Graphiti Fail Open",
+      "help": "If enabled, memory_store still succeeds when Graphiti is unavailable",
+      "advanced": true
+    },
+    "graphiti.read.enableGraphRecallTool": {
+      "label": "Enable Graph Recall Tool",
+      "help": "Registers memory_graph_recall for Graphiti node/fact queries",
+      "advanced": true
+    },
     "scopes.default": {
       "label": "Default Scope",
       "help": "Default memory scope for new memories",
