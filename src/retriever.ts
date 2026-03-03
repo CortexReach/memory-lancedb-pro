@@ -6,6 +6,11 @@
 import type { MemoryStore, MemorySearchResult } from "./store.js";
 import type { Embedder } from "./embedder.js";
 import { filterNoise } from "./noise-filter.js";
+import {
+  AccessTracker,
+  parseAccessMetadata,
+  computeEffectiveHalfLife,
+} from "./access-tracker.js";
 
 // ============================================================================
 // Types & Configuration
@@ -59,6 +64,12 @@ export interface RetrievalConfig {
    * Set 0 to disable. (default: 60)
    */
   timeDecayHalfLifeDays: number;
+  /** Access reinforcement factor for time decay half-life extension.
+   *  Higher = stronger reinforcement. 0 to disable. (default: 0.5) */
+  reinforcementFactor: number;
+  /** Maximum half-life multiplier from access reinforcement.
+   *  Prevents frequently accessed memories from becoming immortal. (default: 3) */
+  maxHalfLifeMultiplier: number;
 }
 
 export interface RetrievalContext {
@@ -66,6 +77,8 @@ export interface RetrievalContext {
   limit: number;
   scopeFilter?: string[];
   category?: string;
+  /** Retrieval source: "manual" for user-triggered, "auto-recall" for system-initiated. */
+  source?: "manual" | "auto-recall";
 }
 
 export interface RetrievalResult extends MemorySearchResult {
@@ -89,13 +102,15 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   rerank: "cross-encoder",
   candidatePoolSize: 20,
   recencyHalfLifeDays: 14,
-  recencyWeight: 0.10,
+  recencyWeight: 0.1,
   filterNoise: true,
   rerankModel: "jina-reranker-v3",
   rerankEndpoint: "https://api.jina.ai/v1/rerank",
   lengthNormAnchor: 500,
   hardMinScore: 0.35,
   timeDecayHalfLifeDays: 60,
+  reinforcementFactor: 0.5,
+  maxHalfLifeMultiplier: 3,
 };
 
 // ============================================================================
@@ -118,7 +133,10 @@ function clamp01(value: number, fallback: number): number {
 
 type RerankProvider = "jina" | "siliconflow" | "voyage" | "pinecone";
 
-interface RerankItem { index: number; score: number }
+interface RerankItem {
+  index: number;
+  score: number;
+}
 
 /** Build provider-specific request headers and body */
 function buildRerankRequest(
@@ -140,7 +158,7 @@ function buildRerankRequest(
         body: {
           model,
           query,
-          documents: documents.map(text => ({ text })),
+          documents: documents.map((text) => ({ text })),
           top_n: topN,
           rank_fields: ["text"],
         },
@@ -149,7 +167,7 @@ function buildRerankRequest(
       return {
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
+          Authorization: `Bearer ${apiKey}`,
         },
         body: {
           model,
@@ -165,7 +183,7 @@ function buildRerankRequest(
       return {
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
+          Authorization: `Bearer ${apiKey}`,
         },
         body: {
           model,
@@ -189,7 +207,8 @@ function parseRerankResponse(
     if (!Array.isArray(items)) return null;
     const parsed: RerankItem[] = [];
     for (const raw of items as Array<Record<string, unknown>>) {
-      const index = typeof raw?.index === "number" ? raw.index : Number(raw?.index);
+      const index =
+        typeof raw?.index === "number" ? raw.index : Number(raw?.index);
       if (!Number.isFinite(index)) continue;
       let score: number | null = null;
       for (const key of scoreKeys) {
@@ -261,53 +280,85 @@ function cosineSimilarity(a: number[], b: number[]): number {
 // ============================================================================
 
 export class MemoryRetriever {
+  private accessTracker: AccessTracker | null = null;
+
   constructor(
     private store: MemoryStore,
     private embedder: Embedder,
-    private config: RetrievalConfig = DEFAULT_RETRIEVAL_CONFIG
+    private config: RetrievalConfig = DEFAULT_RETRIEVAL_CONFIG,
   ) {}
 
+  setAccessTracker(tracker: AccessTracker): void {
+    this.accessTracker = tracker;
+  }
+
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
-    const { query, limit, scopeFilter, category } = context;
+    const { query, limit, scopeFilter, category, source } = context;
     const safeLimit = clampInt(limit, 1, 20);
 
-    // For vector-only mode, use legacy behavior
+    let results: RetrievalResult[];
     if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
-      return this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category);
+      results = await this.vectorOnlyRetrieval(
+        query,
+        safeLimit,
+        scopeFilter,
+        category,
+      );
+    } else {
+      results = await this.hybridRetrieval(
+        query,
+        safeLimit,
+        scopeFilter,
+        category,
+      );
     }
 
-    // Hybrid retrieval with vector + BM25 + RRF fusion
-    return this.hybridRetrieval(query, safeLimit, scopeFilter, category);
+    // Record access for reinforcement (manual recall only)
+    if (this.accessTracker && source !== "auto-recall" && results.length > 0) {
+      this.accessTracker.recordAccess(results.map((r) => r.entry.id));
+    }
+
+    return results;
   }
 
   private async vectorOnlyRetrieval(
     query: string,
     limit: number,
     scopeFilter?: string[],
-    category?: string
+    category?: string,
   ): Promise<RetrievalResult[]> {
     const queryVector = await this.embedder.embedQuery(query);
-    const results = await this.store.vectorSearch(queryVector, limit, this.config.minScore, scopeFilter);
+    const results = await this.store.vectorSearch(
+      queryVector,
+      limit,
+      this.config.minScore,
+      scopeFilter,
+    );
 
     // Filter by category if specified
     const filtered = category
-      ? results.filter(r => r.entry.category === category)
+      ? results.filter((r) => r.entry.category === category)
       : results;
 
-    const mapped = filtered.map((result, index) => ({
-      ...result,
-      sources: {
-        vector: { score: result.score, rank: index + 1 },
-      },
-    } as RetrievalResult));
+    const mapped = filtered.map(
+      (result, index) =>
+        ({
+          ...result,
+          sources: {
+            vector: { score: result.score, rank: index + 1 },
+          },
+        }) as RetrievalResult,
+    );
 
     const boosted = this.applyRecencyBoost(mapped);
     const weighted = this.applyImportanceWeight(boosted);
     const lengthNormalized = this.applyLengthNormalization(weighted);
     const timeDecayed = this.applyTimeDecay(lengthNormalized);
-    const hardFiltered = timeDecayed.filter(r => r.score >= this.config.hardMinScore);
+    const hardFiltered = timeDecayed.filter(
+      (r) => r.score >= this.config.hardMinScore,
+    );
     const denoised = this.config.filterNoise
-      ? filterNoise(hardFiltered, r => r.entry.text)
+      ? filterNoise(hardFiltered, (r) => r.entry.text)
       : hardFiltered;
 
     // MMR deduplication: avoid top-k filled with near-identical memories
@@ -320,16 +371,24 @@ export class MemoryRetriever {
     query: string,
     limit: number,
     scopeFilter?: string[],
-    category?: string
+    category?: string,
   ): Promise<RetrievalResult[]> {
-    const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
+    const candidatePoolSize = Math.max(
+      this.config.candidatePoolSize,
+      limit * 2,
+    );
 
     // Compute query embedding once, reuse for vector search + reranking
     const queryVector = await this.embedder.embedQuery(query);
 
     // Run vector and BM25 searches in parallel
     const [vectorResults, bm25Results] = await Promise.all([
-      this.runVectorSearch(queryVector, candidatePoolSize, scopeFilter, category),
+      this.runVectorSearch(
+        queryVector,
+        candidatePoolSize,
+        scopeFilter,
+        category,
+      ),
       this.runBM25Search(query, candidatePoolSize, scopeFilter, category),
     ]);
 
@@ -337,12 +396,19 @@ export class MemoryRetriever {
     const fusedResults = await this.fuseResults(vectorResults, bm25Results);
 
     // Apply minimum score threshold
-    const filtered = fusedResults.filter(r => r.score >= this.config.minScore);
+    const filtered = fusedResults.filter(
+      (r) => r.score >= this.config.minScore,
+    );
 
     // Rerank if enabled
-    const reranked = this.config.rerank !== "none"
-      ? await this.rerankResults(query, queryVector, filtered.slice(0, limit * 2))
-      : filtered;
+    const reranked =
+      this.config.rerank !== "none"
+        ? await this.rerankResults(
+            query,
+            queryVector,
+            filtered.slice(0, limit * 2),
+          )
+        : filtered;
 
     // Apply temporal re-ranking (recency boost)
     const temporalReranked = this.applyRecencyBoost(reranked);
@@ -357,11 +423,13 @@ export class MemoryRetriever {
     const timeDecayed = this.applyTimeDecay(lengthNormalized);
 
     // Hard minimum score cutoff (post all scoring stages)
-    const hardFiltered = timeDecayed.filter(r => r.score >= this.config.hardMinScore);
+    const hardFiltered = timeDecayed.filter(
+      (r) => r.score >= this.config.hardMinScore,
+    );
 
     // Filter noise
     const denoised = this.config.filterNoise
-      ? filterNoise(hardFiltered, r => r.entry.text)
+      ? filterNoise(hardFiltered, (r) => r.entry.text)
       : hardFiltered;
 
     // MMR deduplication: avoid top-k filled with near-identical memories
@@ -374,13 +442,18 @@ export class MemoryRetriever {
     queryVector: number[],
     limit: number,
     scopeFilter?: string[],
-    category?: string
+    category?: string,
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
-    const results = await this.store.vectorSearch(queryVector, limit, 0.1, scopeFilter);
+    const results = await this.store.vectorSearch(
+      queryVector,
+      limit,
+      0.1,
+      scopeFilter,
+    );
 
     // Filter by category if specified
     const filtered = category
-      ? results.filter(r => r.entry.category === category)
+      ? results.filter((r) => r.entry.category === category)
       : results;
 
     return filtered.map((result, index) => ({
@@ -393,13 +466,13 @@ export class MemoryRetriever {
     query: string,
     limit: number,
     scopeFilter?: string[],
-    category?: string
+    category?: string,
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
     const results = await this.store.bm25Search(query, limit, scopeFilter);
 
     // Filter by category if specified
     const filtered = category
-      ? results.filter(r => r.entry.category === category)
+      ? results.filter((r) => r.entry.category === category)
       : results;
 
     return filtered.map((result, index) => ({
@@ -410,17 +483,17 @@ export class MemoryRetriever {
 
   private async fuseResults(
     vectorResults: Array<MemorySearchResult & { rank: number }>,
-    bm25Results: Array<MemorySearchResult & { rank: number }>
+    bm25Results: Array<MemorySearchResult & { rank: number }>,
   ): Promise<RetrievalResult[]> {
     // Create maps for quick lookup
     const vectorMap = new Map<string, MemorySearchResult & { rank: number }>();
     const bm25Map = new Map<string, MemorySearchResult & { rank: number }>();
 
-    vectorResults.forEach(result => {
+    vectorResults.forEach((result) => {
       vectorMap.set(result.entry.id, result);
     });
 
-    bm25Results.forEach(result => {
+    bm25Results.forEach((result) => {
       bm25Map.set(result.entry.id, result);
     });
 
@@ -459,15 +532,19 @@ export class MemoryRetriever {
       // (e.g. searching "JINA_API_KEY") still surface. The previous floor of 0.5
       // was too generous and allowed ghost entries to survive hardMinScore (0.35).
       const fusedScore = vectorResult
-        ? clamp01(vectorScore + (bm25Hit * 0.15 * vectorScore), 0.1)
+        ? clamp01(vectorScore + bm25Hit * 0.15 * vectorScore, 0.1)
         : clamp01(bm25Result!.score, 0.1);
 
       fusedResults.push({
         entry: baseResult.entry,
         score: fusedScore,
         sources: {
-          vector: vectorResult ? { score: vectorResult.score, rank: vectorResult.rank } : undefined,
-          bm25: bm25Result ? { score: bm25Result.score, rank: bm25Result.rank } : undefined,
+          vector: vectorResult
+            ? { score: vectorResult.score, rank: vectorResult.rank }
+            : undefined,
+          bm25: bm25Result
+            ? { score: bm25Result.score, rank: bm25Result.rank }
+            : undefined,
           fused: { score: fusedScore },
         },
       });
@@ -481,7 +558,11 @@ export class MemoryRetriever {
    * Rerank results using cross-encoder API (Jina, Pinecone, or compatible).
    * Falls back to cosine similarity if API is unavailable or fails.
    */
-  private async rerankResults(query: string, queryVector: number[], results: RetrievalResult[]): Promise<RetrievalResult[]> {
+  private async rerankResults(
+    query: string,
+    queryVector: number[],
+    results: RetrievalResult[],
+  ): Promise<RetrievalResult[]> {
     if (results.length === 0) {
       return results;
     }
@@ -491,11 +572,19 @@ export class MemoryRetriever {
       try {
         const provider = this.config.rerankProvider || "jina";
         const model = this.config.rerankModel || "jina-reranker-v3";
-        const endpoint = this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
-        const documents = results.map(r => r.entry.text);
+        const endpoint =
+          this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
+        const documents = results.map((r) => r.entry.text);
 
         // Build provider-specific request
-        const { headers, body } = buildRerankRequest(provider, this.config.rerankApiKey, model, query, documents, results.length);
+        const { headers, body } = buildRerankRequest(
+          provider,
+          this.config.rerankApiKey,
+          model,
+          query,
+          documents,
+          results.length,
+        );
 
         // Timeout: 5 seconds to prevent stalling retrieval pipeline
         const controller = new AbortController();
@@ -511,20 +600,22 @@ export class MemoryRetriever {
         clearTimeout(timeout);
 
         if (response.ok) {
-          const data = await response.json() as Record<string, unknown>;
+          const data = (await response.json()) as Record<string, unknown>;
 
           // Parse provider-specific response into unified format
           const parsed = parseRerankResponse(provider, data);
 
           if (!parsed) {
-            console.warn("Rerank API: invalid response shape, falling back to cosine");
+            console.warn(
+              "Rerank API: invalid response shape, falling back to cosine",
+            );
           } else {
             // Build a Set of returned indices to identify unreturned candidates
-            const returnedIndices = new Set(parsed.map(r => r.index));
+            const returnedIndices = new Set(parsed.map((r) => r.index));
 
             const reranked = parsed
-              .filter(item => item.index >= 0 && item.index < results.length)
-              .map(item => {
+              .filter((item) => item.index >= 0 && item.index < results.length)
+              .map((item) => {
                 const original = results[item.index];
                 // Blend: 60% cross-encoder score + 40% original fused score
                 const blendedScore = clamp01(
@@ -544,13 +635,17 @@ export class MemoryRetriever {
             // Keep unreturned candidates with their original scores (slightly penalized)
             const unreturned = results
               .filter((_, idx) => !returnedIndices.has(idx))
-              .map(r => ({ ...r, score: r.score * 0.8 }));
+              .map((r) => ({ ...r, score: r.score * 0.8 }));
 
-            return [...reranked, ...unreturned].sort((a, b) => b.score - a.score);
+            return [...reranked, ...unreturned].sort(
+              (a, b) => b.score - a.score,
+            );
           }
         } else {
           const errText = await response.text().catch(() => "");
-          console.warn(`Rerank API returned ${response.status}: ${errText.slice(0, 200)}, falling back to cosine`);
+          console.warn(
+            `Rerank API returned ${response.status}: ${errText.slice(0, 200)}, falling back to cosine`,
+          );
         }
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
@@ -563,9 +658,9 @@ export class MemoryRetriever {
 
     // Fallback: lightweight cosine similarity rerank
     try {
-      const reranked = results.map(result => {
+      const reranked = results.map((result) => {
         const cosineScore = cosineSimilarity(queryVector, result.entry.vector);
-        const combinedScore = (result.score * 0.7) + (cosineScore * 0.3);
+        const combinedScore = result.score * 0.7 + cosineScore * 0.3;
 
         return {
           ...result,
@@ -597,8 +692,9 @@ export class MemoryRetriever {
     }
 
     const now = Date.now();
-    const boosted = results.map(r => {
-      const ts = (r.entry.timestamp && r.entry.timestamp > 0) ? r.entry.timestamp : now;
+    const boosted = results.map((r) => {
+      const ts =
+        r.entry.timestamp && r.entry.timestamp > 0 ? r.entry.timestamp : now;
       const ageDays = (now - ts) / 86_400_000;
       const boost = Math.exp(-ageDays / recencyHalfLifeDays) * recencyWeight;
       return {
@@ -619,7 +715,7 @@ export class MemoryRetriever {
    */
   private applyImportanceWeight(results: RetrievalResult[]): RetrievalResult[] {
     const baseWeight = 0.7;
-    const weighted = results.map(r => {
+    const weighted = results.map((r) => {
       const importance = r.entry.importance ?? 0.7;
       const factor = baseWeight + (1 - baseWeight) * importance;
       return {
@@ -637,11 +733,13 @@ export class MemoryRetriever {
    * Long, sprawling entries (> anchor) get penalized.
    * Formula: score *= 1 / (1 + log2(charLen / anchor))
    */
-  private applyLengthNormalization(results: RetrievalResult[]): RetrievalResult[] {
+  private applyLengthNormalization(
+    results: RetrievalResult[],
+  ): RetrievalResult[] {
     const anchor = this.config.lengthNormAnchor;
     if (!anchor || anchor <= 0) return results;
 
-    const normalized = results.map(r => {
+    const normalized = results.map((r) => {
       const charLen = r.entry.text.length;
       const ratio = charLen / anchor;
       // No penalty for entries at or below anchor length.
@@ -675,11 +773,25 @@ export class MemoryRetriever {
     if (!halfLife || halfLife <= 0) return results;
 
     const now = Date.now();
-    const decayed = results.map(r => {
-      const ts = (r.entry.timestamp && r.entry.timestamp > 0) ? r.entry.timestamp : now;
+    const decayed = results.map((r) => {
+      const ts =
+        r.entry.timestamp && r.entry.timestamp > 0 ? r.entry.timestamp : now;
       const ageDays = (now - ts) / 86_400_000;
+
+      // Access reinforcement: frequently recalled memories decay slower
+      const { accessCount, lastAccessedAt } = parseAccessMetadata(
+        r.entry.metadata,
+      );
+      const effectiveHL = computeEffectiveHalfLife(
+        halfLife,
+        accessCount,
+        lastAccessedAt,
+        this.config.reinforcementFactor,
+        this.config.maxHalfLifeMultiplier,
+      );
+
       // floor at 0.5: even very old entries keep at least 50% of their score
-      const factor = 0.5 + 0.5 * Math.exp(-ageDays / halfLife);
+      const factor = 0.5 + 0.5 * Math.exp(-ageDays / effectiveHL);
       return {
         ...r,
         score: clamp01(r.score * factor, r.score * 0.5),
@@ -701,7 +813,10 @@ export class MemoryRetriever {
    * (e.g. 3 similar "SVG style" memories) while keeping them available
    * if the pool is small.
    */
-  private applyMMRDiversity(results: RetrievalResult[], similarityThreshold = 0.85): RetrievalResult[] {
+  private applyMMRDiversity(
+    results: RetrievalResult[],
+    similarityThreshold = 0.85,
+  ): RetrievalResult[] {
     if (results.length <= 1) return results;
 
     const selected: RetrievalResult[] = [];
@@ -709,7 +824,7 @@ export class MemoryRetriever {
 
     for (const candidate of results) {
       // Check if this candidate is too similar to any already-selected result
-      const tooSimilar = selected.some(s => {
+      const tooSimilar = selected.some((s) => {
         // Both must have vectors to compare.
         // LanceDB returns Arrow Vector objects (not plain arrays),
         // so use .length directly and Array.from() for conversion.
@@ -778,7 +893,7 @@ export class MemoryRetriever {
 export function createRetriever(
   store: MemoryStore,
   embedder: Embedder,
-  config?: Partial<RetrievalConfig>
+  config?: Partial<RetrievalConfig>,
 ): MemoryRetriever {
   const fullConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config };
   return new MemoryRetriever(store, embedder, fullConfig);

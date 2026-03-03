@@ -16,7 +16,13 @@ import type { Embedder } from "./embedder.js";
 // Types
 // ============================================================================
 
-export const MEMORY_CATEGORIES = ["preference", "fact", "decision", "entity", "other"] as const;
+export const MEMORY_CATEGORIES = [
+  "preference",
+  "fact",
+  "decision",
+  "entity",
+  "other",
+] as const;
 
 interface ToolContext {
   retriever: MemoryRetriever;
@@ -47,7 +53,7 @@ function clamp01(value: number, fallback = 0.7): number {
 }
 
 function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
-  return results.map(r => ({
+  return results.map((r) => ({
     id: r.entry.id,
     text: r.entry.text,
     category: r.entry.category,
@@ -62,22 +68,41 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
 // Core Tools (Backward Compatible)
 // ============================================================================
 
-export function registerMemoryRecallTool(api: OpenClawPluginApi, context: ToolContext) {
+export function registerMemoryRecallTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
   api.registerTool(
     (toolCtx) => {
       const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
       return {
         name: "memory_recall",
       label: "Memory Recall",
-      description: "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
+      description:
+        "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
       parameters: Type.Object({
-        query: Type.String({ description: "Search query for finding relevant memories" }),
-        limit: Type.Optional(Type.Number({ description: "Max results to return (default: 5, max: 20)" })),
-        scope: Type.Optional(Type.String({ description: "Specific memory scope to search in (optional)" })),
+        query: Type.String({
+          description: "Search query for finding relevant memories",
+        }),
+        limit: Type.Optional(
+          Type.Number({
+            description: "Max results to return (default: 5, max: 20)",
+          }),
+        ),
+        scope: Type.Optional(
+          Type.String({
+            description: "Specific memory scope to search in (optional)",
+          }),
+        ),
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
       }),
       async execute(_toolCallId, params) {
-        const { query, limit = 5, scope, category } = params as {
+        const {
+          query,
+          limit = 5,
+          scope,
+          category,
+        } = params as {
           query: string;
           limit?: number;
           scope?: string;
@@ -94,8 +119,13 @@ export function registerMemoryRecallTool(api: OpenClawPluginApi, context: ToolCo
               scopeFilter = [scope];
             } else {
               return {
-                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
-                details: { error: "scope_access_denied", requestedScope: scope },
+                content: [
+                  { type: "text", text: `Access denied to scope: ${scope}` },
+                ],
+                details: {
+                  error: "scope_access_denied",
+                  requestedScope: scope,
+                },
               };
             }
           }
@@ -105,6 +135,7 @@ export function registerMemoryRecallTool(api: OpenClawPluginApi, context: ToolCo
             limit: safeLimit,
             scopeFilter,
             category,
+            source: "manual",
           });
 
           if (results.length === 0) {
@@ -121,12 +152,17 @@ export function registerMemoryRecallTool(api: OpenClawPluginApi, context: ToolCo
               if (r.sources.bm25) sources.push("BM25");
               if (r.sources.reranked) sources.push("reranked");
 
-              return `${i + 1}. [${r.entry.id}] [${r.entry.category}:${r.entry.scope}] ${r.entry.text} (${(r.score * 100).toFixed(0)}%${sources.length > 0 ? `, ${sources.join('+')}` : ''})`;
+              return `${i + 1}. [${r.entry.id}] [${r.entry.category}:${r.entry.scope}] ${r.entry.text} (${(r.score * 100).toFixed(0)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
             })
             .join("\n");
 
           return {
-            content: [{ type: "text", text: `Found ${results.length} memories:\n\n${text}` }],
+            content: [
+              {
+                type: "text",
+                text: `Found ${results.length} memories:\n\n${text}`,
+              },
+            ],
             details: {
               count: results.length,
               memories: sanitizeMemoryForSerialization(results),
@@ -137,30 +173,45 @@ export function registerMemoryRecallTool(api: OpenClawPluginApi, context: ToolCo
           };
         } catch (error) {
           return {
-            content: [{ type: "text", text: `Memory recall failed: ${error instanceof Error ? error.message : String(error)}` }],
+            content: [
+              {
+                type: "text",
+                text: `Memory recall failed: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
             details: { error: "recall_failed", message: String(error) },
           };
         }
       },
     };
     },
-    { name: "memory_recall" }
+    { name: "memory_recall" },
   );
 }
 
-export function registerMemoryStoreTool(api: OpenClawPluginApi, context: ToolContext) {
+export function registerMemoryStoreTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
   api.registerTool(
     (toolCtx) => {
       const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
       return {
         name: "memory_store",
       label: "Memory Store",
-      description: "Save important information in long-term memory. Use for preferences, facts, decisions, and other notable information.",
+      description:
+        "Save important information in long-term memory. Use for preferences, facts, decisions, and other notable information.",
       parameters: Type.Object({
         text: Type.String({ description: "Information to remember" }),
-        importance: Type.Optional(Type.Number({ description: "Importance score 0-1 (default: 0.7)" })),
+        importance: Type.Optional(
+          Type.Number({ description: "Importance score 0-1 (default: 0.7)" }),
+        ),
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
-        scope: Type.Optional(Type.String({ description: "Memory scope (optional, defaults to agent scope)" })),
+        scope: Type.Optional(
+          Type.String({
+            description: "Memory scope (optional, defaults to agent scope)",
+          }),
+        ),
       }),
       async execute(_toolCallId, params) {
         const {
@@ -182,15 +233,28 @@ export function registerMemoryStoreTool(api: OpenClawPluginApi, context: ToolCon
           // Validate scope access
           if (!context.scopeManager.isAccessible(targetScope, agentId)) {
             return {
-              content: [{ type: "text", text: `Access denied to scope: ${targetScope}` }],
-              details: { error: "scope_access_denied", requestedScope: targetScope },
+              content: [
+                {
+                  type: "text",
+                  text: `Access denied to scope: ${targetScope}`,
+                },
+              ],
+              details: {
+                error: "scope_access_denied",
+                requestedScope: targetScope,
+              },
             };
           }
 
           // Reject noise before wasting an embedding API call
           if (isNoise(text)) {
             return {
-              content: [{ type: "text", text: `Skipped: text detected as noise (greeting, boilerplate, or meta-question)` }],
+              content: [
+                {
+                  type: "text",
+                  text: `Skipped: text detected as noise (greeting, boilerplate, or meta-question)`,
+                },
+              ],
               details: { action: "noise_filtered", text: text.slice(0, 60) },
             };
           }
@@ -199,7 +263,9 @@ export function registerMemoryStoreTool(api: OpenClawPluginApi, context: ToolCon
           const vector = await context.embedder.embedPassage(text);
 
           // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
-          const existing = await context.store.vectorSearch(vector, 1, 0.1, [targetScope]);
+          const existing = await context.store.vectorSearch(vector, 1, 0.1, [
+            targetScope,
+          ]);
 
           if (existing.length > 0 && existing[0].score > 0.98) {
             return {
@@ -228,7 +294,12 @@ export function registerMemoryStoreTool(api: OpenClawPluginApi, context: ToolCon
           });
 
           return {
-            content: [{ type: "text", text: `Stored: "${text.slice(0, 100)}${text.length > 100 ? '...' : ''}" in scope '${targetScope}'` }],
+            content: [
+              {
+                type: "text",
+                text: `Stored: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}" in scope '${targetScope}'`,
+              },
+            ],
             details: {
               action: "created",
               id: entry.id,
@@ -239,29 +310,46 @@ export function registerMemoryStoreTool(api: OpenClawPluginApi, context: ToolCon
           };
         } catch (error) {
           return {
-            content: [{ type: "text", text: `Memory storage failed: ${error instanceof Error ? error.message : String(error)}` }],
+            content: [
+              {
+                type: "text",
+                text: `Memory storage failed: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
             details: { error: "store_failed", message: String(error) },
           };
         }
       },
     };
     },
-    { name: "memory_store" }
+    { name: "memory_store" },
   );
 }
 
-export function registerMemoryForgetTool(api: OpenClawPluginApi, context: ToolContext) {
+export function registerMemoryForgetTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
   api.registerTool(
     (toolCtx) => {
       const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
       return {
         name: "memory_forget",
       label: "Memory Forget",
-      description: "Delete specific memories. Supports both search-based and direct ID-based deletion.",
+      description:
+        "Delete specific memories. Supports both search-based and direct ID-based deletion.",
       parameters: Type.Object({
-        query: Type.Optional(Type.String({ description: "Search query to find memory to delete" })),
-        memoryId: Type.Optional(Type.String({ description: "Specific memory ID to delete" })),
-        scope: Type.Optional(Type.String({ description: "Scope to search/delete from (optional)" })),
+        query: Type.Optional(
+          Type.String({ description: "Search query to find memory to delete" }),
+        ),
+        memoryId: Type.Optional(
+          Type.String({ description: "Specific memory ID to delete" }),
+        ),
+        scope: Type.Optional(
+          Type.String({
+            description: "Scope to search/delete from (optional)",
+          }),
+        ),
       }),
       async execute(_toolCallId, params) {
         const { query, memoryId, scope } = params as {
@@ -278,8 +366,13 @@ export function registerMemoryForgetTool(api: OpenClawPluginApi, context: ToolCo
               scopeFilter = [scope];
             } else {
               return {
-                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
-                details: { error: "scope_access_denied", requestedScope: scope },
+                content: [
+                  { type: "text", text: `Access denied to scope: ${scope}` },
+                ],
+                details: {
+                  error: "scope_access_denied",
+                  requestedScope: scope,
+                },
               };
             }
           }
@@ -288,12 +381,19 @@ export function registerMemoryForgetTool(api: OpenClawPluginApi, context: ToolCo
             const deleted = await context.store.delete(memoryId, scopeFilter);
             if (deleted) {
               return {
-                content: [{ type: "text", text: `Memory ${memoryId} forgotten.` }],
+                content: [
+                  { type: "text", text: `Memory ${memoryId} forgotten.` },
+                ],
                 details: { action: "deleted", id: memoryId },
               };
             } else {
               return {
-                content: [{ type: "text", text: `Memory ${memoryId} not found or access denied.` }],
+                content: [
+                  {
+                    type: "text",
+                    text: `Memory ${memoryId} not found or access denied.`,
+                  },
+                ],
                 details: { error: "not_found", id: memoryId },
               };
             }
@@ -308,23 +408,36 @@ export function registerMemoryForgetTool(api: OpenClawPluginApi, context: ToolCo
 
             if (results.length === 0) {
               return {
-                content: [{ type: "text", text: "No matching memories found." }],
+                content: [
+                  { type: "text", text: "No matching memories found." },
+                ],
                 details: { found: 0, query },
               };
             }
 
             if (results.length === 1 && results[0].score > 0.9) {
-              const deleted = await context.store.delete(results[0].entry.id, scopeFilter);
+              const deleted = await context.store.delete(
+                results[0].entry.id,
+                scopeFilter,
+              );
               if (deleted) {
                 return {
-                  content: [{ type: "text", text: `Forgotten: "${results[0].entry.text}"` }],
+                  content: [
+                    {
+                      type: "text",
+                      text: `Forgotten: "${results[0].entry.text}"`,
+                    },
+                  ],
                   details: { action: "deleted", id: results[0].entry.id },
                 };
               }
             }
 
             const list = results
-              .map(r => `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? '...' : ''}`)
+              .map(
+                (r) =>
+                  `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
+              )
               .join("\n");
 
             return {
@@ -342,19 +455,29 @@ export function registerMemoryForgetTool(api: OpenClawPluginApi, context: ToolCo
           }
 
           return {
-            content: [{ type: "text", text: "Provide either 'query' to search for memories or 'memoryId' to delete specific memory." }],
+            content: [
+              {
+                type: "text",
+                text: "Provide either 'query' to search for memories or 'memoryId' to delete specific memory.",
+              },
+            ],
             details: { error: "missing_param" },
           };
         } catch (error) {
           return {
-            content: [{ type: "text", text: `Memory deletion failed: ${error instanceof Error ? error.message : String(error)}` }],
+            content: [
+              {
+                type: "text",
+                text: `Memory deletion failed: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
             details: { error: "delete_failed", message: String(error) },
           };
         }
       },
     };
     },
-    { name: "memory_forget" }
+    { name: "memory_forget" },
   );
 }
 
@@ -362,18 +485,31 @@ export function registerMemoryForgetTool(api: OpenClawPluginApi, context: ToolCo
 // Update Tool
 // ============================================================================
 
-export function registerMemoryUpdateTool(api: OpenClawPluginApi, context: ToolContext) {
+export function registerMemoryUpdateTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
   api.registerTool(
     (toolCtx) => {
       const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
       return {
         name: "memory_update",
       label: "Memory Update",
-      description: "Update an existing memory in-place. Preserves original timestamp. Use when correcting outdated info or adjusting importance/category without losing creation date.",
+      description:
+        "Update an existing memory in-place. Preserves original timestamp. Use when correcting outdated info or adjusting importance/category without losing creation date.",
       parameters: Type.Object({
-        memoryId: Type.String({ description: "ID of the memory to update (full UUID or 8+ char prefix)" }),
-        text: Type.Optional(Type.String({ description: "New text content (triggers re-embedding)" })),
-        importance: Type.Optional(Type.Number({ description: "New importance score 0-1" })),
+        memoryId: Type.String({
+          description:
+            "ID of the memory to update (full UUID or 8+ char prefix)",
+        }),
+        text: Type.Optional(
+          Type.String({
+            description: "New text content (triggers re-embedding)",
+          }),
+        ),
+        importance: Type.Optional(
+          Type.Number({ description: "New importance score 0-1" }),
+        ),
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
       }),
       async execute(_toolCallId, params) {
@@ -387,7 +523,12 @@ export function registerMemoryUpdateTool(api: OpenClawPluginApi, context: ToolCo
         try {
           if (!text && importance === undefined && !category) {
             return {
-              content: [{ type: "text", text: "Nothing to update. Provide at least one of: text, importance, category." }],
+              content: [
+                {
+                  type: "text",
+                  text: "Nothing to update. Provide at least one of: text, importance, category.",
+                },
+              ],
               details: { error: "no_updates" },
             };
           }
@@ -407,7 +548,12 @@ export function registerMemoryUpdateTool(api: OpenClawPluginApi, context: ToolCo
             });
             if (results.length === 0) {
               return {
-                content: [{ type: "text", text: `No memory found matching "${memoryId}".` }],
+                content: [
+                  {
+                    type: "text",
+                    text: `No memory found matching "${memoryId}".`,
+                  },
+                ],
                 details: { error: "not_found", query: memoryId },
               };
             }
@@ -415,11 +561,22 @@ export function registerMemoryUpdateTool(api: OpenClawPluginApi, context: ToolCo
               resolvedId = results[0].entry.id;
             } else {
               const list = results
-                .map(r => `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? '...' : ''}`)
+                .map(
+                  (r) =>
+                    `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
+                )
                 .join("\n");
               return {
-                content: [{ type: "text", text: `Multiple matches. Specify memoryId:\n${list}` }],
-                details: { action: "candidates", candidates: sanitizeMemoryForSerialization(results) },
+                content: [
+                  {
+                    type: "text",
+                    text: `Multiple matches. Specify memoryId:\n${list}`,
+                  },
+                ],
+                details: {
+                  action: "candidates",
+                  candidates: sanitizeMemoryForSerialization(results),
+                },
               };
             }
           }
@@ -429,7 +586,12 @@ export function registerMemoryUpdateTool(api: OpenClawPluginApi, context: ToolCo
           if (text) {
             if (isNoise(text)) {
               return {
-                content: [{ type: "text", text: "Skipped: updated text detected as noise" }],
+                content: [
+                  {
+                    type: "text",
+                    text: "Skipped: updated text detected as noise",
+                  },
+                ],
                 details: { action: "noise_filtered" },
               };
             }
@@ -439,20 +601,35 @@ export function registerMemoryUpdateTool(api: OpenClawPluginApi, context: ToolCo
           const updates: Record<string, any> = {};
           if (text) updates.text = text;
           if (newVector) updates.vector = newVector;
-          if (importance !== undefined) updates.importance = clamp01(importance, 0.7);
+          if (importance !== undefined)
+            updates.importance = clamp01(importance, 0.7);
           if (category) updates.category = category;
 
-          const updated = await context.store.update(resolvedId, updates, scopeFilter);
+          const updated = await context.store.update(
+            resolvedId,
+            updates,
+            scopeFilter,
+          );
 
           if (!updated) {
             return {
-              content: [{ type: "text", text: `Memory ${resolvedId.slice(0, 8)}... not found or access denied.` }],
+              content: [
+                {
+                  type: "text",
+                  text: `Memory ${resolvedId.slice(0, 8)}... not found or access denied.`,
+                },
+              ],
               details: { error: "not_found", id: resolvedId },
             };
           }
 
           return {
-            content: [{ type: "text", text: `Updated memory ${updated.id.slice(0, 8)}...: "${updated.text.slice(0, 80)}${updated.text.length > 80 ? '...' : ''}"` }],
+            content: [
+              {
+                type: "text",
+                text: `Updated memory ${updated.id.slice(0, 8)}...: "${updated.text.slice(0, 80)}${updated.text.length > 80 ? "..." : ""}"`,
+              },
+            ],
             details: {
               action: "updated",
               id: updated.id,
@@ -464,14 +641,19 @@ export function registerMemoryUpdateTool(api: OpenClawPluginApi, context: ToolCo
           };
         } catch (error) {
           return {
-            content: [{ type: "text", text: `Memory update failed: ${error instanceof Error ? error.message : String(error)}` }],
+            content: [
+              {
+                type: "text",
+                text: `Memory update failed: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
             details: { error: "update_failed", message: String(error) },
           };
         }
       },
     };
     },
-    { name: "memory_update" }
+    { name: "memory_update" },
   );
 }
 
@@ -479,7 +661,10 @@ export function registerMemoryUpdateTool(api: OpenClawPluginApi, context: ToolCo
 // Management Tools (Optional)
 // ============================================================================
 
-export function registerMemoryStatsTool(api: OpenClawPluginApi, context: ToolContext) {
+export function registerMemoryStatsTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
   api.registerTool(
     (toolCtx) => {
       const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
@@ -488,7 +673,11 @@ export function registerMemoryStatsTool(api: OpenClawPluginApi, context: ToolCon
       label: "Memory Statistics",
       description: "Get statistics about memory usage, scopes, and categories.",
       parameters: Type.Object({
-        scope: Type.Optional(Type.String({ description: "Specific scope to get stats for (optional)" })),
+        scope: Type.Optional(
+          Type.String({
+            description: "Specific scope to get stats for (optional)",
+          }),
+        ),
       }),
       async execute(_toolCallId, params) {
         const { scope } = params as { scope?: string };
@@ -501,8 +690,13 @@ export function registerMemoryStatsTool(api: OpenClawPluginApi, context: ToolCon
               scopeFilter = [scope];
             } else {
               return {
-                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
-                details: { error: "scope_access_denied", requestedScope: scope },
+                content: [
+                  { type: "text", text: `Access denied to scope: ${scope}` },
+                ],
+                details: {
+                  error: "scope_access_denied",
+                  requestedScope: scope,
+                },
               };
             }
           }
@@ -516,14 +710,18 @@ export function registerMemoryStatsTool(api: OpenClawPluginApi, context: ToolCon
             `• Total memories: ${stats.totalCount}`,
             `• Available scopes: ${scopeManagerStats.totalScopes}`,
             `• Retrieval mode: ${retrievalConfig.mode}`,
-            `• FTS support: ${context.store.hasFtsSupport ? 'Yes' : 'No'}`,
+            `• FTS support: ${context.store.hasFtsSupport ? "Yes" : "No"}`,
             ``,
             `Memories by scope:`,
-            ...Object.entries(stats.scopeCounts).map(([s, count]) => `  • ${s}: ${count}`),
+            ...Object.entries(stats.scopeCounts).map(
+              ([s, count]) => `  • ${s}: ${count}`,
+            ),
             ``,
             `Memories by category:`,
-            ...Object.entries(stats.categoryCounts).map(([c, count]) => `  • ${c}: ${count}`),
-          ].join('\n');
+            ...Object.entries(stats.categoryCounts).map(
+              ([c, count]) => `  • ${c}: ${count}`,
+            ),
+          ].join("\n");
 
           return {
             content: [{ type: "text", text }],
@@ -539,30 +737,49 @@ export function registerMemoryStatsTool(api: OpenClawPluginApi, context: ToolCon
           };
         } catch (error) {
           return {
-            content: [{ type: "text", text: `Failed to get memory stats: ${error instanceof Error ? error.message : String(error)}` }],
+            content: [
+              {
+                type: "text",
+                text: `Failed to get memory stats: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
             details: { error: "stats_failed", message: String(error) },
           };
         }
       },
     };
     },
-    { name: "memory_stats" }
+    { name: "memory_stats" },
   );
 }
 
-export function registerMemoryListTool(api: OpenClawPluginApi, context: ToolContext) {
+export function registerMemoryListTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
   api.registerTool(
     (toolCtx) => {
       const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
       return {
         name: "memory_list",
       label: "Memory List",
-      description: "List recent memories with optional filtering by scope and category.",
+      description:
+        "List recent memories with optional filtering by scope and category.",
       parameters: Type.Object({
-        limit: Type.Optional(Type.Number({ description: "Max memories to list (default: 10, max: 50)" })),
-        scope: Type.Optional(Type.String({ description: "Filter by specific scope (optional)" })),
+        limit: Type.Optional(
+          Type.Number({
+            description: "Max memories to list (default: 10, max: 50)",
+          }),
+        ),
+        scope: Type.Optional(
+          Type.String({ description: "Filter by specific scope (optional)" }),
+        ),
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
-        offset: Type.Optional(Type.Number({ description: "Number of memories to skip (default: 0)" })),
+        offset: Type.Optional(
+          Type.Number({
+            description: "Number of memories to skip (default: 0)",
+          }),
+        ),
       }),
       async execute(_toolCallId, params) {
         const {
@@ -588,33 +805,58 @@ export function registerMemoryListTool(api: OpenClawPluginApi, context: ToolCont
               scopeFilter = [scope];
             } else {
               return {
-                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
-                details: { error: "scope_access_denied", requestedScope: scope },
+                content: [
+                  { type: "text", text: `Access denied to scope: ${scope}` },
+                ],
+                details: {
+                  error: "scope_access_denied",
+                  requestedScope: scope,
+                },
               };
             }
           }
 
-          const entries = await context.store.list(scopeFilter, category, safeLimit, safeOffset);
+          const entries = await context.store.list(
+            scopeFilter,
+            category,
+            safeLimit,
+            safeOffset,
+          );
 
           if (entries.length === 0) {
             return {
               content: [{ type: "text", text: "No memories found." }],
-              details: { count: 0, filters: { scope, category, limit: safeLimit, offset: safeOffset } },
+              details: {
+                count: 0,
+                filters: {
+                  scope,
+                  category,
+                  limit: safeLimit,
+                  offset: safeOffset,
+                },
+              },
             };
           }
 
           const text = entries
             .map((entry, i) => {
-              const date = new Date(entry.timestamp).toISOString().split('T')[0];
-              return `${safeOffset + i + 1}. [${entry.id}] [${entry.category}:${entry.scope}] ${entry.text.slice(0, 100)}${entry.text.length > 100 ? '...' : ''} (${date})`;
+              const date = new Date(entry.timestamp)
+                .toISOString()
+                .split("T")[0];
+              return `${safeOffset + i + 1}. [${entry.id}] [${entry.category}:${entry.scope}] ${entry.text.slice(0, 100)}${entry.text.length > 100 ? "..." : ""} (${date})`;
             })
-            .join('\n');
+            .join("\n");
 
           return {
-            content: [{ type: "text", text: `Recent memories (showing ${entries.length}):\n\n${text}` }],
+            content: [
+              {
+                type: "text",
+                text: `Recent memories (showing ${entries.length}):\n\n${text}`,
+              },
+            ],
             details: {
               count: entries.length,
-              memories: entries.map(e => ({
+              memories: entries.map((e) => ({
                 id: e.id,
                 text: e.text,
                 category: e.category,
@@ -622,19 +864,29 @@ export function registerMemoryListTool(api: OpenClawPluginApi, context: ToolCont
                 importance: e.importance,
                 timestamp: e.timestamp,
               })),
-              filters: { scope, category, limit: safeLimit, offset: safeOffset },
+              filters: {
+                scope,
+                category,
+                limit: safeLimit,
+                offset: safeOffset,
+              },
             },
           };
         } catch (error) {
           return {
-            content: [{ type: "text", text: `Failed to list memories: ${error instanceof Error ? error.message : String(error)}` }],
+            content: [
+              {
+                type: "text",
+                text: `Failed to list memories: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
             details: { error: "list_failed", message: String(error) },
           };
         }
       },
     };
     },
-    { name: "memory_list" }
+    { name: "memory_list" },
   );
 }
 
@@ -647,7 +899,7 @@ export function registerAllMemoryTools(
   context: ToolContext,
   options: {
     enableManagementTools?: boolean;
-  } = {}
+  } = {},
 ) {
   // Core tools (always enabled)
   registerMemoryRecallTool(api, context);
