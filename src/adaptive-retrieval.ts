@@ -46,21 +46,24 @@ const FORCE_RETRIEVE_PATTERNS = [
 function normalizeQuery(query: string): string {
   let s = query.trim();
 
-  // Strip OpenClaw cron wrapper prefix.
-  s = s.replace(/^\[cron:[^\]]+\]\s*/i, "");
-
-  // Strip OpenClaw timestamp prefix [Mon 2026-03-02 04:21 GMT+8].
-  s = s.replace(/^\[[A-Za-z]{3}\s\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\s[^\]]+\]\s*/, "");
-
-  // Strip OpenClaw injected metadata header used in some transcripts.
-  if (/^Conversation info \(untrusted metadata\):/i.test(s)) {
-    s = s.replace(/^Conversation info \(untrusted metadata\):\s*/i, "");
-    // If there is a blank-line separator, keep only the part after it.
+  // 1. Strip OpenClaw injected metadata header (Conversation info or Sender).
+  if (/^(Conversation info|Sender) \(untrusted metadata\):/i.test(s)) {
+    s = s.replace(/^(Conversation info|Sender) \(untrusted metadata\):\s*/i, "");
+    // If there is a blank-line separator (after JSON block), keep only the part after it.
     const parts = s.split(/\n\s*\n/, 2);
-    if (parts.length === 2) s = parts[1];
+    if (parts.length === 2) {
+      s = parts[1].trim();
+    }
   }
 
-  return s.trim();
+  // 2. Strip OpenClaw cron wrapper prefix.
+  s = s.trim().replace(/^\[cron:[^\]]+\]\s*/i, "");
+
+  // 3. Strip OpenClaw timestamp prefix [Mon 2026-03-02 04:21 GMT+8].
+  s = s.trim().replace(/^\[[A-Za-z]{3}\s\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\s[^\]]+\]\s*/, "");
+
+  const result = s.trim();
+  return result;
 }
 
 /**
