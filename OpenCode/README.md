@@ -32,6 +32,22 @@ and creates it automatically when missing.
 
 Only when user explicitly provides `scope` does it use another scope.
 
+The plugin also auto-extracts key memories from conversation events on
+`session.idle` and stores only high-signal content (architecture decisions,
+requirements constraints, major code/class structure). Low-value chatter is
+filtered.
+
+Storage decisions are model-gated: candidate memories are sent to the active
+OpenCode model for keep/skip judgment. The prompt strongly prioritizes class
+inheritance/implements relations and overall architecture design.
+
+Recall is configured to run aggressively in frequency (over-fetch candidates),
+but final output is precision-filtered with mandatory noise filtering to avoid
+irrelevant results.
+
+When available, recall/list output includes file/language metadata extracted
+from attached file parts (for example `files:src/core/retriever.rs;lang:rust`).
+
 ## Install modes
 
 ### 1) Project-local mode
