@@ -774,116 +774,109 @@ const memoryLanceDBProPlugin = {
     // Session Memory Hook (replaces built-in session-memory)
     // ========================================================================
 
-    if (config.sessionMemory?.enabled === true) {
-      // DISABLED by default (2026-07-09): session summaries stored in LanceDB pollute
-      // retrieval quality. OpenClaw already saves .jsonl files to ~/.openclaw/agents/*/sessions/
-      // and memorySearch.sources: ["memory", "sessions"] can search them directly.
-      // Set sessionMemory.enabled: true in plugin config to re-enable.
-      const sessionMessageCount = config.sessionMemory?.messageCount ?? 15;
+    // Session memory hook handler (defined here, registered in service.start() to survive clearInternalHooks)
+    const sessionMessageCount = config.sessionMemory?.messageCount ?? 15;
+    
+    const sessionMemoryHandler = async (event: any) => {
+      try {
+        api.logger.debug("session-memory-lancedb: hook triggered for /new command");
 
-      api.registerHook("command:new", async (event) => {
-        try {
-          api.logger.debug("session-memory: hook triggered for /new command");
+        const context = (event.context || {}) as Record<string, unknown>;
+        const sessionEntry = (context.previousSessionEntry ||
+          context.sessionEntry ||
+          {}) as Record<string, unknown>;
+        const currentSessionId = sessionEntry.sessionId as string | undefined;
+        let currentSessionFile =
+          (sessionEntry.sessionFile as string) || undefined;
+        const source = (context.commandSource as string) || "unknown";
 
-          const context = (event.context || {}) as Record<string, unknown>;
-          const sessionEntry = (context.previousSessionEntry ||
-            context.sessionEntry ||
-            {}) as Record<string, unknown>;
-          const currentSessionId = sessionEntry.sessionId as string | undefined;
-          let currentSessionFile =
-            (sessionEntry.sessionFile as string) || undefined;
-          const source = (context.commandSource as string) || "unknown";
+        // Resolve session file (handle reset rotation)
+        if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
+          const searchDirs = new Set<string>();
+          if (currentSessionFile) searchDirs.add(dirname(currentSessionFile));
 
-          // Resolve session file (handle reset rotation)
-          if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
-            const searchDirs = new Set<string>();
-            if (currentSessionFile) searchDirs.add(dirname(currentSessionFile));
+          const workspaceDir = context.workspaceDir as string | undefined;
+          if (workspaceDir) searchDirs.add(join(workspaceDir, "sessions"));
 
-            const workspaceDir = context.workspaceDir as string | undefined;
-            if (workspaceDir) searchDirs.add(join(workspaceDir, "sessions"));
-
-            for (const sessionsDir of searchDirs) {
-              const recovered = await findPreviousSessionFile(
-                sessionsDir,
-                currentSessionFile,
-                currentSessionId,
+          for (const sessionsDir of searchDirs) {
+            const recovered = await findPreviousSessionFile(
+              sessionsDir,
+              currentSessionFile,
+              currentSessionId,
+            );
+            if (recovered) {
+              currentSessionFile = recovered;
+              api.logger.debug(
+                `session-memory: recovered session file: ${recovered}`,
               );
-              if (recovered) {
-                currentSessionFile = recovered;
-                api.logger.debug(
-                  `session-memory: recovered session file: ${recovered}`,
-                );
-                break;
-              }
+              break;
             }
           }
-
-          if (!currentSessionFile) {
-            api.logger.debug("session-memory: no session file found, skipping");
-            return;
-          }
-
-          // Read session content
-          const sessionContent = await readSessionContentWithResetFallback(
-            currentSessionFile,
-            sessionMessageCount,
-          );
-          if (!sessionContent) {
-            api.logger.debug(
-              "session-memory: no session content found, skipping",
-            );
-            return;
-          }
-
-          // Format as memory entry
-          const now = new Date(event.timestamp);
-          const dateStr = now.toISOString().split("T")[0];
-          const timeStr = now.toISOString().split("T")[1].split(".")[0];
-
-          const memoryText = [
-            `Session: ${dateStr} ${timeStr} UTC`,
-            `Session Key: ${event.sessionKey}`,
-            `Session ID: ${currentSessionId || "unknown"}`,
-            `Source: ${source}`,
-            "",
-            "Conversation Summary:",
-            sessionContent,
-          ].join("\n");
-
-          // Embed and store
-          const vector = await embedder.embedPassage(memoryText);
-          await store.store({
-            text: memoryText,
-            vector,
-            category: "fact",
-            scope: "global",
-            importance: 0.5,
-            metadata: JSON.stringify({
-              type: "session-summary",
-              sessionKey: event.sessionKey,
-              sessionId: currentSessionId || "unknown",
-              date: dateStr,
-            }),
-          });
-
-          // Dual-write to Markdown mirror if enabled
-          if (mdMirror) {
-            await mdMirror(
-              { text: memoryText.replace(/\n/g, " ").slice(0, 500), category: "fact", scope: "global", timestamp: Date.now() },
-              { source: "session-memory" },
-            );
-          }
-
-          api.logger.info(
-            `session-memory: stored session summary for ${currentSessionId || "unknown"}`,
-          );
-        } catch (err) {
-          api.logger.warn(`session-memory: failed to save: ${String(err)}`);
         }
-      });
 
-      api.logger.info("session-memory: hook registered for command:new");
-    }
+        if (!currentSessionFile) {
+          api.logger.debug("session-memory: no session file found, skipping");
+          return;
+        }
+
+        // Read session content
+        const sessionContent = await readSessionContentWithResetFallback(
+          currentSessionFile,
+          sessionMessageCount,
+        );
+        if (!sessionContent) {
+          api.logger.debug(
+            "session-memory: no session content found, skipping",
+          );
+          return;
+        }
+
+        // Format as memory entry
+        const now = new Date(event.timestamp);
+        const dateStr = now.toISOString().split("T")[0];
+        const timeStr = now.toISOString().split("T")[1].split(".")[0];
+
+        const memoryText = [
+          `Session: ${dateStr} ${timeStr} UTC`,
+          `Session Key: ${event.sessionKey}`,
+          `Session ID: ${currentSessionId || "unknown"}`,
+          `Source: ${source}`,
+          "",
+          "Conversation Summary:",
+          sessionContent,
+        ].join("\n");
+
+        // Embed and store
+        const vector = await embedder.embedPassage(memoryText);
+        await store.store({
+          text: memoryText,
+          vector,
+          category: "fact",
+          scope: "global",
+          importance: 0.5,
+          metadata: JSON.stringify({
+            type: "session-summary",
+            sessionKey: event.sessionKey,
+            sessionId: currentSessionId || "unknown",
+            date: dateStr,
+          }),
+        });
+
+        // Dual-write to Markdown mirror if enabled
+        if (mdMirror) {
+          await mdMirror(
+            { text: memoryText.replace(/\n/g, " ").slice(0, 500), category: "fact", scope: "global", timestamp: Date.now() },
+            { source: "session-memory" },
+          );
+        }
+
+        api.logger.info(
+          `session-memory-lancedb: stored session summary for ${currentSessionId || "unknown"}`,
+        );
+      } catch (err) {
+        api.logger.warn(`session-memory-lancedb: failed to save: ${String(err)}`);
+      }
+    };
 
     // ========================================================================
     // Auto-Backup (daily JSONL export)
@@ -1013,6 +1006,25 @@ const memoryLanceDBProPlugin = {
         // Run initial backup after a short delay, then schedule daily
         setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+
+        // Register session-memory hook AFTER clearInternalHooks() has run.
+        // Workaround for https://github.com/openclaw/openclaw/pull/29515
+        // The hook is registered in service.start() which runs after loadInternalHooks().
+        if (config.sessionMemory?.enabled === true) {
+          // Access the global internal hooks registry directly
+          const g = globalThis as any;
+          const handlers = g.__openclaw_internal_hook_handlers__ as Map<string, any[]> | undefined;
+          if (handlers) {
+            if (!handlers.has("command:new")) {
+              handlers.set("command:new", []);
+            }
+            handlers.get("command:new")!.push(sessionMemoryHandler);
+            api.logger.info("session-memory-lancedb: hook registered for command:new (via globalThis workaround)");
+          } else {
+            api.logger.warn("session-memory-lancedb: global internal hooks registry not found, falling back to api.registerHook");
+            api.registerHook("command:new", sessionMemoryHandler, { name: "session-memory-lancedb" });
+          }
+        }
       },
       stop: async () => {
         // Flush pending access reinforcement data before shutdown
