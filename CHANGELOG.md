@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.32
+
+- Fix: strip OpenClaw `Conversation info` / `Sender` metadata noise before auto-capture matching and adaptive retrieval normalization, reducing false captures and noisy retrieval triggers.
+- Fix: parse `autoRecallMinRepeated` from plugin config so repeated-memory suppression works when configured.
+
+PR: #50
+
+---
+
+
 ## 1.0.31
 
 - Fix: `memory-pro import` now preserves provided IDs and is idempotent (skips if ID already exists).

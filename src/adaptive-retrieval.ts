@@ -46,15 +46,10 @@ const FORCE_RETRIEVE_PATTERNS = [
 function normalizeQuery(query: string): string {
   let s = query.trim();
 
-  // 1. Strip OpenClaw injected metadata header (Conversation info or Sender).
-  if (/^(Conversation info|Sender) \(untrusted metadata\):/i.test(s)) {
-    s = s.replace(/^(Conversation info|Sender) \(untrusted metadata\):\s*/i, "");
-    // If there is a blank-line separator (after JSON block), keep only the part after it.
-    const parts = s.split(/\n\s*\n/, 2);
-    if (parts.length === 2) {
-      s = parts[1].trim();
-    }
-  }
+  // 1. Strip OpenClaw injected metadata headers (Conversation info or Sender).
+  // Use a global regex to strip all metadata blocks including following blank lines.
+  const metadataPattern = /^(Conversation info|Sender) \(untrusted metadata\):[\s\S]*?\n\s*\n/gim;
+  s = s.replace(metadataPattern, "");
 
   // 2. Strip OpenClaw cron wrapper prefix.
   s = s.trim().replace(/^\[cron:[^\]]+\]\s*/i, "");
