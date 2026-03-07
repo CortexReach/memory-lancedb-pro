@@ -35,7 +35,7 @@
     ]
   },
   "scripts": {
-    "test": "node test/embedder-error-hints.test.mjs && node test/cli-smoke.mjs"
+    "test": "node test/embedder-error-hints.test.mjs && node test/migrate-legacy-schema.test.mjs && node test/cli-smoke.mjs"
   },
   "devDependencies": {
     "commander": "^14.0.0",
