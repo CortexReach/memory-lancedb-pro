@@ -1571,10 +1571,12 @@ const memoryLanceDBProPlugin = {
     // Default is OFF to prevent the model from accidentally echoing injected context.
     if (config.autoRecall === true) {
       api.on("before_agent_start", async (event, ctx) => {
-        if (
-          !event.prompt ||
-          shouldSkipRetrieval(event.prompt, config.autoRecallMinLength)
-        ) {
+        if (!event.prompt) {
+          retriever.recordSkippedRequest("auto-recall", "empty_prompt");
+          return;
+        }
+        if (shouldSkipRetrieval(event.prompt, config.autoRecallMinLength)) {
+          retriever.recordSkippedRequest("auto-recall", "adaptive_skip");
           return;
         }
 
@@ -1588,12 +1590,18 @@ const memoryLanceDBProPlugin = {
           const agentId = ctx?.agentId || "main";
           const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
 
-          const results = await retriever.retrieve({
+          const execution = await retriever.retrieveWithTrace({
             query: event.prompt,
             limit: 3,
             scopeFilter: accessibleScopes,
             source: "auto-recall",
           });
+          const { results, trace } = execution;
+
+          api.logger.debug?.(
+            `memory-lancedb-pro: auto-recall trace mode=${trace.mode} results=${trace.resultCount} elapsed=${trace.totalElapsedMs}ms ` +
+            `stages=${trace.stages.map((stage) => `${stage.name}:${stage.outputCount}`).join(",")}`,
+          );
 
           if (results.length === 0) {
             return;
@@ -1626,6 +1634,10 @@ const memoryLanceDBProPlugin = {
                   `memory-lancedb-pro: all ${results.length} memories were filtered out due to redundancy policy`,
                 );
               }
+              retriever.recordSkippedRequest(
+                "auto-recall",
+                "redundancy_filter",
+              );
               return;
             }
 

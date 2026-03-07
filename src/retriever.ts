@@ -77,8 +77,8 @@ export interface RetrievalContext {
   limit: number;
   scopeFilter?: string[];
   category?: string;
-  /** Retrieval source: "manual" for user-triggered, "auto-recall" for system-initiated. */
-  source?: "manual" | "auto-recall";
+  /** Retrieval source: "manual" for user-triggered, "auto-recall" for system-initiated, "cli" for CLI commands. */
+  source?: "manual" | "auto-recall" | "cli";
 }
 
 export interface RetrievalResult extends MemorySearchResult {
@@ -88,6 +88,51 @@ export interface RetrievalResult extends MemorySearchResult {
     fused?: { score: number };
     reranked?: { score: number };
   };
+}
+
+export interface RetrievalTraceStage {
+  name: string;
+  inputCount: number;
+  outputCount: number;
+  elapsedMs: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface RetrievalTrace {
+  query: string;
+  limit: number;
+  source: RetrievalContext["source"] | "unknown";
+  mode: RetrievalConfig["mode"] | "hybrid-fallback-vector";
+  scopeFilter?: string[];
+  category?: string;
+  totalElapsedMs: number;
+  stages: RetrievalTraceStage[];
+  resultCount: number;
+}
+
+export interface RetrievalExecution {
+  results: RetrievalResult[];
+  trace: RetrievalTrace;
+}
+
+export interface RetrievalTelemetrySnapshot {
+  totalRequests: number;
+  skippedRequests: number;
+  /** Executed requests broken down by source (manual, auto-recall, cli, unknown) */
+  executedBySource: Record<string, number>;
+  /** Skipped requests broken down by source */
+  skippedBySource: Record<string, number>;
+  zeroResultRequests: number;
+  totalResults: number;
+  averageResults: number;
+  averageLatencyMs: number;
+  sourceBreakdown: {
+    vectorOnly: number;
+    bm25Only: number;
+    hybrid: number;
+    reranked: number;
+  };
+  skipReasons: Record<string, number>;
 }
 
 // ============================================================================
@@ -281,6 +326,22 @@ function cosineSimilarity(a: number[], b: number[]): number {
 
 export class MemoryRetriever {
   private accessTracker: AccessTracker | null = null;
+  private telemetry = {
+    totalRequests: 0,
+    skippedRequests: 0,
+    totalLatencyMs: 0,
+    zeroResultRequests: 0,
+    totalResults: 0,
+    executedBySource: new Map<string, number>(),
+    skippedBySource: new Map<string, number>(),
+    sourceBreakdown: {
+      vectorOnly: 0,
+      bm25Only: 0,
+      hybrid: 0,
+      reranked: 0,
+    },
+    skipReasons: new Map<string, number>(),
+  };
 
   constructor(
     private store: MemoryStore,
@@ -293,8 +354,32 @@ export class MemoryRetriever {
   }
 
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
+    const execution = await this.retrieveWithTrace(context);
+    return execution.results;
+  }
+
+  async retrieveWithTrace(
+    context: RetrievalContext,
+  ): Promise<RetrievalExecution> {
     const { query, limit, scopeFilter, category, source } = context;
     const safeLimit = clampInt(limit, 1, 20);
+    const startedAt = Date.now();
+    const trace: RetrievalTrace = {
+      query,
+      limit: safeLimit,
+      source: source || "unknown",
+      mode:
+        this.config.mode === "vector" || !this.store.hasFtsSupport
+          ? this.config.mode === "vector"
+            ? "vector"
+            : "hybrid-fallback-vector"
+          : "hybrid",
+      scopeFilter,
+      category,
+      totalElapsedMs: 0,
+      stages: [],
+      resultCount: 0,
+    };
 
     let results: RetrievalResult[];
     if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
@@ -303,6 +388,7 @@ export class MemoryRetriever {
         safeLimit,
         scopeFilter,
         category,
+        trace,
       );
     } else {
       results = await this.hybridRetrieval(
@@ -310,6 +396,7 @@ export class MemoryRetriever {
         safeLimit,
         scopeFilter,
         category,
+        trace,
       );
     }
 
@@ -318,7 +405,10 @@ export class MemoryRetriever {
       this.accessTracker.recordAccess(results.map((r) => r.entry.id));
     }
 
-    return results;
+    trace.totalElapsedMs = Date.now() - startedAt;
+    trace.resultCount = results.length;
+    this.recordTelemetry(results, trace);
+    return { results, trace };
   }
 
   private async vectorOnlyRetrieval(
@@ -326,19 +416,35 @@ export class MemoryRetriever {
     limit: number,
     scopeFilter?: string[],
     category?: string,
+    trace?: RetrievalTrace,
   ): Promise<RetrievalResult[]> {
+    const embedStartedAt = Date.now();
     const queryVector = await this.embedder.embedQuery(query);
+    this.pushTrace(trace, "embed_query", 1, 1, Date.now() - embedStartedAt);
+
+    const vectorStartedAt = Date.now();
     const results = await this.store.vectorSearch(
       queryVector,
       limit,
       this.config.minScore,
       scopeFilter,
     );
+    this.pushTrace(
+      trace,
+      "vector_search",
+      0,
+      results.length,
+      Date.now() - vectorStartedAt,
+    );
 
     // Filter by category if specified
+    const categoryInput = results.length;
     const filtered = category
       ? results.filter((r) => r.entry.category === category)
       : results;
+    this.pushTrace(trace, "category_filter", categoryInput, filtered.length, 0, {
+      applied: Boolean(category),
+    });
 
     const mapped = filtered.map(
       (result, index) =>
@@ -350,19 +456,27 @@ export class MemoryRetriever {
         }) as RetrievalResult,
     );
 
-    const boosted = this.applyRecencyBoost(mapped);
-    const weighted = this.applyImportanceWeight(boosted);
-    const lengthNormalized = this.applyLengthNormalization(weighted);
-    const timeDecayed = this.applyTimeDecay(lengthNormalized);
+    const boosted = this.applyRecencyBoost(mapped, trace);
+    const weighted = this.applyImportanceWeight(boosted, trace);
+    const lengthNormalized = this.applyLengthNormalization(weighted, trace);
+    const timeDecayed = this.applyTimeDecay(lengthNormalized, trace);
+    const hardInput = timeDecayed.length;
     const hardFiltered = timeDecayed.filter(
       (r) => r.score >= this.config.hardMinScore,
     );
+    this.pushTrace(trace, "hard_min_score", hardInput, hardFiltered.length, 0, {
+      threshold: this.config.hardMinScore,
+    });
+    const noiseInput = hardFiltered.length;
     const denoised = this.config.filterNoise
       ? filterNoise(hardFiltered, (r) => r.entry.text)
       : hardFiltered;
+    this.pushTrace(trace, "noise_filter", noiseInput, denoised.length, 0, {
+      enabled: this.config.filterNoise,
+    });
 
     // MMR deduplication: avoid top-k filled with near-identical memories
-    const deduplicated = this.applyMMRDiversity(denoised);
+    const deduplicated = this.applyMMRDiversity(denoised, 0.85, trace);
 
     return deduplicated.slice(0, limit);
   }
@@ -372,6 +486,7 @@ export class MemoryRetriever {
     limit: number,
     scopeFilter?: string[],
     category?: string,
+    trace?: RetrievalTrace,
   ): Promise<RetrievalResult[]> {
     const candidatePoolSize = Math.max(
       this.config.candidatePoolSize,
@@ -379,9 +494,12 @@ export class MemoryRetriever {
     );
 
     // Compute query embedding once, reuse for vector search + reranking
+    const embedStartedAt = Date.now();
     const queryVector = await this.embedder.embedQuery(query);
+    this.pushTrace(trace, "embed_query", 1, 1, Date.now() - embedStartedAt);
 
     // Run vector and BM25 searches in parallel
+    const searchStartedAt = Date.now();
     const [vectorResults, bm25Results] = await Promise.all([
       this.runVectorSearch(
         queryVector,
@@ -391,14 +509,34 @@ export class MemoryRetriever {
       ),
       this.runBM25Search(query, candidatePoolSize, scopeFilter, category),
     ]);
+    this.pushTrace(
+      trace,
+      "parallel_search",
+      0,
+      vectorResults.length + bm25Results.length,
+      Date.now() - searchStartedAt,
+      {
+        vectorCount: vectorResults.length,
+        bm25Count: bm25Results.length,
+        candidatePoolSize,
+      },
+    );
 
     // Fuse results using RRF (async: validates BM25-only entries exist in store)
-    const fusedResults = await this.fuseResults(vectorResults, bm25Results);
+    const fusedResults = await this.fuseResults(
+      vectorResults,
+      bm25Results,
+      trace,
+    );
 
     // Apply minimum score threshold
+    const minInput = fusedResults.length;
     const filtered = fusedResults.filter(
       (r) => r.score >= this.config.minScore,
     );
+    this.pushTrace(trace, "min_score", minInput, filtered.length, 0, {
+      threshold: this.config.minScore,
+    });
 
     // Rerank if enabled
     const reranked =
@@ -407,33 +545,53 @@ export class MemoryRetriever {
             query,
             queryVector,
             filtered.slice(0, limit * 2),
+            trace,
           )
         : filtered;
+    if (this.config.rerank === "none") {
+      this.pushTrace(trace, "rerank", filtered.length, filtered.length, 0, {
+        mode: "none",
+      });
+    }
 
     // Apply temporal re-ranking (recency boost)
-    const temporalReranked = this.applyRecencyBoost(reranked);
+    const temporalReranked = this.applyRecencyBoost(reranked, trace);
 
     // Apply importance weighting
-    const importanceWeighted = this.applyImportanceWeight(temporalReranked);
+    const importanceWeighted = this.applyImportanceWeight(
+      temporalReranked,
+      trace,
+    );
 
     // Apply length normalization (penalize long entries dominating via keyword density)
-    const lengthNormalized = this.applyLengthNormalization(importanceWeighted);
+    const lengthNormalized = this.applyLengthNormalization(
+      importanceWeighted,
+      trace,
+    );
 
     // Apply time decay (penalize stale entries)
-    const timeDecayed = this.applyTimeDecay(lengthNormalized);
+    const timeDecayed = this.applyTimeDecay(lengthNormalized, trace);
 
     // Hard minimum score cutoff (post all scoring stages)
+    const hardInput = timeDecayed.length;
     const hardFiltered = timeDecayed.filter(
       (r) => r.score >= this.config.hardMinScore,
     );
+    this.pushTrace(trace, "hard_min_score", hardInput, hardFiltered.length, 0, {
+      threshold: this.config.hardMinScore,
+    });
 
     // Filter noise
+    const noiseInput = hardFiltered.length;
     const denoised = this.config.filterNoise
       ? filterNoise(hardFiltered, (r) => r.entry.text)
       : hardFiltered;
+    this.pushTrace(trace, "noise_filter", noiseInput, denoised.length, 0, {
+      enabled: this.config.filterNoise,
+    });
 
     // MMR deduplication: avoid top-k filled with near-identical memories
-    const deduplicated = this.applyMMRDiversity(denoised);
+    const deduplicated = this.applyMMRDiversity(denoised, 0.85, trace);
 
     return deduplicated.slice(0, limit);
   }
@@ -484,7 +642,9 @@ export class MemoryRetriever {
   private async fuseResults(
     vectorResults: Array<MemorySearchResult & { rank: number }>,
     bm25Results: Array<MemorySearchResult & { rank: number }>,
+    trace?: RetrievalTrace,
   ): Promise<RetrievalResult[]> {
+    const startedAt = Date.now();
     // Create maps for quick lookup
     const vectorMap = new Map<string, MemorySearchResult & { rank: number }>();
     const bm25Map = new Map<string, MemorySearchResult & { rank: number }>();
@@ -551,7 +711,12 @@ export class MemoryRetriever {
     }
 
     // Sort by fused score descending
-    return fusedResults.sort((a, b) => b.score - a.score);
+    const sorted = fusedResults.sort((a, b) => b.score - a.score);
+    this.pushTrace(trace, "fuse", allIds.size, sorted.length, Date.now() - startedAt, {
+      vectorCount: vectorResults.length,
+      bm25Count: bm25Results.length,
+    });
+    return sorted;
   }
 
   /**
@@ -562,10 +727,14 @@ export class MemoryRetriever {
     query: string,
     queryVector: number[],
     results: RetrievalResult[],
+    trace?: RetrievalTrace,
   ): Promise<RetrievalResult[]> {
     if (results.length === 0) {
+      this.pushTrace(trace, "rerank", 0, 0, 0, { mode: this.config.rerank });
       return results;
     }
+
+    const startedAt = Date.now();
 
     // Try cross-encoder rerank via configured provider API
     if (this.config.rerank === "cross-encoder" && this.config.rerankApiKey) {
@@ -637,9 +806,15 @@ export class MemoryRetriever {
               .filter((_, idx) => !returnedIndices.has(idx))
               .map((r) => ({ ...r, score: r.score * 0.8 }));
 
-            return [...reranked, ...unreturned].sort(
+            const sorted = [...reranked, ...unreturned].sort(
               (a, b) => b.score - a.score,
             );
+            this.pushTrace(trace, "rerank", results.length, sorted.length, Date.now() - startedAt, {
+              mode: "cross-encoder",
+              provider,
+              returnedCount: parsed.length,
+            });
+            return sorted;
           }
         } else {
           const errText = await response.text().catch(() => "");
@@ -672,9 +847,16 @@ export class MemoryRetriever {
         };
       });
 
-      return reranked.sort((a, b) => b.score - a.score);
+      const sorted = reranked.sort((a, b) => b.score - a.score);
+      this.pushTrace(trace, "rerank", results.length, sorted.length, Date.now() - startedAt, {
+        mode: this.config.rerank === "lightweight" ? "lightweight" : "cosine-fallback",
+      });
+      return sorted;
     } catch (error) {
       console.warn("Reranking failed, returning original results:", error);
+      this.pushTrace(trace, "rerank", results.length, results.length, Date.now() - startedAt, {
+        mode: "failed",
+      });
       return results;
     }
   }
@@ -685,12 +867,19 @@ export class MemoryRetriever {
    * when semantic similarity is close.
    * Formula: boost = exp(-ageDays / halfLife) * weight
    */
-  private applyRecencyBoost(results: RetrievalResult[]): RetrievalResult[] {
+  private applyRecencyBoost(
+    results: RetrievalResult[],
+    trace?: RetrievalTrace,
+  ): RetrievalResult[] {
     const { recencyHalfLifeDays, recencyWeight } = this.config;
     if (!recencyHalfLifeDays || recencyHalfLifeDays <= 0 || !recencyWeight) {
+      this.pushTrace(trace, "recency_boost", results.length, results.length, 0, {
+        enabled: false,
+      });
       return results;
     }
 
+    const startedAt = Date.now();
     const now = Date.now();
     const boosted = results.map((r) => {
       const ts =
@@ -703,7 +892,12 @@ export class MemoryRetriever {
       };
     });
 
-    return boosted.sort((a, b) => b.score - a.score);
+    const sorted = boosted.sort((a, b) => b.score - a.score);
+    this.pushTrace(trace, "recency_boost", results.length, sorted.length, Date.now() - startedAt, {
+      halfLifeDays: recencyHalfLifeDays,
+      weight: recencyWeight,
+    });
+    return sorted;
   }
 
   /**
@@ -713,8 +907,12 @@ export class MemoryRetriever {
    * Formula: score *= (baseWeight + (1 - baseWeight) * importance)
    * With baseWeight=0.7: importance=1.0 → ×1.0, importance=0.5 → ×0.85, importance=0.0 → ×0.7
    */
-  private applyImportanceWeight(results: RetrievalResult[]): RetrievalResult[] {
+  private applyImportanceWeight(
+    results: RetrievalResult[],
+    trace?: RetrievalTrace,
+  ): RetrievalResult[] {
     const baseWeight = 0.7;
+    const startedAt = Date.now();
     const weighted = results.map((r) => {
       const importance = r.entry.importance ?? 0.7;
       const factor = baseWeight + (1 - baseWeight) * importance;
@@ -723,7 +921,11 @@ export class MemoryRetriever {
         score: clamp01(r.score * factor, r.score * baseWeight),
       };
     });
-    return weighted.sort((a, b) => b.score - a.score);
+    const sorted = weighted.sort((a, b) => b.score - a.score);
+    this.pushTrace(trace, "importance_weight", results.length, sorted.length, Date.now() - startedAt, {
+      baseWeight,
+    });
+    return sorted;
   }
 
   /**
@@ -735,10 +937,17 @@ export class MemoryRetriever {
    */
   private applyLengthNormalization(
     results: RetrievalResult[],
+    trace?: RetrievalTrace,
   ): RetrievalResult[] {
     const anchor = this.config.lengthNormAnchor;
-    if (!anchor || anchor <= 0) return results;
+    if (!anchor || anchor <= 0) {
+      this.pushTrace(trace, "length_norm", results.length, results.length, 0, {
+        enabled: false,
+      });
+      return results;
+    }
 
+    const startedAt = Date.now();
     const normalized = results.map((r) => {
       const charLen = r.entry.text.length;
       const ratio = charLen / anchor;
@@ -755,7 +964,11 @@ export class MemoryRetriever {
       };
     });
 
-    return normalized.sort((a, b) => b.score - a.score);
+    const sorted = normalized.sort((a, b) => b.score - a.score);
+    this.pushTrace(trace, "length_norm", results.length, sorted.length, Date.now() - startedAt, {
+      anchor,
+    });
+    return sorted;
   }
 
   /**
@@ -768,10 +981,19 @@ export class MemoryRetriever {
    * At 2*halfLife: ~0.59x
    * Floor at 0.5x (never penalize more than half)
    */
-  private applyTimeDecay(results: RetrievalResult[]): RetrievalResult[] {
+  private applyTimeDecay(
+    results: RetrievalResult[],
+    trace?: RetrievalTrace,
+  ): RetrievalResult[] {
     const halfLife = this.config.timeDecayHalfLifeDays;
-    if (!halfLife || halfLife <= 0) return results;
+    if (!halfLife || halfLife <= 0) {
+      this.pushTrace(trace, "time_decay", results.length, results.length, 0, {
+        enabled: false,
+      });
+      return results;
+    }
 
+    const startedAt = Date.now();
     const now = Date.now();
     const decayed = results.map((r) => {
       const ts =
@@ -798,7 +1020,11 @@ export class MemoryRetriever {
       };
     });
 
-    return decayed.sort((a, b) => b.score - a.score);
+    const sorted = decayed.sort((a, b) => b.score - a.score);
+    this.pushTrace(trace, "time_decay", results.length, sorted.length, Date.now() - startedAt, {
+      halfLifeDays: halfLife,
+    });
+    return sorted;
   }
 
   /**
@@ -816,9 +1042,17 @@ export class MemoryRetriever {
   private applyMMRDiversity(
     results: RetrievalResult[],
     similarityThreshold = 0.85,
+    trace?: RetrievalTrace,
   ): RetrievalResult[] {
-    if (results.length <= 1) return results;
+    if (results.length <= 1) {
+      this.pushTrace(trace, "mmr_diversity", results.length, results.length, 0, {
+        deferredCount: 0,
+        threshold: similarityThreshold,
+      });
+      return results;
+    }
 
+    const startedAt = Date.now();
     const selected: RetrievalResult[] = [];
     const deferred: RetrievalResult[] = [];
 
@@ -844,7 +1078,12 @@ export class MemoryRetriever {
       }
     }
     // Append deferred results at the end (available but deprioritized)
-    return [...selected, ...deferred];
+    const finalResults = [...selected, ...deferred];
+    this.pushTrace(trace, "mmr_diversity", results.length, finalResults.length, Date.now() - startedAt, {
+      deferredCount: deferred.length,
+      threshold: similarityThreshold,
+    });
+    return finalResults;
   }
 
   // Update configuration
@@ -855,6 +1094,37 @@ export class MemoryRetriever {
   // Get current configuration
   getConfig(): RetrievalConfig {
     return { ...this.config };
+  }
+
+  recordSkippedRequest(
+    source: RetrievalContext["source"] | "unknown",
+    reason: string,
+  ): void {
+    this.telemetry.skippedRequests += 1;
+    this.bumpCounter(this.telemetry.skippedBySource, source || "unknown");
+    this.bumpCounter(this.telemetry.skipReasons, reason || "unknown");
+  }
+
+  getTelemetry(): RetrievalTelemetrySnapshot {
+    const totalRequests = this.telemetry.totalRequests;
+    return {
+      totalRequests,
+      skippedRequests: this.telemetry.skippedRequests,
+      executedBySource: Object.fromEntries(this.telemetry.executedBySource),
+      skippedBySource: Object.fromEntries(this.telemetry.skippedBySource),
+      zeroResultRequests: this.telemetry.zeroResultRequests,
+      totalResults: this.telemetry.totalResults,
+      averageResults:
+        totalRequests > 0
+          ? Number((this.telemetry.totalResults / totalRequests).toFixed(2))
+          : 0,
+      averageLatencyMs:
+        totalRequests > 0
+          ? Number((this.telemetry.totalLatencyMs / totalRequests).toFixed(2))
+          : 0,
+      sourceBreakdown: { ...this.telemetry.sourceBreakdown },
+      skipReasons: Object.fromEntries(this.telemetry.skipReasons),
+    };
   }
 
   // Test retrieval system
@@ -882,6 +1152,49 @@ export class MemoryRetriever {
         hasFtsSupport: this.store.hasFtsSupport,
         error: error instanceof Error ? error.message : String(error),
       };
+    }
+  }
+
+  private pushTrace(
+    trace: RetrievalTrace | undefined,
+    name: string,
+    inputCount: number,
+    outputCount: number,
+    elapsedMs: number,
+    metadata?: Record<string, unknown>,
+  ): void {
+    if (!trace) return;
+    trace.stages.push({
+      name,
+      inputCount,
+      outputCount,
+      elapsedMs,
+      metadata,
+    });
+  }
+
+  private bumpCounter(counter: Map<string, number>, key: string): void {
+    counter.set(key, (counter.get(key) || 0) + 1);
+  }
+
+  private recordTelemetry(
+    results: RetrievalResult[],
+    trace: RetrievalTrace,
+  ): void {
+    this.telemetry.totalRequests += 1;
+    this.telemetry.totalLatencyMs += trace.totalElapsedMs;
+    this.telemetry.totalResults += results.length;
+    this.bumpCounter(this.telemetry.executedBySource, trace.source || "unknown");
+    if (results.length === 0) this.telemetry.zeroResultRequests += 1;
+
+    for (const result of results) {
+      const hasVector = Boolean(result.sources.vector);
+      const hasBm25 = Boolean(result.sources.bm25);
+      const hasRerank = Boolean(result.sources.reranked);
+      if (hasRerank) this.telemetry.sourceBreakdown.reranked += 1;
+      if (hasVector && hasBm25) this.telemetry.sourceBreakdown.hybrid += 1;
+      else if (hasVector) this.telemetry.sourceBreakdown.vectorOnly += 1;
+      else if (hasBm25) this.telemetry.sourceBreakdown.bm25Only += 1;
     }
   }
 }

@@ -441,6 +441,11 @@ export function registerMemoryRecallTool(
           }),
         ),
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
+        debug: Type.Optional(
+          Type.Boolean({
+            description: "Include retrieval trace details for debugging",
+          }),
+        ),
       }),
       async execute(_toolCallId, params) {
         const {
@@ -448,11 +453,13 @@ export function registerMemoryRecallTool(
           limit = 5,
           scope,
           category,
+          debug = false,
         } = params as {
           query: string;
           limit?: number;
           scope?: string;
           category?: string;
+          debug?: boolean;
         };
 
         try {
@@ -476,18 +483,25 @@ export function registerMemoryRecallTool(
             }
           }
 
-          const results = await context.retriever.retrieve({
+          const execution = await context.retriever.retrieveWithTrace({
             query,
             limit: safeLimit,
             scopeFilter,
             category,
             source: "manual",
           });
+          const { results, trace } = execution;
 
           if (results.length === 0) {
             return {
               content: [{ type: "text", text: "No relevant memories found." }],
-              details: { count: 0, query, scopes: scopeFilter },
+              details: {
+                count: 0,
+                query,
+                scopes: scopeFilter,
+                retrievalMode: context.retriever.getConfig().mode,
+                trace: debug ? trace : undefined,
+              },
             };
           }
 
@@ -503,11 +517,22 @@ export function registerMemoryRecallTool(
             })
             .join("\n");
 
+          const traceSummary = trace.stages
+            .map((stage) => {
+              const meta = stage.metadata
+                ? ` ${JSON.stringify(stage.metadata)}`
+                : "";
+              return `- ${stage.name}: ${stage.inputCount} -> ${stage.outputCount} in ${stage.elapsedMs}ms${meta}`;
+            })
+            .join("\n");
+
           return {
             content: [
               {
                 type: "text",
-                text: `Found ${results.length} memories:\n\n${text}`,
+                text: debug
+                  ? `Found ${results.length} memories:\n\n${text}\n\nTrace:\n${traceSummary}`
+                  : `Found ${results.length} memories:\n\n${text}`,
               },
             ],
             details: {
@@ -516,6 +541,7 @@ export function registerMemoryRecallTool(
               query,
               scopes: scopeFilter,
               retrievalMode: context.retriever.getConfig().mode,
+              trace: debug ? trace : undefined,
             },
           };
         } catch (error) {
