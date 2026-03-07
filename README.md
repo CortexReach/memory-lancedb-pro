@@ -505,6 +505,45 @@ openclaw config get plugins.slots.memory
 
 </details>
 
+### Deduplication
+
+Memory store automatically detects and skips near-duplicate entries to prevent redundant storage.
+
+```json
+{
+  "storage": {
+    "dedup": {
+      "enabled": true,
+      "threshold": 0.92,
+      "scopeMode": "scope"
+    }
+  }
+}
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | boolean | `true` | Enable duplicate detection |
+| `threshold` | number | `0.92` | Similarity threshold (0-1). Higher = stricter |
+| `scopeMode` | string | `'scope'` | `'scope'` = dedup within scope, `'global'` = across all scopes |
+
+#### Force Storage
+
+To bypass dedup and force storage:
+
+```
+memory_store({
+  text: "Critical info that must be stored",
+  force: true
+})
+```
+
+#### Behavior
+
+- **Threshold 0.92**: Only skips highly similar content (>92% match)
+- **Scope mode**: Different scopes can have intentional duplicates
+- **Fail-open**: If dedup check fails, stores anyway (no data loss)
+
 ### Parameter Mapping Notes (avoid common misconfig)
 
 `memory-lancedb-pro` does **not** support `recallTopK` / `recallThreshold`.
