@@ -34,9 +34,65 @@ export interface MemorySearchResult {
   score: number;
 }
 
+// ============================================================================
+// Deduplication Types
+// ============================================================================
+
+export interface DedupConfig {
+  /** Enable duplicate detection (default: true) */
+  enabled?: boolean;
+  /** Similarity threshold 0-1 (default: 0.92) */
+  threshold?: number;
+  /** Dedup scope: 'scope' = current scope only, 'global' = all scopes (default: 'scope') */
+  scopeMode?: 'scope' | 'global';
+}
+
+export const DEFAULT_DEDUP_CONFIG: Required<DedupConfig> = {
+  enabled: true,
+  threshold: 0.92,
+  scopeMode: 'scope',
+};
+
 export interface StoreConfig {
   dbPath: string;
   vectorDim: number;
+  dedup?: DedupConfig;
+}
+
+export interface StoreParams {
+  text: string;
+  vector?: number[];
+  category?: MemoryEntry["category"];
+  scope?: string;
+  importance?: number;
+  metadata?: Record<string, unknown>;
+  force?: boolean; // Force store even if duplicate detected
+}
+
+export interface StoreResult {
+  id: string;
+  status: 'stored' | 'skipped';
+  reason?: 'duplicate';
+  similarity?: number;
+  similarTo?: {
+    id: string;
+    text: string;
+    timestamp: number;
+    scope: string;
+  };
+}
+
+export interface StoreResult {
+  id: string;
+  status: 'stored' | 'skipped';
+  reason?: 'duplicate';
+  similarity?: number;
+  similarTo?: {
+    id: string;
+    text: string;
+    timestamp: number;
+    scope: string;
+  };
 }
 
 // ============================================================================
@@ -160,6 +216,53 @@ export class MemoryStore {
 
   get dbPath(): string {
     return this.config.dbPath;
+  }
+
+  private getDedupConfig(): Required<DedupConfig> {
+    return {
+      enabled: this.config.dedup?.enabled ?? DEFAULT_DEDUP_CONFIG.enabled,
+      threshold: this.config.dedup?.threshold ?? DEFAULT_DEDUP_CONFIG.threshold,
+      scopeMode: this.config.dedup?.scopeMode ?? DEFAULT_DEDUP_CONFIG.scopeMode,
+    };
+  }
+
+  /**
+   * Check for duplicate memories before storage.
+   * Uses existing vector to avoid redundant embedding API calls.
+   * Fail-open: errors here should not block storage.
+   */
+  private async checkDuplicate(
+    vector: number[],
+    config: Required<DedupConfig>,
+    currentScope?: string,
+  ): Promise<{ entry: MemoryEntry; similarity: number } | null> {
+    try {
+      // Build scope filter based on scopeMode
+      const scopeFilter = config.scopeMode === 'scope' && currentScope
+        ? [currentScope]
+        : undefined;
+
+      // Vector search for top-1 most similar (low minScore to catch near-duplicates)
+      const results = await this.vectorSearch(vector, 1, 0.1, scopeFilter);
+
+      // Check threshold
+      if (results.length > 0 && results[0].score >= config.threshold) {
+        return {
+          entry: results[0].entry,
+          similarity: results[0].score,
+        };
+      }
+
+      return null;
+
+    } catch (err) {
+      // Fail-open: dedup failure should not block storage
+      console.warn({
+        event: 'dedup_check_failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
   }
 
   private async ensureInitialized(): Promise<void> {
@@ -291,16 +394,67 @@ export class MemoryStore {
     }
   }
 
-  async store(
-    entry: Omit<MemoryEntry, "id" | "timestamp">,
-  ): Promise<MemoryEntry> {
+  /**
+   * Store a memory entry with automatic duplicate detection.
+   * Returns StoreResult with status 'stored' or 'skipped'.
+   */
+  async store(params: StoreParams & { vector?: number[] }): Promise<StoreResult> {
     await this.ensureInitialized();
 
+    const dedupConfig = this.getDedupConfig();
+    const scope = params.scope || "global";
+
+    // Dedup detection (can be disabled, can be forced to skip)
+    if (dedupConfig.enabled && !params.force) {
+      // For dedup, we need the vector - generate it if not provided
+      // Note: This requires an embedder to be available
+      // For now, we skip dedup if no vector provided (backward compat)
+      if (params.vector) {
+        const dup = await this.checkDuplicate(
+          params.vector,
+          dedupConfig,
+          scope,
+        );
+
+        if (dup) {
+          // Log the skip
+          console.info({
+            event: 'memory_dedup_skip',
+            similarity: dup.similarity,
+            threshold: dedupConfig.threshold,
+            scopeMode: dedupConfig.scopeMode,
+            newText: params.text.slice(0, 50),
+            existingId: dup.entry.id,
+            existingScope: dup.entry.scope,
+          });
+
+          // Return skipped result
+          return {
+            id: randomUUID(),
+            status: 'skipped',
+            reason: 'duplicate',
+            similarity: dup.similarity,
+            similarTo: {
+              id: dup.entry.id,
+              text: dup.entry.text.slice(0, 100) + (dup.entry.text.length > 100 ? '...' : ''),
+              timestamp: dup.entry.timestamp,
+              scope: dup.entry.scope,
+            },
+          };
+        }
+      }
+    }
+
+    // Normal storage path
     const fullEntry: MemoryEntry = {
-      ...entry,
       id: randomUUID(),
+      text: params.text,
+      vector: params.vector || [],
+      category: params.category || "other",
+      scope,
+      importance: params.importance ?? 0.7,
       timestamp: Date.now(),
-      metadata: entry.metadata || "{}",
+      metadata: params.metadata ? JSON.stringify(params.metadata) : "{}",
     };
 
     try {
@@ -312,7 +466,11 @@ export class MemoryStore {
         `Failed to store memory in "${this.config.dbPath}": ${code} ${message}`,
       );
     }
-    return fullEntry;
+
+    return {
+      id: fullEntry.id,
+      status: 'stored',
+    };
   }
 
   /**
