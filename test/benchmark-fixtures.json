@@ -1,0 +1,87 @@
+[
+  {
+    "id": "pref_editor",
+    "category": "preference",
+    "level": "baseline",
+    "datasetAssumption": "small_corpus",
+    "expectedBehavior": "Should return at least 1 memory mentioning editor preference. In small corpus, Neovim memory may not be top1 but should appear.",
+    "query": "用户喜欢什么编辑器",
+    "expect": {
+      "minResults": 1,
+      "top1MinScore": 0.5
+    }
+  },
+  {
+    "id": "keyword_jina",
+    "category": "exact_keyword",
+    "level": "baseline",
+    "datasetAssumption": "small_corpus",
+    "expectedBehavior": "JINA_API_KEY should appear in results if stored. In small corpus, exact keyword match via BM25 may not be available.",
+    "query": "JINA_API_KEY",
+    "expect": {
+      "minResults": 1,
+      "top1MinScore": 0.5
+    }
+  },
+  {
+    "id": "keyword_tmux",
+    "category": "exact_keyword",
+    "level": "baseline",
+    "datasetAssumption": "small_corpus",
+    "expectedBehavior": "tmux-related memory should surface. BM25 would help with exact CJK keyword matching.",
+    "query": "tmux 终端会话",
+    "expect": {
+      "minResults": 1,
+      "top1MinScore": 0.5
+    }
+  },
+  {
+    "id": "stale_old_decision",
+    "category": "stale_memory",
+    "level": "smoke",
+    "datasetAssumption": "small_corpus",
+    "expectedBehavior": "Observational: time_decay should visibly reduce scores for old entries. No strict assertion.",
+    "query": "去年的技术决策",
+    "expect": {
+      "note": "time_decay observable; no strict pass/fail"
+    }
+  },
+  {
+    "id": "dup_chinese_docs",
+    "category": "duplicate",
+    "level": "baseline",
+    "datasetAssumption": "small_corpus",
+    "expectedBehavior": "If two similar entries exist, both should appear in top results. MMR diversity should be observable in trace.",
+    "query": "项目文档用什么语言",
+    "expect": {
+      "minResults": 1,
+      "top1MinScore": 0.5
+    }
+  },
+  {
+    "id": "neg_random",
+    "category": "negative",
+    "level": "baseline",
+    "strict": false,
+    "datasetAssumption": "small_corpus",
+    "expectedBehavior": "Random gibberish should score low. In small corpus, results may still appear due to limited vector space. Check top1MaxScore.",
+    "query": "xyzqv-987654 完全无关的随机字符串",
+    "expect": {
+      "top1MaxScore": 0.75,
+      "note": "In small corpus, may still return results; score ceiling is the real assertion"
+    }
+  },
+  {
+    "id": "neg_unrelated",
+    "category": "negative",
+    "level": "baseline",
+    "strict": false,
+    "datasetAssumption": "small_corpus",
+    "expectedBehavior": "Semantically unrelated domain query. Score should be low even if results are returned.",
+    "query": "量子计算中的拓扑错误校正码",
+    "expect": {
+      "top1MaxScore": 0.75,
+      "note": "Unrelated domain; score cap is the assertion, not zero results"
+    }
+  }
+]

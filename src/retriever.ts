@@ -88,6 +88,24 @@ export interface RetrievalResult extends MemorySearchResult {
     fused?: { score: number };
     reranked?: { score: number };
   };
+  /** Per-result score evolution across pipeline stages (populated when trace is enabled) */
+  scoreHistory?: ScoreStep[];
+}
+
+/** Records a single score mutation for one result at one pipeline stage */
+export interface ScoreStep {
+  /** Pipeline stage name (e.g. "vector_search", "recency_boost") */
+  stage: string;
+  /** Stage category */
+  stageType: "seed" | "transform" | "rerank" | "filter";
+  /** Score before this stage */
+  scoreBefore: number;
+  /** Score after this stage */
+  score: number;
+  /** Delta from previous stage (positive = boosted, negative = penalized) */
+  delta: number;
+  /** Optional reason for the score change */
+  reason?: string;
 }
 
 export interface RetrievalTraceStage {
@@ -453,17 +471,29 @@ export class MemoryRetriever {
           sources: {
             vector: { score: result.score, rank: index + 1 },
           },
+          scoreHistory: trace
+            ? [{ stage: "vector_search", stageType: "seed" as const, scoreBefore: 0, score: result.score, delta: 0 }]
+            : undefined,
         }) as RetrievalResult,
     );
 
-    const boosted = this.applyRecencyBoost(mapped, trace);
-    const weighted = this.applyImportanceWeight(boosted, trace);
-    const lengthNormalized = this.applyLengthNormalization(weighted, trace);
-    const timeDecayed = this.applyTimeDecay(lengthNormalized, trace);
+    const trackScores = Boolean(trace);
+    const boosted = this.applyRecencyBoost(mapped, trace, trackScores);
+    const weighted = this.applyImportanceWeight(boosted, trace, trackScores);
+    const lengthNormalized = this.applyLengthNormalization(weighted, trace, trackScores);
+    const timeDecayed = this.applyTimeDecay(lengthNormalized, trace, trackScores);
     const hardInput = timeDecayed.length;
     const hardFiltered = timeDecayed.filter(
       (r) => r.score >= this.config.hardMinScore,
     );
+    // Mark eliminated results in scoreHistory
+    if (trackScores) {
+      for (const r of timeDecayed) {
+        if (r.score < this.config.hardMinScore && r.scoreHistory) {
+          r.scoreHistory.push({ stage: "hard_min_score:eliminated", stageType: "filter" as const, scoreBefore: r.score, score: r.score, delta: 0, reason: `below threshold ${this.config.hardMinScore}` });
+        }
+      }
+    }
     this.pushTrace(trace, "hard_min_score", hardInput, hardFiltered.length, 0, {
       threshold: this.config.hardMinScore,
     });
@@ -554,23 +584,27 @@ export class MemoryRetriever {
       });
     }
 
+    const trackScores = Boolean(trace);
+
     // Apply temporal re-ranking (recency boost)
-    const temporalReranked = this.applyRecencyBoost(reranked, trace);
+    const temporalReranked = this.applyRecencyBoost(reranked, trace, trackScores);
 
     // Apply importance weighting
     const importanceWeighted = this.applyImportanceWeight(
       temporalReranked,
       trace,
+      trackScores,
     );
 
     // Apply length normalization (penalize long entries dominating via keyword density)
     const lengthNormalized = this.applyLengthNormalization(
       importanceWeighted,
       trace,
+      trackScores,
     );
 
     // Apply time decay (penalize stale entries)
-    const timeDecayed = this.applyTimeDecay(lengthNormalized, trace);
+    const timeDecayed = this.applyTimeDecay(lengthNormalized, trace, trackScores);
 
     // Hard minimum score cutoff (post all scoring stages)
     const hardInput = timeDecayed.length;
@@ -695,6 +729,7 @@ export class MemoryRetriever {
         ? clamp01(vectorScore + bm25Hit * 0.15 * vectorScore, 0.1)
         : clamp01(bm25Result!.score, 0.1);
 
+      const seedStage = vectorResult ? "fused" : "bm25_only";
       fusedResults.push({
         entry: baseResult.entry,
         score: fusedScore,
@@ -707,6 +742,9 @@ export class MemoryRetriever {
             : undefined,
           fused: { score: fusedScore },
         },
+        scoreHistory: trace
+          ? [{ stage: seedStage, stageType: "seed" as const, scoreBefore: 0, score: fusedScore, delta: 0, reason: vectorResult && bm25Result ? "vector+bm25" : vectorResult ? "vector" : "bm25" }]
+          : undefined,
       });
     }
 
@@ -791,7 +829,7 @@ export class MemoryRetriever {
                   item.score * 0.6 + original.score * 0.4,
                   original.score * 0.5,
                 );
-                return {
+                const rerankedResult = {
                   ...original,
                   score: blendedScore,
                   sources: {
@@ -799,6 +837,10 @@ export class MemoryRetriever {
                     reranked: { score: item.score },
                   },
                 };
+                if (rerankedResult.scoreHistory) {
+                  rerankedResult.scoreHistory = [...rerankedResult.scoreHistory, { stage: "rerank", stageType: "rerank" as const, scoreBefore: original.score, score: blendedScore, delta: blendedScore - original.score, reason: `cross-encoder: raw=${item.score.toFixed(4)}` }];
+                }
+                return rerankedResult;
               });
 
             // Keep unreturned candidates with their original scores (slightly penalized)
@@ -870,6 +912,7 @@ export class MemoryRetriever {
   private applyRecencyBoost(
     results: RetrievalResult[],
     trace?: RetrievalTrace,
+    trackScores = false,
   ): RetrievalResult[] {
     const { recencyHalfLifeDays, recencyWeight } = this.config;
     if (!recencyHalfLifeDays || recencyHalfLifeDays <= 0 || !recencyWeight) {
@@ -886,10 +929,13 @@ export class MemoryRetriever {
         r.entry.timestamp && r.entry.timestamp > 0 ? r.entry.timestamp : now;
       const ageDays = (now - ts) / 86_400_000;
       const boost = Math.exp(-ageDays / recencyHalfLifeDays) * recencyWeight;
-      return {
-        ...r,
-        score: clamp01(r.score + boost, r.score),
-      };
+      const prevScore = r.score;
+      const newScore = clamp01(r.score + boost, r.score);
+      const result = { ...r, score: newScore };
+      if (trackScores && result.scoreHistory) {
+        result.scoreHistory = [...result.scoreHistory, { stage: "recency_boost", stageType: "transform" as const, scoreBefore: prevScore, score: newScore, delta: newScore - prevScore }];
+      }
+      return result;
     });
 
     const sorted = boosted.sort((a, b) => b.score - a.score);
@@ -910,16 +956,20 @@ export class MemoryRetriever {
   private applyImportanceWeight(
     results: RetrievalResult[],
     trace?: RetrievalTrace,
+    trackScores = false,
   ): RetrievalResult[] {
     const baseWeight = 0.7;
     const startedAt = Date.now();
     const weighted = results.map((r) => {
       const importance = r.entry.importance ?? 0.7;
       const factor = baseWeight + (1 - baseWeight) * importance;
-      return {
-        ...r,
-        score: clamp01(r.score * factor, r.score * baseWeight),
-      };
+      const prevScore = r.score;
+      const newScore = clamp01(r.score * factor, r.score * baseWeight);
+      const result = { ...r, score: newScore };
+      if (trackScores && result.scoreHistory) {
+        result.scoreHistory = [...result.scoreHistory, { stage: "importance_weight", stageType: "transform" as const, scoreBefore: prevScore, score: newScore, delta: newScore - prevScore }];
+      }
+      return result;
     });
     const sorted = weighted.sort((a, b) => b.score - a.score);
     this.pushTrace(trace, "importance_weight", results.length, sorted.length, Date.now() - startedAt, {
@@ -938,6 +988,7 @@ export class MemoryRetriever {
   private applyLengthNormalization(
     results: RetrievalResult[],
     trace?: RetrievalTrace,
+    trackScores = false,
   ): RetrievalResult[] {
     const anchor = this.config.lengthNormAnchor;
     if (!anchor || anchor <= 0) {
@@ -951,17 +1002,15 @@ export class MemoryRetriever {
     const normalized = results.map((r) => {
       const charLen = r.entry.text.length;
       const ratio = charLen / anchor;
-      // No penalty for entries at or below anchor length.
-      // Gentle logarithmic decay for longer entries:
-      //   anchor (500) → 1.0, 800 → 0.75, 1000 → 0.67, 1500 → 0.56, 2000 → 0.50
-      // This prevents long, keyword-rich entries from dominating top-k
-      // while keeping their scores reasonable.
-      const logRatio = Math.log2(Math.max(ratio, 1)); // no boost for short entries
+      const logRatio = Math.log2(Math.max(ratio, 1));
       const factor = 1 / (1 + 0.5 * logRatio);
-      return {
-        ...r,
-        score: clamp01(r.score * factor, r.score * 0.3),
-      };
+      const prevScore = r.score;
+      const newScore = clamp01(r.score * factor, r.score * 0.3);
+      const result = { ...r, score: newScore };
+      if (trackScores && result.scoreHistory) {
+        result.scoreHistory = [...result.scoreHistory, { stage: "length_norm", stageType: "transform" as const, scoreBefore: prevScore, score: newScore, delta: newScore - prevScore }];
+      }
+      return result;
     });
 
     const sorted = normalized.sort((a, b) => b.score - a.score);
@@ -984,6 +1033,7 @@ export class MemoryRetriever {
   private applyTimeDecay(
     results: RetrievalResult[],
     trace?: RetrievalTrace,
+    trackScores = false,
   ): RetrievalResult[] {
     const halfLife = this.config.timeDecayHalfLifeDays;
     if (!halfLife || halfLife <= 0) {
@@ -1014,10 +1064,13 @@ export class MemoryRetriever {
 
       // floor at 0.5: even very old entries keep at least 50% of their score
       const factor = 0.5 + 0.5 * Math.exp(-ageDays / effectiveHL);
-      return {
-        ...r,
-        score: clamp01(r.score * factor, r.score * 0.5),
-      };
+      const prevScore = r.score;
+      const newScore = clamp01(r.score * factor, r.score * 0.5);
+      const result = { ...r, score: newScore };
+      if (trackScores && result.scoreHistory) {
+        result.scoreHistory = [...result.scoreHistory, { stage: "time_decay", stageType: "transform" as const, scoreBefore: prevScore, score: newScore, delta: newScore - prevScore }];
+      }
+      return result;
     });
 
     const sorted = decayed.sort((a, b) => b.score - a.score);
