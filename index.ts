@@ -1449,7 +1449,7 @@ const memoryLanceDBProPlugin = {
     const config = parsePluginConfig(api.pluginConfig);
 
     const dbPath = config.dbPath || getDefaultDbPath();
-    const isCloud = dbPath.includes("://");
+    const isCloud = /^[a-z][a-z0-9+.-]*:\/\//i.test(dbPath.trim());
 
     let resolvedDbPath: string;
     if (isCloud) {
@@ -2927,26 +2927,29 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     mdMirror:
       typeof cfg.mdMirror === "object" && cfg.mdMirror !== null
         ? {
-            enabled:
-              (cfg.mdMirror as Record<string, unknown>).enabled === true,
-            dir:
-              typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
-                ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
-                : undefined,
-          }
+          enabled:
+            (cfg.mdMirror as Record<string, unknown>).enabled === true,
+          dir:
+            typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
+              ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
+              : undefined,
+        }
         : undefined,
     storageOptions:
       typeof cfg.storageOptions === "object" && cfg.storageOptions !== null && !Array.isArray(cfg.storageOptions)
         ? (() => {
           const opts = cfg.storageOptions as Record<string, unknown>;
+          const resolved: Record<string, string> = {};
           for (const [key, value] of Object.entries(opts)) {
             if (typeof value !== "string") {
               throw new Error(
                   `storageOptions[${key}] is invalid: expected string, got ${typeof value}`
               );
             }
+            // Resolve environment variables in value
+            resolved[key] = resolveEnvVars(value);
           }
-          return opts as Record<string, string>;
+          return resolved;
         })()
         : undefined,
   };

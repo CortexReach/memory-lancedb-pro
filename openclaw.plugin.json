@@ -822,7 +822,8 @@
     "storageOptions": {
       "label": "Storage Options",
       "help": "Additional storage options for LanceDB connection configuration (e.g., cloud provider credentials)",
-      "advanced": true
+      "advanced": true,
+      "sensitive": true
     },
     "enableManagementTools": {
       "label": "Management Tools",

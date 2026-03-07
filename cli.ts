@@ -646,6 +646,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .option("--dry-run", "Show what would be re-embedded without writing")
     .option("--skip-existing", "Skip entries whose id already exists in the target DB")
     .option("--force", "Allow using the same source-db as the target dbPath (DANGEROUS)")
+    .option("--storage-options <json>", "Storage options for LanceDB connection (JSON string, e.g. '{\"aws_access_key_id\":\"...\"}')")
     .action(async (options) => {
       try {
         if (!context.embedder) {
@@ -661,6 +662,23 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         const dryRun = options.dryRun === true;
         const skipExisting = options.skipExisting === true;
         const force = options.force === true;
+
+        let storageOptions: Record<string, string> = {};
+        if (options.storageOptions) {
+          try {
+            const parsed = JSON.parse(options.storageOptions as string);
+            if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+              for (const [key, value] of Object.entries(parsed)) {
+                if (typeof value === "string") {
+                  storageOptions[key] = value;
+                }
+              }
+            }
+          } catch {
+            console.error("Invalid JSON in --storage-options");
+            process.exit(1);
+          }
+        }
 
         // Safety: prevent accidental in-place re-embedding
         let sourceReal = sourceDbPath;
@@ -678,7 +696,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         }
 
         const lancedb = await loadLanceDB();
-        const db = await lancedb.connect(sourceDbPath);
+        const db = await lancedb.connect(sourceDbPath, { storageOptions });
         const table = await db.openTable("memories");
 
         let query = table
