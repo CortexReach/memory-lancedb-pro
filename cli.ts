@@ -8,6 +8,7 @@ import { loadLanceDB, type MemoryEntry, type MemoryStore } from "./src/store.js"
 import type { MemoryRetriever } from "./src/retriever.js";
 import type { MemoryScopeManager } from "./src/scopes.js";
 import type { MemoryMigrator } from "./src/migrate.js";
+import { collectOpenClawMemories } from "./src/import-openclaw.js";
 
 // ============================================================================
 // Types
@@ -51,6 +52,120 @@ function formatMemory(memory: any, index?: number): string {
 
 function formatJson(obj: any): string {
   return JSON.stringify(obj, null, 2);
+}
+
+
+async function importMemoryObjects(
+  context: CLIContext,
+  memories: any[],
+  options: { scope?: string; dryRun?: boolean },
+): Promise<void> {
+  if (options.dryRun) {
+    console.log("DRY RUN - No memories will be imported");
+    console.log(`Would import ${memories.length} memories`);
+    if (options.scope) console.log(`Target scope: ${options.scope}`);
+    return;
+  }
+
+  console.log(`Importing ${memories.length} memories...`);
+
+  let imported = 0;
+  let skipped = 0;
+
+  if (!context.embedder) {
+    console.error("Import requires an embedder (not available in basic CLI mode).");
+    console.error("Use the plugin's memory_store tool or pass embedder to createMemoryCLI.");
+    return;
+  }
+
+  const targetScope = options.scope || context.scopeManager.getDefaultScope();
+
+  for (const memory of memories) {
+    try {
+      const text = memory.text;
+      if (!text || typeof text !== "string" || text.length < 2) {
+        skipped++;
+        continue;
+      }
+
+      const categoryRaw = memory.category;
+      const category: MemoryEntry["category"] =
+        categoryRaw === "preference" ||
+        categoryRaw === "fact" ||
+        categoryRaw === "decision" ||
+        categoryRaw === "entity" ||
+        categoryRaw === "other"
+          ? categoryRaw
+          : "other";
+
+      const importanceRaw = Number(memory.importance);
+      const importance = Number.isFinite(importanceRaw)
+        ? Math.max(0, Math.min(1, importanceRaw))
+        : 0.7;
+
+      const timestampRaw = Number(memory.timestamp);
+      const timestamp = Number.isFinite(timestampRaw) ? timestampRaw : Date.now();
+
+      const metadataRaw = memory.metadata;
+      const metadata =
+        typeof metadataRaw === "string"
+          ? metadataRaw
+          : metadataRaw != null
+            ? JSON.stringify(metadataRaw)
+            : "{}";
+
+      const idRaw = memory.id;
+      const id = typeof idRaw === "string" && idRaw.length > 0 ? idRaw : undefined;
+
+      if (id && (await context.store.hasId(id))) {
+        skipped++;
+        continue;
+      }
+
+      if (!id) {
+        const existing = await context.retriever.retrieve({
+          query: text,
+          limit: 1,
+          scopeFilter: [targetScope],
+        });
+        if (existing.length > 0 && existing[0].score > 0.95) {
+          skipped++;
+          continue;
+        }
+      }
+
+      const vector = await context.embedder.embedPassage(text);
+
+      if (id) {
+        await context.store.importEntry({
+          id,
+          text,
+          vector,
+          category,
+          scope: targetScope,
+          importance,
+          timestamp,
+          metadata,
+        });
+      } else {
+        await context.store.store({
+          text,
+          vector,
+          importance,
+          category,
+          scope: targetScope,
+          metadata,
+        });
+      }
+
+      imported++;
+    } catch (error) {
+      console.warn(`Failed to import memory: ${error}`);
+      skipped++;
+    }
+  }
+
+  console.log(`Import completed: ${imported} imported, ${skipped} skipped`);
 }
 
 // ============================================================================
@@ -349,118 +464,39 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           throw new Error("Invalid import file format");
         }
 
-        if (options.dryRun) {
-          console.log("DRY RUN - No memories will be imported");
-          console.log(`Would import ${data.memories.length} memories`);
-          if (options.scope) {
-            console.log(`Target scope: ${options.scope}`);
-          }
-          return;
-        }
-
-        console.log(`Importing ${data.memories.length} memories...`);
-
-        let imported = 0;
-        let skipped = 0;
-
-        if (!context.embedder) {
-          console.error("Import requires an embedder (not available in basic CLI mode).");
-          console.error("Use the plugin's memory_store tool or pass embedder to createMemoryCLI.");
-          return;
-        }
-
-        const targetScope = options.scope || context.scopeManager.getDefaultScope();
-
-        for (const memory of data.memories) {
-          try {
-            const text = memory.text;
-            if (!text || typeof text !== "string" || text.length < 2) {
-              skipped++;
-              continue;
-            }
-
-            const categoryRaw = memory.category;
-            const category: MemoryEntry["category"] =
-              categoryRaw === "preference" ||
-              categoryRaw === "fact" ||
-              categoryRaw === "decision" ||
-              categoryRaw === "entity" ||
-              categoryRaw === "other"
-                ? categoryRaw
-                : "other";
-
-            const importanceRaw = Number(memory.importance);
-            const importance = Number.isFinite(importanceRaw)
-              ? Math.max(0, Math.min(1, importanceRaw))
-              : 0.7;
-
-            const timestampRaw = Number(memory.timestamp);
-            const timestamp = Number.isFinite(timestampRaw) ? timestampRaw : Date.now();
-
-            const metadataRaw = memory.metadata;
-            const metadata =
-              typeof metadataRaw === "string"
-                ? metadataRaw
-                : metadataRaw != null
-                  ? JSON.stringify(metadataRaw)
-                  : "{}";
-
-            const idRaw = memory.id;
-            const id = typeof idRaw === "string" && idRaw.length > 0 ? idRaw : undefined;
-
-            // Idempotency: if the import file includes an id and we already have it, skip.
-            if (id && (await context.store.hasId(id))) {
-              skipped++;
-              continue;
-            }
-
-            // Back-compat dedupe: if no id provided, do a best-effort similarity check.
-            if (!id) {
-              const existing = await context.retriever.retrieve({
-                query: text,
-                limit: 1,
-                scopeFilter: [targetScope],
-              });
-              if (existing.length > 0 && existing[0].score > 0.95) {
-                skipped++;
-                continue;
-              }
-            }
-
-            const vector = await context.embedder.embedPassage(text);
-
-            if (id) {
-              await context.store.importEntry({
-                id,
-                text,
-                vector,
-                category,
-                scope: targetScope,
-                importance,
-                timestamp,
-                metadata,
-              });
-            } else {
-              await context.store.store({
-                text,
-                vector,
-                importance,
-                category,
-                scope: targetScope,
-                metadata,
-              });
-            }
-
-            imported++;
-          } catch (error) {
-            console.warn(`Failed to import memory: ${error}`);
-            skipped++;
-          }
-        }
-
-        console.log(`Import completed: ${imported} imported, ${skipped} skipped`);
+        await importMemoryObjects(context, data.memories, options);
       } catch (error) {
         console.error("Import failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // Import OpenClaw file-based memory
+  memory
+    .command("import-openclaw <workspace>")
+    .description("Import MEMORY.md and memory/*.md from an OpenClaw workspace")
+    .option("--scope <scope>", "Import into specific scope")
+    .option("--since <date>", "Only import daily files on/after YYYY-MM-DD")
+    .option("--dry-run", "Show what would be imported without actually importing")
+    .action(async (workspace, options) => {
+      try {
+        const memories = collectOpenClawMemories(workspace, { since: options.since });
+        if (options.dryRun) {
+          const byCategory = memories.reduce((acc: Record<string, number>, m) => {
+            acc[m.category] = (acc[m.category] || 0) + 1;
+            return acc;
+          }, {});
+          console.log("DRY RUN - No memories will be imported");
+          console.log(`Would import ${memories.length} memories from OpenClaw workspace`);
+          if (options.scope) console.log(`Target scope: ${options.scope}`);
+          if (options.since) console.log(`Since: ${options.since}`);
+          Object.entries(byCategory).forEach(([k, v]) => console.log(`  • ${k}: ${v}`));
+          return;
+        }
+
+        await importMemoryObjects(context, memories, options);
+      } catch (error) {
+        console.error("OpenClaw import failed:", error);
         process.exit(1);
       }
     });

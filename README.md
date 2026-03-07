@@ -647,6 +647,9 @@ openclaw memory-pro delete-bulk --scope global [--before 2025-01-01] [--dry-run]
 openclaw memory-pro export [--scope global] [--output memories.json]
 openclaw memory-pro import memories.json [--scope global] [--dry-run]
 
+# Import file-based memory from an OpenClaw workspace
+openclaw memory-pro import-openclaw ~/.openclaw/workspace [--scope global] [--since 2026-03-01] [--dry-run]
+
 # Re-embed all entries with a new model
 openclaw memory-pro reembed --source-db /path/to/old-db [--batch-size 32] [--skip-existing]
 

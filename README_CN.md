@@ -559,6 +559,9 @@ openclaw memory-pro delete-bulk --scope global [--before 2025-01-01] [--dry-run]
 openclaw memory-pro export [--scope global] [--output memories.json]
 openclaw memory-pro import memories.json [--scope global] [--dry-run]
 
+# 从 OpenClaw workspace 导入文件记忆
+openclaw memory-pro import-openclaw ~/.openclaw/workspace [--scope global] [--since 2026-03-01] [--dry-run]
+
 # 使用新模型重新生成 Embedding
 openclaw memory-pro reembed --source-db /path/to/old-db [--batch-size 32] [--skip-existing]
 
@@ -588,6 +591,15 @@ LanceDB 表 `memories`：
 ---
 
 ## 常见问题 / 排错
+
+### Gemini 配置排错
+
+- 使用 `embedding.baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"`
+- 使用 `embedding.model: "gemini-embedding-001"`
+- 设置 `embedding.dimensions: 3072`
+- 确保 `GEMINI_API_KEY` 存在于 Gateway 进程环境中，而不只是当前 shell
+- 如果看到 404 / model-not-found 错误，请重点检查 `v1beta/openai/` 后缀与模型名是否正确
+
 
 ### "Cannot mix BigInt and other types"（LanceDB / Apache Arrow）
 

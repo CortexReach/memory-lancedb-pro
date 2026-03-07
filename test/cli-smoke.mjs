@@ -151,7 +151,43 @@ async function runCliSmoke() {
   ]);
   assert.match(out2, /Import completed: 0 imported, 1 skipped/, out2);
 
-  // 4) Access reinforcement formula smoke test
+  // 4) import-openclaw should parse MEMORY.md + daily notes
+  const ocWorkspace = path.join(workDir, "openclaw-workspace");
+  const fs = await import("node:fs");
+  fs.mkdirSync(path.join(ocWorkspace, "memory"), { recursive: true });
+  fs.writeFileSync(
+    path.join(ocWorkspace, "MEMORY.md"),
+    "# MEMORY\n\n## User Preferences\n- Xiaoyf prefers concise technical replies.\n",
+  );
+  fs.writeFileSync(
+    path.join(ocWorkspace, "memory", "2026-03-06.md"),
+    "# 2026-03-06\n\n## Daily Summary\n- Enabled memory-lancedb-pro with Gemini embeddings.\n",
+  );
+
+  const out3 = await captureLogs([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "import-openclaw",
+    ocWorkspace,
+    "--scope",
+    "agent:smoke",
+  ]);
+  assert.match(out3, /Import completed: 2 imported/, out3);
+
+  const out4 = await captureLogs([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "import-openclaw",
+    ocWorkspace,
+    "--scope",
+    "agent:smoke",
+    "--dry-run",
+  ]);
+  assert.match(out4, /Would import 2 memories/, out4);
+
+  // 5) Access reinforcement formula smoke test
   const { parseAccessMetadata, buildUpdatedMetadata, computeEffectiveHalfLife } =
     jiti("../src/access-tracker.ts");
 

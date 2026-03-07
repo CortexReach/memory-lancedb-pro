@@ -100,6 +100,30 @@ async function run() {
   );
   assert.match(formattedBatch, /^Failed to generate batch embeddings from /, formattedBatch);
 
+  const geminiAuth = formatEmbeddingProviderError(
+    Object.assign(new Error("403 API key invalid"), {
+      status: 403,
+      code: "invalid_api_key",
+    }),
+    {
+      baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+      model: "gemini-embedding-001",
+    },
+  );
+  assert.match(geminiAuth, /Gemini/i, geminiAuth);
+  assert.match(geminiAuth, /gemini-embedding-001/i, geminiAuth);
+  assert.match(geminiAuth, /3072/i, geminiAuth);
+
+  const geminiNotFound = formatEmbeddingProviderError(
+    Object.assign(new Error("404 model not found"), { status: 404 }),
+    {
+      baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+      model: "bad-model",
+    },
+  );
+  assert.match(geminiNotFound, /v1beta\/openai\//i, geminiNotFound);
+  assert.match(geminiNotFound, /gemini-embedding-001/i, geminiNotFound);
+
   console.log("OK: embedder auth/network error hints verified");
 }
 

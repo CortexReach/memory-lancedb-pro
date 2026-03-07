@@ -164,6 +164,7 @@ function getProviderLabel(baseURL: string | undefined, model: string): string {
   if (base) {
     if (/api\.jina\.ai/i.test(base)) return "Jina";
     if (/localhost:11434|127\.0\.0\.1:11434|\/ollama\b/i.test(base)) return "Ollama";
+    if (/generativelanguage\.googleapis\.com/i.test(base) || /^gemini-/i.test(model)) return "Gemini";
     if (/api\.openai\.com/i.test(base)) return "OpenAI";
 
     try {
@@ -174,6 +175,7 @@ function getProviderLabel(baseURL: string | undefined, model: string): string {
   }
 
   if (/^jina-/i.test(model)) return "Jina";
+  if (/^gemini-/i.test(model)) return "Gemini";
 
   return "embedding provider";
 }
@@ -197,6 +199,16 @@ function isNetworkError(error: unknown): boolean {
 
   const msg = getErrorMessage(error);
   return /ECONNREFUSED|ECONNRESET|ENOTFOUND|EHOSTUNREACH|ETIMEDOUT|fetch failed|network error|socket hang up|connection refused|getaddrinfo/i.test(msg);
+}
+
+function isNotFoundOrModelError(error: unknown): boolean {
+  const status = getErrorStatus(error);
+  if (status === 404 || status == 400) {
+    const msg = getErrorMessage(error);
+    return /model|not found|unsupported|unknown|invalid/i.test(msg);
+  }
+  const msg = getErrorMessage(error);
+  return /model.*not found|unsupported model|unknown model|invalid model/i.test(msg);
 }
 
 export function formatEmbeddingProviderError(
@@ -232,8 +244,15 @@ export function formatEmbeddingProviderError(
     } else if (provider === "Ollama") {
       hint +=
         " Ollama usually works with a dummy apiKey; verify the local server is running, the model is pulled, and embedding.dimensions matches the model output.";
+    } else if (provider === "Gemini") {
+      hint +=
+        " For Gemini, use an OpenAI-compatible baseURL such as https://generativelanguage.googleapis.com/v1beta/openai/, set embedding.model to gemini-embedding-001, set embedding.dimensions to 3072, and ensure GEMINI_API_KEY is valid in the gateway environment.";
     }
     return `Embedding provider authentication failed (${detailText}). ${hint}`;
+  }
+
+  if (isNotFoundOrModelError(error) && provider === "Gemini") {
+    return `Failed to generate embedding from ${provider} (${detailText}). Verify embedding.baseURL is https://generativelanguage.googleapis.com/v1beta/openai/, embedding.model is gemini-embedding-001, and embedding.dimensions is 3072.`;
   }
 
   if (isNetworkError(error)) {
