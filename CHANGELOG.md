@@ -4,6 +4,7 @@
 
 - Refactor: build reset/new reflection handoff note in `runMemoryReflection`.
 - Refactor: `<open-loops>` now comes from the fresh reflection run, while `<derived-focus>` comes from historical scored itemized derived rows.
+- Refactor: upgrade historical `<derived-focus>` ranking to Derived-Focus V2 (conservative strict/soft normalization, non-linear group scoring, diversity-aware shortlist up to 36 before final note injection capped at 13, with no hard `score > 0.3` gate).
 - Breaking: stop writing and stop reading legacy combined reflection rows (`type=memory-reflection`).
 - Docs: refresh README / README_CN for the new handoff-note behavior and remove old legacy combined guidance.
 

@@ -32,8 +32,10 @@ const {
   storeReflectionToLanceDB,
   loadAgentReflectionSlicesFromEntries,
   loadAgentDerivedRowsWithScoresFromEntries,
+  loadAgentDerivedFocusRowsForHandoffFromEntries,
   loadReflectionMappedRowsFromEntries,
 } = jiti("../src/reflection-store.ts");
+const { normalizeReflectionSoftKey } = jiti("../src/reflection-normalize.ts");
 const { rankDynamicReflectionRecallFromEntries } = jiti("../src/reflection-recall.ts");
 const {
   createDynamicRecallSessionState,
@@ -649,6 +651,314 @@ describe("memory reflection", () => {
       assert.ok(highRow && highRow.score > 0.3);
       assert.ok(lowRow && lowRow.score < 0.3);
     });
+
+    it("applies non-linear saturation so exact duplicates do not scale linearly", () => {
+      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+      const day = 24 * 60 * 60 * 1000;
+      const repeatedLine = "Repeat post-check verification path before declaring success.";
+
+      const entries = Array.from({ length: 12 }, (_, idx) =>
+        makeEntry({
+          timestamp: now - (idx % 2) * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - (idx % 2) * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 1,
+            usedFallback: false,
+          },
+        })
+      );
+      for (const entry of entries) {
+        entry.text = repeatedLine;
+      }
+
+      const rows = loadAgentDerivedRowsWithScoresFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 30 * day,
+        limit: 36,
+      });
+
+      const repeated = rows.find((row) => row.text === repeatedLine);
+      assert.ok(repeated);
+
+      const singleItemScore = computeReflectionScore({
+        ageDays: 1,
+        midpointDays: 7,
+        k: 0.65,
+        baseWeight: 1,
+        quality: 1,
+        usedFallback: false,
+      });
+      const naiveLinear = singleItemScore * 12;
+      assert.ok(repeated.score < naiveLinear * 0.25);
+      assert.ok(repeated.score > singleItemScore * 0.8);
+    });
+
+    it("prefers representative non-fallback text instead of always taking the newest variant", () => {
+      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+      const day = 24 * 60 * 60 * 1000;
+      const entries = [
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 1,
+            usedFallback: false,
+          },
+        }),
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 1,
+            usedFallback: true,
+          },
+        }),
+      ];
+      entries[0].text = "Use deterministic post-check command list.";
+      entries[1].text = "Use deterministic post-check command list!";
+
+      const rows = loadAgentDerivedRowsWithScoresFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 30 * day,
+        limit: 36,
+      });
+
+      assert.equal(rows[0].text, "Use deterministic post-check command list.");
+    });
+
+    it("expands historical shortlist beyond 24 so deeper candidates remain available", () => {
+      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+      const day = 24 * 60 * 60 * 1000;
+
+      const entries = Array.from({ length: 32 }, (_, idx) =>
+        makeEntry({
+          timestamp: now - (idx % 4) * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - (idx % 4) * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 0.95,
+            usedFallback: false,
+          },
+        })
+      );
+      for (let i = 0; i < entries.length; i += 1) {
+        entries[i].text = `Shortlist candidate ${i + 1}: preserve deterministic verification evidence.`;
+      }
+
+      const rows10 = loadAgentDerivedRowsWithScoresFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 30 * day,
+        limit: 10,
+      });
+      const rows24 = loadAgentDerivedRowsWithScoresFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 30 * day,
+        limit: 24,
+      });
+      const rows36 = loadAgentDerivedRowsWithScoresFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 30 * day,
+        limit: 36,
+      });
+
+      assert.equal(rows10.length, 10);
+      assert.equal(rows24.length, 24);
+      assert.equal(rows36.length, 32);
+      assert.ok(rows36.slice(24).length > 0);
+      assert.ok(rows36.slice(24).every((row) => typeof row.text === "string" && row.text.length > 0));
+    });
+
+    it("keeps final derived-focus selection capped at 13 without applying a hard score threshold", () => {
+      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+      const day = 24 * 60 * 60 * 1000;
+
+      const strongEntries = Array.from({ length: 12 }, (_, idx) =>
+        makeEntry({
+          timestamp: now - (idx % 3) * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - (idx % 3) * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 0.95,
+            usedFallback: false,
+          },
+        })
+      );
+      strongEntries.forEach((entry, idx) => {
+        entry.text = `Strong candidate ${idx + 1}: keep post-check output deterministic.`;
+      });
+
+      const borderline = makeEntry({
+        timestamp: now - 35 * day,
+        metadata: {
+          type: "memory-reflection-item",
+          itemKind: "derived",
+          agentId: "main",
+          storedAt: now - 35 * day,
+          decayMidpointDays: 7,
+          decayK: 0.65,
+          baseWeight: 1,
+          quality: 0.6,
+          usedFallback: false,
+        },
+      });
+      borderline.text = "Borderline low-score candidate that should still remain eligible without score gating.";
+
+      const veryOldEntries = Array.from({ length: 8 }, (_, idx) =>
+        makeEntry({
+          timestamp: now - (70 + idx) * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - (70 + idx) * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 0.55,
+            usedFallback: false,
+          },
+        })
+      );
+      veryOldEntries.forEach((entry, idx) => {
+        entry.text = `Very old candidate ${idx + 1}: likely ranked below borderline.`;
+      });
+
+      const rows = loadAgentDerivedFocusRowsForHandoffFromEntries({
+        entries: [...strongEntries, borderline, ...veryOldEntries],
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 90 * day,
+        shortlistLimit: 36,
+        finalLimit: 13,
+      });
+      const borderlineRow = rows.find((row) => row.text.includes("Borderline low-score candidate"));
+
+      assert.equal(rows.length, 13);
+      assert.ok(borderlineRow);
+      assert.ok(borderlineRow.score < 0.3);
+    });
+
+    it("uses diversity-aware ordering so near-duplicate soft-keys do not saturate the final output", () => {
+      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+      const day = 24 * 60 * 60 * 1000;
+      const similarLines = [
+        "Validate /root/work mount health after service restart.",
+        "Validate root/work mount health after service restart.",
+        "validate root work mount health after service restart",
+        "Validate root-work mount health after service restart.",
+        "Validate root (work) mount health after service restart.",
+        "Validate root\\work mount health after service restart.",
+      ];
+      const diverseLines = [
+        "Keep DNS post-check output with getent host evidence.",
+        "Track proxy failover endpoint and retry timing explicitly.",
+        "Record exact UTC timestamps for each recovery action.",
+        "Confirm reflection handoff note does not include stale loops.",
+        "Gate risky service changes behind focused preflight checks.",
+        "Capture one-line rollback steps before applying infra edits.",
+        "Write recovery commands in execution order to avoid skipped steps.",
+        "Tag unresolved blockers explicitly so follow-up runs can prioritize them.",
+        "Capture exact command output snippets that prove service recovery.",
+        "Prefer a minimal blast-radius rollback command before retries.",
+        "Record dependency assumptions before changing shared config files.",
+        "Keep one deterministic verification command per subsystem.",
+        "Document expected service states before applying risky edits.",
+        "List one explicit next owner/action for each open loop.",
+      ];
+
+      const entries = [];
+      for (const line of similarLines) {
+        const entry = makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 1,
+            usedFallback: false,
+          },
+        });
+        entry.text = line;
+        entries.push(entry);
+      }
+      for (const line of diverseLines) {
+        const entry = makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 0.62,
+            usedFallback: false,
+          },
+        });
+        entry.text = line;
+        entries.push(entry);
+      }
+
+      const rows = loadAgentDerivedFocusRowsForHandoffFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 30 * day,
+        shortlistLimit: 36,
+        finalLimit: 13,
+      });
+      const duplicateSoftKey = normalizeReflectionSoftKey(similarLines[0]);
+
+      const duplicateSoftKeyCount = rows.filter((row) => normalizeReflectionSoftKey(row.text) === duplicateSoftKey).length;
+      const uniqueSoftKeys = new Set(rows.map((row) => normalizeReflectionSoftKey(row.text)));
+
+      assert.equal(rows.length, 13);
+      assert.equal(duplicateSoftKeyCount, 1);
+      assert.ok(uniqueSoftKeys.size >= 12);
+    });
   });
 
   describe("mapped reflection metadata and ranking", () => {
@@ -857,16 +1167,225 @@ describe("memory reflection", () => {
       assert.equal(capped[0].repeatCount, 10);
       assert.equal(uncapped[0].repeatCount, 12);
       assert.ok(uncapped[0].score > capped[0].score);
+      assert.ok(Number.isFinite(capped[0].score));
+      assert.ok(capped[0].score > 0);
+    });
 
-      const singleScore = computeReflectionScore({
-        ageDays: 0,
-        midpointDays: 45,
-        k: 0.22,
-        baseWeight: 1.1,
-        quality: 1,
-        usedFallback: false,
+    it("reuses helper representative selection so newer fallback phrasing is not always preferred", () => {
+      const now = Date.UTC(2026, 2, 8);
+      const day = 24 * 60 * 60 * 1000;
+      const entries = [
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            usedFallback: false,
+          },
+        }),
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            usedFallback: true,
+          },
+        }),
+      ];
+      entries[0].text = "Always run DNS and mount post-checks after service restarts.";
+      entries[1].text = "Always run DNS and mount post-checks after service restarts!";
+
+      const rows = rankDynamicReflectionRecallFromEntries(entries, {
+        agentId: "main",
+        includeKinds: ["invariant"],
+        maxAgeMs: 90 * day,
+        maxEntriesPerKey: 10,
+        topK: 6,
+        minScore: 0,
+        now,
       });
-      assert.equal(capped[0].score, Number((singleScore * 10).toFixed(6)));
+
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].text, "Always run DNS and mount post-checks after service restarts.");
+      assert.equal(rows[0].repeatCount, 2);
+    });
+
+    it("preserves kind identity by partitioning aggregation with kind + strictKey semantics", () => {
+      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+      const day = 24 * 60 * 60 * 1000;
+      const entries = [
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            usedFallback: false,
+          },
+        }),
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            usedFallback: false,
+          },
+        }),
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 1,
+            usedFallback: false,
+          },
+        }),
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 1,
+            usedFallback: false,
+          },
+        }),
+      ];
+      entries[0].text = "Keep DNS and mount post-check evidence after service changes.";
+      entries[1].text = "Keep DNS and mount post-check evidence after service changes!";
+      entries[2].text = "Keep DNS and mount post-check evidence after service changes.";
+      entries[3].text = "Keep DNS and mount post-check evidence after service changes!";
+
+      const rows = rankDynamicReflectionRecallFromEntries(entries, {
+        agentId: "main",
+        includeKinds: ["invariant", "derived"],
+        maxAgeMs: 90 * day,
+        maxEntriesPerKey: 1,
+        topK: 6,
+        minScore: 0,
+        now,
+      });
+
+      assert.equal(rows.length, 2);
+      assert.deepEqual(
+        [...new Set(rows.map((row) => row.kind))].sort(),
+        ["derived", "invariant"]
+      );
+      assert.equal(new Set(rows.map((row) => row.id)).size, 2);
+      assert.equal(new Set(rows.map((row) => normalizeReflectionSoftKey(row.text))).size, 1);
+    });
+
+    it("reuses diversity-aware final ordering in recall and keeps deterministic output", () => {
+      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+      const day = 24 * 60 * 60 * 1000;
+      const similarLines = [
+        "Validate /root/work mount health after service restart.",
+        "Validate root/work mount health after service restart.",
+        "validate root work mount health after service restart",
+        "Validate root-work mount health after service restart.",
+      ];
+      const diverseLines = [
+        "Keep DNS post-check output with getent host evidence.",
+        "Record exact UTC timestamps for each recovery action.",
+        "Capture exact command output snippets that prove service recovery.",
+        "Prefer a minimal blast-radius rollback command before retries.",
+        "Document expected service states before applying risky edits.",
+      ];
+
+      const entries = [];
+      for (const line of similarLines) {
+        const entry = makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            usedFallback: false,
+          },
+        });
+        entry.text = line;
+        entries.push(entry);
+      }
+
+      for (const line of diverseLines) {
+        const entry = makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 0.6,
+            usedFallback: false,
+          },
+        });
+        entry.text = line;
+        entries.push(entry);
+      }
+
+      const forward = rankDynamicReflectionRecallFromEntries(entries, {
+        agentId: "main",
+        includeKinds: ["invariant"],
+        maxAgeMs: 90 * day,
+        maxEntriesPerKey: 10,
+        topK: 5,
+        minScore: 0,
+        now,
+      });
+      const reversed = rankDynamicReflectionRecallFromEntries([...entries].reverse(), {
+        agentId: "main",
+        includeKinds: ["invariant"],
+        maxAgeMs: 90 * day,
+        maxEntriesPerKey: 10,
+        topK: 5,
+        minScore: 0,
+        now,
+      });
+
+      const duplicateSoftKey = normalizeReflectionSoftKey(similarLines[0]);
+      const duplicateSoftKeyCount = forward.filter((row) => normalizeReflectionSoftKey(row.text) === duplicateSoftKey).length;
+      assert.equal(duplicateSoftKeyCount, 1);
+      assert.deepEqual(forward, reversed);
     });
   });
 

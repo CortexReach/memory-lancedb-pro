@@ -163,7 +163,7 @@ Filters out low-quality content at both auto-capture and tool-store stages:
   - Under `sessionStrategy="memoryReflection"`, the final reset/new note is assembled in `runMemoryReflection`.
   - In `memoryReflection.injectMode="inheritance+derived"` mode, the note can include:
     - `<open-loops>` from the **fresh** reflection text of the current `/new` or `/reset`.
-    - `<derived-focus>` from **historical** LanceDB derived rows after dedupe+decay scoring, filtered to final score `> 0.3`.
+    - `<derived-focus>` from **historical** LanceDB derived rows after dedupe+decay scoring (shortlist up to 36, final injection capped at 13, no hard score threshold gate).
 - File ensure/create path: ensures `.learnings/LEARNINGS.md` and `.learnings/ERRORS.md` exist.
 - This flow is separate from `memoryReflection`: seeing self-improvement notes or `.learnings/*` activity does not by itself mean reflection storage is enabled.
 - Append paths are intentionally distinct:
@@ -237,6 +237,8 @@ Filters out low-quality content at both auto-capture and tool-store stages:
   - `before_agent_start`: injects `<inherited-rules>` via Reflection-Recall.
   - `memoryReflection.recall.mode="fixed"` (default): compatibility path; fixed inheritance remains active even when generic Auto-Recall is disabled.
   - `memoryReflection.recall.mode="dynamic"`: prompt-gated dynamic Reflection-Recall with independent top-k/session suppression budget from generic Auto-Recall.
+    - Ranking reuses the shared normalization/aggregation/selection helpers, including diversity-aware final ordering.
+    - Recall grouping is partitioned by `kind + strictKey`, so invariant/derived rows with identical normalized text stay separate.
   - `command:new` / `command:reset`: `runMemoryReflection` builds the self-improvement note (`<open-loops>` from fresh reflection; `<derived-focus>` from historical scored rows when mode is `inheritance+derived`).
   - `before_prompt_build`: injects `<error-detected>` only (no `<derived-focus>`).
 

@@ -17,9 +17,19 @@ import {
 } from "./reflection-item-store.js";
 import { getReflectionMappedDecayDefaults, type ReflectionMappedKind } from "./reflection-mapped-metadata.js";
 import { computeReflectionScore, normalizeReflectionLineForAggregation } from "./reflection-ranking.js";
+import { aggregateReflectionGroups, type ReflectionScoredItem } from "./reflection-aggregation.js";
+import { normalizeReflectionSoftKey, normalizeReflectionStrictKey } from "./reflection-normalize.js";
+import {
+  DERIVED_FOCUS_V2_FINAL_TARGET,
+  DERIVED_FOCUS_V2_SHORTLIST_TARGET,
+  selectDiversityAwareReflectionGroups,
+} from "./reflection-selection.js";
 
 export const DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 export const DEFAULT_REFLECTION_MAPPED_MAX_AGE_MS = 60 * 24 * 60 * 60 * 1000;
+const LEGACY_REFLECTION_DERIVED_SLICE_LIMIT = 10;
+export const DEFAULT_REFLECTION_DERIVED_SHORTLIST_LIMIT = DERIVED_FOCUS_V2_SHORTLIST_TARGET;
+export const DEFAULT_REFLECTION_DERIVED_FINAL_LIMIT = DERIVED_FOCUS_V2_FINAL_TARGET;
 
 type ReflectionStoreKind = "event" | "item-invariant" | "item-derived";
 
@@ -150,7 +160,10 @@ export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlice
   invariants: string[];
   derived: string[];
 } {
-  const ranked = loadAgentReflectionRankedSlicesFromEntries(params);
+  const ranked = loadAgentReflectionRankedSlicesFromEntries(params, {
+    derivedShortlistLimit: LEGACY_REFLECTION_DERIVED_SLICE_LIMIT,
+    derivedFinalLimit: LEGACY_REFLECTION_DERIVED_SLICE_LIMIT,
+  });
   return {
     invariants: ranked.invariants.map((row) => row.text),
     derived: ranked.derived.map((row) => row.text),
@@ -158,14 +171,45 @@ export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlice
 }
 
 export function loadAgentDerivedRowsWithScoresFromEntries(
-  params: LoadReflectionSlicesParams & { limit?: number }
+  params: LoadReflectionSlicesParams & { limit?: number; finalLimit?: number }
 ): ScoredReflectionLine[] {
-  const ranked = loadAgentReflectionRankedSlicesFromEntries(params);
-  const limit = Number.isFinite(params.limit) ? Math.max(1, Math.floor(Number(params.limit))) : 10;
-  return ranked.derived.slice(0, limit);
+  const shortlistLimit = Number.isFinite(params.limit)
+    ? Math.max(1, Math.floor(Number(params.limit)))
+    : DEFAULT_REFLECTION_DERIVED_SHORTLIST_LIMIT;
+  const finalLimit = Number.isFinite(params.finalLimit)
+    ? Math.max(1, Math.floor(Number(params.finalLimit)))
+    : shortlistLimit;
+  const ranked = loadAgentReflectionRankedSlicesFromEntries(params, {
+    derivedShortlistLimit: shortlistLimit,
+    derivedFinalLimit: finalLimit,
+  });
+  return ranked.derived;
 }
 
-function loadAgentReflectionRankedSlicesFromEntries(params: LoadReflectionSlicesParams): {
+export function loadAgentDerivedFocusRowsForHandoffFromEntries(
+  params: LoadReflectionSlicesParams & {
+    shortlistLimit?: number;
+    finalLimit?: number;
+  }
+): ScoredReflectionLine[] {
+  const shortlistLimit = Number.isFinite(params.shortlistLimit)
+    ? Math.max(1, Math.floor(Number(params.shortlistLimit)))
+    : DEFAULT_REFLECTION_DERIVED_SHORTLIST_LIMIT;
+  const finalLimit = Number.isFinite(params.finalLimit)
+    ? Math.max(1, Math.floor(Number(params.finalLimit)))
+    : DEFAULT_REFLECTION_DERIVED_FINAL_LIMIT;
+
+  return loadAgentDerivedRowsWithScoresFromEntries({
+    ...params,
+    limit: shortlistLimit,
+    finalLimit,
+  });
+}
+
+function loadAgentReflectionRankedSlicesFromEntries(
+  params: LoadReflectionSlicesParams,
+  options?: { derivedShortlistLimit?: number; derivedFinalLimit?: number }
+): {
   invariants: ScoredReflectionLine[];
   derived: ScoredReflectionLine[];
 } {
@@ -186,17 +230,24 @@ function loadAgentReflectionRankedSlicesFromEntries(params: LoadReflectionSlices
   const itemRows = reflectionRows.filter(({ metadata }) => metadata.type === "memory-reflection-item");
   const invariantCandidates = buildInvariantCandidates(itemRows);
   const derivedCandidates = buildDerivedCandidates(itemRows);
+  const derivedShortlistLimit = Number.isFinite(options?.derivedShortlistLimit)
+    ? Math.max(1, Math.floor(Number(options?.derivedShortlistLimit)))
+    : LEGACY_REFLECTION_DERIVED_SLICE_LIMIT;
+  const derivedFinalLimit = Number.isFinite(options?.derivedFinalLimit)
+    ? Math.max(1, Math.floor(Number(options?.derivedFinalLimit)))
+    : derivedShortlistLimit;
 
-  const invariants = rankReflectionLineScores(invariantCandidates, {
+  const invariants = rankReflectionLineScoresLinear(invariantCandidates, {
     now,
     maxAgeMs: invariantMaxAgeMs,
     limit: 8,
   });
 
-  const derived = rankReflectionLineScores(derivedCandidates, {
+  const derived = rankDerivedReflectionLineScoresV2(derivedCandidates, {
     now,
     maxAgeMs: deriveMaxAgeMs,
-    limit: 10,
+    shortlistLimit: derivedShortlistLimit,
+    finalLimit: derivedFinalLimit,
   });
 
   return { invariants, derived };
@@ -258,7 +309,7 @@ function buildDerivedCandidates(
     });
 }
 
-function rankReflectionLineScores(
+function rankReflectionLineScoresLinear(
   candidates: WeightedLineCandidate[],
   options: { now: number; maxAgeMs?: number; limit: number }
 ): ScoredReflectionLine[] {
@@ -309,6 +360,60 @@ function rankReflectionLineScores(
       text: item.line,
       score: Number(item.score.toFixed(6)),
       latestTs: item.latestTs,
+    }));
+}
+
+function rankDerivedReflectionLineScoresV2(
+  candidates: WeightedLineCandidate[],
+  options: { now: number; maxAgeMs?: number; shortlistLimit: number; finalLimit: number }
+): ScoredReflectionLine[] {
+  const scoredItems: ReflectionScoredItem[] = [];
+  for (const candidate of candidates) {
+    const timestamp = Number.isFinite(candidate.timestamp) ? candidate.timestamp : options.now;
+    if (Number.isFinite(options.maxAgeMs) && options.maxAgeMs! >= 0 && options.now - timestamp > options.maxAgeMs!) {
+      continue;
+    }
+
+    const ageDays = Math.max(0, (options.now - timestamp) / 86_400_000);
+    const score = computeReflectionScore({
+      ageDays,
+      midpointDays: candidate.midpointDays,
+      k: candidate.k,
+      baseWeight: candidate.baseWeight,
+      quality: candidate.quality,
+      usedFallback: candidate.usedFallback,
+    });
+    if (!Number.isFinite(score) || score <= 0) continue;
+
+    const strictKey = normalizeReflectionStrictKey(candidate.line);
+    if (!strictKey) continue;
+    const softKey = normalizeReflectionSoftKey(candidate.line) || strictKey;
+
+    scoredItems.push({
+      text: candidate.line,
+      ts: timestamp,
+      score,
+      quality: candidate.quality,
+      isFallback: candidate.usedFallback,
+      strictKey,
+      softKey,
+    });
+  }
+
+  if (scoredItems.length === 0) return [];
+
+  const groups = aggregateReflectionGroups(scoredItems, options.now);
+  const selected = selectDiversityAwareReflectionGroups(groups, {
+    shortlistTarget: options.shortlistLimit,
+    finalTarget: options.finalLimit,
+  });
+
+  return selected
+    .filter((group) => Number.isFinite(group.finalScore) && group.finalScore > 0)
+    .map((group) => ({
+      text: group.representative.text,
+      score: Number(group.finalScore.toFixed(6)),
+      latestTs: group.latestTs,
     }));
 }
 

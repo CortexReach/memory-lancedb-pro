@@ -160,6 +160,10 @@ Query → BM25 FTS ─────┘
 - 触发事件：`agent:bootstrap`、`command:new`、`command:reset`。
 - `agent:bootstrap`：将 `SELF_IMPROVEMENT_REMINDER.md` 注入 bootstrap 上下文。
 - `command:new` / `command:reset`：在重置前追加简短 `/note self-improvement ...` 提醒。
+  - 在 `sessionStrategy="memoryReflection"` 下，最终 reset/new note 由 `runMemoryReflection` 组装。
+  - 当 `memoryReflection.injectMode="inheritance+derived"` 时，note 可包含：
+    - 来自当前 `/new` 或 `/reset` 新鲜反思文本的 `<open-loops>`。
+    - 来自历史 LanceDB 派生行（去重+衰减评分后）的 `<derived-focus>`（shortlist 最多 36，最终注入上限 13，不使用硬性分数阈值门槛）。
 - 文件初始化路径：确保 `.learnings/LEARNINGS.md` 和 `.learnings/ERRORS.md` 存在。
 - 这条链路与 `memoryReflection` 分离：看到 self-improvement note 或 `.learnings/*` 写入，并不等于 reflection 存储已开启。
 - 追加路径刻意区分为三种：
@@ -234,6 +238,8 @@ Query → BM25 FTS ─────┘
   - `before_agent_start`：通过 Reflection-Recall 注入 `<inherited-rules>`。
   - `memoryReflection.recall.mode="fixed"`（默认）：兼容路径；即使关闭 generic Auto-Recall，固定继承仍会注入。
   - `memoryReflection.recall.mode="dynamic"`：按 prompt 动态检索反思规则，且与 generic Auto-Recall 使用独立 top-k / session 去重预算。
+    - 排序复用共享的 normalize/aggregation/selection helper（包含多样性感知的最终排序）。
+    - 回忆分组按 `kind + strictKey` 分区；即使标准化文本相同，`invariant`/`derived` 也不会被合并成同一条。
   - `command:new` / `command:reset`：`runMemoryReflection` 生成 self-improvement note（`<open-loops>` 来自本次新反思；`<derived-focus>` 来自历史打分行，模式为 `inheritance+derived` 时启用）。
   - `before_prompt_build`：仅注入 `<error-detected>`（不会注入 `<derived-focus>`）。
 

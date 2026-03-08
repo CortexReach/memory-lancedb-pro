@@ -28,8 +28,10 @@ import { resolveReflectionSessionSearchDirs, stripResetSuffix } from "./src/sess
 import {
   storeReflectionToLanceDB,
   loadAgentReflectionSlicesFromEntries,
-  loadAgentDerivedRowsWithScoresFromEntries,
+  loadAgentDerivedFocusRowsForHandoffFromEntries,
   DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+  DEFAULT_REFLECTION_DERIVED_FINAL_LIMIT,
+  DEFAULT_REFLECTION_DERIVED_SHORTLIST_LIMIT,
 } from "./src/reflection-store.js";
 import {
   extractReflectionLearningGovernanceCandidates,
@@ -269,6 +271,8 @@ const DEFAULT_REFLECTION_RECALL_MAX_ENTRIES_PER_KEY = 10;
 const DEFAULT_REFLECTION_RECALL_MIN_REPEATED = 2;
 const DEFAULT_REFLECTION_RECALL_MIN_SCORE = 0.18;
 const DEFAULT_REFLECTION_RECALL_MIN_PROMPT_LENGTH = 8;
+// Rendering safety guard only; ranking/store layer owns the semantic final-13 cap.
+const DERIVED_FOCUS_RENDER_HARD_LIMIT = 64;
 const REFLECTION_FALLBACK_MARKER = "(fallback) Reflection generation failed; storing minimal pointer only.";
 const DIAG_BUILD_TAG = "memory-lancedb-pro-diag-20260308-0058";
 
@@ -276,7 +280,7 @@ function buildReflectionDerivedFocusBlock(derivedLines: string[]): string {
   const trimmed = derivedLines
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
-    .slice(0, 6);
+    .slice(0, DERIVED_FOCUS_RENDER_HARD_LIMIT);
   if (trimmed.length === 0) return "";
   return [
     "<derived-focus>",
@@ -876,6 +880,8 @@ function buildReflectionPrompt(
     "- Invariants = stable cross-session rules only; prefer bullets starting with Always / Never / When / If / Before / After / Prefer / Avoid / Require.",
     "- Derived = recent-run distilled learnings, adjustments, and follow-up heuristics that may help the next several runs, but should decay over time.",
     "- Keep Invariants stable and long-lived; keep Derived recent, reusable across near-term runs, and decayable.",
+    "- Start Derived bullets with varied lead-ins (for example: Next run..., When..., If..., To avoid...) instead of repeating one opening phrase.",
+    "- Keep Derived phrasing non-redundant; do not start every bullet with the same words.",
     "- Do not restate long-term rules in Derived.",
     "",
     "Governance section rules:",
@@ -937,7 +943,7 @@ function buildReflectionPrompt(
     "- Always ...",
     "",
     "## Derived",
-    "- This run showed ...",
+    "- Next run, ...",
     "",
     "Recent tool error signals:",
     errorHints,
@@ -988,7 +994,7 @@ function buildReflectionFallbackText(): string {
     "- (none captured)",
     "",
     "## Derived",
-    "- Investigate why embedded reflection generation failed before trusting any next-run delta.",
+    "- If embedded reflection generation fails again, investigate root cause before trusting any next-run delta.",
   ].join("\n");
 }
 
@@ -2290,15 +2296,15 @@ const memoryLanceDBProPlugin = {
             try {
               const scopes = scopeManager.getAccessibleScopes(sourceAgentId);
               const historicalEntries = await store.list(scopes, undefined, 160, 0);
-              const historicalDerivedRows = loadAgentDerivedRowsWithScoresFromEntries({
+              const historicalDerivedRows = loadAgentDerivedFocusRowsForHandoffFromEntries({
                 entries: historicalEntries,
                 agentId: sourceAgentId,
                 now: nowTs,
                 deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
-                limit: 10,
+                shortlistLimit: DEFAULT_REFLECTION_DERIVED_SHORTLIST_LIMIT,
+                finalLimit: DEFAULT_REFLECTION_DERIVED_FINAL_LIMIT,
               });
               const historicalDerivedLines = historicalDerivedRows
-                .filter((row) => row.score > 0.3)
                 .map((row) => row.text);
               derivedFocusBlock = buildReflectionDerivedFocusBlock(historicalDerivedLines);
             } catch (err) {

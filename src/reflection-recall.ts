@@ -4,6 +4,9 @@ import { sanitizeReflectionSliceLines } from "./reflection-slices.js";
 import { computeReflectionScore, normalizeReflectionLineForAggregation } from "./reflection-ranking.js";
 import { getReflectionItemDecayDefaults, type ReflectionItemKind } from "./reflection-item-store.js";
 import { filterByMaxAge, keepMostRecentPerNormalizedKey } from "./recall-engine.js";
+import { normalizeReflectionSoftKey, normalizeReflectionStrictKey } from "./reflection-normalize.js";
+import { aggregateReflectionGroups, type ReflectionScoredItem } from "./reflection-aggregation.js";
+import { selectDiversityAwareReflectionGroups } from "./reflection-selection.js";
 
 export interface ReflectionRecallOptions {
   agentId: string;
@@ -32,6 +35,10 @@ interface WeightedReflectionLine {
   baseWeight: number;
   quality: number;
   usedFallback: boolean;
+  kind: ReflectionItemKind;
+}
+
+interface ReflectionRecallScoredItem extends ReflectionScoredItem {
   kind: ReflectionItemKind;
 }
 
@@ -73,10 +80,10 @@ export function rankDynamicReflectionRecallFromEntries(
     items: withinAge,
     maxEntriesPerKey: options.maxEntriesPerKey,
     getTimestamp: (row) => row.timestamp,
-    getNormalizedKey: (row) => normalizeReflectionLineForAggregation(row.text),
+    getNormalizedKey: (row) => `${row.kind}::${normalizeReflectionLineForAggregation(row.text)}`,
   });
 
-  const grouped = new Map<string, { text: string; score: number; latestTs: number; kind: ReflectionItemKind; repeatCount: number }>();
+  const scoredItems: ReflectionRecallScoredItem[] = [];
 
   for (const row of cappedPerKey) {
     const ageDays = Math.max(0, (now - row.timestamp) / 86_400_000);
@@ -90,45 +97,44 @@ export function rankDynamicReflectionRecallFromEntries(
     });
     if (!Number.isFinite(score) || score <= 0) continue;
 
-    const normalized = normalizeReflectionLineForAggregation(row.text);
-    if (!normalized) continue;
+    const strictKey = normalizeReflectionStrictKey(row.text);
+    if (!strictKey) continue;
+    const partitionedStrictKey = `${row.kind}::${strictKey}`;
+    const softKey = normalizeReflectionSoftKey(row.text) || strictKey;
 
-    const current = grouped.get(normalized);
-    if (!current) {
-      grouped.set(normalized, {
-        text: row.text,
-        score,
-        latestTs: row.timestamp,
-        kind: row.kind,
-        repeatCount: 1,
-      });
-      continue;
-    }
-
-    current.score += score;
-    current.repeatCount += 1;
-    if (row.timestamp > current.latestTs) {
-      current.latestTs = row.timestamp;
-      current.text = row.text;
-    }
+    scoredItems.push({
+      text: row.text,
+      ts: row.timestamp,
+      score,
+      quality: row.quality,
+      isFallback: row.usedFallback,
+      strictKey: partitionedStrictKey,
+      softKey,
+      kind: row.kind,
+    });
   }
 
+  const groups = aggregateReflectionGroups(scoredItems, now);
+  if (groups.length === 0) return [];
+  const grouped = selectDiversityAwareReflectionGroups(groups, {
+    shortlistTarget: groups.length,
+    finalTarget: groups.length,
+  });
   const minScore = Number.isFinite(options.minScore) ? Number(options.minScore) : 0;
-  const rows = [...grouped.entries()]
-    .map(([normalized, row]) => ({
-      id: `reflection:${normalized}`,
-      text: row.text,
-      score: Number(row.score.toFixed(6)),
-      latestTs: row.latestTs,
-      kind: row.kind,
-      repeatCount: row.repeatCount,
-    }))
-    .filter((row) => row.score >= minScore)
-    .sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      if (b.latestTs !== a.latestTs) return b.latestTs - a.latestTs;
-      return a.text.localeCompare(b.text);
-    });
+  const rows = grouped
+    .map((group) => {
+      const representative = group.representative as ReflectionRecallScoredItem;
+      const primary = (group.items[0] || representative) as ReflectionRecallScoredItem;
+      return {
+        id: `reflection:${group.strictKey}`,
+        text: group.representative.text,
+        score: Number(group.finalScore.toFixed(6)),
+        latestTs: group.latestTs,
+        kind: representative.kind || primary.kind || "invariant",
+        repeatCount: group.repeatCount,
+      };
+    })
+    .filter((row) => row.score >= minScore);
 
   const topK = Number.isFinite(options.topK) ? Math.max(1, Math.floor(Number(options.topK))) : rows.length;
   return rows.slice(0, topK);
