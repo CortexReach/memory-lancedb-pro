@@ -489,6 +489,11 @@
             "description": "Fallback directory for Markdown mirror files when agent workspace is unknown"
           }
         }
+      },
+      "exposeRetrievalMetadata": {
+        "type": "boolean",
+        "default": false,
+        "description": "Expose retrieval metadata (score, sources) in details.debug field. Useful for debugging retrieval quality. Default: false to keep output clean."
       }
     },
     "required": [

@@ -35,7 +35,7 @@
     ]
   },
   "scripts": {
-    "test": "node test/embedder-error-hints.test.mjs && node test/migrate-legacy-schema.test.mjs && node test/cli-smoke.mjs && node --test test/memory-reflection.test.mjs test/self-improvement.test.mjs"
+    "test": "node test/embedder-error-hints.test.mjs && node test/migrate-legacy-schema.test.mjs && node test/cli-smoke.mjs && node --test test/memory-recall-metadata.test.mjs test/memory-reflection.test.mjs test/self-improvement.test.mjs"
   },
   "devDependencies": {
     "commander": "^14.0.0",

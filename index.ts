@@ -133,6 +133,7 @@ interface PluginConfig {
     };
   };
   mdMirror?: { enabled?: boolean; dir?: string };
+  exposeRetrievalMetadata?: boolean;
 }
 
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
@@ -1606,6 +1607,7 @@ const memoryLanceDBProPlugin = {
         agentId: undefined, // Will be determined at runtime from context
         workspaceDir: getDefaultWorkspaceDir(),
         mdMirror,
+        exposeRetrievalMetadata: config.exposeRetrievalMetadata,
       },
       {
         enableManagementTools: config.enableManagementTools,
@@ -1691,7 +1693,7 @@ const memoryLanceDBProPlugin = {
               return postProcessAutoRecallResults(retrieved).slice(0, topK);
             },
             formatLine: (row) =>
-              `- [${row.entry.category}:${row.entry.scope}] ${sanitizeForContext(row.entry.text)} (${(row.score * 100).toFixed(0)}%${row.sources?.bm25 ? ", vector+BM25" : ""}${row.sources?.reranked ? "+reranked" : ""})`,
+              `- [${row.entry.category}:${row.entry.scope}] ${sanitizeForContext(row.entry.text)}`,
           });
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: auto-recall failed: ${String(err)}`);
@@ -2882,6 +2884,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
                 : undefined,
           }
         : undefined,
+    exposeRetrievalMetadata: cfg.exposeRetrievalMetadata === true,
   };
 }
 
