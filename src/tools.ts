@@ -28,8 +28,14 @@ export const MEMORY_CATEGORIES = [
   "fact",
   "decision",
   "entity",
+  "reflection",
   "other",
 ] as const;
+
+export type MdMirrorWriter = (
+  entry: { text: string; category: string; scope: string; timestamp?: number },
+  meta?: { source?: string; agentId?: string },
+) => Promise<void>;
 
 interface ToolContext {
   retriever: MemoryRetriever;
@@ -43,6 +49,8 @@ interface ToolContext {
     warn?: (message: string) => void;
   };
   agentId?: string;
+  workspaceDir?: string;
+  mdMirror?: MdMirrorWriter | null;
 }
 
 function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
@@ -74,7 +82,8 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
   return results.map((r) => ({
     id: r.entry.id,
     text: r.entry.text,
-    category: r.entry.category,
+    category: getDisplayCategoryTag(r.entry),
+    rawCategory: r.entry.category,
     scope: r.entry.scope,
     importance: r.entry.importance,
     score: r.score,
@@ -227,7 +236,8 @@ export function registerMemoryRecallTool(
               if (r.sources.bm25) sources.push("BM25");
               if (r.sources.reranked) sources.push("reranked");
 
-              return `${i + 1}. [${r.entry.id}] [${r.entry.category}:${r.entry.scope}] ${r.entry.text} (${(r.score * 100).toFixed(0)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
+              const categoryTag = getDisplayCategoryTag(r.entry);
+              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text} (${(r.score * 100).toFixed(0)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
             })
             .join("\n");
 
@@ -338,9 +348,17 @@ export function registerMemoryStoreTool(
           const vector = await context.embedder.embedPassage(text);
 
           // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
-          const existing = await context.store.vectorSearch(vector, 1, 0.1, [
-            targetScope,
-          ]);
+          // Fail-open by design: dedup must never block a legitimate memory write.
+          let existing: Awaited<ReturnType<typeof context.store.vectorSearch>> = [];
+          try {
+            existing = await context.store.vectorSearch(vector, 1, 0.1, [
+              targetScope,
+            ]);
+          } catch (err) {
+            console.warn(
+              `memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`,
+            );
+          }
 
           if (existing.length > 0 && existing[0].score > 0.98) {
             return {
@@ -1187,7 +1205,8 @@ export function registerMemoryListTool(
               const date = new Date(entry.timestamp)
                 .toISOString()
                 .split("T")[0];
-              return `${safeOffset + i + 1}. [${entry.id}] [${entry.category}:${entry.scope}] ${entry.text.slice(0, 100)}${entry.text.length > 100 ? "..." : ""} (${date})`;
+              const categoryTag = getDisplayCategoryTag(entry);
+              return `${safeOffset + i + 1}. [${entry.id}] [${categoryTag}] ${entry.text.slice(0, 100)}${entry.text.length > 100 ? "..." : ""} (${date})`;
             })
             .join("\n");
 
@@ -1203,7 +1222,8 @@ export function registerMemoryListTool(
               memories: entries.map((e) => ({
                 id: e.id,
                 text: e.text,
-                category: e.category,
+                category: getDisplayCategoryTag(e),
+                rawCategory: e.category,
                 scope: e.scope,
                 importance: e.importance,
                 timestamp: e.timestamp,
@@ -1261,6 +1281,13 @@ export function registerAllMemoryTools(
     registerMemoryListTool(api, context);
     registerSelfImprovementLogTool(api, context);
     registerSelfImprovementExtractSkillTool(api, context);
+  }
+  if (options.enableSelfImprovementTools !== false) {
+    registerSelfImprovementLogTool(api, context);
+    if (options.enableManagementTools) {
+      registerSelfImprovementExtractSkillTool(api, context);
+      registerSelfImprovementReviewTool(api, context);
+    }
   }
 }
 function safeParseJson(value: string | undefined): Record<string, unknown> {

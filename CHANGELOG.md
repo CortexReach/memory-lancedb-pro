@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.1.0-beta.6
+
+- Refactor: build reset/new reflection handoff note in `runMemoryReflection`.
+- Refactor: `<open-loops>` now comes from the fresh reflection run, while `<derived-focus>` comes from historical scored itemized derived rows.
+- Refactor: upgrade historical `<derived-focus>` ranking to Derived-Focus V2 (conservative strict/soft normalization, non-linear group scoring, diversity-aware shortlist up to 36 before final note injection capped at 13, with no hard `score > 0.3` gate).
+- Breaking: stop writing and stop reading legacy combined reflection rows (`type=memory-reflection`).
+- Docs: refresh README / README_CN for the new handoff-note behavior and remove old legacy combined guidance.
+
+---
+
+## 1.1.0
+
+- Feat: add integrated self-improvement governance flow (`agent:bootstrap`, `command:new/reset`, governance tools, and `.learnings` file bootstrap).
+- Feat: add `memoryReflection` session strategy with inheritance/derived injection, reflection persistence, and dedicated reflection-agent support.
+- Fix: keep session-strategy compatibility by mapping legacy `sessionMemory.enabled` to `systemSessionMemory` / `none` and trimming reflection input toward recent conversation tail.
+- Fix: retry early transient upstream reflection failures once and broaden session recovery search paths to real OpenClaw agent session directories.
+- Docs: update README / README_CN for session strategy, self-improvement, memoryReflection, mdMirror, and reflection fallback behavior.
+- Tests: add targeted coverage for reflection retry classification and session recovery path resolution.
+
+PRs: #43, #2
+
+---
+
+## 1.0.32
+
+- Fix: strip OpenClaw `Conversation info` / `Sender` metadata noise before auto-capture matching and adaptive retrieval normalization, reducing false captures and noisy retrieval triggers.
+- Fix: parse `autoRecallMinRepeated` from plugin config so repeated-memory suppression works when configured.
+
+PR: #50
+
+---
+
+
+## 1.0.31
+
+- Fix: `memory-pro import` now preserves provided IDs and is idempotent (skips if ID already exists).
+
 ## 1.0.26
 
 **Access Reinforcement for Time Decay**

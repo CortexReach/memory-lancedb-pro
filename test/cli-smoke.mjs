@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -47,14 +47,23 @@ async function runCliSmoke() {
   const program = new Command();
   program.exitOverride();
 
+  const { MemoryStore } = jiti("../src/store.ts");
+
+  const store = new MemoryStore({
+    dbPath: path.join(workDir, "target-db"),
+    vectorDim: 4,
+  });
+
   const context = {
-    // Minimal store interface for reembed dry-run.
-    store: { dbPath: path.join(workDir, "target-db") },
-    retriever: {},
-    scopeManager: {},
+    store,
+    // Only used for similarity-based dedupe when the import file has no id.
+    retriever: { retrieve: async () => [] },
+    scopeManager: { getDefaultScope: () => "global" },
     migrator: {},
-    // Presence required, but dry-run exits before embeddings.
-    embedder: {},
+    // Stub embedder used by import/reembed.
+    embedder: {
+      embedPassage: async () => [0, 0, 0, 0],
+    },
   };
 
   // Register commands under `memory-pro`
@@ -78,7 +87,71 @@ async function runCliSmoke() {
     "--dry-run",
   ]);
 
-  // 3) Access reinforcement formula smoke test
+  // 3) import should preserve id and be idempotent (skip on second import)
+  const importId = "smoke_import_id_1";
+  const importPhrase = `smoke-import-${Date.now()}`;
+  const importFile = path.join(workDir, "import-test.json");
+
+  writeFileSync(
+    importFile,
+    JSON.stringify(
+      {
+        version: "1.0",
+        exportedAt: new Date().toISOString(),
+        count: 1,
+        filters: {},
+        memories: [
+          {
+            id: importId,
+            text: `Import smoke test. UniquePhrase=${importPhrase}.`,
+            category: "other",
+            scope: "global",
+            importance: 0.3,
+            timestamp: Date.now(),
+            metadata: "{}",
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+  );
+
+  const captureLogs = async (argv) => {
+    const logs = [];
+    const origLog = console.log;
+    console.log = (...args) => logs.push(args.join(" "));
+    try {
+      await program.parseAsync(argv);
+    } finally {
+      console.log = origLog;
+    }
+    return logs.join("\n");
+  };
+
+  const out1 = await captureLogs([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "import",
+    importFile,
+    "--scope",
+    "agent:smoke",
+  ]);
+  assert.match(out1, /Import completed: 1 imported/, out1);
+
+  const out2 = await captureLogs([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "import",
+    importFile,
+    "--scope",
+    "agent:smoke",
+  ]);
+  assert.match(out2, /Import completed: 0 imported, 1 skipped/, out2);
+
+  // 4) Access reinforcement formula smoke test
   const { parseAccessMetadata, buildUpdatedMetadata, computeEffectiveHalfLife } =
     jiti("../src/access-tracker.ts");
 

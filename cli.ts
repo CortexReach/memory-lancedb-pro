@@ -379,25 +379,78 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
               continue;
             }
 
-            // Check for duplicates
-            const existing = await context.retriever.retrieve({
-              query: text,
-              limit: 1,
-              scopeFilter: [targetScope],
-            });
-            if (existing.length > 0 && existing[0].score > 0.95) {
+            const categoryRaw = memory.category;
+            const category: MemoryEntry["category"] =
+              categoryRaw === "preference" ||
+              categoryRaw === "fact" ||
+              categoryRaw === "decision" ||
+              categoryRaw === "entity" ||
+              categoryRaw === "other"
+                ? categoryRaw
+                : "other";
+
+            const importanceRaw = Number(memory.importance);
+            const importance = Number.isFinite(importanceRaw)
+              ? Math.max(0, Math.min(1, importanceRaw))
+              : 0.7;
+
+            const timestampRaw = Number(memory.timestamp);
+            const timestamp = Number.isFinite(timestampRaw) ? timestampRaw : Date.now();
+
+            const metadataRaw = memory.metadata;
+            const metadata =
+              typeof metadataRaw === "string"
+                ? metadataRaw
+                : metadataRaw != null
+                  ? JSON.stringify(metadataRaw)
+                  : "{}";
+
+            const idRaw = memory.id;
+            const id = typeof idRaw === "string" && idRaw.length > 0 ? idRaw : undefined;
+
+            // Idempotency: if the import file includes an id and we already have it, skip.
+            if (id && (await context.store.hasId(id))) {
               skipped++;
               continue;
             }
 
+            // Back-compat dedupe: if no id provided, do a best-effort similarity check.
+            if (!id) {
+              const existing = await context.retriever.retrieve({
+                query: text,
+                limit: 1,
+                scopeFilter: [targetScope],
+              });
+              if (existing.length > 0 && existing[0].score > 0.95) {
+                skipped++;
+                continue;
+              }
+            }
+
             const vector = await context.embedder.embedPassage(text);
-            await context.store.store({
-              text,
-              vector,
-              importance: memory.importance ?? 0.7,
-              category: memory.category || "other",
-              scope: targetScope,
-            });
+
+            if (id) {
+              await context.store.importEntry({
+                id,
+                text,
+                vector,
+                category,
+                scope: targetScope,
+                importance,
+                timestamp,
+                metadata,
+              });
+            } else {
+              await context.store.store({
+                text,
+                vector,
+                importance,
+                category,
+                scope: targetScope,
+                metadata,
+              });
+            }
+
             imported++;
           } catch (error) {
             console.warn(`Failed to import memory: ${error}`);

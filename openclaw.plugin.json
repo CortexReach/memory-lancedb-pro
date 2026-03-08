@@ -2,7 +2,7 @@
   "id": "memory-lancedb-pro",
   "name": "Memory (LanceDB Pro)",
   "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, long-context chunking, and management CLI",
-  "version": "1.0.26",
+  "version": "1.1.0-beta.6",
   "kind": "memory",
   "configSchema": {
     "type": "object",
@@ -71,7 +71,17 @@
       "enableManagementTools": {
         "type": "boolean",
         "default": false,
-        "description": "Enable memory_list and memory_stats management tools"
+        "description": "Enable management/debug tools such as memory_list, memory_stats, and governance-oriented self-improvement review/extract actions"
+      },
+      "sessionStrategy": {
+        "type": "string",
+        "enum": [
+          "memoryReflection",
+          "systemSessionMemory",
+          "none"
+        ],
+        "default": "systemSessionMemory",
+        "description": "Choose session pipeline: plugin memory-reflection, built-in session-memory, or none"
       },
       "autoCapture": {
         "type": "boolean"
@@ -93,6 +103,54 @@
         "maximum": 100,
         "default": 0,
         "description": "Minimum number of turns before the same memory can be recalled again in the same session. Set to 0 to disable deduplication (default behavior: inject all memories)."
+      },
+      "autoRecallTopK": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20,
+        "default": 3,
+        "description": "Maximum number of rows injected into <relevant-memories> for each turn."
+      },
+      "autoRecallCategories": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "enum": [
+            "preference",
+            "fact",
+            "decision",
+            "entity",
+            "other",
+            "reflection"
+          ]
+        },
+        "default": [
+          "preference",
+          "fact",
+          "decision",
+          "entity",
+          "other"
+        ],
+        "description": "Allowlist of memory categories eligible for generic Auto-Recall."
+      },
+      "autoRecallExcludeReflection": {
+        "type": "boolean",
+        "default": true,
+        "description": "Exclude category=reflection rows from generic Auto-Recall."
+      },
+      "autoRecallMaxAgeDays": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 3650,
+        "default": 30,
+        "description": "Drop Auto-Recall candidates older than this many days."
+      },
+      "autoRecallMaxEntriesPerKey": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100,
+        "default": 10,
+        "description": "Per normalized text key, keep only the most recent N entries before Auto-Recall final trimming."
       },
       "captureAssistant": {
         "type": "boolean"
@@ -156,10 +214,11 @@
               "jina",
               "siliconflow",
               "voyage",
-              "pinecone"
+              "pinecone",
+              "vllm"
             ],
             "default": "jina",
-            "description": "Reranker provider format. Determines request/response shape and auth header."
+            "description": "Reranker provider format. Determines request/response shape and auth header. Use 'vllm' for Docker Model Runner."
           },
           "candidatePoolSize": {
             "type": "integer",
@@ -226,18 +285,164 @@
       "sessionMemory": {
         "type": "object",
         "additionalProperties": false,
+        "description": "Deprecated legacy switch. Kept for compatibility and mapped to sessionStrategy.",
         "properties": {
           "enabled": {
             "type": "boolean",
-            "default": true,
-            "description": "Store session summaries to LanceDB on /new command (replaces built-in session-memory hook)"
+            "description": "Deprecated. true -> sessionStrategy=systemSessionMemory, false -> sessionStrategy=none."
           },
           "messageCount": {
             "type": "integer",
             "minimum": 1,
             "maximum": 100,
             "default": 15,
-            "description": "Number of recent messages to include in session summary"
+            "description": "Legacy compatibility field. Mapped to memoryReflection.messageCount."
+          }
+        }
+      },
+      "selfImprovement": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "beforeResetNote": {
+            "type": "boolean",
+            "default": true
+          },
+          "skipSubagentBootstrap": {
+            "type": "boolean",
+            "default": true
+          },
+          "ensureLearningFiles": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "memoryReflection": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "storeToLanceDB": {
+            "type": "boolean",
+            "default": true
+          },
+          "injectMode": {
+            "type": "string",
+            "enum": [
+              "inheritance-only",
+              "inheritance+derived"
+            ],
+            "default": "inheritance+derived"
+          },
+          "agentId": {
+            "type": "string",
+            "description": "Optional dedicated agent id used to run reflection generation (for example: memory-distiller)."
+          },
+          "messageCount": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500,
+            "default": 120
+          },
+          "maxInputChars": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 200000,
+            "default": 24000
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 120000,
+            "default": 20000
+          },
+          "thinkLevel": {
+            "type": "string",
+            "enum": [
+              "off",
+              "minimal",
+              "low",
+              "medium",
+              "high"
+            ],
+            "default": "medium"
+          },
+          "errorReminderMaxEntries": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "default": 3
+          },
+          "dedupeErrorSignals": {
+            "type": "boolean",
+            "default": true
+          },
+          "recall": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "fixed",
+                  "dynamic"
+                ],
+                "default": "fixed"
+              },
+              "topK": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
+                "default": 6
+              },
+              "includeKinds": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "invariant",
+                    "derived"
+                  ]
+                },
+                "default": [
+                  "invariant"
+                ]
+              },
+              "maxAgeDays": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3650,
+                "default": 45
+              },
+              "maxEntriesPerKey": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 10
+              },
+              "minRepeated": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100,
+                "default": 2
+              },
+              "minScore": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 5,
+                "default": 0.18
+              },
+              "minPromptLength": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 8
+              }
+            }
           }
         }
       },
@@ -361,6 +566,21 @@
             }
           }
         }
+      },
+      "mdMirror": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable dual-write: store memories in both LanceDB and human-readable Markdown files"
+          },
+          "dir": {
+            "type": "string",
+            "description": "Fallback directory for Markdown mirror files when agent workspace is unknown"
+          }
+        }
       }
     },
     "required": [
@@ -437,6 +657,31 @@
       "help": "Minimum number of conversation turns before a specific memory can be re-injected in the same session.",
       "advanced": true
     },
+    "autoRecallTopK": {
+      "label": "Auto-Recall Top K",
+      "help": "Maximum rows injected into <relevant-memories> each turn.",
+      "advanced": true
+    },
+    "autoRecallCategories": {
+      "label": "Auto-Recall Categories",
+      "help": "Allowlist of categories eligible for generic auto-recall.",
+      "advanced": true
+    },
+    "autoRecallExcludeReflection": {
+      "label": "Exclude Reflection From Auto-Recall",
+      "help": "Exclude category=reflection rows from <relevant-memories>.",
+      "advanced": true
+    },
+    "autoRecallMaxAgeDays": {
+      "label": "Auto-Recall Max Age (days)",
+      "help": "Drop auto-recall candidates older than this many days.",
+      "advanced": true
+    },
+    "autoRecallMaxEntriesPerKey": {
+      "label": "Auto-Recall Max Entries Per Key",
+      "help": "Per normalized text key, keep only the most recent N entries before top-k trimming.",
+      "advanced": true
+    },
     "captureAssistant": {
       "label": "Capture Assistant Messages",
       "help": "Also auto-capture assistant messages (default false to reduce memory pollution)",
@@ -488,7 +733,7 @@
     },
     "retrieval.rerankProvider": {
       "label": "Reranker Provider",
-      "help": "Provider format: jina (default), siliconflow, voyage, or pinecone",
+      "help": "Provider format: jina (default), siliconflow, voyage, pinecone, or vllm (Docker Model Runner)",
       "advanced": true
     },
     "retrieval.candidatePoolSize": {
@@ -512,12 +757,122 @@
       "advanced": true
     },
     "sessionMemory.enabled": {
-      "label": "Session Memory",
-      "help": "Store session summaries to LanceDB when /new is triggered (replaces built-in session-memory hook)"
+      "label": "Session Memory (Deprecated)",
+      "help": "Legacy compatibility: true maps to systemSessionMemory, false maps to none.",
+      "advanced": true
     },
     "sessionMemory.messageCount": {
-      "label": "Session Message Count",
-      "help": "Number of recent messages to include in session summaries",
+      "label": "Session Message Count (Legacy)",
+      "help": "Legacy compatibility field; mapped to memoryReflection.messageCount.",
+      "advanced": true
+    },
+    "sessionStrategy": {
+      "label": "Session Strategy",
+      "help": "memoryReflection / systemSessionMemory / none",
+      "advanced": true
+    },
+    "selfImprovement.enabled": {
+      "label": "Self-Improvement",
+      "help": "Enable self-improvement reminder and governance tools"
+    },
+    "selfImprovement.beforeResetNote": {
+      "label": "Reset Reminder Note",
+      "help": "Append /note reminder before /new and /reset",
+      "advanced": true
+    },
+    "selfImprovement.skipSubagentBootstrap": {
+      "label": "Skip Subagent Bootstrap",
+      "help": "Do not inject reminder file into subagent bootstrap context",
+      "advanced": true
+    },
+    "selfImprovement.ensureLearningFiles": {
+      "label": "Ensure Learning Files",
+      "help": "Auto-create .learnings files when missing",
+      "advanced": true
+    },
+    "memoryReflection.storeToLanceDB": {
+      "label": "Store Reflection To LanceDB",
+      "help": "Persist reflection event + item rows to LanceDB (effective only under memoryReflection strategy)",
+      "advanced": true
+    },
+    "memoryReflection.injectMode": {
+      "label": "Reflection Inject Mode",
+      "help": "inheritance-only or inheritance+derived",
+      "advanced": true
+    },
+    "memoryReflection.agentId": {
+      "label": "Reflection Agent Id",
+      "help": "Optional dedicated agent id used for reflection generation (e.g. memory-distiller)",
+      "advanced": true
+    },
+    "memoryReflection.messageCount": {
+      "label": "Reflection Message Count",
+      "help": "Recent messages included in reflection input",
+      "advanced": true
+    },
+    "memoryReflection.maxInputChars": {
+      "label": "Reflection Max Input Chars",
+      "help": "Max prompt chars sent to reflection run",
+      "advanced": true
+    },
+    "memoryReflection.timeoutMs": {
+      "label": "Reflection Timeout (ms)",
+      "help": "Timeout for reflection run",
+      "advanced": true
+    },
+    "memoryReflection.thinkLevel": {
+      "label": "Reflection Think Level",
+      "help": "off/minimal/low/medium/high",
+      "advanced": true
+    },
+    "memoryReflection.errorReminderMaxEntries": {
+      "label": "Error Reminder Max Entries",
+      "help": "Max recent error hints injected into prompt",
+      "advanced": true
+    },
+    "memoryReflection.dedupeErrorSignals": {
+      "label": "Dedupe Error Signals",
+      "help": "Deduplicate repeated error signatures per session",
+      "advanced": true
+    },
+    "memoryReflection.recall.mode": {
+      "label": "Reflection-Recall Mode",
+      "help": "fixed keeps compatibility inheritance; dynamic enables prompt-gated Reflection-Recall.",
+      "advanced": true
+    },
+    "memoryReflection.recall.topK": {
+      "label": "Reflection-Recall Top K",
+      "help": "Maximum rows injected into <inherited-rules> in dynamic mode.",
+      "advanced": true
+    },
+    "memoryReflection.recall.includeKinds": {
+      "label": "Reflection-Recall Include Kinds",
+      "help": "Which reflection item kinds are considered in dynamic mode (invariant/derived).",
+      "advanced": true
+    },
+    "memoryReflection.recall.maxAgeDays": {
+      "label": "Reflection-Recall Max Age (days)",
+      "help": "Drop dynamic reflection candidates older than this many days.",
+      "advanced": true
+    },
+    "memoryReflection.recall.maxEntriesPerKey": {
+      "label": "Reflection-Recall Max Entries Per Key",
+      "help": "Per normalized key, keep only the most recent N rows before dynamic aggregation.",
+      "advanced": true
+    },
+    "memoryReflection.recall.minRepeated": {
+      "label": "Reflection-Recall Min Repeated",
+      "help": "Minimum turn gap before re-injecting the same dynamic reflection row in one session.",
+      "advanced": true
+    },
+    "memoryReflection.recall.minScore": {
+      "label": "Reflection-Recall Min Score",
+      "help": "Minimum aggregated score required for dynamic reflection injection.",
+      "advanced": true
+    },
+    "memoryReflection.recall.minPromptLength": {
+      "label": "Reflection-Recall Min Prompt Length",
+      "help": "Prompts shorter than this are skipped in dynamic reflection mode.",
       "advanced": true
     },
     "graphiti.enabled": {
@@ -563,7 +918,16 @@
     },
     "enableManagementTools": {
       "label": "Management Tools",
-      "help": "Enable memory_list and memory_stats tools for debugging and auditing",
+      "help": "Enable management/debug tools such as memory_list, memory_stats, and governance-oriented self-improvement review/extract actions.",
+      "advanced": true
+    },
+    "mdMirror.enabled": {
+      "label": "Markdown Mirror",
+      "help": "Write a human-readable Markdown copy alongside LanceDB storage (dual-write mode)"
+    },
+    "mdMirror.dir": {
+      "label": "Mirror Fallback Directory",
+      "help": "Fallback directory when agent workspace mapping is unavailable",
       "advanced": true
     }
   }

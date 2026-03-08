@@ -39,8 +39,9 @@ export interface RetrievalConfig {
    *  - "jina" (default): Authorization: Bearer, string[] documents, results[].relevance_score
    *  - "siliconflow": same format as jina (alias, for clarity)
    *  - "voyage": Authorization: Bearer, string[] documents, data[].relevance_score
-   *  - "pinecone": Api-Key header, {text}[] documents, data[].score */
-  rerankProvider?: "jina" | "siliconflow" | "voyage" | "pinecone";
+   *  - "pinecone": Api-Key header, {text}[] documents, data[].score
+   *  - "vllm": No auth, string[] documents, results[].relevance_score (Docker Model Runner) */
+  rerankProvider?: "jina" | "siliconflow" | "voyage" | "pinecone" | "vllm";
   /**
    * Length normalization: penalize long entries that dominate via sheer keyword
    * density. Formula: score *= 1 / (1 + log2(charLen / anchor)).
@@ -131,7 +132,7 @@ function clamp01(value: number, fallback: number): number {
 // Rerank Provider Adapters
 // ============================================================================
 
-type RerankProvider = "jina" | "siliconflow" | "voyage" | "pinecone";
+type RerankProvider = "jina" | "siliconflow" | "voyage" | "pinecone" | "vllm";
 
 interface RerankItem {
   index: number;
@@ -175,6 +176,19 @@ function buildRerankRequest(
           documents,
           // Voyage uses top_k (not top_n) to limit reranked outputs.
           top_k: topN,
+        },
+      };
+    case "vllm":
+      // Docker Model Runner / vLLM: no auth required, runs locally
+      return {
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: {
+          model,
+          query,
+          documents,
+          top_n: topN,
         },
       };
     case "siliconflow":
@@ -242,10 +256,11 @@ function parseRerankResponse(
         parseItems(data.results, ["relevance_score", "score"])
       );
     }
+    case "vllm":
     case "siliconflow":
     case "jina":
     default: {
-      // Jina / SiliconFlow: usually { results: [{ index, relevance_score }] }
+      // Jina / SiliconFlow / vLLM: usually { results: [{ index, relevance_score }] }
       // Also tolerate data[] for compatibility across gateways.
       return (
         parseItems(data.results, ["relevance_score", "score"]) ??
@@ -573,18 +588,30 @@ export class MemoryRetriever {
     }
 
     // Try cross-encoder rerank via configured provider API
-    if (this.config.rerank === "cross-encoder" && this.config.rerankApiKey) {
+    // vLLM (Docker Model Runner) doesn't require an API key
+    const provider = this.config.rerankProvider || "jina";
+    const needsApiKey = provider !== "vllm";
+    const hasApiKey = !!this.config.rerankApiKey;
+
+    if (this.config.rerank === "cross-encoder" && (!needsApiKey || hasApiKey)) {
       try {
-        const provider = this.config.rerankProvider || "jina";
         const model = this.config.rerankModel || "jina-reranker-v3";
         const endpoint =
           this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
         const documents = results.map((r) => r.entry.text);
 
+        // vLLM requires a custom endpoint - fail fast if using default Jina endpoint
+        if (provider === "vllm" && !this.config.rerankEndpoint) {
+          throw new Error(
+            "vLLM rerank provider requires rerankEndpoint to be configured. " +
+              "Example: http://host.docker.internal:12434/engines/vllm/rerank"
+          );
+        }
+
         // Build provider-specific request
         const { headers, body } = buildRerankRequest(
           provider,
-          this.config.rerankApiKey,
+          this.config.rerankApiKey || "", // vLLM doesn't use it anyway
           model,
           query,
           documents,

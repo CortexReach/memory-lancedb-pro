@@ -116,6 +116,13 @@ const EMBEDDING_DIMENSIONS: Record<string, number> = {
   // Jina v5
   "jina-embeddings-v5-text-small": 1024,
   "jina-embeddings-v5-text-nano": 768,
+
+  // Qwen3 Embedding (Docker Model Runner)
+  "ai/qwen3-embedding": 1024, // default tag (4B)
+  "ai/qwen3-embedding:0.6B-F16": 1024,
+  "ai/qwen3-embedding:4B": 1024,
+  "ai/qwen3-embedding:4B-Q4_K_M": 1024,
+  "ai/qwen3-embedding:8B-Q4_K_M": 1024,
 };
 
 // ============================================================================
