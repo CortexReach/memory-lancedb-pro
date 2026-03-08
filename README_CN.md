@@ -326,7 +326,7 @@ Query → BM25 FTS ─────┘
 
 ## 安装
 
-> **🧪 Beta 版本可用：v1.1.0-beta.5**
+> **🧪 Beta 版本可用：v1.1.0-beta.6**
 >
 > Beta 版包含多项重大新特性：**Self-Improvement 治理流**、**memoryReflection 会话策略**、**Markdown 镜像双写**、以及改进的 Embedding 错误诊断。稳定版 `latest` 仍为 v1.0.32。
 >
@@ -338,7 +338,7 @@ Query → BM25 FTS ─────┘
 > npm install memory-lancedb-pro
 > ```
 >
-> 详见 [Release Notes](https://github.com/win4r/memory-lancedb-pro/releases/tag/v1.1.0-beta.5)。欢迎通过 [GitHub Issues](https://github.com/win4r/memory-lancedb-pro/issues) 反馈问题。
+> 详见 [Release Notes](https://github.com/win4r/memory-lancedb-pro/releases/tag/v1.1.0-beta.6)。欢迎通过 [GitHub Issues](https://github.com/win4r/memory-lancedb-pro/issues) 反馈问题。
 
 ### AI 安装指引（防幻觉版）
 

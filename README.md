@@ -325,7 +325,7 @@ Add a line to your agent system prompt, e.g.:
 
 ## Installation
 
-> **🧪 Beta available: v1.1.0-beta.5**
+> **🧪 Beta available: v1.1.0-beta.6**
 >
 > A beta release is available with major new features: **Self-Improvement governance**, **memoryReflection session strategy**, **Markdown Mirror**, and improved embedding error diagnostics. The stable `latest` remains at v1.0.32.
 >
@@ -337,7 +337,7 @@ Add a line to your agent system prompt, e.g.:
 > npm install memory-lancedb-pro
 > ```
 >
-> See [Release Notes](https://github.com/win4r/memory-lancedb-pro/releases/tag/v1.1.0-beta.5) for details. Feedback welcome via [GitHub Issues](https://github.com/win4r/memory-lancedb-pro/issues).
+> See [Release Notes](https://github.com/win4r/memory-lancedb-pro/releases/tag/v1.1.0-beta.6) for details. Feedback welcome via [GitHub Issues](https://github.com/win4r/memory-lancedb-pro/issues).
 
 ### AI-safe install notes (anti-hallucination)
 

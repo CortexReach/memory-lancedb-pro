@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.0-beta.5
+## 1.1.0-beta.6
 
 - Refactor: build reset/new reflection handoff note in `runMemoryReflection`.
 - Refactor: `<open-loops>` now comes from the fresh reflection run, while `<derived-focus>` comes from historical scored itemized derived rows.
