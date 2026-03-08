@@ -708,11 +708,11 @@ const memoryLanceDBProPlugin = {
           const minRepeated = config.autoRecallMinRepeated ?? 0;
 
           // Only enable dedup logic when minRepeated > 0
-          let finalResults = results;
+          let finalResults = filtered;
 
           if (minRepeated > 0) {
             const sessionHistory = recallHistory.get(sessionId) || new Map<string, number>();
-            const filteredResults = results.filter((r) => {
+            const filteredResults = filtered.filter((r) => {
               const lastTurn = sessionHistory.get(r.entry.id) ?? -999;
               const diff = currentTurn - lastTurn;
               const isRedundant = diff < minRepeated;
@@ -726,9 +726,9 @@ const memoryLanceDBProPlugin = {
             });
 
             if (filteredResults.length === 0) {
-              if (results.length > 0) {
+              if (filtered.length > 0) {
                 api.logger.info?.(
-                  `memory-lancedb-pro: all ${results.length} memories were filtered out due to redundancy policy`,
+                  `memory-lancedb-pro: all ${filtered.length} memories were filtered out due to redundancy policy`,
                 );
               }
               return;
