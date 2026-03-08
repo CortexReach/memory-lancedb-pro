@@ -1,11 +1,18 @@
 import type { MemoryEntry } from "./store.js";
 
 export type PromotionTarget = "USER" | "AGENTS" | "IDENTITY" | "SOUL";
+export type PromotionQueueReason =
+  | "contradiction_detected"
+  | "low_confidence_inferred"
+  | "missing_confidence_score"
+  | "insufficient_repeat_evidence"
+  | "awaiting_manual_review"
+  | "not_promotable";
 
 export interface PromotionQueueItem {
   entry: MemoryEntry;
   target: PromotionTarget;
-  reason: string;
+  reason: PromotionQueueReason;
   assertionKind: string;
   confidence: number;
   repeatCount: number;
@@ -22,6 +29,7 @@ export interface PromotionPolicyResult {
   queue: PromotionQueueItem[];
   contradictions: PromotionContradiction[];
   inferredCandidates: MemoryEntry[];
+  reasonStats: Record<string, number>;
 }
 
 interface AnalyzedEntry {
@@ -40,6 +48,7 @@ export function applyPromotionPolicy(entries: MemoryEntry[]): PromotionPolicyRes
     SOUL: [],
   };
   const queue: PromotionQueueItem[] = [];
+  const reasonStats: Record<string, number> = {};
 
   const analyzed = entries.map((entry) => {
     const metadata = safeParseJson(entry.metadata);
@@ -87,17 +96,34 @@ export function applyPromotionPolicy(entries: MemoryEntry[]): PromotionPolicyRes
     .slice(0, 24);
 
   for (const row of analyzed) {
-    const target = inferPromotionTarget(row.entry);
-    if (!target) continue;
+    const inferredTarget = inferPromotionTarget(row.entry);
+    const promotionState = readPromotionState(row.metadata);
+    const target = promotionState.target || inferredTarget;
+    if (!target) {
+      pushReason(reasonStats, "not_promotable");
+      continue;
+    }
+
+    if (promotionState.status === "rejected") {
+      pushReason(reasonStats, "awaiting_manual_review");
+      continue;
+    }
+
+    if (promotionState.status === "approved") {
+      promotedByTarget[target].push(row.entry);
+      continue;
+    }
 
     const assertionKind = typeof row.metadata.assertionKind === "string"
       ? row.metadata.assertionKind
       : "asserted";
-    const confidence = typeof row.metadata.confidence === "number"
+    const confidenceRaw = row.metadata.confidence;
+    const confidence = typeof confidenceRaw === "number"
       ? row.metadata.confidence
       : assertionKind === "asserted"
         ? 1
         : 0;
+    const missingConfidence = assertionKind === "inferred" && typeof confidenceRaw !== "number";
     const repeatCount = repeatCounts.get(row.normalized) || 1;
 
     const trustPassed = assertionKind === "asserted" ||
@@ -109,10 +135,13 @@ export function applyPromotionPolicy(entries: MemoryEntry[]): PromotionPolicyRes
       continue;
     }
 
-    let reason = "insufficient_evidence";
+    let reason: PromotionQueueReason = "awaiting_manual_review";
     if (contradicted) reason = "contradiction_detected";
+    else if (missingConfidence) reason = "missing_confidence_score";
     else if (assertionKind === "inferred" && confidence < 0.8) reason = "low_confidence_inferred";
     else if (assertionKind === "inferred" && repeatCount < 2) reason = "insufficient_repeat_evidence";
+
+    pushReason(reasonStats, reason);
 
     queue.push({
       entry: row.entry,
@@ -134,7 +163,24 @@ export function applyPromotionPolicy(entries: MemoryEntry[]): PromotionPolicyRes
     queue: queue.slice(0, 40),
     contradictions: contradictions.slice(0, 20),
     inferredCandidates,
+    reasonStats,
   };
+}
+
+function pushReason(stats: Record<string, number>, reason: PromotionQueueReason): void {
+  stats[reason] = (stats[reason] || 0) + 1;
+}
+
+function readPromotionState(metadata: Record<string, unknown>): { status?: string; target?: PromotionTarget } {
+  const promotion = metadata.promotion;
+  if (!promotion || typeof promotion !== "object") return {};
+  const obj = promotion as Record<string, unknown>;
+  const status = typeof obj.status === "string" ? obj.status : undefined;
+  const targetRaw = typeof obj.target === "string" ? obj.target : undefined;
+  const target = targetRaw === "USER" || targetRaw === "AGENTS" || targetRaw === "IDENTITY" || targetRaw === "SOUL"
+    ? targetRaw
+    : undefined;
+  return { status, target };
 }
 
 function inferPromotionTarget(entry: MemoryEntry): PromotionTarget | undefined {

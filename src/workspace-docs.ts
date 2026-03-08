@@ -193,6 +193,13 @@ function buildDocs(input: {
         ? queueRows.map((item) => `- [${item.target}] ${item.entry.text.replace(/\s+/g, " ").slice(0, 120)} (reason=${item.reason}, confidence=${item.confidence.toFixed(2)}, repeat=${item.repeatCount})`)
         : ["- Promotion queue is empty."]),
       "",
+      "## Queue Reason Stats",
+      ...(Object.keys(policy.reasonStats).length > 0
+        ? Object.entries(policy.reasonStats)
+          .sort((a, b) => b[1] - a[1])
+          .map(([reason, count]) => `- ${reason}: ${count}`)
+        : ["- No queue reason stats available."]),
+      "",
       "## Contradictions",
       ...(policy.contradictions.length > 0
         ? policy.contradictions.slice(0, 8).map((item) => `- ${item.positive.slice(0, 80)} <-> ${item.negative.slice(0, 80)}`)

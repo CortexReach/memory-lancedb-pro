@@ -11,6 +11,10 @@ import type { MemoryRetriever } from "./src/retriever.js";
 import type { MemoryScopeManager } from "./src/scopes.js";
 import type { MemoryMigrator } from "./src/migrate.js";
 import { createWorkspaceDocsMaterializer } from "./src/workspace-docs.js";
+import { applyPromotionPolicy } from "./src/promotion-policy.js";
+import type { GraphitiBridge } from "./src/graphiti/bridge.js";
+import type { GraphitiSyncService } from "./src/graphiti/sync.js";
+import type { GraphitiPluginConfig } from "./src/graphiti/types.js";
 
 // ============================================================================
 // Types
@@ -22,6 +26,24 @@ interface CLIContext {
   scopeManager: MemoryScopeManager;
   migrator: MemoryMigrator;
   embedder?: import("./src/embedder.js").Embedder;
+  graphitiBridge?: GraphitiBridge;
+  graphitiSync?: GraphitiSyncService;
+  graphitiConfig?: GraphitiPluginConfig;
+  graphInferenceRun?: (options: {
+    reason: string;
+    dryRun?: boolean;
+    includeScopes?: string[];
+    excludeScopes?: string[];
+    forceRun?: boolean;
+  }) => Promise<{
+    reason: string;
+    dryRun: boolean;
+    scopesScanned: number;
+    scopeFilterApplied: string[];
+    candidates: number;
+    stored: number;
+    skippedDuplicate: number;
+  }>;
 }
 
 // ============================================================================
@@ -67,6 +89,68 @@ function safeParseJson(value: unknown): Record<string, unknown> {
     return {};
   }
   return {};
+}
+
+function parseScopeList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return [...new Set(value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0))];
+  }
+  if (typeof value === "string") {
+    return [...new Set(value
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0))];
+  }
+  return [];
+}
+
+function normalizeTarget(value: unknown): "USER" | "AGENTS" | "IDENTITY" | "SOUL" | undefined {
+  if (typeof value !== "string") return undefined;
+  const upper = value.trim().toUpperCase();
+  if (upper === "USER" || upper === "AGENTS" || upper === "IDENTITY" || upper === "SOUL") {
+    return upper;
+  }
+  return undefined;
+}
+
+function detectPromotionTarget(entry: MemoryEntry): "USER" | "AGENTS" | "IDENTITY" | "SOUL" | undefined {
+  const policy = applyPromotionPolicy([entry]);
+  for (const [target, rows] of Object.entries(policy.promotedByTarget)) {
+    if (rows.some((row) => row.id === entry.id)) {
+      return normalizeTarget(target);
+    }
+  }
+  const queued = policy.queue.find((row) => row.entry.id === entry.id);
+  return queued ? queued.target : undefined;
+}
+
+async function resolveMemoryById(
+  store: MemoryStore,
+  idOrPrefix: string,
+  scope?: string,
+): Promise<MemoryEntry | null> {
+  const trimmed = String(idOrPrefix || "").trim();
+  if (!trimmed) return null;
+
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (uuidRegex.test(trimmed)) {
+    const row = await store.getById(trimmed);
+    if (!row) return null;
+    if (scope && row.scope !== scope) return null;
+    return row;
+  }
+
+  const scopeFilter = scope ? [scope] : undefined;
+  const rows = await store.list(scopeFilter, undefined, 2000, 0);
+  const matched = rows.filter((row) => row.id.startsWith(trimmed));
+  if (matched.length === 0) return null;
+  if (matched.length > 1) {
+    throw new Error(`Ambiguous id prefix ${trimmed}; ${matched.length} matches found.`);
+  }
+  return matched[0];
 }
 
 // ============================================================================
@@ -669,6 +753,328 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         console.log(`• Coverage: ${(report.coverage * 100).toFixed(1)}%`);
       } catch (error) {
         console.error("Graph doctor failed:", error);
+        process.exit(1);
+      }
+    });
+
+  const executeGraphSync = async (mode: "backfill" | "resync", options: Record<string, unknown>) => {
+    if (!context.graphitiSync || !context.graphitiConfig?.enabled) {
+      throw new Error("Graph sync is unavailable. Enable graphiti config first.");
+    }
+
+    const limit = clampInt(parseInt(String(options.limit ?? "500"), 10) || 500, 1, 5000);
+    const scopeFilter = typeof options.scope === "string" && options.scope.trim().length > 0
+      ? [options.scope.trim()]
+      : undefined;
+    const dryRun = options.dryRun === true;
+
+    const entries = await context.store.list(scopeFilter, undefined, limit, 0);
+    const candidates = entries.filter((entry) => {
+      if (entry.category === "reflection") return false;
+      if (mode === "resync") return true;
+      const metadata = safeParseJson(entry.metadata);
+      const graphiti = metadata.graphiti && typeof metadata.graphiti === "object"
+        ? (metadata.graphiti as Record<string, unknown>)
+        : undefined;
+      return !graphiti || graphiti.status !== "stored";
+    });
+
+    let synced = 0;
+    let failed = 0;
+    let skipped = 0;
+
+    for (const entry of candidates) {
+      if (dryRun) {
+        synced++;
+        continue;
+      }
+      const result = await context.graphitiSync.syncMemory(
+        {
+          id: entry.id,
+          text: entry.text,
+          scope: entry.scope,
+          category: entry.category,
+          metadata: entry.metadata,
+        },
+        {
+          mode: "memoryStore",
+          source: `graph_sync:${mode}`,
+          mutation: `graph_sync_${mode}`,
+          extraMetadata: {
+            trigger: "memory-pro graph-sync",
+          },
+        },
+      );
+
+      if (!result || result.status === "skipped") skipped++;
+      else if (result.status === "failed") failed++;
+      else synced++;
+    }
+
+    return {
+      mode,
+      dryRun,
+      scanned: entries.length,
+      candidates: candidates.length,
+      synced,
+      failed,
+      skipped,
+      scope: scopeFilter?.[0] || "all",
+    };
+  };
+
+  memory
+    .command("graph-infer")
+    .description("Run Graphiti inference once for validation or manual refresh")
+    .option("--once", "Run one-shot inference (default behavior)", true)
+    .option("--dry-run", "Analyze candidates without storing inferred memories")
+    .option("--scope <scope>", "Single scope filter")
+    .option("--include-scopes <csv>", "Comma-separated scope allowlist")
+    .option("--exclude-scopes <csv>", "Comma-separated scope denylist")
+    .option("--json", "Output as JSON")
+    .action(async (options) => {
+      try {
+        if (!context.graphInferenceRun) {
+          console.error("Graph inference runner is unavailable. Start via plugin runtime with Graphiti enabled.");
+          process.exit(1);
+        }
+
+        const includeScopes = parseScopeList(options.includeScopes);
+        const excludeScopes = parseScopeList(options.excludeScopes);
+        if (typeof options.scope === "string" && options.scope.trim()) {
+          includeScopes.push(options.scope.trim());
+        }
+
+        const result = await context.graphInferenceRun({
+          reason: options.once === false ? "cli" : "cli:once",
+          dryRun: options.dryRun === true,
+          includeScopes,
+          excludeScopes,
+          forceRun: true,
+        });
+
+        if (options.json) {
+          console.log(formatJson(result));
+          return;
+        }
+
+        console.log("Graph Inference Run:");
+        console.log(`• Reason: ${result.reason}`);
+        console.log(`• Dry run: ${result.dryRun ? "Yes" : "No"}`);
+        console.log(`• Scopes scanned: ${result.scopesScanned}`);
+        console.log(`• Scope filter applied: ${result.scopeFilterApplied.length > 0 ? result.scopeFilterApplied.join(", ") : "(none)"}`);
+        console.log(`• Candidates: ${result.candidates}`);
+        console.log(`• Stored: ${result.stored}`);
+        console.log(`• Skipped duplicates: ${result.skippedDuplicate}`);
+      } catch (error) {
+        console.error("Graph inference failed:", error);
+        process.exit(1);
+      }
+    });
+
+  memory
+    .command("graph-sync")
+    .description("Backfill/resync LanceDB memories into Graphiti")
+    .option("--mode <mode>", "backfill or resync", "backfill")
+    .option("--scope <scope>", "Scope filter")
+    .option("--limit <n>", "Max memories scanned", "500")
+    .option("--dry-run", "Show sync results without writing to Graphiti")
+    .option("--json", "Output as JSON")
+    .action(async (options) => {
+      try {
+        const mode = String(options.mode || "backfill").trim().toLowerCase();
+        if (mode !== "backfill" && mode !== "resync") {
+          console.error("Invalid --mode. Use backfill or resync.");
+          process.exit(1);
+        }
+        const report = await executeGraphSync(mode, options);
+
+        if (options.json) {
+          console.log(formatJson(report));
+          return;
+        }
+
+        console.log("Graph Sync Run:");
+        console.log(`• Mode: ${report.mode}`);
+        console.log(`• Dry run: ${report.dryRun ? "Yes" : "No"}`);
+        console.log(`• Scanned: ${report.scanned}`);
+        console.log(`• Candidates: ${report.candidates}`);
+        console.log(`• Synced: ${report.synced}`);
+        console.log(`• Failed: ${report.failed}`);
+        console.log(`• Skipped: ${report.skipped}`);
+      } catch (error) {
+        console.error("Graph sync failed:", error);
+        process.exit(1);
+      }
+    });
+
+  memory
+    .command("graph-backfill")
+    .description("Backfill LanceDB memories into Graphiti")
+    .option("--scope <scope>", "Scope filter")
+    .option("--limit <n>", "Max memories scanned", "500")
+    .option("--dry-run", "Show sync results without writing to Graphiti")
+    .option("--json", "Output as JSON")
+    .action(async (options) => {
+      try {
+        const report = await executeGraphSync("backfill", options);
+        if (options.json) {
+          console.log(formatJson(report));
+          return;
+        }
+        console.log(`Graph backfill complete: synced=${report.synced}, failed=${report.failed}, skipped=${report.skipped}, dryRun=${report.dryRun ? "yes" : "no"}`);
+      } catch (error) {
+        console.error("Graph backfill failed:", error);
+        process.exit(1);
+      }
+    });
+
+  memory
+    .command("graph-resync")
+    .description("Resync LanceDB memories into Graphiti (re-mirror)")
+    .option("--scope <scope>", "Scope filter")
+    .option("--limit <n>", "Max memories scanned", "500")
+    .option("--dry-run", "Show sync results without writing to Graphiti")
+    .option("--json", "Output as JSON")
+    .action(async (options) => {
+      try {
+        const report = await executeGraphSync("resync", options);
+        if (options.json) {
+          console.log(formatJson(report));
+          return;
+        }
+        console.log(`Graph resync complete: synced=${report.synced}, failed=${report.failed}, skipped=${report.skipped}, dryRun=${report.dryRun ? "yes" : "no"}`);
+      } catch (error) {
+        console.error("Graph resync failed:", error);
+        process.exit(1);
+      }
+    });
+
+  memory
+    .command("promotion-queue")
+    .description("Inspect promotion queue with reason stats")
+    .option("--scope <scope>", "Scope filter")
+    .option("--limit <n>", "Max queue rows", "40")
+    .option("--json", "Output as JSON")
+    .action(async (options) => {
+      try {
+        const limit = clampInt(parseInt(options.limit, 10) || 40, 1, 200);
+        const scopeFilter = typeof options.scope === "string" && options.scope.trim().length > 0
+          ? [options.scope.trim()]
+          : undefined;
+        const entries = await context.store.list(scopeFilter, undefined, 600, 0);
+        const policy = applyPromotionPolicy(entries);
+
+        const report = {
+          scope: scopeFilter?.[0] || "all",
+          queued: policy.queue.slice(0, limit).map((item) => ({
+            id: item.entry.id,
+            scope: item.entry.scope,
+            category: item.entry.category,
+            target: item.target,
+            reason: item.reason,
+            confidence: Number(item.confidence.toFixed(2)),
+            repeatCount: item.repeatCount,
+            text: item.entry.text,
+          })),
+          reasonStats: policy.reasonStats,
+          contradictions: policy.contradictions,
+        };
+
+        if (options.json) {
+          console.log(formatJson(report));
+          return;
+        }
+
+        console.log("Promotion Queue:");
+        console.log(`• Scope: ${report.scope}`);
+        console.log(`• Queue size (shown): ${report.queued.length}`);
+        console.log("• Reason stats:");
+        const reasonRows = Object.entries(report.reasonStats).sort((a, b) => b[1] - a[1]);
+        if (reasonRows.length === 0) console.log("  - none");
+        for (const [reason, count] of reasonRows) {
+          console.log(`  - ${reason}: ${count}`);
+        }
+        if (report.contradictions.length > 0) {
+          console.log("• Contradictions:");
+          for (const c of report.contradictions.slice(0, 8)) {
+            console.log(`  - ${c.positive} <-> ${c.negative}`);
+          }
+        }
+        if (report.queued.length > 0) {
+          console.log("• Pending rows:");
+          for (const row of report.queued) {
+            console.log(`  - [${row.id}] [${row.target}] reason=${row.reason} confidence=${row.confidence} repeat=${row.repeatCount} ${row.text.slice(0, 120)}`);
+          }
+        }
+      } catch (error) {
+        console.error("Promotion queue failed:", error);
+        process.exit(1);
+      }
+    });
+
+  memory
+    .command("promotion-approve <id>")
+    .description("Approve a queued promotion and persist metadata")
+    .option("--target <target>", "Override target: USER|AGENTS|IDENTITY|SOUL")
+    .option("--scope <scope>", "Optional scope guard")
+    .action(async (id, options) => {
+      try {
+        const entry = await resolveMemoryById(context.store, id, options.scope);
+        if (!entry) {
+          console.error(`Memory ${id} not found.`);
+          process.exit(1);
+        }
+
+        const target = normalizeTarget(options.target) || detectPromotionTarget(entry);
+        if (!target) {
+          console.error("Unable to infer promotion target; pass --target USER|AGENTS|IDENTITY|SOUL");
+          process.exit(1);
+        }
+
+        const metadata = safeParseJson(entry.metadata);
+        metadata.promotion = {
+          ...(metadata.promotion && typeof metadata.promotion === "object" ? metadata.promotion as Record<string, unknown> : {}),
+          status: "approved",
+          target,
+          actedAt: new Date().toISOString(),
+          actedBy: "memory-pro",
+        };
+
+        await context.store.update(entry.id, { metadata: JSON.stringify(metadata) }, [entry.scope]);
+        console.log(`Approved promotion for ${entry.id} -> ${target}`);
+      } catch (error) {
+        console.error("Promotion approve failed:", error);
+        process.exit(1);
+      }
+    });
+
+  memory
+    .command("promotion-reject <id>")
+    .description("Reject a queued promotion and persist metadata")
+    .option("--reason <reason>", "Optional rejection reason", "manual_reject")
+    .option("--scope <scope>", "Optional scope guard")
+    .action(async (id, options) => {
+      try {
+        const entry = await resolveMemoryById(context.store, id, options.scope);
+        if (!entry) {
+          console.error(`Memory ${id} not found.`);
+          process.exit(1);
+        }
+
+        const metadata = safeParseJson(entry.metadata);
+        metadata.promotion = {
+          ...(metadata.promotion && typeof metadata.promotion === "object" ? metadata.promotion as Record<string, unknown> : {}),
+          status: "rejected",
+          reason: String(options.reason || "manual_reject"),
+          actedAt: new Date().toISOString(),
+          actedBy: "memory-pro",
+        };
+
+        await context.store.update(entry.id, { metadata: JSON.stringify(metadata) }, [entry.scope]);
+        console.log(`Rejected promotion for ${entry.id}`);
+      } catch (error) {
+        console.error("Promotion reject failed:", error);
         process.exit(1);
       }
     });

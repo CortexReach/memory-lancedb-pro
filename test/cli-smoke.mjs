@@ -64,6 +64,21 @@ async function runCliSmoke() {
     embedder: {
       embedPassage: async () => [0, 0, 0, 0],
     },
+    graphitiConfig: {
+      enabled: true,
+    },
+    graphitiSync: {
+      syncMemory: async () => ({ status: "stored", groupId: "global" }),
+    },
+    graphInferenceRun: async () => ({
+      reason: "cli:once",
+      dryRun: true,
+      scopesScanned: 1,
+      scopeFilterApplied: ["global"],
+      candidates: 1,
+      stored: 1,
+      skippedDuplicate: 0,
+    }),
   };
 
   // Register commands under `memory-pro`
@@ -88,7 +103,7 @@ async function runCliSmoke() {
   ]);
 
   // 3) import should preserve id and be idempotent (skip on second import)
-  const importId = "smoke_import_id_1";
+  const importId = "11111111-1111-1111-1111-111111111111";
   const importPhrase = `smoke-import-${Date.now()}`;
   const importFile = path.join(workDir, "import-test.json");
 
@@ -162,7 +177,75 @@ async function runCliSmoke() {
     "50",
   ]);
 
-  // 5) docs-refresh should create managed workspace docs
+  // 5) graph-infer one-shot dry-run should not crash
+  await program.parseAsync([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "graph-infer",
+    "--once",
+    "--dry-run",
+    "--scope",
+    "global",
+  ]);
+
+  // 6) graph-sync dry-run should not crash
+  await program.parseAsync([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "graph-sync",
+    "--mode",
+    "backfill",
+    "--dry-run",
+    "--scope",
+    "global",
+    "--limit",
+    "10",
+  ]);
+  await program.parseAsync([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "graph-backfill",
+    "--dry-run",
+  ]);
+  await program.parseAsync([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "graph-resync",
+    "--dry-run",
+  ]);
+
+  // 7) promotion queue and approve/reject should work
+  await program.parseAsync([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "promotion-queue",
+    "--json",
+  ]);
+  await program.parseAsync([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "promotion-approve",
+    importId,
+    "--target",
+    "USER",
+  ]);
+  await program.parseAsync([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "promotion-reject",
+    importId,
+    "--reason",
+    "smoke-test",
+  ]);
+
+  // 8) docs-refresh should create managed workspace docs
   const workspaceDir = path.join(workDir, "workspace");
   const outDocs = await captureLogs([
     "node",
@@ -176,7 +259,7 @@ async function runCliSmoke() {
   ]);
   assert.match(outDocs, /Workspace docs refreshed/, outDocs);
 
-  // 6) Access reinforcement formula smoke test
+  // 9) Access reinforcement formula smoke test
   const { parseAccessMetadata, buildUpdatedMetadata, computeEffectiveHalfLife } =
     jiti("../src/access-tracker.ts");
 

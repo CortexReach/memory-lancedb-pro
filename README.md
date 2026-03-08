@@ -321,6 +321,11 @@ When embedding calls fail, the plugin provides **actionable error messages** ins
 Operational CLI commands:
 
 - `memory-pro graph-doctor [--json] [--scope <scope>] [--limit <n>]`
+- `memory-pro graph-infer --once [--dry-run] [--scope <scope>] [--include-scopes <csv>] [--exclude-scopes <csv>]`
+- `memory-pro graph-sync --mode backfill|resync [--dry-run] [--scope <scope>] [--limit <n>]`
+- `memory-pro promotion-queue [--scope <scope>] [--limit <n>] [--json]`
+- `memory-pro promotion-approve <id> [--target USER|AGENTS|IDENTITY|SOUL]`
+- `memory-pro promotion-reject <id> [--reason <reason>]`
 - `memory-pro docs-refresh [--workspace <path>] [--reason <label>]`
 
 Minimal config:
@@ -355,7 +360,9 @@ Minimal config:
               "intervalMs": 2700000,
               "maxMemories": 120,
               "minConfidence": 0.62,
-              "maxScopes": 6
+              "maxScopes": 6,
+              "includeScopes": ["global"],
+              "excludeScopes": ["agent:experimental"]
             }
           }
         }
