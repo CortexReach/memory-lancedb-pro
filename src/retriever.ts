@@ -297,7 +297,12 @@ export class MemoryRetriever {
     const safeLimit = clampInt(limit, 1, 20);
 
     let results: RetrievalResult[];
-    if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
+    // Vector-only mode: force the legacy path.
+    // Note: do NOT gate hybrid retrieval on store.hasFtsSupport here.
+    // On cold-start (e.g. one-shot CLI), hasFtsSupport may be false until the
+    // store initializes / creates the FTS index, which would incorrectly skip
+    // BM25 + reranking.
+    if (this.config.mode === "vector") {
       results = await this.vectorOnlyRetrieval(
         query,
         safeLimit,
