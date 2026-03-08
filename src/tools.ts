@@ -16,6 +16,7 @@ import type { MemoryScopeManager } from "./scopes.js";
 import type { Embedder } from "./embedder.js";
 import type { GraphitiBridge } from "./graphiti/bridge.js";
 import type { GraphitiPluginConfig } from "./graphiti/types.js";
+import type { GraphitiSyncService } from "./graphiti/sync.js";
 import { registerMemoryGraphRecallTool } from "./tools-graphiti.js";
 import { ensureSelfImprovementLearningFiles } from "./self-improvement-files.js";
 
@@ -44,6 +45,7 @@ interface ToolContext {
   embedder: Embedder;
   workspaceDir?: string;
   graphitiBridge?: GraphitiBridge;
+  graphitiSync?: GraphitiSyncService;
   graphitiConfig?: GraphitiPluginConfig;
   logger?: {
     warn?: (message: string) => void;
@@ -400,6 +402,23 @@ export function registerMemoryStoreTool(
             | undefined;
 
           if (
+            context.graphitiSync
+          ) {
+            graphitiDetails = await context.graphitiSync.syncMemory(
+              {
+                id: entry.id,
+                text,
+                scope: targetScope,
+                category: entry.category,
+                metadata: entry.metadata,
+              },
+              {
+                mode: "memoryStore",
+                source: "memory_store",
+                mutation: "memory_store",
+              },
+            );
+          } else if (
             context.graphitiBridge &&
             context.graphitiConfig?.enabled &&
             context.graphitiConfig.write.memoryStore
@@ -526,6 +545,21 @@ export function registerMemoryForgetTool(
             text?: string;
             mode: "memoryId" | "query-auto";
           }) => {
+            if (context.graphitiSync) {
+              return await context.graphitiSync.recordEvent({
+                mode: "memoryStore",
+                source: "memory_forget",
+                scope: payload.scope,
+                text: payload.text
+                  ? `Memory forgotten: ${payload.text}`
+                  : `Memory forgotten: id=${payload.memoryId}`,
+                metadata: {
+                  mode: payload.mode,
+                  memoryId: payload.memoryId,
+                },
+              });
+            }
+
             if (
               !context.graphitiBridge ||
               !context.graphitiConfig?.enabled ||
@@ -848,6 +882,26 @@ export function registerMemoryUpdateTool(
             | undefined;
 
           if (
+            context.graphitiSync
+          ) {
+            graphitiDetails = await context.graphitiSync.syncMemory(
+              {
+                id: updated.id,
+                text: updated.text,
+                scope: updated.scope,
+                category: updated.category,
+                metadata: updated.metadata,
+              },
+              {
+                mode: "memoryStore",
+                source: "memory_update",
+                mutation: "memory_update",
+                extraMetadata: {
+                  fieldsUpdated: Object.keys(updates),
+                },
+              },
+            );
+          } else if (
             context.graphitiBridge &&
             context.graphitiConfig?.enabled &&
             context.graphitiConfig.write.memoryStore

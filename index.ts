@@ -42,6 +42,7 @@ import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
 import { createGraphitiBridge } from "./src/graphiti/bridge.js";
+import { createGraphitiSyncService } from "./src/graphiti/sync.js";
 import type { GraphitiPluginConfig } from "./src/graphiti/types.js";
 import { extractReflectionOpenLoops } from "./src/reflection-slices.js";
 import {
@@ -713,6 +714,12 @@ const memoryLanceDBProPlugin = {
           logger: api.logger,
         })
       : undefined;
+    const graphitiSync = createGraphitiSyncService({
+      bridge: graphitiBridge,
+      config: config.graphiti,
+      store,
+      logger: api.logger,
+    });
 
     const reflectionErrorStateBySession = new Map<string, ReflectionErrorState>();
     const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
@@ -844,6 +851,7 @@ const memoryLanceDBProPlugin = {
         embedder,
         agentId: undefined, // Will be determined at runtime from context
         graphitiBridge,
+        graphitiSync,
         graphitiConfig: config.graphiti,
         logger: api.logger,
         mdMirror,
@@ -1082,41 +1090,22 @@ const memoryLanceDBProPlugin = {
               scope: defaultScope,
             });
 
-            if (
-              graphitiBridge &&
-              config.graphiti?.enabled &&
-              config.graphiti.write.autoCapture
-            ) {
-              const graphiti = await graphitiBridge.addEpisode({
-                text,
-                scope: defaultScope,
-                metadata: {
+            if (graphitiSync.isEnabled("autoCapture")) {
+              await graphitiSync.syncMemory(
+                {
+                  id: entry.id,
+                  text,
+                  scope: defaultScope,
+                  category: entry.category,
+                  metadata: entry.metadata,
+                },
+                {
+                  mode: "autoCapture",
                   source: "agent_end",
                   agentId,
-                  memoryId: entry.id,
-                  category: entry.category,
-                  scope: entry.scope,
+                  mutation: "auto_capture",
                 },
-              });
-
-              if (graphiti.status !== "skipped") {
-                try {
-                  const currentMetadata = safeParseJson(entry.metadata);
-                  const nextMetadata = {
-                    ...currentMetadata,
-                    graphiti: {
-                      groupId: graphiti.groupId,
-                      episodeRef: graphiti.episodeRef,
-                      status: graphiti.status,
-                      error: graphiti.error,
-                      updatedAt: new Date().toISOString(),
-                    },
-                  };
-                  await store.update(entry.id, { metadata: JSON.stringify(nextMetadata) }, [defaultScope]);
-                } catch (err) {
-                  api.logger.warn(`memory-lancedb-pro: auto-capture graphiti metadata update failed: ${String(err)}`);
-                }
-              }
+              );
             }
             stored++;
 
@@ -1933,6 +1922,28 @@ const memoryLanceDBProPlugin = {
               scope: targetScope,
               metadata,
             });
+
+            if (graphitiSync.isEnabled("memoryStore")) {
+              await graphitiSync.syncMemory(
+                {
+                  id: storedEntry.id,
+                  text: mapped.text,
+                  scope: targetScope,
+                  category: mapped.category,
+                  metadata: storedEntry.metadata,
+                },
+                {
+                  mode: "memoryStore",
+                  source: `reflection:${mapped.heading}`,
+                  agentId: sourceAgentId,
+                  mutation: "reflection_mapped_store",
+                  extraMetadata: {
+                    reflectionEventId,
+                    reflectionPath: relPath,
+                  },
+                },
+              );
+            }
 
             if (mdMirror) {
               await mdMirror(
