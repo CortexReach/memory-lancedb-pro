@@ -151,7 +151,32 @@ async function runCliSmoke() {
   ]);
   assert.match(out2, /Import completed: 0 imported, 1 skipped/, out2);
 
-  // 4) Access reinforcement formula smoke test
+  // 4) graph-doctor JSON output should not crash
+  await program.parseAsync([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "graph-doctor",
+    "--json",
+    "--limit",
+    "50",
+  ]);
+
+  // 5) docs-refresh should create managed workspace docs
+  const workspaceDir = path.join(workDir, "workspace");
+  const outDocs = await captureLogs([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "docs-refresh",
+    "--workspace",
+    workspaceDir,
+    "--reason",
+    "cli-smoke",
+  ]);
+  assert.match(outDocs, /Workspace docs refreshed/, outDocs);
+
+  // 6) Access reinforcement formula smoke test
   const { parseAccessMetadata, buildUpdatedMetadata, computeEffectiveHalfLife } =
     jiti("../src/access-tracker.ts");
 

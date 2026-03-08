@@ -4,10 +4,13 @@
 
 import type { Command } from "commander";
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { loadLanceDB, type MemoryEntry, type MemoryStore } from "./src/store.js";
 import type { MemoryRetriever } from "./src/retriever.js";
 import type { MemoryScopeManager } from "./src/scopes.js";
 import type { MemoryMigrator } from "./src/migrate.js";
+import { createWorkspaceDocsMaterializer } from "./src/workspace-docs.js";
 
 // ============================================================================
 // Types
@@ -51,6 +54,19 @@ function formatMemory(memory: any, index?: number): string {
 
 function formatJson(obj: any): string {
   return JSON.stringify(obj, null, 2);
+}
+
+function safeParseJson(value: unknown): Record<string, unknown> {
+  if (typeof value !== "string" || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return {};
+  }
+  return {};
 }
 
 // ============================================================================
@@ -586,6 +602,94 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         console.log(`Re-embed completed: ${imported} imported, ${skipped} skipped (processed=${processed}).`);
       } catch (error) {
         console.error("Re-embed failed:", error);
+        process.exit(1);
+      }
+    });
+
+  memory
+    .command("graph-doctor")
+    .description("Inspect Graphiti sync metadata health from LanceDB entries")
+    .option("--scope <scope>", "Filter by scope")
+    .option("--limit <n>", "Max rows to scan", "500")
+    .option("--json", "Output as JSON")
+    .action(async (options) => {
+      try {
+        const limit = clampInt(parseInt(options.limit, 10) || 500, 1, 5000);
+        const scopeFilter = options.scope ? [String(options.scope)] : undefined;
+        const entries = await context.store.list(scopeFilter, undefined, limit, 0);
+
+        let withGraphiti = 0;
+        let stored = 0;
+        let failed = 0;
+        let skipped = 0;
+        let inferred = 0;
+
+        for (const entry of entries) {
+          const metadata = safeParseJson(entry.metadata);
+          const graphiti = metadata.graphiti && typeof metadata.graphiti === "object"
+            ? (metadata.graphiti as Record<string, unknown>)
+            : undefined;
+          if (graphiti) {
+            withGraphiti++;
+            const status = typeof graphiti.status === "string" ? graphiti.status : "";
+            if (status === "stored") stored++;
+            if (status === "failed") failed++;
+            if (status === "skipped") skipped++;
+          }
+
+          const assertionKind = typeof metadata.assertionKind === "string" ? metadata.assertionKind : "";
+          if (assertionKind === "inferred") inferred++;
+        }
+
+        const report = {
+          scanned: entries.length,
+          withGraphiti,
+          statuses: {
+            stored,
+            failed,
+            skipped,
+          },
+          inferredCount: inferred,
+          coverage: entries.length > 0 ? Number((withGraphiti / entries.length).toFixed(4)) : 0,
+          scope: options.scope || "all",
+        };
+
+        if (options.json) {
+          console.log(formatJson(report));
+          return;
+        }
+
+        console.log("Graph Sync Doctor:");
+        console.log(`• Scanned: ${report.scanned}`);
+        console.log(`• With graphiti metadata: ${report.withGraphiti}`);
+        console.log(`• Stored: ${report.statuses.stored}`);
+        console.log(`• Failed: ${report.statuses.failed}`);
+        console.log(`• Skipped: ${report.statuses.skipped}`);
+        console.log(`• Inferred entries: ${report.inferredCount}`);
+        console.log(`• Coverage: ${(report.coverage * 100).toFixed(1)}%`);
+      } catch (error) {
+        console.error("Graph doctor failed:", error);
+        process.exit(1);
+      }
+    });
+
+  memory
+    .command("docs-refresh")
+    .description("Refresh managed workspace markdown sections")
+    .option("--workspace <path>", "Workspace directory", join(homedir(), ".openclaw", "workspace"))
+    .option("--reason <reason>", "Refresh reason label", "cli")
+    .action(async (options) => {
+      try {
+        const workspaceDir = String(options.workspace);
+        const materializer = createWorkspaceDocsMaterializer({
+          store: context.store,
+          workspaceDir,
+          markerPrefix: "memory-lancedb-pro",
+        });
+        await materializer.refresh({ reason: String(options.reason || "cli") });
+        console.log(`Workspace docs refreshed at ${workspaceDir}`);
+      } catch (error) {
+        console.error("Docs refresh failed:", error);
         process.exit(1);
       }
     });
