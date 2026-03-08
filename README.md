@@ -55,38 +55,56 @@ The built-in `memory-lancedb` plugin in OpenClaw provides basic vector search. *
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                   index.ts (Entry Point)                │
-│  Plugin Registration · Config Parsing · Lifecycle Hooks │
-└────────┬──────────┬──────────┬──────────┬───────────────┘
-         │          │          │          │
-    ┌────▼───┐ ┌────▼───┐ ┌───▼────┐ ┌──▼──────────┐
-    │ store  │ │embedder│ │retriever│ │   scopes    │
-    │ .ts    │ │ .ts    │ │ .ts    │ │    .ts      │
-    └────────┘ └────────┘ └────────┘ └─────────────┘
-         │                     │
-    ┌────▼───┐           ┌─────▼──────────┐
-    │migrate │           │noise-filter.ts │
-    │ .ts    │           │adaptive-       │
-    └────────┘           │retrieval.ts    │
-                         └────────────────┘
-    ┌─────────────┐   ┌──────────┐
-    │  tools.ts   │   │  cli.ts  │
-    │ (Agent API) │   │ (CLI)    │
-    └─────────────┘   └──────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                         index.ts (Entry Point)                      │
+│     Plugin registration · config parsing · lifecycle orchestration  │
+└────────┬───────────────────────────────┬─────────────────────────────┘
+         │                               │
+         │ generic auto-recall           │ reflection / inherited-rules
+         │                               │
+┌────────▼────────┐              ┌───────▼───────────────────────────┐
+│   retriever.ts  │              │       reflection-recall.ts        │
+│ vector/BM25/RRF │              │ dynamic reflection recall ranking │
+│ rerank/filters  │              └───────────────┬───────────────────┘
+└────────┬────────┘                              │
+         │                               ┌──────▼────────────────────┐
+┌────────▼───────────────┐               │ reflection-aggregation.ts │
+│ postProcessAutoRecall  │               │ strictKey-group scoring   │
+│ (index.ts local step)  │               └──────┬────────────────────┘
+└────────┬───────────────┘                      │
+         │                               ┌──────▼───────────────────────┐
+         │ legacy | setwise-v2           │ reflection-recall-final-     │
+┌────────▼────────────────────┐           │ selection.ts                 │
+│ auto-recall-final-          │           └──────┬───────────────────────┘
+│ selection.ts                │                  │
+└────────┬────────────────────┘           ┌──────▼───────────────────────┐
+         └────────────────────────────────► final-topk-setwise-         │
+                                          │ selection.ts                │
+                                          │ shared final top-k selector │
+                                          └─────────────────────────────┘
+
+Shared infrastructure: `store.ts`, `embedder.ts`, `scopes.ts`, `tools.ts`,
+`noise-filter.ts`, `adaptive-retrieval.ts`, `recall-engine.ts`, `migrate.ts`, `cli.ts`
 ```
 
 ### File Reference
 
 | File | Purpose |
 |------|---------|
-| `index.ts` | Plugin entry point. Registers with OpenClaw Plugin API, parses config, mounts `before_agent_start` (auto-recall), `agent_end` (auto-capture), integrated `self-improvement` (`agent:bootstrap`, `command:new/reset`) and integrated `memory-reflection` (`command:new/reset`) hooks |
+| `index.ts` | Plugin entry point. Registers with OpenClaw Plugin API, parses config, mounts `before_agent_start` / `agent_end` hooks, routes generic auto-recall through `legacy | setwise-v2`, and coordinates reflection injection flows |
 | `openclaw.plugin.json` | Plugin metadata + full JSON Schema config declaration (with `uiHints`) |
 | `package.json` | NPM package info. Depends on `@lancedb/lancedb`, `openai`, `@sinclair/typebox` |
 | `cli.ts` | CLI commands: `memory list/search/stats/delete/delete-bulk/export/import/reembed/migrate` |
 | `src/store.ts` | LanceDB storage layer. Table creation / FTS indexing / Vector search / BM25 search / CRUD / bulk delete / stats |
 | `src/embedder.ts` | Embedding abstraction. Compatible with any OpenAI-API provider (OpenAI, Gemini, Jina, Ollama, etc.). Supports task-aware embedding (`taskQuery`/`taskPassage`) |
-| `src/retriever.ts` | Hybrid retrieval engine. Vector + BM25 → RRF fusion → Jina Cross-Encoder Rerank → Recency Boost → Importance Weight → Length Norm → Time Decay → Hard Min Score → Noise Filter → MMR Diversity |
+| `src/retriever.ts` | Hybrid retrieval engine. Vector + BM25 → RRF fusion → rerank → recency / importance / length / decay weighting → noise filter → coarse MMR diversity. |
+| `src/recall-engine.ts` | Shared recall helpers: prompt gating, session repeated-injection suppression, tagged-block assembly, max-age filtering, and recent-per-key capping |
+| `src/auto-recall-final-selection.ts` | Generic auto-recall adapter. Maps `RetrievalResult` rows into final-selection candidates and applies generic `legacy | setwise-v2` behavior at the final cutoff seam |
+| `src/final-topk-setwise-selection.ts` | Shared final top-k selector. Owns shortlist presort, deterministic set-wise selection, lexical-overlap suppression, and optional embedding-based semantic redundancy suppression |
+| `src/reflection-recall.ts` | Dynamic Reflection-Recall ranking for `<inherited-rules>`. Filters/caps reflection items, computes scores, preserves `kind + strictKey` partitioning, and maps selected groups back to recall rows |
+| `src/reflection-aggregation.ts` | Reflection group aggregation. Combines scored reflection items into strict-key groups with representative selection and final group scoring |
+| `src/reflection-recall-final-selection.ts` | Reflection-specific adapter into the shared final selector for dynamic Reflection-Recall final top-k ordering |
+| `src/reflection-selection.ts` | Historical derived-focus diversity ordering helper retained for reflection-store / handoff-note selection flows |
 | `src/scopes.ts` | Multi-scope access control. Supports `global`, `agent:<id>`, `custom:<name>`, `project:<id>`, `user:<id>` |
 | `src/tools.ts` | Agent tool definitions: `memory_recall`, `memory_store`, `memory_forget` (core), `self_improvement_log` (default), and governance tools `self_improvement_review` / `self_improvement_extract_skill` (management mode) |
 | `src/noise-filter.ts` | Noise filter. Filters out agent refusals, meta-questions, greetings, and low-quality content |
@@ -148,117 +166,127 @@ Filters out low-quality content at both auto-capture and tool-store stages:
 
 ### 7. Session Strategy
 
-- `sessionStrategy: "systemSessionMemory"` (default): do not register plugin reflection hooks; use OpenClaw built-in `session-memory`.
-- `sessionStrategy: "memoryReflection"`: enable plugin reflection hooks for `/new` / `/reset`.
-- `sessionStrategy: "none"`: disable plugin session strategy hooks entirely.
-- Legacy compatibility: `sessionMemory.enabled=true|false` maps to `systemSessionMemory|none`.
-- `sessionMemory.messageCount` is also kept as a legacy compatibility field and maps to `memoryReflection.messageCount`.
-- Practical rule: `memoryReflection.*` settings only take effect when `sessionStrategy="memoryReflection"`.
+Use this to choose who owns `/new` / `/reset` session behavior.
+
+- `sessionStrategy: "systemSessionMemory"` (default)
+  - use OpenClaw built-in `session-memory`
+  - plugin reflection hooks stay off
+- `sessionStrategy: "memoryReflection"`
+  - enable plugin reflection flow
+  - `memoryReflection.*` settings take effect only in this mode
+- `sessionStrategy: "none"`
+  - disable plugin session strategy hooks entirely
+
+ Legacy compatibility:
+- `sessionMemory.enabled=true|false` still maps to `systemSessionMemory|none`
+- `sessionMemory.messageCount` still maps to `memoryReflection.messageCount`
+
+Recommended starter config:
+
+```json
+{
+  "sessionStrategy": "memoryReflection"
+}
+```
 
 ### 8. Self-Improvement
 
-- Hooks: `agent:bootstrap`, `command:new`, `command:reset`.
-- `agent:bootstrap`: injects `SELF_IMPROVEMENT_REMINDER.md` into bootstrap context.
-- `command:new` / `command:reset`: appends a short `/note self-improvement ...` reminder before reset.
-  - Under `sessionStrategy="memoryReflection"`, the final reset/new note is assembled in `runMemoryReflection`.
-  - In `memoryReflection.injectMode="inheritance+derived"` mode, the note can include:
-    - `<open-loops>` from the **fresh** reflection text of the current `/new` or `/reset`.
-    - `<derived-focus>` from **historical** LanceDB derived rows after dedupe+decay scoring (shortlist up to 36, final injection capped at 13, no hard score threshold gate).
-- File ensure/create path: ensures `.learnings/LEARNINGS.md` and `.learnings/ERRORS.md` exist.
-- This flow is separate from `memoryReflection`: seeing self-improvement notes or `.learnings/*` activity does not by itself mean reflection storage is enabled.
-- Append paths are intentionally distinct:
-  - explicit tool write: `self_improvement_log`
-  - reflection-driven automatic append: structured governance candidates from reflection
-  - file/template ensure path: bootstrap-time file creation
-- Tools:
-  - `self_improvement_log`: writes structured `learning` / `error` entries.
-  - `self_improvement_review`: summarizes governance backlog (pending/high/promoted).
-  - `self_improvement_extract_skill`: extracts a reusable `SKILL.md` scaffold from a learning entry via explicit tool call.
-- Reflection auto-append behavior:
-  - Source section: `## Learning governance candidates (.learnings / promotion / skill extraction)`.
-  - Preferred format: structured per-entry records (`### Entry N`, `Priority`, `Status`, `Area`, `Summary`, `Details`, `Suggested Action`).
-  - Backward compatibility: legacy bullet-style governance content is still accepted as a fallback parse path.
-  - One parsed governance candidate becomes one appended `.learnings/LEARNINGS.md` entry.
-  - `Logged` timestamps and entry ids are generated by the writer, not by the reflection text.
+Use this when you want the plugin to keep a lightweight governance trail of learnings and errors.
+
+- Main tools:
+  - `self_improvement_log`: append a structured learning/error entry
+  - `self_improvement_review`: summarize pending governance backlog
+  - `self_improvement_extract_skill`: scaffold a reusable skill from a proven learning entry
+- Main config:
+  - `selfImprovement.enabled`: master switch
+  - `selfImprovement.beforeResetNote`: show a reminder before `/new` or `/reset`
+  - `selfImprovement.ensureLearningFiles`: auto-create `.learnings/` files
+  - `selfImprovement.managementTools`: expose review/extract tools
+- Main outputs:
+  - `.learnings/LEARNINGS.md`
+  - `.learnings/ERRORS.md`
+  - extracted skill scaffold under `.learnings/skills/...`
+
+Recommended starter config:
+
+```json
+{
+  "selfImprovement": {
+    "enabled": true,
+    "beforeResetNote": true,
+    "ensureLearningFiles": true,
+    "managementTools": true
+  }
+}
+```
 
 ### 9. memoryReflection
 
-- Activation:
-  - Requires `sessionStrategy="memoryReflection"`.
-  - Triggers on `command:new` / `command:reset`.
-  - Skips generation when session context is incomplete (for example missing config, session file, or readable conversation content).
-  - Edge case: issuing `/new` immediately after a previous `/new` can land in a fresh empty session without a readable prior `sessionFile`; in that case reflection skips and logs `missing session file after recovery`. This is expected behavior.
-- Runner chain:
-  - First try embedded runner (`runEmbeddedPiAgent`).
-  - If the embedded path fails, fall back to `openclaw agent --local --json`.
-  - If both fail, write a minimal fallback reflection artifact.
-- Markdown artifact:
-  - Written under `memory/reflections/YYYY-MM-DD/`.
-  - Filename uses high-resolution timestamp + agent/session token, for example `HHMMSSmmm-agent-session[-xxxxxx].md`.
-- Prompt/output contract:
-  - Required headings are fixed and parsed by exact section names.
-  - `Invariants` = stable cross-session rules.
-  - `Derived` = recent-run distilled learnings / adjustments / follow-up heuristics that may help the next several runs, but should decay over time.
-  - Governance candidates use a structured entry template so they can be appended safely into `.learnings`.
-  - Writer-owned metadata such as `Logged` timestamps and ids is intentionally generated by the persistence layer, not by the model.
-- LanceDB persistence (optional):
-  - Controlled by `memoryReflection.storeToLanceDB`.
-  - Writes one event row (`type=memory-reflection-event`) plus item rows (`type=memory-reflection-item`) for each `Invariants` / `Derived` bullet.
-  - Event rows keep lightweight provenance/audit metadata only (`eventId`, `sessionKey`, `usedFallback`, `errorSignals`, source path).
-  - Item rows carry per-item decay metadata (`decayModel`, `decayMidpointDays`, `decayK`, `baseWeight`, `quality`) plus ordinal/group metadata.
-  - Reflection rows display as `reflection:<scope>`.
-- Reflection-derived durable memory mapping:
-  - Available memory categories in the plugin are `preference`, `fact`, `decision`, `entity`, `reflection`, `other`.
-  - Reflection auto-mapping intentionally writes only:
-    - `User model deltas` → `preference`
-    - `Agent model deltas` → `preference`
-    - `Lessons & pitfalls` → `fact`
-    - `Decisions (durable)` → `decision`
-  - `Context`, `Open loops`, `Retrieval tags`, `Invariants`, and `Derived` are not auto-mapped as ordinary durable memory categories.
-- Decay algorithm and built-in profiles:
-  - Reflection loading/injection uses logistic decay only; this does **not** modify the global retriever scoring pipeline.
-  - Formula: `weight = 1 / (1 + exp(k * (ageDays - midpointDays)))`
-  - Built-in reflection item profiles:
-    - `invariant`: midpointDays=`45`, `k=0.22`, `baseWeight=1.10`, `quality=1.00`
-    - `derived`: midpointDays=`7`, `k=0.65`, `baseWeight=1.00`, `quality=0.95`
-  - Built-in mapped durable-memory profiles:
-    - `decision`: midpointDays=`45`, `k=0.25`, `baseWeight=1.10`, `quality=1.00`
-    - `user-model`: midpointDays=`21`, `k=0.30`, `baseWeight=1.00`, `quality=0.95`
-    - `agent-model`: midpointDays=`10`, `k=0.35`, `baseWeight=0.95`, `quality=0.93`
-    - `lesson`: midpointDays=`7`, `k=0.45`, `baseWeight=0.90`, `quality=0.90`
-  - These decay parameters are currently implementation-defined metadata written by the plugin, not user-configurable `memoryReflection.*` schema fields.
-  - Fallback-generated rows receive an extra score penalty factor (`0.75`).
-- Dedicated agent (optional):
-  - `memoryReflection.agentId` can point to a dedicated reflection agent such as `memory-distiller`.
-  - If the configured agent id is not present in `cfg.agents.list`, the plugin warns and falls back to the runtime agent id.
-- Error loop:
-  - `after_tool_call` captures and deduplicates tool error signatures for reminder/reflection context.
-- Injection placement by hook (`memoryReflection.injectMode`):
-  - `before_agent_start`: injects `<inherited-rules>` via Reflection-Recall.
-  - `memoryReflection.recall.mode="fixed"` (default): compatibility path; fixed inheritance remains active even when generic Auto-Recall is disabled.
-  - `memoryReflection.recall.mode="dynamic"`: prompt-gated dynamic Reflection-Recall with independent top-k/session suppression budget from generic Auto-Recall.
-    - Ranking reuses the shared normalization/aggregation/selection helpers, including diversity-aware final ordering.
-    - Recall grouping is partitioned by `kind + strictKey`, so invariant/derived rows with identical normalized text stay separate.
-  - `command:new` / `command:reset`: `runMemoryReflection` builds the self-improvement note (`<open-loops>` from fresh reflection; `<derived-focus>` from historical scored rows when mode is `inheritance+derived`).
-  - `before_prompt_build`: injects `<error-detected>` only (no `<derived-focus>`).
+Use this when you want reflection-based rule inheritance and optional reflection persistence.
+
+What to configure first:
+- `memoryReflection.enabled`: turn reflection features on/off
+- `memoryReflection.injectMode`:
+  - `inheritance-only` = inject inherited rules only
+  - `inheritance+derived` = inherited rules + derived-focus note on `/new` / `/reset`
+- `memoryReflection.recall.mode`:
+  - `fixed` = compatibility path
+  - `dynamic` = prompt-gated `<inherited-rules>` recall
+- `memoryReflection.storeToLanceDB`: store reflection event/item rows in LanceDB
+- `memoryReflection.agentId` (optional): use a dedicated reflection agent
+
+Recommended starter config:
+
+```json
+{
+  "memoryReflection": {
+    "enabled": true,
+    "injectMode": "inheritance-only",
+    "storeToLanceDB": true,
+    "recall": {
+      "mode": "dynamic",
+      "topK": 6,
+      "includeKinds": ["invariant", "derived"],
+      "maxAgeDays": 14,
+      "maxEntriesPerKey": 7,
+      "minRepeated": 3,
+      "minScore": 0.22,
+      "minPromptLength": 12
+    }
+  }
+}
+```
+
+Quick behavior guide:
+- `before_agent_start` can inject `<inherited-rules>`
+- `/new` / `/reset` can build the reflection note
+- `before_prompt_build` only injects `<error-detected>` reminders
+- dynamic recall keeps `kind + strictKey` separation for invariant/derived rows
 
 ### 10. Markdown Mirror (`mdMirror`)
 
-- Purpose:
-  - Dual-write memory entries to readable Markdown files in addition to LanceDB.
-  - Useful for audit/debug/manual review.
-- Write paths:
-  - Preferred: mapped agent workspace `memory/YYYY-MM-DD.md`.
-  - Fallback: `mdMirror.dir` (default: `memory-md`) when agent workspace mapping is unavailable.
-- Trigger points:
-  - `memory_store` tool writes.
-  - Auto-capture writes from `agent_end`.
-- Compatibility:
-  - Does not replace LanceDB storage or retrieval flow.
-  - Existing retrieval remains vector/BM25/rerank based.
-- Config:
-  - `mdMirror.enabled`: enable/disable dual-write (`false` by default).
-  - `mdMirror.dir`: fallback directory for Markdown mirror files.
+Use this when you want a readable Markdown copy of memories in addition to LanceDB.
+
+Main config:
+- `mdMirror.enabled`: turn Markdown dual-write on/off
+- `mdMirror.dir`: fallback output directory when the agent workspace path is unavailable
+
+What it does:
+- writes memory entries to readable Markdown files
+- prefers `memory/YYYY-MM-DD.md` in the mapped workspace
+- falls back to `mdMirror.dir` when needed
+- does not replace LanceDB retrieval/storage
+
+Recommended starter config:
+
+```json
+{
+  "mdMirror": {
+    "enabled": true,
+    "dir": "memory-md"
+  }
+}
+```
 
 ### 11. Long Context Chunking
 
@@ -288,9 +316,13 @@ When embedding calls fail, the plugin provides **actionable error messages** ins
   - Skips memory-management prompts (e.g. delete/forget/cleanup memory entries) to reduce noise
 - **Auto-Recall** (`before_agent_start` hook): Injects `<relevant-memories>` context
   - Default top-k: `autoRecallTopK=3`
+  - Generic final-selection mode: `autoRecallSelectionMode` (`legacy` by default; `setwise-v2` to enable set-wise final selector)
   - Default category allowlist: `preference`, `fact`, `decision`, `entity`, `other`
   - `autoRecallExcludeReflection=true` by default, so `<relevant-memories>` stays separate from `<inherited-rules>`
   - Supports age window (`autoRecallMaxAgeDays`) and recent-per-key cap (`autoRecallMaxEntriesPerKey`)
+  - `legacy`: post-processed rows use direct truncation (`slice(0, topK)`) for compatibility
+  - `setwise-v2`: final top-k uses shared set-wise selection (base score + freshness + light category/scope coverage + lexical overlap suppression + embedding-based semantic near-duplicate suppression), with deterministic output order and safe lexical-only fallback when vectors are missing
+  - This mode is generic auto-recall only. Reflection-Recall mode remains `fixed | dynamic`.
 
 ### Prevent memories from showing up in replies
 
@@ -489,6 +521,7 @@ openclaw config get plugins.slots.memory
   "autoRecall": false,
   "autoRecallMinLength": 8,
   "autoRecallTopK": 3,
+  "autoRecallSelectionMode": "legacy",
   "autoRecallCategories": ["preference", "fact", "decision", "entity", "other"],
   "autoRecallExcludeReflection": true,
   "autoRecallMaxAgeDays": 30,
@@ -579,6 +612,7 @@ A practical starting point for Chinese chat workloads:
   "autoCapture": true,
   "autoRecall": true,
   "autoRecallMinLength": 8,
+  "autoRecallSelectionMode": "legacy",
   "autoRecallExcludeReflection": true,
   "retrieval": {
     "candidatePoolSize": 20,

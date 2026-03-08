@@ -37,10 +37,12 @@ const {
 } = jiti("../src/reflection-store.ts");
 const { normalizeReflectionSoftKey } = jiti("../src/reflection-normalize.ts");
 const { rankDynamicReflectionRecallFromEntries } = jiti("../src/reflection-recall.ts");
+const { selectFinalAutoRecallResults } = jiti("../src/auto-recall-final-selection.ts");
 const {
   createDynamicRecallSessionState,
   clearDynamicRecallSessionState,
   orchestrateDynamicRecall,
+  normalizeRecallTextKey,
 } = jiti("../src/recall-engine.ts");
 const {
   REFLECTION_INVARIANT_DECAY_MIDPOINT_DAYS,
@@ -1075,6 +1077,358 @@ describe("memory reflection", () => {
     });
   });
 
+  describe("generic auto-recall final selection", () => {
+    function makeRetrievalResult({ id, text, score, category, scope, timestamp, vector = [] }) {
+      return {
+        entry: {
+          id,
+          text,
+          category,
+          scope,
+          timestamp,
+          vector,
+          importance: 0.8,
+          metadata: "{}",
+        },
+        score,
+        sources: {},
+      };
+    }
+
+    it("keeps strongest rank-1 while reducing duplicate saturation with light category/scope coverage", () => {
+      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+      const day = 24 * 60 * 60 * 1000;
+      const rows = [
+        makeRetrievalResult({
+          id: "dup-1",
+          text: "Verify DNS and mount health after service restart.",
+          score: 0.99,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+        }),
+        makeRetrievalResult({
+          id: "dup-2",
+          text: "Verify dns and mount health after service restart!",
+          score: 0.985,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+        }),
+        makeRetrievalResult({
+          id: "dup-3",
+          text: "verify dns mount health after service restart",
+          score: 0.98,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+        }),
+        makeRetrievalResult({
+          id: "decision-1",
+          text: "Record rollback command before changing service units.",
+          score: 0.95,
+          category: "decision",
+          scope: "global",
+          timestamp: now - 2 * day,
+        }),
+        makeRetrievalResult({
+          id: "pref-1",
+          text: "Prefer concise post-check summaries in final responses.",
+          score: 0.945,
+          category: "preference",
+          scope: "agent:main",
+          timestamp: now - 1 * day,
+        }),
+        makeRetrievalResult({
+          id: "entity-1",
+          text: "Service dependency map includes mosdns and rclone.",
+          score: 0.94,
+          category: "entity",
+          scope: "project:ops",
+          timestamp: now - 3 * day,
+        }),
+      ];
+
+      const selected = selectFinalAutoRecallResults(rows, { topK: 4, now });
+
+      assert.equal(selected.length, 4);
+      assert.equal(selected[0].entry.id, "dup-1");
+
+      const duplicateKey = normalizeRecallTextKey(rows[0].entry.text);
+      const duplicateCount = selected.filter((row) => normalizeRecallTextKey(row.entry.text) === duplicateKey).length;
+      assert.equal(duplicateCount, 1);
+      assert.ok(new Set(selected.map((row) => row.entry.category)).size >= 3);
+      assert.ok(new Set(selected.map((row) => row.entry.scope)).size >= 2);
+    });
+
+    it("is deterministic for the same candidate set regardless of input order", () => {
+      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+      const day = 24 * 60 * 60 * 1000;
+      const rows = [
+        makeRetrievalResult({
+          id: "dup-1",
+          text: "Keep DNS and mount post-checks in recovery flow.",
+          score: 0.97,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+        }),
+        makeRetrievalResult({
+          id: "dup-2",
+          text: "Keep dns and mount post-checks in recovery flow!",
+          score: 0.965,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+        }),
+        makeRetrievalResult({
+          id: "decision-1",
+          text: "Log rollback command and expected service state before edits.",
+          score: 0.94,
+          category: "decision",
+          scope: "global",
+          timestamp: now - 2 * day,
+        }),
+        makeRetrievalResult({
+          id: "pref-1",
+          text: "Respond with concise and factual status updates.",
+          score: 0.938,
+          category: "preference",
+          scope: "agent:main",
+          timestamp: now - 1 * day,
+        }),
+      ];
+
+      const forward = selectFinalAutoRecallResults(rows, { topK: 3, now });
+      const reversed = selectFinalAutoRecallResults([...rows].reverse(), { topK: 3, now });
+
+      assert.deepEqual(
+        forward.map((row) => row.entry.id),
+        reversed.map((row) => row.entry.id)
+      );
+    });
+
+    it("suppresses lexical-overlap paraphrases even when normalized keys differ", () => {
+      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+      const day = 24 * 60 * 60 * 1000;
+      const rows = [
+        makeRetrievalResult({
+          id: "dup-1",
+          text: "Keep DNS/mount post-check command list after service restart.",
+          score: 0.99,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+        }),
+        makeRetrievalResult({
+          id: "dup-2",
+          text: "Keep DNS mount post check command list after service restart",
+          score: 0.987,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+        }),
+        makeRetrievalResult({
+          id: "dup-3",
+          text: "Keep DNS-mount post check command list after service restart",
+          score: 0.984,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+        }),
+        makeRetrievalResult({
+          id: "decision-1",
+          text: "Write rollback command before editing service unit files.",
+          score: 0.955,
+          category: "decision",
+          scope: "global",
+          timestamp: now - 2 * day,
+        }),
+        makeRetrievalResult({
+          id: "pref-1",
+          text: "Prefer concise status updates after mandatory verification checks.",
+          score: 0.951,
+          category: "preference",
+          scope: "agent:main",
+          timestamp: now - 2 * day,
+        }),
+      ];
+
+      const selected = selectFinalAutoRecallResults(rows, { topK: 3, now });
+
+      assert.equal(selected.length, 3);
+      assert.equal(selected[0].entry.id, "dup-1");
+      assert.equal(selected.filter((row) => row.entry.id.startsWith("dup-")).length, 1);
+      assert.ok(selected.some((row) => row.entry.id === "decision-1"));
+      assert.ok(selected.some((row) => row.entry.id === "pref-1"));
+    });
+
+    it("suppresses semantic redundancy while preserving strongest top1", () => {
+      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+      const day = 24 * 60 * 60 * 1000;
+      const rows = [
+        makeRetrievalResult({
+          id: "sem-1",
+          text: "Use rollback checklist before restarting critical services.",
+          score: 0.992,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+          vector: [1, 0, 0, 0],
+        }),
+        makeRetrievalResult({
+          id: "sem-2",
+          text: "Maintain pre-restart safeguards for high-impact daemons.",
+          score: 0.989,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+          vector: [0.995, 0.005, 0, 0],
+        }),
+        makeRetrievalResult({
+          id: "sem-3",
+          text: "Record recovery expectations before applying config edits.",
+          score: 0.987,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+          vector: [0.996, 0.004, 0, 0],
+        }),
+        makeRetrievalResult({
+          id: "decision-1",
+          text: "Run post-check commands and store evidence timestamps.",
+          score: 0.956,
+          category: "decision",
+          scope: "global",
+          timestamp: now - 2 * day,
+          vector: [0, 1, 0, 0],
+        }),
+        makeRetrievalResult({
+          id: "pref-1",
+          text: "Keep responses concise and report only verified outcomes.",
+          score: 0.954,
+          category: "preference",
+          scope: "agent:main",
+          timestamp: now - 2 * day,
+          vector: [0, 0, 1, 0],
+        }),
+      ];
+
+      const selected = selectFinalAutoRecallResults(rows, { topK: 3, now });
+
+      assert.equal(selected.length, 3);
+      assert.equal(selected[0].entry.id, "sem-1");
+      assert.equal(selected.filter((row) => row.entry.id.startsWith("sem-")).length, 1);
+      assert.ok(selected.some((row) => row.entry.id === "decision-1"));
+      assert.ok(selected.some((row) => row.entry.id === "pref-1"));
+    });
+
+    it("keeps deterministic output under reversed order when semantic penalties are active", () => {
+      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+      const day = 24 * 60 * 60 * 1000;
+      const rows = [
+        makeRetrievalResult({
+          id: "sem-1",
+          text: "Store rollback checks before service restarts.",
+          score: 0.986,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+          vector: [1, 0, 0, 0],
+        }),
+        makeRetrievalResult({
+          id: "sem-2",
+          text: "Keep safety checklist in place ahead of daemon restarts.",
+          score: 0.983,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+          vector: [0.998, 0.002, 0, 0],
+        }),
+        makeRetrievalResult({
+          id: "decision-1",
+          text: "Record service state before changing systemd units.",
+          score: 0.95,
+          category: "decision",
+          scope: "global",
+          timestamp: now - 2 * day,
+          vector: [0, 1, 0, 0],
+        }),
+        makeRetrievalResult({
+          id: "pref-1",
+          text: "Keep final status reports concise and factual.",
+          score: 0.948,
+          category: "preference",
+          scope: "agent:main",
+          timestamp: now - 2 * day,
+          vector: [0, 0, 1, 0],
+        }),
+      ];
+
+      const forward = selectFinalAutoRecallResults(rows, { topK: 3, now });
+      const reversed = selectFinalAutoRecallResults([...rows].reverse(), { topK: 3, now });
+
+      assert.deepEqual(
+        forward.map((row) => row.entry.id),
+        reversed.map((row) => row.entry.id)
+      );
+    });
+
+    it("falls back safely to lexical-only behavior when vectors are missing or invalid", () => {
+      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+      const day = 24 * 60 * 60 * 1000;
+      const rows = [
+        makeRetrievalResult({
+          id: "dup-1",
+          text: "Keep DNS/mount checks mandatory after service edits.",
+          score: 0.99,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+          vector: [],
+        }),
+        makeRetrievalResult({
+          id: "dup-2",
+          text: "Keep DNS mount checks mandatory after service edits.",
+          score: 0.987,
+          category: "fact",
+          scope: "global",
+          timestamp: now - 1 * day,
+          vector: [Number.NaN, 1, 2],
+        }),
+        makeRetrievalResult({
+          id: "decision-1",
+          text: "Write rollback plan before changing service units.",
+          score: 0.955,
+          category: "decision",
+          scope: "global",
+          timestamp: now - 2 * day,
+          vector: undefined,
+        }),
+        makeRetrievalResult({
+          id: "pref-1",
+          text: "Report only verified outcomes in short status updates.",
+          score: 0.951,
+          category: "preference",
+          scope: "agent:main",
+          timestamp: now - 2 * day,
+          vector: new Float32Array([0, 1, 0, 0]),
+        }),
+      ];
+
+      const selected = selectFinalAutoRecallResults(rows, { topK: 3, now });
+      const reversed = selectFinalAutoRecallResults([...rows].reverse(), { topK: 3, now });
+
+      assert.equal(selected.length, 3);
+      assert.equal(selected[0].entry.id, "dup-1");
+      assert.equal(selected.filter((row) => row.entry.id.startsWith("dup-")).length, 1);
+      assert.deepEqual(
+        selected.map((row) => row.entry.id),
+        reversed.map((row) => row.entry.id)
+      );
+    });
+  });
+
   describe("dynamic reflection recall ranking", () => {
     it("filters stale rows by time window", () => {
       const now = Date.UTC(2026, 2, 8);
@@ -1303,6 +1657,9 @@ describe("memory reflection", () => {
         [...new Set(rows.map((row) => row.kind))].sort(),
         ["derived", "invariant"]
       );
+      for (const row of rows) {
+        assert.match(row.id, /^reflection:(derived|invariant)::/);
+      }
       assert.equal(new Set(rows.map((row) => row.id)).size, 2);
       assert.equal(new Set(rows.map((row) => normalizeReflectionSoftKey(row.text))).size, 1);
     });
@@ -1862,6 +2219,130 @@ describe("memory reflection", () => {
       assert.match(relevant.prependContext, /User prefers concise incident updates\./);
       assert.match(relevant.prependContext, /Decide to verify services after config edits\./);
       assert.match(inherited.prependContext, /Dynamic reflection rule 1/);
+    });
+  });
+
+  describe("generic auto-recall selection mode compatibility", () => {
+    let workspaceDir;
+    let originalRetrieve;
+    const now = Date.UTC(2026, 2, 8, 12, 0, 0);
+    const day = 24 * 60 * 60 * 1000;
+
+    beforeEach(() => {
+      workspaceDir = mkdtempSync(path.join(tmpdir(), "generic-auto-recall-selection-mode-test-"));
+      originalRetrieve = MemoryRetriever.prototype.retrieve;
+    });
+
+    afterEach(() => {
+      MemoryRetriever.prototype.retrieve = originalRetrieve;
+      rmSync(workspaceDir, { recursive: true, force: true });
+    });
+
+    function buildGenericRecallRows() {
+      return [
+        {
+          entry: {
+            id: "dup-1",
+            text: "Restart API service after config updates.",
+            category: "fact",
+            scope: "global",
+            timestamp: now - 1 * day,
+            vector: [],
+            importance: 0.8,
+            metadata: "{}",
+          },
+          score: 0.99,
+          sources: {},
+        },
+        {
+          entry: {
+            id: "dup-2",
+            text: "restart api service after config updates.",
+            category: "fact",
+            scope: "global",
+            timestamp: now - 2 * day,
+            vector: [],
+            importance: 0.8,
+            metadata: "{}",
+          },
+          score: 0.97,
+          sources: {},
+        },
+        {
+          entry: {
+            id: "alt-1",
+            text: "Run DNS and mount health checks after restart.",
+            category: "decision",
+            scope: "global",
+            timestamp: now - 1 * day,
+            vector: [],
+            importance: 0.8,
+            metadata: "{}",
+          },
+          score: 0.65,
+          sources: {},
+        },
+      ];
+    }
+
+    it("legacy mode bypasses set-wise selector and uses direct truncation", async () => {
+      MemoryRetriever.prototype.retrieve = async () => buildGenericRecallRows();
+
+      const harness = createPluginApiHarness({
+        resolveRoot: workspaceDir,
+        pluginConfig: {
+          embedding: { apiKey: "test-api-key" },
+          autoCapture: false,
+          autoRecall: true,
+          autoRecallTopK: 2,
+          autoRecallSelectionMode: "legacy",
+          autoRecallMinLength: 1,
+          selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+        },
+      });
+      memoryLanceDBProPlugin.register(harness.api);
+
+      const hooks = harness.eventHandlers.get("before_agent_start") || [];
+      assert.equal(hooks.length, 1);
+      const output = await hooks[0].handler(
+        { prompt: "Need rollout memories now." },
+        { sessionId: "legacy-mode", sessionKey: "agent:main:session:legacy-mode", agentId: "main" }
+      );
+      assert.ok(output);
+      assert.match(output.prependContext, /<relevant-memories>/);
+      assert.match(output.prependContext, /Restart API service after config updates\./);
+      assert.match(output.prependContext, /restart api service after config updates\./);
+      assert.doesNotMatch(output.prependContext, /Run DNS and mount health checks after restart\./);
+    });
+
+    it("setwise-v2 mode uses set-wise selector for final top-k", async () => {
+      MemoryRetriever.prototype.retrieve = async () => buildGenericRecallRows();
+
+      const harness = createPluginApiHarness({
+        resolveRoot: workspaceDir,
+        pluginConfig: {
+          embedding: { apiKey: "test-api-key" },
+          autoCapture: false,
+          autoRecall: true,
+          autoRecallTopK: 2,
+          autoRecallSelectionMode: "setwise-v2",
+          autoRecallMinLength: 1,
+          selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+        },
+      });
+      memoryLanceDBProPlugin.register(harness.api);
+
+      const hooks = harness.eventHandlers.get("before_agent_start") || [];
+      assert.equal(hooks.length, 1);
+      const output = await hooks[0].handler(
+        { prompt: "Need rollout memories now." },
+        { sessionId: "setwise-mode", sessionKey: "agent:main:session:setwise-mode", agentId: "main" }
+      );
+      assert.ok(output);
+      assert.match(output.prependContext, /<relevant-memories>/);
+      assert.match(output.prependContext, /Restart API service after config updates\./);
+      assert.match(output.prependContext, /Run DNS and mount health checks after restart\./);
+      assert.doesNotMatch(output.prependContext, /restart api service after config updates\./);
     });
   });
 });

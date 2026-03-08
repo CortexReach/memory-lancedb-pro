@@ -63,4 +63,17 @@ describe("sessionStrategy legacy compatibility mapping", () => {
     });
     assert.equal(parsed.embedding.chunking, false);
   });
+
+  it("defaults generic auto-recall selection mode to legacy", () => {
+    const parsed = parsePluginConfig(baseConfig());
+    assert.equal(parsed.autoRecallSelectionMode, "legacy");
+  });
+
+  it("parses explicit generic auto-recall selection mode override", () => {
+    const parsed = parsePluginConfig({
+      ...baseConfig(),
+      autoRecallSelectionMode: "setwise-v2",
+    });
+    assert.equal(parsed.autoRecallSelectionMode, "setwise-v2");
+  });
 });

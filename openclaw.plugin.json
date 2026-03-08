@@ -111,6 +111,15 @@
         "default": 3,
         "description": "Maximum number of rows injected into <relevant-memories> for each turn."
       },
+      "autoRecallSelectionMode": {
+        "type": "string",
+        "enum": [
+          "legacy",
+          "setwise-v2"
+        ],
+        "default": "legacy",
+        "description": "Generic Auto-Recall final top-k mode. legacy keeps post-processed direct truncation compatibility; setwise-v2 uses set-wise final selection."
+      },
       "autoRecallCategories": {
         "type": "array",
         "items": {
@@ -569,6 +578,11 @@
     "autoRecallTopK": {
       "label": "Auto-Recall Top K",
       "help": "Maximum rows injected into <relevant-memories> each turn.",
+      "advanced": true
+    },
+    "autoRecallSelectionMode": {
+      "label": "Auto-Recall Selection Mode",
+      "help": "Generic final top-k mode: legacy uses direct truncation after post-processing; setwise-v2 enables set-wise final selection.",
       "advanced": true
     },
     "autoRecallCategories": {

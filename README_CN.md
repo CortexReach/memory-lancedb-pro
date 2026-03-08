@@ -55,38 +55,56 @@ OpenClaw 内置的 `memory-lancedb` 插件仅提供基本的向量搜索。**mem
 ## 架构概览
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                   index.ts (入口)                        │
-│  插件注册 · 配置解析 · 生命周期钩子 · 自动捕获/回忆       │
-└────────┬──────────┬──────────┬──────────┬───────────────┘
-         │          │          │          │
-    ┌────▼───┐ ┌────▼───┐ ┌───▼────┐ ┌──▼──────────┐
-    │ store  │ │embedder│ │retriever│ │   scopes    │
-    │ .ts    │ │ .ts    │ │ .ts    │ │    .ts      │
-    └────────┘ └────────┘ └────────┘ └─────────────┘
-         │                     │
-    ┌────▼───┐           ┌─────▼──────────┐
-    │migrate │           │noise-filter.ts │
-    │ .ts    │           │adaptive-       │
-    └────────┘           │retrieval.ts    │
-                         └────────────────┘
-    ┌─────────────┐   ┌──────────┐
-    │  tools.ts   │   │  cli.ts  │
-    │ (Agent API) │   │ (CLI)    │
-    └─────────────┘   └──────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                           index.ts（入口）                          │
+│              插件注册 · 配置解析 · 生命周期与注入流程编排           │
+└────────┬───────────────────────────────┬─────────────────────────────┘
+         │                               │
+         │ generic auto-recall           │ reflection / inherited-rules
+         │                               │
+┌────────▼────────┐              ┌───────▼───────────────────────────┐
+│   retriever.ts  │              │       reflection-recall.ts        │
+│ 向量/BM25/RRF   │              │ 动态 Reflection-Recall 排序       │
+│ rerank/filters  │              └───────────────┬───────────────────┘
+└────────┬────────┘                              │
+         │                               ┌──────▼────────────────────┐
+┌────────▼───────────────┐               │ reflection-aggregation.ts │
+│ postProcessAutoRecall  │               │ strictKey 分组与打分      │
+│ （index.ts 本地步骤）  │               └──────┬────────────────────┘
+└────────┬───────────────┘                      │
+         │                               ┌──────▼───────────────────────┐
+         │ legacy | setwise-v2           │ reflection-recall-final-     │
+┌────────▼────────────────────┐           │ selection.ts                 │
+│ auto-recall-final-          │           └──────┬───────────────────────┘
+│ selection.ts                │                  │
+└────────┬────────────────────┘           ┌──────▼───────────────────────┐
+         └────────────────────────────────► final-topk-setwise-         │
+                                          │ selection.ts                │
+                                          │ 共享最终 top-k 选择器       │
+                                          └─────────────────────────────┘
+
+共享基础设施：`store.ts`、`embedder.ts`、`scopes.ts`、`tools.ts`、
+`noise-filter.ts`、`adaptive-retrieval.ts`、`recall-engine.ts`、`migrate.ts`、`cli.ts`
 ```
 
 ### 文件说明
 
 | 文件 | 用途 |
 |------|------|
-| `index.ts` | 插件入口。注册到 OpenClaw Plugin API，解析配置，挂载 `before_agent_start`（自动回忆）、`agent_end`（自动捕获）、集成 `self-improvement`（`agent:bootstrap`、`command:new/reset`）和集成 `memory-reflection`（`command:new/reset`）钩子 |
+| `index.ts` | 插件入口。注册到 OpenClaw Plugin API，解析配置，挂载 `before_agent_start` / `agent_end` 钩子，负责 generic auto-recall 的 `legacy | setwise-v2` 分流，并编排 reflection 注入流程 |
 | `openclaw.plugin.json` | 插件元数据 + 完整 JSON Schema 配置声明（含 `uiHints`） |
 | `package.json` | NPM 包信息，依赖 `@lancedb/lancedb`、`openai`、`@sinclair/typebox` |
 | `cli.ts` | CLI 命令实现：`memory list/search/stats/delete/delete-bulk/export/import/reembed/migrate` |
 | `src/store.ts` | LanceDB 存储层。表创建 / FTS 索引 / Vector Search / BM25 Search / CRUD / 批量删除 / 统计 |
 | `src/embedder.ts` | Embedding 抽象层。兼容 OpenAI API 的任意 Provider（OpenAI、Gemini、Jina、Ollama 等），支持 task-aware embedding（`taskQuery`/`taskPassage`） |
-| `src/retriever.ts` | 混合检索引擎。Vector + BM25 → RRF 融合 → Jina Cross-Encoder Rerank → Recency Boost → Importance Weight → Length Norm → Time Decay → Hard Min Score → Noise Filter → MMR Diversity |
+| `src/retriever.ts` | 混合检索引擎。Vector + BM25 → RRF 融合 → rerank → 时效 / 重要性 / 长度 / 衰减加权 → 噪声过滤 → 粗粒度 MMR 去重。 |
+| `src/recall-engine.ts` | 共享 recall 辅助层：prompt 触发判断、session 重复注入抑制、tag block 组装、max-age 过滤、按 key 保留最近 N 条 |
+| `src/auto-recall-final-selection.ts` | generic auto-recall 适配层。把 `RetrievalResult` 映射为最终选择候选，并在最终截断点应用 generic 的 `legacy | setwise-v2` 行为 |
+| `src/final-topk-setwise-selection.ts` | 共享最终 top-k 选择器。负责 shortlist presort、确定性的 set-wise 选择、词法重叠抑制，以及可选的 embedding 语义冗余抑制 |
+| `src/reflection-recall.ts` | `<inherited-rules>` 的动态 Reflection-Recall 排序链路。负责 reflection item 过滤/截断、分数计算、保持 `kind + strictKey` 分区，并将选中的 group 映射回 recall rows |
+| `src/reflection-aggregation.ts` | Reflection group 聚合层。把打分后的 reflection item 聚合为 strict-key group，选择代表文本并计算 group final score |
+| `src/reflection-recall-final-selection.ts` | Reflection 专用适配层，把动态 Reflection-Recall 的 group 接到共享 final selector 上做最终 top-k 排序 |
+| `src/reflection-selection.ts` | 历史 derived-focus / handoff-note 仍在使用的 reflection 多样性排序 helper |
 | `src/scopes.ts` | 多 Scope 访问控制。支持 `global`、`agent:<id>`、`custom:<name>`、`project:<id>`、`user:<id>` 等 Scope 模式 |
 | `src/tools.ts` | Agent 工具定义：`memory_recall`、`memory_store`、`memory_forget`（核心）、`self_improvement_log`（默认）+ `self_improvement_review`、`self_improvement_extract_skill`（管理模式） |
 | `src/noise-filter.ts` | 噪声过滤器。过滤 Agent 拒绝回复、Meta 问题、寒暄等低质量记忆 |
@@ -148,118 +166,127 @@ Query → BM25 FTS ─────┘
 
 ### 7. Session 策略
 
-- `sessionStrategy: "systemSessionMemory"`（默认）：不注册插件 reflection hooks，改用 OpenClaw 内置 `session-memory`。
-- `sessionStrategy: "memoryReflection"`：为 `/new` / `/reset` 启用插件 reflection hooks。
-- `sessionStrategy: "none"`：完全禁用本插件的会话策略 hooks。
-- 兼容说明：`sessionMemory.enabled=true|false` 映射为 `systemSessionMemory|none`。
-- `sessionMemory.messageCount` 也作为遗留兼容字段保留，并映射到 `memoryReflection.messageCount`。
-- 实用规则：只有在 `sessionStrategy="memoryReflection"` 时，`memoryReflection.*` 配置才会真正生效。
+这一组配置决定 `/new` / `/reset` 由谁接管。
+
+- `sessionStrategy: "systemSessionMemory"`（默认）
+  - 使用 OpenClaw 内置 `session-memory`
+  - 插件自己的 reflection hooks 不启用
+- `sessionStrategy: "memoryReflection"`
+  - 启用插件 reflection 流程
+  - 只有在这个模式下，`memoryReflection.*` 配置才会生效
+- `sessionStrategy: "none"`
+  - 完全禁用本插件的 session strategy hooks
+
+兼容字段：
+- `sessionMemory.enabled=true|false` 仍映射到 `systemSessionMemory|none`
+- `sessionMemory.messageCount` 仍映射到 `memoryReflection.messageCount`
+
+推荐起步配置：
+
+```json
+{
+  "sessionStrategy": "memoryReflection"
+}
+```
 
 ### 8. Self-Improvement
 
-- 触发事件：`agent:bootstrap`、`command:new`、`command:reset`。
-- `agent:bootstrap`：将 `SELF_IMPROVEMENT_REMINDER.md` 注入 bootstrap 上下文。
-- `command:new` / `command:reset`：在重置前追加简短 `/note self-improvement ...` 提醒。
-  - 在 `sessionStrategy="memoryReflection"` 下，最终 reset/new note 由 `runMemoryReflection` 组装。
-  - 当 `memoryReflection.injectMode="inheritance+derived"` 时，note 可包含：
-    - 来自当前 `/new` 或 `/reset` 新鲜反思文本的 `<open-loops>`。
-    - 来自历史 LanceDB 派生行（去重+衰减评分后）的 `<derived-focus>`（shortlist 最多 36，最终注入上限 13，不使用硬性分数阈值门槛）。
-- 文件初始化路径：确保 `.learnings/LEARNINGS.md` 和 `.learnings/ERRORS.md` 存在。
-- 这条链路与 `memoryReflection` 分离：看到 self-improvement note 或 `.learnings/*` 写入，并不等于 reflection 存储已开启。
-- 追加路径刻意区分为三种：
-  - 显式工具写入：`self_improvement_log`
-  - reflection 驱动的自动追加：来自结构化 governance candidates
-  - 文件/模板确保路径：bootstrap 阶段创建缺失文件
-- 工具：
-  - `self_improvement_log`：写入结构化 `learning` / `error` 条目。
-  - `self_improvement_review`：汇总治理 backlog（pending/high/promoted）。
-  - `self_improvement_extract_skill`：通过显式工具调用，从学习条目提炼可复用 `SKILL.md` 脚手架。
-- Reflection 自动追加行为：
-  - 来源段落：`## Learning governance candidates (.learnings / promotion / skill extraction)`。
-  - 首选格式：结构化逐条记录（`### Entry N`、`Priority`、`Status`、`Area`、`Summary`、`Details`、`Suggested Action`）。
-  - 向后兼容：旧的 bullet-style governance 内容仍作为 fallback 解析路径保留。
-  - 每个解析出的 governance candidate 会单独追加为一条 `.learnings/LEARNINGS.md` 记录。
-  - `Logged` 时间戳和条目 id 由写入器生成，而不是由 reflection 文本提供。
+如果你希望插件顺手维护一套可审计的学习/报错记录，就开启这一组功能。
+
+- 主要工具：
+  - `self_improvement_log`：追加结构化 learning / error 条目
+  - `self_improvement_review`：查看待处理治理 backlog
+  - `self_improvement_extract_skill`：从已验证的 learning 条目提炼 skill scaffold
+- 主要配置：
+  - `selfImprovement.enabled`：总开关
+  - `selfImprovement.beforeResetNote`：在 `/new` 或 `/reset` 前给出提醒
+  - `selfImprovement.ensureLearningFiles`：自动创建 `.learnings` 文件
+  - `selfImprovement.managementTools`：暴露 review / extract 工具
+- 主要输出：
+  - `.learnings/LEARNINGS.md`
+  - `.learnings/ERRORS.md`
+  - 提炼 skill 时写入 `.learnings/skills/...`
+
+推荐起步配置：
+
+```json
+{
+  "selfImprovement": {
+    "enabled": true,
+    "beforeResetNote": true,
+    "ensureLearningFiles": true,
+    "managementTools": true
+  }
+}
+```
 
 ### 9. memoryReflection
 
-- 启用条件：
-  - 需要 `sessionStrategy="memoryReflection"`。
-  - 触发于 `command:new` / `command:reset`。
-  - 若会话上下文不完整（例如缺少配置、session 文件、或可读对话内容），则跳过生成。
-  - 边界场景：在刚 `/new` 后立即再次 `/new`，可能进入一个没有可读上一轮 `sessionFile` 的新空会话；此时 reflection 会跳过并记录 `missing session file after recovery`。这属于预期行为。
-- 执行链：
-  - 先尝试 embedded runner（`runEmbeddedPiAgent`）。
-  - 若 embedded 路径失败，则回退到 `openclaw agent --local --json`。
-  - 若两者都失败，则写入最小 fallback reflection artifact。
-- Markdown 产物：
-  - 写入 `memory/reflections/YYYY-MM-DD/`。
-  - 文件名使用高精度时间戳 + agent/session token，例如 `HHMMSSmmm-agent-session[-xxxxxx].md`。
-- Prompt / 输出契约：
-  - 必需段落使用固定标题，并按精确 section 名解析。
-  - `Invariants` = 稳定的跨会话规则。
-  - `Derived` = 本轮提炼出的近期经验 / 调整 / follow-up heuristics，可能在接下来几轮继续有用，但应随时间衰减。
-  - Governance candidates 使用结构化 entry 模板，以便安全追加到 `.learnings`。
-  - `Logged` 时间戳和 ids 等 writer-owned metadata 由持久化层生成，而非模型输出。
-- 写入 LanceDB（可选）：
-  - 由 `memoryReflection.storeToLanceDB` 控制。
-  - 每次反思会写入 1 条 event row（`type=memory-reflection-event`）以及多条 item row（`type=memory-reflection-item`，对应每个 `Invariants` / `Derived` bullet）。
-  - event row 仅保留轻量 provenance / audit 元数据（`eventId`、`sessionKey`、`usedFallback`、`errorSignals`、source path）。
-  - item row 携带逐条衰减元数据（`decayModel`、`decayMidpointDays`、`decayK`、`baseWeight`、`quality`）以及 `ordinal/groupSize`。
-  - 仅使用 itemized reflection rows；旧版 combined row（`type=memory-reflection`）已不再写入，也不再参与读取。
-  - reflection 行展示标签为 `reflection:<scope>`。
-- Reflection 派生 durable memory 映射：
-  - 插件支持的 memory categories 包括 `preference`、`fact`、`decision`、`entity`、`reflection`、`other`。
-  - 但 reflection auto-map 有意只写：
-    - `User model deltas` → `preference`
-    - `Agent model deltas` → `preference`
-    - `Lessons & pitfalls` → `fact`
-    - `Decisions (durable)` → `decision`
-  - `Context`、`Open loops`、`Retrieval tags`、`Invariants`、`Derived` 不会被自动映射成普通 durable memory 类别。
-- 衰减算法与内置档位：
-  - reflection loading / injection 阶段使用 logistic decay；这**不会**修改全局 retriever 评分链路。
-  - 公式：`weight = 1 / (1 + exp(k * (ageDays - midpointDays)))`
-  - reflection item 内置档位：
-    - `invariant`：midpointDays=`45`，`k=0.22`，`baseWeight=1.10`，`quality=1.00`
-    - `derived`：midpointDays=`7`，`k=0.65`，`baseWeight=1.00`，`quality=0.95`
-  - mapped durable-memory 内置档位：
-    - `decision`：midpointDays=`45`，`k=0.25`，`baseWeight=1.10`，`quality=1.00`
-    - `user-model`：midpointDays=`21`，`k=0.30`，`baseWeight=1.00`，`quality=0.95`
-    - `agent-model`：midpointDays=`10`，`k=0.35`，`baseWeight=0.95`，`quality=0.93`
-    - `lesson`：midpointDays=`7`，`k=0.45`，`baseWeight=0.90`，`quality=0.90`
-  - 这些衰减参数当前属于插件写入的实现内置 metadata，不是用户可直接配置的 `memoryReflection.*` schema 字段。
-  - fallback 生成的记录会额外乘以 `0.75` 惩罚因子。
-- 独立代理（可选）：
-  - `memoryReflection.agentId` 可指向专门的 reflection agent（如 `memory-distiller`）。
-  - 若配置的 agent id 不在 `cfg.agents.list` 中，插件会告警并回退到 runtime agent id。
-- 错误闭环：
-  - `after_tool_call` 捕获并去重工具错误签名，用于提醒 / reflection 上下文。
-- Hook 注入位置（`memoryReflection.injectMode`）：
-  - `before_agent_start`：通过 Reflection-Recall 注入 `<inherited-rules>`。
-  - `memoryReflection.recall.mode="fixed"`（默认）：兼容路径；即使关闭 generic Auto-Recall，固定继承仍会注入。
-  - `memoryReflection.recall.mode="dynamic"`：按 prompt 动态检索反思规则，且与 generic Auto-Recall 使用独立 top-k / session 去重预算。
-    - 排序复用共享的 normalize/aggregation/selection helper（包含多样性感知的最终排序）。
-    - 回忆分组按 `kind + strictKey` 分区；即使标准化文本相同，`invariant`/`derived` 也不会被合并成同一条。
-  - `command:new` / `command:reset`：`runMemoryReflection` 生成 self-improvement note（`<open-loops>` 来自本次新反思；`<derived-focus>` 来自历史打分行，模式为 `inheritance+derived` 时启用）。
-  - `before_prompt_build`：仅注入 `<error-detected>`（不会注入 `<derived-focus>`）。
+如果你希望插件在新会话前继承规则、并可选地把反思写入 LanceDB，就配置这一组功能。
+
+优先关注这些配置：
+- `memoryReflection.enabled`：开启/关闭 reflection 功能
+- `memoryReflection.injectMode`：
+  - `inheritance-only` = 只注入继承规则
+  - `inheritance+derived` = 继承规则 + `/new` / `/reset` 时追加 derived-focus note
+- `memoryReflection.recall.mode`：
+  - `fixed` = 兼容路径
+  - `dynamic` = 按 prompt 动态生成 `<inherited-rules>`
+- `memoryReflection.storeToLanceDB`：是否把 reflection event/item 写入 LanceDB
+- `memoryReflection.agentId`（可选）：指定专门的 reflection agent
+
+推荐起步配置：
+
+```json
+{
+  "memoryReflection": {
+    "enabled": true,
+    "injectMode": "inheritance-only",
+    "storeToLanceDB": true,
+    "recall": {
+      "mode": "dynamic",
+      "topK": 6,
+      "includeKinds": ["invariant", "derived"],
+      "maxAgeDays": 14,
+      "maxEntriesPerKey": 7,
+      "minRepeated": 3,
+      "minScore": 0.22,
+      "minPromptLength": 12
+    }
+  }
+}
+```
+
+快速行为说明：
+- `before_agent_start` 可注入 `<inherited-rules>`
+- `/new` / `/reset` 可生成 reflection note
+- `before_prompt_build` 只注入 `<error-detected>` 提醒
+- dynamic recall 会保持 `kind + strictKey` 分区，不会把 invariant / derived 混在一起
 
 ### 10. Markdown 镜像（`mdMirror`）
 
-- 作用：
-  - 在写入 LanceDB 的同时，把记忆双写到可读的 Markdown 文件。
-  - 便于审计、排查和人工复核。
-- 写入路径：
-  - 优先：按 agent workspace 映射写入 `memory/YYYY-MM-DD.md`。
-  - 回退：当 agent workspace 不可解析时，写入 `mdMirror.dir`（默认 `memory-md`）。
-- 触发路径：
-  - `memory_store` 工具写入。
-  - `agent_end` 自动捕获写入。
-- 兼容性：
-  - 不替代 LanceDB 存储，不影响现有检索链路。
-  - 检索仍走 vector/BM25/rerank。
-- 配置项：
-  - `mdMirror.enabled`：是否开启双写（默认 `false`）。
-  - `mdMirror.dir`：Markdown 镜像回退目录。
+如果你想在 LanceDB 之外，再保留一份可读的 Markdown 记忆副本，就开启这个功能。
+
+主要配置：
+- `mdMirror.enabled`：开启/关闭 Markdown 双写
+- `mdMirror.dir`：当 agent workspace 路径不可用时的回退目录
+
+它会做什么：
+- 把 memory entry 双写到可读的 Markdown 文件
+- 优先写到映射 workspace 下的 `memory/YYYY-MM-DD.md`
+- 必要时回退到 `mdMirror.dir`
+- 不会替代 LanceDB 的存储/检索
+
+推荐起步配置：
+
+```json
+{
+  "mdMirror": {
+    "enabled": true,
+    "dir": "memory-md"
+  }
+}
+```
 
 ### 11. 长文本分块嵌入（Long Context Chunking）
 
@@ -289,9 +316,13 @@ Query → BM25 FTS ─────┘
   - 触发词支持 **简体中文 + 繁體中文**（例如：记住/記住、偏好/喜好/喜歡、决定/決定 等）
 - **Auto-Recall**（`before_agent_start` hook）: 注入 `<relevant-memories>` 上下文
   - 默认 top-k：`autoRecallTopK=3`
+  - Generic 最终选择模式：`autoRecallSelectionMode`（默认 `legacy`；设置 `setwise-v2` 可启用 set-wise 最终选择器）
   - 默认类别白名单：`preference`、`fact`、`decision`、`entity`、`other`
   - 默认 `autoRecallExcludeReflection=true`，让 `<relevant-memories>` 与 `<inherited-rules>` 分离
   - 支持时间窗（`autoRecallMaxAgeDays`）和按归一化 key 的最近 N 条限制（`autoRecallMaxEntriesPerKey`）
+  - `legacy`：保留 retriever 当前的排序结果（包括内部的粗粒度 MMR 去重），再对 post-process 后的结果直接截断（`slice(0, topK)`），保持兼容行为
+  - `setwise-v2`：最终 top-k 使用共享 set-wise selector（基础分 + 新鲜度 + 轻量 category/scope 覆盖 + 词法重叠抑制 + 基于 embedding 的语义近重复抑制）；当向量缺失时会安全回退到仅词法抑制，并保持确定性顺序
+  - 该模式只作用于 generic auto-recall；Reflection-Recall 的 `fixed | dynamic` 语义不变。
 
 ### 不想在对话中"显示长期记忆"？
 
@@ -490,6 +521,7 @@ openclaw config get plugins.slots.memory
   "autoRecall": false,
   "autoRecallMinLength": 8,
   "autoRecallTopK": 3,
+  "autoRecallSelectionMode": "legacy",
   "autoRecallCategories": ["preference", "fact", "decision", "entity", "other"],
   "autoRecallExcludeReflection": true,
   "autoRecallMaxAgeDays": 30,
@@ -580,6 +612,7 @@ openclaw config get plugins.slots.memory
   "autoCapture": true,
   "autoRecall": true,
   "autoRecallMinLength": 8,
+  "autoRecallSelectionMode": "legacy",
   "autoRecallExcludeReflection": true,
   "retrieval": {
     "candidatePoolSize": 20,

@@ -50,6 +50,7 @@ import {
   keepMostRecentPerNormalizedKey,
 } from "./src/recall-engine.js";
 import { rankDynamicReflectionRecallFromEntries } from "./src/reflection-recall.js";
+import { selectFinalAutoRecallResults } from "./src/auto-recall-final-selection.js";
 
 // ============================================================================
 // Configuration & Types
@@ -73,6 +74,7 @@ interface PluginConfig {
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
   autoRecallTopK?: number;
+  autoRecallSelectionMode?: AutoRecallSelectionMode;
   autoRecallCategories?: MemoryCategory[];
   autoRecallExcludeReflection?: boolean;
   autoRecallMaxAgeDays?: number;
@@ -142,6 +144,7 @@ type SessionStrategy = "memoryReflection" | "systemSessionMemory" | "none";
 type ReflectionInjectMode = "inheritance-only" | "inheritance+derived";
 type ReflectionRecallMode = "fixed" | "dynamic";
 type ReflectionRecallKind = "invariant" | "derived";
+type AutoRecallSelectionMode = "legacy" | "setwise-v2";
 type MemoryCategory = "preference" | "fact" | "decision" | "entity" | "other" | "reflection";
 
 // ============================================================================
@@ -259,6 +262,7 @@ const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_AUTO_RECALL_TOP_K = 3;
+const DEFAULT_AUTO_RECALL_SELECTION_MODE: AutoRecallSelectionMode = "legacy";
 const DEFAULT_AUTO_RECALL_EXCLUDE_REFLECTION = true;
 const DEFAULT_AUTO_RECALL_MAX_AGE_DAYS = 30;
 const DEFAULT_AUTO_RECALL_MAX_ENTRIES_PER_KEY = 10;
@@ -1694,7 +1698,11 @@ const memoryLanceDBProPlugin = {
                 scopeFilter: accessibleScopes,
                 source: "auto-recall",
               });
-              return postProcessAutoRecallResults(retrieved).slice(0, topK);
+              const postProcessed = postProcessAutoRecallResults(retrieved);
+              if (config.autoRecallSelectionMode === "setwise-v2") {
+                return selectFinalAutoRecallResults(postProcessed, { topK });
+              }
+              return postProcessed.slice(0, topK);
             },
             formatLine: (row) =>
               `- [${row.entry.category}:${row.entry.scope}] ${sanitizeForContext(row.entry.text)} (${(row.score * 100).toFixed(0)}%${row.sources?.bm25 ? ", vector+BM25" : ""}${row.sources?.reranked ? "+reranked" : ""})`,
@@ -2745,6 +2753,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   const reflectionRecallMinRepeated = parsePositiveInt(memoryReflectionRecallRaw?.minRepeated) ?? DEFAULT_REFLECTION_RECALL_MIN_REPEATED;
   const reflectionRecallMinScore = parseNonNegativeNumber(memoryReflectionRecallRaw?.minScore) ?? DEFAULT_REFLECTION_RECALL_MIN_SCORE;
   const reflectionRecallMinPromptLength = parsePositiveInt(memoryReflectionRecallRaw?.minPromptLength) ?? DEFAULT_REFLECTION_RECALL_MIN_PROMPT_LENGTH;
+  const autoRecallSelectionMode: AutoRecallSelectionMode =
+    cfg.autoRecallSelectionMode === "setwise-v2"
+      ? "setwise-v2"
+      : DEFAULT_AUTO_RECALL_SELECTION_MODE;
 
   return {
     embedding: {
@@ -2785,6 +2797,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
     autoRecallTopK: parsePositiveInt(cfg.autoRecallTopK) ?? DEFAULT_AUTO_RECALL_TOP_K,
+    autoRecallSelectionMode,
     autoRecallCategories: parseMemoryCategories(cfg.autoRecallCategories, DEFAULT_AUTO_RECALL_CATEGORIES),
     autoRecallExcludeReflection: typeof cfg.autoRecallExcludeReflection === "boolean"
       ? cfg.autoRecallExcludeReflection

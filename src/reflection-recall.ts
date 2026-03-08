@@ -6,7 +6,7 @@ import { getReflectionItemDecayDefaults, type ReflectionItemKind } from "./refle
 import { filterByMaxAge, keepMostRecentPerNormalizedKey } from "./recall-engine.js";
 import { normalizeReflectionSoftKey, normalizeReflectionStrictKey } from "./reflection-normalize.js";
 import { aggregateReflectionGroups, type ReflectionScoredItem } from "./reflection-aggregation.js";
-import { selectDiversityAwareReflectionGroups } from "./reflection-selection.js";
+import { selectFinalReflectionRecallGroups } from "./reflection-recall-final-selection.js";
 
 export interface ReflectionRecallOptions {
   agentId: string;
@@ -116,9 +116,10 @@ export function rankDynamicReflectionRecallFromEntries(
 
   const groups = aggregateReflectionGroups(scoredItems, now);
   if (groups.length === 0) return [];
-  const grouped = selectDiversityAwareReflectionGroups(groups, {
+  const grouped = selectFinalReflectionRecallGroups(groups, {
     shortlistTarget: groups.length,
     finalTarget: groups.length,
+    now,
   });
   const minScore = Number.isFinite(options.minScore) ? Number(options.minScore) : 0;
   const rows = grouped
