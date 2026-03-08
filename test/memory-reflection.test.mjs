@@ -8,7 +8,6 @@ import jitiFactory from "jiti";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const pluginSdkStubPath = path.resolve(testDir, "helpers", "openclaw-plugin-sdk-stub.mjs");
-const extensionApiStubPath = path.resolve(testDir, "helpers", "openclaw-extension-api-stub.mjs");
 const jiti = jitiFactory(import.meta.url, {
   interopDefault: true,
   alias: {
@@ -16,10 +15,7 @@ const jiti = jitiFactory(import.meta.url, {
   },
 });
 
-const pluginModule = jiti("../index.ts");
-const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
-const { readSessionConversationWithResetFallback, parsePluginConfig } = pluginModule;
-const { MemoryStore } = jiti("../src/store.ts");
+const { readSessionConversationWithResetFallback, parsePluginConfig } = jiti("../index.ts");
 const { getDisplayCategoryTag } = jiti("../src/reflection-metadata.ts");
 const {
   classifyReflectionRetry,
@@ -31,8 +27,10 @@ const {
 const {
   storeReflectionToLanceDB,
   loadAgentReflectionSlicesFromEntries,
-  loadAgentDerivedRowsWithScoresFromEntries,
   loadReflectionMappedRowsFromEntries,
+  REFLECTION_DERIVE_LOGISTIC_K,
+  REFLECTION_DERIVE_LOGISTIC_MIDPOINT_DAYS,
+  REFLECTION_DERIVE_FALLBACK_BASE_WEIGHT,
 } = jiti("../src/reflection-store.ts");
 const {
   REFLECTION_INVARIANT_DECAY_MIDPOINT_DAYS,
@@ -74,52 +72,6 @@ function baseConfig() {
     embedding: {
       apiKey: "test-api-key",
     },
-  };
-}
-
-function createPluginApiHarness({ pluginConfig, resolveRoot }) {
-  const eventHandlers = new Map();
-  const commandHooks = new Map();
-  const logs = [];
-
-  const api = {
-    pluginConfig,
-    resolvePath(target) {
-      if (typeof target !== "string") return target;
-      if (path.isAbsolute(target)) return target;
-      return path.join(resolveRoot, target);
-    },
-    logger: {
-      info(message) {
-        logs.push({ level: "info", message: String(message) });
-      },
-      warn(message) {
-        logs.push({ level: "warn", message: String(message) });
-      },
-      debug(message) {
-        logs.push({ level: "debug", message: String(message) });
-      },
-    },
-    registerTool() {},
-    registerCli() {},
-    registerService() {},
-    on(eventName, handler, meta) {
-      const list = eventHandlers.get(eventName) || [];
-      list.push({ handler, meta });
-      eventHandlers.set(eventName, list);
-    },
-    registerHook(hookName, handler, meta) {
-      const list = commandHooks.get(hookName) || [];
-      list.push({ handler, meta });
-      commandHooks.set(hookName, list);
-    },
-  };
-
-  return {
-    api,
-    eventHandlers,
-    commandHooks,
-    logs,
   };
 }
 
@@ -181,7 +133,7 @@ describe("memory reflection", () => {
         getDisplayCategoryTag({
           category: "reflection",
           scope: "project-a",
-          metadata: JSON.stringify({ type: "memory-reflection-item", itemKind: "invariant" }),
+          metadata: JSON.stringify({ type: "memory-reflection", invariants: ["Always verify output"] }),
         }),
         "reflection:project-a"
       );
@@ -191,9 +143,10 @@ describe("memory reflection", () => {
           category: "reflection",
           scope: "project-b",
           metadata: JSON.stringify({
-            type: "memory-reflection-item",
-            reflectionVersion: 4,
-            itemKind: "derived",
+            type: "memory-reflection",
+            reflectionVersion: 3,
+            invariants: ["Always verify output"],
+            derived: ["Next run keep prompts short."],
           }),
         }),
         "reflection:project-b"
@@ -206,10 +159,11 @@ describe("memory reflection", () => {
           category: "reflection",
           scope: "global",
           metadata: JSON.stringify({
-            type: "memory-reflection-item",
-            reflectionVersion: 4,
-            itemKind: "invariant",
-            baseWeight: 1.1,
+            type: "memory-reflection",
+            reflectionVersion: 3,
+            invariants: ["Always keep steps auditable."],
+            derived: ["Next run keep verification concise."],
+            deriveBaseWeight: 0.35,
           }),
         }),
         "reflection:global"
@@ -387,8 +341,9 @@ describe("memory reflection", () => {
   });
 
   describe("reflection persistence", () => {
-    it("stores event + itemized rows", async () => {
+    it("stores event + itemized rows and keeps legacy combined rows by default", async () => {
       const storedEntries = [];
+      const vectorSearchCalls = [];
 
       const result = await storeReflectionToLanceDB({
         reflectionText: [
@@ -407,6 +362,10 @@ describe("memory reflection", () => {
         usedFallback: false,
         sourceReflectionPath: "memory/reflections/2026-03-07/test.md",
         embedPassage: async (text) => [text.length],
+        vectorSearch: async (vector) => {
+          vectorSearchCalls.push(vector);
+          return [];
+        },
         store: async (entry) => {
           storedEntries.push(entry);
           return { ...entry, id: `id-${storedEntries.length}`, timestamp: 1_700_000_000_000 };
@@ -414,13 +373,15 @@ describe("memory reflection", () => {
       });
 
       assert.equal(result.stored, true);
-      assert.deepEqual(result.storedKinds, ["event", "item-invariant", "item-derived"]);
-      assert.equal(storedEntries.length, 3);
+      assert.deepEqual(result.storedKinds, ["event", "item-invariant", "item-derived", "combined-legacy"]);
+      assert.equal(storedEntries.length, 4);
+      assert.equal(vectorSearchCalls.length, 1, "legacy combined row keeps compatibility dedupe path");
 
       const metas = storedEntries.map((entry) => JSON.parse(entry.metadata));
       const eventMeta = metas.find((meta) => meta.type === "memory-reflection-event");
       const invariantMeta = metas.find((meta) => meta.type === "memory-reflection-item" && meta.itemKind === "invariant");
       const derivedMeta = metas.find((meta) => meta.type === "memory-reflection-item" && meta.itemKind === "derived");
+      const legacyMeta = metas.find((meta) => meta.type === "memory-reflection");
 
       assert.ok(eventMeta);
       assert.equal(eventMeta.reflectionVersion, 4);
@@ -453,6 +414,45 @@ describe("memory reflection", () => {
       assert.equal(derivedMeta.decayK, REFLECTION_DERIVED_DECAY_K);
       assert.equal(derivedMeta.baseWeight, REFLECTION_DERIVED_BASE_WEIGHT);
       assert.equal(derivedMeta.usedFallback, false);
+
+      assert.ok(legacyMeta);
+      assert.equal(legacyMeta.reflectionVersion, 3);
+      assert.deepEqual(legacyMeta.invariants, ["Always confirm assumptions before changing files."]);
+      assert.deepEqual(legacyMeta.derived, ["Next run verify reflection persistence with targeted tests."]);
+      assert.equal(legacyMeta.decayModel, "logistic");
+      assert.equal(legacyMeta.decayK, REFLECTION_DERIVE_LOGISTIC_K);
+      assert.equal(legacyMeta.decayMidpointDays, REFLECTION_DERIVE_LOGISTIC_MIDPOINT_DAYS);
+      assert.equal(legacyMeta.deriveBaseWeight, 1);
+    });
+
+    it("supports migration mode that disables legacy combined writes", async () => {
+      const storedEntries = [];
+      const result = await storeReflectionToLanceDB({
+        reflectionText: [
+          "## Invariants",
+          "- Always run tests after edits.",
+          "## Derived",
+          "- Next run keep post-check output in final summary.",
+        ].join("\n"),
+        sessionKey: "agent:main:session:def",
+        sessionId: "def",
+        agentId: "main",
+        command: "command:new",
+        scope: "global",
+        toolErrorSignals: [],
+        runAt: 1_700_100_000_000,
+        usedFallback: false,
+        writeLegacyCombined: false,
+        embedPassage: async (text) => [text.length],
+        vectorSearch: async () => [],
+        store: async (entry) => {
+          storedEntries.push(entry);
+          return { ...entry, id: `id-${storedEntries.length}`, timestamp: 1_700_100_000_000 };
+        },
+      });
+
+      assert.deepEqual(result.storedKinds, ["event", "item-invariant", "item-derived"]);
+      assert.equal(storedEntries.some((entry) => JSON.parse(entry.metadata).type === "memory-reflection"), false);
     });
 
     it("writes an event row even when invariant/derived slices are empty", async () => {
@@ -467,7 +467,9 @@ describe("memory reflection", () => {
         toolErrorSignals: [],
         runAt: 1_700_200_000_000,
         usedFallback: true,
+        writeLegacyCombined: false,
         embedPassage: async (text) => [text.length],
+        vectorSearch: async () => [],
         store: async (entry) => {
           storedEntries.push(entry);
           return { ...entry, id: `id-${storedEntries.length}`, timestamp: 1_700_200_000_000 };
@@ -483,10 +485,63 @@ describe("memory reflection", () => {
   });
 
   describe("reflection slice loading", () => {
-    it("loads itemized reflection rows", () => {
+    it("loads legacy combined rows for backward compatibility", () => {
+      const now = Date.UTC(2026, 2, 7);
+      const entries = [
+        makeEntry({
+          timestamp: now - 30 * 60 * 1000,
+          metadata: {
+            type: "memory-reflection",
+            agentId: "main",
+            invariants: ["Legacy invariant still applies."],
+            derived: ["Legacy derived delta still applies."],
+            storedAt: now - 30 * 60 * 1000,
+          },
+        }),
+        makeEntry({
+          timestamp: now - 25 * 60 * 1000,
+          metadata: {
+            type: "memory-reflection",
+            agentId: "main",
+            reflectionVersion: 3,
+            invariants: ["Current invariant applies too."],
+            derived: ["Current derived delta still applies."],
+            storedAt: now - 25 * 60 * 1000,
+            decayModel: "logistic",
+            decayMidpointDays: REFLECTION_DERIVE_LOGISTIC_MIDPOINT_DAYS,
+            decayK: REFLECTION_DERIVE_LOGISTIC_K,
+          },
+        }),
+      ];
+
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * 24 * 60 * 60 * 1000,
+      });
+
+      assert.ok(slices.invariants.includes("Legacy invariant still applies."));
+      assert.ok(slices.invariants.includes("Current invariant applies too."));
+      assert.ok(slices.derived.includes("Legacy derived delta still applies."));
+      assert.ok(slices.derived.includes("Current derived delta still applies."));
+    });
+
+    it("prefers item rows when both item and legacy layouts exist", () => {
       const now = Date.UTC(2026, 2, 7);
       const day = 24 * 60 * 60 * 1000;
+
       const entries = [
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection",
+            agentId: "main",
+            invariants: ["Legacy invariant should not be selected when item rows exist."],
+            derived: ["Legacy derived should not be selected when item rows exist."],
+            storedAt: now - 1 * day,
+          },
+        }),
         makeEntry({
           timestamp: now - 1 * day,
           metadata: {
@@ -515,8 +570,8 @@ describe("memory reflection", () => {
         }),
       ];
 
-      entries[0].text = "Always use itemized rows first.";
-      entries[1].text = "Next run prioritize itemized reflection rows.";
+      entries[1].text = "Always use itemized rows first.";
+      entries[2].text = "Next run prioritize itemized reflection rows.";
 
       const slices = loadAgentReflectionSlicesFromEntries({
         entries,
@@ -592,55 +647,6 @@ describe("memory reflection", () => {
       assert.equal(slices.derived[0], "Repeat verification path");
       assert.ok(slices.derived.includes("Fresh fallback derive"));
       assert.equal(REFLECTION_FALLBACK_SCORE_FACTOR, 0.75);
-    });
-
-    it("returns historical derived rows with retained scores after dedupe+decay", () => {
-      const now = Date.UTC(2026, 2, 8);
-      const day = 24 * 60 * 60 * 1000;
-
-      const entries = [
-        makeEntry({
-          timestamp: now - 1 * day,
-          metadata: {
-            type: "memory-reflection-item",
-            itemKind: "derived",
-            agentId: "main",
-            storedAt: now - 1 * day,
-            decayMidpointDays: 7,
-            decayK: 0.65,
-            baseWeight: 1,
-            quality: 1,
-          },
-        }),
-        makeEntry({
-          timestamp: now - 50 * day,
-          metadata: {
-            type: "memory-reflection-item",
-            itemKind: "derived",
-            agentId: "main",
-            storedAt: now - 50 * day,
-            decayMidpointDays: 7,
-            decayK: 0.65,
-            baseWeight: 1,
-            quality: 1,
-          },
-        }),
-      ];
-      entries[0].text = "Historical high-score derived line";
-      entries[1].text = "Historical low-score derived line";
-
-      const rows = loadAgentDerivedRowsWithScoresFromEntries({
-        entries,
-        agentId: "main",
-        now,
-        deriveMaxAgeMs: 60 * day,
-        limit: 10,
-      });
-
-      const highRow = rows.find((row) => row.text === "Historical high-score derived line");
-      const lowRow = rows.find((row) => row.text === "Historical low-score derived line");
-      assert.ok(highRow && highRow.score > 0.3);
-      assert.ok(lowRow && lowRow.score < 0.3);
     });
   });
 
@@ -788,174 +794,25 @@ describe("memory reflection", () => {
       const parsed = parsePluginConfig(baseConfig());
       assert.equal(parsed.sessionStrategy, "systemSessionMemory");
     });
-  });
 
-  describe("memoryReflection injectMode inheritance+derived hook flow", () => {
-    let workspaceDir;
-    let sessionFile;
-    let originalList;
-    let originalExtensionApiPath;
-    let harness;
+    it("defaults writeLegacyCombined=true for memoryReflection config", () => {
+      const parsed = parsePluginConfig({
+        ...baseConfig(),
+        sessionStrategy: "memoryReflection",
+        memoryReflection: {},
+      });
+      assert.equal(parsed.memoryReflection.writeLegacyCombined, true);
+    });
 
-    beforeEach(() => {
-      workspaceDir = mkdtempSync(path.join(tmpdir(), "reflection-hook-flow-test-"));
-      const sessionsDir = path.join(workspaceDir, "sessions");
-      mkdirSync(sessionsDir, { recursive: true });
-      sessionFile = path.join(sessionsDir, "s1.jsonl");
-      writeFileSync(
-        sessionFile,
-        [
-          messageLine("user", "Please keep responses concise and verify test output.", 1),
-          messageLine("assistant", "Acknowledged. I will keep responses concise and verify output.", 2),
-        ].join("\n") + "\n",
-        "utf-8"
-      );
-
-      originalList = MemoryStore.prototype.list;
-      originalExtensionApiPath = process.env.OPENCLAW_EXTENSION_API_PATH;
-      process.env.OPENCLAW_EXTENSION_API_PATH = extensionApiStubPath;
-
-      const now = Date.UTC(2026, 2, 8, 12, 0, 0);
-      const day = 24 * 60 * 60 * 1000;
-      const reflectionEntries = [
-        makeEntry({
-          timestamp: now - 1 * day,
-          metadata: {
-            type: "memory-reflection-item",
-            itemKind: "invariant",
-            agentId: "main",
-            storedAt: now - 1 * day,
-            decayMidpointDays: 45,
-            decayK: 0.22,
-            baseWeight: 1.1,
-            quality: 1,
-          },
-        }),
-        makeEntry({
-          timestamp: now - 1 * day,
-          metadata: {
-            type: "memory-reflection-item",
-            itemKind: "derived",
-            agentId: "main",
-            storedAt: now - 1 * day,
-            decayMidpointDays: 7,
-            decayK: 0.65,
-            baseWeight: 1,
-            quality: 1,
-          },
-        }),
-        makeEntry({
-          timestamp: now - 45 * day,
-          metadata: {
-            type: "memory-reflection-item",
-            itemKind: "derived",
-            agentId: "main",
-            storedAt: now - 45 * day,
-            decayMidpointDays: 7,
-            decayK: 0.65,
-            baseWeight: 1,
-            quality: 1,
-          },
-        }),
-      ];
-      reflectionEntries[0].text = "Always verify edits before reporting completion.";
-      reflectionEntries[1].text = "Historical derived focus that remains relevant.";
-      reflectionEntries[2].text = "Historical stale follow-up should be filtered.";
-      MemoryStore.prototype.list = async () => reflectionEntries;
-
-      harness = createPluginApiHarness({
-        resolveRoot: workspaceDir,
-        pluginConfig: {
-          embedding: {
-            apiKey: "test-api-key",
-          },
-          autoCapture: false,
-          autoRecall: false,
-          sessionStrategy: "memoryReflection",
-          selfImprovement: {
-            enabled: true,
-            beforeResetNote: true,
-            ensureLearningFiles: false,
-          },
-          memoryReflection: {
-            injectMode: "inheritance+derived",
-            storeToLanceDB: false,
-          },
+    it("allows disabling legacy combined reflection writes", () => {
+      const parsed = parsePluginConfig({
+        ...baseConfig(),
+        sessionStrategy: "memoryReflection",
+        memoryReflection: {
+          writeLegacyCombined: false,
         },
       });
-      memoryLanceDBProPlugin.register(harness.api);
-    });
-
-    afterEach(() => {
-      MemoryStore.prototype.list = originalList;
-      if (typeof originalExtensionApiPath === "string") {
-        process.env.OPENCLAW_EXTENSION_API_PATH = originalExtensionApiPath;
-      } else {
-        delete process.env.OPENCLAW_EXTENSION_API_PATH;
-      }
-      rmSync(workspaceDir, { recursive: true, force: true });
-    });
-
-    it("keeps inherited-rules in before_agent_start and builds note with fresh open-loops + historical derived-focus", async () => {
-      const beforeAgentStartHooks = harness.eventHandlers.get("before_agent_start") || [];
-      assert.equal(beforeAgentStartHooks.length, 1);
-      const inheritedResult = await beforeAgentStartHooks[0].handler({}, {
-        sessionKey: "agent:main:session:s1",
-        agentId: "main",
-      });
-      assert.match(inheritedResult.prependContext, /<inherited-rules>/);
-      assert.doesNotMatch(inheritedResult.prependContext, /<derived-focus>/);
-
-      const commandNewHooks = harness.commandHooks.get("command:new") || [];
-      assert.equal(commandNewHooks.length, 1);
-      assert.match(String(commandNewHooks[0].meta?.name || ""), /memory-reflection\.command-new/);
-
-      const messages = [];
-      await commandNewHooks[0].handler({
-        action: "new",
-        sessionKey: "agent:main:session:s1",
-        timestamp: Date.UTC(2026, 2, 8, 12, 0, 0),
-        messages,
-        context: {
-          cfg: {},
-          workspaceDir,
-          commandSource: "cli",
-          previousSessionEntry: {
-            sessionId: "s1",
-            sessionFile,
-          },
-        },
-      });
-      assert.equal(messages.length, 1);
-      assert.match(messages[0], /^\/note self-improvement \(before reset\):/);
-      assert.match(messages[0], /<open-loops>/);
-      assert.match(messages[0], /Verify current reflection handoff after reset\./);
-      const openLoopsBlock = messages[0].match(/<open-loops>[\s\S]*?<\/open-loops>/);
-      assert.ok(openLoopsBlock);
-      assert.doesNotMatch(openLoopsBlock[0], /Historical derived focus that remains relevant\./);
-      assert.match(messages[0], /<derived-focus>/);
-      assert.match(messages[0], /Historical derived focus that remains relevant\./);
-      assert.doesNotMatch(messages[0], /Historical stale follow-up should be filtered\./);
-    });
-
-    it("keeps error-detected in before_prompt_build without derived-focus", async () => {
-      const afterToolHooks = harness.eventHandlers.get("after_tool_call") || [];
-      const beforePromptHooks = harness.eventHandlers.get("before_prompt_build") || [];
-      assert.equal(afterToolHooks.length, 1);
-      assert.equal(beforePromptHooks.length, 1);
-
-      await afterToolHooks[0].handler(
-        { toolName: "shell", error: "ETIMEDOUT while contacting upstream" },
-        { sessionKey: "agent:main:session:s1" }
-      );
-
-      const promptResult = await beforePromptHooks[0].handler({}, {
-        sessionKey: "agent:main:session:s1",
-        agentId: "main",
-      });
-      assert.match(promptResult.prependContext, /<error-detected>/);
-      assert.match(promptResult.prependContext, /\[shell\]/);
-      assert.doesNotMatch(promptResult.prependContext, /<derived-focus>/);
+      assert.equal(parsed.memoryReflection.writeLegacyCombined, false);
     });
   });
 });

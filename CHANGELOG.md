@@ -1,14 +1,5 @@
 # Changelog
 
-## 1.1.0-beta.5
-
-- Refactor: build reset/new reflection handoff note in `runMemoryReflection`.
-- Refactor: `<open-loops>` now comes from the fresh reflection run, while `<derived-focus>` comes from historical scored itemized derived rows.
-- Breaking: stop writing and stop reading legacy combined reflection rows (`type=memory-reflection`).
-- Docs: refresh README / README_CN for the new handoff-note behavior and remove old legacy combined guidance.
-
----
-
 ## 1.1.0
 
 - Feat: add integrated self-improvement governance flow (`agent:bootstrap`, `command:new/reset`, governance tools, and `.learnings` file bootstrap).

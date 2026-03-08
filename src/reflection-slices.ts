@@ -104,12 +104,6 @@ function isOpenLoopAction(line: string): boolean {
   return /^(investigate|verify|confirm|re-check|retest|update|add|remove|fix|avoid|keep|watch|document)\b/i.test(line);
 }
 
-export function extractReflectionOpenLoops(reflectionText: string): string[] {
-  return sanitizeReflectionSliceLines(parseSectionBullets(reflectionText, "Open loops / next actions"))
-    .filter(isOpenLoopAction)
-    .slice(0, 8);
-}
-
 export function extractReflectionLessons(reflectionText: string): string[] {
   return sanitizeReflectionSliceLines(parseSectionBullets(reflectionText, "Lessons & pitfalls (symptom / cause / fix / prevention)"));
 }
@@ -227,6 +221,9 @@ export function extractReflectionSlices(reflectionText: string): ReflectionSlice
   const reflectionLinesLegacy = sanitizeReflectionSliceLines(
     mergedSection.filter((line) => /reflect|inherit|derive|change|apply/i.test(line))
   ).filter(isDerivedDeltaLike);
+  const openLoopLines = sanitizeReflectionSliceLines(parseSectionBullets(reflectionText, "Open loops / next actions"))
+    .filter(isOpenLoopAction)
+    .filter(isDerivedDeltaLike);
   const durableDecisionLines = sanitizeReflectionSliceLines(parseSectionBullets(reflectionText, "Decisions (durable)"))
     .filter(isInvariantRuleLike);
 
@@ -235,7 +232,7 @@ export function extractReflectionSlices(reflectionText: string): ReflectionSlice
     : (invariantLinesLegacy.length > 0 ? invariantLinesLegacy : durableDecisionLines);
   const derived = derivedPrimary.length > 0
     ? derivedPrimary
-    : reflectionLinesLegacy;
+    : [...reflectionLinesLegacy, ...openLoopLines];
 
   return {
     invariants: invariants.slice(0, 8),

@@ -160,10 +160,6 @@ Filters out low-quality content at both auto-capture and tool-store stages:
 - Hooks: `agent:bootstrap`, `command:new`, `command:reset`.
 - `agent:bootstrap`: injects `SELF_IMPROVEMENT_REMINDER.md` into bootstrap context.
 - `command:new` / `command:reset`: appends a short `/note self-improvement ...` reminder before reset.
-  - Under `sessionStrategy="memoryReflection"`, the final reset/new note is assembled in `runMemoryReflection`.
-  - In `memoryReflection.injectMode="inheritance+derived"` mode, the note can include:
-    - `<open-loops>` from the **fresh** reflection text of the current `/new` or `/reset`.
-    - `<derived-focus>` from **historical** LanceDB derived rows after dedupe+decay scoring, filtered to final score `> 0.3`.
 - File ensure/create path: ensures `.learnings/LEARNINGS.md` and `.learnings/ERRORS.md` exist.
 - This flow is separate from `memoryReflection`: seeing self-improvement notes or `.learnings/*` activity does not by itself mean reflection storage is enabled.
 - Append paths are intentionally distinct:
@@ -187,7 +183,6 @@ Filters out low-quality content at both auto-capture and tool-store stages:
   - Requires `sessionStrategy="memoryReflection"`.
   - Triggers on `command:new` / `command:reset`.
   - Skips generation when session context is incomplete (for example missing config, session file, or readable conversation content).
-  - Edge case: issuing `/new` immediately after a previous `/new` can land in a fresh empty session without a readable prior `sessionFile`; in that case reflection skips and logs `missing session file after recovery`. This is expected behavior.
 - Runner chain:
   - First try embedded runner (`runEmbeddedPiAgent`).
   - If the embedded path fails, fall back to `openclaw agent --local --json`.
@@ -206,6 +201,7 @@ Filters out low-quality content at both auto-capture and tool-store stages:
   - Writes one event row (`type=memory-reflection-event`) plus item rows (`type=memory-reflection-item`) for each `Invariants` / `Derived` bullet.
   - Event rows keep lightweight provenance/audit metadata only (`eventId`, `sessionKey`, `usedFallback`, `errorSignals`, source path).
   - Item rows carry per-item decay metadata (`decayModel`, `decayMidpointDays`, `decayK`, `baseWeight`, `quality`) plus ordinal/group metadata.
+  - Compatibility mode: `memoryReflection.writeLegacyCombined=true` (default) also writes legacy combined rows (`type=memory-reflection`) during migration.
   - Reflection rows display as `reflection:<scope>`.
 - Reflection-derived durable memory mapping:
   - Available memory categories in the plugin are `preference`, `fact`, `decision`, `entity`, `reflection`, `other`.
@@ -233,10 +229,6 @@ Filters out low-quality content at both auto-capture and tool-store stages:
   - If the configured agent id is not present in `cfg.agents.list`, the plugin warns and falls back to the runtime agent id.
 - Error loop:
   - `after_tool_call` captures and deduplicates tool error signatures for reminder/reflection context.
-- Injection placement by hook (`memoryReflection.injectMode`):
-  - `before_agent_start`: injects `<inherited-rules>` (stable cross-session constraints).
-  - `command:new` / `command:reset`: `runMemoryReflection` builds the self-improvement note (`<open-loops>` from fresh reflection; `<derived-focus>` from historical scored rows when mode is `inheritance+derived`).
-  - `before_prompt_build`: injects `<error-detected>` only (no `<derived-focus>`).
 
 ### 10. Markdown Mirror (`mdMirror`)
 
@@ -317,7 +309,7 @@ Add a line to your agent system prompt, e.g.:
 
 ## Installation
 
-> **🧪 Beta available: v1.1.0-beta.5**
+> **🧪 Beta available: v1.1.0-beta.3**
 >
 > A beta release is available with major new features: **Self-Improvement governance**, **memoryReflection session strategy**, **Markdown Mirror**, and improved embedding error diagnostics. The stable `latest` remains at v1.0.32.
 >
@@ -329,7 +321,7 @@ Add a line to your agent system prompt, e.g.:
 > npm install memory-lancedb-pro
 > ```
 >
-> See [Release Notes](https://github.com/win4r/memory-lancedb-pro/releases/tag/v1.1.0-beta.5) for details. Feedback welcome via [GitHub Issues](https://github.com/win4r/memory-lancedb-pro/issues).
+> See [Release Notes](https://github.com/win4r/memory-lancedb-pro/releases/tag/v1.1.0-beta.3) for details. Feedback welcome via [GitHub Issues](https://github.com/win4r/memory-lancedb-pro/issues).
 
 ### AI-safe install notes (anti-hallucination)
 
@@ -518,6 +510,7 @@ openclaw config get plugins.slots.memory
   },
   "memoryReflection": {
     "storeToLanceDB": true,
+    "writeLegacyCombined": true,
     "injectMode": "inheritance+derived",
     "agentId": "memory-distiller",
     "messageCount": 120,

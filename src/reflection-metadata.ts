@@ -11,7 +11,8 @@ export function parseReflectionMetadata(metadataRaw: string | undefined): Record
 export function isReflectionEntry(entry: { category: string; metadata?: string }): boolean {
   if (entry.category === "reflection") return true;
   const metadata = parseReflectionMetadata(entry.metadata);
-  return metadata.type === "memory-reflection-event" ||
+  return metadata.type === "memory-reflection" ||
+    metadata.type === "memory-reflection-event" ||
     metadata.type === "memory-reflection-item";
 }
 

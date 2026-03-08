@@ -43,6 +43,7 @@ interface ToolContext {
   agentId?: string;
   workspaceDir?: string;
   mdMirror?: MdMirrorWriter | null;
+  exposeRetrievalMetadata?: boolean;
 }
 
 function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
@@ -65,17 +66,50 @@ function clamp01(value: number, fallback = 0.7): number {
   return Math.min(1, Math.max(0, value));
 }
 
-function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
-  return results.map((r) => ({
+interface MemoryItem {
+  id: string;
+  text: string;
+  category: string;
+  rawCategory: string;
+  scope: string;
+  importance: number;
+}
+
+interface DebugItem {
+  id: string;
+  score: number;
+  sources: {
+    vector?: { score: number; rank: number };
+    bm25?: { score: number; rank: number };
+    fused?: { score: number };
+    reranked?: { score: number };
+  };
+}
+
+function sanitizeMemoryForSerialization(
+  results: RetrievalResult[],
+  exposeRetrievalMetadata?: boolean,
+): { memories: MemoryItem[]; debug?: DebugItem[] } {
+  const memories = results.map((r) => ({
     id: r.entry.id,
     text: r.entry.text,
     category: getDisplayCategoryTag(r.entry),
     rawCategory: r.entry.category,
     scope: r.entry.scope,
     importance: r.entry.importance,
-    score: r.score,
-    sources: r.sources,
   }));
+
+  const payload: { memories: MemoryItem[]; debug?: DebugItem[] } = { memories };
+
+  if (exposeRetrievalMetadata) {
+    payload.debug = results.map((r) => ({
+      id: r.entry.id,
+      score: r.score,
+      sources: r.sources,
+    }));
+  }
+
+  return payload;
 }
 
 function resolveWorkspaceDir(toolCtx: unknown, fallback?: string): string {
@@ -406,16 +440,10 @@ export function registerMemoryRecallTool(
             };
           }
 
-          const text = results
-            .map((r, i) => {
-              const sources = [];
-              if (r.sources.vector) sources.push("vector");
-              if (r.sources.bm25) sources.push("BM25");
-              if (r.sources.reranked) sources.push("reranked");
+          const { memories, debug } = sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata);
 
-              const categoryTag = getDisplayCategoryTag(r.entry);
-              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text} (${(r.score * 100).toFixed(0)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
-            })
+          const text = memories
+            .map((m, i) => `${i + 1}. [${m.id}] [${m.category}] ${m.text}`)
             .join("\n");
 
           return {
@@ -427,7 +455,8 @@ export function registerMemoryRecallTool(
             ],
             details: {
               count: results.length,
-              memories: sanitizeMemoryForSerialization(results),
+              memories,
+              ...(debug ? { debug } : {}),
               query,
               scopes: scopeFilter,
               retrievalMode: context.retriever.getConfig().mode,
@@ -711,10 +740,12 @@ export function registerMemoryForgetTool(
               }
             }
 
-            const list = results
+            const { memories, debug } = sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata);
+
+            const list = memories
               .map(
-                (r) =>
-                  `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
+                (m) =>
+                  `- [${m.id.slice(0, 8)}] ${m.text.slice(0, 60)}${m.text.length > 60 ? "..." : ""}`,
               )
               .join("\n");
 
@@ -727,7 +758,8 @@ export function registerMemoryForgetTool(
               ],
               details: {
                 action: "candidates",
-                candidates: sanitizeMemoryForSerialization(results),
+                candidates: memories,
+                ...(debug ? { debug } : {}),
               },
             };
           }
@@ -838,10 +870,11 @@ export function registerMemoryUpdateTool(
             if (results.length === 1 || results[0].score > 0.85) {
               resolvedId = results[0].entry.id;
             } else {
-              const list = results
+              const { memories, debug } = sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata);
+              const list = memories
                 .map(
-                  (r) =>
-                    `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
+                  (m) =>
+                    `- [${m.id.slice(0, 8)}] ${m.text.slice(0, 60)}${m.text.length > 60 ? "..." : ""}`,
                 )
                 .join("\n");
               return {
@@ -853,7 +886,8 @@ export function registerMemoryUpdateTool(
                 ],
                 details: {
                   action: "candidates",
-                  candidates: sanitizeMemoryForSerialization(results),
+                  candidates: memories,
+                  ...(debug ? { debug } : {}),
                 },
               };
             }

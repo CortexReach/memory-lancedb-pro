@@ -2,7 +2,7 @@
   "id": "memory-lancedb-pro",
   "name": "Memory (LanceDB Pro)",
   "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, long-context chunking, and management CLI",
-  "version": "1.1.0-beta.5",
+  "version": "1.1.0-beta.4",
   "kind": "memory",
   "configSchema": {
     "type": "object",
@@ -72,6 +72,11 @@
         "type": "boolean",
         "default": false,
         "description": "Enable management/debug tools such as memory_list, memory_stats, and governance-oriented self-improvement review/extract actions"
+      },
+      "exposeRetrievalMetadata": {
+        "type": "boolean",
+        "default": false,
+        "description": "Include score and sources in details.debug for memory_recall, memory_forget, and memory_update (candidates path) tools. Useful for debugging retrieval quality. Default: false to avoid leaking metadata to LLM context."
       },
       "sessionStrategy": {
         "type": "string",
@@ -278,6 +283,10 @@
         "additionalProperties": false,
         "properties": {
           "storeToLanceDB": {
+            "type": "boolean",
+            "default": true
+          },
+          "writeLegacyCombined": {
             "type": "boolean",
             "default": true
           },
@@ -565,6 +574,11 @@
     "memoryReflection.storeToLanceDB": {
       "label": "Store Reflection To LanceDB",
       "help": "Persist reflection event + item rows to LanceDB (effective only under memoryReflection strategy)",
+      "advanced": true
+    },
+    "memoryReflection.writeLegacyCombined": {
+      "label": "Write Legacy Combined Reflection",
+      "help": "Compatibility switch: also write legacy combined memory-reflection rows during migration.",
       "advanced": true
     },
     "memoryReflection.injectMode": {
