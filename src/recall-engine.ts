@@ -1,4 +1,4 @@
-import { shouldSkipRetrieval } from "./adaptive-retrieval.js";
+import { shouldSkipRetrieval, shouldSkipRetrievalFirstTurn } from "./adaptive-retrieval.js";
 
 export interface DynamicRecallSessionState {
   historyBySession: Map<string, Map<string, number>>;
@@ -81,13 +81,30 @@ export function clearDynamicRecallSessionState(state: DynamicRecallSessionState,
 export async function orchestrateDynamicRecall<T extends DynamicRecallCandidate>(
   params: OrchestrateDynamicRecallParams<T>
 ): Promise<DynamicRecallResult | undefined> {
-  if (!params.prompt || shouldSkipRetrieval(params.prompt, params.minPromptLength)) return undefined;
+  if (!params.prompt) return undefined;
 
-  const topK = Number.isFinite(params.topK) ? Math.max(1, Math.floor(params.topK)) : 1;
   const sessionId = params.sessionId || "default";
   touchDynamicRecallSessionState(params.state, sessionId);
   const currentTurn = (params.state.turnCounterBySession.get(sessionId) || 0) + 1;
   params.state.turnCounterBySession.set(sessionId, currentTurn);
+
+  // On the first turn of a fresh session, use relaxed skip logic to preserve
+  // continuity recovery. On subsequent turns, use standard adaptive retrieval.
+  const isFirstTurn = currentTurn === 1;
+  const shouldSkip = isFirstTurn
+    ? shouldSkipRetrievalFirstTurn(params.prompt)
+    : shouldSkipRetrieval(params.prompt, params.minPromptLength);
+
+  if (shouldSkip) {
+    if (isFirstTurn) {
+      params.logger?.debug?.(
+        `memory-lancedb-pro: ${params.channelName} first-turn retrieval skipped (system/command message, session=${sessionId})`
+      );
+    }
+    return undefined;
+  }
+
+  const topK = Number.isFinite(params.topK) ? Math.max(1, Math.floor(params.topK)) : 1;
 
   const loaded = await params.loadCandidates();
   if (loaded.length === 0) return undefined;

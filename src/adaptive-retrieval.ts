@@ -95,3 +95,40 @@ export function shouldSkipRetrieval(query: string, minLength?: number): boolean 
   // Default: do retrieve
   return false;
 }
+
+/**
+ * Relaxed skip check for the first turn of a fresh session.
+ *
+ * On the very first user message after a session restart, the user often sends
+ * a low-signal continuation (emoji, "?", "继续", etc.). Normal skip logic would
+ * suppress retrieval, but this is exactly when continuity recovery matters most.
+ *
+ * This function only skips retrieval for:
+ * - Empty / whitespace-only messages
+ * - Slash commands (explicit bot commands)
+ * - Heartbeat / system messages
+ *
+ * Everything else — including short messages, pure emoji, and affirmations —
+ * is allowed through so that autoRecall can attempt continuity recovery.
+ *
+ * @param query The raw prompt text
+ */
+export function shouldSkipRetrievalFirstTurn(query: string): boolean {
+  const trimmed = normalizeQuery(query);
+
+  // Force retrieve if query has memory-related intent
+  if (FORCE_RETRIEVE_PATTERNS.some(p => p.test(trimmed))) return false;
+
+  // Empty after normalization — nothing to retrieve for
+  if (trimmed.length === 0) return true;
+
+  // Slash commands — explicit bot commands, not continuations
+  if (/^\//.test(trimmed)) return true;
+
+  // Heartbeat / system messages — never user-facing continuity
+  if (/HEARTBEAT/i.test(trimmed)) return true;
+  if (/^\[System/i.test(trimmed)) return true;
+
+  // Everything else: allow retrieval on first turn
+  return false;
+}
