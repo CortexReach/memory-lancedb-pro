@@ -823,6 +823,113 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     };
   };
 
+  const executeGraphImport = async (options: Record<string, unknown>) => {
+    if (!context.graphitiBridge) {
+      throw new Error("Graph import is unavailable. Graphiti bridge is not initialized.");
+    }
+    if (!context.embedder) {
+      throw new Error("Graph import requires embedder support.");
+    }
+
+    const modeRaw = String(options.mode || "recall").trim().toLowerCase();
+    if (modeRaw !== "recall" && modeRaw !== "list") {
+      throw new Error("Invalid --mode. Use recall or list.");
+    }
+
+    const scope = typeof options.scope === "string" && options.scope.trim().length > 0
+      ? options.scope.trim()
+      : "global";
+    const query = typeof options.query === "string"
+      ? options.query.trim()
+      : "";
+    const limit = clampInt(parseInt(String(options.limit ?? "40"), 10) || 40, 1, 200);
+    const dryRun = options.dryRun === true;
+
+    const graph = modeRaw === "list"
+      ? await context.graphitiBridge.list(scope, limit, limit)
+      : await context.graphitiBridge.recall({
+          scope,
+          query: query || "memory",
+          limitNodes: limit,
+          limitFacts: limit,
+        });
+
+    const candidates = [
+      ...graph.facts.map((fact) => ({
+        text: fact.text,
+        category: "fact" as const,
+        sourceKind: "fact",
+      })),
+      ...graph.nodes.map((node) => ({
+        text: node.label,
+        category: "entity" as const,
+        sourceKind: "node",
+      })),
+    ]
+      .map((row) => ({
+        ...row,
+        normalized: row.text.replace(/\s+/g, " ").trim(),
+      }))
+      .filter((row) => row.normalized.length > 0)
+      .slice(0, limit * 2);
+
+    let imported = 0;
+    let skippedDuplicate = 0;
+    let skippedEmpty = 0;
+
+    for (const row of candidates) {
+      if (row.normalized.length < 2) {
+        skippedEmpty++;
+        continue;
+      }
+
+      const vector = await context.embedder.embedPassage(row.normalized);
+      const existing = await context.store.vectorSearch(vector, 1, 0.1, [scope]);
+      if (existing.length > 0 && existing[0].score > 0.97) {
+        skippedDuplicate++;
+        continue;
+      }
+
+      if (dryRun) {
+        imported++;
+        continue;
+      }
+
+      await context.store.store({
+        text: row.normalized,
+        vector,
+        importance: 0.62,
+        category: row.category,
+        scope,
+        metadata: JSON.stringify({
+          source: "graphiti_import",
+          importMode: modeRaw,
+          sourceKind: row.sourceKind,
+          groupId: graph.groupId,
+          query: query || undefined,
+          assertionKind: "inferred",
+          confidence: 0.66,
+          importedAt: Date.now(),
+        }),
+      });
+      imported++;
+    }
+
+    return {
+      mode: modeRaw,
+      dryRun,
+      scope,
+      groupId: graph.groupId,
+      query: query || undefined,
+      scanned: candidates.length,
+      imported,
+      skippedDuplicate,
+      skippedEmpty,
+      factsFetched: graph.facts.length,
+      nodesFetched: graph.nodes.length,
+    };
+  };
+
   memory
     .command("graph-infer")
     .description("Run Graphiti inference once for validation or manual refresh")
@@ -904,6 +1011,40 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         console.log(`• Skipped: ${report.skipped}`);
       } catch (error) {
         console.error("Graph sync failed:", error);
+        process.exit(1);
+      }
+    });
+
+  memory
+    .command("graph-import")
+    .description("Reverse import Graphiti recall/list results into LanceDB")
+    .option("--mode <mode>", "recall or list", "recall")
+    .option("--scope <scope>", "Target scope", "global")
+    .option("--query <query>", "Recall query (used when mode=recall)")
+    .option("--limit <n>", "Max nodes/facts fetched", "40")
+    .option("--dry-run", "Analyze without writing to LanceDB")
+    .option("--json", "Output as JSON")
+    .action(async (options) => {
+      try {
+        const report = await executeGraphImport(options);
+        if (options.json) {
+          console.log(formatJson(report));
+          return;
+        }
+
+        console.log("Graph Import Run:");
+        console.log(`• Mode: ${report.mode}`);
+        console.log(`• Dry run: ${report.dryRun ? "Yes" : "No"}`);
+        console.log(`• Scope: ${report.scope}`);
+        console.log(`• Group ID: ${report.groupId}`);
+        console.log(`• Facts fetched: ${report.factsFetched}`);
+        console.log(`• Nodes fetched: ${report.nodesFetched}`);
+        console.log(`• Candidates scanned: ${report.scanned}`);
+        console.log(`• Imported: ${report.imported}`);
+        console.log(`• Skipped duplicates: ${report.skippedDuplicate}`);
+        console.log(`• Skipped empty: ${report.skippedEmpty}`);
+      } catch (error) {
+        console.error("Graph import failed:", error);
         process.exit(1);
       }
     });

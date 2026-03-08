@@ -67,6 +67,18 @@ async function runCliSmoke() {
     graphitiConfig: {
       enabled: true,
     },
+    graphitiBridge: {
+      recall: async () => ({
+        groupId: "global",
+        nodes: [{ label: "Alice" }],
+        facts: [{ text: "Alice likes tea" }],
+      }),
+      list: async () => ({
+        groupId: "global",
+        nodes: [{ label: "Bob" }],
+        facts: [{ text: "Bob uses Vim" }],
+      }),
+    },
     graphitiSync: {
       syncMemory: async () => ({ status: "stored", groupId: "global" }),
     },
@@ -190,6 +202,31 @@ async function runCliSmoke() {
   ]);
 
   // 6) graph-sync dry-run should not crash
+  await program.parseAsync([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "graph-import",
+    "--mode",
+    "recall",
+    "--scope",
+    "global",
+    "--query",
+    "tea",
+    "--dry-run",
+  ]);
+  await program.parseAsync([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "graph-import",
+    "--mode",
+    "list",
+    "--scope",
+    "global",
+    "--dry-run",
+  ]);
+
   await program.parseAsync([
     "node",
     "openclaw",

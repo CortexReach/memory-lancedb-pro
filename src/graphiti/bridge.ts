@@ -23,6 +23,8 @@ interface GraphitiBridgeOptions {
 const ADD_EPISODE_TOOL_CANDIDATES = ["add_memory", "add_episode", "graphiti_add_episode"];
 const SEARCH_NODES_TOOL_CANDIDATES = ["search_nodes", "graphiti_search_nodes"];
 const SEARCH_FACTS_TOOL_CANDIDATES = ["search_memory_facts", "search_facts", "graphiti_search_facts"];
+const LIST_NODES_TOOL_CANDIDATES = ["list_nodes", "graphiti_list_nodes"];
+const LIST_FACTS_TOOL_CANDIDATES = ["list_facts", "list_memory_facts", "graphiti_list_facts"];
 
 export class GraphitiBridge {
   private readonly client: GraphitiMcpClient;
@@ -131,6 +133,24 @@ export class GraphitiBridge {
     };
   }
 
+  async list(scope: string, limitNodes: number, limitFacts: number): Promise<GraphitiRecallResult> {
+    const groupId = this.resolveGroupId(scope);
+    if (!this.config.enabled) {
+      return { groupId, nodes: [], facts: [] };
+    }
+
+    const [nodes, facts] = await Promise.all([
+      this.listNodes(groupId, limitNodes),
+      this.listFacts(groupId, limitFacts),
+    ]);
+
+    return {
+      groupId,
+      nodes,
+      facts,
+    };
+  }
+
   private async searchNodes(groupId: string, query: string, limit: number): Promise<GraphitiNodeResult[]> {
     try {
       const tool = await this.pickFirstTool(SEARCH_NODES_TOOL_CANDIDATES);
@@ -175,6 +195,52 @@ export class GraphitiBridge {
       return [];
     } catch (err) {
       this.logger?.warn?.(`memory-lancedb-pro: graphiti search_facts failed: ${String(err)}`);
+      return [];
+    }
+  }
+
+  private async listNodes(groupId: string, limit: number): Promise<GraphitiNodeResult[]> {
+    try {
+      const tool = await this.pickFirstTool(LIST_NODES_TOOL_CANDIDATES);
+      const payloads = [
+        { group_ids: [groupId], max_nodes: limit },
+        { group_id: groupId, limit },
+        { groupId, limit },
+      ];
+      for (const args of payloads) {
+        try {
+          const result = await this.client.callTool(tool, args);
+          return normalizeNodeResults(result);
+        } catch {
+          continue;
+        }
+      }
+      return [];
+    } catch {
+      // Optional capability; not all servers support list tools.
+      return [];
+    }
+  }
+
+  private async listFacts(groupId: string, limit: number): Promise<GraphitiFactResult[]> {
+    try {
+      const tool = await this.pickFirstTool(LIST_FACTS_TOOL_CANDIDATES);
+      const payloads = [
+        { group_ids: [groupId], max_facts: limit },
+        { group_id: groupId, limit },
+        { groupId, limit },
+      ];
+      for (const args of payloads) {
+        try {
+          const result = await this.client.callTool(tool, args);
+          return normalizeFactResults(result);
+        } catch {
+          continue;
+        }
+      }
+      return [];
+    } catch {
+      // Optional capability; not all servers support list tools.
       return [];
     }
   }

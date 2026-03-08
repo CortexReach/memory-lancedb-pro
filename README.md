@@ -323,6 +323,7 @@ Operational CLI commands:
 - `memory-pro graph-doctor [--json] [--scope <scope>] [--limit <n>]`
 - `memory-pro graph-infer --once [--dry-run] [--scope <scope>] [--include-scopes <csv>] [--exclude-scopes <csv>]`
 - `memory-pro graph-sync --mode backfill|resync [--dry-run] [--scope <scope>] [--limit <n>]`
+- `memory-pro graph-import --mode recall|list [--scope <scope>] [--query <query>] [--dry-run]`
 - `memory-pro promotion-queue [--scope <scope>] [--limit <n>] [--json]`
 - `memory-pro promotion-approve <id> [--target USER|AGENTS|IDENTITY|SOUL]`
 - `memory-pro promotion-reject <id> [--reason <reason>]`
