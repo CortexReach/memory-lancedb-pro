@@ -846,6 +846,7 @@ const memoryLanceDBProPlugin = {
         graphitiBridge,
         graphitiConfig: config.graphiti,
         logger: api.logger,
+        mdMirror,
       },
       {
         enableManagementTools: config.enableManagementTools,
