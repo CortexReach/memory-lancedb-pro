@@ -91,7 +91,7 @@ OpenClaw 内置的 `memory-lancedb` 插件仅提供基本的向量搜索。**mem
 
 | 文件 | 用途 |
 |------|------|
-| `index.ts` | 插件入口。注册到 OpenClaw Plugin API，解析配置，挂载 `before_agent_start` / `agent_end` 钩子，负责 generic auto-recall 的 `legacy | setwise-v2` 分流，并编排 reflection 注入流程 |
+| `index.ts` | 插件入口。注册到 OpenClaw Plugin API，解析配置，挂载生命周期钩子（`before_agent_start` / `before_prompt_build` / `agent_end`），负责 generic auto-recall 的 `legacy | setwise-v2` 分流，并编排 reflection 注入流程 |
 | `openclaw.plugin.json` | 插件元数据 + 完整 JSON Schema 配置声明（含 `uiHints`） |
 | `package.json` | NPM 包信息，依赖 `@lancedb/lancedb`、`openai`、`@sinclair/typebox` |
 | `cli.ts` | CLI 命令实现：`memory list/search/stats/delete/delete-bulk/export/import/reembed/migrate` |
@@ -258,9 +258,9 @@ Query → BM25 FTS ─────┘
 ```
 
 快速行为说明：
-- `before_agent_start` 可注入 `<inherited-rules>`
+- `before_prompt_build` 可注入 `<inherited-rules>`
 - `/new` / `/reset` 可生成 reflection note
-- `before_prompt_build` 只注入 `<error-detected>` 提醒
+- `before_prompt_build` 还可注入 `<error-detected>` 提醒
 - dynamic recall 会保持 `kind + strictKey` 分区，不会把 invariant / derived 混在一起
 
 ### 10. Markdown 镜像（`mdMirror`）

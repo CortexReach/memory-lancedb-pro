@@ -91,7 +91,7 @@ Shared infrastructure: `store.ts`, `embedder.ts`, `scopes.ts`, `tools.ts`,
 
 | File | Purpose |
 |------|---------|
-| `index.ts` | Plugin entry point. Registers with OpenClaw Plugin API, parses config, mounts `before_agent_start` / `agent_end` hooks, routes generic auto-recall through `legacy | setwise-v2`, and coordinates reflection injection flows |
+| `index.ts` | Plugin entry point. Registers with OpenClaw Plugin API, parses config, mounts lifecycle hooks (`before_agent_start` / `before_prompt_build` / `agent_end`), routes generic auto-recall through `legacy | setwise-v2`, and coordinates reflection injection flows |
 | `openclaw.plugin.json` | Plugin metadata + full JSON Schema config declaration (with `uiHints`) |
 | `package.json` | NPM package info. Depends on `@lancedb/lancedb`, `openai`, `@sinclair/typebox` |
 | `cli.ts` | CLI commands: `memory list/search/stats/delete/delete-bulk/export/import/reembed/migrate` |
@@ -258,9 +258,9 @@ Recommended starter config:
 ```
 
 Quick behavior guide:
-- `before_agent_start` can inject `<inherited-rules>`
+- `before_prompt_build` can inject `<inherited-rules>`
 - `/new` / `/reset` can build the reflection note
-- `before_prompt_build` only injects `<error-detected>` reminders
+- `before_prompt_build` can also inject `<error-detected>` reminders
 - dynamic recall keeps `kind + strictKey` separation for invariant/derived rows
 
 ### 10. Markdown Mirror (`mdMirror`)
