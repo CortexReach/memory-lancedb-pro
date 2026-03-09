@@ -2357,7 +2357,37 @@ describe("memory reflection", () => {
       ];
     }
 
-    it("legacy mode bypasses set-wise selector and uses direct truncation", async () => {
+    it("mmr mode bypasses set-wise selector and uses direct truncation", async () => {
+      MemoryRetriever.prototype.retrieve = async () => buildGenericRecallRows();
+
+      const harness = createPluginApiHarness({
+        resolveRoot: workspaceDir,
+        pluginConfig: {
+          embedding: { apiKey: "test-api-key" },
+          autoCapture: false,
+          autoRecall: true,
+          autoRecallTopK: 2,
+          autoRecallSelectionMode: "mmr",
+          autoRecallMinLength: 1,
+          selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+        },
+      });
+      memoryLanceDBProPlugin.register(harness.api);
+
+      const hooks = harness.eventHandlers.get("before_agent_start") || [];
+      assert.equal(hooks.length, 1);
+      const output = await hooks[0].handler(
+        { prompt: "Need rollout memories now." },
+        { sessionId: "mmr-mode", sessionKey: "agent:main:session:mmr-mode", agentId: "main" }
+      );
+      assert.ok(output);
+      assert.match(output.prependContext, /<relevant-memories>/);
+      assert.match(output.prependContext, /Restart API service after config updates\./);
+      assert.match(output.prependContext, /restart api service after config updates\./);
+      assert.doesNotMatch(output.prependContext, /Run DNS and mount health checks after restart\./);
+    });
+
+    it("legacy alias follows the same direct-truncation path as mmr", async () => {
       MemoryRetriever.prototype.retrieve = async () => buildGenericRecallRows();
 
       const harness = createPluginApiHarness({
@@ -2378,7 +2408,7 @@ describe("memory reflection", () => {
       assert.equal(hooks.length, 1);
       const output = await hooks[0].handler(
         { prompt: "Need rollout memories now." },
-        { sessionId: "legacy-mode", sessionKey: "agent:main:session:legacy-mode", agentId: "main" }
+        { sessionId: "legacy-alias-mode", sessionKey: "agent:main:session:legacy-alias-mode", agentId: "main" }
       );
       assert.ok(output);
       assert.match(output.prependContext, /<relevant-memories>/);

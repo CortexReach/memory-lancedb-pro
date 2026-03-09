@@ -73,7 +73,7 @@ The built-in `memory-lancedb` plugin in OpenClaw provides basic vector search. *
 │ (index.ts local step)  │               └──────┬────────────────────┘
 └────────┬───────────────┘                      │
          │                               ┌──────▼───────────────────────┐
-         │ legacy | setwise-v2           │ reflection-recall-final-     │
+         │ mmr | setwise-v2              │ reflection-recall-final-     │
 ┌────────▼────────────────────┐           │ selection.ts                 │
 │ auto-recall-final-          │           └──────┬───────────────────────┘
 │ selection.ts                │                  │
@@ -91,7 +91,7 @@ Shared infrastructure: `store.ts`, `embedder.ts`, `scopes.ts`, `tools.ts`,
 
 | File | Purpose |
 |------|---------|
-| `index.ts` | Plugin entry point. Registers with OpenClaw Plugin API, parses config, mounts lifecycle hooks (`before_agent_start` / `before_prompt_build` / `agent_end`), routes generic auto-recall through `legacy | setwise-v2`, and coordinates reflection injection flows |
+| `index.ts` | Plugin entry point. Registers with OpenClaw Plugin API, parses config, mounts lifecycle hooks (`before_agent_start` / `before_prompt_build` / `agent_end`), routes generic auto-recall through `mmr | setwise-v2`, and coordinates reflection injection flows |
 | `openclaw.plugin.json` | Plugin metadata + full JSON Schema config declaration (with `uiHints`) |
 | `package.json` | NPM package info. Depends on `@lancedb/lancedb`, `openai`, `@sinclair/typebox` |
 | `cli.ts` | CLI commands: `memory list/search/stats/delete/delete-bulk/export/import/reembed/migrate` |
@@ -99,7 +99,7 @@ Shared infrastructure: `store.ts`, `embedder.ts`, `scopes.ts`, `tools.ts`,
 | `src/embedder.ts` | Embedding abstraction. Compatible with any OpenAI-API provider (OpenAI, Gemini, Jina, Ollama, etc.). Supports task-aware embedding (`taskQuery`/`taskPassage`) |
 | `src/retriever.ts` | Hybrid retrieval engine. Vector + BM25 → RRF fusion → rerank → recency / importance / length / decay weighting → noise filter → coarse MMR diversity. |
 | `src/recall-engine.ts` | Shared recall helpers: prompt gating, session repeated-injection suppression, tagged-block assembly, max-age filtering, and recent-per-key capping |
-| `src/auto-recall-final-selection.ts` | Generic auto-recall adapter. Maps `RetrievalResult` rows into final-selection candidates and applies generic `legacy | setwise-v2` behavior at the final cutoff seam |
+| `src/auto-recall-final-selection.ts` | Generic auto-recall adapter. Maps `RetrievalResult` rows into final-selection candidates and applies generic `mmr | setwise-v2` behavior at the final cutoff seam |
 | `src/final-topk-setwise-selection.ts` | Shared final top-k selector. Owns shortlist presort, deterministic set-wise selection, lexical-overlap suppression, and optional embedding-based semantic redundancy suppression |
 | `src/reflection-recall.ts` | Dynamic Reflection-Recall ranking for `<inherited-rules>`. Filters/caps reflection items, computes scores, preserves `kind + strictKey` partitioning, and maps selected groups back to recall rows |
 | `src/reflection-aggregation.ts` | Reflection group aggregation. Combines scored reflection items into strict-key groups with representative selection and final group scoring |
@@ -316,12 +316,13 @@ When embedding calls fail, the plugin provides **actionable error messages** ins
   - Skips memory-management prompts (e.g. delete/forget/cleanup memory entries) to reduce noise
 - **Auto-Recall** (`before_agent_start` hook): Injects `<relevant-memories>` context
   - Default top-k: `autoRecallTopK=3`
-  - Generic final-selection mode: `autoRecallSelectionMode` (`legacy` by default; `setwise-v2` to enable set-wise final selector)
+  - Generic final-selection mode: `autoRecallSelectionMode` (`mmr` by default; `setwise-v2` to enable set-wise final selector)
   - Default category allowlist: `preference`, `fact`, `decision`, `entity`, `other`
   - `autoRecallExcludeReflection=true` by default, so `<relevant-memories>` stays separate from `<inherited-rules>`
   - Supports age window (`autoRecallMaxAgeDays`) and recent-per-key cap (`autoRecallMaxEntriesPerKey`)
-  - `legacy`: post-processed rows use direct truncation (`slice(0, topK)`) for compatibility
-  - `setwise-v2`: final top-k uses shared set-wise selection (base score + freshness + light category/scope coverage + lexical overlap suppression + embedding-based semantic near-duplicate suppression), with deterministic output order and safe lexical-only fallback when vectors are missing
+  - `mmr`: post-processed rows use direct truncation (`slice(0, topK)`); this is simpler and closer to current retriever order, usually with stronger per-item relevance/score stability, but diversity/coverage is weaker
+  - `setwise-v2`: final top-k uses shared set-wise selection (base score + freshness + light category/scope coverage + lexical overlap suppression + embedding-based semantic near-duplicate suppression), so diversity/coverage in the final top-k is usually better, but average per-item score/relevance can be lower than `mmr`
+  - Choose according to your preference: prioritize rank stability/relevance with `mmr`, or prioritize diversity/coverage with `setwise-v2`.
   - This mode is generic auto-recall only. Reflection-Recall mode remains `fixed | dynamic`.
 
 ### Prevent memories from showing up in replies
@@ -521,7 +522,7 @@ openclaw config get plugins.slots.memory
   "autoRecall": false,
   "autoRecallMinLength": 8,
   "autoRecallTopK": 3,
-  "autoRecallSelectionMode": "legacy",
+  "autoRecallSelectionMode": "mmr",
   "autoRecallCategories": ["preference", "fact", "decision", "entity", "other"],
   "autoRecallExcludeReflection": true,
   "autoRecallMaxAgeDays": 30,
@@ -612,7 +613,7 @@ A practical starting point for Chinese chat workloads:
   "autoCapture": true,
   "autoRecall": true,
   "autoRecallMinLength": 8,
-  "autoRecallSelectionMode": "legacy",
+  "autoRecallSelectionMode": "mmr",
   "autoRecallExcludeReflection": true,
   "retrieval": {
     "candidatePoolSize": 20,

@@ -64,12 +64,28 @@ describe("sessionStrategy legacy compatibility mapping", () => {
     assert.equal(parsed.embedding.chunking, false);
   });
 
-  it("defaults generic auto-recall selection mode to legacy", () => {
+  it("defaults generic auto-recall selection mode to mmr", () => {
     const parsed = parsePluginConfig(baseConfig());
-    assert.equal(parsed.autoRecallSelectionMode, "legacy");
+    assert.equal(parsed.autoRecallSelectionMode, "mmr");
   });
 
-  it("parses explicit generic auto-recall selection mode override", () => {
+  it("accepts explicit generic auto-recall selection mode mmr", () => {
+    const parsed = parsePluginConfig({
+      ...baseConfig(),
+      autoRecallSelectionMode: "mmr",
+    });
+    assert.equal(parsed.autoRecallSelectionMode, "mmr");
+  });
+
+  it("normalizes legacy generic auto-recall selection mode to mmr", () => {
+    const parsed = parsePluginConfig({
+      ...baseConfig(),
+      autoRecallSelectionMode: "legacy",
+    });
+    assert.equal(parsed.autoRecallSelectionMode, "mmr");
+  });
+
+  it("parses explicit generic auto-recall selection mode setwise-v2", () => {
     const parsed = parsePluginConfig({
       ...baseConfig(),
       autoRecallSelectionMode: "setwise-v2",

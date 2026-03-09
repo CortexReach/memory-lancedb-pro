@@ -73,7 +73,7 @@ OpenClaw 内置的 `memory-lancedb` 插件仅提供基本的向量搜索。**mem
 │ （index.ts 本地步骤）  │               └──────┬────────────────────┘
 └────────┬───────────────┘                      │
          │                               ┌──────▼───────────────────────┐
-         │ legacy | setwise-v2           │ reflection-recall-final-     │
+         │ mmr | setwise-v2              │ reflection-recall-final-     │
 ┌────────▼────────────────────┐           │ selection.ts                 │
 │ auto-recall-final-          │           └──────┬───────────────────────┘
 │ selection.ts                │                  │
@@ -91,7 +91,7 @@ OpenClaw 内置的 `memory-lancedb` 插件仅提供基本的向量搜索。**mem
 
 | 文件 | 用途 |
 |------|------|
-| `index.ts` | 插件入口。注册到 OpenClaw Plugin API，解析配置，挂载生命周期钩子（`before_agent_start` / `before_prompt_build` / `agent_end`），负责 generic auto-recall 的 `legacy | setwise-v2` 分流，并编排 reflection 注入流程 |
+| `index.ts` | 插件入口。注册到 OpenClaw Plugin API，解析配置，挂载生命周期钩子（`before_agent_start` / `before_prompt_build` / `agent_end`），负责 generic auto-recall 的 `mmr | setwise-v2` 分流，并编排 reflection 注入流程 |
 | `openclaw.plugin.json` | 插件元数据 + 完整 JSON Schema 配置声明（含 `uiHints`） |
 | `package.json` | NPM 包信息，依赖 `@lancedb/lancedb`、`openai`、`@sinclair/typebox` |
 | `cli.ts` | CLI 命令实现：`memory list/search/stats/delete/delete-bulk/export/import/reembed/migrate` |
@@ -99,7 +99,7 @@ OpenClaw 内置的 `memory-lancedb` 插件仅提供基本的向量搜索。**mem
 | `src/embedder.ts` | Embedding 抽象层。兼容 OpenAI API 的任意 Provider（OpenAI、Gemini、Jina、Ollama 等），支持 task-aware embedding（`taskQuery`/`taskPassage`） |
 | `src/retriever.ts` | 混合检索引擎。Vector + BM25 → RRF 融合 → rerank → 时效 / 重要性 / 长度 / 衰减加权 → 噪声过滤 → 粗粒度 MMR 去重。 |
 | `src/recall-engine.ts` | 共享 recall 辅助层：prompt 触发判断、session 重复注入抑制、tag block 组装、max-age 过滤、按 key 保留最近 N 条 |
-| `src/auto-recall-final-selection.ts` | generic auto-recall 适配层。把 `RetrievalResult` 映射为最终选择候选，并在最终截断点应用 generic 的 `legacy | setwise-v2` 行为 |
+| `src/auto-recall-final-selection.ts` | generic auto-recall 适配层。把 `RetrievalResult` 映射为最终选择候选，并在最终截断点应用 generic 的 `mmr | setwise-v2` 行为 |
 | `src/final-topk-setwise-selection.ts` | 共享最终 top-k 选择器。负责 shortlist presort、确定性的 set-wise 选择、词法重叠抑制，以及可选的 embedding 语义冗余抑制 |
 | `src/reflection-recall.ts` | `<inherited-rules>` 的动态 Reflection-Recall 排序链路。负责 reflection item 过滤/截断、分数计算、保持 `kind + strictKey` 分区，并将选中的 group 映射回 recall rows |
 | `src/reflection-aggregation.ts` | Reflection group 聚合层。把打分后的 reflection item 聚合为 strict-key group，选择代表文本并计算 group final score |
@@ -316,12 +316,13 @@ Query → BM25 FTS ─────┘
   - 触发词支持 **简体中文 + 繁體中文**（例如：记住/記住、偏好/喜好/喜歡、决定/決定 等）
 - **Auto-Recall**（`before_agent_start` hook）: 注入 `<relevant-memories>` 上下文
   - 默认 top-k：`autoRecallTopK=3`
-  - Generic 最终选择模式：`autoRecallSelectionMode`（默认 `legacy`；设置 `setwise-v2` 可启用 set-wise 最终选择器）
+  - Generic 最终选择模式：`autoRecallSelectionMode`（默认 `mmr`；设置 `setwise-v2` 可启用 set-wise 最终选择器）
   - 默认类别白名单：`preference`、`fact`、`decision`、`entity`、`other`
   - 默认 `autoRecallExcludeReflection=true`，让 `<relevant-memories>` 与 `<inherited-rules>` 分离
   - 支持时间窗（`autoRecallMaxAgeDays`）和按归一化 key 的最近 N 条限制（`autoRecallMaxEntriesPerKey`）
-  - `legacy`：保留 retriever 当前的排序结果（包括内部的粗粒度 MMR 去重），再对 post-process 后的结果直接截断（`slice(0, topK)`），保持兼容行为
-  - `setwise-v2`：最终 top-k 使用共享 set-wise selector（基础分 + 新鲜度 + 轻量 category/scope 覆盖 + 词法重叠抑制 + 基于 embedding 的语义近重复抑制）；当向量缺失时会安全回退到仅词法抑制，并保持确定性顺序
+  - `mmr`：对 post-process 后的结果直接截断（`slice(0, topK)`）；实现更简单、更贴近当前 retriever 顺序，通常单条相关性/分数稳定性更好，但多样性与覆盖度较弱
+  - `setwise-v2`：最终 top-k 使用共享 set-wise selector（基础分 + 新鲜度 + 轻量 category/scope 覆盖 + 词法重叠抑制 + 基于 embedding 的语义近重复抑制）；最终 top-k 的多样性/覆盖度通常更好，但平均单条分数/相关性可能低于 `mmr`
+  - 请按偏好选择：偏向相关性稳定可选 `mmr`，偏向多样覆盖可选 `setwise-v2`。
   - 该模式只作用于 generic auto-recall；Reflection-Recall 的 `fixed | dynamic` 语义不变。
 
 ### 不想在对话中"显示长期记忆"？
@@ -521,7 +522,7 @@ openclaw config get plugins.slots.memory
   "autoRecall": false,
   "autoRecallMinLength": 8,
   "autoRecallTopK": 3,
-  "autoRecallSelectionMode": "legacy",
+  "autoRecallSelectionMode": "mmr",
   "autoRecallCategories": ["preference", "fact", "decision", "entity", "other"],
   "autoRecallExcludeReflection": true,
   "autoRecallMaxAgeDays": 30,
@@ -612,7 +613,7 @@ openclaw config get plugins.slots.memory
   "autoCapture": true,
   "autoRecall": true,
   "autoRecallMinLength": 8,
-  "autoRecallSelectionMode": "legacy",
+  "autoRecallSelectionMode": "mmr",
   "autoRecallExcludeReflection": true,
   "retrieval": {
     "candidatePoolSize": 20,

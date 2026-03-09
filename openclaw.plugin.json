@@ -114,11 +114,12 @@
       "autoRecallSelectionMode": {
         "type": "string",
         "enum": [
+          "mmr",
           "legacy",
           "setwise-v2"
         ],
-        "default": "legacy",
-        "description": "Generic Auto-Recall final top-k mode. legacy keeps post-processed direct truncation compatibility; setwise-v2 uses set-wise final selection."
+        "default": "mmr",
+        "description": "Generic Auto-Recall final top-k mode. mmr keeps direct truncation after post-processing as the canonical mode; legacy is accepted as a backward-compatible alias to mmr; setwise-v2 enables set-wise final selection with higher diversity/coverage but potentially lower average per-item relevance."
       },
       "autoRecallCategories": {
         "type": "array",
@@ -582,7 +583,7 @@
     },
     "autoRecallSelectionMode": {
       "label": "Auto-Recall Selection Mode",
-      "help": "Generic final top-k mode: legacy uses direct truncation after post-processing; setwise-v2 enables set-wise final selection.",
+      "help": "Generic final top-k mode: mmr is the canonical direct-truncation mode; legacy remains a backward-compatible alias to mmr; setwise-v2 enables a more diverse final selector with possible average relevance tradeoffs.",
       "advanced": true
     },
     "autoRecallCategories": {

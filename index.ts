@@ -144,7 +144,7 @@ type SessionStrategy = "memoryReflection" | "systemSessionMemory" | "none";
 type ReflectionInjectMode = "inheritance-only" | "inheritance+derived";
 type ReflectionRecallMode = "fixed" | "dynamic";
 type ReflectionRecallKind = "invariant" | "derived";
-type AutoRecallSelectionMode = "legacy" | "setwise-v2";
+type AutoRecallSelectionMode = "mmr" | "setwise-v2";
 type MemoryCategory = "preference" | "fact" | "decision" | "entity" | "other" | "reflection";
 
 // ============================================================================
@@ -262,7 +262,7 @@ const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_AUTO_RECALL_TOP_K = 3;
-const DEFAULT_AUTO_RECALL_SELECTION_MODE: AutoRecallSelectionMode = "legacy";
+const DEFAULT_AUTO_RECALL_SELECTION_MODE: AutoRecallSelectionMode = "mmr";
 const DEFAULT_AUTO_RECALL_EXCLUDE_REFLECTION = true;
 const DEFAULT_AUTO_RECALL_MAX_AGE_DAYS = 30;
 const DEFAULT_AUTO_RECALL_MAX_ENTRIES_PER_KEY = 10;
@@ -2764,6 +2764,8 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   const autoRecallSelectionMode: AutoRecallSelectionMode =
     cfg.autoRecallSelectionMode === "setwise-v2"
       ? "setwise-v2"
+      : cfg.autoRecallSelectionMode === "mmr" || cfg.autoRecallSelectionMode === "legacy"
+        ? "mmr"
       : DEFAULT_AUTO_RECALL_SELECTION_MODE;
 
   return {
