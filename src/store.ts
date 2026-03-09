@@ -316,6 +316,39 @@ export class MemoryStore {
   }
 
   /**
+   * Batch store multiple entries at once for better performance.
+   * Returns all stored entries with their generated IDs.
+   */
+  async storeBatch(
+    entries: Array<Omit<MemoryEntry, "id" | "timestamp">>,
+  ): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+
+    const fullEntries: MemoryEntry[] = entries.map((entry) => ({
+      ...entry,
+      id: randomUUID(),
+      timestamp: Date.now(),
+      metadata: entry.metadata || "{}",
+    }));
+
+    if (fullEntries.length === 0) {
+      return [];
+    }
+
+    try {
+      await this.table!.add(fullEntries);
+    } catch (err: any) {
+      const code = err.code || "";
+      const message = err.message || String(err);
+      throw new Error(
+        `Failed to batch store ${fullEntries.length} memories in "${this.config.dbPath}": ${code} ${message}`,
+      );
+    }
+
+    return fullEntries;
+  }
+
+  /**
    * Import a pre-built entry while preserving its id/timestamp.
    * Used for re-embedding / migration / A/B testing across embedding models.
    * Intentionally separate from `store()` to keep normal writes simple.
@@ -788,6 +821,438 @@ export class MemoryStore {
     }
 
     return deleteCount;
+  }
+
+  /**
+   * Decay old memories based on age, access count, and importance.
+   * Returns the IDs of deleted memories.
+   * Uses reinforcement-based decay: frequently accessed memories decay slower.
+   */
+  async decayOldMemories(options: {
+    halfLifeDays?: number;
+    minAgeDays?: number;
+    minScoreThreshold?: number;
+    reinforcementFactor?: number;
+    maxHalfLifeMultiplier?: number;
+    dryRun?: boolean;
+  } = {}): Promise<{ deletedIds: string[]; deletedCount: number }> {
+    await this.ensureInitialized();
+
+    const {
+      halfLifeDays = 60,
+      minAgeDays = 7,
+      minScoreThreshold = 0.2,
+      reinforcementFactor = 0.5,
+      maxHalfLifeMultiplier = 3,
+      dryRun = false,
+    } = options;
+
+    const now = Date.now();
+    const minAgeMs = minAgeDays * 24 * 60 * 60 * 1000;
+
+    const allRows = await this.table!.query().toArray() as any[];
+    const toDelete: string[] = [];
+
+    for (const row of allRows) {
+      const age = now - (row.timestamp as number);
+      if (age < minAgeMs) continue;
+
+      const ageDays = age / (24 * 60 * 60 * 1000);
+      const importance = (row.importance as number) ?? 0.5;
+
+      // Parse access count from metadata
+      let accessCount = 0;
+      let lastAccessedAt = 0;
+      try {
+        const metadata = typeof row.metadata === "string" ? JSON.parse(row.metadata) : row.metadata;
+        accessCount = metadata?.accessCount ?? 0;
+        lastAccessedAt = metadata?.lastAccessedAt ?? 0;
+      } catch { /* ignore parse errors */ }
+
+      // Compute effective half-life with access reinforcement
+      const effectiveHalfLife = this.computeEffectiveHalfLife(
+        halfLifeDays,
+        accessCount,
+        lastAccessedAt,
+        reinforcementFactor,
+        maxHalfLifeMultiplier,
+      );
+
+      // Decay score: importance * access factor * age factor
+      const accessFactor = 1 + Math.log10(accessCount + 1);
+      const ageFactor = Math.max(0, 1 - ageDays / effectiveHalfLife);
+      const score = importance * accessFactor * ageFactor;
+
+      if (score < minScoreThreshold) {
+        toDelete.push(row.id as string);
+      }
+    }
+
+    if (!dryRun && toDelete.length > 0) {
+      for (const id of toDelete) {
+        const safeId = escapeSqlLiteral(id);
+        await this.table!.delete(`id = '${safeId}'`);
+      }
+    }
+
+    return { deletedIds: toDelete, deletedCount: toDelete.length };
+  }
+
+  /**
+   * Compute effective half-life with access reinforcement.
+   * Frequently accessed memories get longer effective half-lives.
+   */
+  private computeEffectiveHalfLife(
+    baseHalfLifeDays: number,
+    accessCount: number,
+    lastAccessedAt: number,
+    reinforcementFactor: number,
+    maxMultiplier: number,
+  ): number {
+    if (reinforcementFactor === 0 || accessCount <= 0) {
+      return baseHalfLifeDays;
+    }
+
+    const now = Date.now();
+    const msPerDay = 24 * 60 * 60 * 1000;
+    const daysSinceLastAccess = lastAccessedAt > 0
+      ? (now - lastAccessedAt) / msPerDay
+      : 30; // Default to 30 days if never accessed
+
+    // Access freshness: recent accesses count more
+    const accessDecayHalfLife = 30; // days
+    const accessFreshness = Math.pow(0.5, daysSinceLastAccess / accessDecayHalfLife);
+
+    // Effective access count (decayed by time since last access)
+    const effectiveAccessCount = accessCount * accessFreshness;
+
+    // Reinforcement multiplier: log scale, capped at maxMultiplier
+    const rawMultiplier = 1 + reinforcementFactor * Math.log2(effectiveAccessCount + 1);
+    const multiplier = Math.min(maxMultiplier, Math.max(1, rawMultiplier));
+
+    return baseHalfLifeDays * multiplier;
+  }
+
+  /**
+   * Compute memory quality score for a single entry.
+   * Quality = relevance * uniqueness * freshness * reinforcement
+   */
+  computeQualityScore(entry: MemoryEntry, options: {
+    baseHalfLifeDays?: number;
+    reinforcementFactor?: number;
+    maxHalfLifeMultiplier?: number;
+  } = {}): {
+    relevance: number;
+    uniqueness: number;
+    freshness: number;
+    reinforcement: number;
+    overall: number;
+  } {
+    const {
+      baseHalfLifeDays = 60,
+      reinforcementFactor = 0.5,
+      maxHalfLifeMultiplier = 3,
+    } = options;
+
+    const now = Date.now();
+    const msPerDay = 24 * 60 * 60 * 1000;
+
+    // 1. Relevance (based on importance field)
+    const relevance = (entry.importance ?? 0.5);
+
+    // 2. Uniqueness (based on vector norm - longer vectors tend to be more specific)
+    let uniqueness = 0.5;
+    if (entry.vector && entry.vector.length > 0) {
+      const norm = Math.sqrt(entry.vector.reduce((sum, v) => sum + v * v, 0));
+      uniqueness = Math.min(1, norm / 10); // Normalize to 0-1
+    }
+
+    // 3. Freshness (time decay)
+    const ageDays = entry.timestamp ? (now - entry.timestamp) / msPerDay : 30;
+    const freshness = Math.pow(0.5, ageDays / baseHalfLifeDays);
+
+    // 4. Reinforcement (access count)
+    let accessCount = 0;
+    let lastAccessedAt = 0;
+    try {
+      const metadata = typeof entry.metadata === "string"
+        ? JSON.parse(entry.metadata)
+        : entry.metadata;
+      accessCount = metadata?.accessCount ?? 0;
+      lastAccessedAt = metadata?.lastAccessedAt ?? 0;
+    } catch { /* ignore */ }
+
+    const effectiveHalfLife = this.computeEffectiveHalfLife(
+      baseHalfLifeDays,
+      accessCount,
+      lastAccessedAt,
+      reinforcementFactor,
+      maxHalfLifeMultiplier,
+    );
+    const reinforcement = Math.min(1, effectiveHalfLife / (baseHalfLifeDays * maxHalfLifeMultiplier));
+
+    // 5. Overall quality score
+    const overall = (relevance * 0.3 + uniqueness * 0.2 + freshness * 0.3 + reinforcement * 0.2);
+
+    return { relevance, uniqueness, freshness, reinforcement, overall };
+  }
+
+  /**
+   * Get memory quality statistics for all entries.
+   */
+  async getQualityStats(options: {
+    scope?: string;
+    category?: string;
+    minScore?: number;
+    sortBy?: "overall" | "relevance" | "freshness" | "reinforcement";
+    limit?: number;
+  } = {}): Promise<Array<MemoryEntry & { quality: ReturnType<MemoryStore["computeQualityScore"]> }>> {
+    await this.ensureInitialized();
+
+    const { scope, category, minScore = 0, sortBy = "overall", limit = 100 } = options;
+
+    let rows = await this.table!.query().toArray() as MemoryEntry[];
+
+    // Filter by scope/category if provided
+    if (scope) {
+      rows = rows.filter(r => r.scope === scope);
+    }
+    if (category) {
+      rows = rows.filter(r => r.category === category);
+    }
+
+    // Compute quality scores
+    const results = rows.map(entry => ({
+      ...entry,
+      quality: this.computeQualityScore(entry),
+    }));
+
+    // Filter by minimum score
+    const filtered = results.filter(r => r.quality.overall >= minScore);
+
+    // Sort
+    filtered.sort((a, b) => b.quality[sortBy] - a.quality[sortBy]);
+
+    return filtered.slice(0, limit);
+  }
+
+  /**
+   * Deduplicate memories by semantic similarity.
+   * Enhanced with:
+   * - Semantic merge: combine similar memories into one
+   * - Temporal merge: keep newer info when values change (e.g., IP addresses)
+   * - Quality-based selection: keep higher quality entry
+   */
+  async deduplicateBySimilarity(options: {
+    similarityThreshold?: number;
+    mergeStrategy?: "keep-newer" | "keep-higher-quality" | "merge";
+    dryRun?: boolean;
+    onMerge?: (kept: MemoryEntry, removed: MemoryEntry) => void;
+  } = {}): Promise<{
+    removedIds: string[];
+    removedCount: number;
+    mergedPairs: Array<{ kept: string; removed: string; similarity: number }>;
+  }> {
+    await this.ensureInitialized();
+
+    const {
+      similarityThreshold = 0.95,
+      mergeStrategy = "keep-higher-quality",
+      dryRun = false,
+      onMerge,
+    } = options;
+
+    const allRows = await this.table!.query().toArray() as MemoryEntry[];
+    const toRemove: string[] = [];
+    const mergedPairs: Array<{ kept: string; removed: string; similarity: number }> = [];
+    const seen = new Map<string, MemoryEntry>();
+
+    const cosineSimilarity = (a: number[], b: number[]): number => {
+      if (a.length !== b.length || a.length === 0) return 0;
+      let dot = 0, normA = 0, normB = 0;
+      for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        normA += a[i] * a[i];
+        normB += b[i] * b[i];
+      }
+      return dot / (Math.sqrt(normA) * Math.sqrt(normB) || 1);
+    };
+
+    // Detect if two texts represent the same entity with different values
+    const detectValueChange = (text1: string, text2: string): {
+      isValueChange: boolean;
+      entity?: string;
+      oldValue?: string;
+      newValue?: string;
+    } => {
+      // Pattern: "X is Y" or "X = Y" or "X: Y"
+      const patterns = [
+        // IP addresses
+        { regex: /(IP|ip_address|地址|服务器).*?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/gi, extract: (m: RegExpMatchArray) => ({ entity: m[1], value: m[2] }) },
+        // URLs
+        { regex: /(URL|url|链接|网站).*?(https?:\/\/[^\s]+)/gi, extract: (m: RegExpMatchArray) => ({ entity: m[1], value: m[2] }) },
+        // Status
+        { regex: /(状态|status).*?(running|stopped|error|success|active|inactive)/gi, extract: (m: RegExpMatchArray) => ({ entity: m[1], value: m[2] }) },
+      ];
+
+      for (const { regex, extract } of patterns) {
+        const match1 = text1.match(regex);
+        const match2 = text2.match(regex);
+
+        if (match1 && match2) {
+          const val1 = extract(match1);
+          const val2 = extract(match2);
+          if (val1.entity === val2.entity && val1.value !== val2.value) {
+            return { isValueChange: true, entity: val1.entity, oldValue: val1.value, newValue: val2.value };
+          }
+        }
+      }
+
+      return { isValueChange: false };
+    };
+
+    for (const entry of allRows) {
+      if (!entry.vector || entry.vector.length === 0) continue;
+
+      let isDuplicate = false;
+      let bestMatch: { entry: MemoryEntry; similarity: number } | null = null;
+
+      for (const [_, existing] of seen) {
+        if (!existing.vector) continue;
+        const sim = cosineSimilarity(entry.vector, existing.vector);
+
+        if (sim >= similarityThreshold) {
+          isDuplicate = true;
+          bestMatch = { entry: existing, similarity: sim };
+          break;
+        }
+      }
+
+      if (isDuplicate && bestMatch) {
+        const existing = bestMatch.entry;
+
+        // Check for value change (e.g., IP address updated)
+        const valueChange = detectValueChange(existing.text, entry.text);
+
+        let keepEntry: MemoryEntry;
+        let removeEntry: MemoryEntry;
+
+        if (valueChange.isValueChange && mergeStrategy === "keep-newer") {
+          // Value changed - keep newer entry
+          keepEntry = entry.timestamp > existing.timestamp ? entry : existing;
+          removeEntry = entry.timestamp > existing.timestamp ? existing : entry;
+        } else if (mergeStrategy === "keep-higher-quality") {
+          // Keep higher quality entry
+          const qualityExisting = this.computeQualityScore(existing);
+          const qualityNew = this.computeQualityScore(entry);
+          keepEntry = qualityNew.overall > qualityExisting.overall ? entry : existing;
+          removeEntry = qualityNew.overall > qualityExisting.overall ? existing : entry;
+        } else {
+          // Default: keep higher importance
+          keepEntry = (entry.importance ?? 0.5) > (existing.importance ?? 0.5) ? entry : existing;
+          removeEntry = (entry.importance ?? 0.5) > (existing.importance ?? 0.5) ? existing : entry;
+        }
+
+        toRemove.push(removeEntry.id);
+        mergedPairs.push({ kept: keepEntry.id, removed: removeEntry.id, similarity: bestMatch.similarity });
+
+        // Update seen map
+        seen.delete(existing.id);
+        seen.set(keepEntry.id, keepEntry);
+
+        onMerge?.(keepEntry, removeEntry);
+      } else {
+        seen.set(entry.id, entry);
+      }
+    }
+
+    if (!dryRun && toRemove.length > 0) {
+      for (const id of toRemove) {
+        const safeId = escapeSqlLiteral(id);
+        await this.table!.delete(`id = '${safeId}'`);
+      }
+    }
+
+    return { removedIds: toRemove, removedCount: toRemove.length, mergedPairs };
+  }
+
+  /**
+   * Filter sensitive information from text.
+   * Returns sanitized text and list of removed patterns.
+   */
+  sanitizeText(text: string): { sanitized: string; removed: string[] } {
+    const SENSITIVE_PATTERNS = [
+      { name: "password", regex: /(password|passwd|pwd)[=:]\s*\S+/gi },
+      { name: "api_key", regex: /(api[_-]?key|apikey)[=:]\s*\S+/gi },
+      { name: "secret", regex: /(secret|token)[=:]\s*[a-zA-Z0-9_-]{10,}/gi },
+      { name: "bearer", regex: /Bearer\s+[a-zA-Z0-9_-]{20,}/gi },
+      { name: "private_key", regex: /-----BEGIN (?:RSA |EC )?PRIVATE KEY-----[\s\S]*?-----END/gi },
+      { name: "connection_string", regex: /(mongodb|mysql|postgres|redis):\/\/[^\s]+/gi },
+    ];
+
+    let sanitized = text;
+    const removed: string[] = [];
+
+    for (const { name, regex } of SENSITIVE_PATTERNS) {
+      const matches = text.match(regex);
+      if (matches) {
+        for (const match of matches) {
+          removed.push(`[${name}] ${match.slice(0, 20)}...`);
+          sanitized = sanitized.replace(match, `[${name}_REDACTED]`);
+        }
+      }
+    }
+
+    return { sanitized, removed };
+  }
+
+  /**
+   * Store a memory entry with automatic sensitive info sanitization.
+   */
+  async storeSanitized(
+    entry: Omit<MemoryEntry, "id" | "timestamp">,
+    options: { sanitize?: boolean } = {},
+  ): Promise<MemoryEntry> {
+    const { sanitize = true } = options;
+
+    if (sanitize) {
+      const { sanitized, removed } = this.sanitizeText(entry.text);
+      if (removed.length > 0) {
+        console.warn(`[memory-lancedb-pro] Sanitized ${removed.length} sensitive patterns`);
+        entry.text = sanitized;
+      }
+    }
+
+    return this.store(entry);
+  }
+
+  /**
+   * Audit existing memories for sensitive information.
+   */
+  async auditSensitiveInfo(options: {
+    dryRun?: boolean;
+    onFound?: (entry: MemoryEntry, patterns: string[]) => void;
+  } = {}): Promise<{ count: number; entries: Array<{ id: string; patterns: string[] }> }> {
+    await this.ensureInitialized();
+
+    const { dryRun = true, onFound } = options;
+    const allRows = await this.table!.query().toArray() as MemoryEntry[];
+    const findings: Array<{ id: string; patterns: string[] }> = [];
+
+    for (const entry of allRows) {
+      const { removed } = this.sanitizeText(entry.text);
+      if (removed.length > 0) {
+        findings.push({ id: entry.id, patterns: removed });
+        onFound?.(entry, removed);
+
+        if (!dryRun) {
+          const { sanitized } = this.sanitizeText(entry.text);
+          await this.update(entry.id, { text: sanitized });
+        }
+      }
+    }
+
+    return { count: findings.length, entries: findings };
   }
 
   get hasFtsSupport(): boolean {

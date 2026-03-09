@@ -679,6 +679,207 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         process.exit(1);
       }
     });
+
+  // ========================================================================
+  // Decay Command - Remove old, low-value memories
+  // ========================================================================
+  memory
+    .command("decay")
+    .description("Decay old memories based on age, access count, and importance")
+    .option("--half-life <days>", "Half-life in days for decay calculation", "60")
+    .option("--min-age <days>", "Minimum age in days to consider for decay", "7")
+    .option("--threshold <score>", "Minimum score threshold (below this = delete)", "0.2")
+    .option("--reinforcement <factor>", "Reinforcement factor (0-1, default 0.5)", "0.5")
+    .option("--dry-run", "Preview what would be deleted without actually deleting")
+    .option("--json", "Output as JSON")
+    .action(async (options) => {
+      try {
+        const result = await context.store.decayOldMemories({
+          halfLifeDays: parseFloat(options.halfLife),
+          minAgeDays: parseFloat(options.minAge),
+          minScoreThreshold: parseFloat(options.threshold),
+          reinforcementFactor: parseFloat(options.reinforcement),
+          dryRun: options.dryRun,
+        });
+
+        if (options.json) {
+          console.log(formatJson(result));
+        } else {
+          console.log(`Decay Results ${options.dryRun ? "(dry run)" : ""}:`);
+          console.log(`• Half-life: ${options.halfLife} days`);
+          console.log(`• Reinforcement factor: ${options.reinforcement}`);
+          console.log(`• Memories to delete: ${result.deletedCount}`);
+          if (result.deletedCount > 0 && result.deletedCount <= 20) {
+            console.log("• IDs:");
+            result.deletedIds.forEach(id => console.log(`  - ${id}`));
+          }
+        }
+      } catch (error) {
+        console.error("Decay failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // ========================================================================
+  // Dedupe Command - Remove duplicate memories by semantic similarity
+  // ========================================================================
+  memory
+    .command("dedupe")
+    .description("Remove duplicate memories by semantic similarity")
+    .option("--threshold <similarity>", "Similarity threshold (0-1, default 0.95)", "0.95")
+    .option("--strategy <strategy>", "Merge strategy: keep-newer, keep-higher-quality, merge", "keep-higher-quality")
+    .option("--dry-run", "Preview what would be removed without actually removing")
+    .option("--json", "Output as JSON")
+    .action(async (options) => {
+      try {
+        const result = await context.store.deduplicateBySimilarity({
+          similarityThreshold: parseFloat(options.threshold),
+          mergeStrategy: options.strategy,
+          dryRun: options.dryRun,
+        });
+
+        if (options.json) {
+          console.log(formatJson(result));
+        } else {
+          console.log(`Deduplication Results ${options.dryRun ? "(dry run)" : ""}:`);
+          console.log(`• Duplicates found: ${result.removedCount}`);
+          if (result.removedCount > 0 && result.removedCount <= 20) {
+            console.log("• Removed IDs:");
+            result.removedIds.forEach(id => console.log(`  - ${id}`));
+          }
+        }
+      } catch (error) {
+        console.error("Deduplication failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // ========================================================================
+  // Batch Store Command - Import multiple memories at once
+  // ========================================================================
+  memory
+    .command("batch-import")
+    .description("Import multiple memories from a JSON file")
+    .argument("<file>", "JSON file containing memory entries")
+    .option("--scope <scope>", "Override scope for all entries")
+    .option("--category <category>", "Override category for all entries")
+    .option("--skip-duplicates", "Skip entries with similar text")
+    .action(async (file, options) => {
+      try {
+        const content = readFileSync(file, "utf-8");
+        const entries = JSON.parse(content);
+
+        if (!Array.isArray(entries)) {
+          console.error("Error: JSON file must contain an array of entries");
+          process.exit(1);
+        }
+
+        const processedEntries = entries.map((entry: any) => ({
+          text: entry.text || entry.content,
+          vector: entry.vector,
+          scope: options.scope || entry.scope || "global",
+          category: options.category || entry.category || "other",
+          importance: entry.importance ?? 0.7,
+          metadata: typeof entry.metadata === "object" ? JSON.stringify(entry.metadata) : entry.metadata,
+        }));
+
+        const result = await context.store.storeBatch(processedEntries);
+
+        console.log(`Batch Import Results:`);
+        console.log(`• Imported: ${result.length} memories`);
+        console.log(`• Scope: ${options.scope || "preserved"}`);
+        console.log(`• Category: ${options.category || "preserved"}`);
+      } catch (error) {
+        console.error("Batch import failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // ========================================================================
+  // Quality Command - Show memory quality scores
+  // ========================================================================
+  memory
+    .command("quality")
+    .description("Analyze memory quality scores")
+    .option("--scope <scope>", "Filter by scope")
+    .option("--category <category>", "Filter by category")
+    .option("--min-score <score>", "Minimum quality score (0-1)", "0")
+    .option("--sort-by <field>", "Sort by: overall, relevance, freshness, reinforcement", "overall")
+    .option("--limit <n>", "Limit results", "20")
+    .option("--json", "Output as JSON")
+    .action(async (options) => {
+      try {
+        const results = await context.store.getQualityStats({
+          scope: options.scope,
+          category: options.category,
+          minScore: parseFloat(options.minScore),
+          sortBy: options.sortBy as any,
+          limit: parseInt(options.limit),
+        });
+
+        if (options.json) {
+          console.log(formatJson(results));
+        } else {
+          if (results.length === 0) {
+            console.log("No memories found matching criteria.");
+          } else {
+            console.log(`Memory Quality Analysis (${results.length} results):\n`);
+            results.forEach((r, i) => {
+              const q = r.quality;
+              console.log(
+                `${i + 1}. [${r.id.slice(0, 8)}] ${r.text.slice(0, 50)}...`
+              );
+              console.log(
+                `   Overall: ${(q.overall * 100).toFixed(0)}% | ` +
+                `Rel: ${(q.relevance * 100).toFixed(0)}% | ` +
+                `Fresh: ${(q.freshness * 100).toFixed(0)}% | ` +
+                `Reinf: ${(q.reinforcement * 100).toFixed(0)}%`
+              );
+            });
+          }
+        }
+      } catch (error) {
+        console.error("Quality analysis failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // ========================================================================
+  // Audit Command - Check for sensitive information
+  // ========================================================================
+  memory
+    .command("audit")
+    .description("Audit memories for sensitive information")
+    .option("--fix", "Automatically sanitize sensitive information")
+    .option("--json", "Output as JSON")
+    .action(async (options) => {
+      try {
+        const results = await context.store.auditSensitiveInfo({
+          dryRun: !options.fix,
+        });
+
+        if (options.json) {
+          console.log(formatJson(results));
+        } else {
+          if (results.count === 0) {
+            console.log("✅ No sensitive information found.");
+          } else {
+            console.log(`⚠️  Found ${results.count} entries with sensitive information:\n`);
+            results.entries.forEach(({ id, patterns }) => {
+              console.log(`[${id.slice(0, 8)}] ${patterns.join(", ")}`);
+            });
+            if (!options.fix) {
+              console.log("\nRun with --fix to sanitize these entries.");
+            } else {
+              console.log("\n✅ All entries have been sanitized.");
+            }
+          }
+        }
+      } catch (error) {
+        console.error("Audit failed:", error);
+        process.exit(1);
+      }
+    });
 }
 
 // ============================================================================
