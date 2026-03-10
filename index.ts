@@ -2555,16 +2555,28 @@ const memoryLanceDBProPlugin = {
         );
         await mkdir(backupDir, { recursive: true });
 
-        const allMemories = await store.list(undefined, undefined, 10000, 0);
+        // Include vectors so backup can be restored without re-embedding
+        const allMemories = await store.list(undefined, undefined, 10000, 0, true);
         if (allMemories.length === 0) return;
 
         const dateStr = new Date().toISOString().split("T")[0];
         const backupFile = join(backupDir, `memory-backup-${dateStr}.jsonl`);
 
-        const lines = allMemories.map((m) =>
+        // First line: metadata header for restore compatibility
+        const embeddingModel = config.embedding.model || "text-embedding-3-small";
+        const metaLine = JSON.stringify({
+          _meta: true,
+          version: "1.1",
+          model: embeddingModel,
+          dimensions: vectorDim,
+          timestamp: new Date().toISOString(),
+        });
+
+        const dataLines = allMemories.map((m) =>
           JSON.stringify({
             id: m.id,
             text: m.text,
+            vector: m.vector,
             category: m.category,
             scope: m.scope,
             importance: m.importance,
@@ -2573,7 +2585,7 @@ const memoryLanceDBProPlugin = {
           }),
         );
 
-        await writeFile(backupFile, lines.join("\n") + "\n");
+        await writeFile(backupFile, metaLine + "\n" + dataLines.join("\n") + "\n");
 
         // Keep only last 7 backups
         const files = (await readdir(backupDir))

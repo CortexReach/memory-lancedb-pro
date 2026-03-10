@@ -592,6 +592,7 @@ export class MemoryStore {
     category?: string,
     limit = 20,
     offset = 0,
+    includeVectors = false,
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
 
@@ -615,17 +616,23 @@ export class MemoryStore {
       query = query.where(conditions.join(" AND "));
     }
 
+    // Select columns - optionally include the vector column for backup/export
+    const selectCols = [
+      "id",
+      "text",
+      "category",
+      "scope",
+      "importance",
+      "timestamp",
+      "metadata",
+    ];
+    if (includeVectors) {
+      selectCols.push("vector");
+    }
+
     // Fetch all matching rows (no pre-limit) so app-layer sort is correct across full dataset
     const results = await query
-      .select([
-        "id",
-        "text",
-        "category",
-        "scope",
-        "importance",
-        "timestamp",
-        "metadata",
-      ])
+      .select(selectCols)
       .toArray();
 
     return results
@@ -633,7 +640,9 @@ export class MemoryStore {
         (row): MemoryEntry => ({
           id: row.id as string,
           text: row.text as string,
-          vector: [], // Don't include vectors in list results for performance
+          vector: includeVectors
+            ? (Array.isArray(row.vector) ? (row.vector as number[]) : [])
+            : [], // Don't include vectors in list results for performance
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
           importance: Number(row.importance),
