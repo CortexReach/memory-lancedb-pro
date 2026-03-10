@@ -50,6 +50,18 @@ const DIAGNOSTIC_ARTIFACT_PATTERNS = [
   /\bno explicit solution\b/i,
 ];
 
+// Structural noise: runtime traces, raw blobs, wrappers, and malformed fragments
+const STRUCTURAL_NOISE_PATTERNS = [
+  /^System\s*:/i,
+  /compacti(ng|on)\s*(context|safeguard)/i,
+  /model\s*(switch|switched|changed|swap)/i,
+  /session\s*(reset|restart|start|end)/i,
+  /\(untrusted metadata\)\s*:/i,
+  /^\{[\s\S]*\}$/,
+  /<[a-z-]+>[\s\S]*<\/[a-z-]+>/i,
+  /(?:^>.*\n){3,}/m,
+];
+
 export interface NoiseFilterOptions {
   /** Filter agent denial responses (default: true) */
   filterDenials?: boolean;
@@ -57,12 +69,15 @@ export interface NoiseFilterOptions {
   filterMetaQuestions?: boolean;
   /** Filter session boilerplate (default: true) */
   filterBoilerplate?: boolean;
+  /** Filter structural noise (default: true) */
+  filterStructuralNoise?: boolean;
 }
 
 const DEFAULT_OPTIONS: Required<NoiseFilterOptions> = {
   filterDenials: true,
   filterMetaQuestions: true,
   filterBoilerplate: true,
+  filterStructuralNoise: true,
 };
 
 /**
@@ -78,6 +93,7 @@ export function isNoise(text: string, options: NoiseFilterOptions = {}): boolean
   if (opts.filterDenials && DENIAL_PATTERNS.some(p => p.test(trimmed))) return true;
   if (opts.filterMetaQuestions && META_QUESTION_PATTERNS.some(p => p.test(trimmed))) return true;
   if (opts.filterBoilerplate && BOILERPLATE_PATTERNS.some(p => p.test(trimmed))) return true;
+  if (opts.filterStructuralNoise && STRUCTURAL_NOISE_PATTERNS.some(p => p.test(trimmed))) return true;
   if (DIAGNOSTIC_ARTIFACT_PATTERNS.some(p => p.test(trimmed))) return true;
 
   return false;
