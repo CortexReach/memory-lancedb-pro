@@ -574,6 +574,38 @@ function resolveAgentPrimaryModelRef(cfg: unknown, agentId: string): string | un
   return undefined;
 }
 
+function resolveFrameworkMemorySearchEnabled(cfg: unknown, agentId: string): boolean | undefined {
+  try {
+    const root = cfg as Record<string, unknown>;
+    const agents = root.agents as Record<string, unknown> | undefined;
+    const target = agentId.trim();
+    const list = agents?.list as unknown;
+
+    if (target && Array.isArray(list)) {
+      const found = list.find((x) => {
+        if (!x || typeof x !== "object") return false;
+        return (x as Record<string, unknown>).id === target;
+      }) as Record<string, unknown> | undefined;
+      const memorySearch = found?.memorySearch as Record<string, unknown> | undefined;
+      if (typeof memorySearch?.enabled === "boolean") return memorySearch.enabled;
+    }
+
+    const defaults = agents?.defaults as Record<string, unknown> | undefined;
+    const defaultMemorySearch = defaults?.memorySearch as Record<string, unknown> | undefined;
+    if (typeof defaultMemorySearch?.enabled === "boolean") return defaultMemorySearch.enabled;
+  } catch {
+    // ignore
+  }
+  return undefined;
+}
+
+function isFrameworkMemorySearchDisabled(
+  api: OpenClawPluginApi,
+  agentId: string,
+): boolean {
+  return resolveFrameworkMemorySearchEnabled(api.config, agentId) === false;
+}
+
 function isAgentDeclaredInConfig(cfg: unknown, agentId: string): boolean {
   const target = agentId.trim();
   if (!target) return false;
@@ -1985,6 +2017,14 @@ const memoryLanceDBProPlugin = {
     // Default is OFF to prevent the model from accidentally echoing injected context.
     if (config.autoRecall === true) {
       api.on("before_agent_start", async (event, ctx) => {
+        const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+        if (isFrameworkMemorySearchDisabled(api, agentId)) {
+          api.logger.debug?.(
+            `memory-lancedb-pro: skipping auto-recall because framework memorySearch.enabled=false for agent ${agentId}`,
+          );
+          return;
+        }
+
         if (
           !event.prompt ||
           shouldSkipRetrieval(event.prompt, config.autoRecallMinLength)
@@ -1998,8 +2038,7 @@ const memoryLanceDBProPlugin = {
         turnCounter.set(sessionId, currentTurn);
 
         try {
-          // Determine agent ID and accessible scopes
-          const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+          // Determine accessible scopes
           const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
 
           const results = await retrieveWithRetry({
