@@ -640,9 +640,9 @@ export class MemoryStore {
         (row): MemoryEntry => ({
           id: row.id as string,
           text: row.text as string,
-          vector: includeVectors
-            ? (Array.isArray(row.vector) ? (row.vector as number[]) : [])
-            : [], // Don't include vectors in list results for performance
+          vector: includeVectors && row.vector
+            ? Array.from(row.vector as Iterable<number>)
+            : [],
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
           importance: Number(row.importance),
