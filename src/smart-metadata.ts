@@ -749,16 +749,22 @@ export function updateSupportStats(
   slice.strength = sliceTotal > 0 ? slice.confirmations / sliceTotal : 0.5;
   slice.last_observed_at = Date.now();
 
-  // Cap slices (keep most recently observed)
+  // Cap slices (keep most recently observed, but preserve dropped evidence)
   let slices = base.slices;
+  let droppedConf = 0, droppedContra = 0;
   if (slices.length > MAX_SUPPORT_SLICES) {
     slices = slices
-      .sort((a, b) => b.last_observed_at - a.last_observed_at)
-      .slice(0, MAX_SUPPORT_SLICES);
+      .sort((a, b) => b.last_observed_at - a.last_observed_at);
+    const dropped = slices.slice(MAX_SUPPORT_SLICES);
+    for (const d of dropped) {
+      droppedConf += d.confirmations;
+      droppedContra += d.contradictions;
+    }
+    slices = slices.slice(0, MAX_SUPPORT_SLICES);
   }
 
-  // Recompute global strength as weighted average
-  let totalConf = 0, totalContra = 0;
+  // Recompute global strength including evidence from dropped slices
+  let totalConf = droppedConf, totalContra = droppedContra;
   for (const s of slices) {
     totalConf += s.confirmations;
     totalContra += s.contradictions;

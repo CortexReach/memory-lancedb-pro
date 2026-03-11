@@ -121,8 +121,8 @@ export function validateStoragePath(dbPath: string): string {
       } catch (err: any) {
         throw new Error(
           `dbPath "${dbPath}" is a symlink whose target does not exist.\n` +
-            `  Fix: Create the target directory, or update the symlink to point to a valid path.\n` +
-            `  Details: ${err.code || ""} ${err.message}`,
+          `  Fix: Create the target directory, or update the symlink to point to a valid path.\n` +
+          `  Details: ${err.code || ""} ${err.message}`,
         );
       }
     }
@@ -147,9 +147,9 @@ export function validateStoragePath(dbPath: string): string {
     } catch (err: any) {
       throw new Error(
         `Failed to create dbPath directory "${resolvedPath}".\n` +
-          `  Fix: Ensure the parent directory "${dirname(resolvedPath)}" exists and is writable,\n` +
-          `       or create it manually: mkdir -p "${resolvedPath}"\n` +
-          `  Details: ${err.code || ""} ${err.message}`,
+        `  Fix: Ensure the parent directory "${dirname(resolvedPath)}" exists and is writable,\n` +
+        `       or create it manually: mkdir -p "${resolvedPath}"\n` +
+        `  Details: ${err.code || ""} ${err.message}`,
       );
     }
   }
@@ -160,9 +160,9 @@ export function validateStoragePath(dbPath: string): string {
   } catch (err: any) {
     throw new Error(
       `dbPath directory "${resolvedPath}" is not writable.\n` +
-        `  Fix: Check permissions with: ls -la "${dirname(resolvedPath)}"\n` +
-        `       Or grant write access: chmod u+w "${resolvedPath}"\n` +
-        `  Details: ${err.code || ""} ${err.message}`,
+      `  Fix: Check permissions with: ls -la "${dirname(resolvedPath)}"\n` +
+      `       Or grant write access: chmod u+w "${resolvedPath}"\n` +
+      `  Details: ${err.code || ""} ${err.message}`,
     );
   }
 
@@ -181,7 +181,7 @@ export class MemoryStore {
   private initPromise: Promise<void> | null = null;
   private ftsIndexCreated = false;
 
-  constructor(private readonly config: StoreConfig) {}
+  constructor(private readonly config: StoreConfig) { }
 
   get dbPath(): string {
     return this.config.dbPath;
@@ -213,7 +213,7 @@ export class MemoryStore {
       const message = err.message || String(err);
       throw new Error(
         `Failed to open LanceDB at "${this.config.dbPath}": ${code} ${message}\n` +
-          `  Fix: Verify the path exists and is writable. Check parent directory permissions.`,
+        `  Fix: Verify the path exists and is writable. Check parent directory permissions.`,
       );
     }
 
@@ -420,7 +420,7 @@ export class MemoryStore {
     const safeLimit = clampInt(limit, 1, 20);
     const fetchLimit = Math.min(safeLimit * 10, 200); // Over-fetch for scope filtering
 
-    let query = this.table!.vectorSearch(vector).limit(fetchLimit);
+    let query = this.table!.vectorSearch(vector).distanceType('cosine').limit(fetchLimit);
 
     // Apply scope filter if provided
     if (scopeFilter && scopeFilter.length > 0) {
