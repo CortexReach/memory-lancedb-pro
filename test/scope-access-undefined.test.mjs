@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
-const { MemoryScopeManager } = jiti("../src/scopes.ts");
+const { MemoryScopeManager, resolveScopeFilter } = jiti("../src/scopes.ts");
 
 describe("MemoryScopeManager - System & Reflection Scopes", () => {
   let manager;
@@ -52,6 +52,29 @@ describe("MemoryScopeManager - System & Reflection Scopes", () => {
     it("does not bypass the store filter for empty or nullish agentId", () => {
       assert.deepStrictEqual(manager.getScopeFilter(""), manager.getAllScopes());
       assert.deepStrictEqual(manager.getScopeFilter(undefined), manager.getAllScopes());
+    });
+
+    it("rejects explicit ACL configuration for reserved bypass identifiers", () => {
+      assert.throws(() => manager.setAgentAccess("system", ["global"]), /Reserved bypass agent ID/);
+      assert.throws(() => manager.setAgentAccess("undefined", ["global"]), /Reserved bypass agent ID/);
+    });
+
+    it("warns when a legacy scope manager returns [] for a reserved bypass identifier", () => {
+      const originalWarn = console.warn;
+      const warnings = [];
+      console.warn = (...args) => warnings.push(args.join(" "));
+      try {
+        const legacyManager = {
+          getAccessibleScopes(id) {
+            return id === "system" ? [] : ["global"];
+          },
+        };
+        assert.deepStrictEqual(resolveScopeFilter(legacyManager, "system"), []);
+      } finally {
+        console.warn = originalWarn;
+      }
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /legacy ScopeManager returned \[\] for reserved bypass id 'system'/);
     });
   });
 

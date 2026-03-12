@@ -69,6 +69,7 @@ const SCOPE_PATTERNS = {
 };
 
 const SYSTEM_BYPASS_IDS = new Set(["system", "undefined"]);
+const warnedLegacyFallbackBypassIds = new Set<string>();
 
 function isSystemBypassId(agentId?: string): boolean {
   return typeof agentId === "string" && SYSTEM_BYPASS_IDS.has(agentId);
@@ -248,6 +249,9 @@ export class MemoryScopeManager implements ScopeManager {
     if (!agentId || typeof agentId !== "string") {
       throw new Error("Invalid agent ID");
     }
+    if (isSystemBypassId(agentId.trim())) {
+      throw new Error(`Reserved bypass agent ID cannot have explicit access configured: ${agentId}`);
+    }
 
     // Note: an agent's own reflection scope is still auto-granted by getAccessibleScopes().
     // This setter can add access, but it does not revoke `reflection:agent:${agentId}`.
@@ -412,7 +416,18 @@ export function resolveScopeFilter(
   }
   // Legacy/custom managers without getScopeFilter fall back to enumeration semantics.
   // They should not use `[]` as an implicit bypass marker for system identifiers.
-  return scopeManager.getAccessibleScopes(agentId);
+  const fallbackScopes = scopeManager.getAccessibleScopes(agentId);
+  if (isSystemBypassId(agentId) && Array.isArray(fallbackScopes) && fallbackScopes.length === 0) {
+    const key = String(agentId);
+    if (!warnedLegacyFallbackBypassIds.has(key)) {
+      warnedLegacyFallbackBypassIds.add(key);
+      console.warn(
+        `resolveScopeFilter: legacy ScopeManager returned [] for reserved bypass id '${key}'. ` +
+        "Implement getScopeFilter() to make store-level bypass semantics explicit.",
+      );
+    }
+  }
+  return fallbackScopes;
 }
 
 export function filterScopesForAgent(scopes: string[], agentId?: string, scopeManager?: ScopeManager): string[] {
