@@ -95,10 +95,10 @@ export class SmartExtractor {
   ): Promise<ExtractionStats> {
     const stats: ExtractionStats = { created: 0, merged: 0, skipped: 0 };
     const targetScope = options.scope ?? this.config.defaultScope ?? "global";
-    const scopeFilter =
-      options.scopeFilter && options.scopeFilter.length > 0
-        ? options.scopeFilter
-        : [targetScope];
+    const hasExplicitScopeFilter = Object.prototype.hasOwnProperty.call(options, "scopeFilter");
+    const scopeFilter = hasExplicitScopeFilter
+      ? options.scopeFilter
+      : [targetScope];
 
     // Step 1: LLM extraction
     const candidates = await this.extractCandidates(conversationText);
@@ -298,7 +298,7 @@ export class SmartExtractor {
     sessionKey: string,
     stats: ExtractionStats,
     targetScope: string,
-    scopeFilter: string[],
+    scopeFilter?: string[],
   ): Promise<void> {
     // Profile always merges (skip dedup)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -400,7 +400,7 @@ export class SmartExtractor {
   private async deduplicate(
     candidate: CandidateMemory,
     candidateVector: number[],
-    scopeFilter: string[],
+    scopeFilter?: string[],
   ): Promise<DedupResult> {
     // Stage 1: Vector pre-filter — find similar memories
     const similar = await this.store.vectorSearch(
@@ -498,7 +498,7 @@ export class SmartExtractor {
     candidate: CandidateMemory,
     sessionKey: string,
     targetScope: string,
-    scopeFilter: string[],
+    scopeFilter?: string[],
   ): Promise<void> {
     // Find existing profile memory by category
     const embeddingText = `${candidate.abstract} ${candidate.content}`;
@@ -539,7 +539,7 @@ export class SmartExtractor {
   private async handleMerge(
     candidate: CandidateMemory,
     matchId: string,
-    scopeFilter: string[],
+    scopeFilter?: string[],
     targetScope: string,
     contextLabel?: string,
   ): Promise<void> {
@@ -649,7 +649,7 @@ export class SmartExtractor {
    */
   private async handleSupport(
     matchId: string,
-    scopeFilter: string[],
+    scopeFilter?: string[],
     source: { session: string; timestamp: number },
     reason: string,
     contextLabel?: string,
@@ -683,7 +683,7 @@ export class SmartExtractor {
     matchId: string,
     sessionKey: string,
     targetScope: string,
-    scopeFilter: string[],
+    scopeFilter?: string[],
     contextLabel?: string,
   ): Promise<void> {
     const storeCategory = this.mapToStoreCategory(candidate.category);
@@ -725,7 +725,7 @@ export class SmartExtractor {
     matchId: string,
     sessionKey: string,
     targetScope: string,
-    scopeFilter: string[],
+    scopeFilter?: string[],
     contextLabel?: string,
   ): Promise<void> {
     // 1. Record contradiction on the existing memory

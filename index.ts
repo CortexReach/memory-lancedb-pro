@@ -1850,8 +1850,9 @@ const memoryLanceDBProPlugin = {
       return clipped;
     };
 
-    const loadAgentReflectionSlices = async (agentId: string, scopeFilter: string[]) => {
-      const cacheKey = `${agentId}::${[...scopeFilter].sort().join(",")}`;
+    const loadAgentReflectionSlices = async (agentId: string, scopeFilter?: string[]) => {
+      const scopeKey = Array.isArray(scopeFilter) ? [...scopeFilter].sort().join(",") : "ALL";
+      const cacheKey = `${agentId}::${scopeKey}`;
       const cached = reflectionByAgentCache.get(cacheKey);
       if (cached && Date.now() - cached.updatedAt < 15_000) return cached;
 
