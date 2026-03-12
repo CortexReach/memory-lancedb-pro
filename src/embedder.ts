@@ -116,6 +116,9 @@ const EMBEDDING_DIMENSIONS: Record<string, number> = {
   // Jina v5
   "jina-embeddings-v5-text-small": 1024,
   "jina-embeddings-v5-text-nano": 768,
+
+  // MiniMax
+  "embo-01": 1536,
 };
 
 // ============================================================================
@@ -165,6 +168,7 @@ function getProviderLabel(baseURL: string | undefined, model: string): string {
     if (/api\.jina\.ai/i.test(base)) return "Jina";
     if (/localhost:11434|127\.0\.0\.1:11434|\/ollama\b/i.test(base)) return "Ollama";
     if (/api\.openai\.com/i.test(base)) return "OpenAI";
+    if (/api\.minimax\.io/i.test(base)) return "MiniMax";
 
     try {
       return new URL(base).host;
@@ -174,6 +178,7 @@ function getProviderLabel(baseURL: string | undefined, model: string): string {
   }
 
   if (/^jina-/i.test(model)) return "Jina";
+  if (/^embo-/i.test(model) || /^MiniMax/i.test(model)) return "MiniMax";
 
   return "embedding provider";
 }

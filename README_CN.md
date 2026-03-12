@@ -27,7 +27,7 @@
 | 🧠 **智能提取** | LLM 驱动的 6 类别记忆提取——不用手动调 `memory_store` |
 | ⏳ **记忆生命周期** | Weibull 衰减 + 三层晋升——重要记忆浮上来，过时记忆沉下去 |
 | 🔒 **多 Scope 隔离** | 按 Agent、用户、项目维度隔离记忆 |
-| 🔌 **任意 Embedding 提供商** | OpenAI、Jina、Gemini、Ollama 或任何 OpenAI 兼容 API |
+| 🔌 **任意 Embedding 提供商** | OpenAI、Jina、Gemini、MiniMax、Ollama 或任何 OpenAI 兼容 API |
 | 🛠️ **完整运维工具链** | CLI、备份、迁移、升级、导入导出——不是玩具 |
 
 ---
@@ -209,6 +209,18 @@ openclaw logs --follow --plain | rg "memory-lancedb-pro"
     "apiKey": "${GROQ_API_KEY}",
     "model": "openai/gpt-oss-120b",
     "baseURL": "https://api.groq.com/openai/v1"
+  }
+}
+```
+
+或使用 MiniMax（204K 超长上下文，OpenAI 兼容）：
+
+```json
+{
+  "llm": {
+    "apiKey": "${MINIMAX_API_KEY}",
+    "model": "MiniMax-M2.5",
+    "baseURL": "https://api.minimax.io/v1"
   }
 }
 ```
@@ -429,6 +441,7 @@ OpenClaw 默认行为：
 | **Jina**（推荐） | `jina-embeddings-v5-text-small` | `https://api.jina.ai/v1` | 1024 |
 | **OpenAI** | `text-embedding-3-small` | `https://api.openai.com/v1` | 1536 |
 | **Google Gemini** | `gemini-embedding-001` | `https://generativelanguage.googleapis.com/v1beta/openai/` | 3072 |
+| **MiniMax** | `embo-01` | `https://api.minimax.io/v1` | 1536 |
 | **Ollama**（本地） | `nomic-embed-text` | `http://localhost:11434/v1` | _与本地模型一致_ |
 
 </details>
@@ -532,6 +545,33 @@ OpenClaw 默认行为：
   "extractMaxChars": 8000
 }
 ```
+
+<details>
+<summary>MiniMax 配置示例（Embedding + LLM）</summary>
+
+[MiniMax](https://www.minimaxi.com) 提供 OpenAI 兼容的 Embedding 和 LLM API。使用 `MiniMax-M2.5`（204K 上下文）做智能提取，`embo-01` 做向量化：
+
+```json
+{
+  "embedding": {
+    "provider": "openai-compatible",
+    "apiKey": "${MINIMAX_API_KEY}",
+    "model": "embo-01",
+    "baseURL": "https://api.minimax.io/v1",
+    "dimensions": 1536
+  },
+  "smartExtraction": true,
+  "llm": {
+    "apiKey": "${MINIMAX_API_KEY}",
+    "model": "MiniMax-M2.5",
+    "baseURL": "https://api.minimax.io/v1"
+  }
+}
+```
+
+> **注意：** MiniMax 要求 `temperature` 在 (0, 1] 范围内。插件默认值（`0.1`）可以正常工作。如果在其他地方自定义 temperature，请避免设为 `0`。
+
+</details>
 
 禁用：`{ "smartExtraction": false }`
 

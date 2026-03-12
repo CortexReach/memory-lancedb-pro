@@ -27,7 +27,7 @@ Most AI agents have amnesia. They forget everything the moment you start a new c
 | 🧠 **Smart Extraction** | LLM-powered 6-category memory extraction — no manual `memory_store` needed |
 | ⏳ **Memory Lifecycle** | Weibull decay + 3-tier promotion — important memories surface, stale ones fade |
 | 🔒 **Multi-Scope Isolation** | Per-agent, per-user, per-project memory boundaries |
-| 🔌 **Any Embedding Provider** | OpenAI, Jina, Gemini, Ollama, or any OpenAI-compatible API |
+| 🔌 **Any Embedding Provider** | OpenAI, Jina, Gemini, MiniMax, Ollama, or any OpenAI-compatible API |
 | 🛠️ **Full Operations Toolkit** | CLI, backup, migration, upgrade, export/import — not a toy |
 
 ---
@@ -209,6 +209,18 @@ For example, to replace only the LLM:
     "apiKey": "${GROQ_API_KEY}",
     "model": "openai/gpt-oss-120b",
     "baseURL": "https://api.groq.com/openai/v1"
+  }
+}
+```
+
+Or use MiniMax (204K context, OpenAI-compatible):
+
+```json
+{
+  "llm": {
+    "apiKey": "${MINIMAX_API_KEY}",
+    "model": "MiniMax-M2.5",
+    "baseURL": "https://api.minimax.io/v1"
   }
 }
 ```
@@ -429,6 +441,7 @@ This plugin works with **any OpenAI-compatible embedding API**:
 | **Jina** (recommended) | `jina-embeddings-v5-text-small` | `https://api.jina.ai/v1` | 1024 |
 | **OpenAI** | `text-embedding-3-small` | `https://api.openai.com/v1` | 1536 |
 | **Google Gemini** | `gemini-embedding-001` | `https://generativelanguage.googleapis.com/v1beta/openai/` | 3072 |
+| **MiniMax** | `embo-01` | `https://api.minimax.io/v1` | 1536 |
 | **Ollama** (local) | `nomic-embed-text` | `http://localhost:11434/v1` | _provider-specific_ |
 
 </details>
@@ -533,6 +546,33 @@ Full config (separate LLM endpoint):
   "extractMaxChars": 8000
 }
 ```
+
+<details>
+<summary>MiniMax config example (embedding + LLM)</summary>
+
+[MiniMax](https://www.minimaxi.com) provides OpenAI-compatible APIs for both embeddings and LLM. Use `MiniMax-M2.5` (204K context) for smart extraction and `embo-01` for embeddings:
+
+```json
+{
+  "embedding": {
+    "provider": "openai-compatible",
+    "apiKey": "${MINIMAX_API_KEY}",
+    "model": "embo-01",
+    "baseURL": "https://api.minimax.io/v1",
+    "dimensions": 1536
+  },
+  "smartExtraction": true,
+  "llm": {
+    "apiKey": "${MINIMAX_API_KEY}",
+    "model": "MiniMax-M2.5",
+    "baseURL": "https://api.minimax.io/v1"
+  }
+}
+```
+
+> **Note:** MiniMax requires `temperature` to be in the range (0, 1]. The plugin default (`0.1`) works fine. If you customize temperature elsewhere, avoid setting it to `0`.
+
+</details>
 
 Disable: `{ "smartExtraction": false }`
 
