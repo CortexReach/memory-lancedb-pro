@@ -20,6 +20,12 @@ export interface ScopeConfig {
 
 export interface ScopeManager {
   getAccessibleScopes(agentId?: string): string[];
+  /**
+   * Optional store-layer filter hook.
+   * Return `undefined` only for intentional full-bypass callers (for example internal system tasks).
+   * Custom implementations should keep this distinct from `getAccessibleScopes()`, which is an
+   * enumeration API and should remain consistent with `isAccessible()`.
+   */
   getScopeFilter?(agentId?: string): string[] | undefined;
   getDefaultScope(agentId?: string): string;
   isAccessible(scope: string, agentId?: string): boolean;

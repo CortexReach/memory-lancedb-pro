@@ -71,4 +71,28 @@ describe("SmartExtractor scopeFilter semantics", () => {
 
     assert.deepStrictEqual(seen, [undefined]);
   });
+
+  it("preserves an explicit empty scopeFilter array", async () => {
+    const seen = [];
+    const extractor = makeExtractor(seen);
+
+    await extractor.extractAndPersist("用户喜欢乌龙茶。", "session-3", {
+      scope: "agent:test",
+      scopeFilter: [],
+    });
+
+    assert.deepStrictEqual(seen, [[]]);
+  });
+
+  it("passes through an explicit non-empty scopeFilter array", async () => {
+    const seen = [];
+    const extractor = makeExtractor(seen);
+
+    await extractor.extractAndPersist("用户喜欢乌龙茶。", "session-4", {
+      scope: "agent:test",
+      scopeFilter: ["custom:foo"],
+    });
+
+    assert.deepStrictEqual(seen, [["custom:foo"]]);
+  });
 });

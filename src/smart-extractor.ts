@@ -95,6 +95,10 @@ export class SmartExtractor {
   ): Promise<ExtractionStats> {
     const stats: ExtractionStats = { created: 0, merged: 0, skipped: 0 };
     const targetScope = options.scope ?? this.config.defaultScope ?? "global";
+    // Distinguish "no override supplied" from explicit bypass/override values.
+    // - omitted `scopeFilter` => default to `[targetScope]`
+    // - explicit `undefined` => preserve full-bypass semantics for trusted callers
+    // - explicit `[]` or non-empty array => pass through unchanged
     const hasExplicitScopeFilter = Object.prototype.hasOwnProperty.call(options, "scopeFilter");
     const scopeFilter = hasExplicitScopeFilter
       ? options.scopeFilter

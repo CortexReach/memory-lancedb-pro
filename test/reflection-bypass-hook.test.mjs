@@ -59,38 +59,40 @@ describe("reflection hooks tolerate bypass scope filters", () => {
     rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("does not throw when before_agent_start/before_prompt_build run with agentId=system", async () => {
-    const harness = createPluginApiHarness({
-      resolveRoot: workDir,
-      pluginConfig: {
-        dbPath: path.join(workDir, "db"),
-        embedding: { apiKey: "test-api-key" },
-        sessionStrategy: "memoryReflection",
-        smartExtraction: false,
-        autoCapture: false,
-        autoRecall: false,
-        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
-      },
+  ["system", "undefined"].forEach((reservedAgentId) => {
+    it(`does not throw when before_agent_start/before_prompt_build run with agentId=${reservedAgentId}`, async () => {
+      const harness = createPluginApiHarness({
+        resolveRoot: workDir,
+        pluginConfig: {
+          dbPath: path.join(workDir, "db"),
+          embedding: { apiKey: "test-api-key" },
+          sessionStrategy: "memoryReflection",
+          smartExtraction: false,
+          autoCapture: false,
+          autoRecall: false,
+          selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+        },
+      });
+
+      memoryLanceDBProPlugin.register(harness.api);
+
+      const startHooks = harness.eventHandlers.get("before_agent_start") || [];
+      const promptHooks = harness.eventHandlers.get("before_prompt_build") || [];
+
+      assert.ok(startHooks.length >= 1, "expected before_agent_start hooks");
+      assert.ok(promptHooks.length >= 1, "expected before_prompt_build hooks");
+
+      for (const { handler } of startHooks) {
+        await assert.doesNotReject(async () => {
+          await handler({}, { sessionKey: `agent:${reservedAgentId}:test`, agentId: reservedAgentId });
+        });
+      }
+
+      for (const { handler } of promptHooks) {
+        await assert.doesNotReject(async () => {
+          await handler({}, { sessionKey: `agent:${reservedAgentId}:test`, agentId: reservedAgentId });
+        });
+      }
     });
-
-    memoryLanceDBProPlugin.register(harness.api);
-
-    const startHooks = harness.eventHandlers.get("before_agent_start") || [];
-    const promptHooks = harness.eventHandlers.get("before_prompt_build") || [];
-
-    assert.ok(startHooks.length >= 1, "expected before_agent_start hooks");
-    assert.ok(promptHooks.length >= 1, "expected before_prompt_build hooks");
-
-    for (const { handler } of startHooks) {
-      await assert.doesNotReject(async () => {
-        await handler({}, { sessionKey: "agent:system:test", agentId: "system" });
-      });
-    }
-
-    for (const { handler } of promptHooks) {
-      await assert.doesNotReject(async () => {
-        await handler({}, { sessionKey: "agent:system:test", agentId: "system" });
-      });
-    }
   });
 });
