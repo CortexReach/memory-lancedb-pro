@@ -65,12 +65,6 @@ interface ToolContext {
   }) => void;
 }
 
-function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
-  if (typeof runtimeAgentId === "string" && runtimeAgentId.trim().length > 0) return runtimeAgentId;
-  if (typeof fallback === "string" && fallback.trim().length > 0) return fallback;
-  return undefined;
-}
-
 // ============================================================================
 // Utility Functions
 // ============================================================================
@@ -131,6 +125,13 @@ function resolveToolContext(
     ...base,
     agentId: resolveRuntimeAgentId(base.agentId, runtimeCtx),
   };
+}
+
+function resolveEffectiveToolAgentId(
+  runtimeContext: ToolContext,
+  runtimeCtx: unknown,
+): string | undefined {
+  return resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -433,7 +434,7 @@ export function registerMemoryRecallTool(
         ),
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
         const {
           query,
           limit = 5,
@@ -448,7 +449,7 @@ export function registerMemoryRecallTool(
 
         try {
           const safeLimit = clampInt(limit, 1, 20);
-          const agentId = runtimeContext.agentId;
+          const agentId = resolveEffectiveToolAgentId(runtimeContext, runtimeCtx);
 
           // Determine accessible scopes
           let scopeFilter = runtimeContext.scopeManager.getAccessibleScopes(agentId);
@@ -514,6 +515,7 @@ export function registerMemoryRecallTool(
             ],
             details: {
               count: results.length,
+              resolvedAgentId: agentId,
               memories: sanitizeMemoryForSerialization(results),
               query,
               scopes: scopeFilter,
@@ -730,7 +732,7 @@ export function registerMemoryForgetTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const runtimeContext = resolveToolContext(context, toolCtx);
       return {
         name: "memory_forget",
       label: "Memory Forget",
@@ -757,11 +759,11 @@ export function registerMemoryForgetTool(
         };
 
         try {
-          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
+          const agentId = resolveEffectiveToolAgentId(runtimeContext, runtimeCtx);
           // Determine accessible scopes
-          let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
+          let scopeFilter = runtimeContext.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
-            if (context.scopeManager.isAccessible(scope, agentId)) {
+            if (runtimeContext.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];
             } else {
               return {
@@ -777,7 +779,7 @@ export function registerMemoryForgetTool(
           }
 
           if (memoryId) {
-            const deleted = await context.store.delete(memoryId, scopeFilter);
+            const deleted = await runtimeContext.store.delete(memoryId, scopeFilter);
             if (deleted) {
               return {
                 content: [
@@ -799,7 +801,7 @@ export function registerMemoryForgetTool(
           }
 
           if (query) {
-            const results = await retrieveWithRetry(context.retriever, {
+            const results = await retrieveWithRetry(runtimeContext.retriever, {
               query,
               limit: 5,
               scopeFilter,
@@ -815,7 +817,7 @@ export function registerMemoryForgetTool(
             }
 
             if (results.length === 1 && results[0].score > 0.9) {
-              const deleted = await context.store.delete(
+              const deleted = await runtimeContext.store.delete(
                 results[0].entry.id,
                 scopeFilter,
               );
@@ -890,7 +892,7 @@ export function registerMemoryUpdateTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const runtimeContext = resolveToolContext(context, toolCtx);
       return {
         name: "memory_update",
       label: "Memory Update",
@@ -933,15 +935,15 @@ export function registerMemoryUpdateTool(
           }
 
           // Determine accessible scopes
-          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
-          const scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
+          const agentId = resolveEffectiveToolAgentId(runtimeContext, runtimeCtx);
+          const scopeFilter = runtimeContext.scopeManager.getAccessibleScopes(agentId);
 
           // Resolve memoryId: if it doesn't look like a UUID, try search
           let resolvedId = memoryId;
           const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(memoryId);
           if (!uuidLike) {
             // Treat as search query
-            const results = await retrieveWithRetry(context.retriever, {
+            const results = await retrieveWithRetry(runtimeContext.retriever, {
               query: memoryId,
               limit: 3,
               scopeFilter,
@@ -995,7 +997,7 @@ export function registerMemoryUpdateTool(
                 details: { action: "noise_filtered" },
               };
             }
-            newVector = await context.embedder.embedPassage(text);
+            newVector = await runtimeContext.embedder.embedPassage(text);
           }
 
           const updates: Record<string, any> = {};
@@ -1005,7 +1007,7 @@ export function registerMemoryUpdateTool(
             updates.importance = clamp01(importance, 0.7);
           if (category) updates.category = category;
 
-          const updated = await context.store.update(
+          const updated = await runtimeContext.store.update(
             resolvedId,
             updates,
             scopeFilter,
@@ -1067,7 +1069,7 @@ export function registerMemoryStatsTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const runtimeContext = resolveToolContext(context, toolCtx);
       return {
         name: "memory_stats",
       label: "Memory Statistics",
@@ -1083,11 +1085,11 @@ export function registerMemoryStatsTool(
         const { scope } = params as { scope?: string };
 
         try {
-          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
+          const agentId = resolveEffectiveToolAgentId(runtimeContext, runtimeCtx);
           // Determine accessible scopes
-          let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
+          let scopeFilter = runtimeContext.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
-            if (context.scopeManager.isAccessible(scope, agentId)) {
+            if (runtimeContext.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];
             } else {
               return {
@@ -1102,22 +1104,24 @@ export function registerMemoryStatsTool(
             }
           }
 
-          const stats = await context.store.stats(scopeFilter);
-          const scopeManagerStats = context.scopeManager.getStats();
-          const retrievalConfig = context.retriever.getConfig();
+          const stats = await runtimeContext.store.stats(scopeFilter);
+          const scopeManagerStats = runtimeContext.scopeManager.getStats();
+          const retrievalConfig = runtimeContext.retriever.getConfig();
           const admission = await buildAdmissionStats({
-            store: context.store,
-            admissionControl: context.admissionControl,
+            store: runtimeContext.store,
+            admissionControl: runtimeContext.admissionControl,
             scopeFilter,
             memoryTotalCount: stats.totalCount,
           });
 
+          const visibleScopeCount = Object.keys(stats.scopeCounts).length;
           const text = [
             `Memory Statistics:`,
             `• Total memories: ${stats.totalCount}`,
-            `• Available scopes: ${scopeManagerStats.totalScopes}`,
+            `• Queried scopes: ${scopeFilter.length}`,
+            `• Configured scope definitions: ${scopeManagerStats.totalScopes}`,
             `• Retrieval mode: ${retrievalConfig.mode}`,
-            `• FTS support: ${context.store.hasFtsSupport ? "Yes" : "No"}`,
+            `• FTS support: ${runtimeContext.store.hasFtsSupport ? "Yes" : "No"}`,
             `• Admission control: ${admission.enabled ? "enabled" : "disabled"}`,
             ``,
             `Memories by scope:`,
@@ -1173,11 +1177,13 @@ export function registerMemoryStatsTool(
               stats,
               admission,
               scopeManagerStats,
+              resolvedAgentId: agentId,
+              scopeFilter,
               retrievalConfig: {
                 ...retrievalConfig,
                 rerankApiKey: retrievalConfig.rerankApiKey ? "***" : undefined,
               },
-              hasFtsSupport: context.store.hasFtsSupport,
+              hasFtsSupport: runtimeContext.store.hasFtsSupport,
             },
           };
         } catch (error) {
@@ -1204,7 +1210,7 @@ export function registerMemoryListTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const runtimeContext = resolveToolContext(context, toolCtx);
       return {
         name: "memory_list",
       label: "Memory List",
@@ -1242,12 +1248,12 @@ export function registerMemoryListTool(
         try {
           const safeLimit = clampInt(limit, 1, 50);
           const safeOffset = clampInt(offset, 0, 1000);
-          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
+          const agentId = resolveEffectiveToolAgentId(runtimeContext, runtimeCtx);
 
           // Determine accessible scopes
-          let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
+          let scopeFilter = runtimeContext.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
-            if (context.scopeManager.isAccessible(scope, agentId)) {
+            if (runtimeContext.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];
             } else {
               return {
@@ -1262,7 +1268,7 @@ export function registerMemoryListTool(
             }
           }
 
-          const entries = await context.store.list(
+          const entries = await runtimeContext.store.list(
             scopeFilter,
             category,
             safeLimit,
@@ -1274,6 +1280,8 @@ export function registerMemoryListTool(
               content: [{ type: "text", text: "No memories found." }],
               details: {
                 count: 0,
+                resolvedAgentId: agentId,
+                scopeFilter,
                 filters: {
                   scope,
                   category,
@@ -1303,6 +1311,8 @@ export function registerMemoryListTool(
             ],
             details: {
               count: entries.length,
+              resolvedAgentId: agentId,
+              scopeFilter,
               memories: entries.map((e) => ({
                 id: e.id,
                 text: e.text,
