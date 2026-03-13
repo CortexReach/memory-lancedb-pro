@@ -17,7 +17,7 @@ import { spawn } from "node:child_process";
 import { MemoryStore, validateStoragePath } from "./src/store.js";
 import { createEmbedder, getVectorDimensions } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
-import { createScopeManager, resolveScopeFilter, isSystemBypassId } from "./src/scopes.js";
+import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
@@ -539,21 +539,6 @@ async function loadSelfImprovementReminderContent(workspaceDir?: string): Promis
   } catch {
     return DEFAULT_SELF_IMPROVEMENT_REMINDER;
   }
-}
-
-function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
-  const sk = (sessionKey ?? "").trim();
-  const parts = sk.split(":");
-  if (parts.length >= 2 && parts[0] === "agent" && parts[1]) {
-    const candidate = parts[1];
-    // Block reserved bypass IDs ("system", "undefined") from session key extraction.
-    // Uses centralized isSystemBypassId from scopes.ts to stay in sync.
-    if (isSystemBypassId(candidate)) {
-      return undefined;
-    }
-    return candidate;
-  }
-  return undefined;
 }
 
 function resolveAgentPrimaryModelRef(cfg: unknown, agentId: string): string | undefined {

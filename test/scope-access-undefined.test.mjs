@@ -69,7 +69,8 @@ describe("MemoryScopeManager - System & Reflection Scopes", () => {
             return id === "system" ? [] : ["global"];
           },
         };
-        assert.deepStrictEqual(resolveScopeFilter(legacyManager, "system"), []);
+        // Legacy [] is now normalized to undefined for bypass consistency
+        assert.strictEqual(resolveScopeFilter(legacyManager, "system"), undefined);
       } finally {
         console.warn = originalWarn;
       }

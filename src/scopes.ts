@@ -80,6 +80,21 @@ export function _resetLegacyFallbackWarningState(): void {
   warnedLegacyFallbackBypassIds.clear();
 }
 
+/**
+ * Extract agentId from an OpenClaw session key (e.g., "agent:main:discord:channel:123").
+ * Returns undefined for missing keys, non-agent keys, or reserved bypass IDs.
+ * This is the single canonical implementation — do not duplicate inline.
+ */
+export function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
+  if (!sessionKey) return undefined;
+  const m = /^agent:([^:]+):/.exec(sessionKey);
+  const candidate = m?.[1];
+  if (candidate && isSystemBypassId(candidate)) {
+    return undefined;
+  }
+  return candidate;
+}
+
 function withOwnReflectionScope(scopes: string[], agentId: string): string[] {
   const reflectionScope = SCOPE_PATTERNS.REFLECTION(agentId);
   return scopes.includes(reflectionScope) ? [...scopes] : [...scopes, reflectionScope];
@@ -440,7 +455,7 @@ export function resolveScopeFilter(
     return scopeManager.getScopeFilter(agentId);
   }
   // Legacy/custom managers without getScopeFilter fall back to enumeration semantics.
-  // They should not use `[]` as an implicit bypass marker for system identifiers.
+  // Normalize [] to undefined for bypass IDs so callers can branch on undefined === bypass.
   const fallbackScopes = scopeManager.getAccessibleScopes(agentId);
   if (isSystemBypassId(agentId) && Array.isArray(fallbackScopes) && fallbackScopes.length === 0) {
     const key = String(agentId);
@@ -448,9 +463,11 @@ export function resolveScopeFilter(
       warnedLegacyFallbackBypassIds.add(key);
       console.warn(
         `resolveScopeFilter: legacy ScopeManager returned [] for reserved bypass id '${key}'. ` +
-        "Implement getScopeFilter() to make store-level bypass semantics explicit.",
+        "Implement getScopeFilter() to make store-level bypass semantics explicit. " +
+        "Normalizing [] to undefined for bypass consistency.",
       );
     }
+    return undefined;
   }
   return fallbackScopes;
 }

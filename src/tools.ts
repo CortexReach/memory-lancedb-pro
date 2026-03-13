@@ -11,7 +11,7 @@ import { join } from "node:path";
 import type { MemoryRetriever, RetrievalResult } from "./retriever.js";
 import type { MemoryStore } from "./store.js";
 import { isNoise } from "./noise-filter.js";
-import { resolveScopeFilter, isSystemBypassId, type MemoryScopeManager } from "./scopes.js";
+import { resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey, type MemoryScopeManager } from "./scopes.js";
 import type { Embedder } from "./embedder.js";
 import {
   buildSmartMetadata,
@@ -86,18 +86,6 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
     score: r.score,
     sources: r.sources,
   }));
-}
-
-function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
-  if (!sessionKey) return undefined;
-  const m = /^agent:([^:]+):/.exec(sessionKey);
-  const candidate = m?.[1];
-  // Block reserved bypass IDs ("system", "undefined") from session key extraction.
-  // Uses centralized isSystemBypassId from scopes.ts to stay in sync.
-  if (candidate && isSystemBypassId(candidate)) {
-    return undefined;
-  }
-  return candidate;
 }
 
 const _warnedMissingAgentId = new Set<string>();
