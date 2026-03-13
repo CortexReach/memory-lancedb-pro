@@ -121,8 +121,14 @@ export class MemoryScopeManager implements ScopeManager {
       throw new Error(`Default scope '${this.config.default}' not found in definitions`);
     }
 
-    // Validate agent access scopes exist in definitions
+    // Validate agent access scopes exist in definitions + reject reserved bypass IDs
     for (const [agentId, scopes] of Object.entries(this.config.agentAccess)) {
+      if (isSystemBypassId(agentId)) {
+        throw new Error(
+          `Reserved bypass agent ID '${agentId}' cannot have explicit access configured. ` +
+          `This is rejected in both constructor and importConfig paths.`
+        );
+      }
       for (const scope of scopes) {
         if (!this.config.definitions[scope] && !this.isBuiltInScope(scope)) {
           console.warn(`Agent '${agentId}' has access to undefined scope '${scope}'`);

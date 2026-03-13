@@ -104,7 +104,7 @@ export class SmartExtractor {
     // - omitted `scopeFilter` => default to `[targetScope]`
     // - explicit `undefined` => preserve full-bypass semantics for trusted callers
     // - explicit `[]` or non-empty array => pass through unchanged
-    const hasExplicitScopeFilter = Object.prototype.hasOwnProperty.call(options, "scopeFilter");
+    const hasExplicitScopeFilter = "scopeFilter" in options;
     const scopeFilter = hasExplicitScopeFilter
       ? options.scopeFilter
       : [targetScope];
