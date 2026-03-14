@@ -311,6 +311,8 @@ function toImportSpecifier(value: string): string {
   if (!trimmed) return "";
   if (trimmed.startsWith("file://")) return trimmed;
   if (trimmed.startsWith("/")) return pathToFileURL(trimmed).href;
+  // Handle Windows absolute paths (e.g., C:\Users\...)
+  if (/^[a-zA-Z]:[/\\]/.test(trimmed)) return pathToFileURL(trimmed).href;
   return trimmed;
 }
 function getExtensionApiImportSpecifiers(): string[] {
@@ -326,8 +328,17 @@ function getExtensionApiImportSpecifiers(): string[] {
     // ignore resolve failures and continue fallback probing
   }
 
-  specifiers.push(toImportSpecifier("/usr/lib/node_modules/openclaw/dist/extensionAPI.js"));
-  specifiers.push(toImportSpecifier("/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js"));
+  // Platform-aware fallback paths
+  const home = homedir();
+  if (process.platform === "win32") {
+    // Windows: %APPDATA%\npm\node_modules\openclaw\dist\extensionAPI.js
+    const winPath = join(process.env.APPDATA || join(home, "AppData", "Roaming"), "npm", "node_modules", "openclaw", "dist", "extensionAPI.js");
+    specifiers.push(toImportSpecifier(winPath));
+  } else {
+    // Unix fallback paths
+    specifiers.push(toImportSpecifier("/usr/lib/node_modules/openclaw/dist/extensionAPI.js"));
+    specifiers.push(toImportSpecifier("/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js"));
+  }
 
   return [...new Set(specifiers.filter(Boolean))];
 }
