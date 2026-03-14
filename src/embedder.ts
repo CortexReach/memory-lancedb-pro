@@ -302,9 +302,14 @@ export class Embedder {
     this._autoChunk = config.chunking !== false;
 
     // Create a client pool — one OpenAI client per key
+    const isAzure = config.baseURL?.includes('.openai.azure.com');
     this.clients = resolvedKeys.map(key => new OpenAI({
       apiKey: key,
       ...(config.baseURL ? { baseURL: config.baseURL } : {}),
+      ...(isAzure ? {
+        defaultHeaders: { 'api-key': key },
+        defaultQuery: { 'api-version': '2024-02-01' }
+      } : {})
     }));
 
     if (this.clients.length > 1) {
