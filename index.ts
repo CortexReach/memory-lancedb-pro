@@ -5,7 +5,7 @@
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { homedir, tmpdir } from "node:os";
-import { join, dirname, basename } from "node:path";
+import { join, dirname, basename, win32 } from "node:path";
 import { readFile, readdir, writeFile, mkdir, appendFile, unlink, stat } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -311,26 +311,58 @@ function toImportSpecifier(value: string): string {
   if (!trimmed) return "";
   if (trimmed.startsWith("file://")) return trimmed;
   if (trimmed.startsWith("/")) return pathToFileURL(trimmed).href;
+  if (/^[a-zA-Z]:[\\/]/.test(trimmed)) {
+    return pathToFileURL(`/${trimmed.replace(/\\/g, "/")}`).href;
+  }
   return trimmed;
 }
-function getExtensionApiImportSpecifiers(): string[] {
-  const envPath = process.env.OPENCLAW_EXTENSION_API_PATH?.trim();
+
+function getExtensionApiFallbackPaths(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  if (platform === "win32") {
+    const appData = env.APPDATA?.trim() || win32.join(homedir(), "AppData", "Roaming");
+    return [
+      win32.join(appData, "npm", "node_modules", "openclaw", "dist", "extensionAPI.js"),
+    ];
+  }
+
+  return [
+    "/usr/lib/node_modules/openclaw/dist/extensionAPI.js",
+    "/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js",
+  ];
+}
+
+function getExtensionApiImportSpecifiers(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  resolveInstalledSpecifier: () => string = () => requireFromHere.resolve("openclaw/dist/extensionAPI.js"),
+): string[] {
+  const envPath = env.OPENCLAW_EXTENSION_API_PATH?.trim();
   const specifiers: string[] = [];
 
   if (envPath) specifiers.push(toImportSpecifier(envPath));
   specifiers.push("openclaw/dist/extensionAPI.js");
 
   try {
-    specifiers.push(toImportSpecifier(requireFromHere.resolve("openclaw/dist/extensionAPI.js")));
+    specifiers.push(toImportSpecifier(resolveInstalledSpecifier()));
   } catch {
     // ignore resolve failures and continue fallback probing
   }
 
-  specifiers.push(toImportSpecifier("/usr/lib/node_modules/openclaw/dist/extensionAPI.js"));
-  specifiers.push(toImportSpecifier("/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js"));
+  for (const fallbackPath of getExtensionApiFallbackPaths(platform, env)) {
+    specifiers.push(toImportSpecifier(fallbackPath));
+  }
 
   return [...new Set(specifiers.filter(Boolean))];
 }
+
+export const __testOnly = {
+  toImportSpecifier,
+  getExtensionApiFallbackPaths,
+  getExtensionApiImportSpecifiers,
+};
 
 async function loadEmbeddedPiRunner(): Promise<EmbeddedPiRunner> {
   if (!embeddedPiRunnerPromise) {

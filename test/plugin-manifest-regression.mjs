@@ -5,6 +5,7 @@ import http from "node:http";
 import Module from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import jitiFactory from "jiti";
 
@@ -88,6 +89,32 @@ assert.equal(
   pkg.dependencies["apache-arrow"],
   "18.1.0",
   "package.json should declare apache-arrow directly so OpenClaw plugin installs do not miss the LanceDB runtime dependency",
+);
+
+const windowsExtensionApiPath = "C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules\\openclaw\\dist\\extensionAPI.js";
+assert.equal(
+  plugin.__testOnly.toImportSpecifier(windowsExtensionApiPath),
+  pathToFileURL("/C:/Users/alice/AppData/Roaming/npm/node_modules/openclaw/dist/extensionAPI.js").href,
+  "Windows absolute extension API paths should be converted into file:// import specifiers",
+);
+
+const windowsSpecifiers = plugin.__testOnly.getExtensionApiImportSpecifiers(
+  "win32",
+  {
+    OPENCLAW_EXTENSION_API_PATH: windowsExtensionApiPath,
+    APPDATA: "C:\\Users\\alice\\AppData\\Roaming",
+  },
+  () => {
+    throw new Error("resolve disabled in regression test");
+  },
+);
+assert.ok(
+  windowsSpecifiers.includes(pathToFileURL("/C:/Users/alice/AppData/Roaming/npm/node_modules/openclaw/dist/extensionAPI.js").href),
+  "Windows fallback probing should include the global npm extensionAPI.js path",
+);
+assert.ok(
+  !windowsSpecifiers.some((specifier) => specifier.includes("/usr/lib/node_modules/openclaw")),
+  "Windows fallback probing should not include Unix-only global npm paths",
 );
 
 const workDir = mkdtempSync(path.join(tmpdir(), "memory-plugin-regression-"));
