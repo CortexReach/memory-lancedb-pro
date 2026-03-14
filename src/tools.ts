@@ -90,6 +90,11 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
 
 const _warnedMissingAgentId = new Set<string>();
 
+/** @internal Exported for testing only — resets the missing-agent warning throttle. */
+export function _resetWarnedMissingAgentIdState(): void {
+  _warnedMissingAgentId.clear();
+}
+
 function resolveRuntimeAgentId(
   staticAgentId: string | undefined,
   runtimeCtx: unknown,

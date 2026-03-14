@@ -17,25 +17,30 @@ describe("MemoryScopeManager - System & Reflection Scopes", () => {
   });
 
   describe("System/Admin Bypass", () => {
-    const bypassIds = ["undefined", "system", "", undefined];
+    const bypassCases = [
+      { label: "reserved string undefined", agentId: "undefined" },
+      { label: "reserved string system", agentId: "system" },
+      { label: "empty string", agentId: "" },
+      { label: "actual undefined", agentId: undefined },
+    ];
 
-    bypassIds.forEach(id => {
-      it(`allows valid scopes when agentId is '${id}'`, () => {
-        assert.strictEqual(manager.isAccessible("global", id), true);
-        assert.strictEqual(manager.isAccessible("reflection:agent:main", id), true);
-        assert.strictEqual(manager.isAccessible("agent:any-agent", id), true);
+    bypassCases.forEach(({ label, agentId }) => {
+      it(`allows valid scopes when agentId is ${label}`, () => {
+        assert.strictEqual(manager.isAccessible("global", agentId), true);
+        assert.strictEqual(manager.isAccessible("reflection:agent:main", agentId), true);
+        assert.strictEqual(manager.isAccessible("agent:any-agent", agentId), true);
       });
 
-      it(`enumerates known scopes when agentId is '${id}'`, () => {
-        assert.deepStrictEqual(manager.getAccessibleScopes(id), manager.getAllScopes());
+      it(`enumerates known scopes when agentId is ${label}`, () => {
+        assert.deepStrictEqual(manager.getAccessibleScopes(agentId), manager.getAllScopes());
       });
 
-      it(`returns the default scope when agentId is '${id}'`, () => {
-        assert.strictEqual(manager.getDefaultScope(id), "global");
+      it(`returns the default scope when agentId is ${label}`, () => {
+        assert.strictEqual(manager.getDefaultScope(agentId), "global");
       });
 
-      it(`still rejects invalid scope formats when agentId is '${id}'`, () => {
-        assert.strictEqual(manager.isAccessible("not a valid scope", id), false);
+      it(`still rejects invalid scope formats when agentId is ${label}`, () => {
+        assert.strictEqual(manager.isAccessible("not a valid scope", agentId), false);
       });
     });
 
