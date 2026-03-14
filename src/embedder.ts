@@ -248,6 +248,35 @@ export function formatEmbeddingProviderError(
   return `${genericPrefix}${detailText}`;
 }
 
+// ============================================================================
+// Safety Constants
+// ============================================================================
+
+/** Maximum recursion depth for embedSingle chunking retries. */
+const MAX_EMBED_DEPTH = 3;
+
+/** Global timeout for a single embedding operation (ms). */
+const EMBED_TIMEOUT_MS = 10_000;
+
+/**
+ * Safe character limits per model for forced truncation.
+ * CJK characters typically consume ~3 tokens each, so the char limit is
+ * conservative compared to the token limit.
+ */
+const SAFE_CHAR_LIMITS: Record<string, number> = {
+  "nomic-embed-text": 2300,
+  "mxbai-embed-large": 2300,
+  "all-MiniLM-L6-v2": 1000,
+  "all-mpnet-base-v2": 1500,
+};
+
+const DEFAULT_SAFE_CHAR_LIMIT = 2000;
+
+/** Return a safe character count for forced truncation given a model name. */
+function getSafeCharLimit(model: string): number {
+  return SAFE_CHAR_LIMITS[model] ?? DEFAULT_SAFE_CHAR_LIMIT;
+}
+
 export function getVectorDimensions(model: string, overrideDims?: number): number {
   if (overrideDims && overrideDims > 0) {
     return overrideDims;
@@ -391,6 +420,21 @@ export class Embedder {
     return this.clients.length;
   }
 
+  /** FR-05: Wrap a promise with a global timeout to prevent indefinite hangs. */
+  private withTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        setTimeout(
+          () => reject(new Error(
+            `[memory-lancedb-pro] ${label} timed out after ${EMBED_TIMEOUT_MS}ms`
+          )),
+          EMBED_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  }
+
   // --------------------------------------------------------------------------
   // Backward-compatible API
   // --------------------------------------------------------------------------
@@ -415,11 +459,11 @@ export class Embedder {
   // --------------------------------------------------------------------------
 
   async embedQuery(text: string): Promise<number[]> {
-    return this.embedSingle(text, this._taskQuery);
+    return this.withTimeout(this.embedSingle(text, this._taskQuery), "embedQuery");
   }
 
   async embedPassage(text: string): Promise<number[]> {
-    return this.embedSingle(text, this._taskPassage);
+    return this.withTimeout(this.embedSingle(text, this._taskPassage), "embedPassage");
   }
 
   async embedBatchQuery(texts: string[]): Promise<number[][]> {
@@ -466,9 +510,19 @@ export class Embedder {
     return payload;
   }
 
-  private async embedSingle(text: string, task?: string): Promise<number[]> {
+  private async embedSingle(text: string, task?: string, depth: number = 0): Promise<number[]> {
     if (!text || text.trim().length === 0) {
       throw new Error("Cannot embed empty text");
+    }
+
+    // FR-01: Recursion depth limit — force truncate when too deep
+    if (depth >= MAX_EMBED_DEPTH) {
+      const safeLimit = getSafeCharLimit(this._model);
+      console.warn(
+        `[memory-lancedb-pro] Recursion depth ${depth} reached MAX_EMBED_DEPTH (${MAX_EMBED_DEPTH}), ` +
+        `force-truncating ${text.length} chars → ${safeLimit} chars`
+      );
+      text = text.slice(0, safeLimit);
     }
 
     // Check cache first
@@ -494,9 +548,26 @@ export class Embedder {
         try {
           console.log(`Document exceeded context limit (${errorMsg}), attempting chunking...`);
           const chunkResult = smartChunk(text, this._model);
-          
+
           if (chunkResult.chunks.length === 0) {
             throw new Error(`Failed to chunk document: ${errorMsg}`);
+          }
+
+          // FR-03: Single chunk output detection — if smartChunk produced only
+          // one chunk that is nearly the same size as the original text, chunking
+          // did not actually reduce the problem.  Force-truncate instead of
+          // recursing (which would loop forever).
+          if (
+            chunkResult.chunks.length === 1 &&
+            chunkResult.chunks[0].length > text.length * 0.9
+          ) {
+            const safeLimit = getSafeCharLimit(this._model);
+            console.warn(
+              `[memory-lancedb-pro] smartChunk produced 1 chunk (${chunkResult.chunks[0].length} chars) ≈ original (${text.length} chars). ` +
+              `Force-truncating to ${safeLimit} chars to avoid infinite recursion.`
+            );
+            const truncated = text.slice(0, safeLimit);
+            return this.embedSingle(truncated, task, depth + 1);
           }
 
           // Embed all chunks in parallel
@@ -504,7 +575,7 @@ export class Embedder {
           const chunkEmbeddings = await Promise.all(
             chunkResult.chunks.map(async (chunk, idx) => {
               try {
-                const embedding = await this.embedSingle(chunk, task);
+                const embedding = await this.embedSingle(chunk, task, depth + 1);
                 return { embedding };
               } catch (chunkError) {
                 console.warn(`Failed to embed chunk ${idx}:`, chunkError);
@@ -525,11 +596,11 @@ export class Embedder {
           );
 
           const finalEmbedding = avgEmbedding.map(v => v / chunkEmbeddings.length);
-          
+
           // Cache the result for the original text (using its hash)
           this._cache.set(text, task, finalEmbedding);
           console.log(`Successfully embedded long document as ${chunkEmbeddings.length} averaged chunks`);
-          
+
           return finalEmbedding;
         } catch (chunkError) {
           // If chunking fails, throw the original error
