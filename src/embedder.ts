@@ -101,6 +101,19 @@ export interface EmbeddingConfig {
   chunking?: boolean;
 }
 
+type EmbeddingProviderProfile =
+  | "openai"
+  | "jina"
+  | "voyage-compatible"
+  | "generic-openai-compatible";
+
+interface EmbeddingCapabilities {
+  encoding_format: boolean;
+  dimensions: boolean;
+  task: boolean;
+  normalized: boolean;
+}
+
 // Known embedding model dimensions
 const EMBEDDING_DIMENSIONS: Record<string, number> = {
   "text-embedding-3-small": 1536,
@@ -159,12 +172,15 @@ function getErrorCode(error: unknown): string | undefined {
 }
 
 function getProviderLabel(baseURL: string | undefined, model: string): string {
+  const profile = detectEmbeddingProviderProfile(baseURL, model);
   const base = baseURL || "";
 
+  if (/localhost:11434|127\.0\.0\.1:11434|\/ollama\b/i.test(base)) return "Ollama";
+
   if (base) {
-    if (/api\.jina\.ai/i.test(base)) return "Jina";
-    if (/localhost:11434|127\.0\.0\.1:11434|\/ollama\b/i.test(base)) return "Ollama";
-    if (/api\.openai\.com/i.test(base)) return "OpenAI";
+    if (profile === "jina" && /api\.jina\.ai/i.test(base)) return "Jina";
+    if (profile === "voyage-compatible" && /api\.voyageai\.com/i.test(base)) return "Voyage";
+    if (profile === "openai" && /api\.openai\.com/i.test(base)) return "OpenAI";
 
     try {
       return new URL(base).host;
@@ -173,9 +189,65 @@ function getProviderLabel(baseURL: string | undefined, model: string): string {
     }
   }
 
-  if (/^jina-/i.test(model)) return "Jina";
+  switch (profile) {
+    case "jina":
+      return "Jina";
+    case "voyage-compatible":
+      return "Voyage";
+    case "openai":
+      return "OpenAI";
+    default:
+      return "embedding provider";
+  }
+}
 
-  return "embedding provider";
+function detectEmbeddingProviderProfile(
+  baseURL: string | undefined,
+  model: string,
+): EmbeddingProviderProfile {
+  const base = baseURL || "";
+
+  if (/api\.openai\.com/i.test(base)) return "openai";
+  if (/api\.jina\.ai/i.test(base) || /^jina-/i.test(model)) return "jina";
+  if (/api\.voyageai\.com/i.test(base) || /^voyage\b/i.test(model)) {
+    return "voyage-compatible";
+  }
+
+  return "generic-openai-compatible";
+}
+
+function getEmbeddingCapabilities(profile: EmbeddingProviderProfile): EmbeddingCapabilities {
+  switch (profile) {
+    case "openai":
+      return {
+        encoding_format: true,
+        dimensions: true,
+        task: false,
+        normalized: false,
+      };
+    case "jina":
+      return {
+        encoding_format: true,
+        dimensions: true,
+        task: true,
+        normalized: true,
+      };
+    case "voyage-compatible":
+      return {
+        encoding_format: false,
+        dimensions: false,
+        task: false,
+        normalized: false,
+      };
+    case "generic-openai-compatible":
+    default:
+      return {
+        encoding_format: true,
+        dimensions: true,
+        task: false,
+        normalized: false,
+      };
+  }
 }
 
 function isAuthError(error: unknown): boolean {
@@ -281,6 +353,8 @@ export class Embedder {
   private readonly _taskQuery?: string;
   private readonly _taskPassage?: string;
   private readonly _normalized?: boolean;
+  private readonly _profile: EmbeddingProviderProfile;
+  private readonly _capabilities: EmbeddingCapabilities;
 
   /** Optional requested dimensions to pass through to the embedding provider (OpenAI-compatible). */
   private readonly _requestDimensions?: number;
@@ -300,6 +374,8 @@ export class Embedder {
     this._requestDimensions = config.dimensions;
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
+    this._profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
+    this._capabilities = getEmbeddingCapabilities(this._profile);
 
     // Create a client pool — one OpenAI client per key
     this.clients = resolvedKeys.map(key => new OpenAI({
@@ -449,17 +525,22 @@ export class Embedder {
     const payload: any = {
       model: this.model,
       input,
-      // Force float output to avoid SDK default base64 decoding path.
-      encoding_format: "float",
     };
 
-    if (task) payload.task = task;
-    if (this._normalized !== undefined) payload.normalized = this._normalized;
+    if (this._capabilities.encoding_format) {
+      // Force float output where providers explicitly support OpenAI-style formatting.
+      payload.encoding_format = "float";
+    }
+
+    if (this._capabilities.task && task) payload.task = task;
+    if (this._capabilities.normalized && this._normalized !== undefined) {
+      payload.normalized = this._normalized;
+    }
 
     // Some OpenAI-compatible providers support requesting a specific vector size.
     // We only pass it through when explicitly configured to avoid breaking providers
     // that reject unknown fields.
-    if (this._requestDimensions && this._requestDimensions > 0) {
+    if (this._capabilities.dimensions && this._requestDimensions && this._requestDimensions > 0) {
       payload.dimensions = this._requestDimensions;
     }
 

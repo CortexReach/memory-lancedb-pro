@@ -27,7 +27,7 @@
 | 🧠 **智能提取** | LLM 驱动的 6 类别记忆提取——不用手动调 `memory_store` |
 | ⏳ **记忆生命周期** | Weibull 衰减 + 三层晋升——重要记忆浮上来，过时记忆沉下去 |
 | 🔒 **多 Scope 隔离** | 按 Agent、用户、项目维度隔离记忆 |
-| 🔌 **任意 Embedding 提供商** | OpenAI、Jina、Gemini、Ollama 或任何 OpenAI 兼容 API |
+| 🔌 **灵活的 Embedding 提供商** | OpenAI、Jina、Gemini、Ollama，以及需要少量请求适配的 OpenAI 兼容 API |
 | 🛠️ **完整运维工具链** | CLI、备份、迁移、升级、导入导出——不是玩具 |
 
 ---
@@ -52,7 +52,7 @@
 | **LLM 智能提取（6 类别）** | ❌ | ✅（v1.1.0） |
 | **Weibull 衰减 + 三层晋升** | ❌ | ✅（v1.1.0） |
 | **旧记忆一键升级** | ❌ | ✅（v1.1.0） |
-| 任意 OpenAI 兼容 Embedding | 有限 | ✅ |
+| OpenAI 兼容 Embedding 适配 | 有限 | ✅ |
 
 ---
 
@@ -253,7 +253,7 @@ openclaw logs --follow --plain | rg "memory-lancedb-pro"
 | `package.json` | NPM 包信息，依赖 `@lancedb/lancedb`、`openai`、`@sinclair/typebox` |
 | `cli.ts` | CLI 命令：`memory list/search/stats/delete/delete-bulk/export/import/reembed/upgrade/migrate` |
 | `src/store.ts` | LanceDB 存储层。表创建 / FTS 索引 / Vector Search / BM25 / CRUD / 批量删除 / 统计 |
-| `src/embedder.ts` | Embedding 抽象层。兼容任意 OpenAI API Provider，支持 task-aware embedding |
+| `src/embedder.ts` | Embedding 抽象层。适配 OpenAI 兼容 Provider，并对部分兼容接口做请求裁剪，支持 task-aware embedding |
 | `src/retriever.ts` | 混合检索引擎。Vector + BM25 → RRF 融合 → Rerank → 生命周期衰减 → Length Norm → Noise Filter → MMR |
 | `src/scopes.ts` | 多 Scope 访问控制：`global`、`agent:<id>`、`custom:<name>`、`project:<id>`、`user:<id>` |
 | `src/tools.ts` | Agent 工具：`memory_recall`、`memory_store`、`memory_forget`、`memory_update` + 管理工具 |
@@ -422,7 +422,7 @@ OpenClaw 默认行为：
 <details>
 <summary><strong>Embedding 提供商</strong></summary>
 
-本插件支持 **任意 OpenAI 兼容的 Embedding API**：
+本插件支持 **OpenAI 兼容的 Embedding API**，包括需要少量请求字段适配的部分兼容提供商：
 
 | 提供商 | 模型 | Base URL | 维度 |
 | --- | --- | --- | --- |

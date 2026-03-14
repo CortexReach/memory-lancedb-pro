@@ -27,7 +27,7 @@ Most AI agents have amnesia. They forget everything the moment you start a new c
 | 🧠 **Smart Extraction** | LLM-powered 6-category memory extraction — no manual `memory_store` needed |
 | ⏳ **Memory Lifecycle** | Weibull decay + 3-tier promotion — important memories surface, stale ones fade |
 | 🔒 **Multi-Scope Isolation** | Per-agent, per-user, per-project memory boundaries |
-| 🔌 **Any Embedding Provider** | OpenAI, Jina, Gemini, Ollama, or any OpenAI-compatible API |
+| 🔌 **Flexible Embedding Providers** | OpenAI, Jina, Gemini, Ollama, and OpenAI-compatible APIs, including partial-compatibility providers |
 | 🛠️ **Full Operations Toolkit** | CLI, backup, migration, upgrade, export/import — not a toy |
 
 ---
@@ -52,7 +52,7 @@ Most AI agents have amnesia. They forget everything the moment you start a new c
 | **LLM Smart Extraction (6-category)** | ❌ | ✅ (v1.1.0) |
 | **Weibull Decay + Tier Promotion** | ❌ | ✅ (v1.1.0) |
 | **Legacy Memory Upgrade** | ❌ | ✅ (v1.1.0) |
-| Any OpenAI-compatible embedding | Limited | ✅ |
+| OpenAI-compatible embedding adapters | Limited | ✅ |
 
 ---
 
@@ -422,7 +422,7 @@ OpenClaw-specific defaults:
 <details>
 <summary><strong>Embedding Providers</strong></summary>
 
-This plugin works with **any OpenAI-compatible embedding API**:
+This plugin works with **OpenAI-compatible embedding APIs**, including providers that require small request-shape adaptations:
 
 | Provider | Model | Base URL | Dimensions |
 | --- | --- | --- | --- |
