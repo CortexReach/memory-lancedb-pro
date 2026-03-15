@@ -23,6 +23,10 @@ import {
 import { TEMPORAL_VERSIONED_CATEGORIES } from "./memory-categories.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./self-improvement-files.js";
 import { getDisplayCategoryTag } from "./reflection-metadata.js";
+import {
+  isUserMdExclusiveMemory,
+  type WorkspaceBoundaryConfig,
+} from "./workspace-boundary.js";
 
 // ============================================================================
 // Types
@@ -56,6 +60,7 @@ interface ToolContext {
   agentId?: string;
   workspaceDir?: string;
   mdMirror?: MdMirrorWriter | null;
+  workspaceBoundary?: WorkspaceBoundaryConfig;
 }
 
 function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
@@ -89,6 +94,25 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
     score: r.score,
     sources: r.sources,
   }));
+}
+
+function filterUserMdExclusiveResults(
+  results: RetrievalResult[],
+  workspaceBoundary?: WorkspaceBoundaryConfig,
+): RetrievalResult[] {
+  return results.filter((result) => {
+    const meta = parseSmartMetadata(result.entry.metadata, result.entry);
+    return !isUserMdExclusiveMemory(
+      {
+        memoryCategory: meta.memory_category,
+        factKey: meta.fact_key,
+        text: result.entry.text,
+        abstract: meta.l0_abstract,
+        content: meta.l2_content,
+      },
+      workspaceBoundary,
+    );
+  });
 }
 
 function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
@@ -453,13 +477,13 @@ export function registerMemoryRecallTool(
             }
           }
 
-          const results = await retrieveWithRetry(runtimeContext.retriever, {
+          const results = filterUserMdExclusiveResults(await retrieveWithRetry(runtimeContext.retriever, {
             query,
             limit: safeLimit,
             scopeFilter,
             category,
             source: "manual",
-          });
+          }), runtimeContext.workspaceBoundary);
 
           if (results.length === 0) {
             return {
@@ -591,6 +615,26 @@ export function registerMemoryStoreTool(
                 },
               ],
               details: { action: "noise_filtered", text: text.slice(0, 60) },
+            };
+          }
+
+          if (
+            isUserMdExclusiveMemory(
+              { text },
+              runtimeContext.workspaceBoundary,
+            )
+          ) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "Skipped: this fact belongs in USER.md, not plugin memory.",
+                },
+              ],
+              details: {
+                action: "skipped_by_workspace_boundary",
+                boundary: "user_md_exclusive",
+              },
             };
           }
 

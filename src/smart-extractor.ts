@@ -38,6 +38,10 @@ import {
   parseSupportInfo,
   updateSupportStats,
 } from "./smart-metadata.js";
+import {
+  isUserMdExclusiveMemory,
+  type WorkspaceBoundaryConfig,
+} from "./workspace-boundary.js";
 
 // ============================================================================
 // Constants
@@ -75,6 +79,8 @@ export interface SmartExtractorConfig {
   debugLog?: (msg: string) => void;
   /** Optional embedding-based noise prototype bank for language-agnostic noise filtering. */
   noiseBank?: NoisePrototypeBank;
+  /** Facts reserved for workspace-managed USER.md should never enter LanceDB. */
+  workspaceBoundary?: WorkspaceBoundaryConfig;
 }
 
 export interface ExtractPersistOptions {
@@ -111,7 +117,7 @@ export class SmartExtractor {
     sessionKey: string = "unknown",
     options: ExtractPersistOptions = {},
   ): Promise<ExtractionStats> {
-    const stats: ExtractionStats = { created: 0, merged: 0, skipped: 0 };
+    const stats: ExtractionStats = { created: 0, merged: 0, skipped: 0, boundarySkipped: 0 };
     const targetScope = options.scope ?? this.config.defaultScope ?? "global";
     const scopeFilter =
       options.scopeFilter && options.scopeFilter.length > 0
@@ -134,6 +140,24 @@ export class SmartExtractor {
 
     // Step 2: Process each candidate through dedup pipeline
     for (const candidate of candidates.slice(0, MAX_MEMORIES_PER_EXTRACTION)) {
+      if (
+        isUserMdExclusiveMemory(
+          {
+            memoryCategory: candidate.category,
+            abstract: candidate.abstract,
+            content: candidate.content,
+          },
+          this.config.workspaceBoundary,
+        )
+      ) {
+        stats.skipped += 1;
+        stats.boundarySkipped = (stats.boundarySkipped ?? 0) + 1;
+        this.log(
+          `memory-pro: smart-extractor: skipped USER.md-exclusive [${candidate.category}] ${candidate.abstract.slice(0, 60)}`,
+        );
+        continue;
+      }
+
       try {
         await this.processCandidate(
           candidate,

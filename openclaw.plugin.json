@@ -453,6 +453,43 @@
             "description": "Fallback directory for Markdown mirror files when agent workspace is unknown"
           }
         }
+      },
+      "workspaceBoundary": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "userMdExclusive": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Do not store USER.md-exclusive facts in LanceDB."
+              },
+              "routeProfile": {
+                "type": "boolean",
+                "default": true,
+                "description": "Treat extracted profile memories as USER.md-exclusive."
+              },
+              "routeCanonicalName": {
+                "type": "boolean",
+                "default": true,
+                "description": "Treat canonical name facts as USER.md-exclusive."
+              },
+              "routeCanonicalAddressing": {
+                "type": "boolean",
+                "default": true,
+                "description": "Treat canonical addressing facts as USER.md-exclusive."
+              },
+              "filterRecall": {
+                "type": "boolean",
+                "default": true,
+                "description": "Filter USER.md-exclusive facts out of plugin recall results."
+              }
+            }
+          }
+        }
       }
     },
     "required": [
@@ -794,6 +831,30 @@
     "mdMirror.dir": {
       "label": "Mirror Fallback Directory",
       "help": "Fallback directory when agent workspace mapping is unavailable",
+      "advanced": true
+    },
+    "workspaceBoundary.userMdExclusive.enabled": {
+      "label": "USER.md Exclusive Facts",
+      "help": "Skip storing USER.md-owned facts in LanceDB and keep them out of plugin recall."
+    },
+    "workspaceBoundary.userMdExclusive.routeProfile": {
+      "label": "Exclude Profile Memories",
+      "help": "Treat extracted profile memories as USER.md-only facts.",
+      "advanced": true
+    },
+    "workspaceBoundary.userMdExclusive.routeCanonicalName": {
+      "label": "Exclude Canonical Name",
+      "help": "Treat canonical name facts as USER.md-only facts.",
+      "advanced": true
+    },
+    "workspaceBoundary.userMdExclusive.routeCanonicalAddressing": {
+      "label": "Exclude Canonical Addressing",
+      "help": "Treat canonical addressing facts as USER.md-only facts.",
+      "advanced": true
+    },
+    "workspaceBoundary.userMdExclusive.filterRecall": {
+      "label": "Filter USER.md Facts From Recall",
+      "help": "Hide USER.md-exclusive facts from plugin auto-recall and memory_recall output.",
       "advanced": true
     },
     "llm.apiKey": {
