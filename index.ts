@@ -2008,8 +2008,20 @@ const memoryLanceDBProPlugin = {
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
 
+          // FR-04: Truncate long prompts (e.g. file attachments) before embedding.
+          // Auto-recall only needs the user's intent, not full attachment text.
+          const MAX_RECALL_QUERY_LENGTH = 1_000;
+          let recallQuery = event.prompt;
+          if (recallQuery.length > MAX_RECALL_QUERY_LENGTH) {
+            const originalLength = recallQuery.length;
+            recallQuery = recallQuery.slice(0, MAX_RECALL_QUERY_LENGTH);
+            api.logger.info(
+              `memory-lancedb-pro: auto-recall query truncated from ${originalLength} to ${MAX_RECALL_QUERY_LENGTH} chars`
+            );
+          }
+
           const results = await retrieveWithRetry({
-            query: event.prompt,
+            query: recallQuery,
             limit: 3,
             scopeFilter: accessibleScopes,
             source: "auto-recall",
