@@ -984,6 +984,20 @@ export class MemoryStore {
     return this._lastFtsError;
   }
 
+  /** Close the database connection and flush pending writes. */
+  async close(): Promise<void> {
+    if (this.table) {
+      try {
+        await this.table.optimize();
+        await this.table.close();
+      } catch {
+        // Ignore close errors
+      }
+      this.table = undefined;
+      this.initPromise = null;
+    }
+  }
+
   /** Get FTS index health status */
   getFtsStatus(): { available: boolean; lastError: string | null } {
     return {
