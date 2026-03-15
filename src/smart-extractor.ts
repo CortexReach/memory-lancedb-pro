@@ -80,7 +80,13 @@ export interface SmartExtractorConfig {
 export interface ExtractPersistOptions {
   /** Target scope for newly created memories. */
   scope?: string;
-  /** Scopes visible to the current agent for dedup/merge. */
+  /**
+   * Optional store-layer scope filter override used for dedup/merge reads.
+   * - omit the field to default reads to `[scope ?? defaultScope]`
+   * - set `undefined` explicitly to preserve trusted full-bypass callers
+   * - pass `[]` to force deny-all reads (match nothing)
+   * - pass a non-empty array to restrict reads to those scopes
+   */
   scopeFilter?: string[];
 }
 
@@ -113,10 +119,14 @@ export class SmartExtractor {
   ): Promise<ExtractionStats> {
     const stats: ExtractionStats = { created: 0, merged: 0, skipped: 0 };
     const targetScope = options.scope ?? this.config.defaultScope ?? "global";
-    const scopeFilter =
-      options.scopeFilter && options.scopeFilter.length > 0
-        ? options.scopeFilter
-        : [targetScope];
+    // Distinguish "no override supplied" from explicit bypass/override values.
+    // - omitted `scopeFilter` => default to `[targetScope]`
+    // - explicit `undefined` => preserve full-bypass semantics for trusted callers
+    // - explicit `[]` or non-empty array => pass through unchanged
+    const hasExplicitScopeFilter = "scopeFilter" in options;
+    const scopeFilter = hasExplicitScopeFilter
+      ? options.scopeFilter
+      : [targetScope];
 
     // Step 1: LLM extraction
     const candidates = await this.extractCandidates(conversationText);
@@ -316,7 +326,7 @@ export class SmartExtractor {
     sessionKey: string,
     stats: ExtractionStats,
     targetScope: string,
-    scopeFilter: string[],
+    scopeFilter?: string[],
   ): Promise<void> {
     // Profile always merges (skip dedup)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -357,8 +367,8 @@ export class SmartExtractor {
           await this.handleMerge(
             candidate,
             dedupResult.matchId,
-            scopeFilter,
             targetScope,
+            scopeFilter,
             dedupResult.contextLabel,
           );
           stats.merged++;
@@ -399,7 +409,7 @@ export class SmartExtractor {
 
       case "support":
         if (dedupResult.matchId) {
-          await this.handleSupport(dedupResult.matchId, scopeFilter, { session: sessionKey, timestamp: Date.now() }, dedupResult.reason, dedupResult.contextLabel);
+          await this.handleSupport(dedupResult.matchId, { session: sessionKey, timestamp: Date.now() }, dedupResult.reason, dedupResult.contextLabel, scopeFilter);
           stats.supported = (stats.supported ?? 0) + 1;
         } else {
           await this.storeCandidate(candidate, vector, sessionKey, targetScope);
@@ -455,7 +465,7 @@ export class SmartExtractor {
   private async deduplicate(
     candidate: CandidateMemory,
     candidateVector: number[],
-    scopeFilter: string[],
+    scopeFilter?: string[],
   ): Promise<DedupResult> {
     // Stage 1: Vector pre-filter — find similar active memories.
     // excludeInactive ensures the store over-fetches to fill N active slots,
@@ -569,7 +579,7 @@ export class SmartExtractor {
     candidate: CandidateMemory,
     sessionKey: string,
     targetScope: string,
-    scopeFilter: string[],
+    scopeFilter?: string[],
   ): Promise<void> {
     // Find existing profile memory by category
     const embeddingText = `${candidate.abstract} ${candidate.content}`;
@@ -595,8 +605,8 @@ export class SmartExtractor {
       await this.handleMerge(
         candidate,
         profileMatch.entry.id,
-        scopeFilter,
         targetScope,
+        scopeFilter,
       );
     } else {
       // No existing profile — create new
@@ -610,8 +620,8 @@ export class SmartExtractor {
   private async handleMerge(
     candidate: CandidateMemory,
     matchId: string,
-    scopeFilter: string[],
     targetScope: string,
+    scopeFilter?: string[],
     contextLabel?: string,
   ): Promise<void> {
     let existingAbstract = "";
@@ -797,10 +807,10 @@ export class SmartExtractor {
    */
   private async handleSupport(
     matchId: string,
-    scopeFilter: string[],
     source: { session: string; timestamp: number },
     reason: string,
     contextLabel?: string,
+    scopeFilter?: string[],
   ): Promise<void> {
     const existing = await this.store.getById(matchId, scopeFilter);
     if (!existing) return;
@@ -831,7 +841,7 @@ export class SmartExtractor {
     matchId: string,
     sessionKey: string,
     targetScope: string,
-    scopeFilter: string[],
+    scopeFilter?: string[],
     contextLabel?: string,
   ): Promise<void> {
     const storeCategory = this.mapToStoreCategory(candidate.category);
@@ -873,7 +883,7 @@ export class SmartExtractor {
     matchId: string,
     sessionKey: string,
     targetScope: string,
-    scopeFilter: string[],
+    scopeFilter?: string[],
     contextLabel?: string,
   ): Promise<void> {
     // 1. Record contradiction on the existing memory
