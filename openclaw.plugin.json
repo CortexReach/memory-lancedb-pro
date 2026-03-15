@@ -426,6 +426,15 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "auth": {
+            "type": "string",
+            "enum": [
+              "api-key",
+              "oauth"
+            ],
+            "default": "api-key",
+            "description": "LLM authentication mode. oauth uses the local Codex/ChatGPT login cache instead of llm.apiKey."
+          },
           "apiKey": {
             "type": "string"
           },
@@ -435,6 +444,14 @@
           },
           "baseURL": {
             "type": "string"
+          },
+          "oauthProvider": {
+            "type": "string",
+            "description": "OAuth provider id for llm.auth=oauth. Currently supported: openai-codex."
+          },
+          "oauthPath": {
+            "type": "string",
+            "description": "Project-scoped OAuth token file for llm.auth=oauth. Defaults to .memory-lancedb-pro/oauth.json."
           }
         }
       },
@@ -800,6 +817,21 @@
       "sensitive": true,
       "placeholder": "sk-... or ${GROQ_API_KEY}",
       "help": "API key for LLM used by smart memory extraction (defaults to embedding.apiKey if omitted)"
+    },
+    "llm.auth": {
+      "label": "LLM Auth",
+      "help": "api-key uses llm.apiKey or embedding.apiKey. oauth uses a project-scoped OAuth token file.",
+      "advanced": true
+    },
+    "llm.oauthProvider": {
+      "label": "LLM OAuth Provider",
+      "help": "OAuth provider id used when llm.auth=oauth. Currently supported: openai-codex.",
+      "advanced": true
+    },
+    "llm.oauthPath": {
+      "label": "LLM OAuth File",
+      "help": "Project-scoped OAuth token file used when llm.auth=oauth. Default: .memory-lancedb-pro/oauth.json",
+      "advanced": true
     },
     "llm.model": {
       "label": "LLM Model",

@@ -508,9 +508,12 @@ OpenClaw 默认行为：
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `smartExtraction` | boolean | `true` | 是否启用 LLM 智能 6 类别提取 |
+| `llm.auth` | string | `api-key` | `api-key` 使用 `llm.apiKey` / `embedding.apiKey`；`oauth` 使用项目级 OAuth token 文件 |
 | `llm.apiKey` | string | *（复用 `embedding.apiKey`）* | LLM 提供商 API Key |
 | `llm.model` | string | `openai/gpt-oss-120b` | LLM 模型名称 |
 | `llm.baseURL` | string | *（复用 `embedding.baseURL`）* | LLM API 端点 |
+| `llm.oauthProvider` | string | `openai-codex` | `llm.auth` 为 `oauth` 时使用的 OAuth provider id |
+| `llm.oauthPath` | string | `.memory-lancedb-pro/oauth.json` | `llm.auth` 为 `oauth` 时使用的项目级 OAuth token 文件 |
 | `extractMinMessages` | number | `2` | 触发提取所需最少消息数 |
 | `extractMaxChars` | number | `8000` | 发送给 LLM 的最大字符数 |
 
@@ -532,6 +535,20 @@ OpenClaw 默认行为：
   "extractMaxChars": 8000
 }
 ```
+
+OAuth `llm` 配置（复用现有 Codex / ChatGPT 登录态进行 LLM 调用）：
+```json
+{
+  "llm": { "auth": "oauth", "oauthProvider": "openai-codex", "model": "gpt-5.4", "oauthPath": ".memory-lancedb-pro/oauth.json" }
+}
+```
+
+`llm.auth: "oauth"` 说明：
+
+- `llm.oauthProvider` 当前仅支持 `openai-codex`。
+- OAuth token 默认按项目存放在 `.memory-lancedb-pro/oauth.json`。
+- 如需自定义路径，可设置 `llm.oauthPath`。
+- `oauth` 模式下除非你明确要覆盖为自定义 ChatGPT/Codex 兼容后端，否则不要设置 `llm.baseURL`。
 
 禁用：`{ "smartExtraction": false }`
 
@@ -747,6 +764,9 @@ Key 存储：不要提交到 git。使用 `${...}` 环境变量时确保 Gateway
 openclaw memory-pro list [--scope global] [--category fact] [--limit 20] [--json]
 openclaw memory-pro search "query" [--scope global] [--limit 10] [--json]
 openclaw memory-pro stats [--scope global] [--json]
+openclaw memory-pro auth login [--provider openai-codex] [--model gpt-5.4] [--oauth-path /abs/path/oauth.json]
+openclaw memory-pro auth status
+openclaw memory-pro auth logout
 openclaw memory-pro delete <id>
 openclaw memory-pro delete-bulk --scope global [--before 2025-01-01] [--dry-run]
 openclaw memory-pro export [--scope global] [--output memories.json]
