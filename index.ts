@@ -128,9 +128,12 @@ interface PluginConfig {
   // Smart extraction config
   smartExtraction?: boolean;
   llm?: {
+    auth?: "api-key" | "oauth";
     apiKey?: string;
     model?: string;
     baseURL?: string;
+    oauthProvider?: string;
+    oauthPath?: string;
   };
   extractMinMessages?: number;
   extractMaxChars?: number;
@@ -195,6 +198,15 @@ function resolveEnvVars(value: string): string {
     }
     return envValue;
   });
+}
+
+function resolveOptionalPathWithEnv(
+  api: Pick<OpenClawPluginApi, "resolvePath">,
+  value: string | undefined,
+  fallback: string,
+): string {
+  const raw = typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback;
+  return api.resolvePath(resolveEnvVars(raw));
 }
 
 function parsePositiveInt(value: unknown): number | undefined {
@@ -1647,18 +1659,32 @@ const memoryLanceDBProPlugin = {
     let smartExtractor: SmartExtractor | null = null;
     if (config.smartExtraction !== false) {
       try {
-        const llmApiKey = config.llm?.apiKey
-          ? resolveEnvVars(config.llm.apiKey)
-          : resolveEnvVars(config.embedding.apiKey);
-        const llmBaseURL = config.llm?.baseURL
-          ? resolveEnvVars(config.llm.baseURL)
-          : config.embedding.baseURL;
+        const llmAuth = config.llm?.auth || "api-key";
+        const llmApiKey = llmAuth === "oauth"
+          ? undefined
+          : config.llm?.apiKey
+            ? resolveEnvVars(config.llm.apiKey)
+            : resolveEnvVars(config.embedding.apiKey);
+        const llmBaseURL = llmAuth === "oauth"
+          ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
+          : config.llm?.baseURL
+            ? resolveEnvVars(config.llm.baseURL)
+            : config.embedding.baseURL;
+        const llmOauthPath = llmAuth === "oauth"
+          ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
+          : undefined;
+        const llmOauthProvider = llmAuth === "oauth"
+          ? config.llm?.oauthProvider
+          : undefined;
         const llmModel = config.llm?.model || "openai/gpt-oss-120b";
 
         const llmClient = createLlmClient({
+          auth: llmAuth,
           apiKey: llmApiKey,
           model: llmModel,
           baseURL: llmBaseURL,
+          oauthProvider: llmOauthProvider,
+          oauthPath: llmOauthPath,
           timeoutMs: 30000,
           log: (msg: string) => api.logger.debug(msg),
         });
@@ -1963,18 +1989,34 @@ const memoryLanceDBProPlugin = {
         scopeManager,
         migrator,
         embedder,
+        pluginId: "memory-lancedb-pro",
+        pluginConfig: config as unknown as Record<string, unknown>,
         llmClient: smartExtractor ? (() => {
           try {
-            const llmApiKey = config.llm?.apiKey
-              ? resolveEnvVars(config.llm.apiKey)
-              : resolveEnvVars(config.embedding.apiKey);
-            const llmBaseURL = config.llm?.baseURL
-              ? resolveEnvVars(config.llm.baseURL)
-              : config.embedding.baseURL;
+            const llmAuth = config.llm?.auth || "api-key";
+            const llmApiKey = llmAuth === "oauth"
+              ? undefined
+              : config.llm?.apiKey
+                ? resolveEnvVars(config.llm.apiKey)
+                : resolveEnvVars(config.embedding.apiKey);
+            const llmBaseURL = llmAuth === "oauth"
+              ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
+              : config.llm?.baseURL
+                ? resolveEnvVars(config.llm.baseURL)
+                : config.embedding.baseURL;
+            const llmOauthPath = llmAuth === "oauth"
+              ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
+              : undefined;
+            const llmOauthProvider = llmAuth === "oauth"
+              ? config.llm?.oauthProvider
+              : undefined;
             return createLlmClient({
+              auth: llmAuth,
               apiKey: llmApiKey,
               model: config.llm?.model || "openai/gpt-oss-120b",
               baseURL: llmBaseURL,
+              oauthProvider: llmOauthProvider,
+              oauthPath: llmOauthPath,
               timeoutMs: 30000,
             });
           } catch { return undefined; }

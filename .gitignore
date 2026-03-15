@@ -3,3 +3,4 @@ node_modules/
 memory-plugin-feature-dev
 memory-plugin-host-validation
 memory-plugin-release-consistency
+.memory-lancedb-pro/oauth.json

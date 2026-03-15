@@ -56,12 +56,25 @@ function createMockApi(pluginConfig, options = {}) {
   };
 }
 
-for (const key of ["smartExtraction", "extractMinMessages", "extractMaxChars"]) {
+for (const key of ["smartExtraction", "extractMinMessages", "extractMaxChars", "llm"]) {
   assert.ok(
     Object.prototype.hasOwnProperty.call(manifest.configSchema.properties, key),
     `configSchema should declare ${key}`,
   );
 }
+
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "auth"),
+  "configSchema should declare llm.auth",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "oauthPath"),
+  "configSchema should declare llm.oauthPath",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "oauthProvider"),
+  "configSchema should declare llm.oauthProvider",
+);
 
 assert.equal(
   manifest.configSchema.properties.autoCapture.default,
