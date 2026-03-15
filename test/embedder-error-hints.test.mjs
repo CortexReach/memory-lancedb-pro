@@ -153,6 +153,46 @@ async function run() {
   });
   await voyageCodeEmbedder.embedPassage("hello");
 
+  // Voyage: taskPassage "retrieval.passage" → input_type "document"
+  //         taskQuery  "retrieval.query"   → input_type "query"
+  const voyageTaskEmbedder = new Embedder({
+    provider: "openai-compatible",
+    apiKey: "test-key",
+    model: "voyage-3-lite",
+    baseURL: "https://api.voyageai.com/v1",
+    dimensions: 1024,
+    taskPassage: "retrieval.passage",
+    taskQuery: "retrieval.query",
+  });
+  installMockEmbeddingClient(voyageTaskEmbedder, async (payload) => {
+    assert.equal(payload.input_type, "document", "voyage taskPassage should map to input_type=document");
+    assert.equal(payload.task, undefined, "voyage should not send task field");
+    return createEmbeddingResponse(1024);
+  });
+  await voyageTaskEmbedder.embedPassage("hello");
+
+  installMockEmbeddingClient(voyageTaskEmbedder, async (payload) => {
+    assert.equal(payload.input_type, "query", "voyage taskQuery should map to input_type=query");
+    return createEmbeddingResponse(1024);
+  });
+  await voyageTaskEmbedder.embedQuery("hello");
+
+  // Voyage: configured dimensions should be sent as output_dimension, not dimensions.
+  // voyage-code-3 is a Matryoshka-capable model that supports output_dimension.
+  const voyageDimEmbedder = new Embedder({
+    provider: "openai-compatible",
+    apiKey: "test-key",
+    model: "voyage-code-3",
+    baseURL: "https://api.voyageai.com/v1",
+    dimensions: 512,
+  });
+  installMockEmbeddingClient(voyageDimEmbedder, async (payload) => {
+    assert.equal(payload.output_dimension, 512, "voyage should send output_dimension");
+    assert.equal(payload.dimensions, undefined, "voyage should not send dimensions");
+    return createEmbeddingResponse(512);
+  });
+  await voyageDimEmbedder.embedPassage("hello");
+
   // End-to-end HTTP payload verification for generic-openai-compatible profile.
   // Unlike the mock tests above, this spins up a real HTTP server and verifies
   // the actual request body sent by the OpenAI SDK.
