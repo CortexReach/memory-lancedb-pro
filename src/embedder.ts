@@ -353,7 +353,6 @@ export class Embedder {
   private readonly _taskQuery?: string;
   private readonly _taskPassage?: string;
   private readonly _normalized?: boolean;
-  private readonly _profile: EmbeddingProviderProfile;
   private readonly _capabilities: EmbeddingCapabilities;
 
   /** Optional requested dimensions to pass through to the embedding provider (OpenAI-compatible). */
@@ -374,8 +373,7 @@ export class Embedder {
     this._requestDimensions = config.dimensions;
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
-    this._profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
-    this._capabilities = getEmbeddingCapabilities(this._profile);
+    this._capabilities = getEmbeddingCapabilities(detectEmbeddingProviderProfile(this._baseURL, this._model));
 
     // Create a client pool — one OpenAI client per key
     this.clients = resolvedKeys.map(key => new OpenAI({
