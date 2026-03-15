@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "strict": false,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "types": ["node"],
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": [
+    "index.ts",
+    "cli.ts",
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "types/**/*.d.ts"
+  ]
+}

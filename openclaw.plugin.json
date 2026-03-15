@@ -453,6 +453,30 @@
             "description": "Fallback directory for Markdown mirror files when agent workspace is unknown"
           }
         }
+      },
+      "layer3Fallback": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Optional NotebookLM deep-recall fallback for time-sensitive or low-confidence memory queries. Disabled by default for backward compatibility.",
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "agent": { "type": "string", "default": "notebooklm" },
+          "notebook": { "type": "string", "default": "memory-archive" },
+          "notebookId": { "type": "string" },
+          "timeout": { "type": "integer", "minimum": 1, "default": 45 },
+          "triggers": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "timeKeywords": { "type": "array", "items": { "type": "string" } },
+              "reasoningKeywords": { "type": "array", "items": { "type": "string" } },
+              "minResults": { "type": "integer", "minimum": 1, "default": 3 },
+              "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 },
+              "minAvgScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.4 },
+              "explicitKeywords": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
       }
     },
     "required": [
@@ -812,6 +836,20 @@
       "placeholder": "https://api.groq.com/openai/v1",
       "help": "OpenAI-compatible base URL for LLM (defaults to embedding.baseURL if omitted)",
       "advanced": true
+    }
+  },
+  "layer3Fallback": {
+    "enabled": false,
+    "agent": "notebooklm",
+    "notebook": "memory-archive",
+    "timeout": 45,
+    "triggers": {
+      "timeKeywords": ["今天", "昨天", "最近", "本周"],
+      "reasoningKeywords": ["为什么", "如何", "对比"],
+      "explicitKeywords": ["详细", "完整", "历史"],
+      "minResults": 3,
+      "minScore": 0.5,
+      "minAvgScore": 0.4
     }
   }
 }

@@ -6,9 +6,10 @@
 import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { MemoryRetriever, RetrievalResult } from "./retriever.js";
+import type { MemoryRetriever, RetrievalContext, RetrievalResult } from "./retriever.js";
 import type { MemoryStore } from "./store.js";
 import { isNoise } from "./noise-filter.js";
 import type { MemoryScopeManager } from "./scopes.js";
@@ -48,6 +49,22 @@ export type MdMirrorWriter = (
   meta?: { source?: string; agentId?: string },
 ) => Promise<void>;
 
+export interface Layer3FallbackSettings {
+  enabled?: boolean;
+  agent?: string;
+  notebook?: string;
+  notebookId?: string;
+  timeout?: number;
+  triggers?: {
+    timeKeywords?: string[];
+    reasoningKeywords?: string[];
+    minResults?: number;
+    minScore?: number;
+    minAvgScore?: number;
+    explicitKeywords?: string[];
+  };
+}
+
 interface ToolContext {
   retriever: MemoryRetriever;
   store: MemoryStore;
@@ -56,6 +73,7 @@ interface ToolContext {
   agentId?: string;
   workspaceDir?: string;
   mdMirror?: MdMirrorWriter | null;
+  layer3Fallback?: Layer3FallbackSettings;
 }
 
 function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
@@ -124,12 +142,7 @@ async function sleep(ms: number): Promise<void> {
 
 async function retrieveWithRetry(
   retriever: MemoryRetriever,
-  params: {
-    query: string;
-    limit: number;
-    scopeFilter?: string[];
-    category?: string;
-  },
+  params: RetrievalContext,
 ): Promise<RetrievalResult[]> {
   let results = await retriever.retrieve(params);
   if (results.length === 0) {
@@ -149,6 +162,358 @@ function resolveWorkspaceDir(toolCtx: unknown, fallback?: string): string {
 
 function escapeRegExp(input: string): string {
   return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const DEFAULT_LAYER3_FALLBACK: Required<Omit<Layer3FallbackSettings, "triggers">> & {
+  triggers: Required<NonNullable<Layer3FallbackSettings["triggers"]>>;
+} = {
+  enabled: false,
+  agent: "notebooklm",
+  notebook: "memory-archive",
+  notebookId: "",
+  timeout: 45,
+  // timeout must stay well below the main agent 60s tool window
+  triggers: {
+    timeKeywords: ["今天", "昨天", "最近", "本周", "上周", "这个月"],
+    reasoningKeywords: ["为什么", "如何", "怎么", "对比", "区别"],
+    minResults: 3,
+    minScore: 0.5,
+    minAvgScore: 0.4,
+    explicitKeywords: ["详细", "完整", "历史", "所有", "全部"],
+  },
+};
+
+export function resolveLayer3FallbackSettings(config?: Layer3FallbackSettings) {
+  const resolved = {
+    ...DEFAULT_LAYER3_FALLBACK,
+    ...config,
+    triggers: {
+      ...DEFAULT_LAYER3_FALLBACK.triggers,
+      ...(config?.triggers ?? {}),
+    },
+  };
+
+  resolved.timeout = Math.min(resolved.timeout, 50);
+
+  return resolved;
+}
+
+export function analyzeLayer3FallbackNeed(
+  query: string,
+  results: Array<{ score?: number }> = [],
+  config?: Layer3FallbackSettings,
+): { shouldFallback: boolean; reasons: string[]; metrics: { resultCount: number; top1Score: number | null; avgTop3Score: number | null } } {
+  const resolved = resolveLayer3FallbackSettings(config);
+  if (!resolved.enabled) {
+    return {
+      shouldFallback: false,
+      reasons: [],
+      metrics: { resultCount: results.length, top1Score: results[0]?.score ?? null, avgTop3Score: null },
+    };
+  }
+
+  const reasons: string[] = [];
+  const normalizedQuery = query.trim();
+  const top1Score = typeof results[0]?.score === "number" ? results[0].score! : null;
+  const top3Scores = results.slice(0, 3)
+    .map((item) => (typeof item.score === "number" ? item.score : null))
+    .filter((score): score is number => score !== null);
+  const avgTop3Score = top3Scores.length > 0
+    ? top3Scores.reduce((sum, score) => sum + score, 0) / top3Scores.length
+    : null;
+
+  if (resolved.triggers.timeKeywords.some((keyword) => normalizedQuery.includes(keyword))) {
+    reasons.push("time-sensitive-query");
+  }
+  if (resolved.triggers.reasoningKeywords.some((keyword) => normalizedQuery.includes(keyword))) {
+    reasons.push("reasoning-query");
+  }
+  if (resolved.triggers.explicitKeywords.some((keyword) => normalizedQuery.includes(keyword))) {
+    reasons.push("explicit-depth-request");
+  }
+  if (results.length < resolved.triggers.minResults) {
+    reasons.push("insufficient-results");
+  }
+  if (top1Score !== null && top1Score < resolved.triggers.minScore) {
+    reasons.push("low-top-score");
+  }
+  if (avgTop3Score !== null && top3Scores.length >= Math.min(3, results.length) && avgTop3Score < resolved.triggers.minAvgScore) {
+    reasons.push("low-average-score");
+  }
+
+  return {
+    shouldFallback: reasons.length > 0,
+    reasons: [...new Set(reasons)],
+    metrics: { resultCount: results.length, top1Score, avgTop3Score },
+  };
+}
+
+function isRetryableLayer3Error(error?: string): boolean {
+  if (!error) return false;
+  const retryablePatterns = [
+    "429",
+    "rate limit",
+    "too many requests",
+    "temporarily unavailable",
+    "service unavailable",
+  ];
+  return retryablePatterns.some((pattern) => error.toLowerCase().includes(pattern));
+}
+
+function truncateLayer3Text(text: string, maxChars: number = 3000): {
+  text: string;
+  originalLength: number;
+  keptLength: number;
+  truncated: boolean;
+} {
+  const originalLength = text.length;
+
+  if (originalLength <= maxChars) {
+    return {
+      text,
+      originalLength,
+      keptLength: originalLength,
+      truncated: false,
+    };
+  }
+
+  const kept = text.slice(0, maxChars);
+  return {
+    text: `${kept}\n\n[TRUNCATED original_length=${originalLength} kept=${maxChars}]`,
+    originalLength,
+    keptLength: maxChars,
+    truncated: true,
+  };
+}
+
+export function stripUnsafeControlChars(raw: string): string {
+  return raw.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+}
+
+function extractBalancedJsonSegment(raw: string, startIndex: number): string | null {
+  const opener = raw[startIndex];
+  const closer = opener === "{" ? "}" : opener === "[" ? "]" : null;
+  if (!closer) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = startIndex; i < raw.length; i += 1) {
+    const char = raw[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === opener) {
+      depth += 1;
+      continue;
+    }
+
+    if (char === closer) {
+      depth -= 1;
+      if (depth === 0) {
+        return raw.slice(startIndex, i + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+export function extractCandidateJson(raw: string): string | null {
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced?.[1]) {
+    return fenced[1].trim();
+  }
+
+  for (let i = 0; i < raw.length; i += 1) {
+    const char = raw[i];
+    if (char !== "{" && char !== "[") continue;
+    const candidate = extractBalancedJsonSegment(raw, i);
+    if (!candidate) continue;
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+export function safeParseJson(raw: string): {
+  ok: boolean;
+  value?: any;
+  mode?: "direct" | "extracted";
+  error?: string;
+} {
+  const cleaned = stripUnsafeControlChars(raw).trim();
+
+  try {
+    return {
+      ok: true,
+      value: JSON.parse(cleaned),
+      mode: "direct",
+    };
+  } catch {}
+
+  const candidate = extractCandidateJson(cleaned);
+  if (candidate) {
+    try {
+      return {
+        ok: true,
+        value: JSON.parse(candidate),
+        mode: "extracted",
+      };
+    } catch {}
+  }
+
+  return {
+    ok: false,
+    error: "json_parse_failed",
+  };
+}
+
+async function runNotebookLMFallbackQuery(
+  query: string,
+  config?: Layer3FallbackSettings,
+): Promise<
+  | { ok: true; text: string; raw: unknown; command: string[]; parseMode?: "direct" | "extracted" }
+  | { ok: false; error: string; command: string[] }
+> {
+  const resolved = resolveLayer3FallbackSettings(config);
+  const notebookInfo = resolved.notebookId
+    ? `${resolved.notebook} (${resolved.notebookId})`
+    : resolved.notebook;
+  const task = `查询 ${resolved.notebook} notebook：${query}\n\n使用 notebook: ${notebookInfo}\n\n请直接返回查询结果。`;
+  const command = [
+    "agent",
+    "--agent", resolved.agent,
+    "--json",
+    "--timeout", String(resolved.timeout),
+    "--message", task,
+  ];
+
+  return await new Promise((resolve) => {
+    const child = spawn("openclaw", command, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", (error) => resolve({ ok: false, error: error.message, command }));
+    child.on("close", (code) => {
+      if (code !== 0) {
+        resolve({ ok: false, error: stderr.trim() || `openclaw agent exited with code ${code}`, command });
+        return;
+      }
+      const trimmed = stdout.trim();
+      if (!trimmed) {
+        resolve({ ok: false, error: "empty NotebookLM response", command });
+        return;
+      }
+
+      const parseResult = safeParseJson(trimmed);
+
+      if (parseResult.ok) {
+        const text = parseResult.value?.content?.[0]?.text
+          || parseResult.value?.result?.payloads?.[0]?.text
+          || parseResult.value?.payloads?.[0]?.text
+          || parseResult.value?.text
+          || parseResult.value?.message
+          || "";
+
+        resolve({
+          ok: true,
+          text,
+          raw: parseResult.value,
+          command,
+          parseMode: parseResult.mode,
+        });
+      } else {
+        console.warn(`[Layer3] JSON parse failed: ${parseResult.error}`);
+        resolve({
+          ok: false,
+          error: `json_parse_failed: ${parseResult.error}`,
+          command,
+        });
+      }
+    });
+  });
+}
+
+async function runNotebookLMFallbackQueryWithBudget(
+  query: string,
+  config?: Layer3FallbackSettings,
+): Promise<{
+  ok: boolean;
+  text?: string;
+  error?: string;
+  command?: string[];
+  raw?: any;
+  parseMode?: "direct" | "extracted";
+  attempts: number;
+  skippedRetry?: boolean;
+}> {
+  const resolved = resolveLayer3FallbackSettings(config);
+  const startedAt = Date.now();
+  const timeoutMs = resolved.timeout * 1000;
+  const reserveMs = 3000;
+  const retryBackoffMs = 1500;
+  const minRetryExecutionMs = 12000;
+
+  const first = await runNotebookLMFallbackQuery(query, config);
+  if (first.ok) {
+    return { ...first, attempts: 1 };
+  }
+
+  if ("error" in first) {
+    const retryable = isRetryableLayer3Error(first.error);
+    const elapsedMs = Date.now() - startedAt;
+    const remainingMs = timeoutMs - elapsedMs - reserveMs;
+
+    if (!retryable || remainingMs < (retryBackoffMs + minRetryExecutionMs)) {
+      console.log(`[Layer3] Skipping retry: retryable=${retryable}, remainingMs=${remainingMs}`);
+      return {
+        ...first,
+        attempts: 1,
+        skippedRetry: true,
+      };
+    }
+
+    console.log(`[Layer3] Retrying after ${retryBackoffMs}ms (remaining budget: ${remainingMs}ms)`);
+    await new Promise((resolve) => setTimeout(resolve, retryBackoffMs));
+
+    const second = await runNotebookLMFallbackQuery(query, {
+      ...config,
+      timeout: Math.max(1, Math.floor((remainingMs - retryBackoffMs) / 1000)),
+    });
+
+    return {
+      ...second,
+      attempts: 2,
+    };
+  }
+
+  return { ok: false, error: "unexpected_layer3_state", attempts: 1 };
 }
 
 export function registerSelfImprovementLogTool(api: OpenClawPluginApi, context: ToolContext) {
@@ -461,40 +826,59 @@ export function registerMemoryRecallTool(
             source: "manual",
           });
 
-          if (results.length === 0) {
-            return {
-              content: [{ type: "text", text: "No relevant memories found." }],
-              details: { count: 0, query, scopes: scopeFilter },
-            };
+          const layer3Decision = analyzeLayer3FallbackNeed(query, results, runtimeContext.layer3Fallback);
+          let layer3Result: Awaited<ReturnType<typeof runNotebookLMFallbackQueryWithBudget>> | null = null;
+          let layer3TruncationInfo: { originalLength: number; keptLength: number; truncated: boolean } | undefined;
+          if (layer3Decision.shouldFallback) {
+            layer3Result = await runNotebookLMFallbackQueryWithBudget(query, runtimeContext.layer3Fallback);
           }
 
-          const now = Date.now();
-          await Promise.allSettled(
-            results.map((result) => {
-              const meta = parseSmartMetadata(result.entry.metadata, result.entry);
-              return runtimeContext.store.patchMetadata(
-                result.entry.id,
-                {
-                  access_count: meta.access_count + 1,
-                  last_accessed_at: now,
-                },
-                scopeFilter,
-              );
-            }),
-          );
+          if (results.length > 0) {
+            const now = Date.now();
+            await Promise.allSettled(
+              results.map((result) => {
+                const meta = parseSmartMetadata(result.entry.metadata, result.entry);
+                return runtimeContext.store.patchMetadata(
+                  result.entry.id,
+                  {
+                    access_count: meta.access_count + 1,
+                    last_accessed_at: now,
+                  },
+                  scopeFilter,
+                );
+              }),
+            );
+          }
 
-          const text = results
-            .map((r, i) => {
-              const categoryTag = getDisplayCategoryTag(r.entry);
-              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text}`;
-            })
-            .join("\n");
+          const layer2Text = results.length > 0
+            ? results
+              .map((r, i) => {
+                const categoryTag = getDisplayCategoryTag(r.entry);
+                return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text}`;
+              })
+              .join("\n")
+            : "No relevant memories found in Layer 2.";
+
+          const parts = [
+            `Layer 2 (${results.length} result${results.length === 1 ? "" : "s"}):\n\n${layer2Text}`,
+          ];
+          if (layer3Result?.ok) {
+            const safeLayer3 = truncateLayer3Text(layer3Result.text ?? "", 3000);
+            layer3TruncationInfo = {
+              originalLength: safeLayer3.originalLength,
+              keptLength: safeLayer3.keptLength,
+              truncated: safeLayer3.truncated,
+            };
+            parts.push(`Layer 3 (NotebookLM):\n\n${safeLayer3.text}`);
+          } else if (layer3Decision.shouldFallback && layer3Result && !layer3Result.ok) {
+            parts.push(`Layer 3 (NotebookLM) failed, returning Layer 2 only.\n\nReason: ${layer3Result.error}`);
+          }
 
           return {
             content: [
               {
                 type: "text",
-                text: `Found ${results.length} memories:\n\n${text}`,
+                text: parts.join("\n\n---\n\n"),
               },
             ],
             details: {
@@ -503,6 +887,27 @@ export function registerMemoryRecallTool(
               query,
               scopes: scopeFilter,
               retrievalMode: runtimeContext.retriever.getConfig().mode,
+              sources: {
+                layer2: {
+                  used: true,
+                  count: results.length,
+                },
+                layer3: {
+                  attempted: layer3Decision.shouldFallback,
+                  used: layer3Result?.ok === true,
+                  fallbackTriggered: layer3Decision.shouldFallback,
+                  reasons: layer3Decision.reasons,
+                  metrics: layer3Decision.metrics,
+                  agent: resolveLayer3FallbackSettings(runtimeContext.layer3Fallback).agent,
+                  notebook: resolveLayer3FallbackSettings(runtimeContext.layer3Fallback).notebook,
+                  error: layer3Result && !layer3Result.ok ? layer3Result.error : undefined,
+                  response: layer3Result?.ok ? layer3Result.text : undefined,
+                  attempts: layer3Result?.attempts,
+                  skippedRetry: layer3Result?.skippedRetry,
+                  parseMode: layer3Result?.ok ? layer3Result.parseMode : undefined,
+                  truncation: layer3TruncationInfo,
+                },
+              },
             },
           };
         } catch (error) {
@@ -1138,7 +1543,7 @@ export function registerMemoryStatsTool(
         const { scope } = params as { scope?: string };
 
         try {
-          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
+          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx) || 'main';
           // Determine accessible scopes
           let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
@@ -1253,7 +1658,7 @@ export function registerMemoryListTool(
         try {
           const safeLimit = clampInt(limit, 1, 50);
           const safeOffset = clampInt(offset, 0, 1000);
-          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
+          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx) || 'main';
 
           // Determine accessible scopes
           let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);

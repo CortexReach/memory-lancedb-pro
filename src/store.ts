@@ -20,6 +20,7 @@ import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmar
 // ============================================================================
 
 export interface MemoryEntry {
+  [key: string]: unknown;
   id: string;
   text: string;
   vector: number[];
@@ -323,10 +324,14 @@ export class MemoryStore {
     await this.ensureInitialized();
 
     const fullEntry: MemoryEntry = {
-      ...entry,
       id: randomUUID(),
+      text: entry.text as string,
+      vector: entry.vector as number[],
+      category: entry.category as MemoryEntry["category"],
+      scope: entry.scope as string,
+      importance: entry.importance as number,
       timestamp: Date.now(),
-      metadata: entry.metadata || "{}",
+      metadata: (typeof entry.metadata === "string" ? entry.metadata : undefined) || "{}",
     };
 
     try {
@@ -367,7 +372,7 @@ export class MemoryStore {
       timestamp: Number.isFinite(entry.timestamp)
         ? entry.timestamp
         : Date.now(),
-      metadata: entry.metadata || "{}",
+      metadata: (typeof entry.metadata === "string" ? entry.metadata : undefined) || "{}",
     };
 
     await this.table!.add([full]);

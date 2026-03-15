@@ -15,8 +15,10 @@ import { spawn } from "node:child_process";
 
 // Import core components
 import { MemoryStore, validateStoragePath } from "./src/store.js";
+import type { MemoryEntry } from "./src/store.js";
 import { createEmbedder, getVectorDimensions } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
+import type { RetrievalResult } from "./src/retriever.js";
 import { createScopeManager } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
@@ -56,6 +58,22 @@ import {
 // ============================================================================
 // Configuration & Types
 // ============================================================================
+
+interface Layer3FallbackConfig {
+  enabled?: boolean;
+  agent?: string;
+  notebook?: string;
+  notebookId?: string;
+  timeout?: number;
+  triggers?: {
+    timeKeywords?: string[];
+    reasoningKeywords?: string[];
+    minResults?: number;
+    minScore?: number;
+    minAvgScore?: number;
+    explicitKeywords?: string[];
+  };
+}
 
 interface PluginConfig {
   embedding: {
@@ -162,6 +180,7 @@ interface PluginConfig {
     dedupeErrorSignals?: boolean;
   };
   mdMirror?: { enabled?: boolean; dir?: string };
+  layer3Fallback?: Layer3FallbackConfig;
 }
 
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
@@ -195,6 +214,11 @@ function resolveEnvVars(value: string): string {
     }
     return envValue;
   });
+}
+
+function resolveApiKeyValue(value: string | string[]): string {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return resolveEnvVars(raw);
 }
 
 function parsePositiveInt(value: unknown): number | undefined {
@@ -1426,6 +1450,13 @@ function sanitizeFileToken(value: string, fallback: string): string {
   return normalized || fallback;
 }
 
+function parseSessionIdFromSessionFile(sessionFile: string | undefined): string | undefined {
+  if (!sessionFile) return undefined;
+  const base = basename(sessionFile).replace(/\.reset\..*$/, "");
+  const match = /^(.*)\.jsonl$/.exec(base);
+  return match?.[1];
+}
+
 async function findPreviousSessionFile(
   sessionsDir: string,
   currentSessionFile?: string,
@@ -1649,7 +1680,7 @@ const memoryLanceDBProPlugin = {
       try {
         const llmApiKey = config.llm?.apiKey
           ? resolveEnvVars(config.llm.apiKey)
-          : resolveEnvVars(config.embedding.apiKey);
+          : resolveApiKeyValue(config.embedding.apiKey);
         const llmBaseURL = config.llm?.baseURL
           ? resolveEnvVars(config.llm.baseURL)
           : config.embedding.baseURL;
@@ -1706,14 +1737,14 @@ const memoryLanceDBProPlugin = {
     }
 
     async function runRecallLifecycle(
-      results: Array<{ entry: { id: string; text: string; category: "preference" | "fact" | "decision" | "entity" | "other"; scope: string; importance: number; timestamp: number; metadata?: string } }>,
+      results: RetrievalResult[],
       scopeFilter: string[],
     ): Promise<Map<string, string>> {
       const now = Date.now();
       type LifecycleEntry = {
         id: string;
         text: string;
-        category: "preference" | "fact" | "decision" | "entity" | "other";
+        category: MemoryEntry["category"];
         scope: string;
         importance: number;
         timestamp: number;
@@ -1945,6 +1976,7 @@ const memoryLanceDBProPlugin = {
         agentId: undefined, // Will be determined at runtime from context
         workspaceDir: getDefaultWorkspaceDir(),
         mdMirror,
+        layer3Fallback: config.layer3Fallback,
       },
       {
         enableManagementTools: config.enableManagementTools,
@@ -1967,7 +1999,7 @@ const memoryLanceDBProPlugin = {
           try {
             const llmApiKey = config.llm?.apiKey
               ? resolveEnvVars(config.llm.apiKey)
-              : resolveEnvVars(config.embedding.apiKey);
+              : resolveApiKeyValue(config.embedding.apiKey);
             const llmBaseURL = config.llm?.baseURL
               ? resolveEnvVars(config.llm.baseURL)
               : config.embedding.baseURL;
@@ -2012,7 +2044,6 @@ const memoryLanceDBProPlugin = {
             query: event.prompt,
             limit: 3,
             scopeFilter: accessibleScopes,
-            source: "auto-recall",
           });
 
           if (results.length === 0) {
@@ -2442,17 +2473,21 @@ const memoryLanceDBProPlugin = {
           }
         };
 
-        api.registerHook("command:new", appendSelfImprovementNote, {
-          name: "memory-lancedb-pro.self-improvement.command-new",
-          description: "Append self-improvement note before /new",
-        });
-        api.registerHook("command:reset", appendSelfImprovementNote, {
-          name: "memory-lancedb-pro.self-improvement.command-reset",
-          description: "Append self-improvement note before /reset",
+        api.on("before_reset", async (event, ctx) => {
+          const actionRaw = typeof event.reason === "string" ? event.reason.trim().toLowerCase() : "reset";
+          const action = actionRaw === "new" ? "new" : "reset";
+          await appendSelfImprovementNote({
+            action,
+            sessionKey: typeof ctx.sessionKey === "string" ? ctx.sessionKey : "",
+            messages: Array.isArray(event.messages) ? event.messages : [],
+            context: {
+              commandSource: `lifecycle:before_reset:${action}`,
+            },
+          });
         });
       }
 
-      api.logger.info("self-improvement: integrated hooks registered (agent:bootstrap, command:new, command:reset)");
+      api.logger.info("self-improvement: integrated hooks registered (agent:bootstrap, before_reset)");
     }
 
     // ========================================================================
@@ -2867,15 +2902,34 @@ const memoryLanceDBProPlugin = {
         }
       };
 
-      api.registerHook("command:new", runMemoryReflection, {
-        name: "memory-lancedb-pro.memory-reflection.command-new",
-        description: "Generate reflection log before /new",
+      api.on("before_reset", async (event, ctx) => {
+        try {
+          const actionRaw = typeof event.reason === "string" ? event.reason.trim().toLowerCase() : "reset";
+          const action = actionRaw === "new" ? "new" : "reset";
+          const sessionFile = typeof event.sessionFile === "string" ? event.sessionFile : undefined;
+          const sessionId = parseSessionIdFromSessionFile(sessionFile) ?? "unknown";
+          await runMemoryReflection({
+            action,
+            sessionKey: typeof ctx.sessionKey === "string" ? ctx.sessionKey : "",
+            timestamp: Date.now(),
+            messages: Array.isArray(event.messages) ? event.messages : [],
+            context: {
+              cfg: ((api as any).config && typeof (api as any).config === "object")
+                ? (api as any).config
+                : {},
+              workspaceDir: ctx.workspaceDir,
+              commandSource: `lifecycle:before_reset:${action}`,
+              sessionEntry: {
+                sessionId,
+                sessionFile,
+              },
+            },
+          });
+        } catch (err) {
+          api.logger.warn(`memory-reflection: before_reset fallback failed: ${String(err)}`);
+        }
       });
-      api.registerHook("command:reset", runMemoryReflection, {
-        name: "memory-lancedb-pro.memory-reflection.command-reset",
-        description: "Generate reflection log before /reset",
-      });
-      api.logger.info("memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_agent_start, before_prompt_build)");
+      api.logger.info("memory-reflection: integrated hooks registered (before_reset, after_tool_call, before_agent_start, before_prompt_build)");
     }
 
     if (config.sessionStrategy === "systemSessionMemory") {
@@ -3334,6 +3388,32 @@ export function parsePluginConfig(value: unknown): PluginConfig {
             typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
               ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
               : undefined,
+        }
+        : undefined,
+    layer3Fallback:
+      typeof cfg.layer3Fallback === "object" && cfg.layer3Fallback !== null
+        ? {
+          enabled: (cfg.layer3Fallback as Record<string, unknown>).enabled === true,
+          agent: asNonEmptyString((cfg.layer3Fallback as Record<string, unknown>).agent) ?? "notebooklm",
+          notebook: asNonEmptyString((cfg.layer3Fallback as Record<string, unknown>).notebook) ?? "memory-archive",
+          notebookId: asNonEmptyString((cfg.layer3Fallback as Record<string, unknown>).notebookId),
+          timeout: parsePositiveInt((cfg.layer3Fallback as Record<string, unknown>).timeout) ?? 45,
+          triggers: (() => {
+            const triggers = (cfg.layer3Fallback as Record<string, unknown>).triggers;
+            if (!triggers || typeof triggers !== "object" || Array.isArray(triggers)) return undefined;
+            const obj = triggers as Record<string, unknown>;
+            const toStringArray = (value: unknown) => Array.isArray(value)
+              ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+              : undefined;
+            return {
+              timeKeywords: toStringArray(obj.timeKeywords),
+              reasoningKeywords: toStringArray(obj.reasoningKeywords),
+              minResults: parsePositiveInt(obj.minResults),
+              minScore: typeof obj.minScore === "number" ? obj.minScore : undefined,
+              minAvgScore: typeof obj.minAvgScore === "number" ? obj.minAvgScore : undefined,
+              explicitKeywords: toStringArray(obj.explicitKeywords),
+            };
+          })(),
         }
         : undefined,
   };

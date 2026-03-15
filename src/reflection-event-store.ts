@@ -7,6 +7,7 @@ export type ReflectionErrorSignalLike = {
 };
 
 export interface ReflectionEventMetadata {
+  [key: string]: unknown;
   type: "memory-reflection-event";
   reflectionVersion: 4;
   stage: "reflect-store";

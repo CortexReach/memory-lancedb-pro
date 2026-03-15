@@ -50,6 +50,7 @@ export interface UpgradeResult {
 }
 
 interface EnrichedMetadata {
+  [key: string]: unknown;
   l0_abstract: string;
   l1_overview: string;
   l2_content: string;

@@ -3,6 +3,7 @@ import type { ReflectionSliceItem } from "./reflection-slices.js";
 export type ReflectionItemKind = "invariant" | "derived";
 
 export interface ReflectionItemMetadata {
+  [key: string]: unknown;
   type: "memory-reflection-item";
   reflectionVersion: 4;
   stage: "reflect-store";

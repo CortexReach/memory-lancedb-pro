@@ -78,6 +78,26 @@ assert.equal(
   false,
   "sessionMemory.enabled schema default should match runtime default",
 );
+assert.equal(
+  manifest.configSchema.properties.layer3Fallback.properties.enabled.default,
+  false,
+  "layer3Fallback.enabled schema default should stay backward-compatible",
+);
+assert.equal(
+  manifest.configSchema.properties.layer3Fallback.properties.timeout.default,
+  45,
+  "layer3Fallback.timeout schema default should match runtime default",
+);
+assert.equal(
+  manifest.layer3Fallback.enabled,
+  false,
+  "manifest layer3Fallback default config should remain disabled",
+);
+assert.equal(
+  manifest.layer3Fallback.timeout,
+  45,
+  "manifest layer3Fallback timeout should match runtime default",
+);
 assert.ok(
   manifest.configSchema.properties.retrieval.properties.rerankProvider.enum.includes("tei"),
   "rerankProvider schema should include tei",
