@@ -495,6 +495,11 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           }
         }
 
+        // Close store to flush pending writes
+        if (context.store.close) {
+          await context.store.close();
+        }
+
         console.log(`Import completed: ${imported} imported, ${skipped} skipped`);
       } catch (error) {
         console.error("Import failed:", error);
