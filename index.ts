@@ -37,7 +37,14 @@ import {
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
+import {
+  detectAtomicUnitType,
+  normalizeAndStoreAutoCaptureCandidates,
+  storeAutoCaptureCandidates,
+  type AutoCaptureCandidate,
+} from "./src/auto-capture.js";
 import { isNoise } from "./src/noise-filter.js";
+import { createMemoryNormalizer, type NormalizerConfig } from "./src/normalizer.js";
 
 // Import smart extraction & lifecycle components
 import { SmartExtractor } from "./src/smart-extractor.js";
@@ -75,6 +82,22 @@ interface PluginConfig {
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
   captureAssistant?: boolean;
+  normalization?: {
+    enabled?: boolean;
+    apiKey?: string;
+    model?: string;
+    baseURL?: string;
+    temperature?: number;
+    maxTokens?: number;
+    enableThinking?: boolean;
+    timeoutMs?: number;
+    maxEntriesPerCandidate?: number;
+    fallbackMode?: "rules-then-raw" | "raw-only";
+    audit?: {
+      enabled?: boolean;
+      logPath?: string;
+    };
+  };
   retrieval?: {
     mode?: "hybrid" | "vector";
     vectorWeight?: number;
@@ -1642,6 +1665,17 @@ const memoryLanceDBProPlugin = {
     );
     const scopeManager = createScopeManager(config.scopes);
     const migrator = createMigrator(store);
+    let normalizer: ReturnType<typeof createMemoryNormalizer> | null = null;
+    if (config.normalization?.enabled) {
+      try {
+        normalizer = createMemoryNormalizer(
+          resolveNormalizerConfig(config.normalization, resolvedDbPath),
+          api.logger,
+        );
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: normalizer init failed, continuing without normalization: ${String(err)}`);
+      }
+    }
 
     // Initialize smart extraction
     let smartExtractor: SmartExtractor | null = null;
@@ -1890,7 +1924,7 @@ const memoryLanceDBProPlugin = {
     _autoCaptureDebugLog = (msg: string) => api.logger.debug(msg);
 
     api.logger.info(
-      `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
+      `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? "ON" : "OFF"}, normalizer: ${normalizer ? "ON" : "OFF"})`
     );
     api.logger.info(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
 
@@ -1942,6 +1976,7 @@ const memoryLanceDBProPlugin = {
         store,
         scopeManager,
         embedder,
+        normalizer,
         agentId: undefined, // Will be determined at runtime from context
         workspaceDir: getDefaultWorkspaceDir(),
         mdMirror,
@@ -2284,57 +2319,81 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: regex fallback found ${toCapture.length} capturable text(s) for agent ${agentId}`,
           );
 
-          // Store each capturable piece (limit to 3 per conversation)
-          let stored = 0;
-          for (const text of toCapture.slice(0, 3)) {
-            const category = detectCategory(text);
-            const vector = await embedder.embedPassage(text);
+          const captureCandidates: AutoCaptureCandidate[] = [];
+          for (const msg of event.messages) {
+            if (!msg || typeof msg !== "object") continue;
+            const msgObj = msg as Record<string, unknown>;
+            const role = msgObj.role === "assistant" ? "assistant" : msgObj.role === "user" ? "user" : null;
+            if (!role) continue;
+            if (role === "assistant" && config.captureAssistant !== true) continue;
 
-            // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
-            // Fail-open by design: dedup should not block auto-capture writes.
-            let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
-            try {
-              existing = await store.vectorSearch(vector, 1, 0.1, [
-                defaultScope,
-              ]);
-            } catch (err) {
-              api.logger.warn(
-                `memory-lancedb-pro: auto-capture duplicate pre-check failed, continue store: ${String(err)}`,
-              );
+            const content = msgObj.content;
+            const textBlocks: string[] = typeof content === "string"
+              ? [content]
+              : Array.isArray(content)
+                ? content.flatMap((block) => (
+                    block &&
+                    typeof block === "object" &&
+                    "type" in block &&
+                    (block as Record<string, unknown>).type === "text" &&
+                    typeof (block as Record<string, unknown>).text === "string"
+                  ) ? [(block as Record<string, unknown>).text as string] : [])
+                : [];
+
+            for (const blockText of textBlocks) {
+              const normalized = normalizeAutoCaptureText(role, blockText);
+              if (!normalized || !toCapture.includes(normalized)) continue;
+              const category = detectCategory(normalized);
+              captureCandidates.push({
+                text: normalized,
+                role,
+                sourceKind: role === "assistant" ? "agent" : "user",
+                category,
+                unitType: detectAtomicUnitType(normalized, category),
+              });
+              if (captureCandidates.length >= 3) break;
             }
+            if (captureCandidates.length >= 3) break;
+          }
 
-            if (existing.length > 0 && existing[0].score > 0.95) {
-              continue;
+          if (captureCandidates.length === 0) {
+            for (const text of toCapture.slice(0, 3)) {
+              const category = detectCategory(text);
+              captureCandidates.push({
+                text,
+                role: "user",
+                sourceKind: "user",
+                category,
+                unitType: detectAtomicUnitType(text, category),
+              });
             }
+          }
 
-            await store.store({
-              text,
-              vector,
-              importance: 0.7,
-              category,
-              scope: defaultScope,
-              metadata: stringifySmartMetadata(
-                buildSmartMetadata(
-                  {
-                    text,
-                    category,
-                    importance: 0.7,
-                  },
-                  {
-                    l0_abstract: text,
-                    l1_overview: `- ${text}`,
-                    l2_content: text,
-                    source_session: (event as any).sessionKey || "unknown",
-                  },
-                ),
-              ),
-            });
-            stored++;
+          const storedEntries = normalizer
+            ? await normalizeAndStoreAutoCaptureCandidates({
+                candidates: captureCandidates,
+                store,
+                embedder,
+                scope: defaultScope,
+                importance: 0.7,
+                limit: config.normalization?.maxEntriesPerCandidate ?? 3,
+                normalizer,
+                agentId,
+              })
+            : await storeAutoCaptureCandidates({
+                candidates: captureCandidates,
+                store,
+                embedder,
+                scope: defaultScope,
+                importance: 0.7,
+                limit: 3,
+              });
+          const stored = storedEntries.length;
 
-            // Dual-write to Markdown mirror if enabled
-            if (mdMirror) {
+          if (mdMirror) {
+            for (const entry of storedEntries) {
               await mdMirror(
-                { text, category, scope: defaultScope, timestamp: Date.now() },
+                { text: entry.text, category: entry.category, scope: defaultScope, timestamp: entry.timestamp },
                 { source: "auto-capture", agentId },
               );
             }
@@ -3257,6 +3316,9 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
     captureAssistant: cfg.captureAssistant === true,
+    normalization: typeof cfg.normalization === "object" && cfg.normalization !== null
+      ? cfg.normalization as any
+      : undefined,
     retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null ? cfg.retrieval as any : undefined,
     decay: typeof cfg.decay === "object" && cfg.decay !== null ? cfg.decay as any : undefined,
     tier: typeof cfg.tier === "object" && cfg.tier !== null ? cfg.tier as any : undefined,
@@ -3336,6 +3398,42 @@ export function parsePluginConfig(value: unknown): PluginConfig {
               : undefined,
         }
         : undefined,
+  };
+}
+
+function resolveNormalizerConfig(
+  normalization: NonNullable<PluginConfig["normalization"]>,
+  resolvedDbPath: string,
+): NormalizerConfig {
+  const auditConfig = normalization.audit && typeof normalization.audit === "object" ? normalization.audit : {};
+  const auditPathRaw = typeof auditConfig.logPath === "string"
+    ? resolveEnvVars(auditConfig.logPath)
+    : join(dirname(resolvedDbPath), "normalizer-audit.jsonl");
+  const apiKey = typeof normalization.apiKey === "string" && normalization.apiKey.trim()
+    ? resolveEnvVars(normalization.apiKey)
+    : process.env.MEMORY_NORMALIZER_API_KEY || process.env.SILICONFLOW_API_KEY || "";
+
+  if (!apiKey) {
+    throw new Error("normalization.apiKey is required when normalization.enabled=true");
+  }
+
+  return {
+    enabled: normalization.enabled === true,
+    apiKey,
+    model: typeof normalization.model === "string" ? normalization.model : "Qwen/Qwen3-8B",
+    baseURL: typeof normalization.baseURL === "string"
+      ? resolveEnvVars(normalization.baseURL)
+      : "https://api.siliconflow.cn/v1/chat/completions",
+    temperature: typeof normalization.temperature === "number" ? normalization.temperature : 0.1,
+    maxTokens: parsePositiveInt(normalization.maxTokens) ?? 1200,
+    enableThinking: normalization.enableThinking === true,
+    timeoutMs: parsePositiveInt(normalization.timeoutMs) ?? 12_000,
+    maxEntriesPerCandidate: parsePositiveInt(normalization.maxEntriesPerCandidate) ?? 3,
+    fallbackMode: normalization.fallbackMode === "raw-only" ? "raw-only" : "rules-then-raw",
+    audit: {
+      enabled: auditConfig.enabled !== false,
+      logPath: auditPathRaw,
+    },
   };
 }
 

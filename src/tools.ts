@@ -10,9 +10,19 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { MemoryRetriever, RetrievalResult } from "./retriever.js";
 import type { MemoryStore } from "./store.js";
+import {
+  ATOMIC_MEMORY_SOURCE_KINDS,
+  ATOMIC_MEMORY_UNIT_TYPES,
+  buildAtomicMemoryMetadata,
+  describeKnowledgeUnit,
+  extractAtomicMemory,
+  type AtomicMemoryInput,
+} from "./atomic-memory.js";
 import { isNoise } from "./noise-filter.js";
 import type { MemoryScopeManager } from "./scopes.js";
 import type { Embedder } from "./embedder.js";
+import type { createMemoryNormalizer } from "./normalizer.js";
+import type { NormalizedMemoryDraft } from "./normalization-types.js";
 import {
   appendRelation,
   buildSmartMetadata,
@@ -53,6 +63,7 @@ interface ToolContext {
   store: MemoryStore;
   scopeManager: MemoryScopeManager;
   embedder: Embedder;
+  normalizer?: ReturnType<typeof createMemoryNormalizer> | null;
   agentId?: string;
   workspaceDir?: string;
   mdMirror?: MdMirrorWriter | null;
@@ -78,17 +89,106 @@ function clamp01(value: number, fallback = 0.7): number {
   return Math.min(1, Math.max(0, value));
 }
 
+function looksEnvironmentFact(text: string): boolean {
+  return /\b(path|shell|node|npm|pnpm|zsh|bash|launchd|gateway|workspace|env|environment|runtime|cli|curl|python|log|logs|test|tests|playwright)\b|环境|環境|路径|路徑|运行时|運行時|终端|終端|日志|日誌|测试|測試|命令/.test(text.toLowerCase());
+}
+
+function inferAtomicForStore(
+  category: string,
+  text: string,
+  confidence: number,
+): AtomicMemoryInput | undefined {
+  switch (category) {
+    case "preference":
+      return { unitType: "preference", sourceKind: "user", confidence };
+    case "decision":
+      return { unitType: "decision", sourceKind: "user", confidence };
+    case "entity":
+      return { unitType: "entity", sourceKind: "user", confidence };
+    case "fact":
+      if (looksEnvironmentFact(text)) {
+        return { unitType: "environment", sourceKind: "tool", confidence };
+      }
+      return { unitType: "fact", sourceKind: "agent", confidence };
+    default:
+      return undefined;
+  }
+}
+
+const atomicMemoryInputSchema = Type.Object(
+  {
+    unitType: Type.Optional(stringEnum(ATOMIC_MEMORY_UNIT_TYPES)),
+    sourceKind: Type.Optional(stringEnum(ATOMIC_MEMORY_SOURCE_KINDS)),
+    confidence: Type.Optional(Type.Number({ description: "Confidence score 0-1 (defaults to importance)" })),
+    sourceRef: Type.Optional(Type.String({ description: "Optional source reference for this atomic memory" })),
+    tags: Type.Optional(Type.Array(Type.String({ description: "Short keyword tag" }))),
+  },
+  { additionalProperties: false },
+);
+
 function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
-  return results.map((r) => ({
-    id: r.entry.id,
-    text: r.entry.text,
-    category: getDisplayCategoryTag(r.entry),
-    rawCategory: r.entry.category,
-    scope: r.entry.scope,
-    importance: r.entry.importance,
-    score: r.score,
-    sources: r.sources,
-  }));
+  return results.map((r) => {
+    const atomic = extractAtomicMemory(r.entry.metadata);
+    return {
+      id: r.entry.id,
+      text: r.entry.text,
+      category: getDisplayCategoryTag(r.entry),
+      rawCategory: r.entry.category,
+      scope: r.entry.scope,
+      importance: r.entry.importance,
+      score: r.score,
+      sources: r.sources,
+      ...(atomic ? { atomic } : {}),
+      knowledgeUnit: describeKnowledgeUnit(r.entry),
+    };
+  });
+}
+
+async function storeDrafts(
+  drafts: NormalizedMemoryDraft[],
+  context: Pick<ToolContext, "store" | "embedder">,
+  targetScope: string,
+  defaultImportance = 0.7,
+) {
+  const stored = [];
+
+  for (const draft of drafts) {
+    const vector = await context.embedder.embedPassage(draft.canonicalText);
+    let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
+    try {
+      existing = await context.store.vectorSearch(vector, 1, 0.1, [targetScope], {
+        excludeInactive: true,
+      });
+    } catch (err) {
+      console.warn(
+        `memory-lancedb-pro: normalized duplicate pre-check failed, continue store: ${String(err)}`,
+      );
+    }
+    if (existing.length > 0 && existing[0].score > 0.98) {
+      continue;
+    }
+
+    const metadata = buildAtomicMemoryMetadata(draft.category, {
+      unitType: draft.atomic.unitType,
+      sourceKind: draft.atomic.sourceKind,
+      confidence: draft.atomic.confidence ?? defaultImportance,
+      sourceRef: draft.atomic.sourceRef,
+      tags: draft.atomic.tags,
+    });
+
+    const entry = await context.store.store({
+      text: draft.canonicalText,
+      vector,
+      importance: defaultImportance,
+      category: draft.category,
+      scope: targetScope,
+      ...(metadata ? { metadata } : {}),
+    });
+
+    stored.push(entry);
+  }
+
+  return stored;
 }
 
 function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
@@ -546,6 +646,7 @@ export function registerMemoryStoreTool(
             description: "Memory scope (optional, defaults to agent scope)",
           }),
         ),
+        atomic: Type.Optional(atomicMemoryInputSchema),
       }),
       async execute(_toolCallId, params) {
         const {
@@ -553,11 +654,13 @@ export function registerMemoryStoreTool(
           importance = 0.7,
           category = "other",
           scope,
+          atomic,
         } = params as {
           text: string;
           importance?: number;
           category?: string;
           scope?: string;
+          atomic?: AtomicMemoryInput;
         };
 
         try {
@@ -595,83 +698,173 @@ export function registerMemoryStoreTool(
           }
 
           const safeImportance = clamp01(importance, 0.7);
-          const vector = await runtimeContext.embedder.embedPassage(text);
+          const inferredAtomic = inferAtomicForStore(category, text, safeImportance);
+          const effectiveAtomic = atomic ?? inferredAtomic;
 
-          // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
-          // Fail-open by design: dedup must never block a legitimate memory write.
-          // excludeInactive: superseded historical records must not block new writes.
-          let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
-          try {
-            existing = await runtimeContext.store.vectorSearch(vector, 1, 0.1, [
-              targetScope,
-            ], { excludeInactive: true });
-          } catch (err) {
-            console.warn(
-              `memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`,
-            );
-          }
+          if (atomic || !runtimeContext.normalizer) {
+            const vector = await runtimeContext.embedder.embedPassage(text);
 
-          if (existing.length > 0 && existing[0].score > 0.98) {
+            // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
+            // Fail-open by design: dedup must never block a legitimate memory write.
+            // excludeInactive: superseded historical records must not block new writes.
+            let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
+            try {
+              existing = await runtimeContext.store.vectorSearch(vector, 1, 0.1, [
+                targetScope,
+              ], { excludeInactive: true });
+            } catch (err) {
+              console.warn(
+                `memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`,
+              );
+            }
+
+            if (existing.length > 0 && existing[0].score > 0.98) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Similar memory already exists: "${existing[0].entry.text}"`,
+                  },
+                ],
+                details: {
+                  action: "duplicate",
+                  existingId: existing[0].entry.id,
+                  existingText: existing[0].entry.text,
+                  existingScope: existing[0].entry.scope,
+                  similarity: existing[0].score,
+                  existingKnowledgeUnit: describeKnowledgeUnit(existing[0].entry),
+                },
+              };
+            }
+
+            const metadata = effectiveAtomic
+              ? buildAtomicMemoryMetadata(category, {
+                  ...effectiveAtomic,
+                  confidence: effectiveAtomic.confidence ?? safeImportance,
+                })
+              : stringifySmartMetadata(
+                  buildSmartMetadata(
+                    {
+                      text,
+                      category: category as any,
+                      importance: safeImportance,
+                    },
+                    {
+                      l0_abstract: text,
+                      l1_overview: `- ${text}`,
+                      l2_content: text,
+                    },
+                  ),
+                );
+
+            const entry = await runtimeContext.store.store({
+              text,
+              vector,
+              importance: safeImportance,
+              category: category as any,
+              scope: targetScope,
+              ...(metadata ? { metadata } : {}),
+            });
+
+            if (runtimeContext.mdMirror) {
+              await runtimeContext.mdMirror(
+                { text, category: category as string, scope: targetScope, timestamp: entry.timestamp },
+                { source: "memory_store", agentId },
+              );
+            }
+
+            const atomicMemory = extractAtomicMemory(entry.metadata);
+            const knowledgeUnit = describeKnowledgeUnit(entry);
+
             return {
               content: [
                 {
                   type: "text",
-                  text: `Similar memory already exists: "${existing[0].entry.text}"`,
+                  text: `Stored: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}" in scope '${targetScope}'`,
                 },
               ],
               details: {
-                action: "duplicate",
-                existingId: existing[0].entry.id,
-                existingText: existing[0].entry.text,
-                existingScope: existing[0].entry.scope,
-                similarity: existing[0].score,
+                action: "created",
+                id: entry.id,
+                scope: entry.scope,
+                category: entry.category,
+                importance: entry.importance,
+                ...(atomicMemory ? { atomic: atomicMemory } : {}),
+                knowledgeUnit,
               },
             };
           }
 
-          const entry = await runtimeContext.store.store({
+          const normalizedEntries = await runtimeContext.normalizer.normalizeCandidate({
             text,
-            vector,
-            importance: safeImportance,
+            role: "user",
+            sourceKind: effectiveAtomic?.sourceKind === "agent" || effectiveAtomic?.sourceKind === "imported"
+              ? effectiveAtomic.sourceKind
+              : "user",
             category: category as any,
+            unitType: effectiveAtomic?.unitType ?? (inferredAtomic?.unitType ?? "other"),
+          }, {
+            agentId: runtimeContext.agentId,
             scope: targetScope,
-            metadata: stringifySmartMetadata(
-              buildSmartMetadata(
-                {
-                  text,
-                  category: category as any,
-                  importance: safeImportance,
-                },
-                {
-                  l0_abstract: text,
-                  l1_overview: `- ${text}`,
-                  l2_content: text,
-                },
-              ),
-            ),
+            source: "memory_store",
+            confidence: safeImportance,
+            sourceRef: "memory_store",
           });
 
-          // Dual-write to Markdown mirror if enabled
-          if (context.mdMirror) {
-            await context.mdMirror(
-              { text, category: category as string, scope: targetScope, timestamp: entry.timestamp },
-              { source: "memory_store", agentId },
-            );
+          const created = await storeDrafts(normalizedEntries, runtimeContext, targetScope, safeImportance);
+
+          if (created.length === 0) {
+            return {
+              content: [{ type: "text", text: `No new memory stored. Normalized result matched existing memories in scope '${targetScope}'.` }],
+              details: {
+                action: "duplicate_after_normalization",
+                scope: targetScope,
+                normalized: normalizedEntries.map((entry) => ({
+                  text: entry.canonicalText,
+                  category: entry.category,
+                  atomic: entry.atomic,
+                })),
+              },
+            };
           }
 
+          if (runtimeContext.mdMirror) {
+            for (const entry of created) {
+              await runtimeContext.mdMirror(
+                { text: entry.text, category: entry.category, scope: entry.scope, timestamp: entry.timestamp },
+                { source: "memory_store", agentId },
+              );
+            }
+          }
+
+          const knowledgeUnits = created.map((entry) => describeKnowledgeUnit(entry));
           return {
-            content: [
-              {
-                type: "text",
-                text: `Stored: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}" in scope '${targetScope}'`,
-              },
-            ],
+            content: [{
+              type: "text",
+              text: created.length === 1
+                ? `Stored normalized memory in scope '${targetScope}': "${created[0].text.slice(0, 100)}${created[0].text.length > 100 ? "..." : ""}"`
+                : `Stored ${created.length} normalized memories in scope '${targetScope}'.`,
+            }],
             details: {
-              action: "created",
-              id: entry.id,
-              scope: entry.scope,
-              category: entry.category,
-              importance: entry.importance,
+              action: created.length === 1 ? "created" : "created_batch",
+              count: created.length,
+              ids: created.map((entry) => entry.id),
+              memories: created.map((entry) => ({
+                id: entry.id,
+                text: entry.text,
+                category: entry.category,
+                scope: entry.scope,
+                importance: entry.importance,
+                atomic: extractAtomicMemory(entry.metadata),
+              })),
+              knowledgeUnits,
+              normalization: normalizedEntries.map((entry) => ({
+                canonicalText: entry.canonicalText,
+                category: entry.category,
+                atomic: entry.atomic,
+                normalizationMode: entry.normalizationMode,
+                reason: entry.reason,
+              })),
             },
           };
         } catch (error) {

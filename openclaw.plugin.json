@@ -108,6 +108,76 @@
       "captureAssistant": {
         "type": "boolean"
       },
+      "normalization": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "apiKey": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string",
+            "default": "Qwen/Qwen3-8B"
+          },
+          "baseURL": {
+            "type": "string",
+            "default": "https://api.siliconflow.cn/v1/chat/completions"
+          },
+          "temperature": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2,
+            "default": 0.1
+          },
+          "maxTokens": {
+            "type": "integer",
+            "minimum": 64,
+            "maximum": 8192,
+            "default": 1200
+          },
+          "enableThinking": {
+            "type": "boolean",
+            "default": false
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 60000,
+            "default": 12000
+          },
+          "maxEntriesPerCandidate": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "default": 3
+          },
+          "fallbackMode": {
+            "type": "string",
+            "enum": [
+              "rules-then-raw",
+              "raw-only"
+            ],
+            "default": "rules-then-raw"
+          },
+          "audit": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "logPath": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
       "smartExtraction": {
         "type": "boolean",
         "default": true,
@@ -562,6 +632,70 @@
     "captureAssistant": {
       "label": "Capture Assistant Messages",
       "help": "Also auto-capture assistant messages (default false to reduce memory pollution)",
+      "advanced": true
+    },
+    "normalization.enabled": {
+      "label": "Memory Normalizer",
+      "help": "Normalize auto-captured memories before storing them. Keeps the main agent free while improving long-term memory quality.",
+      "advanced": true
+    },
+    "normalization.apiKey": {
+      "label": "Normalizer API Key",
+      "sensitive": true,
+      "placeholder": "sk-... or ${SILICONFLOW_API_KEY}",
+      "help": "API key for the chat-completions compatible normalizer model.",
+      "advanced": true
+    },
+    "normalization.model": {
+      "label": "Normalizer Model",
+      "placeholder": "Qwen/Qwen3-8B",
+      "help": "Model used only for memory normalization. Recommended: Qwen/Qwen3-8B on SiliconFlow.",
+      "advanced": true
+    },
+    "normalization.baseURL": {
+      "label": "Normalizer Endpoint",
+      "placeholder": "https://api.siliconflow.cn/v1/chat/completions",
+      "help": "Chat-completions compatible endpoint used by the memory normalizer.",
+      "advanced": true
+    },
+    "normalization.temperature": {
+      "label": "Normalizer Temperature",
+      "help": "Lower values improve consistency for structured output.",
+      "advanced": true
+    },
+    "normalization.maxTokens": {
+      "label": "Normalizer Max Tokens",
+      "help": "Maximum response tokens for the normalizer model.",
+      "advanced": true
+    },
+    "normalization.enableThinking": {
+      "label": "Normalizer Thinking",
+      "help": "Enable provider-side thinking mode if supported. Default off for stable JSON.",
+      "advanced": true
+    },
+    "normalization.timeoutMs": {
+      "label": "Normalizer Timeout",
+      "help": "Abort the normalizer request after this many milliseconds.",
+      "advanced": true
+    },
+    "normalization.maxEntriesPerCandidate": {
+      "label": "Max Entries Per Candidate",
+      "help": "Maximum number of memory entries the normalizer may produce from a single candidate.",
+      "advanced": true
+    },
+    "normalization.fallbackMode": {
+      "label": "Normalizer Fallback",
+      "help": "Fallback behavior when the normalizer model fails.",
+      "advanced": true
+    },
+    "normalization.audit.enabled": {
+      "label": "Normalizer Audit Log",
+      "help": "Record normalization decisions and fallbacks to a JSONL audit file.",
+      "advanced": true
+    },
+    "normalization.audit.logPath": {
+      "label": "Normalizer Audit Path",
+      "help": "Optional custom path for the normalizer audit log.",
       "advanced": true
     },
     "retrieval.mode": {
