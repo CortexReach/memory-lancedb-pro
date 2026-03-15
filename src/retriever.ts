@@ -85,6 +85,10 @@ export interface RetrievalConfig {
   /** Maximum half-life multiplier from access reinforcement.
    *  Prevents frequently accessed memories from becoming immortal. (default: 3) */
   maxHalfLifeMultiplier: number;
+  /** Tag prefixes for exact-match queries (default: ["proj", "env", "team", "scope"]).
+   *  Queries containing these prefixes (e.g. "proj:AIF") will use BM25-only + mustContain
+   *  to avoid semantic false positives from vector search. */
+  tagPrefixes: string[];
 }
 
 export interface RetrievalContext {
@@ -126,6 +130,7 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   timeDecayHalfLifeDays: 60,
   reinforcementFactor: 0.5,
   maxHalfLifeMultiplier: 3,
+  tagPrefixes: ["proj", "env", "team", "scope"],
 };
 
 // ============================================================================
@@ -354,16 +359,37 @@ function cosineSimilarity(a: number[], b: number[]): number {
 export class MemoryRetriever {
   private accessTracker: AccessTracker | null = null;
   private tierManager: TierManager | null = null;
+  private tagQueryRegex: RegExp;
 
   constructor(
     private store: MemoryStore,
     private embedder: Embedder,
     private config: RetrievalConfig = DEFAULT_RETRIEVAL_CONFIG,
     private decayEngine: DecayEngine | null = null,
-  ) { }
+  ) {
+    this.tagQueryRegex = this.buildTagQueryRegex(config.tagPrefixes);
+  }
 
   setAccessTracker(tracker: AccessTracker): void {
     this.accessTracker = tracker;
+  }
+
+  private buildTagQueryRegex(prefixes: string[]): RegExp {
+    if (!prefixes || prefixes.length === 0) {
+      // Fallback: match nothing
+      return /(?!)/g;
+    }
+    const escaped = prefixes.map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    const pattern = `\\b(?:${escaped.join("|")}):[A-Za-z0-9][A-Za-z0-9._-]{0,63}\\b`;
+    return new RegExp(pattern, "g");
+  }
+
+  private extractTagTokens(query: string): string[] {
+    const matches = query.match(this.tagQueryRegex) || [];
+    const uniq = Array.from(
+      new Set(matches.map((s) => s.trim()).filter(Boolean)),
+    );
+    return uniq.slice(0, 5);
   }
 
   private filterActiveResults<T extends MemorySearchResult>(results: T[]): T[] {
@@ -375,6 +401,28 @@ export class MemoryRetriever {
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
     const { query, limit, scopeFilter, category, source } = context;
     const safeLimit = clampInt(limit, 1, 20);
+
+    // Tag-style queries (e.g. "proj:AIF") should behave like exact filters.
+    // Hybrid vector search tends to introduce semantic false positives for short tokens.
+    const tags = this.extractTagTokens(query);
+    if (tags.length > 0 && this.config.mode !== "vector" && this.store.hasFtsSupport) {
+      const bm25 = await this.bm25OnlyRetrieval(
+        query,
+        safeLimit,
+        scopeFilter,
+        category,
+        tags,
+      );
+      if (bm25.length > 0) {
+        // Record access for reinforcement (manual recall only)
+        if (this.accessTracker && source === "manual") {
+          this.accessTracker.recordAccess(bm25.map((r) => r.entry.id));
+        }
+        return bm25;
+      }
+      // If there are no literal matches, fall back to normal retrieval so
+      // users can still find related wording.
+    }
 
     let results: RetrievalResult[];
     if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
@@ -399,6 +447,57 @@ export class MemoryRetriever {
     }
 
     return results;
+  }
+
+  private async bm25OnlyRetrieval(
+    query: string,
+    limit: number,
+    scopeFilter?: string[],
+    category?: string,
+    mustContain?: string[],
+  ): Promise<RetrievalResult[]> {
+    const results = await this.store.bm25Search(
+      query,
+      Math.max(limit * 4, 20),
+      scopeFilter,
+    );
+
+    const filteredByCategory = category
+      ? results.filter((r) => r.entry.category === category)
+      : results;
+
+    const required = mustContain || [];
+    const literalFiltered = required.length
+      ? filteredByCategory.filter((r) =>
+          required.every((t) => r.entry.text.includes(t)),
+        )
+      : filteredByCategory;
+
+    const mapped = literalFiltered.map(
+      (result, index) =>
+        ({
+          ...result,
+          sources: {
+            vector: undefined,
+            bm25: { score: result.score, rank: index + 1 },
+            fused: { score: result.score },
+          },
+        }) as RetrievalResult,
+    );
+
+    const temporal = this.applyRecencyBoost(mapped);
+    const importance = this.applyImportanceWeight(temporal);
+    const lengthNormalized = this.applyLengthNormalization(importance);
+    const timeDecayed = this.applyTimeDecay(lengthNormalized);
+    const hardFiltered = timeDecayed.filter(
+      (r) => r.score >= this.config.hardMinScore,
+    );
+    const denoised = this.config.filterNoise
+      ? filterNoise(hardFiltered, (r) => r.entry.text)
+      : hardFiltered;
+    const deduplicated = this.applyMMRDiversity(denoised);
+
+    return deduplicated.slice(0, limit);
   }
 
   private async vectorOnlyRetrieval(
@@ -1053,6 +1152,10 @@ export class MemoryRetriever {
   // Update configuration
   updateConfig(newConfig: Partial<RetrievalConfig>): void {
     this.config = { ...this.config, ...newConfig };
+    // Rebuild tag regex if tagPrefixes changed
+    if (newConfig.tagPrefixes) {
+      this.tagQueryRegex = this.buildTagQueryRegex(this.config.tagPrefixes);
+    }
   }
 
   // Get current configuration
