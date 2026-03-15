@@ -131,6 +131,7 @@ interface PluginConfig {
     apiKey?: string;
     model?: string;
     baseURL?: string;
+    timeoutMs?: number;
   };
   extractMinMessages?: number;
   extractMaxChars?: number;
@@ -209,6 +210,10 @@ function parsePositiveInt(value: unknown): number | undefined {
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
   }
   return undefined;
+}
+
+function resolveLlmTimeoutMs(config: PluginConfig): number {
+  return parsePositiveInt(config.llm?.timeoutMs) ?? 30000;
 }
 
 function resolveHookAgentId(
@@ -1654,12 +1659,13 @@ const memoryLanceDBProPlugin = {
           ? resolveEnvVars(config.llm.baseURL)
           : config.embedding.baseURL;
         const llmModel = config.llm?.model || "openai/gpt-oss-120b";
+        const llmTimeoutMs = resolveLlmTimeoutMs(config);
 
         const llmClient = createLlmClient({
           apiKey: llmApiKey,
           model: llmModel,
           baseURL: llmBaseURL,
-          timeoutMs: 30000,
+          timeoutMs: llmTimeoutMs,
           log: (msg: string) => api.logger.debug(msg),
         });
 
@@ -1681,7 +1687,13 @@ const memoryLanceDBProPlugin = {
           noiseBank,
         });
 
-        api.logger.info("memory-lancedb-pro: smart extraction enabled (LLM model: " + llmModel + ", noise bank: ON)");
+        api.logger.info(
+          "memory-lancedb-pro: smart extraction enabled (LLM model: "
+          + llmModel
+          + ", timeoutMs: "
+          + llmTimeoutMs
+          + ", noise bank: ON)",
+        );
       } catch (err) {
         api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
       }
@@ -1971,11 +1983,13 @@ const memoryLanceDBProPlugin = {
             const llmBaseURL = config.llm?.baseURL
               ? resolveEnvVars(config.llm.baseURL)
               : config.embedding.baseURL;
+            const llmTimeoutMs = resolveLlmTimeoutMs(config);
             return createLlmClient({
               apiKey: llmApiKey,
               model: config.llm?.model || "openai/gpt-oss-120b",
               baseURL: llmBaseURL,
-              timeoutMs: 30000,
+              timeoutMs: llmTimeoutMs,
+              log: (msg: string) => api.logger.debug(msg),
             });
           } catch { return undefined; }
         })() : undefined,

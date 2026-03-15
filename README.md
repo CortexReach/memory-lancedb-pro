@@ -199,7 +199,7 @@ If you already have your own OpenAI-compatible services, just replace the releva
 
 - `embedding`: change `apiKey` / `model` / `baseURL` / `dimensions`
 - `retrieval`: change `rerankProvider` / `rerankEndpoint` / `rerankModel` / `rerankApiKey`
-- `llm`: change `apiKey` / `model` / `baseURL`
+- `llm`: change `apiKey` / `model` / `baseURL` / `timeoutMs`
 
 For example, to replace only the LLM:
 
@@ -535,6 +535,7 @@ When `smartExtraction` is enabled (default: `true`), the plugin uses an LLM to i
 | `llm.apiKey` | string | *(falls back to `embedding.apiKey`)* | API key for the LLM provider |
 | `llm.model` | string | `openai/gpt-oss-120b` | LLM model name |
 | `llm.baseURL` | string | *(falls back to `embedding.baseURL`)* | LLM API endpoint |
+| `llm.timeoutMs` | number | `30000` | LLM request timeout in milliseconds |
 | `extractMinMessages` | number | `2` | Minimum messages before extraction triggers |
 | `extractMaxChars` | number | `8000` | Maximum characters sent to the LLM |
 
@@ -551,7 +552,7 @@ Full config (separate LLM endpoint):
 {
   "embedding": { "apiKey": "${OPENAI_API_KEY}", "model": "text-embedding-3-small" },
   "smartExtraction": true,
-  "llm": { "apiKey": "${OPENAI_API_KEY}", "model": "gpt-4o-mini", "baseURL": "https://api.openai.com/v1" },
+  "llm": { "apiKey": "${OPENAI_API_KEY}", "model": "gpt-4o-mini", "baseURL": "https://api.openai.com/v1", "timeoutMs": 30000 },
   "extractMinMessages": 2,
   "extractMaxChars": 8000
 }

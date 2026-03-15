@@ -436,6 +436,11 @@
           },
           "baseURL": {
             "type": "string"
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 30000
           }
         }
       },
@@ -811,6 +816,12 @@
       "label": "LLM Base URL",
       "placeholder": "https://api.groq.com/openai/v1",
       "help": "OpenAI-compatible base URL for LLM (defaults to embedding.baseURL if omitted)",
+      "advanced": true
+    },
+    "llm.timeoutMs": {
+      "label": "LLM Timeout (ms)",
+      "placeholder": "30000",
+      "help": "Request timeout for the smart-extraction / upgrade LLM in milliseconds",
       "advanced": true
     }
   }

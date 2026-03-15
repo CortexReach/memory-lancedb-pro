@@ -199,7 +199,7 @@ openclaw logs --follow --plain | rg "memory-lancedb-pro"
 
 - `embedding`：改 `apiKey` / `model` / `baseURL` / `dimensions`
 - `retrieval`：改 `rerankProvider` / `rerankEndpoint` / `rerankModel` / `rerankApiKey`
-- `llm`：改 `apiKey` / `model` / `baseURL`
+- `llm`：改 `apiKey` / `model` / `baseURL` / `timeoutMs`
 
 例如只替换 LLM：
 
@@ -535,6 +535,7 @@ OpenClaw 默认行为：
 | `llm.apiKey` | string | *（复用 `embedding.apiKey`）* | LLM 提供商 API Key |
 | `llm.model` | string | `openai/gpt-oss-120b` | LLM 模型名称 |
 | `llm.baseURL` | string | *（复用 `embedding.baseURL`）* | LLM API 端点 |
+| `llm.timeoutMs` | number | `30000` | LLM 请求超时（毫秒） |
 | `extractMinMessages` | number | `2` | 触发提取所需最少消息数 |
 | `extractMaxChars` | number | `8000` | 发送给 LLM 的最大字符数 |
 
@@ -551,7 +552,7 @@ OpenClaw 默认行为：
 {
   "embedding": { "apiKey": "${OPENAI_API_KEY}", "model": "text-embedding-3-small" },
   "smartExtraction": true,
-  "llm": { "apiKey": "${OPENAI_API_KEY}", "model": "gpt-4o-mini", "baseURL": "https://api.openai.com/v1" },
+  "llm": { "apiKey": "${OPENAI_API_KEY}", "model": "gpt-4o-mini", "baseURL": "https://api.openai.com/v1", "timeoutMs": 30000 },
   "extractMinMessages": 2,
   "extractMaxChars": 8000
 }
