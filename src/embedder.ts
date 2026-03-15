@@ -101,6 +101,32 @@ export interface EmbeddingConfig {
   chunking?: boolean;
 }
 
+type EmbeddingProviderProfile =
+  | "openai"
+  | "jina"
+  | "voyage-compatible"
+  | "generic-openai-compatible";
+
+interface EmbeddingCapabilities {
+  /** Whether to send encoding_format: "float" */
+  encoding_format: boolean;
+  /** Whether to send normalized (Jina-style) */
+  normalized: boolean;
+  /**
+   * Field name to use for the task/input-type hint, or null if unsupported.
+   * e.g. "task" for Jina, "input_type" for Voyage, null for OpenAI/generic.
+   * If a taskValueMap is provided, task values are translated before sending.
+   */
+  taskField: string | null;
+  /** Optional value translation map for taskField (e.g. Voyage needs "retrieval.query" → "query") */
+  taskValueMap?: Record<string, string>;
+  /**
+   * Field name to use for the requested output dimension, or null if unsupported.
+   * e.g. "dimensions" for OpenAI, "output_dimension" for Voyage, null if not supported.
+   */
+  dimensionsField: string | null;
+}
+
 // Known embedding model dimensions
 const EMBEDDING_DIMENSIONS: Record<string, number> = {
   "text-embedding-3-small": 1536,
@@ -159,12 +185,15 @@ function getErrorCode(error: unknown): string | undefined {
 }
 
 function getProviderLabel(baseURL: string | undefined, model: string): string {
+  const profile = detectEmbeddingProviderProfile(baseURL, model);
   const base = baseURL || "";
 
+  if (/localhost:11434|127\.0\.0\.1:11434|\/ollama\b/i.test(base)) return "Ollama";
+
   if (base) {
-    if (/api\.jina\.ai/i.test(base)) return "Jina";
-    if (/localhost:11434|127\.0\.0\.1:11434|\/ollama\b/i.test(base)) return "Ollama";
-    if (/api\.openai\.com/i.test(base)) return "OpenAI";
+    if (profile === "jina" && /api\.jina\.ai/i.test(base)) return "Jina";
+    if (profile === "voyage-compatible" && /api\.voyageai\.com/i.test(base)) return "Voyage";
+    if (profile === "openai" && /api\.openai\.com/i.test(base)) return "OpenAI";
 
     try {
       return new URL(base).host;
@@ -173,9 +202,71 @@ function getProviderLabel(baseURL: string | undefined, model: string): string {
     }
   }
 
-  if (/^jina-/i.test(model)) return "Jina";
+  switch (profile) {
+    case "jina":
+      return "Jina";
+    case "voyage-compatible":
+      return "Voyage";
+    case "openai":
+      return "OpenAI";
+    default:
+      return "embedding provider";
+  }
+}
 
-  return "embedding provider";
+function detectEmbeddingProviderProfile(
+  baseURL: string | undefined,
+  model: string,
+): EmbeddingProviderProfile {
+  const base = baseURL || "";
+
+  if (/api\.openai\.com/i.test(base)) return "openai";
+  if (/api\.jina\.ai/i.test(base) || /^jina-/i.test(model)) return "jina";
+  if (/api\.voyageai\.com/i.test(base) || /^voyage\b/i.test(model)) {
+    return "voyage-compatible";
+  }
+
+  return "generic-openai-compatible";
+}
+
+function getEmbeddingCapabilities(profile: EmbeddingProviderProfile): EmbeddingCapabilities {
+  switch (profile) {
+    case "openai":
+      return {
+        encoding_format: true,
+        normalized: false,
+        taskField: null,
+        dimensionsField: "dimensions",
+      };
+    case "jina":
+      return {
+        encoding_format: true,
+        normalized: true,
+        taskField: "task",
+        dimensionsField: "dimensions",
+      };
+    case "voyage-compatible":
+      return {
+        encoding_format: false,
+        normalized: false,
+        taskField: "input_type",
+        taskValueMap: {
+          "retrieval.query":   "query",
+          "retrieval.passage": "document",
+          "query":             "query",
+          "document":          "document",
+        },
+        dimensionsField: "output_dimension",
+      };
+    case "generic-openai-compatible":
+    default:
+      return {
+        encoding_format: true,
+        normalized: false,
+        taskField: null,
+        dimensionsField: "dimensions",
+      };
+  }
 }
 
 function isAuthError(error: unknown): boolean {
@@ -281,6 +372,7 @@ export class Embedder {
   private readonly _taskQuery?: string;
   private readonly _taskPassage?: string;
   private readonly _normalized?: boolean;
+  private readonly _capabilities: EmbeddingCapabilities;
 
   /** Optional requested dimensions to pass through to the embedding provider (OpenAI-compatible). */
   private readonly _requestDimensions?: number;
@@ -300,6 +392,7 @@ export class Embedder {
     this._requestDimensions = config.dimensions;
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
+    this._capabilities = getEmbeddingCapabilities(detectEmbeddingProviderProfile(this._baseURL, this._model));
 
     // Create a client pool — one OpenAI client per key
     this.clients = resolvedKeys.map(key => new OpenAI({
@@ -449,18 +542,28 @@ export class Embedder {
     const payload: any = {
       model: this.model,
       input,
-      // Force float output to avoid SDK default base64 decoding path.
-      encoding_format: "float",
     };
 
-    if (task) payload.task = task;
-    if (this._normalized !== undefined) payload.normalized = this._normalized;
+    if (this._capabilities.encoding_format) {
+      // Force float output where providers explicitly support OpenAI-style formatting.
+      payload.encoding_format = "float";
+    }
 
-    // Some OpenAI-compatible providers support requesting a specific vector size.
-    // We only pass it through when explicitly configured to avoid breaking providers
-    // that reject unknown fields.
-    if (this._requestDimensions && this._requestDimensions > 0) {
-      payload.dimensions = this._requestDimensions;
+    if (this._capabilities.normalized && this._normalized !== undefined) {
+      payload.normalized = this._normalized;
+    }
+
+    // Task hint: field name and optional value translation are provider-defined.
+    if (this._capabilities.taskField && task) {
+      const cap = this._capabilities;
+      const value = cap.taskValueMap?.[task] ?? task;
+      payload[cap.taskField] = value;
+    }
+
+    // Output dimension: field name is provider-defined.
+    // Only sent when explicitly configured to avoid breaking providers that reject unknown fields.
+    if (this._capabilities.dimensionsField && this._requestDimensions && this._requestDimensions > 0) {
+      payload[this._capabilities.dimensionsField] = this._requestDimensions;
     }
 
     return payload;
