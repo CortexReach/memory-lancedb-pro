@@ -725,7 +725,7 @@ export function registerMemoryForgetTool(
         };
 
         try {
-          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
+          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx) || 'main';
           // Determine accessible scopes
           let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
@@ -901,7 +901,7 @@ export function registerMemoryUpdateTool(
           }
 
           // Determine accessible scopes
-          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
+          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx) || 'main';
           const scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
 
           // Resolve memoryId: if it doesn't look like a UUID, try search
