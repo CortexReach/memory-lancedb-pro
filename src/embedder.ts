@@ -108,10 +108,23 @@ type EmbeddingProviderProfile =
   | "generic-openai-compatible";
 
 interface EmbeddingCapabilities {
+  /** Whether to send encoding_format: "float" */
   encoding_format: boolean;
-  dimensions: boolean;
-  task: boolean;
+  /** Whether to send normalized (Jina-style) */
   normalized: boolean;
+  /**
+   * Field name to use for the task/input-type hint, or null if unsupported.
+   * e.g. "task" for Jina, "input_type" for Voyage, null for OpenAI/generic.
+   * If a taskValueMap is provided, task values are translated before sending.
+   */
+  taskField: string | null;
+  /** Optional value translation map for taskField (e.g. Voyage needs "retrieval.query" → "query") */
+  taskValueMap?: Record<string, string>;
+  /**
+   * Field name to use for the requested output dimension, or null if unsupported.
+   * e.g. "dimensions" for OpenAI, "output_dimension" for Voyage, null if not supported.
+   */
+  dimensionsField: string | null;
 }
 
 // Known embedding model dimensions
@@ -221,31 +234,37 @@ function getEmbeddingCapabilities(profile: EmbeddingProviderProfile): EmbeddingC
     case "openai":
       return {
         encoding_format: true,
-        dimensions: true,
-        task: false,
         normalized: false,
+        taskField: null,
+        dimensionsField: "dimensions",
       };
     case "jina":
       return {
         encoding_format: true,
-        dimensions: true,
-        task: true,
         normalized: true,
+        taskField: "task",
+        dimensionsField: "dimensions",
       };
     case "voyage-compatible":
       return {
         encoding_format: false,
-        dimensions: false,
-        task: false,
         normalized: false,
+        taskField: "input_type",
+        taskValueMap: {
+          "retrieval.query":   "query",
+          "retrieval.passage": "document",
+          "query":             "query",
+          "document":          "document",
+        },
+        dimensionsField: "output_dimension",
       };
     case "generic-openai-compatible":
     default:
       return {
         encoding_format: true,
-        dimensions: true,
-        task: false,
         normalized: false,
+        taskField: null,
+        dimensionsField: "dimensions",
       };
   }
 }
@@ -530,16 +549,21 @@ export class Embedder {
       payload.encoding_format = "float";
     }
 
-    if (this._capabilities.task && task) payload.task = task;
     if (this._capabilities.normalized && this._normalized !== undefined) {
       payload.normalized = this._normalized;
     }
 
-    // Some OpenAI-compatible providers support requesting a specific vector size.
-    // We only pass it through when explicitly configured to avoid breaking providers
-    // that reject unknown fields.
-    if (this._capabilities.dimensions && this._requestDimensions && this._requestDimensions > 0) {
-      payload.dimensions = this._requestDimensions;
+    // Task hint: field name and optional value translation are provider-defined.
+    if (this._capabilities.taskField && task) {
+      const cap = this._capabilities;
+      const value = cap.taskValueMap?.[task] ?? task;
+      payload[cap.taskField] = value;
+    }
+
+    // Output dimension: field name is provider-defined.
+    // Only sent when explicitly configured to avoid breaking providers that reject unknown fields.
+    if (this._capabilities.dimensionsField && this._requestDimensions && this._requestDimensions > 0) {
+      payload[this._capabilities.dimensionsField] = this._requestDimensions;
     }
 
     return payload;
