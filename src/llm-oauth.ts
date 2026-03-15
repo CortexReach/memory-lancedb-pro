@@ -336,55 +336,72 @@ export function needsRefresh(session: OAuthSession): boolean {
   return !!session.refreshToken && !!session.expiresAt && session.expiresAt - EXPIRY_SKEW_MS <= Date.now();
 }
 
-export async function refreshOAuthSession(session: OAuthSession): Promise<OAuthSession> {
+function createTimeoutSignal(timeoutMs?: number): { signal: AbortSignal; dispose: () => void } {
+  const effectiveTimeoutMs =
+    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30_000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
+  return {
+    signal: controller.signal,
+    dispose: () => clearTimeout(timer),
+  };
+}
+
+export async function refreshOAuthSession(session: OAuthSession, timeoutMs?: number): Promise<OAuthSession> {
   if (!session.refreshToken) {
     throw new Error(
       `OAuth session from ${session.authPath} is expired and has no refresh token. Re-run \`codex login\`.`,
     );
   }
 
-  const response = await fetch(resolveOauthTokenUrl(session.providerId), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: session.refreshToken,
-      client_id: resolveOauthClientId(session.providerId),
-    }),
-  });
+  const { signal, dispose } = createTimeoutSignal(timeoutMs);
+  try {
+    const response = await fetch(resolveOauthTokenUrl(session.providerId), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: session.refreshToken,
+        client_id: resolveOauthClientId(session.providerId),
+      }),
+      signal,
+    });
 
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    throw new Error(`OAuth refresh failed (${response.status}): ${detail.slice(0, 500)}`);
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new Error(`OAuth refresh failed (${response.status}): ${detail.slice(0, 500)}`);
+    }
+
+    const payload = await response.json() as TokenRefreshResponse;
+    if (!payload.access_token) {
+      throw new Error("OAuth refresh returned no access token");
+    }
+
+    const accessToken = payload.access_token;
+    const refreshToken = payload.refresh_token || session.refreshToken;
+    const expiresAt =
+      typeof payload.expires_in === "number"
+        ? Date.now() + payload.expires_in * 1000
+        : getJwtExpiry(accessToken);
+    const accountId = getJwtAccountId(accessToken, session.providerId) || session.accountId;
+
+    if (!accountId) {
+      throw new Error("OAuth refresh returned a token without a ChatGPT account id");
+    }
+
+    return {
+      accessToken,
+      refreshToken,
+      expiresAt,
+      accountId,
+      providerId: session.providerId,
+      authPath: session.authPath,
+    };
+  } finally {
+    dispose();
   }
-
-  const payload = await response.json() as TokenRefreshResponse;
-  if (!payload.access_token) {
-    throw new Error("OAuth refresh returned no access token");
-  }
-
-  const accessToken = payload.access_token;
-  const refreshToken = payload.refresh_token || session.refreshToken;
-  const expiresAt =
-    typeof payload.expires_in === "number"
-      ? Date.now() + payload.expires_in * 1000
-      : getJwtExpiry(accessToken);
-  const accountId = getJwtAccountId(accessToken, session.providerId) || session.accountId;
-
-  if (!accountId) {
-    throw new Error("OAuth refresh returned a token without a ChatGPT account id");
-  }
-
-  return {
-    accessToken,
-    refreshToken,
-    expiresAt,
-    accountId,
-    providerId: session.providerId,
-    authPath: session.authPath,
-  };
 }
 
 async function exchangeAuthorizationCode(code: string, verifier: string, providerId?: string): Promise<OAuthSession> {
@@ -431,7 +448,7 @@ async function exchangeAuthorizationCode(code: string, verifier: string, provide
   };
 }
 
-async function saveOAuthSession(authPath: string, session: OAuthSession): Promise<void> {
+export async function saveOAuthSession(authPath: string, session: OAuthSession): Promise<void> {
   await mkdir(dirname(authPath), { recursive: true });
   const payload = {
     provider: session.providerId,

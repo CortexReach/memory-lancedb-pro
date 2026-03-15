@@ -11,6 +11,7 @@ import {
   needsRefresh,
   normalizeOauthModel,
   refreshOAuthSession,
+  saveOAuthSession,
 } from "./llm-oauth.js";
 
 export interface LlmClientConfig {
@@ -70,6 +71,17 @@ function previewText(value: string, maxLen = 200): string {
 function looksLikeSseResponse(bodyText: string): boolean {
   const trimmed = bodyText.trimStart();
   return trimmed.startsWith("event:") || trimmed.startsWith("data:");
+}
+
+function createTimeoutSignal(timeoutMs?: number): { signal: AbortSignal; dispose: () => void } {
+  const effectiveTimeoutMs =
+    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30_000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
+  return {
+    signal: controller.signal,
+    dispose: () => clearTimeout(timer),
+  };
 }
 
 function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
@@ -148,11 +160,15 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void):
 
   async function getSession() {
     if (!cachedSessionPromise) {
-      cachedSessionPromise = loadOAuthSession(config.oauthPath!);
+      cachedSessionPromise = loadOAuthSession(config.oauthPath!).catch((error) => {
+        cachedSessionPromise = null;
+        throw error;
+      });
     }
     let session = await cachedSessionPromise;
     if (needsRefresh(session)) {
-      session = await refreshOAuthSession(session);
+      session = await refreshOAuthSession(session, config.timeoutMs);
+      await saveOAuthSession(config.oauthPath!, session);
       cachedSessionPromise = Promise.resolve(session);
     }
     return session;
@@ -162,93 +178,99 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void):
     async completeJson<T>(prompt: string, label = "generic"): Promise<T | null> {
       try {
         const session = await getSession();
+        const { signal, dispose } = createTimeoutSignal(config.timeoutMs);
         const endpoint = buildOauthEndpoint(config.baseURL, config.oauthProvider);
-        const response = await fetch(endpoint, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${session.accessToken}`,
-            "Content-Type": "application/json",
-            Accept: "text/event-stream",
-            "OpenAI-Beta": "responses=experimental",
-            "chatgpt-account-id": session.accountId,
-            originator: "codex_cli_rs",
-          },
-          body: JSON.stringify({
-            model: normalizeOauthModel(config.model),
-            instructions:
-              "You are a memory extraction assistant. Always respond with valid JSON only.",
-            input: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "input_text",
-                    text: prompt,
-                  },
-                ],
-              },
-            ],
-            store: false,
-            stream: true,
-            text: {
-              format: { type: "text" },
-            },
-          }),
-        });
-
-        if (!response.ok) {
-          const detail = await response.text().catch(() => "");
-          throw new Error(`HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 500)}`);
-        }
-
-        const bodyText = await response.text();
-        const raw = (
-          response.headers.get("content-type")?.includes("text/event-stream") ||
-          looksLikeSseResponse(bodyText)
-        )
-          ? extractOutputTextFromSse(bodyText)
-          : (() => {
-              try {
-                const parsed = JSON.parse(bodyText) as Record<string, unknown>;
-                const output = Array.isArray(parsed.output) ? parsed.output : [];
-                const first = output.find(
-                  (item) =>
-                    item &&
-                    typeof item === "object" &&
-                    Array.isArray((item as Record<string, unknown>).content),
-                ) as Record<string, unknown> | undefined;
-                if (!first) return null;
-                const content = (first.content as Array<Record<string, unknown>>).find(
-                  (part) => part?.type === "output_text" && typeof part.text === "string",
-                );
-                return typeof content?.text === "string" ? content.text : null;
-              } catch {
-                return null;
-              }
-            })();
-
-        if (!raw) {
-          log(
-            `memory-lancedb-pro: llm-client [${label}] empty OAuth response content from model ${config.model}`,
-          );
-          return null;
-        }
-
-        const jsonStr = extractJsonFromResponse(raw);
-        if (!jsonStr) {
-          log(
-            `memory-lancedb-pro: llm-client [${label}] no JSON object found in OAuth response (chars=${raw.length}, preview=${JSON.stringify(previewText(raw))})`,
-          );
-          return null;
-        }
-
         try {
-          return JSON.parse(jsonStr) as T;
-        } catch (err) {
-          log(
-            `memory-lancedb-pro: llm-client [${label}] OAuth JSON.parse failed: ${err instanceof Error ? err.message : String(err)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`,
-          );
-          return null;
+          const response = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${session.accessToken}`,
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+              "OpenAI-Beta": "responses=experimental",
+              "chatgpt-account-id": session.accountId,
+              originator: "codex_cli_rs",
+            },
+            signal,
+            body: JSON.stringify({
+              model: normalizeOauthModel(config.model),
+              instructions:
+                "You are a memory extraction assistant. Always respond with valid JSON only.",
+              input: [
+                {
+                  role: "user",
+                  content: [
+                    {
+                      type: "input_text",
+                      text: prompt,
+                    },
+                  ],
+                },
+              ],
+              store: false,
+              stream: true,
+              text: {
+                format: { type: "text" },
+              },
+            }),
+          });
+
+          if (!response.ok) {
+            const detail = await response.text().catch(() => "");
+            throw new Error(`HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 500)}`);
+          }
+
+          const bodyText = await response.text();
+          const raw = (
+            response.headers.get("content-type")?.includes("text/event-stream") ||
+            looksLikeSseResponse(bodyText)
+          )
+            ? extractOutputTextFromSse(bodyText)
+            : (() => {
+                try {
+                  const parsed = JSON.parse(bodyText) as Record<string, unknown>;
+                  const output = Array.isArray(parsed.output) ? parsed.output : [];
+                  const first = output.find(
+                    (item) =>
+                      item &&
+                      typeof item === "object" &&
+                      Array.isArray((item as Record<string, unknown>).content),
+                  ) as Record<string, unknown> | undefined;
+                  if (!first) return null;
+                  const content = (first.content as Array<Record<string, unknown>>).find(
+                    (part) => part?.type === "output_text" && typeof part.text === "string",
+                  );
+                  return typeof content?.text === "string" ? content.text : null;
+                } catch {
+                  return null;
+                }
+              })();
+
+          if (!raw) {
+            log(
+              `memory-lancedb-pro: llm-client [${label}] empty OAuth response content from model ${config.model}`,
+            );
+            return null;
+          }
+
+          const jsonStr = extractJsonFromResponse(raw);
+          if (!jsonStr) {
+            log(
+              `memory-lancedb-pro: llm-client [${label}] no JSON object found in OAuth response (chars=${raw.length}, preview=${JSON.stringify(previewText(raw))})`,
+            );
+            return null;
+          }
+
+          try {
+            return JSON.parse(jsonStr) as T;
+          } catch (err) {
+            log(
+              `memory-lancedb-pro: llm-client [${label}] OAuth JSON.parse failed: ${err instanceof Error ? err.message : String(err)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`,
+            );
+            return null;
+          }
+        } finally {
+          dispose();
         }
       } catch (err) {
         log(
