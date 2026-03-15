@@ -453,7 +453,14 @@ export class Embedder {
       encoding_format: "float",
     };
 
-    if (task) payload.task = task;
+    if (task) {
+      // NVIDIA NIM uses input_type; other providers (Jina etc.) use task
+      if (this._baseURL && /nvidia\.com/i.test(this._baseURL)) {
+        payload.input_type = task;
+      } else {
+        payload.task = task;
+      }
+    }
     if (this._normalized !== undefined) payload.normalized = this._normalized;
 
     // Some OpenAI-compatible providers support requesting a specific vector size.
