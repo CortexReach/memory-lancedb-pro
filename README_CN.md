@@ -1,6 +1,6 @@
 <div align="center">
 
-# memory-lancedb-pro
+# 🧠 memory-lancedb-pro · 🦞OpenClaw Plugin
 
 **[OpenClaw](https://github.com/openclaw/openclaw) 智能体的 AI 记忆助理**
 
