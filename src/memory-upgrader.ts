@@ -315,7 +315,8 @@ export class MemoryUpgrader {
         }>(prompt);
 
         if (!llmResult) {
-          throw new Error("LLM returned null");
+          const detail = this.llm.getLastError();
+          throw new Error(detail || "LLM returned null");
         }
 
         enriched = {

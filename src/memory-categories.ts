@@ -70,6 +70,7 @@ export type ExtractionStats = {
   created: number;
   merged: number;
   skipped: number;
+  boundarySkipped?: number;
   supported?: number; // context-aware support count
   superseded?: number; // temporal fact replacements
 };

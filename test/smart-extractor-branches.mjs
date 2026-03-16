@@ -952,4 +952,198 @@ assert.ok(
   ),
 );
 
+async function runUserMdExclusiveProfileScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-smart-user-md-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  const embeddingServer = createEmbeddingServer();
+  const llmServer = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const prompt = payload.messages?.[1]?.content || "";
+
+    let content = JSON.stringify({ memories: [] });
+    if (prompt.includes("Analyze the following session context")) {
+      content = JSON.stringify({
+        memories: [
+          {
+            category: "profile",
+            abstract: "User profile: timezone Asia/Shanghai",
+            overview: "## Background\n- Timezone: Asia/Shanghai",
+            content: "User timezone is Asia/Shanghai.",
+          },
+        ],
+      });
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl-test",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: "mock-memory-model",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content },
+          finish_reason: "stop",
+        },
+      ],
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const llmPort = llmServer.address().port;
+
+  try {
+    const api = createMockApi(
+      dbPath,
+      `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${llmPort}`,
+      logs,
+    );
+    api.pluginConfig.workspaceBoundary = {
+      userMdExclusive: {
+        enabled: true,
+      },
+    };
+    plugin.register(api);
+
+    await api.hooks.agent_end(
+      {
+        success: true,
+        sessionKey: "agent:life:user-md-exclusive",
+        messages: [
+          { role: "user", content: "我的时区是 Asia/Shanghai。" },
+          { role: "user", content: "这是长期资料。" },
+        ],
+      },
+      { agentId: "life", sessionKey: "agent:life:user-md-exclusive" },
+    );
+
+    const store = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const entries = await store.list(["agent:life"], undefined, 10, 0);
+    return { entries, logs };
+  } finally {
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const userMdExclusiveProfileResult = await runUserMdExclusiveProfileScenario();
+assert.equal(userMdExclusiveProfileResult.entries.length, 0);
+assert.ok(
+  userMdExclusiveProfileResult.logs.some((entry) =>
+    entry[1].includes("skipped USER.md-exclusive [profile]")
+  ),
+);
+
+async function runBoundarySkipKeepsRegexFallbackScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-smart-boundary-fallback-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  const embeddingServer = createEmbeddingServer();
+
+  const llmServer = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const prompt = payload.messages?.[1]?.content || "";
+
+    let content = JSON.stringify({ memories: [] });
+    if (prompt.includes("Analyze the following session context")) {
+      content = JSON.stringify({
+        memories: [
+          {
+            category: "profile",
+            abstract: "User profile: timezone Asia/Shanghai",
+            overview: "## Background\n- Timezone: Asia/Shanghai",
+            content: "User timezone is Asia/Shanghai.",
+          },
+        ],
+      });
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl-test",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: "mock-memory-model",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content },
+          finish_reason: "stop",
+        },
+      ],
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const llmPort = llmServer.address().port;
+
+  try {
+    const api = createMockApi(
+      dbPath,
+      `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${llmPort}`,
+      logs,
+    );
+    api.pluginConfig.workspaceBoundary = {
+      userMdExclusive: {
+        enabled: true,
+      },
+    };
+    plugin.register(api);
+
+    await api.hooks.agent_end(
+      {
+        success: true,
+        sessionKey: "agent:life:user-md-fallback",
+        messages: [
+          { role: "user", content: "我的时区是 Asia/Shanghai。" },
+          { role: "user", content: "我们决定以后用 AWS ECS with Fargate 部署应用。" },
+        ],
+      },
+      { agentId: "life", sessionKey: "agent:life:user-md-fallback" },
+    );
+
+    const store = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const entries = await store.list(["agent:life"], undefined, 10, 0);
+    return { entries, logs };
+  } finally {
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const boundarySkipFallbackResult = await runBoundarySkipKeepsRegexFallbackScenario();
+assert.equal(boundarySkipFallbackResult.entries.length, 1);
+assert.equal(boundarySkipFallbackResult.entries[0].text, "我们决定以后用 AWS ECS with Fargate 部署应用。");
+assert.ok(
+  boundarySkipFallbackResult.logs.some((entry) =>
+    entry[1].includes("continuing to regex fallback for non-boundary texts")
+  ),
+);
+
 console.log("OK: smart extractor branch regression test passed");

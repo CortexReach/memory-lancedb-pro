@@ -17,8 +17,9 @@ const jiti = jitiFactory(import.meta.url, {
 
 const pluginModule = jiti("../index.ts");
 const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
-const { registerMemoryRecallTool } = jiti("../src/tools.ts");
+const { registerMemoryRecallTool, registerMemoryStoreTool } = jiti("../src/tools.ts");
 const { MemoryRetriever } = jiti("../src/retriever.ts");
+const { buildSmartMetadata, stringifySmartMetadata } = jiti("../src/smart-metadata.ts");
 
 function makeApiCapture() {
   let capturedCreator = null;
@@ -111,6 +112,74 @@ function makeExpandedResults() {
       score: 0.65,
       sources: {
         vector: { score: 0.65, rank: 3 },
+      },
+    },
+  ];
+}
+
+function makeUserMdExclusiveResults() {
+  return [
+    ...makeResults(),
+    {
+      entry: {
+        id: "m3",
+        text: "称呼偏好：宙斯",
+        category: "preference",
+        scope: "global",
+        importance: 0.9,
+        timestamp: Date.now(),
+        metadata: stringifySmartMetadata(
+          buildSmartMetadata(
+            { text: "称呼偏好：宙斯", category: "preference", importance: 0.9 },
+            {
+              l0_abstract: "称呼偏好：宙斯",
+              l1_overview: "## Addressing\n- Preferred form of address: 宙斯",
+              l2_content: "用户希望以后被称呼为“宙斯”。",
+              memory_category: "preferences",
+              fact_key: "preferences:称呼偏好",
+            },
+          ),
+        ),
+      },
+      score: 0.96,
+      sources: {
+        vector: { score: 0.96, rank: 1 },
+      },
+    },
+  ];
+}
+
+function makeLegacyAddressingResults() {
+  return [
+    ...makeResults(),
+    {
+      entry: {
+        id: "m4",
+        text: "用户从 2026-03-15 起希望在主会话中被称呼为“宙斯”。",
+        category: "preference",
+        scope: "agent:main",
+        importance: 0.95,
+        timestamp: Date.now(),
+        metadata: stringifySmartMetadata(
+          buildSmartMetadata(
+            {
+              text: "用户从 2026-03-15 起希望在主会话中被称呼为“宙斯”。",
+              category: "preference",
+              importance: 0.95,
+            },
+            {
+              l0_abstract: "用户从 2026-03-15 起希望在主会话中被称呼为“宙斯”。",
+              l1_overview: "- 用户从 2026-03-15 起希望在主会话中被称呼为“宙斯”。",
+              l2_content: "用户从 2026-03-15 起希望在主会话中被称呼为“宙斯”。",
+              memory_category: "preferences",
+              fact_key: "preferences:用户从 2026-03-15 起希望在主会话中被称呼为“宙斯”",
+            },
+          ),
+        ),
+      },
+      score: 0.91,
+      sources: {
+        vector: { score: 0.91, rank: 1 },
       },
     },
   ];
@@ -236,5 +305,173 @@ describe("recall text cleanup", () => {
     assert.doesNotMatch(output.prependContext, /vector\+BM25/);
     assert.doesNotMatch(output.prependContext, /reranked/);
     assert.doesNotMatch(output.prependContext, /\d+%/);
+  });
+
+  it("filters USER.md-exclusive facts from memory_recall output", async () => {
+    const tool = createTool(registerMemoryRecallTool, {
+      ...makeRecallContext(makeUserMdExclusiveResults()),
+      workspaceBoundary: {
+        userMdExclusive: {
+          enabled: true,
+        },
+      },
+    });
+    const res = await tool.execute(null, { query: "addressing" });
+
+    assert.deepEqual(extractRenderedMemoryRecallLines(res.content[0].text), [
+      "1. [m1] [fact:global] remember this",
+      "2. [m2] [preference:global] prefer concise diffs",
+    ]);
+    assert.equal(res.details.memories.length, 2);
+    assert.doesNotMatch(res.content[0].text, /称呼偏好：宙斯/);
+  });
+
+  it("skips USER.md-exclusive facts in memory_store", async () => {
+    const tool = createTool(registerMemoryStoreTool, {
+      ...makeRecallContext(),
+      workspaceBoundary: {
+        userMdExclusive: {
+          enabled: true,
+        },
+      },
+      embedder: {
+        embedPassage: async () => {
+          throw new Error("embedder should not run for USER.md-exclusive facts");
+        },
+      },
+    });
+    const res = await tool.execute(null, { text: "以后请叫我宙斯" });
+
+    assert.match(res.content[0].text, /belongs in USER\.md/);
+    assert.equal(res.details.action, "skipped_by_workspace_boundary");
+  });
+
+  it("skips startup profile facts in memory_store", async () => {
+    const tool = createTool(registerMemoryStoreTool, {
+      ...makeRecallContext(),
+      workspaceBoundary: {
+        userMdExclusive: {
+          enabled: true,
+        },
+      },
+      embedder: {
+        embedPassage: async () => {
+          throw new Error("embedder should not run for USER.md-exclusive profile facts");
+        },
+      },
+    });
+    const res = await tool.execute(null, { text: "我的时区是 Asia/Shanghai。" });
+
+    assert.match(res.content[0].text, /belongs in USER\.md/);
+    assert.equal(res.details.action, "skipped_by_workspace_boundary");
+  });
+
+  it("filters USER.md-exclusive facts from auto-recall injected text", async () => {
+    MemoryRetriever.prototype.retrieve = async () => makeUserMdExclusiveResults();
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: true,
+        autoRecallMinLength: 1,
+        workspaceBoundary: {
+          userMdExclusive: {
+            enabled: true,
+          },
+        },
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+
+    const hooks = harness.eventHandlers.get("before_agent_start") || [];
+    assert.equal(hooks.length, 1);
+    const [{ handler: autoRecallHook }] = hooks;
+
+    const output = await autoRecallHook(
+      { prompt: "Please recall what I mentioned before about this task." },
+      { sessionId: "auto-filter", sessionKey: "agent:main:session:auto-filter", agentId: "main" }
+    );
+
+    assert.ok(output);
+    assert.match(output.prependContext, /remember this/);
+    assert.doesNotMatch(output.prependContext, /称呼偏好：宙斯/);
+  });
+
+  it("filters legacy addressing memories with non-canonical fact keys", async () => {
+    const tool = createTool(registerMemoryRecallTool, {
+      ...makeRecallContext(makeLegacyAddressingResults()),
+      workspaceBoundary: {
+        userMdExclusive: {
+          enabled: true,
+        },
+      },
+    });
+    const res = await tool.execute(null, { query: "legacy addressing" });
+
+    assert.deepEqual(extractRenderedMemoryRecallLines(res.content[0].text), [
+      "1. [m1] [fact:global] remember this",
+      "2. [m2] [preference:global] prefer concise diffs",
+    ]);
+    assert.equal(res.details.memories.length, 2);
+    assert.doesNotMatch(res.content[0].text, /希望在主会话中被称呼为“宙斯”/);
+  });
+
+  it("filters legacy addressing memories from auto-recall injected text", async () => {
+    MemoryRetriever.prototype.retrieve = async () => makeLegacyAddressingResults();
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: true,
+        autoRecallMinLength: 1,
+        workspaceBoundary: {
+          userMdExclusive: {
+            enabled: true,
+          },
+        },
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+
+    const hooks = harness.eventHandlers.get("before_agent_start") || [];
+    assert.equal(hooks.length, 1);
+    const [{ handler: autoRecallHook }] = hooks;
+
+    const output = await autoRecallHook(
+      { prompt: "Please recall what I mentioned before about this task." },
+      { sessionId: "auto-filter-legacy", sessionKey: "agent:main:session:auto-filter-legacy", agentId: "main" }
+    );
+
+    assert.ok(output);
+    assert.match(output.prependContext, /remember this/);
+    assert.doesNotMatch(output.prependContext, /希望在主会话中被称呼为“宙斯”/);
+  });
+
+  it("respects filterRecall=false for memory_recall output", async () => {
+    const tool = createTool(registerMemoryRecallTool, {
+      ...makeRecallContext(makeUserMdExclusiveResults()),
+      workspaceBoundary: {
+        userMdExclusive: {
+          enabled: true,
+          filterRecall: false,
+        },
+      },
+    });
+    const res = await tool.execute(null, { query: "addressing without recall filter" });
+
+    assert.equal(res.details.memories.length, 3);
+    assert.match(res.content[0].text, /称呼偏好：宙斯/);
   });
 });
