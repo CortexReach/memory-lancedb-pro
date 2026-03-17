@@ -106,6 +106,11 @@ assert.equal(
   "18.1.0",
   "package.json should declare apache-arrow directly so OpenClaw plugin installs do not miss the LanceDB runtime dependency",
 );
+assert.equal(
+  pkg.optionalDependencies?.["@lancedb/lancedb-darwin-x64"],
+  pkg.dependencies["@lancedb/lancedb"].replace(/^[~^]/, ""),
+  "package.json should declare the missing LanceDB Intel macOS native package so x64 installs do not fail at runtime",
+);
 
 const workDir = mkdtempSync(path.join(tmpdir(), "memory-plugin-regression-"));
 const services = [];

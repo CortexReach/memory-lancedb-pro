@@ -31,6 +31,9 @@
     "json5": "^2.2.3",
     "openai": "^6.21.0"
   },
+  "optionalDependencies": {
+    "@lancedb/lancedb-darwin-x64": "0.26.2"
+  },
   "openclaw": {
     "extensions": [
       "./index.ts"
