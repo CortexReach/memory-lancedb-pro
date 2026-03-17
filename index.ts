@@ -17,7 +17,7 @@ import { spawn } from "node:child_process";
 import { MemoryStore, validateStoragePath } from "./src/store.js";
 import { createEmbedder, getVectorDimensions } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
-import { createScopeManager } from "./src/scopes.js";
+import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
@@ -238,7 +238,10 @@ function resolveHookAgentId(
   explicitAgentId: string | undefined,
   sessionKey: string | undefined,
 ): string {
-  return explicitAgentId || parseAgentIdFromSessionKey(sessionKey) || "main";
+  const trimmedExplicit = explicitAgentId?.trim();
+  return (trimmedExplicit && trimmedExplicit.length > 0
+    ? trimmedExplicit
+    : parseAgentIdFromSessionKey(sessionKey)) || "main";
 }
 
 function summarizeAgentEndMessages(messages: unknown[]): string {
@@ -568,13 +571,6 @@ async function loadSelfImprovementReminderContent(workspaceDir?: string): Promis
   } catch {
     return DEFAULT_SELF_IMPROVEMENT_REMINDER;
   }
-}
-
-function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
-  const sk = (sessionKey ?? "").trim();
-  const parts = sk.split(":");
-  if (parts.length >= 2 && parts[0] === "agent" && parts[1]) return parts[1];
-  return undefined;
 }
 
 function resolveAgentPrimaryModelRef(cfg: unknown, agentId: string): string | undefined {
@@ -1752,7 +1748,7 @@ const memoryLanceDBProPlugin = {
 
     async function runRecallLifecycle(
       results: Array<{ entry: { id: string; text: string; category: "preference" | "fact" | "decision" | "entity" | "other"; scope: string; importance: number; timestamp: number; metadata?: string } }>,
-      scopeFilter: string[],
+      scopeFilter?: string[],
     ): Promise<Map<string, string>> {
       const now = Date.now();
       type LifecycleEntry = {
@@ -1783,11 +1779,15 @@ const memoryLanceDBProPlugin = {
       );
 
       try {
-        const recentEntries = await store.list(scopeFilter, undefined, 100, 0);
-        for (const entry of recentEntries) {
-          if (!lifecycleEntries.has(entry.id)) {
-            lifecycleEntries.set(entry.id, entry);
+        if (scopeFilter !== undefined) {
+          const recentEntries = await store.list(scopeFilter, undefined, 100, 0);
+          for (const entry of recentEntries) {
+            if (!lifecycleEntries.has(entry.id)) {
+              lifecycleEntries.set(entry.id, entry);
+            }
           }
+        } else {
+          api.logger.debug(`memory-lancedb-pro: skipping tier maintenance preload for bypass scope filter`);
         }
       } catch (err) {
         api.logger.warn(`memory-lancedb-pro: tier maintenance preload failed: ${String(err)}`);
@@ -1901,17 +1901,40 @@ const memoryLanceDBProPlugin = {
       return clipped;
     };
 
-    const loadAgentReflectionSlices = async (agentId: string, scopeFilter: string[]) => {
-      const cacheKey = `${agentId}::${[...scopeFilter].sort().join(",")}`;
+    const loadAgentReflectionSlices = async (agentId: string, scopeFilter?: string[]) => {
+      const scopeKey = Array.isArray(scopeFilter)
+        ? `scopes:${[...scopeFilter].sort().join(",")}`
+        : "<NO_SCOPE_FILTER>";
+      const cacheKey = `${agentId}::${scopeKey}`;
       const cached = reflectionByAgentCache.get(cacheKey);
       if (cached && Date.now() - cached.updatedAt < 15_000) return cached;
 
-      const entries = await store.list(scopeFilter, undefined, 120, 0);
-      const { invariants, derived } = loadAgentReflectionSlicesFromEntries({
+      // Prefer reflection-category rows to avoid full-table reads on bypass callers.
+      // Fall back to an uncategorized scan only when the category query produced no
+      // agent-owned reflection slices, preserving backward compatibility with mixed-schema stores.
+      let entries = await store.list(scopeFilter, "reflection", 240, 0);
+      let slices = loadAgentReflectionSlicesFromEntries({
         entries,
         agentId,
         deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
       });
+      if (slices.invariants.length === 0 && slices.derived.length === 0) {
+        const legacyEntries = await store.list(scopeFilter, undefined, 240, 0);
+        entries = legacyEntries.filter((entry) => {
+          try {
+            const metadata = parseReflectionMetadata(entry.metadata);
+            return isReflectionMetadataType(metadata.type) && isOwnedByAgent(metadata, agentId);
+          } catch {
+            return false;
+          }
+        });
+        slices = loadAgentReflectionSlicesFromEntries({
+          entries,
+          agentId,
+          deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+        });
+      }
+      const { invariants, derived } = slices;
       const next = { updatedAt: Date.now(), invariants, derived };
       reflectionByAgentCache.set(cacheKey, next);
       return next;
@@ -2068,7 +2091,7 @@ const memoryLanceDBProPlugin = {
         try {
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
-          const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
+          const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
 
           const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry({
             query: event.prompt,
@@ -2160,8 +2183,10 @@ const memoryLanceDBProPlugin = {
         try {
           // Determine agent ID and default scope
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
-          const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
-          const defaultScope = scopeManager.getDefaultScope(agentId);
+          const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
+          const defaultScope = isSystemBypassId(agentId)
+            ? config.scopes?.default ?? "global"
+            : scopeManager.getDefaultScope(agentId);
           const sessionKey = ctx?.sessionKey || (event as any).sessionKey || "unknown";
 
           api.logger.debug(
@@ -2604,8 +2629,11 @@ const memoryLanceDBProPlugin = {
         if (reflectionInjectMode !== "inheritance-only" && reflectionInjectMode !== "inheritance+derived") return;
         try {
           pruneReflectionSessionState();
-          const agentId = typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : "main";
-          const scopes = scopeManager.getAccessibleScopes(agentId);
+          const agentId = resolveHookAgentId(
+            typeof ctx.agentId === "string" ? ctx.agentId : undefined,
+            sessionKey,
+          );
+          const scopes = resolveScopeFilter(scopeManager, agentId);
           const slices = await loadAgentReflectionSlices(agentId, scopes);
           if (slices.invariants.length === 0) return;
           const body = slices.invariants.slice(0, 6).map((line, i) => `${i + 1}. ${line}`).join("\n");
@@ -2625,13 +2653,16 @@ const memoryLanceDBProPlugin = {
       api.on("before_prompt_build", async (_event, ctx) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
-        const agentId = typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : "main";
+        const agentId = resolveHookAgentId(
+          typeof ctx.agentId === "string" ? ctx.agentId : undefined,
+          sessionKey,
+        );
         pruneReflectionSessionState();
 
         const blocks: string[] = [];
         if (reflectionInjectMode === "inheritance+derived") {
           try {
-            const scopes = scopeManager.getAccessibleScopes(agentId);
+            const scopes = resolveScopeFilter(scopeManager, agentId);
             const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
             const derivedLines = derivedCache?.derived?.length
               ? derivedCache.derived
@@ -2752,7 +2783,9 @@ const memoryLanceDBProPlugin = {
           const timeHms = timeIso.split(".")[0];
           const timeCompact = timeIso.replace(/[:.]/g, "");
           const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
-          const targetScope = scopeManager.getDefaultScope(sourceAgentId);
+          const targetScope = isSystemBypassId(sourceAgentId)
+            ? config.scopes?.default ?? "global"
+            : scopeManager.getDefaultScope(sourceAgentId);
           const toolErrorSignals = sessionKey
             ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
             : [];
@@ -2966,7 +2999,9 @@ const memoryLanceDBProPlugin = {
             (event.agentId as string) || (context.agentId as string) || undefined,
             sessionKey || (context.sessionKey as string) || undefined,
           );
-          const defaultScope = scopeManager.getDefaultScope(agentId);
+          const defaultScope = isSystemBypassId(agentId)
+            ? config.scopes?.default ?? "global"
+            : scopeManager.getDefaultScope(agentId);
           const workspaceDir = resolveWorkspaceDirFromContext(context);
           const cfg = context.cfg;
           const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<string, unknown>;

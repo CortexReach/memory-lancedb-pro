@@ -84,6 +84,10 @@ function normalizeSearchText(value: string): string {
   return value.toLowerCase().trim();
 }
 
+function isExplicitDenyAllScopeFilter(scopeFilter?: string[]): boolean {
+  return Array.isArray(scopeFilter) && scopeFilter.length === 0;
+}
+
 function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight: number }>): number {
   const normalizedQuery = normalizeSearchText(query);
   if (!normalizedQuery) return 0;
@@ -388,6 +392,8 @@ export class MemoryStore {
   async getById(id: string, scopeFilter?: string[]): Promise<MemoryEntry | null> {
     await this.ensureInitialized();
 
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return null;
+
     const safeId = escapeSqlLiteral(id);
     const rows = await this.table!
       .query()
@@ -417,6 +423,8 @@ export class MemoryStore {
 
   async vectorSearch(vector: number[], limit = 5, minScore = 0.3, scopeFilter?: string[], options?: { excludeInactive?: boolean }): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
+
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
     const safeLimit = clampInt(limit, 1, 20);
     // Over-fetch more aggressively when filtering inactive records,
@@ -486,6 +494,8 @@ export class MemoryStore {
     options?: { excludeInactive?: boolean },
   ): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
+
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
     const safeLimit = clampInt(limit, 1, 20);
     const inactiveFilter = options?.excludeInactive ?? false;
@@ -563,6 +573,8 @@ export class MemoryStore {
   }
 
   private async lexicalFallbackSearch(query: string, limit: number, scopeFilter?: string[], options?: { excludeInactive?: boolean }): Promise<MemorySearchResult[]> {
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
+
     const trimmedQuery = query.trim();
     if (!trimmedQuery) return [];
 
@@ -630,6 +642,10 @@ export class MemoryStore {
   async delete(id: string, scopeFilter?: string[]): Promise<boolean> {
     await this.ensureInitialized();
 
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+      throw new Error(`Memory ${id} is outside accessible scopes`);
+    }
+
     // Support both full UUID and short prefix (8+ hex chars)
     const uuidRegex =
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -688,6 +704,8 @@ export class MemoryStore {
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
 
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
+
     let query = this.table!.query();
 
     // Build where conditions
@@ -745,6 +763,14 @@ export class MemoryStore {
   }> {
     await this.ensureInitialized();
 
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+      return {
+        totalCount: 0,
+        scopeCounts: {},
+        categoryCounts: {},
+      };
+    }
+
     let query = this.table!.query();
 
     if (scopeFilter && scopeFilter.length > 0) {
@@ -786,6 +812,10 @@ export class MemoryStore {
     scopeFilter?: string[],
   ): Promise<MemoryEntry | null> {
     await this.ensureInitialized();
+
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+      throw new Error(`Memory ${id} is outside accessible scopes`);
+    }
 
     return this.runSerializedUpdate(async () => {
       // Support both full UUID and short prefix (8+ hex chars), same as delete()
