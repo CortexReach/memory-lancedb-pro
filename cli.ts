@@ -9,7 +9,11 @@ import { homedir } from "node:os";
 import path from "node:path";
 import * as readline from "node:readline";
 import JSON5 from "json5";
-import { loadLanceDB, type MemoryEntry, type MemoryStore } from "./src/store.js";
+import {
+  loadLanceDB,
+  type MemoryEntry,
+  type MemoryStore,
+} from "./src/store.js";
 import { createRetriever, type MemoryRetriever } from "./src/retriever.js";
 import type { MemoryScopeManager } from "./src/scopes.js";
 import type { MemoryMigrator } from "./src/migrate.js";
@@ -55,7 +59,9 @@ interface CLIContext {
 function getPluginVersion(): string {
   try {
     const pkgUrl = new URL("./package.json", import.meta.url);
-    const pkg = JSON.parse(readFileSync(pkgUrl, "utf8")) as { version?: string };
+    const pkg = JSON.parse(readFileSync(pkgUrl, "utf8")) as {
+      version?: string;
+    };
     return pkg.version || "unknown";
   } catch {
     return "unknown";
@@ -65,6 +71,10 @@ function getPluginVersion(): string {
 function clampInt(value: number, min: number, max: number): number {
   const n = Number.isFinite(value) ? value : min;
   return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+function pctFmt(rate: number): string {
+  return `${(rate * 100).toFixed(1)}%`;
 }
 
 function resolveOpenClawConfigPath(explicit?: string): string {
@@ -97,7 +107,10 @@ function resolveLoginOauthPath(rawPath: unknown): string {
   return path.resolve(candidate);
 }
 
-function resolveConfiguredOauthPath(configPath: string, rawPath: unknown): string {
+function resolveConfiguredOauthPath(
+  configPath: string,
+  rawPath: unknown,
+): string {
   const trimmed = typeof rawPath === "string" ? rawPath.trim() : "";
   if (!trimmed) {
     return resolveDefaultOauthPath();
@@ -130,7 +143,9 @@ function isOauthLlmConfig(value: unknown): boolean {
   return isPlainObject(value) && value.auth === "oauth";
 }
 
-function extractRestorableApiKeyLlmConfig(value: unknown): RestorableApiKeyLlmConfig {
+function extractRestorableApiKeyLlmConfig(
+  value: unknown,
+): RestorableApiKeyLlmConfig {
   if (!isPlainObject(value)) {
     return {};
   }
@@ -148,7 +163,11 @@ function extractRestorableApiKeyLlmConfig(value: unknown): RestorableApiKeyLlmCo
   if (typeof value.baseURL === "string") {
     result.baseURL = value.baseURL;
   }
-  if (typeof value.timeoutMs === "number" && Number.isFinite(value.timeoutMs) && value.timeoutMs > 0) {
+  if (
+    typeof value.timeoutMs === "number" &&
+    Number.isFinite(value.timeoutMs) &&
+    value.timeoutMs > 0
+  ) {
     result.timeoutMs = Math.trunc(value.timeoutMs);
   }
   return result;
@@ -163,17 +182,25 @@ function extractOauthSafeLlmConfig(value: unknown): RestorableApiKeyLlmConfig {
   if (typeof value.baseURL === "string") {
     result.baseURL = value.baseURL;
   }
-  if (typeof value.timeoutMs === "number" && Number.isFinite(value.timeoutMs) && value.timeoutMs > 0) {
+  if (
+    typeof value.timeoutMs === "number" &&
+    Number.isFinite(value.timeoutMs) &&
+    value.timeoutMs > 0
+  ) {
     result.timeoutMs = Math.trunc(value.timeoutMs);
   }
   return result;
 }
 
-function hasRestorableApiKeyLlmConfig(value: RestorableApiKeyLlmConfig): boolean {
+function hasRestorableApiKeyLlmConfig(
+  value: RestorableApiKeyLlmConfig,
+): boolean {
   return Object.keys(value).length > 0;
 }
 
-function buildLogoutFallbackLlmConfig(value: unknown): RestorableApiKeyLlmConfig {
+function buildLogoutFallbackLlmConfig(
+  value: unknown,
+): RestorableApiKeyLlmConfig {
   if (isOauthLlmConfig(value)) {
     return extractOauthSafeLlmConfig(value);
   }
@@ -188,7 +215,11 @@ function getOauthBackupPath(oauthPath: string): string {
   return path.join(parsed.dir, fileName);
 }
 
-async function saveOauthLlmBackup(oauthPath: string, llm: unknown, hadLlmConfig: boolean): Promise<void> {
+async function saveOauthLlmBackup(
+  oauthPath: string,
+  llm: unknown,
+  hadLlmConfig: boolean,
+): Promise<void> {
   const backupPath = getOauthBackupPath(oauthPath);
   const payload: OAuthLlmBackup = {
     version: 1,
@@ -199,12 +230,18 @@ async function saveOauthLlmBackup(oauthPath: string, llm: unknown, hadLlmConfig:
   await writeFile(backupPath, JSON.stringify(payload, null, 2) + "\n", "utf8");
 }
 
-async function loadOauthLlmBackup(oauthPath: string): Promise<OAuthLlmBackup | null> {
+async function loadOauthLlmBackup(
+  oauthPath: string,
+): Promise<OAuthLlmBackup | null> {
   const backupPath = getOauthBackupPath(oauthPath);
   try {
     const raw = await readFile(backupPath, "utf8");
     const parsed = JSON.parse(raw);
-    if (!isPlainObject(parsed) || parsed.version !== 1 || typeof parsed.hadLlmConfig !== "boolean") {
+    if (
+      !isPlainObject(parsed) ||
+      parsed.version !== 1 ||
+      typeof parsed.hadLlmConfig !== "boolean"
+    ) {
       return null;
     }
     return {
@@ -221,17 +258,26 @@ const OAUTH_PROVIDER_CHOICES = listOAuthProviders()
   .map((provider) => `${provider.id} (${provider.label})`)
   .join(", ");
 
-function pickOauthProvider(currentProvider: string | undefined, overrideProvider: string | undefined): {
+function pickOauthProvider(
+  currentProvider: string | undefined,
+  overrideProvider: string | undefined,
+): {
   providerId: string;
   source: "override" | "config" | "default";
 } {
   if (overrideProvider && overrideProvider.trim()) {
-    return { providerId: normalizeOAuthProviderId(overrideProvider), source: "override" };
+    return {
+      providerId: normalizeOAuthProviderId(overrideProvider),
+      source: "override",
+    };
   }
 
   if (currentProvider && currentProvider.trim()) {
     try {
-      return { providerId: normalizeOAuthProviderId(currentProvider), source: "config" };
+      return {
+        providerId: normalizeOAuthProviderId(currentProvider),
+        source: "config",
+      };
     } catch {
       // Fall back to the default provider when the saved config is stale or invalid.
     }
@@ -258,7 +304,9 @@ async function promptOauthProviderSelection(
     return { providerId: currentProviderId, source: "default" };
   }
 
-  let selectedIndex = providers.findIndex((provider) => provider.id === currentProviderId);
+  let selectedIndex = providers.findIndex(
+    (provider) => provider.id === currentProviderId,
+  );
   if (selectedIndex < 0) selectedIndex = 0;
 
   readline.emitKeypressEvents(process.stdin);
@@ -297,7 +345,10 @@ async function promptOauthProviderSelection(
       process.stdout.write("\n");
     };
 
-    const onKeypress = (_str: string, key: { name?: string; ctrl?: boolean }) => {
+    const onKeypress = (
+      _str: string,
+      key: { name?: string; ctrl?: boolean },
+    ) => {
       if (key.ctrl && key.name === "c") {
         cleanup();
         reject(new Error("OAuth login cancelled while selecting a provider."));
@@ -311,7 +362,8 @@ async function promptOauthProviderSelection(
       }
 
       if (key.name === "up" || key.name === "left") {
-        selectedIndex = (selectedIndex - 1 + providers.length) % providers.length;
+        selectedIndex =
+          (selectedIndex - 1 + providers.length) % providers.length;
         render();
         return;
       }
@@ -342,13 +394,19 @@ async function resolveOauthProviderSelection(
   currentProvider: string | undefined,
   overrideProvider: string | undefined,
   chooseProviderHook?: CLIContext["oauthTestHooks"]["chooseProvider"],
-): Promise<{ providerId: string; source: "override" | "config" | "default" | "prompt" }> {
+): Promise<{
+  providerId: string;
+  source: "override" | "config" | "default" | "prompt";
+}> {
   if (overrideProvider && overrideProvider.trim()) {
     return pickOauthProvider(currentProvider, overrideProvider);
   }
 
   const initial = pickOauthProvider(currentProvider, undefined);
-  return await promptOauthProviderSelection(initial.providerId, chooseProviderHook);
+  return await promptOauthProviderSelection(
+    initial.providerId,
+    chooseProviderHook,
+  );
 }
 
 function pickOauthModel(
@@ -369,19 +427,29 @@ function pickOauthModel(
     return { model: currentModel!.trim(), source: "config" };
   }
 
-  return { model: getDefaultOauthModelForProvider(providerId), source: "default" };
+  return {
+    model: getDefaultOauthModelForProvider(providerId),
+    source: "default",
+  };
 }
 
-async function loadOpenClawConfig(configPath: string): Promise<Record<string, any>> {
+async function loadOpenClawConfig(
+  configPath: string,
+): Promise<Record<string, any>> {
   const raw = await readFile(configPath, "utf8");
   const parsed = JSON5.parse(raw);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`Invalid OpenClaw config at ${configPath}: expected object`);
+    throw new Error(
+      `Invalid OpenClaw config at ${configPath}: expected object`,
+    );
   }
   return parsed as Record<string, any>;
 }
 
-function ensurePluginConfigRoot(config: Record<string, any>, pluginId: string): Record<string, any> {
+function ensurePluginConfigRoot(
+  config: Record<string, any>,
+  pluginId: string,
+): Record<string, any> {
   config.plugins ||= {};
   config.plugins.entries ||= {};
   config.plugins.entries[pluginId] ||= { enabled: true, config: {} };
@@ -391,7 +459,10 @@ function ensurePluginConfigRoot(config: Record<string, any>, pluginId: string): 
   return entry.config as Record<string, any>;
 }
 
-async function saveOpenClawConfig(configPath: string, config: Record<string, any>): Promise<void> {
+async function saveOpenClawConfig(
+  configPath: string,
+  config: Record<string, any>,
+): Promise<void> {
   await mkdir(path.dirname(configPath), { recursive: true });
   await writeFile(configPath, JSON.stringify(config, null, 2) + "\n", "utf8");
 }
@@ -399,7 +470,9 @@ async function saveOpenClawConfig(configPath: string, config: Record<string, any
 function formatMemory(memory: any, index?: number): string {
   const prefix = index !== undefined ? `${index + 1}. ` : "";
   const id = memory?.id ? String(memory.id) : "unknown";
-  const date = new Date(memory.timestamp || memory.createdAt || Date.now()).toISOString().split('T')[0];
+  const date = new Date(memory.timestamp || memory.createdAt || Date.now())
+    .toISOString()
+    .split("T")[0];
   const fullText = String(memory.text || "");
   const text = fullText.slice(0, 100) + (fullText.length > 100 ? "..." : "");
   return `${prefix}[${id}] [${memory.category}:${memory.scope}] ${text} (${date})`;
@@ -410,7 +483,7 @@ function formatJson(obj: any): string {
 }
 
 async function sleep(ms: number): Promise<void> {
-  await new Promise(resolve => setTimeout(resolve, ms));
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ============================================================================
@@ -422,7 +495,11 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     if (!context.embedder) {
       return context.retriever;
     }
-    return createRetriever(context.store, context.embedder, context.retriever.getConfig());
+    return createRetriever(
+      context.store,
+      context.embedder,
+      context.retriever.getConfig(),
+    );
   };
 
   const runSearch = async (
@@ -471,42 +548,73 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
 
   auth
     .command("login")
-    .description("Authenticate with ChatGPT/Codex in a browser, save the plugin OAuth file, and switch this plugin to llm.auth=oauth")
+    .description(
+      "Authenticate with ChatGPT/Codex in a browser, save the plugin OAuth file, and switch this plugin to llm.auth=oauth",
+    )
     .option("--config <path>", "OpenClaw config file to update")
-    .option("--provider <provider>", `OAuth provider to use (${OAUTH_PROVIDER_CHOICES})`)
+    .option(
+      "--provider <provider>",
+      `OAuth provider to use (${OAUTH_PROVIDER_CHOICES})`,
+    )
     .option("--model <model>", "Override the model saved into llm.model")
-    .option("--oauth-path <path>", "OAuth file path (default: ~/.openclaw/.memory-lancedb-pro/oauth.json)")
+    .option(
+      "--oauth-path <path>",
+      "OAuth file path (default: ~/.openclaw/.memory-lancedb-pro/oauth.json)",
+    )
     .option("--timeout <seconds>", "OAuth callback timeout in seconds", "120")
-    .option("--no-browser", "Do not auto-open the browser; print the authorization URL only")
+    .option(
+      "--no-browser",
+      "Do not auto-open the browser; print the authorization URL only",
+    )
     .action(async (options) => {
       try {
         const pluginId = context.pluginId || "memory-lancedb-pro";
         const currentLlm = context.pluginConfig?.llm;
-        const currentProvider = currentLlm && typeof currentLlm === "object" && typeof (currentLlm as any).oauthProvider === "string"
-          ? String((currentLlm as any).oauthProvider)
-          : undefined;
+        const currentProvider =
+          currentLlm &&
+          typeof currentLlm === "object" &&
+          typeof (currentLlm as any).oauthProvider === "string"
+            ? String((currentLlm as any).oauthProvider)
+            : undefined;
         const selectedProvider = await resolveOauthProviderSelection(
           currentProvider,
           options.provider,
           context.oauthTestHooks?.chooseProvider,
         );
-        const currentModel = currentLlm && typeof currentLlm === "object" && typeof (currentLlm as any).model === "string"
-          ? String((currentLlm as any).model)
-          : undefined;
-        const selectedModel = pickOauthModel(selectedProvider.providerId, currentModel, options.model);
+        const currentModel =
+          currentLlm &&
+          typeof currentLlm === "object" &&
+          typeof (currentLlm as any).model === "string"
+            ? String((currentLlm as any).model)
+            : undefined;
+        const selectedModel = pickOauthModel(
+          selectedProvider.providerId,
+          currentModel,
+          options.model,
+        );
         const oauthModel = normalizeOauthModel(selectedModel.model);
         const configPath = resolveOpenClawConfigPath(options.config);
         const oauthPath = resolveLoginOauthPath(options.oauthPath);
-        const timeoutMs = clampInt((parseInt(options.timeout, 10) || 120) * 1000, 15_000, 900_000);
+        const timeoutMs = clampInt(
+          (parseInt(options.timeout, 10) || 120) * 1000,
+          15_000,
+          900_000,
+        );
 
-        if (selectedModel.source === "default" && currentModel && currentModel.trim()) {
+        if (
+          selectedModel.source === "default" &&
+          currentModel &&
+          currentModel.trim()
+        ) {
           console.log(
             `Configured llm.model "${currentModel}" is not supported by provider ${selectedProvider.providerId}. Falling back to ${getDefaultOauthModelForProvider(selectedProvider.providerId)}.`,
           );
         }
 
         console.log(`Config file: ${configPath}`);
-        console.log(`Provider: ${getOAuthProviderLabel(selectedProvider.providerId)} (${selectedProvider.providerId}, ${selectedProvider.source})`);
+        console.log(
+          `Provider: ${getOAuthProviderLabel(selectedProvider.providerId)} (${selectedProvider.providerId}, ${selectedProvider.source})`,
+        );
         console.log(`OAuth file: ${oauthPath}`);
         console.log(`Model: ${oauthModel} (${selectedModel.source})`);
 
@@ -526,14 +634,18 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         const openclawConfig = await loadOpenClawConfig(configPath);
         const pluginConfig = ensurePluginConfigRoot(openclawConfig, pluginId);
         const hadLlmConfig = isPlainObject(pluginConfig.llm);
-        const existingLlm = hadLlmConfig ? { ...(pluginConfig.llm as Record<string, unknown>) } : {};
+        const existingLlm = hadLlmConfig
+          ? { ...(pluginConfig.llm as Record<string, unknown>) }
+          : {};
         const wasOauthMode = isOauthLlmConfig(existingLlm);
 
         if (!wasOauthMode) {
           await saveOauthLlmBackup(oauthPath, pluginConfig.llm, hadLlmConfig);
         }
 
-        const nextLlm = wasOauthMode ? { ...existingLlm } : extractOauthSafeLlmConfig(existingLlm);
+        const nextLlm = wasOauthMode
+          ? { ...existingLlm }
+          : extractOauthSafeLlmConfig(existingLlm);
         delete nextLlm.apiKey;
         if (!wasOauthMode) {
           delete nextLlm.baseURL;
@@ -567,10 +679,14 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         const configPath = resolveOpenClawConfigPath(options.config);
         const openclawConfig = await loadOpenClawConfig(configPath);
         const pluginConfig = ensurePluginConfigRoot(openclawConfig, pluginId);
-        const llm = typeof pluginConfig.llm === "object" && pluginConfig.llm ? pluginConfig.llm as Record<string, unknown> : {};
-        const oauthProviderRaw = typeof llm.oauthProvider === "string" && llm.oauthProvider.trim()
-          ? llm.oauthProvider.trim()
-          : normalizeOAuthProviderId();
+        const llm =
+          typeof pluginConfig.llm === "object" && pluginConfig.llm
+            ? (pluginConfig.llm as Record<string, unknown>)
+            : {};
+        const oauthProviderRaw =
+          typeof llm.oauthProvider === "string" && llm.oauthProvider.trim()
+            ? llm.oauthProvider.trim()
+            : normalizeOAuthProviderId();
         let oauthProviderDisplay = `${oauthProviderRaw} (unknown)`;
         try {
           oauthProviderDisplay = `${normalizeOAuthProviderId(oauthProviderRaw)} (${getOAuthProviderLabel(oauthProviderRaw)})`;
@@ -589,9 +705,13 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
 
         console.log(`Config file: ${configPath}`);
         console.log(`Plugin: ${pluginId}`);
-        console.log(`llm.auth: ${typeof llm.auth === "string" ? llm.auth : "api-key"}`);
+        console.log(
+          `llm.auth: ${typeof llm.auth === "string" ? llm.auth : "api-key"}`,
+        );
         console.log(`llm.oauthProvider: ${oauthProviderDisplay}`);
-        console.log(`llm.model: ${typeof llm.model === "string" ? llm.model : "openai/gpt-oss-120b"}`);
+        console.log(
+          `llm.model: ${typeof llm.model === "string" ? llm.model : "openai/gpt-oss-120b"}`,
+        );
         console.log(`llm.oauthPath: ${oauthPath}`);
         console.log(`oauth file: ${tokenInfo}`);
       } catch (error) {
@@ -602,7 +722,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
 
   auth
     .command("logout")
-    .description("Delete the plugin OAuth file and switch this plugin back to llm.auth=api-key")
+    .description(
+      "Delete the plugin OAuth file and switch this plugin back to llm.auth=api-key",
+    )
     .option("--config <path>", "OpenClaw config file to update")
     .option("--oauth-path <path>", "OAuth file path to remove")
     .action(async (options) => {
@@ -611,7 +733,10 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         const configPath = resolveOpenClawConfigPath(options.config);
         const openclawConfig = await loadOpenClawConfig(configPath);
         const pluginConfig = ensurePluginConfigRoot(openclawConfig, pluginId);
-        const llm = typeof pluginConfig.llm === "object" && pluginConfig.llm ? pluginConfig.llm as Record<string, unknown> : {};
+        const llm =
+          typeof pluginConfig.llm === "object" && pluginConfig.llm
+            ? (pluginConfig.llm as Record<string, unknown>)
+            : {};
         const oauthPath =
           options.oauthPath && String(options.oauthPath).trim()
             ? resolveLoginOauthPath(options.oauthPath)
@@ -669,7 +794,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           scopeFilter,
           options.category,
           limit,
-          offset
+          offset,
         );
 
         if (options.json) {
@@ -707,7 +832,12 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           scopeFilter = [options.scope];
         }
 
-        const results = await runSearch(query, limit, scopeFilter, options.category);
+        const results = await runSearch(
+          query,
+          limit,
+          scopeFilter,
+          options.category,
+        );
 
         if (options.json) {
           console.log(formatJson(results));
@@ -724,7 +854,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
 
               console.log(
                 `${i + 1}. [${result.entry.id}] [${result.entry.category}:${result.entry.scope}] ${result.entry.text} ` +
-                `(${(result.score * 100).toFixed(0)}%, ${sources.join('+')})`
+                  `(${(result.score * 100).toFixed(0)}%, ${sources.join("+")})`,
               );
             });
           }
@@ -768,7 +898,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           console.log(`• Total memories: ${stats.totalCount}`);
           console.log(`• Available scopes: ${scopeStats.totalScopes}`);
           console.log(`• Retrieval mode: ${retrievalConfig.mode}`);
-          console.log(`• FTS support: ${context.store.hasFtsSupport ? 'Yes' : 'No'}`);
+          console.log(
+            `• FTS support: ${context.store.hasFtsSupport ? "Yes" : "No"}`,
+          );
           console.log();
 
           console.log("Memories by scope:");
@@ -840,13 +972,20 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
 
         if (options.dryRun) {
           console.log("DRY RUN - No memories will be deleted");
-          console.log(`Filters: scopes=${options.scope.join(',')}, before=${options.before || 'none'}`);
+          console.log(
+            `Filters: scopes=${options.scope.join(",")}, before=${options.before || "none"}`,
+          );
 
           // Show what would be deleted
           const stats = await context.store.stats(options.scope);
-          console.log(`Would delete from ${stats.totalCount} memories in matching scopes.`);
+          console.log(
+            `Would delete from ${stats.totalCount} memories in matching scopes.`,
+          );
         } else {
-          const deletedCount = await context.store.bulkDelete(options.scope, beforeTimestamp);
+          const deletedCount = await context.store.bulkDelete(
+            options.scope,
+            beforeTimestamp,
+          );
           console.log(`Deleted ${deletedCount} memories.`);
         }
       } catch (error) {
@@ -872,7 +1011,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         const memories = await context.store.list(
           scopeFilter,
           options.category,
-          1000 // Large limit for export
+          1000, // Large limit for export
         );
 
         const exportData = {
@@ -883,7 +1022,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
             scope: options.scope,
             category: options.category,
           },
-          memories: memories.map(m => ({
+          memories: memories.map((m) => ({
             ...m,
             vector: undefined, // Exclude vectors to reduce size
           })),
@@ -894,7 +1033,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         if (options.output) {
           const fs = await import("node:fs/promises");
           await fs.writeFile(options.output, output);
-          console.log(`Exported ${memories.length} memories to ${options.output}`);
+          console.log(
+            `Exported ${memories.length} memories to ${options.output}`,
+          );
         } else {
           console.log(output);
         }
@@ -909,7 +1050,10 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .command("import <file>")
     .description("Import memories from JSON file")
     .option("--scope <scope>", "Import into specific scope")
-    .option("--dry-run", "Show what would be imported without actually importing")
+    .option(
+      "--dry-run",
+      "Show what would be imported without actually importing",
+    )
     .action(async (file, options) => {
       try {
         const fs = await import("node:fs/promises");
@@ -935,12 +1079,17 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         let skipped = 0;
 
         if (!context.embedder) {
-          console.error("Import requires an embedder (not available in basic CLI mode).");
-          console.error("Use the plugin's memory_store tool or pass embedder to createMemoryCLI.");
+          console.error(
+            "Import requires an embedder (not available in basic CLI mode).",
+          );
+          console.error(
+            "Use the plugin's memory_store tool or pass embedder to createMemoryCLI.",
+          );
           return;
         }
 
-        const targetScope = options.scope || context.scopeManager.getDefaultScope();
+        const targetScope =
+          options.scope || context.scopeManager.getDefaultScope();
 
         for (const memory of data.memories) {
           try {
@@ -953,10 +1102,10 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
             const categoryRaw = memory.category;
             const category: MemoryEntry["category"] =
               categoryRaw === "preference" ||
-                categoryRaw === "fact" ||
-                categoryRaw === "decision" ||
-                categoryRaw === "entity" ||
-                categoryRaw === "other"
+              categoryRaw === "fact" ||
+              categoryRaw === "decision" ||
+              categoryRaw === "entity" ||
+              categoryRaw === "other"
                 ? categoryRaw
                 : "other";
 
@@ -966,7 +1115,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
               : 0.7;
 
             const timestampRaw = Number(memory.timestamp);
-            const timestamp = Number.isFinite(timestampRaw) ? timestampRaw : Date.now();
+            const timestamp = Number.isFinite(timestampRaw)
+              ? timestampRaw
+              : Date.now();
 
             const metadataRaw = memory.metadata;
             const metadata =
@@ -977,7 +1128,8 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
                   : "{}";
 
             const idRaw = memory.id;
-            const id = typeof idRaw === "string" && idRaw.length > 0 ? idRaw : undefined;
+            const id =
+              typeof idRaw === "string" && idRaw.length > 0 ? idRaw : undefined;
 
             // Idempotency: if the import file includes an id and we already have it, skip.
             if (id && (await context.store.hasId(id))) {
@@ -1029,7 +1181,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           }
         }
 
-        console.log(`Import completed: ${imported} imported, ${skipped} skipped`);
+        console.log(
+          `Import completed: ${imported} imported, ${skipped} skipped`,
+        );
       } catch (error) {
         console.error("Import failed:", error);
         process.exit(1);
@@ -1039,25 +1193,41 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
   // Re-embed an existing LanceDB into the current target DB (A/B testing)
   memory
     .command("reembed")
-    .description("Re-embed memories from a source LanceDB database into the current target database")
+    .description(
+      "Re-embed memories from a source LanceDB database into the current target database",
+    )
     .requiredOption("--source-db <path>", "Source LanceDB database directory")
     .option("--batch-size <n>", "Batch size for embedding calls", "32")
     .option("--limit <n>", "Limit number of rows to process (for testing)")
     .option("--dry-run", "Show what would be re-embedded without writing")
-    .option("--skip-existing", "Skip entries whose id already exists in the target DB")
-    .option("--force", "Allow using the same source-db as the target dbPath (DANGEROUS)")
+    .option(
+      "--skip-existing",
+      "Skip entries whose id already exists in the target DB",
+    )
+    .option(
+      "--force",
+      "Allow using the same source-db as the target dbPath (DANGEROUS)",
+    )
     .action(async (options) => {
       try {
         if (!context.embedder) {
-          console.error("Re-embed requires an embedder (not available in basic CLI mode).");
+          console.error(
+            "Re-embed requires an embedder (not available in basic CLI mode).",
+          );
           return;
         }
 
         const fs = await import("node:fs/promises");
 
         const sourceDbPath = options.sourceDb as string;
-        const batchSize = clampInt(parseInt(options.batchSize, 10) || 32, 1, 128);
-        const limit = options.limit ? clampInt(parseInt(options.limit, 10) || 0, 1, 1000000) : undefined;
+        const batchSize = clampInt(
+          parseInt(options.batchSize, 10) || 32,
+          1,
+          128,
+        );
+        const limit = options.limit
+          ? clampInt(parseInt(options.limit, 10) || 0, 1, 1000000)
+          : undefined;
         const dryRun = options.dryRun === true;
         const skipExisting = options.skipExisting === true;
         const force = options.force === true;
@@ -1067,13 +1237,15 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         let targetReal = context.store.dbPath;
         try {
           sourceReal = await fs.realpath(sourceDbPath);
-        } catch { }
+        } catch {}
         try {
           targetReal = await fs.realpath(context.store.dbPath);
-        } catch { }
+        } catch {}
 
         if (!force && sourceReal === targetReal) {
-          console.error("Refusing to re-embed in-place: source-db equals target dbPath. Use a new dbPath or pass --force.");
+          console.error(
+            "Refusing to re-embed in-place: source-db equals target dbPath. Use a new dbPath or pass --force.",
+          );
           process.exit(1);
         }
 
@@ -1083,12 +1255,23 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
 
         let query = table
           .query()
-          .select(["id", "text", "category", "scope", "importance", "timestamp", "metadata"]);
+          .select([
+            "id",
+            "text",
+            "category",
+            "scope",
+            "importance",
+            "timestamp",
+            "metadata",
+          ]);
 
         if (limit) query = query.limit(limit);
 
         const rows = (await query.toArray())
-          .filter((r: any) => r && typeof r.text === "string" && r.text.trim().length > 0)
+          .filter(
+            (r: any) =>
+              r && typeof r.text === "string" && r.text.trim().length > 0,
+          )
           .filter((r: any) => r.id && r.id !== "__schema__");
 
         if (rows.length === 0) {
@@ -1097,12 +1280,14 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         }
 
         console.log(
-          `Re-embedding ${rows.length} memories from ${sourceDbPath} → ${context.store.dbPath} (batchSize=${batchSize})`
+          `Re-embedding ${rows.length} memories from ${sourceDbPath} → ${context.store.dbPath} (batchSize=${batchSize})`,
         );
 
         if (dryRun) {
           console.log("DRY RUN - No memories will be written");
-          console.log(`First example: ${rows[0].id?.slice?.(0, 8)} ${String(rows[0].text).slice(0, 80)}`);
+          console.log(
+            `First example: ${rows[0].id?.slice?.(0, 8)} ${String(rows[0].text).slice(0, 80)}`,
+          );
           return;
         }
 
@@ -1140,8 +1325,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
               vector,
               category: (row.category as any) || "other",
               scope: (row.scope as string | undefined) || "global",
-              importance: (row.importance != null) ? Number(row.importance) : 0.7,
-              timestamp: (row.timestamp != null) ? Number(row.timestamp) : Date.now(),
+              importance: row.importance != null ? Number(row.importance) : 0.7,
+              timestamp:
+                row.timestamp != null ? Number(row.timestamp) : Date.now(),
               metadata: typeof row.metadata === "string" ? row.metadata : "{}",
             };
 
@@ -1150,11 +1336,15 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           }
 
           if (processed % 100 === 0 || processed === rows.length) {
-            console.log(`Progress: ${processed}/${rows.length} processed, ${imported} imported, ${skipped} skipped`);
+            console.log(
+              `Progress: ${processed}/${rows.length} processed, ${imported} imported, ${skipped} skipped`,
+            );
           }
         }
 
-        console.log(`Re-embed completed: ${imported} imported, ${skipped} skipped (processed=${processed}).`);
+        console.log(
+          `Re-embed completed: ${imported} imported, ${skipped} skipped (processed=${processed}).`,
+        );
       } catch (error) {
         console.error("Re-embed failed:", error);
         process.exit(1);
@@ -1164,7 +1354,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
   // Upgrade legacy memories to new smart memory format
   memory
     .command("upgrade")
-    .description("Upgrade legacy memories to new 6-category L0/L1/L2 smart memory format")
+    .description(
+      "Upgrade legacy memories to new 6-category L0/L1/L2 smart memory format",
+    )
     .option("--dry-run", "Show upgrade statistics without modifying data")
     .option("--batch-size <n>", "Number of memories per batch", "10")
     .option("--no-llm", "Skip LLM calls; use simple text truncation for L0/L1")
@@ -1194,7 +1386,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         }
 
         if (counts.legacy === 0) {
-          console.log(`\nAll memories are already in the new format. No upgrade needed.`);
+          console.log(
+            `\nAll memories are already in the new format. No upgrade needed.`,
+          );
           return;
         }
 
@@ -1217,7 +1411,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         console.log(`• Already new format: ${result.skipped}`);
         if (result.errors.length > 0) {
           console.log(`• Errors: ${result.errors.length}`);
-          result.errors.slice(0, 5).forEach(err => console.log(`  - ${err}`));
+          result.errors.slice(0, 5).forEach((err) => console.log(`  - ${err}`));
           if (result.errors.length > 5) {
             console.log(`  ... and ${result.errors.length - 5} more`);
           }
@@ -1229,9 +1423,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     });
 
   // Migration commands
-  const migrate = memory
-    .command("migrate")
-    .description("Migration utilities");
+  const migrate = memory.command("migrate").description("Migration utilities");
 
   migrate
     .command("check")
@@ -1239,17 +1431,21 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .option("--source <path>", "Specific source database path")
     .action(async (options) => {
       try {
-        const check = await context.migrator.checkMigrationNeeded(options.source);
+        const check = await context.migrator.checkMigrationNeeded(
+          options.source,
+        );
 
         console.log("Migration Check Results:");
-        console.log(`• Legacy database found: ${check.sourceFound ? 'Yes' : 'No'}`);
+        console.log(
+          `• Legacy database found: ${check.sourceFound ? "Yes" : "No"}`,
+        );
         if (check.sourceDbPath) {
           console.log(`• Source path: ${check.sourceDbPath}`);
         }
         if (check.entryCount !== undefined) {
           console.log(`• Entries to migrate: ${check.entryCount}`);
         }
-        console.log(`• Migration needed: ${check.needed ? 'Yes' : 'No'}`);
+        console.log(`• Migration needed: ${check.needed ? "Yes" : "No"}`);
       } catch (error) {
         console.error("Migration check failed:", error);
         process.exit(1);
@@ -1260,8 +1456,15 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .command("run")
     .description("Run migration from legacy memory-lancedb")
     .option("--source <path>", "Specific source database path")
-    .option("--default-scope <scope>", "Default scope for migrated data", "global")
-    .option("--dry-run", "Show what would be migrated without actually migrating")
+    .option(
+      "--default-scope <scope>",
+      "Default scope for migrated data",
+      "global",
+    )
+    .option(
+      "--dry-run",
+      "Show what would be migrated without actually migrating",
+    )
     .option("--skip-existing", "Skip entries that already exist")
     .action(async (options) => {
       try {
@@ -1273,12 +1476,12 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         });
 
         console.log("Migration Results:");
-        console.log(`• Status: ${result.success ? 'Success' : 'Failed'}`);
+        console.log(`• Status: ${result.success ? "Success" : "Failed"}`);
         console.log(`• Migrated: ${result.migratedCount}`);
         console.log(`• Skipped: ${result.skippedCount}`);
         if (result.errors.length > 0) {
           console.log(`• Errors: ${result.errors.length}`);
-          result.errors.forEach(error => console.log(`  - ${error}`));
+          result.errors.forEach((error) => console.log(`  - ${error}`));
         }
         console.log(`• Summary: ${result.summary}`);
 
@@ -1300,13 +1503,13 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         const result = await context.migrator.verifyMigration(options.source);
 
         console.log("Migration Verification:");
-        console.log(`• Valid: ${result.valid ? 'Yes' : 'No'}`);
+        console.log(`• Valid: ${result.valid ? "Yes" : "No"}`);
         console.log(`• Source count: ${result.sourceCount}`);
         console.log(`• Target count: ${result.targetCount}`);
 
         if (result.issues.length > 0) {
           console.log("• Issues:");
-          result.issues.forEach(issue => console.log(`  - ${issue}`));
+          result.issues.forEach((issue) => console.log(`  - ${issue}`));
         }
 
         if (!result.valid) {
@@ -1325,7 +1528,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .action(async () => {
       try {
         const status = context.store.getFtsStatus();
-        console.log(`FTS status before: available=${status.available}, lastError=${status.lastError || "none"}`);
+        console.log(
+          `FTS status before: available=${status.available}, lastError=${status.lastError || "none"}`,
+        );
         const result = await context.store.rebuildFtsIndex();
         if (result.success) {
           console.log("✅ FTS index rebuilt successfully");
@@ -1338,6 +1543,307 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         process.exit(1);
       }
     });
+
+  // ========================================================================
+  // Skill Observation CLI Commands
+  // ========================================================================
+
+  // skill-health: Global health dashboard
+  memory
+    .command("skill-health")
+    .description("Show health dashboard for all tracked skills")
+    .option("--scope <scope>", "Scope filter")
+    .option("--json", "Output as JSON")
+    .action(async (options) => {
+      try {
+        const { getSkillHealth } = await import("./src/skill-inspect.js");
+        const scopeFilter = options.scope
+          ? [options.scope]
+          : [context.scopeManager.getDefaultScope()];
+        const dashboard = await getSkillHealth(
+          context.store,
+          context.retriever,
+          scopeFilter,
+        );
+
+        if (options.json) {
+          console.log(formatJson(dashboard));
+        } else {
+          console.log("Skill Health Dashboard\n");
+          for (const report of dashboard.skills) {
+            const trend =
+              report.trend === "improving"
+                ? "↑"
+                : report.trend === "declining"
+                  ? "↓"
+                  : "→";
+            console.log(
+              `  ${report.skill_id}: ${pctFmt(report.success_rate)} success (${report.total_observations} obs) ${trend}`,
+            );
+            if (report.trend_alert) {
+              console.log(`    ⚠ ${report.trend_alert}`);
+            }
+          }
+          if (dashboard.skills.length === 0) {
+            console.log("  No skill observations recorded yet.");
+          }
+        }
+      } catch (error) {
+        console.error("Skill health failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // skill-inspect: Detailed report for a single skill
+  memory
+    .command("skill-inspect <skill_id>")
+    .description("Get detailed health report for a specific skill")
+    .option("--scope <scope>", "Scope filter")
+    .option("--json", "Output as JSON")
+    .action(async (skillId, options) => {
+      try {
+        const { inspectSkill } = await import("./src/skill-inspect.js");
+        const scopeFilter = options.scope
+          ? [options.scope]
+          : [context.scopeManager.getDefaultScope()];
+        const report = await inspectSkill(
+          context.store,
+          context.retriever,
+          skillId,
+          scopeFilter,
+        );
+
+        if (options.json) {
+          console.log(formatJson(report));
+        } else {
+          console.log(`Skill Report: ${report.skill_id}\n`);
+          console.log(`  Total observations: ${report.total_observations}`);
+          console.log(`  Success rate: ${pctFmt(report.success_rate)}`);
+          console.log(`  Trend: ${report.trend}`);
+          if (report.trend_alert) {
+            console.log(`  Alert: ${report.trend_alert}`);
+          }
+          console.log(`\n  Time Windows:`);
+          console.log(
+            `    7d:  ${report.time_windows.recent_7d.observations} obs, ${pctFmt(report.time_windows.recent_7d.success_rate)}`,
+          );
+          console.log(
+            `    30d: ${report.time_windows.recent_30d.observations} obs, ${pctFmt(report.time_windows.recent_30d.success_rate)}`,
+          );
+          console.log(
+            `    all: ${report.time_windows.all_time.observations} obs, ${pctFmt(report.time_windows.all_time.success_rate)}`,
+          );
+          if (report.top_failures.length > 0) {
+            console.log(`\n  Top Failures:`);
+            for (const f of report.top_failures) {
+              console.log(`    - ${f.pattern} (${f.count}x)`);
+            }
+          }
+        }
+      } catch (error) {
+        console.error("Skill inspect failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // skill-history: Chronological list of observations for a skill
+  memory
+    .command("skill-history <skill_id>")
+    .description("Show chronological observation history for a skill")
+    .option("--scope <scope>", "Scope filter")
+    .option("--limit <n>", "Max entries to show", "20")
+    .option("--json", "Output as JSON")
+    .action(async (skillId, options) => {
+      try {
+        const { getSkillHistory } = await import("./src/skill-inspect.js");
+        const scopeFilter = options.scope
+          ? [options.scope]
+          : [context.scopeManager.getDefaultScope()];
+        const limit = clampInt(parseInt(options.limit, 10) || 20, 1, 100);
+        const history = await getSkillHistory(context.store, skillId, {
+          scopeFilter,
+          limit,
+        });
+
+        if (options.json) {
+          console.log(formatJson(history));
+        } else {
+          console.log(`Skill History: ${skillId} (last ${history.length})\n`);
+          for (const entry of history) {
+            const date = new Date(entry.timestamp).toISOString().slice(0, 19);
+            console.log(
+              `  ${date}  ${entry.outcome.padEnd(7)}  ${entry.text.slice(0, 80)}`,
+            );
+          }
+          if (history.length === 0) {
+            console.log("  No observations found.");
+          }
+        }
+      } catch (error) {
+        console.error("Skill history failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // skill-trend: Show success rate trend over time windows
+  memory
+    .command("skill-trend <skill_id>")
+    .description("Show success rate trend for a skill across time windows")
+    .option("--scope <scope>", "Scope filter")
+    .option("--json", "Output as JSON")
+    .action(async (skillId, options) => {
+      try {
+        const { inspectSkill } = await import("./src/skill-inspect.js");
+        const scopeFilter = options.scope
+          ? [options.scope]
+          : [context.scopeManager.getDefaultScope()];
+        const report = await inspectSkill(
+          context.store,
+          context.retriever,
+          skillId,
+          scopeFilter,
+        );
+
+        if (options.json) {
+          console.log(
+            formatJson({
+              skill_id: report.skill_id,
+              trend: report.trend,
+              time_windows: report.time_windows,
+            }),
+          );
+        } else {
+          console.log(`Skill Trend: ${skillId}\n`);
+          const tw = report.time_windows;
+          console.log(
+            `  7d:   ${pctFmt(tw.recent_7d.success_rate)} (${tw.recent_7d.observations} obs)`,
+          );
+          console.log(
+            `  30d:  ${pctFmt(tw.recent_30d.success_rate)} (${tw.recent_30d.observations} obs)`,
+          );
+          console.log(
+            `  all:  ${pctFmt(tw.all_time.success_rate)} (${tw.all_time.observations} obs)`,
+          );
+          console.log(`\n  Trend: ${report.trend}`);
+          if (report.trend_alert) {
+            console.log(`  Alert: ${report.trend_alert}`);
+          }
+        }
+      } catch (error) {
+        console.error("Skill trend failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // skill-evidence: Generate evidence pack
+  memory
+    .command("skill-evidence <skill_id>")
+    .description("Generate evidence pack for a skill")
+    .option("--scope <scope>", "Scope filter")
+    .option("--json", "Output as JSON")
+    .action(async (skillId, options) => {
+      try {
+        const { generateSkillEvidence } =
+          await import("./src/skill-evidence.js");
+        const scopeFilter = options.scope
+          ? [options.scope]
+          : [context.scopeManager.getDefaultScope()];
+        const pack = await generateSkillEvidence(
+          context.store,
+          context.retriever,
+          skillId,
+          scopeFilter,
+        );
+
+        if (options.json) {
+          console.log(formatJson(pack));
+        } else {
+          console.log(`Evidence Pack: ${skillId}\n`);
+          const tw = pack.evidence.time_windows;
+          console.log(`  Time Windows:`);
+          console.log(
+            `    7d:  ${tw.recent_7d.observations} obs, ${pctFmt(tw.recent_7d.success_rate)}`,
+          );
+          console.log(
+            `    30d: ${tw.recent_30d.observations} obs, ${pctFmt(tw.recent_30d.success_rate)}`,
+          );
+          console.log(
+            `    all: ${tw.all_time.observations} obs, ${pctFmt(tw.all_time.success_rate)}`,
+          );
+          if (pack.evidence.failure_clusters.length > 0) {
+            console.log(`\n  Failure Clusters:`);
+            for (const c of pack.evidence.failure_clusters) {
+              console.log(`    - ${c.pattern} (${c.frequency}x)`);
+            }
+          }
+          if (pack.suggested_actions.length > 0) {
+            console.log(`\n  Suggested Actions:`);
+            for (const a of pack.suggested_actions) {
+              console.log(`    - ${a}`);
+            }
+          }
+        }
+      } catch (error) {
+        console.error("Skill evidence failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // import-learnings: Import from .learnings/ directory
+  memory
+    .command("import-learnings <dir>")
+    .description(
+      "Import learning entries from .learnings/ directory as skill observations",
+    )
+    .option("--scope <scope>", "Target scope", "global")
+    .action(async (dir, options) => {
+      try {
+        if (!context.embedder) {
+          console.error("Import requires an embedder.");
+          process.exit(1);
+          return;
+        }
+        const { importLearnings } = await import("./src/skill-bridge.js");
+        const result = await importLearnings(
+          { store: context.store, embedder: context.embedder },
+          dir,
+          options.scope,
+        );
+        console.log(
+          `Import learnings completed: ${result.imported} imported, ${result.skipped} skipped`,
+        );
+      } catch (error) {
+        console.error("Import learnings failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // import-instincts: Import from instincts JSONL file
+  memory
+    .command("import-instincts <file>")
+    .description("Import instincts from JSONL file as skill observations")
+    .option("--scope <scope>", "Target scope", "global")
+    .action(async (file, options) => {
+      try {
+        if (!context.embedder) {
+          console.error("Import requires an embedder.");
+          process.exit(1);
+          return;
+        }
+        const { importInstincts } = await import("./src/skill-bridge.js");
+        const result = await importInstincts(
+          { store: context.store, embedder: context.embedder },
+          file,
+          options.scope,
+        );
+        console.log(
+          `Import instincts completed: ${result.imported} imported, ${result.skipped} skipped`,
+        );
+      } catch (error) {
+        console.error("Import instincts failed:", error);
+        process.exit(1);
+      }
+    });
 }
 
 // ============================================================================
@@ -1345,5 +1851,6 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
 // ============================================================================
 
 export function createMemoryCLI(context: CLIContext) {
-  return ({ program }: { program: Command }) => registerMemoryCLI(program, context);
+  return ({ program }: { program: Command }) =>
+    registerMemoryCLI(program, context);
 }

@@ -11,7 +11,12 @@ import { join } from "node:path";
 import type { MemoryRetriever, RetrievalResult } from "./retriever.js";
 import type { MemoryStore } from "./store.js";
 import { isNoise } from "./noise-filter.js";
-import { isSystemBypassId, resolveScopeFilter, parseAgentIdFromSessionKey, type MemoryScopeManager } from "./scopes.js";
+import {
+  isSystemBypassId,
+  resolveScopeFilter,
+  parseAgentIdFromSessionKey,
+  type MemoryScopeManager,
+} from "./scopes.js";
 import type { Embedder } from "./embedder.js";
 import {
   appendRelation,
@@ -21,7 +26,10 @@ import {
   stringifySmartMetadata,
 } from "./smart-metadata.js";
 import { TEMPORAL_VERSIONED_CATEGORIES } from "./memory-categories.js";
-import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./self-improvement-files.js";
+import {
+  appendSelfImprovementEntry,
+  ensureSelfImprovementLearningFiles,
+} from "./self-improvement-files.js";
 import { getDisplayCategoryTag } from "./reflection-metadata.js";
 import {
   filterUserMdExclusiveRecallResults,
@@ -64,9 +72,14 @@ interface ToolContext {
   workspaceBoundary?: WorkspaceBoundaryConfig;
 }
 
-function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
-  if (typeof runtimeAgentId === "string" && runtimeAgentId.trim().length > 0) return runtimeAgentId;
-  if (typeof fallback === "string" && fallback.trim().length > 0) return fallback;
+function resolveAgentId(
+  runtimeAgentId: unknown,
+  fallback?: string,
+): string | undefined {
+  if (typeof runtimeAgentId === "string" && runtimeAgentId.trim().length > 0)
+    return runtimeAgentId;
+  if (typeof fallback === "string" && fallback.trim().length > 0)
+    return fallback;
   return undefined;
 }
 
@@ -114,20 +127,22 @@ function resolveRuntimeAgentId(
       _warnedMissingAgentId.add("no-context");
       console.warn(
         "resolveRuntimeAgentId: no runtime context or static agentId, defaulting to 'main'. " +
-        "Tool callers without explicit agentId will be scoped to agent:main + global + reflection:agent:main."
+          "Tool callers without explicit agentId will be scoped to agent:main + global + reflection:agent:main.",
       );
     }
     return fallback || "main";
   }
   const ctx = runtimeCtx as Record<string, unknown>;
   const ctxAgentId = typeof ctx.agentId === "string" ? ctx.agentId : undefined;
-  const ctxSessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : undefined;
-  const resolved = ctxAgentId || parseAgentIdFromSessionKey(ctxSessionKey) || staticAgentId;
+  const ctxSessionKey =
+    typeof ctx.sessionKey === "string" ? ctx.sessionKey : undefined;
+  const resolved =
+    ctxAgentId || parseAgentIdFromSessionKey(ctxSessionKey) || staticAgentId;
   const trimmed = resolved?.trim();
   if (!trimmed && !_warnedMissingAgentId.has("empty-resolved")) {
     _warnedMissingAgentId.add("empty-resolved");
     console.warn(
-      "resolveRuntimeAgentId: resolved agentId is empty after trim, defaulting to 'main'."
+      "resolveRuntimeAgentId: resolved agentId is empty after trim, defaulting to 'main'.",
     );
   }
   return trimmed ? trimmed : "main";
@@ -144,7 +159,7 @@ function resolveToolContext(
 }
 
 async function sleep(ms: number): Promise<void> {
-  await new Promise(resolve => setTimeout(resolve, ms));
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function retrieveWithRetry(
@@ -166,7 +181,10 @@ async function retrieveWithRetry(
 
 function resolveWorkspaceDir(toolCtx: unknown, fallback?: string): string {
   const runtime = toolCtx as Record<string, unknown> | undefined;
-  const runtimePath = typeof runtime?.workspaceDir === "string" ? runtime.workspaceDir.trim() : "";
+  const runtimePath =
+    typeof runtime?.workspaceDir === "string"
+      ? runtime.workspaceDir.trim()
+      : "";
   if (runtimePath) return runtimePath;
   if (fallback && fallback.trim()) return fallback;
   return join(homedir(), ".openclaw", "workspace");
@@ -176,20 +194,40 @@ function escapeRegExp(input: string): string {
   return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function registerSelfImprovementLogTool(api: OpenClawPluginApi, context: ToolContext) {
+export function registerSelfImprovementLogTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
   api.registerTool(
     (toolCtx) => ({
       name: "self_improvement_log",
       label: "Self-Improvement Log",
-      description: "Log structured learning/error entries into .learnings for governance and later distillation.",
+      description:
+        "Log structured learning/error entries into .learnings for governance and later distillation.",
       parameters: Type.Object({
         type: stringEnum(["learning", "error"]),
         summary: Type.String({ description: "One-line summary" }),
-        details: Type.Optional(Type.String({ description: "Detailed context or error output" })),
-        suggestedAction: Type.Optional(Type.String({ description: "Concrete action to prevent recurrence" })),
-        category: Type.Optional(Type.String({ description: "learning category (correction/best_practice/knowledge_gap) when type=learning" })),
-        area: Type.Optional(Type.String({ description: "frontend|backend|infra|tests|docs|config or custom area" })),
-        priority: Type.Optional(Type.String({ description: "low|medium|high|critical" })),
+        details: Type.Optional(
+          Type.String({ description: "Detailed context or error output" }),
+        ),
+        suggestedAction: Type.Optional(
+          Type.String({ description: "Concrete action to prevent recurrence" }),
+        ),
+        category: Type.Optional(
+          Type.String({
+            description:
+              "learning category (correction/best_practice/knowledge_gap) when type=learning",
+          }),
+        ),
+        area: Type.Optional(
+          Type.String({
+            description:
+              "frontend|backend|infra|tests|docs|config or custom area",
+          }),
+        ),
+        priority: Type.Optional(
+          Type.String({ description: "low|medium|high|critical" }),
+        ),
       }),
       async execute(_toolCallId, params) {
         const {
@@ -210,7 +248,10 @@ export function registerSelfImprovementLogTool(api: OpenClawPluginApi, context: 
           priority?: string;
         };
         try {
-          const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
+          const workspaceDir = resolveWorkspaceDir(
+            toolCtx,
+            context.workspaceDir,
+          );
           const { id: entryId, filePath } = await appendSelfImprovementEntry({
             baseDir: workspaceDir,
             type,
@@ -225,35 +266,66 @@ export function registerSelfImprovementLogTool(api: OpenClawPluginApi, context: 
           const fileName = type === "learning" ? "LEARNINGS.md" : "ERRORS.md";
 
           return {
-            content: [{ type: "text", text: `Logged ${type} entry ${entryId} to .learnings/${fileName}` }],
+            content: [
+              {
+                type: "text",
+                text: `Logged ${type} entry ${entryId} to .learnings/${fileName}`,
+              },
+            ],
             details: { action: "logged", type, id: entryId, filePath },
           };
         } catch (error) {
           return {
-            content: [{ type: "text", text: `Failed to log self-improvement entry: ${error instanceof Error ? error.message : String(error)}` }],
-            details: { error: "self_improvement_log_failed", message: String(error) },
+            content: [
+              {
+                type: "text",
+                text: `Failed to log self-improvement entry: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
+            details: {
+              error: "self_improvement_log_failed",
+              message: String(error),
+            },
           };
         }
       },
     }),
-    { name: "self_improvement_log" }
+    { name: "self_improvement_log" },
   );
 }
 
-export function registerSelfImprovementExtractSkillTool(api: OpenClawPluginApi, context: ToolContext) {
+export function registerSelfImprovementExtractSkillTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
   api.registerTool(
     (toolCtx) => ({
       name: "self_improvement_extract_skill",
       label: "Extract Skill From Learning",
-      description: "Create a new skill scaffold from a learning entry and mark the source learning as promoted_to_skill.",
+      description:
+        "Create a new skill scaffold from a learning entry and mark the source learning as promoted_to_skill.",
       parameters: Type.Object({
-        learningId: Type.String({ description: "Learning ID like LRN-YYYYMMDD-001" }),
-        skillName: Type.String({ description: "Skill folder name, lowercase with hyphens" }),
+        learningId: Type.String({
+          description: "Learning ID like LRN-YYYYMMDD-001",
+        }),
+        skillName: Type.String({
+          description: "Skill folder name, lowercase with hyphens",
+        }),
         sourceFile: Type.Optional(stringEnum(["LEARNINGS.md", "ERRORS.md"])),
-        outputDir: Type.Optional(Type.String({ description: "Relative output dir under workspace (default: skills)" })),
+        outputDir: Type.Optional(
+          Type.String({
+            description:
+              "Relative output dir under workspace (default: skills)",
+          }),
+        ),
       }),
       async execute(_toolCallId, params) {
-        const { learningId, skillName, sourceFile = "LEARNINGS.md", outputDir = "skills" } = params as {
+        const {
+          learningId,
+          skillName,
+          sourceFile = "LEARNINGS.md",
+          outputDir = "skills",
+        } = params as {
           learningId: string;
           skillName: string;
           sourceFile?: "LEARNINGS.md" | "ERRORS.md";
@@ -262,39 +334,66 @@ export function registerSelfImprovementExtractSkillTool(api: OpenClawPluginApi, 
         try {
           if (!/^(LRN|ERR)-\d{8}-\d{3}$/.test(learningId)) {
             return {
-              content: [{ type: "text", text: "Invalid learningId format. Use LRN-YYYYMMDD-001 / ERR-..." }],
+              content: [
+                {
+                  type: "text",
+                  text: "Invalid learningId format. Use LRN-YYYYMMDD-001 / ERR-...",
+                },
+              ],
               details: { error: "invalid_learning_id" },
             };
           }
           if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(skillName)) {
             return {
-              content: [{ type: "text", text: "Invalid skillName. Use lowercase letters, numbers, and hyphens only." }],
+              content: [
+                {
+                  type: "text",
+                  text: "Invalid skillName. Use lowercase letters, numbers, and hyphens only.",
+                },
+              ],
               details: { error: "invalid_skill_name" },
             };
           }
 
-          const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
+          const workspaceDir = resolveWorkspaceDir(
+            toolCtx,
+            context.workspaceDir,
+          );
           await ensureSelfImprovementLearningFiles(workspaceDir);
           const learningsPath = join(workspaceDir, ".learnings", sourceFile);
           const learningBody = await readFile(learningsPath, "utf-8");
           const escapedLearningId = escapeRegExp(learningId.trim());
-          const entryRegex = new RegExp(`## \\[${escapedLearningId}\\][\\s\\S]*?(?=\\n## \\[|$)`, "m");
+          const entryRegex = new RegExp(
+            `## \\[${escapedLearningId}\\][\\s\\S]*?(?=\\n## \\[|$)`,
+            "m",
+          );
           const match = learningBody.match(entryRegex);
           if (!match) {
             return {
-              content: [{ type: "text", text: `Learning entry ${learningId} not found in .learnings/${sourceFile}` }],
+              content: [
+                {
+                  type: "text",
+                  text: `Learning entry ${learningId} not found in .learnings/${sourceFile}`,
+                },
+              ],
               details: { error: "learning_not_found", learningId, sourceFile },
             };
           }
 
           const summaryMatch = match[0].match(/### Summary\n([\s\S]*?)\n###/m);
-          const summary = (summaryMatch?.[1] ?? "Summarize the source learning here.").trim();
+          const summary = (
+            summaryMatch?.[1] ?? "Summarize the source learning here."
+          ).trim();
           const safeOutputDir = outputDir
             .replace(/\\/g, "/")
             .split("/")
             .filter((segment) => segment && segment !== "." && segment !== "..")
             .join("/");
-          const skillDir = join(workspaceDir, safeOutputDir || "skills", skillName);
+          const skillDir = join(
+            workspaceDir,
+            safeOutputDir || "skills",
+            skillName,
+          );
           await mkdir(skillDir, { recursive: true });
           const skillPath = join(skillDir, "SKILL.md");
           const skillTitle = skillName
@@ -335,11 +434,19 @@ export function registerSelfImprovementExtractSkillTool(api: OpenClawPluginApi, 
           if (!updatedEntry.includes("Skill-Path:")) {
             updatedEntry = `${updatedEntry.trimEnd()}\n${skillPathMarker}\n`;
           }
-          const updatedLearningBody = learningBody.replace(match[0], updatedEntry);
+          const updatedLearningBody = learningBody.replace(
+            match[0],
+            updatedEntry,
+          );
           await writeFile(learningsPath, updatedLearningBody, "utf-8");
 
           return {
-            content: [{ type: "text", text: `Extracted skill scaffold to ${safeOutputDir || "skills"}/${skillName}/SKILL.md and updated ${learningId}.` }],
+            content: [
+              {
+                type: "text",
+                text: `Extracted skill scaffold to ${safeOutputDir || "skills"}/${skillName}/SKILL.md and updated ${learningId}.`,
+              },
+            ],
             details: {
               action: "skill_extracted",
               learningId,
@@ -349,37 +456,61 @@ export function registerSelfImprovementExtractSkillTool(api: OpenClawPluginApi, 
           };
         } catch (error) {
           return {
-            content: [{ type: "text", text: `Failed to extract skill: ${error instanceof Error ? error.message : String(error)}` }],
-            details: { error: "self_improvement_extract_skill_failed", message: String(error) },
+            content: [
+              {
+                type: "text",
+                text: `Failed to extract skill: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
+            details: {
+              error: "self_improvement_extract_skill_failed",
+              message: String(error),
+            },
           };
         }
       },
     }),
-    { name: "self_improvement_extract_skill" }
+    { name: "self_improvement_extract_skill" },
   );
 }
 
-export function registerSelfImprovementReviewTool(api: OpenClawPluginApi, context: ToolContext) {
+export function registerSelfImprovementReviewTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
   api.registerTool(
     (toolCtx) => ({
       name: "self_improvement_review",
       label: "Self-Improvement Review",
-      description: "Summarize governance backlog from .learnings files (pending/high-priority/promoted counts).",
+      description:
+        "Summarize governance backlog from .learnings files (pending/high-priority/promoted counts).",
       parameters: Type.Object({}),
       async execute() {
         try {
-          const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
+          const workspaceDir = resolveWorkspaceDir(
+            toolCtx,
+            context.workspaceDir,
+          );
           await ensureSelfImprovementLearningFiles(workspaceDir);
           const learningsDir = join(workspaceDir, ".learnings");
           const files = ["LEARNINGS.md", "ERRORS.md"] as const;
           const stats = { pending: 0, high: 0, promoted: 0, total: 0 };
 
           for (const f of files) {
-            const content = await readFile(join(learningsDir, f), "utf-8").catch(() => "");
+            const content = await readFile(
+              join(learningsDir, f),
+              "utf-8",
+            ).catch(() => "");
             stats.total += (content.match(/^## \[/gm) || []).length;
-            stats.pending += (content.match(/\*\*Status\*\*:\s*pending/gi) || []).length;
-            stats.high += (content.match(/\*\*Priority\*\*:\s*(high|critical)/gi) || []).length;
-            stats.promoted += (content.match(/\*\*Status\*\*:\s*promoted(_to_skill)?/gi) || []).length;
+            stats.pending += (
+              content.match(/\*\*Status\*\*:\s*pending/gi) || []
+            ).length;
+            stats.high += (
+              content.match(/\*\*Priority\*\*:\s*(high|critical)/gi) || []
+            ).length;
+            stats.promoted += (
+              content.match(/\*\*Status\*\*:\s*promoted(_to_skill)?/gi) || []
+            ).length;
           }
 
           const text = [
@@ -401,13 +532,21 @@ export function registerSelfImprovementReviewTool(api: OpenClawPluginApi, contex
           };
         } catch (error) {
           return {
-            content: [{ type: "text", text: `Failed to review self-improvement backlog: ${error instanceof Error ? error.message : String(error)}` }],
-            details: { error: "self_improvement_review_failed", message: String(error) },
+            content: [
+              {
+                type: "text",
+                text: `Failed to review self-improvement backlog: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
+            details: {
+              error: "self_improvement_review_failed",
+              message: String(error),
+            },
           };
         }
       },
     }),
-    { name: "self_improvement_review" }
+    { name: "self_improvement_review" },
   );
 }
 
@@ -423,126 +562,137 @@ export function registerMemoryRecallTool(
     (toolCtx) => {
       const runtimeContext = resolveToolContext(context, toolCtx);
       return {
-      name: "memory_recall",
-      label: "Memory Recall",
-      description:
-        "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
-      parameters: Type.Object({
-        query: Type.String({
-          description: "Search query for finding relevant memories",
+        name: "memory_recall",
+        label: "Memory Recall",
+        description:
+          "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
+        parameters: Type.Object({
+          query: Type.String({
+            description: "Search query for finding relevant memories",
+          }),
+          limit: Type.Optional(
+            Type.Number({
+              description: "Max results to return (default: 5, max: 20)",
+            }),
+          ),
+          scope: Type.Optional(
+            Type.String({
+              description: "Specific memory scope to search in (optional)",
+            }),
+          ),
+          category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
         }),
-        limit: Type.Optional(
-          Type.Number({
-            description: "Max results to return (default: 5, max: 20)",
-          }),
-        ),
-        scope: Type.Optional(
-          Type.String({
-            description: "Specific memory scope to search in (optional)",
-          }),
-        ),
-        category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
-      }),
-      async execute(_toolCallId, params) {
-        const {
-          query,
-          limit = 5,
-          scope,
-          category,
-        } = params as {
-          query: string;
-          limit?: number;
-          scope?: string;
-          category?: string;
-        };
+        async execute(_toolCallId, params) {
+          const {
+            query,
+            limit = 5,
+            scope,
+            category,
+          } = params as {
+            query: string;
+            limit?: number;
+            scope?: string;
+            category?: string;
+          };
 
-        try {
-          const safeLimit = clampInt(limit, 1, 20);
-          const agentId = runtimeContext.agentId;
+          try {
+            const safeLimit = clampInt(limit, 1, 20);
+            const agentId = runtimeContext.agentId;
 
-          // Determine accessible scopes
-          let scopeFilter = resolveScopeFilter(runtimeContext.scopeManager, agentId);
-          if (scope) {
-            if (runtimeContext.scopeManager.isAccessible(scope, agentId)) {
-              scopeFilter = [scope];
-            } else {
+            // Determine accessible scopes
+            let scopeFilter = resolveScopeFilter(
+              runtimeContext.scopeManager,
+              agentId,
+            );
+            if (scope) {
+              if (runtimeContext.scopeManager.isAccessible(scope, agentId)) {
+                scopeFilter = [scope];
+              } else {
+                return {
+                  content: [
+                    { type: "text", text: `Access denied to scope: ${scope}` },
+                  ],
+                  details: {
+                    error: "scope_access_denied",
+                    requestedScope: scope,
+                  },
+                };
+              }
+            }
+
+            const results = filterUserMdExclusiveRecallResults(
+              await retrieveWithRetry(runtimeContext.retriever, {
+                query,
+                limit: safeLimit,
+                scopeFilter,
+                category,
+                source: "manual",
+              }),
+              runtimeContext.workspaceBoundary,
+            );
+
+            if (results.length === 0) {
               return {
                 content: [
-                  { type: "text", text: `Access denied to scope: ${scope}` },
+                  { type: "text", text: "No relevant memories found." },
                 ],
-                details: {
-                  error: "scope_access_denied",
-                  requestedScope: scope,
-                },
+                details: { count: 0, query, scopes: scopeFilter },
               };
             }
-          }
 
-          const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry(runtimeContext.retriever, {
-            query,
-            limit: safeLimit,
-            scopeFilter,
-            category,
-            source: "manual",
-          }), runtimeContext.workspaceBoundary);
+            const now = Date.now();
+            await Promise.allSettled(
+              results.map((result) => {
+                const meta = parseSmartMetadata(
+                  result.entry.metadata,
+                  result.entry,
+                );
+                return runtimeContext.store.patchMetadata(
+                  result.entry.id,
+                  {
+                    access_count: meta.access_count + 1,
+                    last_accessed_at: now,
+                  },
+                  scopeFilter,
+                );
+              }),
+            );
 
-          if (results.length === 0) {
+            const text = results
+              .map((r, i) => {
+                const categoryTag = getDisplayCategoryTag(r.entry);
+                return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text}`;
+              })
+              .join("\n");
+
             return {
-              content: [{ type: "text", text: "No relevant memories found." }],
-              details: { count: 0, query, scopes: scopeFilter },
+              content: [
+                {
+                  type: "text",
+                  text: `Found ${results.length} memories:\n\n${text}`,
+                },
+              ],
+              details: {
+                count: results.length,
+                memories: sanitizeMemoryForSerialization(results),
+                query,
+                scopes: scopeFilter,
+                retrievalMode: runtimeContext.retriever.getConfig().mode,
+              },
+            };
+          } catch (error) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Memory recall failed: ${error instanceof Error ? error.message : String(error)}`,
+                },
+              ],
+              details: { error: "recall_failed", message: String(error) },
             };
           }
-
-          const now = Date.now();
-          await Promise.allSettled(
-            results.map((result) => {
-              const meta = parseSmartMetadata(result.entry.metadata, result.entry);
-              return runtimeContext.store.patchMetadata(
-                result.entry.id,
-                {
-                  access_count: meta.access_count + 1,
-                  last_accessed_at: now,
-                },
-                scopeFilter,
-              );
-            }),
-          );
-
-          const text = results
-            .map((r, i) => {
-              const categoryTag = getDisplayCategoryTag(r.entry);
-              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text}`;
-            })
-            .join("\n");
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Found ${results.length} memories:\n\n${text}`,
-              },
-            ],
-            details: {
-              count: results.length,
-              memories: sanitizeMemoryForSerialization(results),
-              query,
-              scopes: scopeFilter,
-              retrievalMode: runtimeContext.retriever.getConfig().mode,
-            },
-          };
-        } catch (error) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Memory recall failed: ${error instanceof Error ? error.message : String(error)}`,
-              },
-            ],
-            details: { error: "recall_failed", message: String(error) },
-          };
-        }
-      },
-    };
+        },
+      };
     },
     { name: "memory_recall" },
   );
@@ -556,199 +706,211 @@ export function registerMemoryStoreTool(
     (toolCtx) => {
       const runtimeContext = resolveToolContext(context, toolCtx);
       return {
-      name: "memory_store",
-      label: "Memory Store",
-      description:
-        "Save important information in long-term memory. Use for preferences, facts, decisions, and other notable information.",
-      parameters: Type.Object({
-        text: Type.String({ description: "Information to remember" }),
-        importance: Type.Optional(
-          Type.Number({ description: "Importance score 0-1 (default: 0.7)" }),
-        ),
-        category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
-        scope: Type.Optional(
-          Type.String({
-            description: "Memory scope (optional, defaults to agent scope)",
-          }),
-        ),
-      }),
-      async execute(_toolCallId, params) {
-        const {
-          text,
-          importance = 0.7,
-          category = "other",
-          scope,
-        } = params as {
-          text: string;
-          importance?: number;
-          category?: string;
-          scope?: string;
-        };
+        name: "memory_store",
+        label: "Memory Store",
+        description:
+          "Save important information in long-term memory. Use for preferences, facts, decisions, and other notable information.",
+        parameters: Type.Object({
+          text: Type.String({ description: "Information to remember" }),
+          importance: Type.Optional(
+            Type.Number({ description: "Importance score 0-1 (default: 0.7)" }),
+          ),
+          category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
+          scope: Type.Optional(
+            Type.String({
+              description: "Memory scope (optional, defaults to agent scope)",
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          const {
+            text,
+            importance = 0.7,
+            category = "other",
+            scope,
+          } = params as {
+            text: string;
+            importance?: number;
+            category?: string;
+            scope?: string;
+          };
 
-        try {
-          const agentId = runtimeContext.agentId;
-          // Determine target scope
-          let targetScope = scope;
-          if (!targetScope) {
-            if (isSystemBypassId(agentId)) {
+          try {
+            const agentId = runtimeContext.agentId;
+            // Determine target scope
+            let targetScope = scope;
+            if (!targetScope) {
+              if (isSystemBypassId(agentId)) {
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: "Reserved bypass agent IDs must provide an explicit scope for memory_store writes.",
+                    },
+                  ],
+                  details: {
+                    error: "explicit_scope_required",
+                    agentId,
+                  },
+                };
+              }
+              targetScope =
+                runtimeContext.scopeManager.getDefaultScope(agentId);
+            }
+
+            // Validate scope access
+            if (
+              !runtimeContext.scopeManager.isAccessible(targetScope, agentId)
+            ) {
               return {
                 content: [
                   {
                     type: "text",
-                    text: "Reserved bypass agent IDs must provide an explicit scope for memory_store writes.",
+                    text: `Access denied to scope: ${targetScope}`,
                   },
                 ],
                 details: {
-                  error: "explicit_scope_required",
-                  agentId,
+                  error: "scope_access_denied",
+                  requestedScope: targetScope,
                 },
               };
             }
-            targetScope = runtimeContext.scopeManager.getDefaultScope(agentId);
-          }
 
-          // Validate scope access
-          if (!runtimeContext.scopeManager.isAccessible(targetScope, agentId)) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Access denied to scope: ${targetScope}`,
+            // Reject noise before wasting an embedding API call
+            if (isNoise(text)) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Skipped: text detected as noise (greeting, boilerplate, or meta-question)`,
+                  },
+                ],
+                details: { action: "noise_filtered", text: text.slice(0, 60) },
+              };
+            }
+
+            if (
+              isUserMdExclusiveMemory(
+                { text },
+                runtimeContext.workspaceBoundary,
+              )
+            ) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: "Skipped: this fact belongs in USER.md, not plugin memory.",
+                  },
+                ],
+                details: {
+                  action: "skipped_by_workspace_boundary",
+                  boundary: "user_md_exclusive",
                 },
-              ],
-              details: {
-                error: "scope_access_denied",
-                requestedScope: targetScope,
-              },
-            };
-          }
+              };
+            }
 
-          // Reject noise before wasting an embedding API call
-          if (isNoise(text)) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Skipped: text detected as noise (greeting, boilerplate, or meta-question)`,
+            const safeImportance = clamp01(importance, 0.7);
+            const vector = await runtimeContext.embedder.embedPassage(text);
+
+            // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
+            // Fail-open by design: dedup must never block a legitimate memory write.
+            // excludeInactive: superseded historical records must not block new writes.
+            let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
+            try {
+              existing = await runtimeContext.store.vectorSearch(
+                vector,
+                1,
+                0.1,
+                [targetScope],
+                { excludeInactive: true },
+              );
+            } catch (err) {
+              console.warn(
+                `memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`,
+              );
+            }
+
+            if (existing.length > 0 && existing[0].score > 0.98) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Similar memory already exists: "${existing[0].entry.text}"`,
+                  },
+                ],
+                details: {
+                  action: "duplicate",
+                  existingId: existing[0].entry.id,
+                  existingText: existing[0].entry.text,
+                  existingScope: existing[0].entry.scope,
+                  similarity: existing[0].score,
                 },
-              ],
-              details: { action: "noise_filtered", text: text.slice(0, 60) },
-            };
-          }
+              };
+            }
 
-          if (
-            isUserMdExclusiveMemory(
-              { text },
-              runtimeContext.workspaceBoundary,
-            )
-          ) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Skipped: this fact belongs in USER.md, not plugin memory.",
-                },
-              ],
-              details: {
-                action: "skipped_by_workspace_boundary",
-                boundary: "user_md_exclusive",
-              },
-            };
-          }
+            const entry = await runtimeContext.store.store({
+              text,
+              vector,
+              importance: safeImportance,
+              category: category as any,
+              scope: targetScope,
+              metadata: stringifySmartMetadata(
+                buildSmartMetadata(
+                  {
+                    text,
+                    category: category as any,
+                    importance: safeImportance,
+                  },
+                  {
+                    l0_abstract: text,
+                    l1_overview: `- ${text}`,
+                    l2_content: text,
+                  },
+                ),
+              ),
+            });
 
-          const safeImportance = clamp01(importance, 0.7);
-          const vector = await runtimeContext.embedder.embedPassage(text);
-
-          // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
-          // Fail-open by design: dedup must never block a legitimate memory write.
-          // excludeInactive: superseded historical records must not block new writes.
-          let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
-          try {
-            existing = await runtimeContext.store.vectorSearch(vector, 1, 0.1, [
-              targetScope,
-            ], { excludeInactive: true });
-          } catch (err) {
-            console.warn(
-              `memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`,
-            );
-          }
-
-          if (existing.length > 0 && existing[0].score > 0.98) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Similar memory already exists: "${existing[0].entry.text}"`,
-                },
-              ],
-              details: {
-                action: "duplicate",
-                existingId: existing[0].entry.id,
-                existingText: existing[0].entry.text,
-                existingScope: existing[0].entry.scope,
-                similarity: existing[0].score,
-              },
-            };
-          }
-
-          const entry = await runtimeContext.store.store({
-            text,
-            vector,
-            importance: safeImportance,
-            category: category as any,
-            scope: targetScope,
-            metadata: stringifySmartMetadata(
-              buildSmartMetadata(
+            // Dual-write to Markdown mirror if enabled
+            if (context.mdMirror) {
+              await context.mdMirror(
                 {
                   text,
-                  category: category as any,
-                  importance: safeImportance,
+                  category: category as string,
+                  scope: targetScope,
+                  timestamp: entry.timestamp,
                 },
+                { source: "memory_store", agentId },
+              );
+            }
+
+            return {
+              content: [
                 {
-                  l0_abstract: text,
-                  l1_overview: `- ${text}`,
-                  l2_content: text,
+                  type: "text",
+                  text: `Stored: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}" in scope '${targetScope}'`,
                 },
-              ),
-            ),
-          });
-
-          // Dual-write to Markdown mirror if enabled
-          if (context.mdMirror) {
-            await context.mdMirror(
-              { text, category: category as string, scope: targetScope, timestamp: entry.timestamp },
-              { source: "memory_store", agentId },
-            );
+              ],
+              details: {
+                action: "created",
+                id: entry.id,
+                scope: entry.scope,
+                category: entry.category,
+                importance: entry.importance,
+              },
+            };
+          } catch (error) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Memory storage failed: ${error instanceof Error ? error.message : String(error)}`,
+                },
+              ],
+              details: { error: "store_failed", message: String(error) },
+            };
           }
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Stored: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}" in scope '${targetScope}'`,
-              },
-            ],
-            details: {
-              action: "created",
-              id: entry.id,
-              scope: entry.scope,
-              category: entry.category,
-              importance: entry.importance,
-            },
-          };
-        } catch (error) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Memory storage failed: ${error instanceof Error ? error.message : String(error)}`,
-              },
-            ],
-            details: { error: "store_failed", message: String(error) },
-          };
-        }
-      },
-    };
+        },
+      };
     },
     { name: "memory_store" },
   );
@@ -760,151 +922,154 @@ export function registerMemoryForgetTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const agentId =
+        resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
       return {
         name: "memory_forget",
-      label: "Memory Forget",
-      description:
-        "Delete specific memories. Supports both search-based and direct ID-based deletion.",
-      parameters: Type.Object({
-        query: Type.Optional(
-          Type.String({ description: "Search query to find memory to delete" }),
-        ),
-        memoryId: Type.Optional(
-          Type.String({ description: "Specific memory ID to delete" }),
-        ),
-        scope: Type.Optional(
-          Type.String({
-            description: "Scope to search/delete from (optional)",
-          }),
-        ),
-      }),
-      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
-        const { query, memoryId, scope } = params as {
-          query?: string;
-          memoryId?: string;
-          scope?: string;
-        };
+        label: "Memory Forget",
+        description:
+          "Delete specific memories. Supports both search-based and direct ID-based deletion.",
+        parameters: Type.Object({
+          query: Type.Optional(
+            Type.String({
+              description: "Search query to find memory to delete",
+            }),
+          ),
+          memoryId: Type.Optional(
+            Type.String({ description: "Specific memory ID to delete" }),
+          ),
+          scope: Type.Optional(
+            Type.String({
+              description: "Scope to search/delete from (optional)",
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
+          const { query, memoryId, scope } = params as {
+            query?: string;
+            memoryId?: string;
+            scope?: string;
+          };
 
-        try {
-          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
-          // Determine accessible scopes
-          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-          if (scope) {
-            if (context.scopeManager.isAccessible(scope, agentId)) {
-              scopeFilter = [scope];
-            } else {
-              return {
-                content: [
-                  { type: "text", text: `Access denied to scope: ${scope}` },
-                ],
-                details: {
-                  error: "scope_access_denied",
-                  requestedScope: scope,
-                },
-              };
-            }
-          }
-
-          if (memoryId) {
-            const deleted = await context.store.delete(memoryId, scopeFilter);
-            if (deleted) {
-              return {
-                content: [
-                  { type: "text", text: `Memory ${memoryId} forgotten.` },
-                ],
-                details: { action: "deleted", id: memoryId },
-              };
-            } else {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Memory ${memoryId} not found or access denied.`,
-                  },
-                ],
-                details: { error: "not_found", id: memoryId },
-              };
-            }
-          }
-
-          if (query) {
-            const results = await retrieveWithRetry(context.retriever, {
-              query,
-              limit: 5,
-              scopeFilter,
-            });
-
-            if (results.length === 0) {
-              return {
-                content: [
-                  { type: "text", text: "No matching memories found." },
-                ],
-                details: { found: 0, query },
-              };
-            }
-
-            if (results.length === 1 && results[0].score > 0.9) {
-              const deleted = await context.store.delete(
-                results[0].entry.id,
-                scopeFilter,
-              );
-              if (deleted) {
+          try {
+            const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
+            // Determine accessible scopes
+            let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+            if (scope) {
+              if (context.scopeManager.isAccessible(scope, agentId)) {
+                scopeFilter = [scope];
+              } else {
                 return {
                   content: [
-                    {
-                      type: "text",
-                      text: `Forgotten: "${results[0].entry.text}"`,
-                    },
+                    { type: "text", text: `Access denied to scope: ${scope}` },
                   ],
-                  details: { action: "deleted", id: results[0].entry.id },
+                  details: {
+                    error: "scope_access_denied",
+                    requestedScope: scope,
+                  },
                 };
               }
             }
 
-            const list = results
-              .map(
-                (r) =>
-                  `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
-              )
-              .join("\n");
+            if (memoryId) {
+              const deleted = await context.store.delete(memoryId, scopeFilter);
+              if (deleted) {
+                return {
+                  content: [
+                    { type: "text", text: `Memory ${memoryId} forgotten.` },
+                  ],
+                  details: { action: "deleted", id: memoryId },
+                };
+              } else {
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: `Memory ${memoryId} not found or access denied.`,
+                    },
+                  ],
+                  details: { error: "not_found", id: memoryId },
+                };
+              }
+            }
+
+            if (query) {
+              const results = await retrieveWithRetry(context.retriever, {
+                query,
+                limit: 5,
+                scopeFilter,
+              });
+
+              if (results.length === 0) {
+                return {
+                  content: [
+                    { type: "text", text: "No matching memories found." },
+                  ],
+                  details: { found: 0, query },
+                };
+              }
+
+              if (results.length === 1 && results[0].score > 0.9) {
+                const deleted = await context.store.delete(
+                  results[0].entry.id,
+                  scopeFilter,
+                );
+                if (deleted) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Forgotten: "${results[0].entry.text}"`,
+                      },
+                    ],
+                    details: { action: "deleted", id: results[0].entry.id },
+                  };
+                }
+              }
+
+              const list = results
+                .map(
+                  (r) =>
+                    `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
+                )
+                .join("\n");
+
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Found ${results.length} candidates. Specify memoryId to delete:\n${list}`,
+                  },
+                ],
+                details: {
+                  action: "candidates",
+                  candidates: sanitizeMemoryForSerialization(results),
+                },
+              };
+            }
 
             return {
               content: [
                 {
                   type: "text",
-                  text: `Found ${results.length} candidates. Specify memoryId to delete:\n${list}`,
+                  text: "Provide either 'query' to search for memories or 'memoryId' to delete specific memory.",
                 },
               ],
-              details: {
-                action: "candidates",
-                candidates: sanitizeMemoryForSerialization(results),
-              },
+              details: { error: "missing_param" },
+            };
+          } catch (error) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Memory deletion failed: ${error instanceof Error ? error.message : String(error)}`,
+                },
+              ],
+              details: { error: "delete_failed", message: String(error) },
             };
           }
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: "Provide either 'query' to search for memories or 'memoryId' to delete specific memory.",
-              },
-            ],
-            details: { error: "missing_param" },
-          };
-        } catch (error) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Memory deletion failed: ${error instanceof Error ? error.message : String(error)}`,
-              },
-            ],
-            details: { error: "delete_failed", message: String(error) },
-          };
-        }
-      },
-    };
+        },
+      };
     },
     { name: "memory_forget" },
   );
@@ -920,255 +1085,265 @@ export function registerMemoryUpdateTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const agentId =
+        resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
       return {
         name: "memory_update",
-      label: "Memory Update",
-      description:
-        "Update an existing memory. For preferences/entities, changing text creates a new version (supersede) to preserve history. Metadata-only changes (importance, category) update in-place.",
-      parameters: Type.Object({
-        memoryId: Type.String({
-          description:
-            "ID of the memory to update (full UUID or 8+ char prefix)",
-        }),
-        text: Type.Optional(
-          Type.String({
-            description: "New text content (triggers re-embedding)",
+        label: "Memory Update",
+        description:
+          "Update an existing memory. For preferences/entities, changing text creates a new version (supersede) to preserve history. Metadata-only changes (importance, category) update in-place.",
+        parameters: Type.Object({
+          memoryId: Type.String({
+            description:
+              "ID of the memory to update (full UUID or 8+ char prefix)",
           }),
-        ),
-        importance: Type.Optional(
-          Type.Number({ description: "New importance score 0-1" }),
-        ),
-        category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
-      }),
-      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
-        const { memoryId, text, importance, category } = params as {
-          memoryId: string;
-          text?: string;
-          importance?: number;
-          category?: string;
-        };
+          text: Type.Optional(
+            Type.String({
+              description: "New text content (triggers re-embedding)",
+            }),
+          ),
+          importance: Type.Optional(
+            Type.Number({ description: "New importance score 0-1" }),
+          ),
+          category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
+          const { memoryId, text, importance, category } = params as {
+            memoryId: string;
+            text?: string;
+            importance?: number;
+            category?: string;
+          };
 
-        try {
-          if (!text && importance === undefined && !category) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Nothing to update. Provide at least one of: text, importance, category.",
-                },
-              ],
-              details: { error: "no_updates" },
-            };
-          }
-
-          // Determine accessible scopes
-          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
-          const scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-
-          // Resolve memoryId: if it doesn't look like a UUID, try search
-          let resolvedId = memoryId;
-          const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(memoryId);
-          if (!uuidLike) {
-            // Treat as search query
-            const results = await retrieveWithRetry(context.retriever, {
-              query: memoryId,
-              limit: 3,
-              scopeFilter,
-            });
-            if (results.length === 0) {
+          try {
+            if (!text && importance === undefined && !category) {
               return {
                 content: [
                   {
                     type: "text",
-                    text: `No memory found matching "${memoryId}".`,
+                    text: "Nothing to update. Provide at least one of: text, importance, category.",
                   },
                 ],
-                details: { error: "not_found", query: memoryId },
+                details: { error: "no_updates" },
               };
             }
-            if (results.length === 1 || results[0].score > 0.85) {
-              resolvedId = results[0].entry.id;
-            } else {
-              const list = results
-                .map(
-                  (r) =>
-                    `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
-                )
-                .join("\n");
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Multiple matches. Specify memoryId:\n${list}`,
-                  },
-                ],
-                details: {
-                  action: "candidates",
-                  candidates: sanitizeMemoryForSerialization(results),
-                },
-              };
-            }
-          }
 
-          // If text changed, re-embed; reject noise
-          let newVector: number[] | undefined;
-          if (text) {
-            if (isNoise(text)) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: "Skipped: updated text detected as noise",
-                  },
-                ],
-                details: { action: "noise_filtered" },
-              };
-            }
-            newVector = await context.embedder.embedPassage(text);
-          }
+            // Determine accessible scopes
+            const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
+            const scopeFilter = resolveScopeFilter(
+              context.scopeManager,
+              agentId,
+            );
 
-          // --- Temporal supersede guard ---
-          // For temporal-versioned categories (preferences/entities), changing
-          // text must go through supersede to preserve the history chain.
-          if (text && newVector) {
-            const existing = await context.store.getById(resolvedId, scopeFilter);
-            if (existing) {
-              const meta = parseSmartMetadata(existing.metadata, existing);
-              if (TEMPORAL_VERSIONED_CATEGORIES.has(meta.memory_category)) {
-                const now = Date.now();
-                const factKey =
-                  meta.fact_key ?? deriveFactKey(meta.memory_category, text);
-
-                // Create new superseding record
-                const newMeta = buildSmartMetadata(
-                  { text, category: existing.category },
-                  {
-                    l0_abstract: text,
-                    l1_overview: meta.l1_overview,
-                    l2_content: text,
-                    memory_category: meta.memory_category,
-                    tier: meta.tier,
-                    access_count: 0,
-                    confidence: importance !== undefined ? clamp01(importance, 0.7) : meta.confidence,
-                    valid_from: now,
-                    fact_key: factKey,
-                    supersedes: resolvedId,
-                    relations: appendRelation([], {
-                      type: "supersedes",
-                      targetId: resolvedId,
-                    }),
-                  },
-                );
-
-                const newEntry = await context.store.store({
-                  text,
-                  vector: newVector,
-                  category: category ? (category as any) : existing.category,
-                  scope: existing.scope,
-                  importance:
-                    importance !== undefined
-                      ? clamp01(importance, 0.7)
-                      : existing.importance,
-                  metadata: stringifySmartMetadata(newMeta),
-                });
-
-                // Invalidate old record (metadata-only patch — safe)
-                try {
-                  const invalidatedMeta = buildSmartMetadata(existing, {
-                    fact_key: factKey,
-                    invalidated_at: now,
-                    superseded_by: newEntry.id,
-                    relations: appendRelation(meta.relations, {
-                      type: "superseded_by",
-                      targetId: newEntry.id,
-                    }),
-                  });
-                  await context.store.update(
-                    resolvedId,
-                    { metadata: stringifySmartMetadata(invalidatedMeta) },
-                    scopeFilter,
-                  );
-                } catch (patchErr) {
-                  // New record is already the source of truth; log but don't fail
-                  console.warn(
-                    `memory-pro: failed to patch superseded record ${resolvedId.slice(0, 8)}: ${patchErr}`,
-                  );
-                }
-
+            // Resolve memoryId: if it doesn't look like a UUID, try search
+            let resolvedId = memoryId;
+            const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(memoryId);
+            if (!uuidLike) {
+              // Treat as search query
+              const results = await retrieveWithRetry(context.retriever, {
+                query: memoryId,
+                limit: 3,
+                scopeFilter,
+              });
+              if (results.length === 0) {
                 return {
                   content: [
                     {
                       type: "text",
-                      text: `Superseded memory ${resolvedId.slice(0, 8)}... → new version ${newEntry.id.slice(0, 8)}...: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`,
+                      text: `No memory found matching "${memoryId}".`,
+                    },
+                  ],
+                  details: { error: "not_found", query: memoryId },
+                };
+              }
+              if (results.length === 1 || results[0].score > 0.85) {
+                resolvedId = results[0].entry.id;
+              } else {
+                const list = results
+                  .map(
+                    (r) =>
+                      `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
+                  )
+                  .join("\n");
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: `Multiple matches. Specify memoryId:\n${list}`,
                     },
                   ],
                   details: {
-                    action: "superseded",
-                    oldId: resolvedId,
-                    newId: newEntry.id,
-                    category: meta.memory_category,
+                    action: "candidates",
+                    candidates: sanitizeMemoryForSerialization(results),
                   },
                 };
               }
             }
-          }
-          // --- End temporal supersede guard ---
 
-          const updates: Record<string, any> = {};
-          if (text) updates.text = text;
-          if (newVector) updates.vector = newVector;
-          if (importance !== undefined)
-            updates.importance = clamp01(importance, 0.7);
-          if (category) updates.category = category;
+            // If text changed, re-embed; reject noise
+            let newVector: number[] | undefined;
+            if (text) {
+              if (isNoise(text)) {
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: "Skipped: updated text detected as noise",
+                    },
+                  ],
+                  details: { action: "noise_filtered" },
+                };
+              }
+              newVector = await context.embedder.embedPassage(text);
+            }
 
-          const updated = await context.store.update(
-            resolvedId,
-            updates,
-            scopeFilter,
-          );
+            // --- Temporal supersede guard ---
+            // For temporal-versioned categories (preferences/entities), changing
+            // text must go through supersede to preserve the history chain.
+            if (text && newVector) {
+              const existing = await context.store.getById(
+                resolvedId,
+                scopeFilter,
+              );
+              if (existing) {
+                const meta = parseSmartMetadata(existing.metadata, existing);
+                if (TEMPORAL_VERSIONED_CATEGORIES.has(meta.memory_category)) {
+                  const now = Date.now();
+                  const factKey =
+                    meta.fact_key ?? deriveFactKey(meta.memory_category, text);
 
-          if (!updated) {
+                  // Create new superseding record
+                  const newMeta = buildSmartMetadata(
+                    { text, category: existing.category },
+                    {
+                      l0_abstract: text,
+                      l1_overview: meta.l1_overview,
+                      l2_content: text,
+                      memory_category: meta.memory_category,
+                      tier: meta.tier,
+                      access_count: 0,
+                      confidence:
+                        importance !== undefined
+                          ? clamp01(importance, 0.7)
+                          : meta.confidence,
+                      valid_from: now,
+                      fact_key: factKey,
+                      supersedes: resolvedId,
+                      relations: appendRelation([], {
+                        type: "supersedes",
+                        targetId: resolvedId,
+                      }),
+                    },
+                  );
+
+                  const newEntry = await context.store.store({
+                    text,
+                    vector: newVector,
+                    category: category ? (category as any) : existing.category,
+                    scope: existing.scope,
+                    importance:
+                      importance !== undefined
+                        ? clamp01(importance, 0.7)
+                        : existing.importance,
+                    metadata: stringifySmartMetadata(newMeta),
+                  });
+
+                  // Invalidate old record (metadata-only patch — safe)
+                  try {
+                    const invalidatedMeta = buildSmartMetadata(existing, {
+                      fact_key: factKey,
+                      invalidated_at: now,
+                      superseded_by: newEntry.id,
+                      relations: appendRelation(meta.relations, {
+                        type: "superseded_by",
+                        targetId: newEntry.id,
+                      }),
+                    });
+                    await context.store.update(
+                      resolvedId,
+                      { metadata: stringifySmartMetadata(invalidatedMeta) },
+                      scopeFilter,
+                    );
+                  } catch (patchErr) {
+                    // New record is already the source of truth; log but don't fail
+                    console.warn(
+                      `memory-pro: failed to patch superseded record ${resolvedId.slice(0, 8)}: ${patchErr}`,
+                    );
+                  }
+
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Superseded memory ${resolvedId.slice(0, 8)}... → new version ${newEntry.id.slice(0, 8)}...: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`,
+                      },
+                    ],
+                    details: {
+                      action: "superseded",
+                      oldId: resolvedId,
+                      newId: newEntry.id,
+                      category: meta.memory_category,
+                    },
+                  };
+                }
+              }
+            }
+            // --- End temporal supersede guard ---
+
+            const updates: Record<string, any> = {};
+            if (text) updates.text = text;
+            if (newVector) updates.vector = newVector;
+            if (importance !== undefined)
+              updates.importance = clamp01(importance, 0.7);
+            if (category) updates.category = category;
+
+            const updated = await context.store.update(
+              resolvedId,
+              updates,
+              scopeFilter,
+            );
+
+            if (!updated) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Memory ${resolvedId.slice(0, 8)}... not found or access denied.`,
+                  },
+                ],
+                details: { error: "not_found", id: resolvedId },
+              };
+            }
+
             return {
               content: [
                 {
                   type: "text",
-                  text: `Memory ${resolvedId.slice(0, 8)}... not found or access denied.`,
+                  text: `Updated memory ${updated.id.slice(0, 8)}...: "${updated.text.slice(0, 80)}${updated.text.length > 80 ? "..." : ""}"`,
                 },
               ],
-              details: { error: "not_found", id: resolvedId },
+              details: {
+                action: "updated",
+                id: updated.id,
+                scope: updated.scope,
+                category: updated.category,
+                importance: updated.importance,
+                fieldsUpdated: Object.keys(updates),
+              },
+            };
+          } catch (error) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Memory update failed: ${error instanceof Error ? error.message : String(error)}`,
+                },
+              ],
+              details: { error: "update_failed", message: String(error) },
             };
           }
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Updated memory ${updated.id.slice(0, 8)}...: "${updated.text.slice(0, 80)}${updated.text.length > 80 ? "..." : ""}"`,
-              },
-            ],
-            details: {
-              action: "updated",
-              id: updated.id,
-              scope: updated.scope,
-              category: updated.category,
-              importance: updated.importance,
-              fieldsUpdated: Object.keys(updates),
-            },
-          };
-        } catch (error) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Memory update failed: ${error instanceof Error ? error.message : String(error)}`,
-              },
-            ],
-            details: { error: "update_failed", message: String(error) },
-          };
-        }
-      },
-    };
+        },
+      };
     },
     { name: "memory_update" },
   );
@@ -1184,88 +1359,92 @@ export function registerMemoryStatsTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const agentId =
+        resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
       return {
         name: "memory_stats",
-      label: "Memory Statistics",
-      description: "Get statistics about memory usage, scopes, and categories.",
-      parameters: Type.Object({
-        scope: Type.Optional(
-          Type.String({
-            description: "Specific scope to get stats for (optional)",
-          }),
-        ),
-      }),
-      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
-        const { scope } = params as { scope?: string };
+        label: "Memory Statistics",
+        description:
+          "Get statistics about memory usage, scopes, and categories.",
+        parameters: Type.Object({
+          scope: Type.Optional(
+            Type.String({
+              description: "Specific scope to get stats for (optional)",
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
+          const { scope } = params as { scope?: string };
 
-        try {
-          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
-          // Determine accessible scopes
-          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-          if (scope) {
-            if (context.scopeManager.isAccessible(scope, agentId)) {
-              scopeFilter = [scope];
-            } else {
-              return {
-                content: [
-                  { type: "text", text: `Access denied to scope: ${scope}` },
-                ],
-                details: {
-                  error: "scope_access_denied",
-                  requestedScope: scope,
-                },
-              };
+          try {
+            const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
+            // Determine accessible scopes
+            let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+            if (scope) {
+              if (context.scopeManager.isAccessible(scope, agentId)) {
+                scopeFilter = [scope];
+              } else {
+                return {
+                  content: [
+                    { type: "text", text: `Access denied to scope: ${scope}` },
+                  ],
+                  details: {
+                    error: "scope_access_denied",
+                    requestedScope: scope,
+                  },
+                };
+              }
             }
+
+            const stats = await context.store.stats(scopeFilter);
+            const scopeManagerStats = context.scopeManager.getStats();
+            const retrievalConfig = context.retriever.getConfig();
+
+            const text = [
+              `Memory Statistics:`,
+              `• Total memories: ${stats.totalCount}`,
+              `• Available scopes: ${scopeManagerStats.totalScopes}`,
+              `• Retrieval mode: ${retrievalConfig.mode}`,
+              `• FTS support: ${context.store.hasFtsSupport ? "Yes" : "No"}`,
+              ``,
+              `Memories by scope:`,
+              ...Object.entries(stats.scopeCounts).map(
+                ([s, count]) => `  • ${s}: ${count}`,
+              ),
+              ``,
+              `Memories by category:`,
+              ...Object.entries(stats.categoryCounts).map(
+                ([c, count]) => `  • ${c}: ${count}`,
+              ),
+            ].join("\n");
+
+            return {
+              content: [{ type: "text", text }],
+              details: {
+                stats,
+                scopeManagerStats,
+                retrievalConfig: {
+                  ...retrievalConfig,
+                  rerankApiKey: retrievalConfig.rerankApiKey
+                    ? "***"
+                    : undefined,
+                },
+                hasFtsSupport: context.store.hasFtsSupport,
+              },
+            };
+          } catch (error) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Failed to get memory stats: ${error instanceof Error ? error.message : String(error)}`,
+                },
+              ],
+              details: { error: "stats_failed", message: String(error) },
+            };
           }
-
-          const stats = await context.store.stats(scopeFilter);
-          const scopeManagerStats = context.scopeManager.getStats();
-          const retrievalConfig = context.retriever.getConfig();
-
-          const text = [
-            `Memory Statistics:`,
-            `• Total memories: ${stats.totalCount}`,
-            `• Available scopes: ${scopeManagerStats.totalScopes}`,
-            `• Retrieval mode: ${retrievalConfig.mode}`,
-            `• FTS support: ${context.store.hasFtsSupport ? "Yes" : "No"}`,
-            ``,
-            `Memories by scope:`,
-            ...Object.entries(stats.scopeCounts).map(
-              ([s, count]) => `  • ${s}: ${count}`,
-            ),
-            ``,
-            `Memories by category:`,
-            ...Object.entries(stats.categoryCounts).map(
-              ([c, count]) => `  • ${c}: ${count}`,
-            ),
-          ].join("\n");
-
-          return {
-            content: [{ type: "text", text }],
-            details: {
-              stats,
-              scopeManagerStats,
-              retrievalConfig: {
-                ...retrievalConfig,
-                rerankApiKey: retrievalConfig.rerankApiKey ? "***" : undefined,
-              },
-              hasFtsSupport: context.store.hasFtsSupport,
-            },
-          };
-        } catch (error) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Failed to get memory stats: ${error instanceof Error ? error.message : String(error)}`,
-              },
-            ],
-            details: { error: "stats_failed", message: String(error) },
-          };
-        }
-      },
-    };
+        },
+      };
     },
     { name: "memory_stats" },
   );
@@ -1277,76 +1456,115 @@ export function registerMemoryListTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const agentId =
+        resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
       return {
         name: "memory_list",
-      label: "Memory List",
-      description:
-        "List recent memories with optional filtering by scope and category.",
-      parameters: Type.Object({
-        limit: Type.Optional(
-          Type.Number({
-            description: "Max memories to list (default: 10, max: 50)",
-          }),
-        ),
-        scope: Type.Optional(
-          Type.String({ description: "Filter by specific scope (optional)" }),
-        ),
-        category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
-        offset: Type.Optional(
-          Type.Number({
-            description: "Number of memories to skip (default: 0)",
-          }),
-        ),
-      }),
-      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
-        const {
-          limit = 10,
-          scope,
-          category,
-          offset = 0,
-        } = params as {
-          limit?: number;
-          scope?: string;
-          category?: string;
-          offset?: number;
-        };
+        label: "Memory List",
+        description:
+          "List recent memories with optional filtering by scope and category.",
+        parameters: Type.Object({
+          limit: Type.Optional(
+            Type.Number({
+              description: "Max memories to list (default: 10, max: 50)",
+            }),
+          ),
+          scope: Type.Optional(
+            Type.String({ description: "Filter by specific scope (optional)" }),
+          ),
+          category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
+          offset: Type.Optional(
+            Type.Number({
+              description: "Number of memories to skip (default: 0)",
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
+          const {
+            limit = 10,
+            scope,
+            category,
+            offset = 0,
+          } = params as {
+            limit?: number;
+            scope?: string;
+            category?: string;
+            offset?: number;
+          };
 
-        try {
-          const safeLimit = clampInt(limit, 1, 50);
-          const safeOffset = clampInt(offset, 0, 1000);
-          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
+          try {
+            const safeLimit = clampInt(limit, 1, 50);
+            const safeOffset = clampInt(offset, 0, 1000);
+            const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
 
-          // Determine accessible scopes
-          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-          if (scope) {
-            if (context.scopeManager.isAccessible(scope, agentId)) {
-              scopeFilter = [scope];
-            } else {
+            // Determine accessible scopes
+            let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+            if (scope) {
+              if (context.scopeManager.isAccessible(scope, agentId)) {
+                scopeFilter = [scope];
+              } else {
+                return {
+                  content: [
+                    { type: "text", text: `Access denied to scope: ${scope}` },
+                  ],
+                  details: {
+                    error: "scope_access_denied",
+                    requestedScope: scope,
+                  },
+                };
+              }
+            }
+
+            const entries = await context.store.list(
+              scopeFilter,
+              category,
+              safeLimit,
+              safeOffset,
+            );
+
+            if (entries.length === 0) {
               return {
-                content: [
-                  { type: "text", text: `Access denied to scope: ${scope}` },
-                ],
+                content: [{ type: "text", text: "No memories found." }],
                 details: {
-                  error: "scope_access_denied",
-                  requestedScope: scope,
+                  count: 0,
+                  filters: {
+                    scope,
+                    category,
+                    limit: safeLimit,
+                    offset: safeOffset,
+                  },
                 },
               };
             }
-          }
 
-          const entries = await context.store.list(
-            scopeFilter,
-            category,
-            safeLimit,
-            safeOffset,
-          );
+            const text = entries
+              .map((entry, i) => {
+                const date = new Date(entry.timestamp)
+                  .toISOString()
+                  .split("T")[0];
+                const categoryTag = getDisplayCategoryTag(entry);
+                return `${safeOffset + i + 1}. [${entry.id}] [${categoryTag}] ${entry.text.slice(0, 100)}${entry.text.length > 100 ? "..." : ""} (${date})`;
+              })
+              .join("\n");
 
-          if (entries.length === 0) {
             return {
-              content: [{ type: "text", text: "No memories found." }],
+              content: [
+                {
+                  type: "text",
+                  text: `Recent memories (showing ${entries.length}):\n\n${text}`,
+                },
+              ],
               details: {
-                count: 0,
+                count: entries.length,
+                memories: entries.map((e) => ({
+                  id: e.id,
+                  text: e.text,
+                  category: getDisplayCategoryTag(e),
+                  rawCategory: e.category,
+                  scope: e.scope,
+                  importance: e.importance,
+                  timestamp: e.timestamp,
+                })),
                 filters: {
                   scope,
                   category,
@@ -1355,42 +1573,113 @@ export function registerMemoryListTool(
                 },
               },
             };
+          } catch (error) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Failed to list memories: ${error instanceof Error ? error.message : String(error)}`,
+                },
+              ],
+              details: { error: "list_failed", message: String(error) },
+            };
           }
+        },
+      };
+    },
+    { name: "memory_list" },
+  );
+}
 
-          const text = entries
-            .map((entry, i) => {
-              const date = new Date(entry.timestamp)
-                .toISOString()
-                .split("T")[0];
-              const categoryTag = getDisplayCategoryTag(entry);
-              return `${safeOffset + i + 1}. [${entry.id}] [${categoryTag}] ${entry.text.slice(0, 100)}${entry.text.length > 100 ? "..." : ""} (${date})`;
-            })
-            .join("\n");
+// ============================================================================
+// Skill Observation Tools
+// ============================================================================
+
+export function registerSkillObserveTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => ({
+      name: "skill_observe",
+      label: "Skill Observe",
+      description:
+        "Record a skill execution observation (success/partial/failure) for tracking and health monitoring.",
+      parameters: Type.Object({
+        skill_id: Type.String({
+          description: "Skill identifier (e.g. tdd-workflow, brainstorming)",
+        }),
+        outcome: stringEnum(["success", "partial", "failure"]),
+        outcome_signal: Type.Optional(
+          stringEnum(["completion", "user_override", "error", "timeout"]),
+        ),
+        text: Type.String({ description: "Description of what happened" }),
+        trace_summary: Type.Optional(
+          Type.String({ description: "Brief trace of execution steps" }),
+        ),
+        error_chain: Type.Optional(
+          Type.Array(Type.String(), {
+            description: "Chain of errors encountered",
+          }),
+        ),
+        user_corrections: Type.Optional(
+          Type.Array(Type.String(), {
+            description: "User corrections during execution",
+          }),
+        ),
+        scope: Type.Optional(
+          Type.String({
+            description: "Memory scope (defaults to agent's default)",
+          }),
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        const p = params as {
+          skill_id: string;
+          outcome: "success" | "partial" | "failure";
+          outcome_signal?: "completion" | "user_override" | "error" | "timeout";
+          text: string;
+          trace_summary?: string;
+          error_chain?: string[];
+          user_corrections?: string[];
+          scope?: string;
+        };
+        try {
+          const agentId = resolveAgentId(toolCtx?.agentId, context.agentId);
+          const scope =
+            p.scope ||
+            (agentId
+              ? context.scopeManager.getDefaultScope(agentId)
+              : context.scopeManager.getDefaultScope());
+
+          const mod = await import("./skill-observe.js");
+          const result = await mod.storeSkillObservation(
+            context.store,
+            context.embedder,
+            {
+              skill_id: p.skill_id,
+              outcome: p.outcome,
+              outcome_signal: p.outcome_signal,
+              text: p.text,
+              trace_summary: p.trace_summary,
+              error_chain: p.error_chain,
+              user_corrections: p.user_corrections,
+              scope,
+            },
+          );
 
           return {
             content: [
               {
                 type: "text",
-                text: `Recent memories (showing ${entries.length}):\n\n${text}`,
+                text: `Recorded ${p.outcome} observation for skill '${p.skill_id}' (id: ${result.id})`,
               },
             ],
             details: {
-              count: entries.length,
-              memories: entries.map((e) => ({
-                id: e.id,
-                text: e.text,
-                category: getDisplayCategoryTag(e),
-                rawCategory: e.category,
-                scope: e.scope,
-                importance: e.importance,
-                timestamp: e.timestamp,
-              })),
-              filters: {
-                scope,
-                category,
-                limit: safeLimit,
-                offset: safeOffset,
-              },
+              action: "skill_observe",
+              id: result.id,
+              skill_id: p.skill_id,
+              outcome: p.outcome,
             },
           };
         } catch (error) {
@@ -1398,16 +1687,174 @@ export function registerMemoryListTool(
             content: [
               {
                 type: "text",
-                text: `Failed to list memories: ${error instanceof Error ? error.message : String(error)}`,
+                text: `Failed to record skill observation: ${error instanceof Error ? error.message : String(error)}`,
               },
             ],
-            details: { error: "list_failed", message: String(error) },
+            details: { error: "skill_observe_failed", message: String(error) },
           };
         }
       },
-    };
-    },
-    { name: "memory_list" },
+    }),
+    { name: "skill_observe" },
+  );
+}
+
+export function registerSkillInspectTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => ({
+      name: "skill_inspect",
+      label: "Skill Inspect",
+      description:
+        "Get detailed health report for a specific skill, including success rates across time windows and failure patterns.",
+      parameters: Type.Object({
+        skill_id: Type.String({ description: "Skill identifier to inspect" }),
+        scope: Type.Optional(Type.String({ description: "Scope filter" })),
+      }),
+      async execute(_toolCallId, params) {
+        const p = params as { skill_id: string; scope?: string };
+        try {
+          const agentId = resolveAgentId(toolCtx?.agentId, context.agentId);
+          const scopeFilter = p.scope
+            ? [p.scope]
+            : agentId
+              ? resolveScopeFilter(context.scopeManager, agentId)
+              : [context.scopeManager.getDefaultScope()];
+
+          const mod = await import("./skill-inspect.js");
+          const report = await mod.inspectSkill(
+            context.store,
+            context.retriever,
+            p.skill_id,
+            scopeFilter,
+          );
+
+          return {
+            content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
+            details: { action: "skill_inspect", skill_id: p.skill_id, report },
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to inspect skill: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
+            details: { error: "skill_inspect_failed", message: String(error) },
+          };
+        }
+      },
+    }),
+    { name: "skill_inspect" },
+  );
+}
+
+export function registerSkillHealthTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => ({
+      name: "skill_health",
+      label: "Skill Health Dashboard",
+      description:
+        "Get health dashboard showing all tracked skills with success rates and trends.",
+      parameters: Type.Object({
+        scope: Type.Optional(Type.String({ description: "Scope filter" })),
+      }),
+      async execute(_toolCallId, params) {
+        const p = params as { scope?: string };
+        try {
+          const agentId = resolveAgentId(toolCtx?.agentId, context.agentId);
+          const scopeFilter = p.scope
+            ? [p.scope]
+            : agentId
+              ? resolveScopeFilter(context.scopeManager, agentId)
+              : [context.scopeManager.getDefaultScope()];
+
+          const mod = await import("./skill-inspect.js");
+          const dashboard = await mod.getSkillHealth(
+            context.store,
+            context.retriever,
+            scopeFilter,
+          );
+
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(dashboard, null, 2) },
+            ],
+            details: { action: "skill_health", dashboard },
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to get skill health: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
+            details: { error: "skill_health_failed", message: String(error) },
+          };
+        }
+      },
+    }),
+    { name: "skill_health" },
+  );
+}
+
+export function registerSkillEvidenceTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => ({
+      name: "skill_evidence",
+      label: "Skill Evidence Pack",
+      description:
+        "Generate an evidence pack for a skill with failure clusters, time windows, and suggested actions.",
+      parameters: Type.Object({
+        skill_id: Type.String({ description: "Skill identifier" }),
+        scope: Type.Optional(Type.String({ description: "Scope filter" })),
+      }),
+      async execute(_toolCallId, params) {
+        const p = params as { skill_id: string; scope?: string };
+        try {
+          const agentId = resolveAgentId(toolCtx?.agentId, context.agentId);
+          const scopeFilter = p.scope
+            ? [p.scope]
+            : agentId
+              ? resolveScopeFilter(context.scopeManager, agentId)
+              : [context.scopeManager.getDefaultScope()];
+
+          const mod = await import("./skill-evidence.js");
+          const pack = await mod.generateSkillEvidence(
+            context.store,
+            context.retriever,
+            p.skill_id,
+            scopeFilter,
+          );
+
+          return {
+            content: [{ type: "text", text: JSON.stringify(pack, null, 2) }],
+            details: { action: "skill_evidence", skill_id: p.skill_id, pack },
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to generate skill evidence: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
+            details: { error: "skill_evidence_failed", message: String(error) },
+          };
+        }
+      },
+    }),
+    { name: "skill_evidence" },
   );
 }
 
@@ -1421,6 +1868,7 @@ export function registerAllMemoryTools(
   options: {
     enableManagementTools?: boolean;
     enableSelfImprovementTools?: boolean;
+    enableSkillObservation?: boolean;
   } = {},
 ) {
   // Core tools (always enabled)
@@ -1440,5 +1888,13 @@ export function registerAllMemoryTools(
       registerSelfImprovementExtractSkillTool(api, context);
       registerSelfImprovementReviewTool(api, context);
     }
+  }
+
+  // Skill observation tools (optional)
+  if (options.enableSkillObservation) {
+    registerSkillObserveTool(api, context);
+    registerSkillInspectTool(api, context);
+    registerSkillHealthTool(api, context);
+    registerSkillEvidenceTool(api, context);
   }
 }

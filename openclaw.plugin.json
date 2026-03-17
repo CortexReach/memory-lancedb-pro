@@ -512,6 +512,69 @@
             }
           }
         }
+      },
+      "skillObservation": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Track skill execution outcomes for health monitoring and proactive alerts.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable skill observation tracking and agent tools."
+          },
+          "implicitCapture": {
+            "type": "boolean",
+            "default": true,
+            "description": "Automatically capture skill observations from agent_end hooks."
+          },
+          "proactiveAlerts": {
+            "type": "boolean",
+            "default": true,
+            "description": "Write proactive suggestions when skill health drops below threshold."
+          },
+          "alertThreshold": {
+            "type": "string",
+            "enum": ["critical", "warn", "trend"],
+            "default": "warn",
+            "description": "Minimum alert priority to surface."
+          },
+          "minObservations": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 5,
+            "description": "Minimum observations before alerts can trigger."
+          },
+          "cooldownDays": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 365,
+            "default": 7,
+            "description": "Days between repeated alerts for the same skill."
+          },
+          "successRateWarn": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.7,
+            "description": "Success rate below this triggers a warn-level alert."
+          },
+          "successRateCritical": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.5,
+            "description": "Success rate below this triggers a critical-level alert."
+          },
+          "trendDeclineRate": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.15,
+            "description": "Rate of decline between historical and recent success rates that triggers a trend alert."
+          }
+        }
       }
     },
     "required": [
@@ -915,6 +978,50 @@
       "label": "LLM Timeout (ms)",
       "placeholder": "30000",
       "help": "Request timeout for the smart-extraction / upgrade LLM in milliseconds",
+      "advanced": true
+    },
+    "skillObservation.enabled": {
+      "label": "Skill Observation",
+      "help": "Track skill execution outcomes and provide health monitoring dashboards."
+    },
+    "skillObservation.implicitCapture": {
+      "label": "Implicit Capture",
+      "help": "Automatically capture observations from agent_end hooks by detecting skill references.",
+      "advanced": true
+    },
+    "skillObservation.proactiveAlerts": {
+      "label": "Proactive Alerts",
+      "help": "Write skill health alerts and suggestions when performance drops.",
+      "advanced": true
+    },
+    "skillObservation.alertThreshold": {
+      "label": "Alert Threshold",
+      "help": "Minimum alert priority: critical, warn, or trend.",
+      "advanced": true
+    },
+    "skillObservation.minObservations": {
+      "label": "Min Observations",
+      "help": "Minimum observation count before health alerts can trigger.",
+      "advanced": true
+    },
+    "skillObservation.cooldownDays": {
+      "label": "Alert Cooldown (days)",
+      "help": "Days between repeated alerts for the same skill.",
+      "advanced": true
+    },
+    "skillObservation.successRateWarn": {
+      "label": "Warn Success Rate",
+      "help": "Success rate below this triggers a warn-level alert.",
+      "advanced": true
+    },
+    "skillObservation.successRateCritical": {
+      "label": "Critical Success Rate",
+      "help": "Success rate below this triggers a critical-level alert.",
+      "advanced": true
+    },
+    "skillObservation.trendDeclineRate": {
+      "label": "Trend Decline Rate",
+      "help": "Decline rate between historical and recent success rates that triggers a trend alert.",
       "advanced": true
     }
   }
