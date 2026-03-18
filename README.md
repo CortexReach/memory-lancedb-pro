@@ -507,8 +507,8 @@ When `smartExtraction` is enabled (default: `true`), the plugin uses an LLM to i
 | `llm.apiKey` | string | *(falls back to `embedding.apiKey`)* | API key for the LLM provider |
 | `llm.model` | string | `openai/gpt-oss-120b` | LLM model name |
 | `llm.baseURL` | string | *(falls back to `embedding.baseURL`)* | LLM API endpoint |
-| `llm.oauthProvider` | string | `openai-codex` | OAuth provider id used when `llm.auth` is `oauth` |
-| `llm.oauthPath` | string | `~/.openclaw/.memory-lancedb-pro/oauth.json` | OAuth token file used when `llm.auth` is `oauth` |
+| `llm.oauthProvider` | string | optional | OAuth provider id used when `llm.auth` is `oauth` |
+| `llm.oauthPath` | string | optional | OAuth token file used when `llm.auth` is `oauth` |
 | `llm.timeoutMs` | number | `30000` | LLM request timeout in milliseconds |
 | `extractMinMessages` | number | `2` | Minimum messages before extraction triggers |
 | `extractMaxChars` | number | `8000` | Maximum characters sent to the LLM |
@@ -534,8 +534,8 @@ OAuth `llm` config (use existing Codex / ChatGPT login cache for LLM calls):
 
 Notes for `llm.auth: "oauth"`:
 
-- `llm.oauthProvider` is currently `openai-codex`.
-- OAuth tokens default to `~/.openclaw/.memory-lancedb-pro/oauth.json`.
+- `llm.oauthProvider` is set when you authenticate with an OAuth provider.
+- OAuth tokens are stored in `~/.openclaw/.memory-lancedb-pro/oauth.json`.
 - You can set `llm.oauthPath` if you want to store that file somewhere else.
 - `auth login` snapshots the previous api-key `llm` config next to the OAuth file, and `auth logout` restores that snapshot when available.
 - Switching from `api-key` to `oauth` does not automatically carry over `llm.baseURL`. Set it manually in OAuth mode only when you intentionally want a custom ChatGPT/Codex-compatible backend.
