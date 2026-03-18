@@ -90,6 +90,7 @@ export interface EmbeddingConfig {
   model: string;
   baseURL?: string;
   dimensions?: number;
+  requestDimensions?: boolean;
 
   /** Optional task type for query embeddings (e.g. "retrieval.query") */
   taskQuery?: string;
@@ -389,6 +390,8 @@ export class Embedder {
 
   /** Optional requested dimensions to pass through to the embedding provider (OpenAI-compatible). */
   private readonly _requestDimensions?: number;
+  /** Whether to send dimensions in payload (default: true). */
+  private readonly _sendDimensions: boolean;
   /** Enable automatic chunking for long documents (default: true) */
   private readonly _autoChunk: boolean;
 
@@ -403,6 +406,7 @@ export class Embedder {
     this._taskPassage = config.taskPassage;
     this._normalized = config.normalized;
     this._requestDimensions = config.dimensions;
+    this._sendDimensions = config.requestDimensions !== false;
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
     const profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
@@ -588,7 +592,7 @@ export class Embedder {
 
     // Output dimension: field name is provider-defined.
     // Only sent when explicitly configured to avoid breaking providers that reject unknown fields.
-    if (this._capabilities.dimensionsField && this._requestDimensions && this._requestDimensions > 0) {
+    if (this._capabilities.dimensionsField && this._sendDimensions && this._requestDimensions && this._requestDimensions > 0) {
       payload[this._capabilities.dimensionsField] = this._requestDimensions;
     }
 

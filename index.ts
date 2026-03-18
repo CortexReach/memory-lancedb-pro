@@ -69,6 +69,7 @@ interface PluginConfig {
     model?: string;
     baseURL?: string;
     dimensions?: number;
+    requestDimensions?: boolean;
     taskQuery?: string;
     taskPassage?: string;
     normalized?: boolean;
@@ -1636,6 +1637,7 @@ const memoryLanceDBProPlugin = {
       model: config.embedding.model || "text-embedding-3-small",
       baseURL: config.embedding.baseURL,
       dimensions: config.embedding.dimensions,
+      requestDimensions: config.embedding.requestDimensions,
       taskQuery: config.embedding.taskQuery,
       taskPassage: config.embedding.taskPassage,
       normalized: config.embedding.normalized,
@@ -3349,6 +3351,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       // Accept number, numeric string, or env-var string (e.g. "${EMBED_DIM}").
       // Also accept legacy top-level `dimensions` for convenience.
       dimensions: parsePositiveInt(embedding.dimensions ?? cfg.dimensions),
+      requestDimensions:
+        typeof embedding.requestDimensions === "boolean"
+          ? embedding.requestDimensions
+          : true,
       taskQuery:
         typeof embedding.taskQuery === "string"
           ? embedding.taskQuery
