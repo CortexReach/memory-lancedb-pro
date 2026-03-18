@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0-beta.3
+
+- Feat: add `retrieval.timeoutMs` for configurable rerank request timeouts.
+- Feat: add `embedding.requestDimensions` to disable sending dimensions to incompatible embedding endpoints while keeping local vector dimensions.
+- Docs: add a dedicated vLLM local deployment guide and document the new config fields in README / README_CN.
+
+---
+
 ## 1.1.0-beta.2 (Smart Memory Beta + Access Reinforcement)
 
 This is a **beta** release published under the npm dist-tag **`beta`** (it does not affect the stable `latest` channel).
