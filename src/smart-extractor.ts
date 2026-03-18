@@ -44,6 +44,51 @@ import {
 } from "./workspace-boundary.js";
 
 // ============================================================================
+// Envelope Metadata Stripping
+// ============================================================================
+
+/**
+ * Strip platform envelope metadata injected by OpenClaw channels before
+ * the conversation text reaches the extraction LLM. These envelopes contain
+ * message IDs, sender IDs, timestamps, and JSON metadata blocks that have
+ * zero informational value for memory extraction but get stored verbatim
+ * by weaker LLMs (e.g. qwen) that can't distinguish metadata from content.
+ *
+ * Targets:
+ * - "System: [YYYY-MM-DD HH:MM:SS GMT+N] Channel[account] ..." header lines
+ * - "Conversation info (untrusted metadata):" + JSON code blocks
+ * - "Sender (untrusted metadata):" + JSON code blocks
+ * - "Replied message (untrusted, for context):" + JSON code blocks
+ * - Standalone JSON blocks containing message_id/sender_id fields
+ */
+function stripEnvelopeMetadata(text: string): string {
+  // 1. Strip "System: [timestamp] Channel..." lines
+  let cleaned = text.replace(
+    /^System:\s*\[[\d\-: +GMT]+\]\s+\S+\[.*?\].*$/gm,
+    "",
+  );
+
+  // 2. Strip labeled metadata sections with their JSON code blocks
+  //    e.g. "Conversation info (untrusted metadata):\n```json\n{...}\n```"
+  cleaned = cleaned.replace(
+    /(?:Conversation info|Sender|Replied message)\s*\(untrusted[^)]*\):\s*```json\s*\{[\s\S]*?\}\s*```/g,
+    "",
+  );
+
+  // 3. Strip any remaining JSON blocks that look like envelope metadata
+  //    (contain message_id and sender_id fields)
+  cleaned = cleaned.replace(
+    /```json\s*\{[^}]*"message_id"\s*:[^}]*"sender_id"\s*:[^}]*\}\s*```/g,
+    "",
+  );
+
+  // 4. Collapse excessive blank lines left by removals
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
+
+  return cleaned.trim();
+}
+
+// ============================================================================
 // Constants
 // ============================================================================
 
@@ -264,8 +309,13 @@ export class SmartExtractor {
         ? conversationText.slice(-maxChars)
         : conversationText;
 
+    // Strip platform envelope metadata injected by OpenClaw channels
+    // (e.g. "System: [2026-03-18 14:21:36 GMT+8] Feishu[default] DM | ou_...")
+    // These pollute extraction if treated as conversation content.
+    const cleaned = stripEnvelopeMetadata(truncated);
+
     const user = this.config.user ?? "User";
-    const prompt = buildExtractionPrompt(truncated, user);
+    const prompt = buildExtractionPrompt(cleaned, user);
 
     const result = await this.llm.completeJson<{
       memories: Array<{
