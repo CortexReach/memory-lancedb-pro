@@ -407,6 +407,7 @@ Query → BM25 FTS ─────┘
     "model": "jina-embeddings-v5-text-small",
     "baseURL": "https://api.jina.ai/v1",
     "dimensions": 1024,
+    "requestDimensions": true,
     "taskQuery": "retrieval.query",
     "taskPassage": "retrieval.passage",
     "normalized": true
@@ -424,6 +425,7 @@ Query → BM25 FTS ─────┘
     "rerankModel": "jina-reranker-v3",
     "rerankEndpoint": "https://api.jina.ai/v1/rerank",
     "rerankProvider": "jina",
+    "timeoutMs": 5000,
     "candidatePoolSize": 20,
     "recencyHalfLifeDays": 14,
     "recencyWeight": 0.1,
@@ -511,6 +513,11 @@ When `smartExtraction` is enabled (default: `true`), the plugin uses an LLM to i
 | `extractMinMessages` | number | `2` | Minimum messages before extraction triggers |
 | `extractMaxChars` | number | `8000` | Maximum characters sent to the LLM |
 
+Additional config:
+- `embedding.requestDimensions` (default: `true`): include `embedding.dimensions` in the embedding request; disable for local or OpenAI-compatible endpoints that reject the field.
+- `retrieval.timeoutMs` (default: `5000`): timeout for cross-encoder rerank requests in milliseconds; slower local services may need higher values.
+
+For vLLM-style local deployments, see `docs/vllm-local-deployment.zh-CN.md`.
 
 OAuth `llm` config (use existing Codex / ChatGPT login cache for LLM calls):
 ```json

@@ -407,6 +407,7 @@ git clone https://github.com/CortexReach/memory-lancedb-pro-skill.git ~/.opencla
     "model": "jina-embeddings-v5-text-small",
     "baseURL": "https://api.jina.ai/v1",
     "dimensions": 1024,
+    "requestDimensions": true,
     "taskQuery": "retrieval.query",
     "taskPassage": "retrieval.passage",
     "normalized": true
@@ -424,6 +425,7 @@ git clone https://github.com/CortexReach/memory-lancedb-pro-skill.git ~/.opencla
     "rerankModel": "jina-reranker-v3",
     "rerankEndpoint": "https://api.jina.ai/v1/rerank",
     "rerankProvider": "jina",
+    "timeoutMs": 5000,
     "candidatePoolSize": 20,
     "recencyHalfLifeDays": 14,
     "recencyWeight": 0.1,
@@ -511,6 +513,11 @@ git clone https://github.com/CortexReach/memory-lancedb-pro-skill.git ~/.opencla
 | `extractMinMessages` | number | `2` | 触发提取的最小消息数 |
 | `extractMaxChars` | number | `8000` | 发送给 LLM 的最大字符数 |
 
+补充配置：
+- `embedding.requestDimensions`（默认：`true`）：是否在 embedding 请求中发送 `embedding.dimensions`（本地或 OpenAI 兼容端点若拒绝该字段可关闭）。
+- `retrieval.timeoutMs`（默认：`5000`）：交叉编码器重排序请求超时（毫秒），本地慢服务可适当调大。
+
+vLLM 本地部署参考 `docs/vllm-local-deployment.zh-CN.md`。
 
 OAuth `llm` 配置（使用现有 Codex / ChatGPT 登录缓存来发送 LLM 请求）：
 ```json
