@@ -43,6 +43,8 @@ export interface RetrievalConfig {
   rerankModel?: string;
   /** Reranker API endpoint (default: https://api.jina.ai/v1/rerank). */
   rerankEndpoint?: string;
+  /** Max rerank request duration (default: 5000ms). */
+  timeoutMs?: number;
   /** Reranker provider format. Determines request/response shape and auth header.
    *  - "jina" (default): Authorization: Bearer, string[] documents, results[].relevance_score
    *  - "siliconflow": same format as jina (alias, for clarity)
