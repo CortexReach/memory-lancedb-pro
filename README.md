@@ -197,7 +197,7 @@ Requirements:
 
 If you already have your own OpenAI-compatible services, just replace the relevant block:
 
-- `embedding`: change `apiKey` / `model` / `baseURL` / `dimensions`
+- `embedding`: change `apiKey` / `model` / `baseURL` / `dimensions` / `omitDimensions`
 - `retrieval`: change `rerankProvider` / `rerankEndpoint` / `rerankModel` / `rerankApiKey`
 - `llm`: change `apiKey` / `model` / `baseURL` / `timeoutMs`
 
@@ -357,6 +357,7 @@ Query → BM25 FTS ─────┘
     "model": "jina-embeddings-v5-text-small",
     "baseURL": "https://api.jina.ai/v1",
     "dimensions": 1024,
+    "omitDimensions": false,
     "taskQuery": "retrieval.query",
     "taskPassage": "retrieval.passage",
     "normalized": true
@@ -633,6 +634,7 @@ npm install
             "model": "jina-embeddings-v5-text-small",
             "baseURL": "https://api.jina.ai/v1",
             "dimensions": 1024,
+            "omitDimensions": false,
             "taskQuery": "retrieval.query",
             "taskPassage": "retrieval.passage",
             "normalized": true
@@ -644,6 +646,8 @@ npm install
   }
 }
 ```
+
+> If your embedding endpoint rejects the `dimensions` request field (common with some local/OpenAI-compatible models such as Qwen3-Embedding), keep `embedding.dimensions` set for schema/registration purposes and set `"omitDimensions": true` so the plugin does not send the parameter upstream.
 
 3. Restart and verify:
 

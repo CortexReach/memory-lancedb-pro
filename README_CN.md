@@ -197,7 +197,7 @@ openclaw logs --follow --plain | rg "memory-lancedb-pro"
 
 如果你已经有自己的 OpenAI-compatible 服务，只需替换对应区块：
 
-- `embedding`：改 `apiKey` / `model` / `baseURL` / `dimensions`
+- `embedding`：改 `apiKey` / `model` / `baseURL` / `dimensions` / `omitDimensions`
 - `retrieval`：改 `rerankProvider` / `rerankEndpoint` / `rerankModel` / `rerankApiKey`
 - `llm`：改 `apiKey` / `model` / `baseURL` / `timeoutMs`
 
@@ -357,6 +357,7 @@ Query → BM25 FTS ─────┘
     "model": "jina-embeddings-v5-text-small",
     "baseURL": "https://api.jina.ai/v1",
     "dimensions": 1024,
+    "omitDimensions": false,
     "taskQuery": "retrieval.query",
     "taskPassage": "retrieval.passage",
     "normalized": true
@@ -633,6 +634,7 @@ npm install
             "model": "jina-embeddings-v5-text-small",
             "baseURL": "https://api.jina.ai/v1",
             "dimensions": 1024,
+            "omitDimensions": false,
             "taskQuery": "retrieval.query",
             "taskPassage": "retrieval.passage",
             "normalized": true
@@ -644,6 +646,8 @@ npm install
   }
 }
 ```
+
+> 如果你的嵌入接口不接受 `dimensions` 请求字段（常见于部分本地/OpenAI-compatible 模型，比如 Qwen3-Embedding），建议继续保留 `embedding.dimensions` 以满足 schema/注册校验，同时设置 `"omitDimensions": true`，这样插件就不会把该参数继续发给上游接口。
 
 3. 重启并验证：
 
