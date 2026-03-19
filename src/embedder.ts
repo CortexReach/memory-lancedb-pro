@@ -287,7 +287,7 @@ function getEmbeddingCapabilities(profile: EmbeddingProviderProfile): EmbeddingC
           "query": "query",
           "passage": "passage",
         },
-        dimensionsField: null,
+        dimensionsField: "dimensions",
       };
     case "generic-openai-compatible":
     default:
