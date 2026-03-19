@@ -964,7 +964,22 @@ export function registerMemoryUpdateTool(
 
           // Determine accessible scopes
           const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
-          const scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+          if (scope) {
+            if (context.scopeManager.isAccessible(scope, agentId)) {
+              scopeFilter = [scope];
+            } else {
+              return {
+                content: [
+                  { type: "text", text: `Access denied to scope: ${scope}` },
+                ],
+                details: {
+                  error: "scope_access_denied",
+                  requestedScope: scope,
+                },
+              };
+            }
+          }
 
           // Resolve memoryId: if it doesn't look like a UUID, try search
           let resolvedId = memoryId;

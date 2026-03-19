@@ -684,11 +684,7 @@ export class MemoryStore {
     const rowScope = (candidates[0].scope as string | undefined) ?? "global";
 
     // Check scope permissions
-    if (
-      scopeFilter &&
-      scopeFilter.length > 0 &&
-      !scopeFilter.includes(rowScope)
-    ) {
+    if (!scopeFilterAllows(scopeFilter, rowScope)) {
       throw new Error(`Memory ${resolvedId} is outside accessible scopes`);
     }
 
