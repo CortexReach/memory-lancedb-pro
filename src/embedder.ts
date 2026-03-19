@@ -168,6 +168,7 @@ function getProviderLabel(baseURL: string | undefined, model: string): string {
     if (/api\.jina\.ai/i.test(base)) return "Jina";
     if (/localhost:11434|127\.0\.0\.1:11434|\/ollama\b/i.test(base)) return "Ollama";
     if (/api\.openai\.com/i.test(base)) return "OpenAI";
+    if (/api\.voyageai\.com/i.test(base)) return "Voyage";
 
     try {
       return new URL(base).host;
@@ -246,6 +247,13 @@ export function formatEmbeddingProviderError(
     }
     hint += ` and that model \"${opts.model}\" is available.`;
     return `Embedding provider unreachable (${detailText}). ${hint}`;
+  }
+
+  // Detect matryoshka representation error from local models that reject dimensions parameter
+  if (/matryoshka|dimensions.*not\s*support|unknown.*param.*dimensions/i.test(raw)) {
+    return `Embedding provider rejected dimensions parameter (${detailText}). ` +
+      `This model does not support matryoshka representation. ` +
+      `Set "embedding.omitDimensions": true in your config to stop sending the dimensions parameter.`;
   }
 
   return `${genericPrefix}${detailText}`;
