@@ -61,7 +61,7 @@ import {
  * - "Replied message (untrusted, for context):" + JSON code blocks
  * - Standalone JSON blocks containing message_id/sender_id fields
  */
-function stripEnvelopeMetadata(text: string): string {
+export function stripEnvelopeMetadata(text: string): string {
   // 1. Strip "System: [timestamp] Channel..." lines
   let cleaned = text.replace(
     /^System:\s*\[[\d\-: +GMT]+\]\s+\S+\[.*?\].*$/gm,
