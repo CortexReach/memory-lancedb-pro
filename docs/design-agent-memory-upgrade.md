@@ -28,15 +28,43 @@ Expected behavior:
 - this scaffolds a later user-confirmed migration flow
 
 ## Phase 2 scope
-### Markdown memory upgrade path
-Add additive import logic, likely as a new module (e.g. `src/md-import.ts`) and CLI command(s):
+### A. Legacy memory upgrade path
+Add additive import logic, likely as a new module (e.g. `src/md-import.ts` plus later SQLite import helpers) and CLI command(s):
 - `memory-pro import-md <path> --dry-run`
 - `memory-pro import-md <path> --scope <scope>`
 - future preview/report command for agent workspaces
+- future SQLite-aware upgrade/import entry points for per-agent `~/.openclaw/memory/*.sqlite`
 
-Two classes of input:
+Legacy input classes:
 1. machine-friendly mdMirror logs
 2. human-authored `MEMORY.md` / `memory/YYYY-MM-DD.md`
+3. existing per-agent SQLite-backed OpenClaw memory stores
+
+### B. Non-destructive runtime coexistence
+During the period when `memory-lancedb-pro` is enabled, the old Markdown / SQLite memory systems should remain usable and compatible.
+
+Target direction:
+- avoid a hard cut-over where enabling the plugin makes old memory effectively disappear
+- make the plugin the **preferred management layer** without making the legacy layers invalid
+- keep the old systems viable as compatibility, rollback, and migration sources
+
+### C. Reversible sync / dual-write design goal
+The preferred Phase 2 direction is to keep the original memory systems and the LanceDB plugin from drifting apart during active use.
+
+Desired property:
+- when a user enables the plugin at time **A** and disables/uninstalls it at time **B**, important memories created during **A → B** should not exist only inside LanceDB with no path back to the original OpenClaw memory systems
+
+This suggests one of these compatible strategies:
+- continuous dual-write / mirroring of newly accepted memories
+- reversible export/backfill from LanceDB to legacy memory layers on disable/uninstall
+- another compatibility-preserving sync strategy that avoids permanent lock-in
+
+### D. Retrieval preference at the skill / agent layer
+Even if runtime compatibility is preserved, agent guidance should prefer `memory-lancedb-pro` for recall/search once enabled.
+
+Target behavior:
+- update the skill/docs so agents are told to prefer `memory-lancedb-pro` retrieval
+- treat Markdown / SQLite as compatibility / fallback / upgrade sources rather than the first-choice retrieval path
 
 ## Per-agent memory model
 ### Recommended read/write defaults
