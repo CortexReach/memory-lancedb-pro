@@ -15,6 +15,7 @@ import { spawn } from "node:child_process";
 
 // Import core components
 import { MemoryStore, validateStoragePath } from "./src/store.js";
+import { checkFirstRun, writeInitMarker, detectUpgradeCandidates } from "./src/init-check.js";
 import { createEmbedder, getVectorDimensions } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
@@ -147,6 +148,7 @@ interface PluginConfig {
     default?: string;
     definitions?: Record<string, { description: string }>;
     agentAccess?: Record<string, string[]>;
+    autoAgentScope?: boolean;
   };
   enableManagementTools?: boolean;
   sessionStrategy?: SessionStrategy;
@@ -1623,6 +1625,71 @@ const memoryLanceDBProPlugin = {
         `  The plugin will still attempt to start, but writes may fail.`,
       );
     }
+
+    // Non-blocking first-run / upgrade detection scaffold.
+    // Logs an initialization summary; does NOT block startup or prompt the user.
+    (async () => {
+      try {
+        const initResult = await checkFirstRun(resolvedDbPath, pluginVersion);
+        if (initResult.status === "first-run") {
+          await writeInitMarker(resolvedDbPath, pluginVersion);
+        } else if (initResult.status === "needs-upgrade") {
+          api.logger.info(
+            `memory-lancedb-pro: version change detected (stored: ${initResult.marker?.version}, current: ${pluginVersion}). ` +
+            `Updating initialization marker.`,
+          );
+          await writeInitMarker(resolvedDbPath, pluginVersion);
+        }
+
+        // Always scan for upgrade candidates on every startup so that newly-added
+        // agents are surfaced even when the plugin is already initialized.
+        const candidates = await detectUpgradeCandidates();
+        const hasWorkspaceSources = candidates.workspaceMemorySources.length > 0;
+        const hasSqliteStores = candidates.sqliteStores.length > 0;
+        const discoveryTag = `[discovery: ${candidates.discoveryMode}]`;
+
+        if (hasWorkspaceSources || hasSqliteStores) {
+          const parts: string[] = [];
+          if (hasWorkspaceSources) {
+            const wsSummary = candidates.workspaceMemorySources.map((s) => {
+              const indicators: string[] = [];
+              if (s.agentId) indicators.push(`agent:${s.agentId}`);
+              if (s.hasMemoryMd) indicators.push("MEMORY.md");
+              if (s.hasMemoryDir) indicators.push(`memory/(${s.memoryDirDateFiles.length} dated files)`);
+              return `${s.workspacePath} [${indicators.join(", ")}]`;
+            });
+            parts.push(`workspace memory sources: [${wsSummary.join("; ")}]`);
+          }
+          if (hasSqliteStores) {
+            const sqliteSummary = candidates.sqliteStores
+              .map((s) => (s.agentId ? s.agentId : `${s.agentName}(unregistered)`))
+              .join(", ");
+            parts.push(`SQLite agent stores: [${sqliteSummary}]`);
+          }
+          const statusLabel =
+            initResult.status === "first-run" ? "first-run detected" :
+            initResult.status === "needs-upgrade" ? "version-change detected" :
+            "startup scan";
+          const logMsg =
+            `memory-lancedb-pro: ${statusLabel} ${discoveryTag} — upgrade candidates found: ${parts.join(", ")}. ` +
+            `A future upgrade step may offer to import these memories.`;
+          // Steady-state startups log at debug to avoid repeated noise;
+          // first-run and version-change get info level since the user sees a banner anyway.
+          if (initResult.status === "initialized") {
+            api.logger.debug(logMsg);
+          } else {
+            api.logger.info(logMsg);
+          }
+        } else if (initResult.status === "first-run") {
+          api.logger.info(
+            `memory-lancedb-pro: first-run detected ${discoveryTag} — no upgrade candidates found. Fresh install.`,
+          );
+        }
+        // 'initialized'/'needs-upgrade' with no candidates: nothing to log
+      } catch (err) {
+        api.logger.debug(`memory-lancedb-pro: init-check failed (non-fatal): ${String(err)}`);
+      }
+    })();
 
     const vectorDim = getVectorDimensions(
       config.embedding.model || "text-embedding-3-small",

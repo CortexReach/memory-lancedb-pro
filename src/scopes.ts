@@ -16,6 +16,15 @@ export interface ScopeConfig {
   default: string;
   definitions: Record<string, ScopeDefinition>;
   agentAccess: Record<string, string[]>;
+  /**
+   * When true, every agent's accessible scopes automatically include `global` and
+   * `agent:<agentId>` as a baseline floor, even when an explicit `agentAccess` entry
+   * is configured.  The agent's default write scope also becomes `agent:<agentId>`.
+   * Explicit `agentAccess` entries extend this baseline rather than replacing it.
+   *
+   * Default: false (backward-compatible behaviour).
+   */
+  autoAgentScope?: boolean;
 }
 
 export interface ScopeManager {
@@ -53,6 +62,7 @@ export const DEFAULT_SCOPE_CONFIG: ScopeConfig = {
     },
   },
   agentAccess: {},
+  autoAgentScope: false,
 };
 
 // ============================================================================
@@ -138,6 +148,7 @@ export class MemoryScopeManager implements ScopeManager {
         ...normalizeAgentAccessMap(DEFAULT_SCOPE_CONFIG.agentAccess),
         ...normalizeAgentAccessMap(config.agentAccess),
       },
+      autoAgentScope: config.autoAgentScope ?? DEFAULT_SCOPE_CONFIG.autoAgentScope,
     };
 
     // Ensure global scope always exists
@@ -196,10 +207,19 @@ export class MemoryScopeManager implements ScopeManager {
     const normalizedAgentId = agentId.trim();
     const explicitAccess = this.config.agentAccess[normalizedAgentId];
     if (explicitAccess) {
+      if (this.config.autoAgentScope) {
+        // Inject global + agent:<id> as a floor; explicit entries extend the baseline.
+        const baseline = ["global", SCOPE_PATTERNS.AGENT(normalizedAgentId)];
+        const merged = [...new Set([...baseline, ...explicitAccess])];
+        return withOwnReflectionScope(merged, normalizedAgentId);
+      }
       return withOwnReflectionScope(explicitAccess, normalizedAgentId);
     }
 
     // Agent and reflection scopes are built-in and provisioned implicitly.
+    // Note: `autoAgentScope` has no effect here — this no-ACL path already
+    // provides the same global + agent:<id> baseline, so the flag only needs
+    // to be checked in the explicit-ACL branch above.
     return withOwnReflectionScope([
       "global",
       SCOPE_PATTERNS.AGENT(normalizedAgentId),
@@ -326,6 +346,10 @@ export class MemoryScopeManager implements ScopeManager {
 
     // Note: an agent's own reflection scope is still auto-granted by getAccessibleScopes().
     // This setter can add access, but it does not revoke `reflection:agent:${normalizedAgentId}`.
+    //
+    // Note: when `autoAgentScope` is true, `global` and `agent:<id>` are also always
+    // injected as a baseline floor at read time inside getAccessibleScopes(), regardless
+    // of what this setter stores.  A stored ACL that omits them does NOT remove access.
 
     // Validate all scopes
     for (const scope of scopes) {
@@ -382,6 +406,7 @@ export class MemoryScopeManager implements ScopeManager {
         ...normalizeAgentAccessMap(previous.agentAccess),
         ...normalizeAgentAccessMap(config.agentAccess),
       },
+      autoAgentScope: config.autoAgentScope !== undefined ? config.autoAgentScope : previous.autoAgentScope,
     };
 
     // Suppress warnings until validation succeeds
