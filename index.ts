@@ -23,6 +23,7 @@ import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
 import type { MdMirrorWriter } from "./src/tools.js";
+import { createCompatibilityMdMirrorWriter } from "./src/md-mirror.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { runWithReflectionTransientRetryOnce } from "./src/reflection-retry.js";
 import { resolveReflectionSessionSearchDirs, stripResetSuffix } from "./src/session-recovery.js";
@@ -1543,7 +1544,15 @@ function createMdMirrorWriter(
 ): MdMirrorWriter | null {
   if (config.mdMirror?.enabled !== true) return null;
 
-  const fallbackDir = api.resolvePath(config.mdMirror.dir || "memory-md");
+  const defaultFallbackDir = join(
+    resolveWorkspaceDirFromContext((api as any).context),
+    "memory",
+    "plugins",
+    "memory-lancedb-pro",
+  );
+  const fallbackDir = config.mdMirror.dir
+    ? api.resolvePath(config.mdMirror.dir)
+    : defaultFallbackDir;
   const workspaceMap = resolveAgentWorkspaceMap(api);
 
   if (Object.keys(workspaceMap).length > 0) {
@@ -1556,28 +1565,11 @@ function createMdMirrorWriter(
     );
   }
 
-  return async (entry, meta) => {
-    try {
-      const ts = new Date(entry.timestamp || Date.now());
-      const dateStr = ts.toISOString().split("T")[0];
-
-      let mirrorDir = fallbackDir;
-      if (meta?.agentId && workspaceMap[meta.agentId]) {
-        mirrorDir = join(workspaceMap[meta.agentId], "memory");
-      }
-
-      const filePath = join(mirrorDir, `${dateStr}.md`);
-      const agentLabel = meta?.agentId ? ` agent=${meta.agentId}` : "";
-      const sourceLabel = meta?.source ? ` source=${meta.source}` : "";
-      const safeText = entry.text.replace(/\n/g, " ").slice(0, 500);
-      const line = `- ${ts.toISOString()} [${entry.category}:${entry.scope}]${agentLabel}${sourceLabel} ${safeText}\n`;
-
-      await mkdir(mirrorDir, { recursive: true });
-      await appendFile(filePath, line, "utf8");
-    } catch (err) {
-      api.logger.warn(`mdMirror: write failed: ${String(err)}`);
-    }
-  };
+  return createCompatibilityMdMirrorWriter({
+    fallbackDir,
+    workspaceMap,
+    logger: api.logger,
+  });
 }
 
 // ============================================================================
