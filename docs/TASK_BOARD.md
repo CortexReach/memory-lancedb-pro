@@ -42,21 +42,21 @@ Implement an incremental, architecture-compatible upgrade path for agent-scoped 
 - [DONE] Define the preview-first CLI plan before spawning implementation workers
 
 ### D1. Legacy memory upgrade/import
-- [TODO] Define Markdown import command surface
-- [TODO] Define SQLite memory upgrade/import boundary
-- [TODO] Define mdMirror-log parser boundary
-- [TODO] Define freeform Markdown extraction boundary
-- [TODO] Define value-filtering / dedupe strategy before writing imported memories into LanceDB
+- [DONE] Define Markdown import command surface at design level
+- [DONE] Define SQLite memory upgrade/import boundary at design level
+- [DONE] Define mdMirror-log parser boundary at design level
+- [DONE] Define freeform Markdown extraction boundary at design level
+- [DONE] Define value-filtering / dedupe strategy direction before writing imported memories into LanceDB
 
 ### D2. Non-destructive coexistence during active use
-- [TODO] Define how legacy Markdown / SQLite systems remain usable while memory-lancedb-pro is enabled
-- [TODO] Define how users can enable the plugin mid-stream without effectively losing old memory continuity
-- [TODO] Define how newly created agents after plugin enablement inherit compatible memory management
+- [DONE] Define how legacy Markdown / SQLite systems remain usable while memory-lancedb-pro is enabled (design level)
+- [DONE] Define how users can enable the plugin mid-stream without effectively losing old memory continuity (design level)
+- [DONE] Define how newly created agents after plugin enablement inherit compatible memory management (design level)
 
 ### D3. Reversible / non-residual exit path
-- [TODO] Define how A→B period memories avoid being trapped only inside LanceDB
-- [TODO] Evaluate dual-write, mirror, export-backfill, or other reversible sync strategies
-- [TODO] Define disable/uninstall behavior so users are not permanently bound to the plugin layer
+- [DONE] Define how A→B period memories avoid being trapped only inside LanceDB (design direction)
+- [DONE] Evaluate dual-write, mirror, export-backfill, or other reversible sync strategies and choose a preferred direction
+- [DONE] Define disable/uninstall behavior expectations so users are not permanently bound to the plugin layer
 
 ### D4. Retrieval preference & skill guidance
 - [TODO] Update skill/docs so agents prefer memory-lancedb-pro retrieval when enabled
