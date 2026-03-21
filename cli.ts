@@ -15,6 +15,8 @@ import type { MemoryScopeManager } from "./src/scopes.js";
 import type { MemoryMigrator } from "./src/migrate.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
 import type { LlmClient } from "./src/llm-client.js";
+import { detectUpgradeCandidates } from "./src/init-check.js";
+import { buildUpgradeScanReport } from "./src/upgrade-planner.js";
 import {
   getDefaultOauthModelForProvider,
   getOAuthProviderLabel,
@@ -1314,6 +1316,83 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         }
       } catch (error) {
         console.error("Verification failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // upgrade-scan: Read-only Phase 2 legacy source inventory
+  memory
+    .command("upgrade-scan")
+    .description("Scan for legacy memory sources and report upgrade readiness (read-only, preview-first)")
+    .option("--json", "Output machine-readable JSON")
+    .option("--workspace-roots <paths...>", "Override workspace root directories to scan")
+    .option("--sqlite-dir <path>", "Override directory to scan for *.sqlite stores")
+    .option("--config <path>", "Override openclaw.json path")
+    .action(async (options) => {
+      try {
+        const candidates = await detectUpgradeCandidates({
+          overrideWorkspaceRoots: options.workspaceRoots,
+          overrideSqliteDir: options.sqliteDir,
+          overrideConfigPath: options.config,
+        });
+
+        const report = buildUpgradeScanReport(candidates);
+
+        if (options.json) {
+          console.log(JSON.stringify(report, null, 2));
+          return;
+        }
+
+        // Human-readable output
+        console.log("=== Upgrade Scan Report ===");
+        console.log(`Discovery mode: ${report.discoveryMode}`);
+        console.log();
+
+        if (report.workspaceMemorySources.length === 0) {
+          console.log("Workspace memory sources: none found");
+        } else {
+          console.log(`Workspace memory sources (${report.workspaceMemorySources.length}):`);
+          for (const src of report.workspaceMemorySources) {
+            console.log(`  • ${src.workspacePath}`);
+            console.log(`    Agent: ${src.agentId ?? "(unresolved)"}`);
+            console.log(`    MEMORY.md: ${src.hasMemoryMd ? "yes" : "no"}`);
+            const datedNote = src.memoryDirDateFiles.length > 0
+              ? ` (${src.memoryDirDateFiles.length} dated files)`
+              : "";
+            console.log(`    memory/ dir: ${src.hasMemoryDir ? "yes" : "no"}${datedNote}`);
+            console.log(`    Import priority: ${src.importPriority}`);
+            for (const w of src.warnings) {
+              console.log(`    ⚠ ${w}`);
+            }
+          }
+        }
+
+        console.log();
+
+        if (report.sqliteStores.length === 0) {
+          console.log("SQLite stores: none found");
+        } else {
+          console.log(`SQLite stores (${report.sqliteStores.length}):`);
+          for (const sq of report.sqliteStores) {
+            console.log(`  • ${sq.filePath}`);
+            console.log(`    Agent: ${sq.agentId ?? "(unregistered)"}`);
+            console.log(`    Import priority: ${sq.importPriority}`);
+            if (sq.overlapWithWorkspaceMarkdown) {
+              console.log(`    Overlap: workspace MEMORY.md exists — prefer Markdown import first`);
+            }
+            for (const w of sq.warnings) {
+              console.log(`    ⚠ ${w}`);
+            }
+          }
+        }
+
+        console.log();
+        console.log("Summary:");
+        console.log(`  Workspace sources: ${report.summary.workspaceSourceCount}`);
+        console.log(`  SQLite stores:     ${report.summary.sqliteSourceCount}`);
+        console.log(`  Ambiguous (warnings): ${report.summary.ambiguousSourceCount}`);
+      } catch (error) {
+        console.error("upgrade-scan failed:", error);
         process.exit(1);
       }
     });
