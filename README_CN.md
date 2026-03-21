@@ -238,6 +238,20 @@ git clone https://github.com/CortexReach/memory-lancedb-pro-skill.git ~/.claude/
 git clone https://github.com/CortexReach/memory-lancedb-pro-skill.git ~/.openclaw/workspace/skills/memory-lancedb-pro-skill
 ```
 
+### 实验性多模态配套插件
+
+> **讨论帖：** [先把多模态支持保持为 sibling plugin](https://github.com/CortexReach/memory-lancedb-pro/discussions/275)
+>
+> **原型仓库：** [gexinggexing/memory-multimodal-ingest](https://github.com/gexinggexing/memory-multimodal-ingest)
+
+如果你想尝试多模态记忆摄取，但又不希望把核心文本记忆运行时做得过于臃肿，现在已经有一个单独的实验性 sibling plugin 方向：
+
+- 让 `memory-lancedb-pro` 继续专注于文本记忆生命周期和 recall
+- 把 image / audio / video / PDF 摄取放进独立插件
+- 多模态 MVP 侧使用 Gemini Embedding 2 + LanceDB
+
+这条路线目前刻意保持在核心插件之外，建议先把它当作实验性配套方案，等集成边界最终定下来后再决定是否进一步合并。
+
 ---
 
 ## 视频教程

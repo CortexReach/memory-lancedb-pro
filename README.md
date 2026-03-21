@@ -238,6 +238,20 @@ git clone https://github.com/CortexReach/memory-lancedb-pro-skill.git ~/.claude/
 git clone https://github.com/CortexReach/memory-lancedb-pro-skill.git ~/.openclaw/workspace/skills/memory-lancedb-pro-skill
 ```
 
+### Experimental Multimodal Companion
+
+> **Discussion:** [Keep multimodal support as a sibling plugin first](https://github.com/CortexReach/memory-lancedb-pro/discussions/275)
+>
+> **Prototype repo:** [gexinggexing/memory-multimodal-ingest](https://github.com/gexinggexing/memory-multimodal-ingest)
+
+If you want to explore multimodal memory ingest without bloating the core text-memory runtime, there is now an experimental sibling plugin path under discussion:
+
+- keeps `memory-lancedb-pro` focused on text memory lifecycle and recall
+- handles image / audio / video / PDF ingest in a separate plugin
+- uses Gemini Embedding 2 + LanceDB for the multimodal MVP
+
+This is intentionally separate from the core plugin for now and should be treated as an experimental companion until the integration boundary is finalized.
+
 ---
 
 ## Video Tutorial
