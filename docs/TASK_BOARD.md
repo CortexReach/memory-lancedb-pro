@@ -37,9 +37,9 @@ Implement an incremental, architecture-compatible upgrade path for agent-scoped 
 ### D0. Main-agent design freeze
 - [DONE] Record Phase 2 coexistence / reversibility goals
 - [DONE] Create a main-agent Phase 2 decomposition document
-- [TODO] Define the legacy source matrix (Markdown vs SQLite, importability, scope mapping, risks)
-- [TODO] Choose the preferred Phase 2 sync strategy (dual-write vs export/backfill vs hybrid)
-- [TODO] Define the preview-first CLI plan before spawning implementation workers
+- [DONE] Define the legacy source matrix (Markdown vs SQLite, importability, scope mapping, risks)
+- [DONE] Choose the preferred Phase 2 sync strategy (dual-write vs export/backfill vs hybrid)
+- [DONE] Define the preview-first CLI plan before spawning implementation workers
 
 ### D1. Legacy memory upgrade/import
 - [TODO] Define Markdown import command surface
