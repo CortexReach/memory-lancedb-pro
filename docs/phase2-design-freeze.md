@@ -192,6 +192,6 @@ Update skill/docs so agents prefer `memory-lancedb-pro` retrieval while treating
 1. **Markdown-first** for historical import when Markdown and SQLite overlap
 2. **SQLite detected and previewed**, but not assumed to be the canonical human-authored write target
 3. **Hybrid sync strategy** preferred: LanceDB primary runtime layer + dedicated per-agent compatibility Markdown subtree (for example `memory/plugin-memory-pro/`) + ongoing SQLite continuity
-4. **Plugin-generated Markdown should not be mixed into** human-authored top-level `memory/YYYY-MM-DD.md` daily logs; a subtree plus `README.md` / `STATEMENT.md` is preferred
+4. **Plugin-generated Markdown should not be mixed into** human-authored top-level `memory/YYYY-MM-DD.md` daily logs; the frozen target is a subtree rooted at `memory/plugin-memory-pro/` with `README.md`, `daily/`, and later canonical `entries/`
 5. **Preview-first CLI** before any broad destructive import
 6. **Skill/docs should prefer LanceDB retrieval** once enabled, while preserving legacy compatibility layers

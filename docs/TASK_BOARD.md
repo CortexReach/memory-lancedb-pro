@@ -58,8 +58,9 @@ Implement an incremental, architecture-compatible upgrade path for agent-scoped 
 - [DONE] Evaluate dual-write, mirror, export-backfill, or other reversible sync strategies and choose a preferred direction
 - [DONE] Define disable/uninstall behavior expectations so users are not permanently bound to the plugin layer
 - [TODO] Refine the chosen sync strategy so legacy SQLite continuity is explicitly preserved during plugin-enabled runtime, not only on export/disable
-- [TODO] Freeze the compatibility Markdown target as a per-agent workspace subtree (for example `memory/plugin-memory-pro/`) instead of mixing plugin output into human-authored daily logs
-- [TODO] Define the required README / STATEMENT contract for that subtree so users can understand why the files exist after plugin enable/disable cycles
+- [DONE] Freeze the compatibility Markdown target as a per-agent workspace subtree (for example `memory/plugin-memory-pro/`) instead of mixing plugin output into human-authored daily logs
+- [DONE] Define the required README / STATEMENT contract for that subtree so users can understand why the files exist after plugin enable/disable cycles
+- [TODO] Wire the runtime Markdown compatibility write-path to the frozen subtree contract (`daily/` + later `entries/`) instead of ad-hoc mirror roots
 
 ### D4. Retrieval preference & skill guidance
 - [TODO] Update skill/docs so agents prefer memory-lancedb-pro retrieval when enabled

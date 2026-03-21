@@ -139,14 +139,15 @@ Define what counts as a “durable accepted memory” eligible for compatibility
 ### Step 2
 Define the Markdown-compatible mirror/backfill target format.
 
-Current preferred direction:
+Current frozen direction:
 - create a dedicated compatibility subtree per agent workspace under `memory/plugin-memory-pro/`
 - keep plugin-generated files out of the human-authored top-level `memory/YYYY-MM-DD.md` daily logs
-- include a `README.md` / `STATEMENT.md` in that subtree so later users can understand why the files exist
-- decide whether the subtree is:
-  - daily audit logs only,
-  - per-memory canonical files,
-  - or a hybrid (`daily/` + `entries/`)
+- require a `README.md` / `STATEMENT.md` in that subtree so later users can understand why the files exist
+- freeze the target layout as a hybrid:
+  - `daily/` for append-only audit logs
+  - `entries/agent-self/` for canonical local durable-memory projections
+  - `entries/global/` for canonical global durable-memory projections
+- allow early implementation to ship `README.md` + `daily/` first, but treat `entries/` as the intended end state
 
 ### Step 3
 Implement preview/reporting for reversible export/backfill.
