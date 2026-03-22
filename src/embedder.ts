@@ -105,6 +105,7 @@ type EmbeddingProviderProfile =
   | "openai"
   | "jina"
   | "voyage-compatible"
+  | "nvidia"
   | "generic-openai-compatible";
 
 interface EmbeddingCapabilities {
@@ -204,6 +205,7 @@ function getProviderLabel(baseURL: string | undefined, model: string): string {
     if (profile === "jina" && /api\.jina\.ai/i.test(base)) return "Jina";
     if (profile === "voyage-compatible" && /api\.voyageai\.com/i.test(base)) return "Voyage";
     if (profile === "openai" && /api\.openai\.com/i.test(base)) return "OpenAI";
+    if (profile === "nvidia") return "NVIDIA NIM";
 
     try {
       return new URL(base).host;
@@ -219,6 +221,8 @@ function getProviderLabel(baseURL: string | undefined, model: string): string {
       return "Voyage";
     case "openai":
       return "OpenAI";
+    case "nvidia":
+      return "NVIDIA NIM";
     default:
       return "embedding provider";
   }
@@ -234,6 +238,10 @@ function detectEmbeddingProviderProfile(
   if (/api\.jina\.ai/i.test(base) || /^jina-/i.test(model)) return "jina";
   if (/api\.voyageai\.com/i.test(base) || /^voyage\b/i.test(model)) {
     return "voyage-compatible";
+  }
+
+  if (/\.nvidia\.com/i.test(base) || /^nvidia\//i.test(model) || /^nv-embed/i.test(model)) {
+    return "nvidia";
   }
 
   return "generic-openai-compatible";
@@ -267,6 +275,19 @@ function getEmbeddingCapabilities(profile: EmbeddingProviderProfile): EmbeddingC
           "document": "document",
         },
         dimensionsField: "output_dimension",
+      };
+    case "nvidia":
+      return {
+        encoding_format: true,
+        normalized: false,
+        taskField: "input_type",
+        taskValueMap: {
+          "retrieval.query": "query",
+          "retrieval.passage": "passage",
+          "query": "query",
+          "passage": "passage",
+        },
+        dimensionsField: "dimensions",
       };
     case "generic-openai-compatible":
     default:
