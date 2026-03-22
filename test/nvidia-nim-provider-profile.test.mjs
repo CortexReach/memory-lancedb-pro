@@ -5,7 +5,7 @@ import { describe, it } from "node:test";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
-const { Embedder } = jiti("../src/embedder.ts");
+const { Embedder, formatEmbeddingProviderError } = jiti("../src/embedder.ts");
 
 /**
  * Create a capture server that records POST bodies and returns embeddings
@@ -109,6 +109,16 @@ describe("NVIDIA NIM provider profile", () => {
       assert.equal(body.input_type, "query", "nvidia/ model prefix should trigger input_type");
       assert.equal(body.task, undefined, "nvidia/ model prefix should NOT send task");
     });
+  });
+
+  it("detects NVIDIA from a .nvidia.com baseURL", () => {
+    const message = formatEmbeddingProviderError(new Error("boom"), {
+      baseURL: "https://build.nvidia.com/v1",
+      model: "custom-embed-model",
+      mode: "single",
+    });
+
+    assert.equal(message, "Failed to generate embedding from NVIDIA NIM: boom");
   });
 
   it("non-NVIDIA: Jina sends task field", async () => {
