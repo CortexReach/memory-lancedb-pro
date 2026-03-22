@@ -240,7 +240,7 @@ function detectEmbeddingProviderProfile(
     return "voyage-compatible";
   }
 
-  if (/\.nvidia\.com|integrate\.api\.nvidia\.com/i.test(base) || /^nvidia\//i.test(model) || /^nv-embed/i.test(model)) {
+  if (/\.nvidia\.com/i.test(base) || /^nvidia\//i.test(model) || /^nv-embed/i.test(model)) {
     return "nvidia";
   }
 
