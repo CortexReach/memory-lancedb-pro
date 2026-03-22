@@ -33,6 +33,7 @@ import {
   normalizeCategory,
 } from "./memory-categories.js";
 import { isNoise } from "./noise-filter.js";
+import { compressToolOutput } from "./tool-output-compressor.js";
 import type { NoisePrototypeBank } from "./noise-prototypes.js";
 import {
   appendRelation,
@@ -339,7 +340,10 @@ export class SmartExtractor {
     // Strip platform envelope metadata injected by OpenClaw channels
     // (e.g. "System: [2026-03-18 14:21:36 GMT+8] Feishu[default] DM | ou_...")
     // These pollute extraction if treated as conversation content.
-    const cleaned = stripEnvelopeMetadata(truncated);
+    const stripped = stripEnvelopeMetadata(truncated);
+    // Compress tool output noise (git boilerplate, passing tests, base64 screenshots)
+    // to reduce LLM token costs and improve extraction quality.
+    const cleaned = compressToolOutput(stripped);
 
     const user = this.config.user ?? "User";
     const prompt = buildExtractionPrompt(cleaned, user);
