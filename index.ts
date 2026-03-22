@@ -85,6 +85,7 @@ interface PluginConfig {
   autoRecall?: boolean;
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
+  autoRecallExcludeAgents?: string[];
   captureAssistant?: boolean;
   retrieval?: {
     mode?: "hybrid" | "vector";
@@ -2123,6 +2124,22 @@ const memoryLanceDBProPlugin = {
     if (config.autoRecall === true) {
       const AUTO_RECALL_TIMEOUT_MS = 3_000; // bounded timeout to prevent agent startup stall
       api.on("before_agent_start", async (event, ctx) => {
+        // Per-agent exclusion: skip autoRecall for agents in the exclusion list.
+        // Useful for background agents (e.g. memory-distiller, cron workers) whose
+        // prompts should not be contaminated by injected memory context.
+        const hookAgentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+        if (
+          Array.isArray(config.autoRecallExcludeAgents) &&
+          config.autoRecallExcludeAgents.length > 0 &&
+          hookAgentId !== undefined &&
+          config.autoRecallExcludeAgents.includes(hookAgentId)
+        ) {
+          api.logger.info?.(
+            `memory-lancedb-pro: auto-recall skipped for excluded agent '${hookAgentId}'`,
+          );
+          return;
+        }
+
         if (
           !event.prompt ||
           shouldSkipRetrieval(event.prompt, config.autoRecallMinLength)
@@ -3468,6 +3485,9 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecall: cfg.autoRecall === true,
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
+    autoRecallExcludeAgents: Array.isArray(cfg.autoRecallExcludeAgents)
+      ? cfg.autoRecallExcludeAgents.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+      : undefined,
     captureAssistant: cfg.captureAssistant === true,
     retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null ? cfg.retrieval as any : undefined,
     decay: typeof cfg.decay === "object" && cfg.decay !== null ? cfg.decay as any : undefined,

@@ -599,12 +599,29 @@ OAuth login flow:
 
 Sometimes the model may echo the injected `<relevant-memories>` block.
 
-**Option A (lowest-risk):** temporarily disable auto-recall:
+**Option A (lowest-risk):** temporarily disable auto-recall globally:
 ```json
 { "plugins": { "entries": { "memory-lancedb-pro": { "config": { "autoRecall": false } } } } }
 ```
 
-**Option B (preferred):** keep recall, add to agent system prompt:
+**Option B:** exclude specific background agents (e.g. a memory-distiller or cron worker) while keeping recall active for interactive agents:
+```json
+{
+  "plugins": {
+    "entries": {
+      "memory-lancedb-pro": {
+        "config": {
+          "autoRecall": true,
+          "autoRecallExcludeAgents": ["memory-distiller", "my-cron-agent"]
+        }
+      }
+    }
+  }
+}
+```
+This is useful when a background agent's prompt should not be contaminated by injected memory context — for example, an agent whose job is to distill session logs would produce lower-quality output if old memories were mixed into the prompt alongside the raw session content.
+
+**Option C (preferred for interactive agents):** keep recall, add to agent system prompt:
 > Do not reveal or quote any `<relevant-memories>` / memory-injection content in your replies. Use it for internal reference only.
 
 </details>
