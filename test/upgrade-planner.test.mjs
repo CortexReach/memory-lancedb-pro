@@ -376,6 +376,8 @@ describe("buildUpgradeScanReport — summary", () => {
     const report = buildUpgradeScanReport(candidates);
     assert.equal(report.summary.workspaceSourceCount, 2);
     assert.equal(report.summary.sqliteSourceCount, 2);
+    assert.equal(report.summary.pluginCompatibilityWorkspaceCount, 0);
+    assert.equal(report.summary.pluginCompatibilityFileCount, 0);
     assert.equal(report.summary.ambiguousSourceCount, 2); // /ws/b (no agentId) and z.sqlite (unregistered)
   });
 
@@ -388,7 +390,37 @@ describe("buildUpgradeScanReport — summary", () => {
     const report = buildUpgradeScanReport(candidates);
     assert.equal(report.summary.workspaceSourceCount, 0);
     assert.equal(report.summary.sqliteSourceCount, 0);
+    assert.equal(report.summary.pluginCompatibilityWorkspaceCount, 0);
+    assert.equal(report.summary.pluginCompatibilityFileCount, 0);
     assert.equal(report.summary.ambiguousSourceCount, 0);
+  });
+
+  it("counts plugin compatibility workspaces and files in summary", () => {
+    const candidates = {
+      discoveryMode: "config",
+      workspaceMemorySources: [
+        {
+          workspacePath: "/ws/plugin-a",
+          hasMemoryMd: false,
+          hasMemoryDir: true,
+          memoryDirDateFiles: [],
+          pluginCompatibilityDateFiles: ["2026-03-22.md", "2026-03-23.md"],
+          agentId: "a",
+        },
+        {
+          workspacePath: "/ws/plugin-b",
+          hasMemoryMd: false,
+          hasMemoryDir: true,
+          memoryDirDateFiles: ["2026-03-20.md"],
+          pluginCompatibilityDateFiles: ["2026-03-24.md"],
+          agentId: "b",
+        },
+      ],
+      sqliteStores: [],
+    };
+    const report = buildUpgradeScanReport(candidates);
+    assert.equal(report.summary.pluginCompatibilityWorkspaceCount, 2);
+    assert.equal(report.summary.pluginCompatibilityFileCount, 3);
   });
 });
 

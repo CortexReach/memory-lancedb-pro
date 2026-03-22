@@ -32,6 +32,8 @@ export interface SqliteMemoryStoreReport extends SqliteMemoryStore {
 export interface UpgradeScanSummary {
   workspaceSourceCount: number;
   sqliteSourceCount: number;
+  pluginCompatibilityWorkspaceCount: number;
+  pluginCompatibilityFileCount: number;
   /** Sources that carry at least one warning (unresolved agent, overlap risk, etc.) */
   ambiguousSourceCount: number;
 }
@@ -126,6 +128,13 @@ export function buildUpgradeScanReport(candidates: UpgradeCandidates): UpgradeSc
   const ambiguousSourceCount =
     workspaceMemorySources.filter((s) => s.warnings.length > 0).length +
     sqliteStores.filter((s) => s.warnings.length > 0).length;
+  const pluginCompatibilityWorkspaceCount = workspaceMemorySources.filter(
+    (s) => s.pluginCompatibilityDateFiles.length > 0,
+  ).length;
+  const pluginCompatibilityFileCount = workspaceMemorySources.reduce(
+    (sum, s) => sum + s.pluginCompatibilityDateFiles.length,
+    0,
+  );
 
   return {
     discoveryMode: candidates.discoveryMode,
@@ -134,6 +143,8 @@ export function buildUpgradeScanReport(candidates: UpgradeCandidates): UpgradeSc
     summary: {
       workspaceSourceCount: workspaceMemorySources.length,
       sqliteSourceCount: sqliteStores.length,
+      pluginCompatibilityWorkspaceCount,
+      pluginCompatibilityFileCount,
       ambiguousSourceCount,
     },
   };

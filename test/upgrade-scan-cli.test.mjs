@@ -127,6 +127,8 @@ describe("memory-pro upgrade-scan CLI", () => {
     assert.ok(parsed.summary && typeof parsed.summary === "object", "should have summary object");
     assert.ok(typeof parsed.summary.workspaceSourceCount === "number", "should have workspaceSourceCount");
     assert.ok(typeof parsed.summary.sqliteSourceCount === "number", "should have sqliteSourceCount");
+    assert.ok(typeof parsed.summary.pluginCompatibilityWorkspaceCount === "number", "should have pluginCompatibilityWorkspaceCount");
+    assert.ok(typeof parsed.summary.pluginCompatibilityFileCount === "number", "should have pluginCompatibilityFileCount");
     assert.ok(typeof parsed.summary.ambiguousSourceCount === "number", "should have ambiguousSourceCount");
   });
 
@@ -159,6 +161,33 @@ describe("memory-pro upgrade-scan CLI", () => {
     assert.equal(src.hasMemoryMd, true);
   });
 
+  it("mentions plugin compatibility subtree in human-readable output when present", async () => {
+    const { createMemoryCLI } = jiti("../cli.ts");
+    const { Command } = jiti("commander");
+    const program = new Command();
+    program.exitOverride();
+    createMemoryCLI(makeMinimalContext())({ program });
+
+    const ws = path.join(workDir, "ws-plugin-human-1");
+    const pluginDir = path.join(ws, "memory", "plugins", "memory-lancedb-pro");
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(path.join(pluginDir, "2026-03-22.md"), "- plugin memory");
+    const sqliteDir = path.join(workDir, "sqlite-plugin-human-1");
+    mkdirSync(sqliteDir, { recursive: true });
+
+    const output = await captureLogs(() =>
+      program.parseAsync([
+        "node", "openclaw", "memory-pro", "upgrade-scan",
+        "--workspace-roots", ws,
+        "--sqlite-dir", sqliteDir,
+      ]),
+    );
+
+    assert.ok(output.includes("plugin compatibility subtree: yes (1 dated files)"));
+    assert.ok(output.includes("Plugin compat workspaces: 1"));
+    assert.ok(output.includes("Plugin compat files:      1"));
+  });
+
   it("returns zero counts and empty arrays when no sources found", async () => {
     const { createMemoryCLI } = jiti("../cli.ts");
     const { Command } = jiti("commander");
@@ -185,6 +214,8 @@ describe("memory-pro upgrade-scan CLI", () => {
     assert.equal(parsed.sqliteStores.length, 0);
     assert.equal(parsed.summary.workspaceSourceCount, 0);
     assert.equal(parsed.summary.sqliteSourceCount, 0);
+    assert.equal(parsed.summary.pluginCompatibilityWorkspaceCount, 0);
+    assert.equal(parsed.summary.pluginCompatibilityFileCount, 0);
     assert.equal(parsed.summary.ambiguousSourceCount, 0);
   });
 });

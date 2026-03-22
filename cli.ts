@@ -1359,7 +1359,13 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
             const datedNote = src.memoryDirDateFiles.length > 0
               ? ` (${src.memoryDirDateFiles.length} dated files)`
               : "";
+            const pluginCompatNote = src.pluginCompatibilityDateFiles.length > 0
+              ? ` (${src.pluginCompatibilityDateFiles.length} dated files)`
+              : "";
             console.log(`    memory/ dir: ${src.hasMemoryDir ? "yes" : "no"}${datedNote}`);
+            console.log(
+              `    plugin compatibility subtree: ${src.pluginCompatibilityDateFiles.length > 0 ? "yes" : "no"}${pluginCompatNote}`,
+            );
             console.log(`    Import priority: ${src.importPriority}`);
             for (const w of src.warnings) {
               console.log(`    ⚠ ${w}`);
@@ -1378,7 +1384,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
             console.log(`    Agent: ${sq.agentId ?? "(unregistered)"}`);
             console.log(`    Import priority: ${sq.importPriority}`);
             if (sq.overlapWithWorkspaceMarkdown) {
-              console.log(`    Overlap: workspace MEMORY.md exists — prefer Markdown import first`);
+              console.log(`    Overlap: legacy-compatible workspace Markdown exists (MEMORY.md, dated memory files, or plugin compatibility subtree) — prefer Markdown import first`);
             }
             for (const w of sq.warnings) {
               console.log(`    ⚠ ${w}`);
@@ -1390,6 +1396,8 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         console.log("Summary:");
         console.log(`  Workspace sources: ${report.summary.workspaceSourceCount}`);
         console.log(`  SQLite stores:     ${report.summary.sqliteSourceCount}`);
+        console.log(`  Plugin compat workspaces: ${report.summary.pluginCompatibilityWorkspaceCount}`);
+        console.log(`  Plugin compat files:      ${report.summary.pluginCompatibilityFileCount}`);
         console.log(`  Ambiguous (warnings): ${report.summary.ambiguousSourceCount}`);
       } catch (error) {
         console.error("upgrade-scan failed:", error);
