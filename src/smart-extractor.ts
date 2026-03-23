@@ -1290,3 +1290,58 @@ export class SmartExtractor {
     }
   }
 }
+
+// ============================================================================
+// Extraction Rate Limiter (Feature 7: Adaptive Extraction Throttling)
+// ============================================================================
+
+const ONE_HOUR_MS = 60 * 60 * 1000;
+
+export interface ExtractionRateLimiterOptions {
+  /** Maximum number of extractions allowed per hour (default: 30) */
+  maxExtractionsPerHour?: number;
+}
+
+export interface ExtractionRateLimiter {
+  /** Check whether the current rate would exceed the limit */
+  isRateLimited(): boolean;
+  /** Record a new extraction timestamp */
+  recordExtraction(): void;
+  /** Get the number of extractions in the current window */
+  getRecentCount(): number;
+}
+
+/**
+ * Create an extraction rate limiter that tracks timestamps in a sliding
+ * one-hour window.
+ */
+export function createExtractionRateLimiter(
+  options: ExtractionRateLimiterOptions = {},
+): ExtractionRateLimiter {
+  const maxPerHour = options.maxExtractionsPerHour ?? 30;
+  const timestamps: number[] = [];
+
+  function pruneOld(): void {
+    const cutoff = Date.now() - ONE_HOUR_MS;
+    while (timestamps.length > 0 && timestamps[0] < cutoff) {
+      timestamps.shift();
+    }
+  }
+
+  return {
+    isRateLimited(): boolean {
+      pruneOld();
+      return timestamps.length >= maxPerHour;
+    },
+
+    recordExtraction(): void {
+      pruneOld();
+      timestamps.push(Date.now());
+    },
+
+    getRecentCount(): number {
+      pruneOld();
+      return timestamps.length;
+    },
+  };
+}

@@ -734,6 +734,44 @@
             }
           }
         }
+      },
+      "sessionCompression": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Session compression settings for auto-capture. Scores and compresses conversation texts to prioritize high-signal content.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Enable session compression before auto-capture extraction"
+          },
+          "minScoreToKeep": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.3,
+            "description": "Minimum score threshold. If all texts score below this, fallback to keeping at least the last few texts."
+          }
+        }
+      },
+      "extractionThrottle": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Adaptive extraction throttling to reduce LLM cost on low-value or rapid-fire sessions.",
+        "properties": {
+          "skipLowValue": {
+            "type": "boolean",
+            "default": true,
+            "description": "Skip extraction for conversations with estimated value < 0.2"
+          },
+          "maxExtractionsPerHour": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "default": 30,
+            "description": "Maximum number of auto-capture extractions allowed per hour"
+          }
+        }
       }
     },
     "required": [
@@ -1196,6 +1234,24 @@
       "label": "LLM Timeout (ms)",
       "placeholder": "30000",
       "help": "Request timeout for the smart-extraction / upgrade LLM in milliseconds",
+      "advanced": true
+    },
+    "sessionCompression.enabled": {
+      "label": "Session Compression",
+      "help": "Score and compress conversation texts before auto-capture to prioritize high-signal content (corrections, decisions, tool calls)"
+    },
+    "sessionCompression.minScoreToKeep": {
+      "label": "Compression Min Score",
+      "help": "Minimum text score threshold. If all texts score below this, keep at least the last few texts as fallback.",
+      "advanced": true
+    },
+    "extractionThrottle.skipLowValue": {
+      "label": "Skip Low-Value Conversations",
+      "help": "Skip auto-capture for conversations estimated to have low memory value (< 0.2)"
+    },
+    "extractionThrottle.maxExtractionsPerHour": {
+      "label": "Max Extractions Per Hour",
+      "help": "Rate limit for auto-capture extractions. Prevents excessive LLM calls during rapid-fire sessions.",
       "advanced": true
     }
   }
