@@ -98,6 +98,9 @@ export interface EmbeddingConfig {
   taskPassage?: string;
   /** Optional flag to request normalized embeddings (provider-dependent, e.g. Jina v5) */
   normalized?: boolean;
+  /** When true, omit the dimensions parameter from embedding requests even if dimensions is set.
+   *  Use this for local models that reject the dimensions parameter with "matryoshka representation" errors. */
+  omitDimensions?: boolean;
   /** Enable automatic chunking for documents exceeding context limits (default: true) */
   chunking?: boolean;
 }
@@ -410,6 +413,8 @@ export class Embedder {
 
   /** Optional requested dimensions to pass through to the embedding provider (OpenAI-compatible). */
   private readonly _requestDimensions?: number;
+  /** When true, omit the dimensions parameter even if _requestDimensions is set. */
+  private readonly _omitDimensions: boolean;
   /** Enable automatic chunking for long documents (default: true) */
   private readonly _autoChunk: boolean;
 
@@ -424,6 +429,7 @@ export class Embedder {
     this._taskPassage = config.taskPassage;
     this._normalized = config.normalized;
     this._requestDimensions = config.dimensions;
+    this._omitDimensions = config.omitDimensions === true;
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
     const profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
@@ -641,8 +647,9 @@ export class Embedder {
     }
 
     // Output dimension: field name is provider-defined.
-    // Only sent when explicitly configured to avoid breaking providers that reject unknown fields.
-    if (this._capabilities.dimensionsField && this._requestDimensions && this._requestDimensions > 0) {
+    // Only sent when explicitly configured, unless omitDimensions is enabled for
+    // local or provider-compatible models that reject the dimensions field.
+    if (!this._omitDimensions && this._capabilities.dimensionsField && this._requestDimensions && this._requestDimensions > 0) {
       payload[this._capabilities.dimensionsField] = this._requestDimensions;
     }
 
