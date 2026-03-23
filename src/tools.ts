@@ -23,6 +23,7 @@ import {
 import { TEMPORAL_VERSIONED_CATEGORIES } from "./memory-categories.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./self-improvement-files.js";
 import { getDisplayCategoryTag } from "./reflection-metadata.js";
+import type { RetrievalTrace } from "./retrieval-trace.js";
 import {
   filterUserMdExclusiveRecallResults,
   isUserMdExclusiveMemory,
@@ -1328,23 +1329,48 @@ export function registerMemoryStatsTool(
           const scopeManagerStats = context.scopeManager.getStats();
           const retrievalConfig = context.retriever.getConfig();
 
-          const text = [
+          const textLines = [
             `Memory Statistics:`,
-            `• Total memories: ${stats.totalCount}`,
-            `• Available scopes: ${scopeManagerStats.totalScopes}`,
-            `• Retrieval mode: ${retrievalConfig.mode}`,
-            `• FTS support: ${context.store.hasFtsSupport ? "Yes" : "No"}`,
+            `\u2022 Total memories: ${stats.totalCount}`,
+            `\u2022 Available scopes: ${scopeManagerStats.totalScopes}`,
+            `\u2022 Retrieval mode: ${retrievalConfig.mode}`,
+            `\u2022 FTS support: ${context.store.hasFtsSupport ? "Yes" : "No"}`,
             ``,
             `Memories by scope:`,
             ...Object.entries(stats.scopeCounts).map(
-              ([s, count]) => `  • ${s}: ${count}`,
+              ([s, count]) => `  \u2022 ${s}: ${count}`,
             ),
             ``,
             `Memories by category:`,
             ...Object.entries(stats.categoryCounts).map(
-              ([c, count]) => `  • ${c}: ${count}`,
+              ([c, count]) => `  \u2022 ${c}: ${count}`,
             ),
-          ].join("\n");
+          ];
+
+          // Include retrieval quality metrics if stats collector is available
+          const statsCollector = context.retriever.getStatsCollector();
+          let retrievalStats = undefined;
+          if (statsCollector && statsCollector.count > 0) {
+            retrievalStats = statsCollector.getStats();
+            textLines.push(
+              ``,
+              `Retrieval Quality (last ${retrievalStats.totalQueries} queries):`,
+              `  \u2022 Zero-result queries: ${retrievalStats.zeroResultQueries}`,
+              `  \u2022 Avg latency: ${retrievalStats.avgLatencyMs}ms`,
+              `  \u2022 P95 latency: ${retrievalStats.p95LatencyMs}ms`,
+              `  \u2022 Avg result count: ${retrievalStats.avgResultCount}`,
+              `  \u2022 Rerank used: ${retrievalStats.rerankUsed}`,
+              `  \u2022 Noise filtered: ${retrievalStats.noiseFiltered}`,
+            );
+            if (retrievalStats.topDropStages.length > 0) {
+              textLines.push(`  Top drop stages:`);
+              for (const ds of retrievalStats.topDropStages) {
+                textLines.push(`    \u2022 ${ds.name}: ${ds.totalDropped} dropped`);
+              }
+            }
+          }
+
+          const text = textLines.join("\n");
 
           return {
             content: [{ type: "text", text }],
@@ -1356,6 +1382,7 @@ export function registerMemoryStatsTool(
                 rerankApiKey: retrievalConfig.rerankApiKey ? "***" : undefined,
               },
               hasFtsSupport: context.store.hasFtsSupport,
+              retrievalStats,
             },
           };
         } catch (error) {
@@ -1373,6 +1400,115 @@ export function registerMemoryStatsTool(
     };
     },
     { name: "memory_stats" },
+  );
+}
+
+export function registerMemoryDebugTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      return {
+        name: "memory_debug",
+        label: "Memory Debug",
+        description:
+          "Debug memory retrieval: search with full pipeline trace showing per-stage drop info, score ranges, and timing.",
+        parameters: Type.Object({
+          query: Type.String({ description: "Search query to debug" }),
+          limit: Type.Optional(
+            Type.Number({ description: "Max results to return (default: 5, max: 20)" }),
+          ),
+          scope: Type.Optional(
+            Type.String({ description: "Specific memory scope to search in (optional)" }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          const { query, limit = 5, scope } = params as {
+            query: string; limit?: number; scope?: string;
+          };
+          try {
+            const safeLimit = clampInt(limit, 1, 20);
+            const scopeFilter = resolveScopeFilter(context.scopeManager, agentId, scope);
+            if (scope && !context.scopeManager.isAccessible(scope, agentId)) {
+              return {
+                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
+                details: { error: "scope_access_denied", requestedScope: scope },
+              };
+            }
+
+            const { results, trace } = await context.retriever.retrieveWithTrace({
+              query, limit: safeLimit, scopeFilter, source: "manual",
+            });
+
+            const traceLines: string[] = [
+              `Retrieval Debug Trace:`,
+              `  Mode: ${trace.mode}`,
+              `  Total: ${trace.totalMs}ms`,
+              `  Stages:`,
+            ];
+            for (const stage of trace.stages) {
+              const dropped = Math.max(0, stage.inputCount - stage.outputCount);
+              const scoreStr = stage.scoreRange
+                ? ` scores=[${stage.scoreRange[0].toFixed(3)}, ${stage.scoreRange[1].toFixed(3)}]`
+                : "";
+              // For search stages (input=0), show "found N" instead of "dropped -N"
+              const dropStr = stage.inputCount === 0
+                ? `found ${stage.outputCount}`
+                : `${stage.inputCount} -> ${stage.outputCount} (-${dropped})`;
+              traceLines.push(
+                `    ${stage.name}: ${dropStr} ${stage.durationMs}ms${scoreStr}`,
+              );
+              if (stage.droppedIds.length > 0 && stage.droppedIds.length <= 3) {
+                traceLines.push(`      dropped: ${stage.droppedIds.join(", ")}`);
+              } else if (stage.droppedIds.length > 3) {
+                traceLines.push(
+                  `      dropped: ${stage.droppedIds.slice(0, 3).join(", ")} (+${stage.droppedIds.length - 3} more)`,
+                );
+              }
+            }
+
+            if (results.length === 0) {
+              traceLines.push(``, `No results survived the pipeline.`);
+              return {
+                content: [{ type: "text", text: traceLines.join("\n") }],
+                details: { count: 0, query, trace },
+              };
+            }
+
+            const resultLines = results.map((r, i) => {
+              const sources: string[] = [];
+              if (r.sources.vector) sources.push("vector");
+              if (r.sources.bm25) sources.push("BM25");
+              if (r.sources.reranked) sources.push("reranked");
+              const categoryTag = getDisplayCategoryTag(r.entry);
+              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text.slice(0, 120)}${r.entry.text.length > 120 ? "..." : ""} (${(r.score * 100).toFixed(1)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
+            });
+
+            const text = [...traceLines, ``, `Results (${results.length}):`, ...resultLines].join("\n");
+            return {
+              content: [{ type: "text", text }],
+              details: {
+                count: results.length,
+                memories: sanitizeMemoryForSerialization(results),
+                query,
+                trace,
+              },
+            };
+          } catch (error) {
+            return {
+              content: [{
+                type: "text",
+                text: `Memory debug failed: ${error instanceof Error ? error.message : String(error)}`,
+              }],
+              details: { error: "debug_failed", message: String(error) },
+            };
+          }
+        },
+      };
+    },
+    { name: "memory_debug" },
   );
 }
 
@@ -1921,6 +2057,7 @@ export function registerAllMemoryTools(
   // Management tools (optional)
   if (options.enableManagementTools) {
     registerMemoryStatsTool(api, context);
+    registerMemoryDebugTool(api, context);
     registerMemoryListTool(api, context);
     registerMemoryPromoteTool(api, context);
     registerMemoryArchiveTool(api, context);
