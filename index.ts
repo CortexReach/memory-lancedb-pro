@@ -47,6 +47,7 @@ import {
   filterByMaxAge,
   keepMostRecentPerNormalizedKey,
 } from "./src/recall-engine.js";
+import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { rankDynamicReflectionRecallFromEntries } from "./src/reflection-recall.js";
 
 // ============================================================================
@@ -68,6 +69,7 @@ interface PluginConfig {
   dbPath?: string;
   autoCapture?: boolean;
   autoRecall?: boolean;
+  recallMode?: "full" | "summary" | "off";
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
   autoRecallTopK?: number;
@@ -1661,7 +1663,11 @@ const memoryLanceDBProPlugin = {
 
     // Auto-Recall: inject relevant memories before agent starts.
     // Default is OFF to prevent the model from accidentally echoing injected context.
-    if (config.autoRecall === true) {
+    // recallMode takes precedence: "full" = inject memories, "summary" = count hint only, "off" = skip.
+    const resolvedRecallMode: "full" | "summary" | "off" = config.recallMode
+      ? config.recallMode
+      : (config.autoRecall ? "full" : "off");
+    if (resolvedRecallMode !== "off") {
       api.on("before_agent_start", async (event, ctx) => {
         try {
           const agentId = ctx?.agentId || "main";
@@ -1669,6 +1675,31 @@ const memoryLanceDBProPlugin = {
           const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
           const topK = config.autoRecallTopK ?? DEFAULT_AUTO_RECALL_TOP_K;
           const fetchLimit = Math.min(20, Math.max(topK * 4, topK, 8));
+
+          // Summary mode: lightweight count hint without injecting full memory content.
+          // The agent can call memory_recall manually if it needs details.
+          if (resolvedRecallMode === "summary") {
+            if (!event.prompt || shouldSkipRetrieval(event.prompt, config.autoRecallMinLength)) return;
+            const retrieved = await retriever.retrieve({
+              query: event.prompt,
+              limit: fetchLimit,
+              scopeFilter: accessibleScopes,
+              source: "auto-recall",
+            });
+            const count = postProcessAutoRecallResults(retrieved).length;
+            if (count === 0) return;
+            api.logger.info?.(
+              `memory-lancedb-pro: summary-mode recall found ${count} matching memories for agent ${agentId}`,
+            );
+            return {
+              prependContext:
+                `<memory-hint>\n` +
+                `${count} relevant memories found. Use memory_recall to retrieve details on demand.\n` +
+                `</memory-hint>`,
+            };
+          }
+
+          // Full mode: inject matching memories into agent context.
           return await orchestrateDynamicRecall({
             channelName: "auto-recall",
             prompt: event.prompt,
@@ -2775,7 +2806,12 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
     autoCapture: cfg.autoCapture !== false,
     // Default OFF: only enable when explicitly set to true.
-    autoRecall: cfg.autoRecall === true,
+    // recallMode takes precedence over boolean autoRecall when both are set.
+    autoRecall: cfg.recallMode
+      ? cfg.recallMode !== "off"
+      : cfg.autoRecall === true,
+    recallMode: (["full", "summary", "off"].includes(cfg.recallMode) ? cfg.recallMode : undefined) as
+      | "full" | "summary" | "off" | undefined,
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
     autoRecallTopK: parsePositiveInt(cfg.autoRecallTopK) ?? DEFAULT_AUTO_RECALL_TOP_K,
