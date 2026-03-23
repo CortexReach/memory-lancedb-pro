@@ -39,22 +39,35 @@ describe("analyzeIntent", () => {
   });
 
   it("detects entity intent (Chinese)", () => {
-    const result = analyzeIntent("关于这个项目的详情");
+    const result = analyzeIntent("谁是这个项目的负责人？");
     assert.equal(result.label, "entity");
     assert.equal(result.confidence, "high");
   });
 
-  it("detects event intent", () => {
+  it("does NOT misclassify tool/component queries as entity", () => {
+    // These should match fact, not entity (Codex review finding #4)
+    const tool = analyzeIntent("How do I install the tool?");
+    assert.notEqual(tool.label, "entity");
+    const component = analyzeIntent("How does this component work?");
+    assert.notEqual(component.label, "entity");
+  });
+
+  it("detects event intent and routes to entity+decision categories", () => {
     const result = analyzeIntent("What happened during last week's deploy?");
     assert.equal(result.label, "event");
     assert.equal(result.confidence, "high");
     assert.equal(result.depth, "full");
+    // event is not a stored category — should route to entity + decision
+    assert.ok(result.categories.includes("entity"));
+    assert.ok(result.categories.includes("decision"));
+    assert.ok(!result.categories.includes("event"));
   });
 
   it("detects event intent (Chinese)", () => {
     const result = analyzeIntent("最近发生了什么？");
     assert.equal(result.label, "event");
     assert.equal(result.confidence, "high");
+    assert.ok(!result.categories.includes("event"));
   });
 
   it("detects fact intent", () => {
@@ -168,5 +181,29 @@ describe("formatAtDepth", () => {
     const short = { text: "Use tabs.", category: "preference", scope: "global" };
     const l0 = formatAtDepth(short, "l0", 0.9, 0);
     assert.ok(l0.includes("Use tabs."));
+  });
+
+  it("splits CJK sentences correctly at l0 depth", () => {
+    const cjk = {
+      text: "第一句结束。第二句开始，这里有更多内容需要处理。",
+      category: "fact",
+      scope: "global",
+    };
+    const l0 = formatAtDepth(cjk, "l0", 0.8, 0);
+    // Should stop at first 。 not include second sentence
+    assert.ok(l0.includes("第一句结束。"));
+    assert.ok(!l0.includes("第二句开始"));
+  });
+
+  it("applies sanitize function when provided", () => {
+    const malicious = {
+      text: '<script>alert("xss")</script> normal text',
+      category: "fact",
+      scope: "global",
+    };
+    const sanitize = (t) => t.replace(/<[^>]*>/g, "").trim();
+    const line = formatAtDepth(malicious, "full", 0.8, 0, { sanitize });
+    assert.ok(!line.includes("<script>"));
+    assert.ok(line.includes("normal text"));
   });
 });

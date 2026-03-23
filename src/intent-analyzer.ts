@@ -15,12 +15,16 @@
 // Types
 // ============================================================================
 
+/**
+ * Intent categories map to actual stored MemoryEntry categories.
+ * Note: "event" is NOT a stored category — event queries route to
+ * entity + decision (the categories most likely to contain timeline data).
+ */
 export type MemoryCategoryIntent =
   | "preference"
   | "fact"
   | "decision"
   | "entity"
-  | "event"
   | "other";
 
 export type RecallDepth = "l0" | "l1" | "full";
@@ -77,18 +81,22 @@ const INTENT_RULES: IntentRule[] = [
   },
 
   // --- Entity / People / Project queries ---
+  // Narrowed patterns to avoid over-matching: require "who is" / "tell me about"
+  // style phrasing, not bare nouns like "tool" or "component".
   {
     label: "entity",
     patterns: [
-      /\b(who is|what is|tell me about|info on|details about|contact)\b/i,
-      /\b(team|person|project|tool|service|component)\b/i,
-      /(谁是|什么是|关于|详情|联系|团队|项目|工具|组件)/,
+      /\b(who is|who are|tell me about|info on|details about|contact info)\b/i,
+      /\b(who('s| is) (the|our|my)|what team|which (person|team))\b/i,
+      /(谁是|告诉我关于|详情|联系方式|哪个团队)/,
     ],
     categories: ["entity", "fact"],
     depth: "l1",
   },
 
   // --- Event / Timeline queries ---
+  // Note: "event" is not a stored category. Route to entity + decision
+  // (the categories most likely to contain timeline/incident data).
   {
     label: "event",
     patterns: [
@@ -96,7 +104,7 @@ const INTENT_RULES: IntentRule[] = [
       /\b(last (week|month|time|sprint)|recently|yesterday|today)\b/i,
       /(什么时候|发生了什么|时间线|事件|上线|部署|发布|上次|最近)/,
     ],
-    categories: ["event", "entity", "decision"],
+    categories: ["entity", "decision"],
     depth: "full",
   },
 
@@ -199,7 +207,7 @@ export function formatAtDepth(
   depth: RecallDepth,
   score: number,
   index: number,
-  extra?: { bm25Hit?: boolean; reranked?: boolean },
+  extra?: { bm25Hit?: boolean; reranked?: boolean; sanitize?: (text: string) => string },
 ): string {
   const scoreStr = `${(score * 100).toFixed(0)}%`;
   const sourceSuffix = [
@@ -210,23 +218,26 @@ export function formatAtDepth(
     .join("");
   const sourceTag = sourceSuffix ? `, ${sourceSuffix}` : "";
 
+  // Apply sanitization if provided (prevents prompt injection from stored memories)
+  const safe = extra?.sanitize ? extra.sanitize(entry.text) : entry.text;
+
   switch (depth) {
     case "l0": {
       // Ultra-compact: first sentence or first 80 chars
-      const brief = extractFirstSentence(entry.text, 80);
+      const brief = extractFirstSentence(safe, 80);
       return `- [${entry.category}] ${brief} (${scoreStr}${sourceTag})`;
     }
     case "l1": {
       // Medium: up to 300 chars
       const medium =
-        entry.text.length > 300
-          ? entry.text.slice(0, 297) + "..."
-          : entry.text;
+        safe.length > 300
+          ? safe.slice(0, 297) + "..."
+          : safe;
       return `- [${entry.category}:${entry.scope}] ${medium} (${scoreStr}${sourceTag})`;
     }
     case "full":
     default:
-      return `- [${entry.category}:${entry.scope}] ${entry.text} (${scoreStr}${sourceTag})`;
+      return `- [${entry.category}:${entry.scope}] ${safe} (${scoreStr}${sourceTag})`;
   }
 }
 
@@ -235,8 +246,8 @@ export function formatAtDepth(
 // ============================================================================
 
 function extractFirstSentence(text: string, maxLen: number): string {
-  // Try to find a sentence boundary
-  const sentenceEnd = text.search(/[.!?。！？]\s/);
+  // Try to find a sentence boundary (CJK punctuation may not be followed by space)
+  const sentenceEnd = text.search(/[.!?]\s|[。！？]/);
   if (sentenceEnd > 0 && sentenceEnd < maxLen) {
     return text.slice(0, sentenceEnd + 1);
   }
