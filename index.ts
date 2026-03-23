@@ -64,6 +64,19 @@ import {
   type AdmissionControlConfig,
   type AdmissionRejectionAuditEntry,
 } from "./src/admission-control.js";
+import {
+  writeRedoMarker,
+  deleteRedoMarker,
+  scanRedoMarkers,
+  createRedoMarker,
+  isStale,
+} from "./src/redo-log.js";
+import { summarizeToolOutcomes } from "./src/tool-outcomes.js";
+import { TopicIndex } from "./src/topic-index.js";
+import {
+  HierarchicalRetriever,
+  DEFAULT_HIERARCHICAL_CONFIG,
+} from "./src/hierarchical-retriever.js";
 
 // ============================================================================
 // Configuration & Types
@@ -183,6 +196,16 @@ interface PluginConfig {
   mdMirror?: { enabled?: boolean; dir?: string };
   workspaceBoundary?: WorkspaceBoundaryConfig;
   admissionControl?: AdmissionControlConfig;
+  crashRecovery?: {
+    enabled?: boolean;
+    maxAgeHours?: number;
+  };
+  retrievalStrategy?: {
+    strategy?: "flat" | "hierarchical";
+    hierarchical?: {
+      alpha?: number;
+    };
+  };
 }
 
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
@@ -1799,6 +1822,87 @@ const memoryLanceDBProPlugin = {
       }
     }
 
+    // ========================================================================
+    // Crash Recovery — scan for orphaned redo markers (Feature 4)
+    // ========================================================================
+    const crashRecoveryEnabled = config.crashRecovery?.enabled !== false;
+    const crashRecoveryMaxAgeMs = (config.crashRecovery?.maxAgeHours ?? 24) * 3600_000;
+
+    if (crashRecoveryEnabled && smartExtractor) {
+      (async () => {
+        try {
+          const markers = await scanRedoMarkers(resolvedDbPath);
+          if (markers.length === 0) return;
+          api.logger.info(
+            `memory-lancedb-pro: crash recovery found ${markers.length} orphaned redo marker(s)`,
+          );
+          for (const marker of markers) {
+            if (isStale(marker, crashRecoveryMaxAgeMs)) {
+              api.logger.warn(
+                `memory-lancedb-pro: crash recovery deleting stale marker taskId=${marker.taskId} (age=${Math.round((Date.now() - marker.createdAt) / 3600_000)}h)`,
+              );
+              await deleteRedoMarker(resolvedDbPath, marker.taskId);
+              continue;
+            }
+            api.logger.info(
+              `memory-lancedb-pro: crash recovery re-running extraction for taskId=${marker.taskId} sessionKey=${marker.sessionKey}`,
+            );
+            try {
+              await smartExtractor!.extractAndPersist(
+                marker.conversationText,
+                marker.sessionKey,
+                {
+                  scope: marker.scope,
+                  scopeFilter: marker.scopeFilter,
+                  agentId: marker.agentId,
+                },
+              );
+              await deleteRedoMarker(resolvedDbPath, marker.taskId);
+              api.logger.info(
+                `memory-lancedb-pro: crash recovery completed taskId=${marker.taskId}`,
+              );
+            } catch (err) {
+              api.logger.warn(
+                `memory-lancedb-pro: crash recovery failed for taskId=${marker.taskId}: ${String(err)}`,
+              );
+            }
+          }
+        } catch (err) {
+          api.logger.debug(
+            `memory-lancedb-pro: crash recovery scan failed: ${String(err)}`,
+          );
+        }
+      })();
+    }
+
+    // ========================================================================
+    // Topic Index — Hierarchical Retrieval (Feature 6)
+    // ========================================================================
+    const topicIndex = new TopicIndex();
+    const retrievalStrategy = config.retrievalStrategy?.strategy ?? "flat";
+    const hierarchicalAlpha = config.retrievalStrategy?.hierarchical?.alpha ?? DEFAULT_HIERARCHICAL_CONFIG.alpha;
+
+    let hierarchicalRetriever: HierarchicalRetriever | null = null;
+    if (retrievalStrategy === "hierarchical") {
+      hierarchicalRetriever = new HierarchicalRetriever(
+        retriever,
+        topicIndex,
+        embedder,
+        { alpha: hierarchicalAlpha, topClusters: 3 },
+      );
+      // Build topic index asynchronously (non-blocking)
+      topicIndex.build(store, embedder).then(() => {
+        const stats = topicIndex.getStats();
+        api.logger.info(
+          `memory-lancedb-pro: topic index built — clusters=${stats.clusterCount}, largest=${stats.largestCluster}, uncategorized=${stats.uncategorizedCount}`,
+        );
+      }).catch((err) => {
+        api.logger.debug(
+          `memory-lancedb-pro: topic index build failed: ${String(err)}`,
+        );
+      });
+    }
+
     async function sleep(ms: number): Promise<void> {
       await new Promise(resolve => setTimeout(resolve, ms));
     }
@@ -2558,11 +2662,46 @@ const memoryLanceDBProPlugin = {
               api.logger.debug(
                 `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (${cleanTexts.length} clean texts >= ${minMessages})`,
               );
-              const conversationText = cleanTexts.join("\n");
+              // Feature 5: Enrich conversation with tool outcome summary
+              let conversationText = cleanTexts.join("\n");
+              const toolSummary = summarizeToolOutcomes(cleanTexts);
+              if (toolSummary) {
+                conversationText = conversationText + "\n\n" + toolSummary;
+              }
+
+              // Feature 4: Write redo marker before extraction
+              let redoTaskId: string | undefined;
+              if (crashRecoveryEnabled) {
+                try {
+                  const marker = createRedoMarker({
+                    sessionKey,
+                    conversationText,
+                    scope: defaultScope,
+                    scopeFilter: accessibleScopes,
+                    agentId,
+                  });
+                  redoTaskId = marker.taskId;
+                  await writeRedoMarker(resolvedDbPath, marker);
+                } catch (redoErr) {
+                  api.logger.debug(
+                    `memory-lancedb-pro: redo marker write failed: ${String(redoErr)}`,
+                  );
+                }
+              }
+
               const stats = await smartExtractor.extractAndPersist(
                 conversationText, sessionKey,
-                { scope: defaultScope, scopeFilter: accessibleScopes },
+                { scope: defaultScope, scopeFilter: accessibleScopes, agentId },
               );
+
+              // Feature 4: Delete redo marker on success
+              if (redoTaskId) {
+                deleteRedoMarker(resolvedDbPath, redoTaskId).catch((err) => {
+                  api.logger.debug(
+                    `memory-lancedb-pro: redo marker cleanup failed: ${String(err)}`,
+                  );
+                });
+              }
               if (stats.created > 0 || stats.merged > 0) {
                 api.logger.info(
                   `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
@@ -3714,6 +3853,28 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         }
         : undefined,
     admissionControl: normalizeAdmissionControlConfig(cfg.admissionControl),
+    crashRecovery: (() => {
+      const raw = typeof cfg.crashRecovery === "object" && cfg.crashRecovery !== null
+        ? cfg.crashRecovery as Record<string, unknown>
+        : undefined;
+      return {
+        enabled: raw?.enabled !== false,
+        maxAgeHours: parsePositiveInt(raw?.maxAgeHours) ?? 24,
+      };
+    })(),
+    retrievalStrategy: (() => {
+      const raw = typeof cfg.retrievalStrategy === "object" && cfg.retrievalStrategy !== null
+        ? cfg.retrievalStrategy as Record<string, unknown>
+        : undefined;
+      const strategy = raw?.strategy === "hierarchical" ? "hierarchical" as const : "flat" as const;
+      const hierarchicalRaw = typeof raw?.hierarchical === "object" && raw.hierarchical !== null
+        ? raw.hierarchical as Record<string, unknown>
+        : undefined;
+      const alpha = typeof hierarchicalRaw?.alpha === "number" && Number.isFinite(hierarchicalRaw.alpha)
+        ? Math.max(0, Math.min(1, hierarchicalRaw.alpha as number))
+        : undefined;
+      return { strategy, hierarchical: alpha !== undefined ? { alpha } : undefined };
+    })(),
   };
 }
 

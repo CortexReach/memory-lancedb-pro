@@ -47,6 +47,7 @@ export type CandidateMemory = {
   abstract: string; // L0: one-sentence index
   overview: string; // L1: structured markdown summary
   content: string; // L2: full narrative
+  topic?: string;  // Optional topic cluster label for hierarchical retrieval
 };
 
 /** Dedup decision from LLM. */

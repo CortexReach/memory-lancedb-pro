@@ -115,6 +115,7 @@ Return JSON:
   "memories": [
     {
       "category": "profile|preferences|entities|events|cases|patterns",
+      "topic": "Short topic label (e.g. 'coding-style', 'project-alpha', 'devops')",
       "abstract": "One-line index",
       "overview": "Structured Markdown summary",
       "content": "Full narrative"
@@ -127,7 +128,8 @@ Notes:
 - Only extract truly valuable personalized information
 - If nothing worth recording, return {"memories": []}
 - Maximum 5 memories per extraction
-- Preferences should be aggregated by topic`;
+- Preferences should be aggregated by topic
+- The "topic" field should be a short, lowercase, hyphen-separated label grouping related memories (e.g. "python-style", "project-setup", "debugging")`;
 }
 
 export function buildDedupPrompt(

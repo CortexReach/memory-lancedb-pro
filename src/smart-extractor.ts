@@ -150,6 +150,8 @@ export interface ExtractPersistOptions {
    * - pass a non-empty array to restrict reads to those scopes
    */
   scopeFilter?: string[];
+  /** Agent ID for routing cases/patterns to agent-specific scope. */
+  agentId?: string;
 }
 
 export class SmartExtractor {
@@ -221,6 +223,7 @@ export class SmartExtractor {
     );
 
     // Step 2: Process each candidate through dedup pipeline
+    const agentId = options.agentId;
     for (const candidate of candidates.slice(0, MAX_MEMORIES_PER_EXTRACTION)) {
       if (
         isUserMdExclusiveMemory(
@@ -240,13 +243,25 @@ export class SmartExtractor {
         continue;
       }
 
+      // Feature 5: Route cases/patterns to agent-specific scope
+      let effectiveScope = targetScope;
+      if (
+        agentId &&
+        (candidate.category === "cases" || candidate.category === "patterns")
+      ) {
+        effectiveScope = `agent:${agentId}`;
+        this.debugLog(
+          `memory-pro: smart-extractor: routing [${candidate.category}] to agent scope agent:${agentId}`,
+        );
+      }
+
       try {
         await this.processCandidate(
           candidate,
           conversationText,
           sessionKey,
           stats,
-          targetScope,
+          effectiveScope,
           scopeFilter,
         );
       } catch (err) {
@@ -351,6 +366,7 @@ export class SmartExtractor {
         abstract: string;
         overview: string;
         content: string;
+        topic?: string;
       }>;
     }>(prompt, "extract-candidates");
 
@@ -406,7 +422,8 @@ export class SmartExtractor {
         continue;
       }
 
-      candidates.push({ category, abstract, overview, content });
+      const topic = typeof raw.topic === "string" ? raw.topic.trim().toLowerCase() : undefined;
+      candidates.push({ category, abstract, overview, content, topic: topic || undefined });
     }
 
     this.debugLog(
@@ -1156,28 +1173,33 @@ export class SmartExtractor {
     // Map 6-category to existing store categories for backward compatibility
     const storeCategory = this.mapToStoreCategory(candidate.category);
 
+    const extraFields: Record<string, unknown> = {
+      l0_abstract: candidate.abstract,
+      l1_overview: candidate.overview,
+      l2_content: candidate.content,
+      memory_category: candidate.category,
+      tier: "working",
+      access_count: 0,
+      confidence: 0.7,
+      source_session: sessionKey,
+      source: "auto-capture",
+      state: "pending",
+      memory_layer: "working",
+      injected_count: 0,
+      bad_recall_count: 0,
+      suppressed_until_turn: 0,
+    };
+    if (candidate.topic) {
+      extraFields.topic = candidate.topic;
+    }
+
     const metadata = stringifySmartMetadata(
       buildSmartMetadata(
         {
           text: candidate.abstract,
           category: this.mapToStoreCategory(candidate.category),
         },
-        {
-          l0_abstract: candidate.abstract,
-          l1_overview: candidate.overview,
-          l2_content: candidate.content,
-          memory_category: candidate.category,
-          tier: "working",
-          access_count: 0,
-          confidence: 0.7,
-          source_session: sessionKey,
-          source: "auto-capture",
-          state: "pending",
-          memory_layer: "working",
-          injected_count: 0,
-          bad_recall_count: 0,
-          suppressed_until_turn: 0,
-        },
+        extraFields,
       ),
     );
 

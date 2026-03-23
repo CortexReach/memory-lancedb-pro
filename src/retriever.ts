@@ -371,6 +371,11 @@ export class MemoryRetriever {
     this.accessTracker = tracker;
   }
 
+  /** Expose the embedder for external use (e.g. hierarchical retrieval). */
+  getEmbedder(): Embedder {
+    return this.embedder;
+  }
+
   private filterActiveResults<T extends MemorySearchResult>(results: T[]): T[] {
     return results.filter((result) =>
       isMemoryActiveAt(parseSmartMetadata(result.entry.metadata, result.entry)),
