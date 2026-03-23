@@ -624,19 +624,20 @@ export class MemoryRetriever {
     const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
     const queryVector = await this.embedder.embedQuery(query);
 
-    // Run vector and BM25 searches in parallel
-    trace?.startStage("vector_search", []);
+    // Run vector and BM25 searches in parallel.
+    // Trace as a single "parallel_search" stage since both run concurrently —
+    // splitting into separate sequential stages would misrepresent timing.
+    trace?.startStage("parallel_search", []);
     const [vectorResults, bm25Results] = await Promise.all([
       this.runVectorSearch(queryVector, candidatePoolSize, scopeFilter, category),
       this.runBM25Search(query, candidatePoolSize, scopeFilter, category),
     ]);
     if (trace) {
-      trace.endStage(vectorResults.map((r) => r.entry.id), vectorResults.map((r) => r.score));
-    }
-
-    if (trace) {
-      trace.startStage("bm25_search", []);
-      trace.endStage(bm25Results.map((r) => r.entry.id), bm25Results.map((r) => r.score));
+      const allSearchIds = [
+        ...new Set([...vectorResults.map((r) => r.entry.id), ...bm25Results.map((r) => r.entry.id)]),
+      ];
+      const allScores = [...vectorResults.map((r) => r.score), ...bm25Results.map((r) => r.score)];
+      trace.endStage(allSearchIds, allScores);
     }
 
     // Fuse results using RRF
@@ -652,12 +653,15 @@ export class MemoryRetriever {
     const filtered = fusedResults.filter((r) => r.score >= this.config.minScore);
     trace?.endStage(filtered.map((r) => r.entry.id), filtered.map((r) => r.score));
 
-    // Rerank if enabled
-    trace?.startStage("rerank", filtered.map((r) => r.entry.id));
-    const reranked = this.config.rerank !== "none"
-      ? await this.rerankResults(query, queryVector, filtered.slice(0, limit * 2))
-      : filtered;
-    trace?.endStage(reranked.map((r) => r.entry.id), reranked.map((r) => r.score));
+    // Rerank if enabled — only emit trace stage when rerank actually runs
+    let reranked: RetrievalResult[];
+    if (this.config.rerank !== "none") {
+      trace?.startStage("rerank", filtered.map((r) => r.entry.id));
+      reranked = await this.rerankResults(query, queryVector, filtered.slice(0, limit * 2));
+      trace?.endStage(reranked.map((r) => r.entry.id), reranked.map((r) => r.score));
+    } else {
+      reranked = filtered;
+    }
 
     let temporallyRanked: RetrievalResult[];
     if (this.decayEngine) {

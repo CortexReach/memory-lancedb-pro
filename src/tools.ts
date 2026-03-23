@@ -1449,12 +1449,16 @@ export function registerMemoryDebugTool(
               `  Stages:`,
             ];
             for (const stage of trace.stages) {
-              const dropped = stage.inputCount - stage.outputCount;
+              const dropped = Math.max(0, stage.inputCount - stage.outputCount);
               const scoreStr = stage.scoreRange
                 ? ` scores=[${stage.scoreRange[0].toFixed(3)}, ${stage.scoreRange[1].toFixed(3)}]`
                 : "";
+              // For search stages (input=0), show "found N" instead of "dropped -N"
+              const dropStr = stage.inputCount === 0
+                ? `found ${stage.outputCount}`
+                : `${stage.inputCount} -> ${stage.outputCount} (-${dropped})`;
               traceLines.push(
-                `    ${stage.name}: ${stage.inputCount} -> ${stage.outputCount} (-${dropped}) ${stage.durationMs}ms${scoreStr}`,
+                `    ${stage.name}: ${dropStr} ${stage.durationMs}ms${scoreStr}`,
               );
               if (stage.droppedIds.length > 0 && stage.droppedIds.length <= 3) {
                 traceLines.push(`      dropped: ${stage.droppedIds.join(", ")}`);
