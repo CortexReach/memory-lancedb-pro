@@ -83,6 +83,16 @@ interface PluginConfig {
   dbPath?: string;
   autoCapture?: boolean;
   autoRecall?: boolean;
+  /**
+   * Control recall intensity injected into agent context.
+   * - "full": inject all matching memories (existing autoRecall behavior)
+   * - "summary": inject only a one-line count hint, no memory content
+   * - "off": disable auto-recall entirely
+   *
+   * When set, this takes precedence over the boolean `autoRecall` field.
+   * If neither is set, auto-recall is off by default.
+   */
+  recallMode?: "full" | "summary" | "off";
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
   autoRecallMaxItems?: number;
@@ -2136,7 +2146,13 @@ const memoryLanceDBProPlugin = {
 
     // Auto-recall: inject relevant memories before agent starts
     // Default is OFF to prevent the model from accidentally echoing injected context.
-    if (config.autoRecall === true) {
+    // recallMode: "full" = inject memories (legacy autoRecall behavior)
+    //             "summary" = inject lightweight count hint only
+    //             "off" / unset = skip entirely
+    const resolvedRecallMode = config.recallMode
+      ? config.recallMode
+      : (config.autoRecall ? "full" : "off");
+    if (resolvedRecallMode !== "off") {
       const AUTO_RECALL_TIMEOUT_MS = 3_000; // bounded timeout to prevent agent startup stall
       api.on("before_agent_start", async (event, ctx) => {
         if (
@@ -2188,6 +2204,21 @@ const memoryLanceDBProPlugin = {
 
           if (results.length === 0) {
             return;
+          }
+
+          // Summary mode: inject only a lightweight count hint, no memory content.
+          // This keeps the agent aware that memories exist without consuming
+          // context budget — the agent can call memory_recall manually if needed.
+          if (resolvedRecallMode === "summary") {
+            api.logger.info?.(
+              `memory-lancedb-pro: summary-mode recall found ${results.length} matching memories for agent ${agentId}`,
+            );
+            return {
+              prependContext:
+                `<memory-hint>\n` +
+                `${results.length} relevant memories found. Use memory_recall to retrieve details on demand.\n` +
+                `</memory-hint>`,
+            };
           }
 
           // Filter out redundant memories based on session history
@@ -3604,7 +3635,12 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
     autoCapture: cfg.autoCapture !== false,
     // Default OFF: only enable when explicitly set to true.
-    autoRecall: cfg.autoRecall === true,
+    // recallMode takes precedence over boolean autoRecall when both are set.
+    autoRecall: cfg.recallMode
+      ? cfg.recallMode !== "off"
+      : cfg.autoRecall === true,
+    recallMode: (["full", "summary", "off"].includes(cfg.recallMode) ? cfg.recallMode : undefined) as
+      | "full" | "summary" | "off" | undefined,
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated) ?? 8,
     autoRecallMaxItems: parsePositiveInt(cfg.autoRecallMaxItems) ?? 3,
