@@ -8,6 +8,7 @@ import type { Embedder } from "./embedder.js";
 import {
   AccessTracker,
   computeEffectiveHalfLife,
+  computeHotnessScore,
   parseAccessMetadata,
 } from "./access-tracker.js";
 import { filterNoise } from "./noise-filter.js";
@@ -89,6 +90,10 @@ export interface RetrievalConfig {
    *  Queries containing these prefixes (e.g. "proj:AIF") will use BM25-only + mustContain
    *  to avoid semantic false positives from vector search. */
   tagPrefixes: string[];
+  /** Hotness blend weight. Blends access-frequency hotness into final score.
+   *  Formula: final = score * (1-alpha) + hotness * alpha.
+   *  0 = disabled (default), 0.15 = recommended. */
+  hotnessWeight: number;
 }
 
 export interface RetrievalContext {
@@ -131,6 +136,7 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   reinforcementFactor: 0.5,
   maxHalfLifeMultiplier: 3,
   tagPrefixes: ["proj", "env", "team", "scope"],
+  hotnessWeight: 0,
 };
 
 // ============================================================================
@@ -462,9 +468,10 @@ export class MemoryRetriever {
     const lifecycleRanked = this.decayEngine
       ? this.applyDecayBoost(hardFiltered)
       : this.applyTimeDecay(hardFiltered);
+    const hotnessBlended = this.applyHotnessBlend(lifecycleRanked);
     const denoised = this.config.filterNoise
-      ? filterNoise(lifecycleRanked, r => r.entry.text)
-      : lifecycleRanked;
+      ? filterNoise(hotnessBlended, r => r.entry.text)
+      : hotnessBlended;
 
     // MMR deduplication: avoid top-k filled with near-identical memories
     const deduplicated = this.applyMMRDiversity(denoised);
@@ -1008,6 +1015,34 @@ export class MemoryRetriever {
     });
 
     return decayed.sort((a, b) => b.score - a.score);
+  }
+
+  /**
+   * Blend access-frequency hotness into retrieval scores.
+   *
+   * Formula: final = score * (1 - alpha) + hotness * alpha
+   * where hotness = sigmoid(log1p(accessCount)) * exp(-decayRate * ageDays)
+   *
+   * Inspired by OpenViking memory_lifecycle.py hotness scoring.
+   * No-op when hotnessWeight is 0 or AccessTracker is absent.
+   */
+  private applyHotnessBlend(results: RetrievalResult[]): RetrievalResult[] {
+    const alpha = this.config.hotnessWeight;
+    if (!alpha || alpha <= 0 || !this.accessTracker) return results;
+
+    const blended = results.map((r) => {
+      const { accessCount, lastAccessedAt } = parseAccessMetadata(r.entry.metadata);
+      const hotness = computeHotnessScore(
+        accessCount,
+        lastAccessedAt || r.entry.timestamp,
+      );
+      return {
+        ...r,
+        score: clamp01(r.score * (1 - alpha) + hotness * alpha, 0),
+      };
+    });
+
+    return blended.sort((a, b) => b.score - a.score);
   }
 
   /**

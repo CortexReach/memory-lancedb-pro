@@ -199,6 +199,38 @@ export function computeEffectiveHalfLife(
 }
 
 // ============================================================================
+// Hotness Score
+// ============================================================================
+
+/**
+ * Compute a hotness score (0-1) for a memory entry.
+ *
+ * Combines access frequency (sigmoid of log1p) with recency of last access
+ * (exponential decay). Inspired by OpenViking memory_lifecycle.py.
+ *
+ * @param accessCount  Number of times this memory was recalled
+ * @param lastAccessMs Timestamp (ms) of last access
+ * @param decayRate    Decay rate (default 0.1 ≈ 7-day half-life)
+ * @returns 0-1 score. High = frequently + recently accessed.
+ */
+export function computeHotnessScore(
+  accessCount: number,
+  lastAccessMs: number,
+  decayRate = 0.1,
+): number {
+  if (accessCount <= 0) return 0;
+
+  // Frequency component: sigmoid of log1p(count) → 0.5..1.0
+  const freq = 1 / (1 + Math.exp(-Math.log1p(accessCount)));
+
+  // Recency component: exponential decay from last access
+  const ageDays = Math.max(0, (Date.now() - lastAccessMs) / 86_400_000);
+  const recency = Math.exp(-decayRate * ageDays);
+
+  return freq * recency;
+}
+
+// ============================================================================
 // AccessTracker Class
 // ============================================================================
 
