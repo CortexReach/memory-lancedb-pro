@@ -892,7 +892,7 @@ export function registerMemoryForgetTool(
         };
 
         try {
-          const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
+          const agentId = runtimeContext.agentId;
           // Determine accessible scopes
           let scopeFilter = resolveScopeFilter(runtimeContext.scopeManager, agentId);
           if (scope) {
@@ -1068,7 +1068,7 @@ export function registerMemoryUpdateTool(
           }
 
           // Determine accessible scopes
-          const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
+          const agentId = runtimeContext.agentId;
           const scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
 
           // Resolve memoryId: if it doesn't look like a UUID, try search
@@ -1305,7 +1305,7 @@ export function registerMemoryStatsTool(
         const { scope } = params as { scope?: string };
 
         try {
-          const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
+          const agentId = runtimeContext.agentId;
           // Determine accessible scopes
           let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
           if (scope) {
@@ -1420,7 +1420,7 @@ export function registerMemoryListTool(
         try {
           const safeLimit = clampInt(limit, 1, 50);
           const safeOffset = clampInt(offset, 0, 1000);
-          const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
+          const agentId = runtimeContext.agentId;
 
           // Determine accessible scopes
           let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
