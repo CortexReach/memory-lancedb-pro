@@ -42,8 +42,7 @@ const TOOL_CALL_INDICATORS = [
   /\btool_result\b/i,
   /\bfunction_call\b/i,
   /\b(memory_store|memory_recall|memory_forget|memory_update)\b/i,
-  /^```[\s\S]*```$/m,
-  /\$ .+/,  // shell commands
+  // Removed over-broad patterns: fenced code blocks and "$ " matched normal pasted code
 ];
 
 const CORRECTION_INDICATORS = [
@@ -200,7 +199,10 @@ export function compressTexts(
   const addIndex = (idx: number): boolean => {
     if (selectedIndices.has(idx) || idx < 0 || idx >= texts.length) return false;
     const len = texts[idx].length;
-    if (usedChars + len > maxChars && selectedIndices.size > 0) return false;
+    if (usedChars + len > maxChars) {
+      // Hard cap: even the first/last text cannot exceed budget
+      return false;
+    }
     selectedIndices.add(idx);
     usedChars += len;
     return true;
@@ -217,10 +219,17 @@ export function compressTexts(
     .filter((s) => s.index !== 0 && s.index !== texts.length - 1)
     .sort((a, b) => b.score - a.score || a.index - b.index);
 
-  // Identify paired indices (tool call at i → result at i+1)
+  // Identify paired indices (tool call at i → result at i+1).
+  // Only pair from a tool_call line, NOT from tool_result — a result line
+  // should not pull in the next unrelated line as its "partner".
   const pairedWith = new Map<number, number>();
   for (const s of scored) {
-    if (s.reason === "tool_call" && s.index + 1 < texts.length) {
+    if (
+      s.reason === "tool_call" &&
+      s.index + 1 < texts.length &&
+      !pairedWith.has(s.index) && // not already claimed
+      !pairedWith.has(s.index + 1) // partner not already claimed
+    ) {
       pairedWith.set(s.index, s.index + 1);
       pairedWith.set(s.index + 1, s.index);
     }
@@ -279,6 +288,14 @@ export function estimateConversationValue(texts: string[]): number {
   let value = 0;
 
   const joined = texts.join(" ");
+
+  // Has explicit memory intent? (e.g. "remember this", "记住") +0.5
+  // These should NEVER be skipped by the low-value gate.
+  const MEMORY_INTENT = /\b(remember|recall|don'?t forget|note that|keep in mind)\b/i;
+  const MEMORY_INTENT_CJK = /(记住|記住|别忘|不要忘|记一下|記一下)/;
+  if (MEMORY_INTENT.test(joined) || MEMORY_INTENT_CJK.test(joined)) {
+    value += 0.5;
+  }
 
   // Has tool calls? +0.4
   if (TOOL_CALL_INDICATORS.some((p) => p.test(joined))) {

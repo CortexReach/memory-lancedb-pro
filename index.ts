@@ -2593,11 +2593,10 @@ const memoryLanceDBProPlugin = {
             }
           }
 
-          // Record extraction for rate limiting (count even if downstream skips)
-          extractionRateLimiter.recordExtraction();
-
           // ----------------------------------------------------------------
           // Smart Extraction (Phase 1: LLM-powered 6-category extraction)
+          // Rate limiter charged AFTER successful extraction, not before,
+          // so no-op sessions don't consume the hourly quota.
           // ----------------------------------------------------------------
           if (smartExtractor) {
             // Pre-filter: embedding-based noise detection (language-agnostic)
@@ -2617,6 +2616,8 @@ const memoryLanceDBProPlugin = {
                 conversationText, sessionKey,
                 { scope: defaultScope, scopeFilter: accessibleScopes },
               );
+              // Charge rate limiter only after successful extraction
+              extractionRateLimiter.recordExtraction();
               if (stats.created > 0 || stats.merged > 0) {
                 api.logger.info(
                   `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
@@ -3772,24 +3773,24 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       typeof cfg.sessionCompression === "object" && cfg.sessionCompression !== null
         ? {
             enabled:
-              (cfg.sessionCompression as Record<string, unknown>).enabled !== false,
+              (cfg.sessionCompression as Record<string, unknown>).enabled === true,
             minScoreToKeep:
               typeof (cfg.sessionCompression as Record<string, unknown>).minScoreToKeep === "number"
                 ? ((cfg.sessionCompression as Record<string, unknown>).minScoreToKeep as number)
                 : 0.3,
           }
-        : { enabled: true, minScoreToKeep: 0.3 },
+        : { enabled: false, minScoreToKeep: 0.3 },
     extractionThrottle:
       typeof cfg.extractionThrottle === "object" && cfg.extractionThrottle !== null
         ? {
             skipLowValue:
-              (cfg.extractionThrottle as Record<string, unknown>).skipLowValue !== false,
+              (cfg.extractionThrottle as Record<string, unknown>).skipLowValue === true,
             maxExtractionsPerHour:
               typeof (cfg.extractionThrottle as Record<string, unknown>).maxExtractionsPerHour === "number"
                 ? ((cfg.extractionThrottle as Record<string, unknown>).maxExtractionsPerHour as number)
                 : 30,
           }
-        : { skipLowValue: true, maxExtractionsPerHour: 30 },
+        : { skipLowValue: false, maxExtractionsPerHour: 30 },
   };
 }
 
