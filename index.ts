@@ -41,7 +41,8 @@ import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 
 // Import smart extraction & lifecycle components
-import { SmartExtractor } from "./src/smart-extractor.js";
+import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
+import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
 import { NoisePrototypeBank } from "./src/noise-prototypes.js";
 import { createLlmClient } from "./src/llm-client.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
@@ -183,6 +184,14 @@ interface PluginConfig {
   mdMirror?: { enabled?: boolean; dir?: string };
   workspaceBoundary?: WorkspaceBoundaryConfig;
   admissionControl?: AdmissionControlConfig;
+  sessionCompression?: {
+    enabled?: boolean;
+    minScoreToKeep?: number;
+  };
+  extractionThrottle?: {
+    skipLowValue?: boolean;
+    maxExtractionsPerHour?: number;
+  };
 }
 
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
@@ -1799,6 +1808,11 @@ const memoryLanceDBProPlugin = {
       }
     }
 
+    // Extraction rate limiter (Feature 7: Adaptive Extraction Throttling)
+    const extractionRateLimiter = createExtractionRateLimiter({
+      maxExtractionsPerHour: config.extractionThrottle?.maxExtractionsPerHour,
+    });
+
     async function sleep(ms: number): Promise<void> {
       await new Promise(resolve => setTimeout(resolve, ms));
     }
@@ -2414,6 +2428,14 @@ const memoryLanceDBProPlugin = {
         // See: https://github.com/CortexReach/memory-lancedb-pro/issues/260
         const backgroundRun = (async () => {
         try {
+          // Feature 7: Check extraction rate limit before any work
+          if (extractionRateLimiter.isRateLimited()) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture skipped (rate limited: ${extractionRateLimiter.getRecentCount()} extractions in last hour)`,
+            );
+            return;
+          }
+
           // Determine agent ID and default scope
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
@@ -2543,7 +2565,38 @@ const memoryLanceDBProPlugin = {
           }
 
           // ----------------------------------------------------------------
+          // Feature 7: Skip low-value conversations
+          // ----------------------------------------------------------------
+          if (config.extractionThrottle?.skipLowValue !== false) {
+            const conversationValue = estimateConversationValue(texts);
+            if (conversationValue < 0.2) {
+              api.logger.debug(
+                `memory-lancedb-pro: auto-capture skipped for agent ${agentId} (low conversation value: ${conversationValue.toFixed(2)})`,
+              );
+              return;
+            }
+          }
+
+          // ----------------------------------------------------------------
+          // Feature 1: Session compression — prioritize high-signal texts
+          // ----------------------------------------------------------------
+          if (config.sessionCompression?.enabled !== false && texts.length > 0) {
+            const maxChars = config.extractMaxChars ?? 8000;
+            const compressed = compressTexts(texts, maxChars, {
+              minScoreToKeep: config.sessionCompression?.minScoreToKeep,
+            });
+            if (compressed.dropped > 0) {
+              api.logger.debug(
+                `memory-lancedb-pro: session compression for agent ${agentId}: dropped ${compressed.dropped}/${texts.length} texts (${compressed.totalChars} chars kept)`,
+              );
+              texts = compressed.texts;
+            }
+          }
+
+          // ----------------------------------------------------------------
           // Smart Extraction (Phase 1: LLM-powered 6-category extraction)
+          // Rate limiter charged AFTER successful extraction, not before,
+          // so no-op sessions don't consume the hourly quota.
           // ----------------------------------------------------------------
           if (smartExtractor) {
             // Pre-filter: embedding-based noise detection (language-agnostic)
@@ -2563,6 +2616,8 @@ const memoryLanceDBProPlugin = {
                 conversationText, sessionKey,
                 { scope: defaultScope, scopeFilter: accessibleScopes },
               );
+              // Charge rate limiter only after successful extraction
+              extractionRateLimiter.recordExtraction();
               if (stats.created > 0 || stats.merged > 0) {
                 api.logger.info(
                   `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
@@ -3714,6 +3769,28 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         }
         : undefined,
     admissionControl: normalizeAdmissionControlConfig(cfg.admissionControl),
+    sessionCompression:
+      typeof cfg.sessionCompression === "object" && cfg.sessionCompression !== null
+        ? {
+            enabled:
+              (cfg.sessionCompression as Record<string, unknown>).enabled === true,
+            minScoreToKeep:
+              typeof (cfg.sessionCompression as Record<string, unknown>).minScoreToKeep === "number"
+                ? ((cfg.sessionCompression as Record<string, unknown>).minScoreToKeep as number)
+                : 0.3,
+          }
+        : { enabled: false, minScoreToKeep: 0.3 },
+    extractionThrottle:
+      typeof cfg.extractionThrottle === "object" && cfg.extractionThrottle !== null
+        ? {
+            skipLowValue:
+              (cfg.extractionThrottle as Record<string, unknown>).skipLowValue === true,
+            maxExtractionsPerHour:
+              typeof (cfg.extractionThrottle as Record<string, unknown>).maxExtractionsPerHour === "number"
+                ? ((cfg.extractionThrottle as Record<string, unknown>).maxExtractionsPerHour as number)
+                : 30,
+          }
+        : { skipLowValue: false, maxExtractionsPerHour: 30 },
   };
 }
 

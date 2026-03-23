@@ -93,6 +93,8 @@ function createMockApi(dbPath, embeddingBaseURL, llmBaseURL, logs) {
         rerankEndpoint: "http://127.0.0.1:8202/v1/rerank",
         rerankModel: "qwen3-reranker-4b",
       },
+      extractionThrottle: { skipLowValue: false, maxExtractionsPerHour: 200 },
+      sessionCompression: { enabled: false },
       scopes: {
         default: "global",
         definitions: {
