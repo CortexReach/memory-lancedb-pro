@@ -102,16 +102,20 @@ function deriveManualMemoryLayer(category: string): "durable" | "working" {
 }
 
 function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
-  return results.map((r) => ({
-    id: r.entry.id,
-    text: r.entry.text,
-    category: getDisplayCategoryTag(r.entry),
-    rawCategory: r.entry.category,
-    scope: r.entry.scope,
-    importance: r.entry.importance,
-    score: r.score,
-    sources: r.sources,
-  }));
+  return results.map((r) => {
+    const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
+    return {
+      id: r.entry.id,
+      text: r.entry.text,
+      fullText: metadata.l2_content || metadata.l1_overview || r.entry.text,
+      category: getDisplayCategoryTag(r.entry),
+      rawCategory: r.entry.category,
+      scope: r.entry.scope,
+      importance: r.entry.importance,
+      score: r.score,
+      sources: r.sources,
+    };
+  });
 }
 
 const _warnedMissingAgentId = new Set<string>();
@@ -604,8 +608,8 @@ export function registerMemoryRecallTool(
               const categoryTag = getDisplayCategoryTag(r.entry);
               const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
               const base = includeFullText
-                ? r.entry.text
-                : metadata.l0_abstract || r.entry.text;
+                ? (metadata.l2_content || metadata.l1_overview || r.entry.text)
+                : (metadata.l0_abstract || r.entry.text);
               const inline = normalizeInlineText(base);
               const rendered = includeFullText
                 ? inline
