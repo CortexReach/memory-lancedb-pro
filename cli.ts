@@ -406,7 +406,11 @@ function formatMemory(memory: any, index?: number): string {
 }
 
 function formatJson(obj: any): string {
-  return JSON.stringify(obj, null, 2);
+  return JSON.stringify(obj, (key, value) => {
+    // Exclude verbose vector arrays from CLI output
+    if (key === "vector") return undefined;
+    return value;
+  }, 2);
 }
 
 async function sleep(ms: number): Promise<void> {
