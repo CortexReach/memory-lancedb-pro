@@ -14,7 +14,11 @@ A LanceDB-backed OpenClaw memory plugin that stores preferences, decisions, and 
 [![LanceDB](https://img.shields.io/badge/LanceDB-Vectorstore-orange)](https://lancedb.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-> **v1.1.0-beta.10** — Fully adapted for OpenClaw 2026.3+ new plugin architecture. Uses `before_prompt_build` hooks (replacing deprecated `before_agent_start`). Run `openclaw doctor --fix` after upgrading.
+### ⚡ [v1.1.0-beta.10 — OpenClaw 2026.3+ Hook Adaptation](https://github.com/CortexReach/memory-lancedb-pro/releases/tag/v1.1.0-beta.10)
+
+> ✅ Fully adapted for OpenClaw 2026.3+ new plugin architecture
+> 🔄 Uses `before_prompt_build` hooks (replacing deprecated `before_agent_start`)
+> 🩺 Run `openclaw doctor --fix` after upgrading
 
 [English](README.md) | [简体中文](README_CN.md) | [繁體中文](README_TW.md) | [日本語](README_JA.md) | [한국어](README_KO.md) | [Français](README_FR.md) | [Español](README_ES.md) | [Deutsch](README_DE.md) | [Italiano](README_IT.md) | [Русский](README_RU.md) | [Português (Brasil)](README_PT-BR.md)
 
@@ -805,13 +809,7 @@ openclaw doctor --fix # resolve any stale config after upgrade
 
 ---
 
-## 🚀 Beta: Smart Memory v1.1.0
-
-### ⚡ [v1.1.0-beta.10 — OpenClaw 2026.3+ Hook Adaptation](https://github.com/CortexReach/memory-lancedb-pro/releases/tag/v1.1.0-beta.10)
-
-> ✅ Fully adapted for OpenClaw 2026.3+ new plugin architecture
-> 🔄 Uses `before_prompt_build` hooks (replacing deprecated `before_agent_start`)
-> 🩺 Run `openclaw doctor --fix` after upgrading
+## Beta: Smart Memory v1.1.0
 
 > Status: Beta — available via `npm i memory-lancedb-pro@beta`. Stable users on `latest` are not affected.
 
