@@ -377,6 +377,13 @@ export class SmartExtractor {
     let shortAbstractCount = 0;
     let noiseAbstractCount = 0;
     for (const raw of result.memories) {
+      if (!raw || typeof raw !== "object") {
+        invalidCategoryCount++;
+        this.debugLog(
+          `memory-lancedb-pro: smart-extractor: dropping null/invalid candidate entry`,
+        );
+        continue;
+      }
       const category = normalizeCategory(raw.category ?? "");
       if (!category) {
         invalidCategoryCount++;
