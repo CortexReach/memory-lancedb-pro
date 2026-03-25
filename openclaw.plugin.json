@@ -46,6 +46,10 @@
             "type": "integer",
             "minimum": 1
           },
+          "omitDimensions": {
+            "type": "boolean",
+            "description": "When true, omit the dimensions parameter from embedding requests even if dimensions is configured"
+          },
           "taskQuery": {
             "type": "string",
             "description": "Embedding task for queries (provider-specific, e.g. Jina: retrieval.query)"
@@ -762,6 +766,11 @@
       "label": "Vector Dimensions",
       "placeholder": "auto-detected from model",
       "help": "Override vector dimensions for custom models not in the built-in lookup table",
+      "advanced": true
+    },
+    "embedding.omitDimensions": {
+      "label": "Omit Request Dimensions",
+      "help": "Do not send the dimensions parameter to the embedding API even if embedding.dimensions is configured. Useful for local models like Qwen3-Embedding that reject the field.",
       "advanced": true
     },
     "embedding.taskQuery": {

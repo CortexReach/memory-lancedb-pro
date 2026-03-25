@@ -105,6 +105,11 @@ assert.equal(
   "embedding.chunking schema default should match runtime default",
 );
 assert.equal(
+  manifest.configSchema.properties.embedding.properties.omitDimensions?.type,
+  "boolean",
+  "embedding.omitDimensions should be declared in the plugin schema",
+);
+assert.equal(
   manifest.configSchema.properties.sessionMemory.properties.enabled.default,
   false,
   "sessionMemory.enabled schema default should match runtime default",
@@ -127,6 +132,7 @@ assert.equal(
 
 const workDir = mkdtempSync(path.join(tmpdir(), "memory-plugin-regression-"));
 const services = [];
+const embeddingRequests = [];
 
 try {
   const api = createMockApi(
@@ -204,6 +210,7 @@ try {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    embeddingRequests.push(payload);
     const inputs = Array.isArray(payload.input) ? payload.input : [payload.input];
 
     if (inputs.some((input) => String(input).length > threshold)) {
@@ -292,6 +299,65 @@ try {
       chunkingOnResult.details.action,
       "created",
       "embedding.chunking=true should recover from long-document embedding errors",
+    );
+
+    const withDimensionsApi = createMockApi({
+      dbPath: path.join(workDir, "db-with-dimensions"),
+      autoCapture: false,
+      autoRecall: false,
+      embedding: {
+        provider: "openai-compatible",
+        apiKey: "dummy",
+        model: "text-embedding-3-small",
+        baseURL: embeddingBaseURL,
+        dimensions: 4,
+      },
+    });
+    plugin.register(withDimensionsApi);
+    const withDimensionsTool = withDimensionsApi.toolFactories.memory_store({
+      agentId: "main",
+      sessionKey: "agent:main:test",
+    });
+    const requestCountBeforeWithDimensions = embeddingRequests.length;
+    await withDimensionsTool.execute("tool-3", {
+      text: "dimensions should be sent by default",
+      scope: "global",
+    });
+    const withDimensionsRequest = embeddingRequests.at(requestCountBeforeWithDimensions);
+    assert.equal(
+      withDimensionsRequest?.dimensions,
+      4,
+      "embedding.dimensions should be forwarded by default",
+    );
+
+    const omitDimensionsApi = createMockApi({
+      dbPath: path.join(workDir, "db-omit-dimensions"),
+      autoCapture: false,
+      autoRecall: false,
+      embedding: {
+        provider: "openai-compatible",
+        apiKey: "dummy",
+        model: "text-embedding-3-small",
+        baseURL: embeddingBaseURL,
+        dimensions: 4,
+        omitDimensions: true,
+      },
+    });
+    plugin.register(omitDimensionsApi);
+    const omitDimensionsTool = omitDimensionsApi.toolFactories.memory_store({
+      agentId: "main",
+      sessionKey: "agent:main:test",
+    });
+    const requestCountBeforeOmitDimensions = embeddingRequests.length;
+    await omitDimensionsTool.execute("tool-4", {
+      text: "dimensions should be omitted when configured",
+      scope: "global",
+    });
+    const omitDimensionsRequest = embeddingRequests.at(requestCountBeforeOmitDimensions);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(omitDimensionsRequest, "dimensions"),
+      false,
+      "embedding.omitDimensions=true should omit dimensions from embedding requests",
     );
   } finally {
     await new Promise((resolve) => embeddingServer.close(resolve));
