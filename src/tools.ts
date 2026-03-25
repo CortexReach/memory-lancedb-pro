@@ -1430,12 +1430,16 @@ export function registerMemoryDebugTool(
           };
           try {
             const safeLimit = clampInt(limit, 1, 20);
-            const scopeFilter = resolveScopeFilter(context.scopeManager, agentId, scope);
-            if (scope && !context.scopeManager.isAccessible(scope, agentId)) {
-              return {
-                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
-                details: { error: "scope_access_denied", requestedScope: scope },
-              };
+            let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+            if (scope) {
+              if (context.scopeManager.isAccessible(scope, agentId)) {
+                scopeFilter = [scope];
+              } else {
+                return {
+                  content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
+                  details: { error: "scope_access_denied", requestedScope: scope },
+                };
+              }
             }
 
             const { results, trace } = await context.retriever.retrieveWithTrace({

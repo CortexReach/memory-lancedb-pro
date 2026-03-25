@@ -49,6 +49,7 @@ import {
   type WorkspaceBoundaryConfig,
 } from "./workspace-boundary.js";
 import { inferAtomicBrandItemPreferenceSlot } from "./preference-slots.js";
+import { batchDedup } from "./batch-dedup.js";
 
 // ============================================================================
 // Envelope Metadata Stripping
@@ -220,11 +221,31 @@ export class SmartExtractor {
       `memory-pro: smart-extractor: extracted ${candidates.length} candidate(s)`,
     );
 
-    // TODO: Wire batchDedup() here — embed candidate abstracts upfront, dedup,
-    // then process survivors (see src/batch-dedup.ts)
+    // Step 1b: Batch-internal dedup — embed candidate abstracts and remove near-duplicates
+    //          before expensive per-candidate LLM dedup calls (see src/batch-dedup.ts)
+    const capped = candidates.slice(0, MAX_MEMORIES_PER_EXTRACTION);
+    let survivingCandidates = capped;
+    try {
+      const abstracts = capped.map((c) => c.abstract);
+      const vectors = await Promise.all(
+        abstracts.map((a) => this.embedder.embed(a).catch(() => [] as number[])),
+      );
+      const dedupResult = batchDedup(abstracts, vectors);
+      if (dedupResult.duplicateIndices.length > 0) {
+        survivingCandidates = dedupResult.survivingIndices.map((i) => capped[i]);
+        stats.skipped += dedupResult.duplicateIndices.length;
+        this.log(
+          `memory-pro: smart-extractor: batchDedup dropped ${dedupResult.duplicateIndices.length} near-duplicate(s), ${survivingCandidates.length} survivor(s)`,
+        );
+      }
+    } catch (err) {
+      this.log(
+        `memory-pro: smart-extractor: batchDedup failed, proceeding without batch dedup: ${String(err)}`,
+      );
+    }
 
-    // Step 2: Process each candidate through dedup pipeline
-    for (const candidate of candidates.slice(0, MAX_MEMORIES_PER_EXTRACTION)) {
+    // Step 2: Process each surviving candidate through dedup pipeline
+    for (const candidate of survivingCandidates) {
       if (
         isUserMdExclusiveMemory(
           {
