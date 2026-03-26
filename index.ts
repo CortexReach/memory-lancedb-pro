@@ -3096,8 +3096,47 @@ const memoryLanceDBProPlugin = {
         pruneReflectionSessionState();
       }, { priority: 20 });
 
+      // Global cross-instance re-entrant guard to prevent reflection loops.
+      // Each plugin instance used to have its own Map, so new instances created during
+      // embedded agent turns could bypass the guard. Using Symbol.for + globalThis
+      // ensures ALL instances share the same lock regardless of how many times the
+      // plugin is re-loaded by the runtime.
+      const GLOBAL_REFLECTION_LOCK = Symbol.for("openclaw.memory-lancedb-pro.reflection-lock");
+      const getGlobalReflectionLock = (): Map<string, boolean> => {
+        const g = globalThis as Record<symbol, unknown>;
+        if (!g[GLOBAL_REFLECTION_LOCK]) g[GLOBAL_REFLECTION_LOCK] = new Map<string, boolean>();
+        return g[GLOBAL_REFLECTION_LOCK] as Map<string, boolean>;
+      };
+
+      // Serial loop guard: track last reflection time per sessionKey to prevent
+      // gateway-level re-triggering (e.g. session_end → new session → command:new)
+      const REFLECTION_SERIAL_GUARD = Symbol.for("openclaw.memory-lancedb-pro.reflection-serial-guard");
+      const getSerialGuardMap = () => {
+        const g = globalThis as any;
+        if (!g[REFLECTION_SERIAL_GUARD]) g[REFLECTION_SERIAL_GUARD] = new Map<string, number>();
+        return g[REFLECTION_SERIAL_GUARD] as Map<string, number>;
+      };
+      const SERIAL_GUARD_COOLDOWN_MS = 120_000; // 2 minutes cooldown per sessionKey
+
       const runMemoryReflection = async (event: any) => {
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
+        // Guard against re-entrant calls for the same session (e.g. file-write triggering another command:new)
+        // Uses global lock shared across all plugin instances to prevent loop amplification.
+        const globalLock = getGlobalReflectionLock();
+        if (sessionKey && globalLock.get(sessionKey)) {
+          api.logger.info(`memory-reflection: skipping re-entrant call for sessionKey=${sessionKey}; already running (global guard)`);
+          return;
+        }
+        // Serial loop guard: skip if a reflection for this sessionKey completed recently
+        if (sessionKey) {
+          const serialGuard = getSerialGuardMap();
+          const lastRun = serialGuard.get(sessionKey);
+          if (lastRun && (Date.now() - lastRun) < SERIAL_GUARD_COOLDOWN_MS) {
+            api.logger.info(`memory-reflection: skipping serial re-trigger for sessionKey=${sessionKey}; last run ${(Date.now() - lastRun) / 1000}s ago (cooldown=${SERIAL_GUARD_COOLDOWN_MS / 1000}s)`);
+            return;
+          }
+        }
+        if (sessionKey) globalLock.set(sessionKey, true);
         try {
           pruneReflectionSessionState();
           const action = String(event?.action || "unknown");
@@ -3357,6 +3396,8 @@ const memoryLanceDBProPlugin = {
         } finally {
           if (sessionKey) {
             reflectionErrorStateBySession.delete(sessionKey);
+            getGlobalReflectionLock().delete(sessionKey);
+            getSerialGuardMap().set(sessionKey, Date.now());
           }
           pruneReflectionSessionState();
         }
