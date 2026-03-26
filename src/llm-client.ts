@@ -438,6 +438,9 @@ function extractAnthropicText(payload: Record<string, unknown>): string | null {
   return text.trim() || null;
 }
 
+// TODO: anthropicGenerateJson in examples/new-session-distill/worker/lesson-extract-worker.mjs
+// builds Anthropic requests independently of this function. The two may diverge over time
+// (e.g. retry logic, model defaults, streaming). Consider unifying into a shared module.
 function createAnthropicApiKeyClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
   let lastError: string | null = null;
   const endpoint = normalizeAnthropicMessagesEndpoint(config.baseURL);

@@ -75,8 +75,8 @@ import {
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import {
   resolveEnvVarsSync,
-  resolveSecretValueSync,
-  resolveSecretValuesSync,
+  resolveSecretValue,
+  resolveSecretValues,
 } from "./src/secret-resolver.js";
 
 // ============================================================================
@@ -247,12 +247,12 @@ function resolveEnvVars(value: string): string {
   return resolveEnvVarsSync(value);
 }
 
-function resolveFirstApiKey(apiKey: string | string[]): string {
+async function resolveFirstApiKey(apiKey: string | string[]): Promise<string> {
   const key = Array.isArray(apiKey) ? apiKey[0] : apiKey;
   if (!key) {
     throw new Error("embedding.apiKey is empty");
   }
-  return resolveSecretValueSync(key);
+  return resolveSecretValue(key);
 }
 
 function resolveOptionalPathWithEnv(
@@ -1585,7 +1585,7 @@ const memoryLanceDBProPlugin = {
     "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, and management CLI",
   kind: "memory" as const,
 
-  register(api: OpenClawPluginApi) {
+  async register(api: OpenClawPluginApi) {
     // Parse and validate configuration
     const config = parsePluginConfig(api.pluginConfig);
 
@@ -1609,9 +1609,9 @@ const memoryLanceDBProPlugin = {
 
     // Initialize core components
     const store = new MemoryStore({ dbPath: resolvedDbPath, vectorDim });
-    const resolvedEmbeddingApiKeys = resolveSecretValuesSync(config.embedding.apiKey);
+    const resolvedEmbeddingApiKeys = await resolveSecretValues(config.embedding.apiKey);
     const resolvedRerankApiKey = typeof config.retrieval?.rerankApiKey === "string" && config.retrieval.rerankApiKey.trim()
-      ? resolveSecretValueSync(config.retrieval.rerankApiKey)
+      ? await resolveSecretValue(config.retrieval.rerankApiKey)
       : undefined;
     const resolvedRetrievalConfig = config.retrieval
       ? {
@@ -1670,8 +1670,8 @@ const memoryLanceDBProPlugin = {
         const llmApiKey = llmAuth === "oauth"
           ? undefined
           : config.llm?.apiKey
-            ? resolveSecretValueSync(config.llm.apiKey)
-            : resolveFirstApiKey(config.embedding.apiKey);
+            ? await resolveSecretValue(config.llm.apiKey)
+            : await resolveFirstApiKey(config.embedding.apiKey);
         const llmBaseURL = llmAuth === "oauth"
           ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
           : config.llm?.baseURL
@@ -2167,15 +2167,15 @@ const memoryLanceDBProPlugin = {
         scopeManager,
         migrator,
         embedder,
-        llmClient: smartExtractor ? (() => {
+        llmClient: smartExtractor ? await (async () => {
           try {
             const llmAuth = config.llm?.auth || "api-key";
             const llmApi = config.llm?.api || "openai-completions";
             const llmApiKey = llmAuth === "oauth"
               ? undefined
               : config.llm?.apiKey
-                ? resolveSecretValueSync(config.llm.apiKey)
-                : resolveFirstApiKey(config.embedding.apiKey);
+                ? await resolveSecretValue(config.llm.apiKey)
+                : await resolveFirstApiKey(config.embedding.apiKey);
             const llmBaseURL = llmAuth === "oauth"
               ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
               : config.llm?.baseURL

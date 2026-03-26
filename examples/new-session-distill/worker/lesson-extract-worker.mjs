@@ -79,6 +79,10 @@ function resolveEnvVars(value) {
   });
 }
 
+// NOTE: This duplicates the logic in src/secret-resolver.ts (parseBitwardenSecretRef +
+// resolveBitwardenSecret). This worker is a standalone ESM script that cannot import
+// the compiled TypeScript, so the logic lives here as well.
+// IMPORTANT: If you update either copy, keep the other in sync.
 async function resolveMaybeBitwardenSecret(value) {
   const resolved = resolveEnvVars(String(value || "").trim());
   if (!resolved) return "";
@@ -241,6 +245,9 @@ function normalizeAnthropicEndpoint(baseURL) {
   return `${trimmed.replace(/\/+$/, "")}/messages`;
 }
 
+// TODO: This builds Anthropic requests independently from createAnthropicApiKeyClient
+// in src/llm-client.ts. The two implementations may diverge over time (e.g. retry
+// logic, model defaults, streaming). Consider unifying into a shared module.
 async function anthropicGenerateJson(prompt) {
   const apiKey = await resolveDistillApiKey();
   const res = await fetch(normalizeAnthropicEndpoint(DISTILL_BASE_URL), {

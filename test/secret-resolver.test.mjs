@@ -80,4 +80,25 @@ describe("secret resolver", () => {
 
     assert.deepEqual(values, ["first-secret-value", "second-value"]);
   });
+
+  it("throws on bws:// URL with no secret ID (empty hostname and path)", async () => {
+    await assert.rejects(
+      () => resolveSecretValue("bws:///", {}),
+      /Invalid Bitwarden secret reference/,
+    );
+  });
+
+  it("throws on bws:// URL with only a slash path and no hostname", async () => {
+    await assert.rejects(
+      () => resolveSecretValue("bws:///secret/", {}),
+      /Invalid Bitwarden secret reference/,
+    );
+  });
+
+  it("throws on bws:// URL where secret ID reduces to empty after prefix strip", async () => {
+    await assert.rejects(
+      () => resolveSecretValue("bws://secret/", {}),
+      /Invalid Bitwarden secret reference/,
+    );
+  });
 });
