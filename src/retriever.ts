@@ -45,6 +45,8 @@ export interface RetrievalConfig {
   rerankModel?: string;
   /** Reranker API endpoint (default: https://api.jina.ai/v1/rerank). */
   rerankEndpoint?: string;
+  /** Reranker request timeout in milliseconds (default: 10000). */
+  rerankTimeoutMs?: number;
   /** Reranker provider format. Determines request/response shape and auth header.
    *  - "jina" (default): Authorization: Bearer, string[] documents, results[].relevance_score
    *  - "siliconflow": same format as jina (alias, for clarity)
@@ -858,9 +860,10 @@ export class MemoryRetriever {
           results.length,
         );
 
-        // Timeout: 5 seconds to prevent stalling retrieval pipeline
+        // Timeout to prevent stalling retrieval pipeline
+        const RERANK_TIMEOUT_MS = this.config.rerankTimeoutMs ?? 10_000;
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
+        const timeout = setTimeout(() => controller.abort(), RERANK_TIMEOUT_MS);
 
         const response = await fetch(endpoint, {
           method: "POST",
