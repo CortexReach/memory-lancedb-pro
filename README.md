@@ -499,8 +499,31 @@ Cross-encoder reranking supports multiple providers via `rerankProvider`:
 | **SiliconFlow** (free tier available) | `siliconflow` | `BAAI/bge-reranker-v2-m3` |
 | **Voyage AI** | `voyage` | `rerank-2.5` |
 | **Pinecone** | `pinecone` | `bge-reranker-v2-m3` |
+| **llama.cpp** (local) | `llamacpp` | `bge-reranker-v2-m3` |
 
 Any Jina-compatible rerank endpoint also works — set `rerankProvider: "jina"` and point `rerankEndpoint` to your service (e.g., Hugging Face TEI, DashScope `qwen3-rerank`).
+
+**Local reranking with llama.cpp:**
+```bash
+# Start llama.cpp server with a reranker model
+./llama-server -m bge-reranker-v2-m3.gguf --rerank --port 8080
+
+# Or with API key protection
+./llama-server -m bge-reranker-v2-m3.gguf --rerank --api-key your-key --port 8080
+```
+
+Configuration:
+```json
+{
+  "retrieval": {
+    "rerank": "cross-encoder",
+    "rerankProvider": "llamacpp",
+    "rerankEndpoint": "http://localhost:8080/v1/rerank",
+    "rerankModel": "bge-reranker-v2-m3",
+    "rerankApiKey": "optional-api-key"
+  }
+}
+```
 
 </details>
 

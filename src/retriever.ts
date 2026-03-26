@@ -57,7 +57,8 @@ export interface RetrievalConfig {
     | "voyage"
     | "pinecone"
     | "dashscope"
-    | "tei";
+    | "tei"
+    | "llamacpp";
   /**
    * Length normalization: penalize long entries that dominate via sheer keyword
    * density. Formula: score *= 1 / (1 + log2(charLen / anchor)).
@@ -164,7 +165,8 @@ type RerankProvider =
   | "voyage"
   | "pinecone"
   | "dashscope"
-  | "tei";
+  | "tei"
+  | "llamacpp";
 
 interface RerankItem {
   index: number;
@@ -237,6 +239,25 @@ function buildRerankRequest(
           top_k: topN,
         },
       };
+    case "llamacpp": {
+      // llama.cpp uses OpenAI-compatible format
+      // API key is optional - only add Authorization if provided
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (apiKey) {
+        headers["Authorization"] = `Bearer ${apiKey}`;
+      }
+      return {
+        headers,
+        body: {
+          model,
+          query,
+          documents: candidates,
+          top_n: topN,
+        },
+      };
+    }
     case "siliconflow":
     case "jina":
     default:
@@ -319,6 +340,14 @@ function parseRerankResponse(
       return (
         parseItems(objectData?.data, ["relevance_score", "score"]) ??
         parseItems(objectData?.results, ["relevance_score", "score"])
+      );
+    }
+    case "llamacpp": {
+      // llama.cpp returns: { results: [{ index, relevance_score }] }
+      // Same format as Jina/SiliconFlow (OpenAI-compatible)
+      return (
+        parseItems(objectData?.results, ["relevance_score", "score"]) ??
+        parseItems(objectData?.data, ["relevance_score", "score"])
       );
     }
     case "siliconflow":
@@ -840,9 +869,12 @@ export class MemoryRetriever {
     }
 
     // Try cross-encoder rerank via configured provider API
-    if (this.config.rerank === "cross-encoder" && this.config.rerankApiKey) {
+    // For llama.cpp, API key is optional (local deployment)
+    const provider = this.config.rerankProvider || "jina";
+    const isApiKeyOptional = provider === "llamacpp";
+    
+    if (this.config.rerank === "cross-encoder" && (this.config.rerankApiKey || isApiKeyOptional)) {
       try {
-        const provider = this.config.rerankProvider || "jina";
         const model = this.config.rerankModel || "jina-reranker-v3";
         const endpoint =
           this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
@@ -851,7 +883,7 @@ export class MemoryRetriever {
         // Build provider-specific request
         const { headers, body } = buildRerankRequest(
           provider,
-          this.config.rerankApiKey,
+          this.config.rerankApiKey ?? "",
           model,
           query,
           documents,
