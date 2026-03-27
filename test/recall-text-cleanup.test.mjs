@@ -376,7 +376,7 @@ describe("recall text cleanup", () => {
       },
     });
 
-    memoryLanceDBProPlugin.register(harness.api);
+    await memoryLanceDBProPlugin.register(harness.api);
 
     const hooks = harness.eventHandlers.get("before_prompt_build") || [];
     assert.equal(hooks.length, 1, "expected at least one before_prompt_build hook for this config");
@@ -445,7 +445,7 @@ describe("recall text cleanup", () => {
       },
     });
 
-    memoryLanceDBProPlugin.register(harness.api);
+    await memoryLanceDBProPlugin.register(harness.api);
     const hooks = harness.eventHandlers.get("before_prompt_build") || [];
     const [{ handler: autoRecallHook }] = hooks;
     const output = await autoRecallHook(
@@ -477,7 +477,7 @@ describe("recall text cleanup", () => {
         selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
       },
     });
-    memoryLanceDBProPlugin.register(harness.api);
+    await memoryLanceDBProPlugin.register(harness.api);
     const hooks = harness.eventHandlers.get("before_prompt_build") || [];
     const [{ handler: autoRecallHook }] = hooks;
     const output = await autoRecallHook(
@@ -571,7 +571,7 @@ describe("recall text cleanup", () => {
       },
     });
 
-    memoryLanceDBProPlugin.register(harness.api);
+    await memoryLanceDBProPlugin.register(harness.api);
 
     const hooks = harness.eventHandlers.get("before_prompt_build") || [];
     assert.equal(hooks.length, 1);
@@ -627,7 +627,7 @@ describe("recall text cleanup", () => {
       },
     });
 
-    memoryLanceDBProPlugin.register(harness.api);
+    await memoryLanceDBProPlugin.register(harness.api);
 
     const hooks = harness.eventHandlers.get("before_prompt_build") || [];
     assert.equal(hooks.length, 1);

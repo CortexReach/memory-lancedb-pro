@@ -96,7 +96,7 @@ async function withTestEnv(apiKeyConfig, fn) {
       registerHook(name, handler) { this.hooks[name] = handler; },
     };
 
-    plugin.register(api);
+    await plugin.register(api);
     await fn(logs);
   } finally {
     await new Promise((r) => embeddingServer.close(r));
