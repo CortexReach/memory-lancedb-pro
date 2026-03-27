@@ -137,6 +137,13 @@
         "default": 180,
         "description": "Maximum character budget per auto-injected memory summary."
       },
+      "maxRecallPerTurn": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50,
+        "default": 10,
+        "description": "Hard per-turn injection cap applied after dedup. Acts as a safety ceiling on top of autoRecallMaxItems to prevent context inflation. Default: 10."
+      },
       "recallMode": {
         "type": "string",
         "enum": ["full", "summary", "adaptive", "off"],
@@ -1042,6 +1049,11 @@
       "label": "Recall Mode",
       "help": "Auto-recall depth: full (default), summary (L0 only), adaptive (intent-based category routing), off.",
       "advanced": false
+    },
+    "maxRecallPerTurn": {
+      "label": "Max Recall Per Turn",
+      "help": "Hard per-turn injection cap. Acts as a safety ceiling on top of Auto-Recall Max Items. Default: 10.",
+      "advanced": true
     },
     "captureAssistant": {
       "label": "Capture Assistant Messages",

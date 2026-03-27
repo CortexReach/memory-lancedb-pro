@@ -201,9 +201,14 @@ try {
   });
   await plugin.register(sessionEnabledApi);
   assert.equal(
-    typeof sessionEnabledApi.hooks["command:new"],
+    typeof sessionEnabledApi.hooks.before_reset,
     "function",
-    "sessionMemory.enabled=true should register the /new hook",
+    "sessionMemory.enabled=true should register the async before_reset hook",
+  );
+  assert.equal(
+    sessionEnabledApi.hooks["command:new"],
+    undefined,
+    "sessionMemory.enabled=true should not register the blocking command:new hook",
   );
 
   const longText = `${"Long embedding payload. ".repeat(420)}tail`;

@@ -105,6 +105,8 @@ interface PluginConfig {
   autoRecallMaxItems?: number;
   autoRecallMaxChars?: number;
   autoRecallPerItemMaxChars?: number;
+  /** Hard per-turn injection cap (safety valve). Overrides autoRecallMaxItems if lower. Default: 10. */
+  maxRecallPerTurn?: number;
   recallMode?: "full" | "summary" | "adaptive" | "off";
   captureAssistant?: boolean;
   retrieval?: {
@@ -295,6 +297,13 @@ function resolveHookAgentId(
   return (trimmedExplicit && trimmedExplicit.length > 0
     ? trimmedExplicit
     : parseAgentIdFromSessionKey(sessionKey)) || "main";
+}
+
+function resolveSourceFromSessionKey(sessionKey: string | undefined): string {
+  const trimmed = sessionKey?.trim() ?? "";
+  const match = /^agent:[^:]+:([^:]+)/.exec(trimmed);
+  const source = match?.[1]?.trim();
+  return source || "unknown";
 }
 
 function summarizeAgentEndMessages(messages: unknown[]): string {
@@ -862,31 +871,48 @@ function extractTextFromToolResult(result: unknown): string {
   }
 }
 
+function summarizeRecentConversationMessages(
+  messages: readonly unknown[],
+  messageCount: number,
+): string | null {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+
+  const recent: string[] = [];
+  for (let index = messages.length - 1; index >= 0 && recent.length < messageCount; index--) {
+    const raw = messages[index];
+    if (!raw || typeof raw !== "object") continue;
+
+    const msg = raw as Record<string, unknown>;
+    const role = typeof msg.role === "string" ? msg.role : "";
+    if (role !== "user" && role !== "assistant") continue;
+
+    const text = extractTextContent(msg.content);
+    if (!text || shouldSkipReflectionMessage(role, text)) continue;
+
+    recent.push(`${role}: ${redactSecrets(text)}`);
+  }
+
+  if (recent.length === 0) return null;
+  recent.reverse();
+  return recent.join("\n");
+}
+
 async function readSessionConversationForReflection(filePath: string, messageCount: number): Promise<string | null> {
   try {
     const lines = (await readFile(filePath, "utf-8")).trim().split("\n");
-    const messages: string[] = [];
+    const messages: unknown[] = [];
 
     for (const line of lines) {
       try {
         const entry = JSON.parse(line);
         if (entry?.type !== "message" || !entry?.message) continue;
-
-        const msg = entry.message as Record<string, unknown>;
-        const role = typeof msg.role === "string" ? msg.role : "";
-        if (role !== "user" && role !== "assistant") continue;
-
-        const text = extractTextContent(msg.content);
-        if (!text || shouldSkipReflectionMessage(role, text)) continue;
-
-        messages.push(`${role}: ${redactSecrets(text)}`);
+        messages.push(entry.message);
       } catch {
         // ignore JSON parse errors
       }
     }
 
-    if (messages.length === 0) return null;
-    return messages.slice(-messageCount).join("\n");
+    return summarizeRecentConversationMessages(messages, messageCount);
   } catch {
     return null;
   }
@@ -2273,7 +2299,10 @@ const memoryLanceDBProPlugin = {
             );
           }
 
-          const autoRecallMaxItems = clampInt(config.autoRecallMaxItems ?? 3, 1, 20);
+          const configMaxItems = clampInt(config.autoRecallMaxItems ?? 3, 1, 20);
+          const maxPerTurn = clampInt(config.maxRecallPerTurn ?? 10, 1, 50);
+          // maxRecallPerTurn acts as a hard ceiling on top of autoRecallMaxItems (#345)
+          const autoRecallMaxItems = Math.min(configMaxItems, maxPerTurn);
           const autoRecallMaxChars = clampInt(config.autoRecallMaxChars ?? 600, 64, 8000);
           const autoRecallPerItemMaxChars = clampInt(config.autoRecallPerItemMaxChars ?? 180, 32, 1000);
           const retrieveLimit = clampInt(Math.max(autoRecallMaxItems * 2, autoRecallMaxItems), 1, 20);
@@ -2491,6 +2520,10 @@ const memoryLanceDBProPlugin = {
               `${memoryContext}\n` +
               `[END UNTRUSTED DATA]\n` +
               `</relevant-memories>`,
+            // Mark as ephemeral so the host framework's compaction logic can
+            // safely discard injected memory blocks instead of persisting them
+            // into the session transcript (#345).
+            ephemeral: true,
           };
         };
 
@@ -2511,6 +2544,22 @@ const memoryLanceDBProPlugin = {
         } catch (err) {
           clearTimeout(timeoutId);
           api.logger.warn(`memory-lancedb-pro: recall failed: ${String(err)}`);
+        }
+      }, { priority: 10 });
+
+      // Clean up auto-recall session state on session end to prevent unbounded
+      // growth of recallHistory and turnCounter Maps (#345).
+      api.on("session_end", (_event: any, ctx: any) => {
+        const sessionId = ctx?.sessionId || "";
+        if (sessionId) {
+          recallHistory.delete(sessionId);
+          turnCounter.delete(sessionId);
+          lastRawUserMessage.delete(sessionId);
+        }
+        // Also clean by channelId/conversationId if present (shared cache key)
+        const cacheKey = ctx?.channelId || ctx?.conversationId || "";
+        if (cacheKey && cacheKey !== sessionId) {
+          lastRawUserMessage.delete(cacheKey);
         }
       }, { priority: 10 });
     }
@@ -2820,7 +2869,11 @@ const memoryLanceDBProPlugin = {
                     l2_content: text,
                     source_session: (event as any).sessionKey || "unknown",
                     source: "auto-capture",
-                    state: "pending",
+                    // Write "confirmed" so auto-recall governance filter accepts
+                    // these memories immediately. Previously "pending" caused a
+                    // deadlock where auto-captured memories could never be
+                    // auto-recalled (see #350).
+                    state: "confirmed",
                     memory_layer: "working",
                     injected_count: 0,
                     bad_recall_count: 0,
@@ -3394,121 +3447,108 @@ const memoryLanceDBProPlugin = {
     if (config.sessionStrategy === "systemSessionMemory") {
       const sessionMessageCount = config.sessionMemory?.messageCount ?? 15;
 
-      api.registerHook("command:new", async (event) => {
-        try {
-          api.logger.debug("session-memory: hook triggered for /new command");
+      const storeSystemSessionSummary = async (params: {
+        agentId: string;
+        defaultScope: string;
+        sessionKey: string;
+        sessionId: string;
+        source: string;
+        sessionContent: string;
+        timestampMs?: number;
+      }) => {
+        const now = new Date(params.timestampMs ?? Date.now());
+        const dateStr = now.toISOString().split("T")[0];
+        const timeStr = now.toISOString().split("T")[1].split(".")[0];
+        const memoryText = [
+          `Session: ${dateStr} ${timeStr} UTC`,
+          `Session Key: ${params.sessionKey}`,
+          `Session ID: ${params.sessionId}`,
+          `Source: ${params.source}`,
+          "",
+          "Conversation Summary:",
+          params.sessionContent,
+        ].join("\n");
 
-          const context = (event.context || {}) as Record<string, unknown>;
-          const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
+        const vector = await embedder.embedPassage(memoryText);
+        await store.store({
+          text: memoryText,
+          vector,
+          category: "fact",
+          scope: params.defaultScope,
+          importance: 0.5,
+          metadata: stringifySmartMetadata(
+            buildSmartMetadata(
+              {
+                text: `Session summary for ${dateStr}`,
+                category: "fact",
+                importance: 0.5,
+                timestamp: Date.now(),
+              },
+              {
+                l0_abstract: `Session summary for ${dateStr}`,
+                l1_overview: `- Session summary saved for ${params.sessionId}`,
+                l2_content: memoryText,
+                memory_category: "patterns",
+                tier: "peripheral",
+                confidence: 0.5,
+                type: "session-summary",
+                sessionKey: params.sessionKey,
+                sessionId: params.sessionId,
+                date: dateStr,
+                agentId: params.agentId,
+                scope: params.defaultScope,
+              },
+            ),
+          ),
+        });
+
+        api.logger.info(
+          `session-memory: stored session summary for ${params.sessionId} (agent: ${params.agentId}, scope: ${params.defaultScope})`
+        );
+      };
+
+      api.on("before_reset", async (event, ctx) => {
+        if (event.reason !== "new") return;
+
+        try {
+          const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
           const agentId = resolveHookAgentId(
-            (event.agentId as string) || (context.agentId as string) || undefined,
-            sessionKey || (context.sessionKey as string) || undefined,
+            typeof ctx.agentId === "string" ? ctx.agentId : undefined,
+            sessionKey,
           );
           const defaultScope = isSystemBypassId(agentId)
             ? config.scopes?.default ?? "global"
             : scopeManager.getDefaultScope(agentId);
-          const workspaceDir = resolveWorkspaceDirFromContext(context);
-          const cfg = context.cfg;
-          const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<string, unknown>;
-          const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
-          let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
-          const source = typeof context.commandSource === "string" ? context.commandSource : "unknown";
+          const currentSessionId =
+            typeof ctx.sessionId === "string" && ctx.sessionId.trim().length > 0
+              ? ctx.sessionId
+              : "unknown";
+          const source = resolveSourceFromSessionKey(sessionKey);
+          const sessionContent =
+            summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount) ??
+            (typeof event.sessionFile === "string"
+              ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount)
+              : null);
 
-          if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
-            const searchDirs = resolveReflectionSessionSearchDirs({
-              context,
-              cfg,
-              workspaceDir,
-              currentSessionFile,
-              sourceAgentId: agentId,
-            });
-
-            for (const sessionsDir of searchDirs) {
-              const recovered = await findPreviousSessionFile(
-                sessionsDir,
-                currentSessionFile,
-                currentSessionId,
-              );
-              if (recovered) {
-                currentSessionFile = recovered;
-                api.logger.debug(`session-memory: recovered session file: ${recovered}`);
-                break;
-              }
-            }
-          }
-
-          if (!currentSessionFile) {
-            api.logger.debug("session-memory: no session file found, skipping");
-            return;
-          }
-
-          const sessionContent = await readSessionConversationWithResetFallback(
-            currentSessionFile,
-            sessionMessageCount,
-          );
           if (!sessionContent) {
             api.logger.debug("session-memory: no session content found, skipping");
             return;
           }
 
-          const now = new Date(typeof event.timestamp === "number" ? event.timestamp : Date.now());
-          const dateStr = now.toISOString().split("T")[0];
-          const timeStr = now.toISOString().split("T")[1].split(".")[0];
-          const memoryText = [
-            `Session: ${dateStr} ${timeStr} UTC`,
-            `Session Key: ${sessionKey}`,
-            `Session ID: ${currentSessionId}`,
-            `Source: ${source}`,
-            "",
-            "Conversation Summary:",
+          await storeSystemSessionSummary({
+            agentId,
+            defaultScope,
+            sessionKey,
+            sessionId: currentSessionId,
+            source,
             sessionContent,
-          ].join("\n");
-
-          const vector = await embedder.embedPassage(memoryText);
-          await store.store({
-            text: memoryText,
-            vector,
-            category: "fact",
-            scope: defaultScope,
-            importance: 0.5,
-            metadata: stringifySmartMetadata(
-              buildSmartMetadata(
-                {
-                  text: `Session summary for ${dateStr}`,
-                  category: "fact",
-                  importance: 0.5,
-                  timestamp: Date.now(),
-                },
-                {
-                  l0_abstract: `Session summary for ${dateStr}`,
-                  l1_overview: `- Session summary saved for ${currentSessionId}`,
-                  l2_content: memoryText,
-                  memory_category: "patterns",
-                  tier: "peripheral",
-                  confidence: 0.5,
-                  type: "session-summary",
-                  sessionKey,
-                  sessionId: currentSessionId,
-                  date: dateStr,
-                  agentId,
-                  scope: defaultScope,
-                },
-              ),
-            ),
           });
-
-          api.logger.info(
-            `session-memory: stored session summary for ${currentSessionId} (agent: ${agentId}, scope: ${defaultScope})`
-          );
         } catch (err) {
           api.logger.warn(`session-memory: failed to save: ${String(err)}`);
         }
-      }, {
-        name: "memory-lancedb-pro-session-memory",
-        description: "Store /new session summaries in LanceDB memory",
       });
 
-      api.logger.info("session-memory: hook registered for command:new as memory-lancedb-pro-session-memory");
+      api.logger.info("session-memory: typed before_reset hook registered for /new session summaries");
     }
     if (config.sessionStrategy === "none") {
       api.logger.info("session-strategy: using none (plugin memory-reflection hooks disabled)");
@@ -3784,6 +3824,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecallMaxItems: parsePositiveInt(cfg.autoRecallMaxItems) ?? 3,
     autoRecallMaxChars: parsePositiveInt(cfg.autoRecallMaxChars) ?? 600,
     autoRecallPerItemMaxChars: parsePositiveInt(cfg.autoRecallPerItemMaxChars) ?? 180,
+    maxRecallPerTurn: parsePositiveInt(cfg.maxRecallPerTurn) ?? 10,
     captureAssistant: cfg.captureAssistant === true,
     retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null ? cfg.retrieval as any : undefined,
     decay: typeof cfg.decay === "object" && cfg.decay !== null ? cfg.decay as any : undefined,
