@@ -84,7 +84,10 @@ interface PluginConfig {
     apiKey: string | string[];
     model?: string;
     baseURL?: string;
+    /** Internal schema/validation dimension (LanceDB + local checks). */
     dimensions?: number;
+    /** Optional provider request dimension (dimensions/output_dimension). */
+    requestDimensions?: number;
     omitDimensions?: boolean;
     taskQuery?: string;
     taskPassage?: string;
@@ -1639,7 +1642,10 @@ const memoryLanceDBProPlugin = {
       apiKey: config.embedding.apiKey,
       model: config.embedding.model || "text-embedding-3-small",
       baseURL: config.embedding.baseURL,
+      // Internal dimension for local schema/validation checks.
       dimensions: config.embedding.dimensions,
+      // Optional request hint sent to providers that support variable dimensions.
+      requestDimensions: config.embedding.requestDimensions,
       omitDimensions: config.embedding.omitDimensions,
       taskQuery: config.embedding.taskQuery,
       taskPassage: config.embedding.taskPassage,
@@ -3776,6 +3782,8 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       // Accept number, numeric string, or env-var string (e.g. "${EMBED_DIM}").
       // Also accept legacy top-level `dimensions` for convenience.
       dimensions: parsePositiveInt(embedding.dimensions ?? cfg.dimensions),
+      // Request dimension is intentionally separate from internal schema sizing.
+      requestDimensions: parsePositiveInt(embedding.requestDimensions),
       omitDimensions:
         typeof embedding.omitDimensions === "boolean"
           ? embedding.omitDimensions

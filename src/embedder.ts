@@ -90,7 +90,10 @@ export interface EmbeddingConfig {
   apiKey: string | string[];
   model: string;
   baseURL?: string;
+  /** Internal vector dimension for schema/validation. This does NOT imply sending API dimensions. */
   dimensions?: number;
+  /** Optional API request output dimension for providers that support variable dimensions. */
+  requestDimensions?: number;
 
   /** Optional task type for query embeddings (e.g. "retrieval.query") */
   taskQuery?: string;
@@ -428,7 +431,8 @@ export class Embedder {
     this._taskQuery = config.taskQuery;
     this._taskPassage = config.taskPassage;
     this._normalized = config.normalized;
-    this._requestDimensions = config.dimensions;
+    // Request-side dimension hint is isolated from internal schema dimension.
+    this._requestDimensions = config.requestDimensions;
     this._omitDimensions = config.omitDimensions === true;
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
@@ -472,6 +476,7 @@ export class Embedder {
       console.log(`[memory-lancedb-pro] Initialized ${this.clients.length} API keys for round-robin rotation`);
     }
 
+    // Internal dimension remains the single source of truth for local validation.
     this.dimensions = getVectorDimensions(config.model, config.dimensions);
     this._cache = new EmbeddingCache(256, 30); // 256 entries, 30 min TTL
   }

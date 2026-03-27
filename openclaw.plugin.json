@@ -46,6 +46,11 @@
             "type": "integer",
             "minimum": 1
           },
+          "requestDimensions": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional output dimension sent to embedding API requests only (for providers supporting variable dimensions)"
+          },
           "omitDimensions": {
             "type": "boolean",
             "description": "When true, omit the dimensions parameter from embedding requests even if dimensions is configured"
