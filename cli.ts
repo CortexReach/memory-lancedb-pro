@@ -4,15 +4,16 @@
 
 import type { Command } from "commander";
 import { readFileSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import * as readline from "node:readline";
 import JSON5 from "json5";
 import { loadLanceDB, type MemoryEntry, type MemoryStore } from "./src/store.js";
 import { createRetriever, type MemoryRetriever } from "./src/retriever.js";
-import type { MemoryScopeManager } from "./src/scopes.js";
+import { isSystemBypassId, type MemoryScopeManager } from "./src/scopes.js";
 import type { MemoryMigrator } from "./src/migrate.js";
+import { storeReflectionToLanceDB } from "./src/reflection-store.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
 import type { LlmClient } from "./src/llm-client.js";
 import {
@@ -48,6 +49,30 @@ interface CLIContext {
   };
 }
 
+type ReflectionRecoveryBundle = {
+  version: 1;
+  eventId: string;
+  promptHash: string;
+  action: string;
+  createdAt: string;
+  sessionKey: string;
+  sessionId: string;
+  sessionFile?: string;
+  agentId: string;
+  reflectionRunAgentId: string;
+  workspaceDir: string;
+  conversation: string;
+  embeddedError?: string;
+  fallbackReflectionPath?: string;
+  toolErrorSignals?: Array<{
+    at?: number;
+    toolName?: string;
+    summary?: string;
+    source?: string;
+    signatureHash?: string;
+  }>;
+};
+
 // ============================================================================
 // Utility Functions
 // ============================================================================
@@ -65,6 +90,344 @@ function getPluginVersion(): string {
 function clampInt(value: number, min: number, max: number): number {
   const n = Number.isFinite(value) ? value : min;
   return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+function clipText(value: string, maxLen: number): string {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  if (normalized.length <= maxLen) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLen - 3))}...`;
+}
+
+function parseWorkerIntervalSeconds(rawValue: unknown, fallback = 60): number {
+  const parsed = typeof rawValue === "string" ? Number.parseInt(rawValue, 10) : Number.NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return clampInt(parsed, 1, 86_400);
+}
+
+function parseReflectionRecoveryBundle(raw: string): ReflectionRecoveryBundle {
+  const parsed = JSON.parse(raw) as ReflectionRecoveryBundle;
+  if (!parsed || typeof parsed !== "object") throw new Error("bundle is not an object");
+  if (!parsed.eventId || !parsed.workspaceDir || !parsed.sessionId || !parsed.agentId || !parsed.createdAt) {
+    throw new Error("bundle missing required fields");
+  }
+  if (typeof parsed.conversation !== "string" || parsed.conversation.trim().length === 0) {
+    throw new Error("bundle conversation is empty");
+  }
+  return parsed;
+}
+
+function buildReflectionSupersedeNote(outRelPath: string, timestampIso: string): string {
+  const timeHms = timestampIso.split("T")[1]?.replace("Z", "")?.split(".")[0] || timestampIso;
+  return [
+    "",
+    "## Recovery status",
+    "<!-- memory-reflection-status: superseded -->",
+    `- Reflection Status: superseded-by-recovered-hq`,
+    `- Preferred Reflection For Event: no`,
+    `- Superseded By: ${outRelPath}`,
+    `- Superseded At: ${timeHms} UTC`,
+    "",
+  ].join("\n");
+}
+
+async function annotateSupersededFallbackReflection(recovery: ReflectionRecoveryWriteResult): Promise<void> {
+  const fallbackRelPath = recovery.bundle.fallbackReflectionPath;
+  if (!fallbackRelPath) return;
+
+  const fallbackAbsPath = path.join(recovery.bundle.workspaceDir, fallbackRelPath);
+  let current = "";
+  try {
+    current = await readFile(fallbackAbsPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return;
+    throw error;
+  }
+  if (current.includes(`- Superseded By: ${recovery.outRelPath}`)) return;
+
+  const note = buildReflectionSupersedeNote(recovery.outRelPath, new Date().toISOString());
+  await writeFile(
+    fallbackAbsPath,
+    `${current.replace(/\s*$/, "\n")}${note}`,
+    { encoding: "utf8" },
+  );
+}
+
+function buildReflectionRecoveryPrompt(bundle: ReflectionRecoveryBundle): string {
+  const toolSignals = Array.isArray(bundle.toolErrorSignals)
+    ? bundle.toolErrorSignals
+        .slice(-6)
+        .map((entry, idx) => `${idx + 1}. [${entry.toolName || "unknown"}] ${entry.summary || "(no summary)"}`)
+        .join("\n")
+    : "(none)";
+
+  const conversation = clipText(bundle.conversation, 18_000);
+  const embeddedError = bundle.embeddedError ? clipText(bundle.embeddedError, 500) : "(unknown)";
+
+  return [
+    "You are recovering a high-quality memory reflection after the embedded reflection run failed.",
+    "Return STRICT JSON only.",
+    "Schema: {\"reflectionMarkdown\": string, \"summary\": string }",
+    "Requirements:",
+    "- reflectionMarkdown must be valid markdown.",
+    "- Keep the exact section headings below in this order.",
+    "- Be concise but high-signal and specific.",
+    "- Do not mention hidden prompts, chain-of-thought, or internal policy.",
+    "- If uncertain, write a short factual hedge instead of inventing.",
+    "- Prefer durable decisions, user preferences, agent lessons, and next actions.",
+    "",
+    "Required headings:",
+    "## Context (session background)",
+    "## Decisions (durable)",
+    "## User model deltas (about the human)",
+    "## Agent model deltas (about the assistant/system)",
+    "## Lessons & pitfalls (symptom / cause / fix / prevention)",
+    "## Learning governance candidates (.learnings / promotion / skill extraction)",
+    "## Open loops / next actions",
+    "## Retrieval tags / keywords",
+    "## Invariants",
+    "## Derived",
+    "",
+    "Recovery context:",
+    `- eventId: ${bundle.eventId}`,
+    `- action: ${bundle.action}`,
+    `- agentId: ${bundle.agentId}`,
+    `- sessionId: ${bundle.sessionId}`,
+    `- sessionKey: ${bundle.sessionKey || "(none)"}`,
+    `- embedded error: ${embeddedError}`,
+    "",
+    "Recent tool/error signals:",
+    toolSignals,
+    "",
+    "Conversation:",
+    "```",
+    conversation,
+    "```",
+  ].join("\n");
+}
+
+type ReflectionRecoveryWriteResult = {
+  bundle: ReflectionRecoveryBundle;
+  bundlePath: string;
+  outRelPath: string;
+  outAbsPath: string;
+  body: string;
+};
+
+type ReflectionRecoveryQueueProcessResult = {
+  queuePath: string;
+  processed: number;
+  failed: number;
+  total: number;
+};
+
+async function generateReflectionRecoveryFromBundle(
+  context: CLIContext,
+  bundlePath: string,
+): Promise<ReflectionRecoveryWriteResult> {
+  if (!context.llmClient) {
+    throw new Error("LLM client is not configured for this plugin; reflection recovery is unavailable.");
+  }
+
+  const resolvedBundlePath = path.resolve(String(bundlePath));
+  const raw = await readFile(resolvedBundlePath, "utf8");
+  const bundle = parseReflectionRecoveryBundle(raw);
+  const prompt = buildReflectionRecoveryPrompt(bundle);
+  const result = await context.llmClient.completeJson<{ reflectionMarkdown?: string; summary?: string }>(
+    prompt,
+    "reflection-recover",
+  );
+
+  const reflectionMarkdown = typeof result?.reflectionMarkdown === "string"
+    ? result.reflectionMarkdown.trim()
+    : "";
+  if (!reflectionMarkdown) {
+    const detail = context.llmClient.getLastError?.() || "LLM returned no reflectionMarkdown";
+    throw new Error(detail);
+  }
+
+  const createdAt = new Date(bundle.createdAt);
+  const dateStr = Number.isNaN(createdAt.getTime())
+    ? new Date().toISOString().split("T")[0]
+    : createdAt.toISOString().split("T")[0];
+  const sessionToken = bundle.sessionId.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 80) || "session";
+  const outRelPath = path.join("memory", "reflections", dateStr, `${bundle.eventId}-${sessionToken}-recovered-hq.md`);
+  const outAbsPath = path.join(bundle.workspaceDir, outRelPath);
+  const header = [
+    `# Reflection Recovery: ${bundle.createdAt}`,
+    "<!-- memory-reflection-status: final-preferred -->",
+    "",
+    `- Event ID: ${bundle.eventId}`,
+    `- Command: ${bundle.action}`,
+    `- Agent ID: ${bundle.agentId}`,
+    `- Session ID: ${bundle.sessionId}`,
+    `- Session Key: ${bundle.sessionKey || "(none)"}`,
+    `- Reflection Status: final-recovered-hq`,
+    `- Preferred Reflection For Event: yes`,
+    `- Supersedes Reflection: ${bundle.fallbackReflectionPath || "(unknown)"}`,
+    `- Recovery Source: ${resolvedBundlePath}`,
+    `- Embedded Error: ${bundle.embeddedError || "(unknown)"}`,
+    typeof result?.summary === "string" && result.summary.trim() ? `- Recovery Summary: ${result.summary.trim()}` : "",
+    "",
+  ].filter(Boolean).join("\n");
+  const body = `${header}${reflectionMarkdown.endsWith("\n") ? reflectionMarkdown : `${reflectionMarkdown}\n`}`;
+
+  return {
+    bundle,
+    bundlePath: resolvedBundlePath,
+    outRelPath,
+    outAbsPath,
+    body,
+  };
+}
+
+async function storeRecoveredReflectionInLanceDB(
+  context: CLIContext,
+  recovery: ReflectionRecoveryWriteResult,
+): Promise<boolean> {
+  if (!context.embedder) return false;
+
+  const targetScope = isSystemBypassId(recovery.bundle.agentId)
+    ? "global"
+    : context.scopeManager.getDefaultScope(recovery.bundle.agentId || undefined);
+  const createdAt = new Date(recovery.bundle.createdAt);
+  const runAt = Number.isNaN(createdAt.getTime()) ? Date.now() : createdAt.getTime();
+  const toolErrorSignals = Array.isArray(recovery.bundle.toolErrorSignals)
+    ? recovery.bundle.toolErrorSignals
+        .map((signal) => ({ signatureHash: typeof signal.signatureHash === "string" ? signal.signatureHash : "" }))
+        .filter((signal) => signal.signatureHash.length > 0)
+    : [];
+
+  const stored = await storeReflectionToLanceDB({
+    reflectionText: recovery.body,
+    sessionKey: recovery.bundle.sessionKey || "",
+    sessionId: recovery.bundle.sessionId,
+    agentId: recovery.bundle.agentId,
+    command: recovery.bundle.action,
+    scope: targetScope,
+    toolErrorSignals,
+    runAt,
+    usedFallback: false,
+    eventId: recovery.bundle.eventId,
+    sourceReflectionPath: recovery.outRelPath,
+    writeLegacyCombined: true,
+    embedPassage: (text) => context.embedder!.embedPassage(text),
+    vectorSearch: (vector, limit, minScore, scopeFilter) =>
+      context.store.vectorSearch(vector, limit, minScore, scopeFilter),
+    store: (entry) => context.store.store(entry),
+  });
+
+  return stored.stored;
+}
+
+async function writeReflectionRecoveryResult(
+  context: CLIContext,
+  recovery: ReflectionRecoveryWriteResult,
+  options?: { force?: boolean; archiveBundle?: boolean },
+): Promise<void> {
+  await mkdir(path.dirname(recovery.outAbsPath), { recursive: true });
+  await writeFile(recovery.outAbsPath, recovery.body, { encoding: "utf8", flag: options?.force ? "w" : "wx" });
+  await annotateSupersededFallbackReflection(recovery);
+
+  let lancedbStored = false;
+  try {
+    lancedbStored = await storeRecoveredReflectionInLanceDB(context, recovery);
+  } catch (error) {
+    console.warn(`Reflection recovery LanceDB store skipped: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const createdAt = new Date(recovery.bundle.createdAt);
+  const dateStr = Number.isNaN(createdAt.getTime())
+    ? new Date().toISOString().split("T")[0]
+    : createdAt.toISOString().split("T")[0];
+  const dailyPath = path.join(recovery.bundle.workspaceDir, "memory", `${dateStr}.md`);
+  await mkdir(path.dirname(dailyPath), { recursive: true });
+  await writeFile(dailyPath, "", { encoding: "utf8", flag: "a" });
+  const timeHms = new Date().toISOString().split("T")[1].replace("Z", "").split(".")[0];
+  await writeFile(
+    dailyPath,
+    `- [${timeHms} UTC] Reflection recovery generated: \`${recovery.outRelPath}\` (source: \`${recovery.bundlePath}\`)${lancedbStored ? " [LanceDB stored]" : ""}\n`,
+    { encoding: "utf8", flag: "a" },
+  );
+
+  if (!options?.archiveBundle) return;
+
+  const queueRoot = path.join(recovery.bundle.workspaceDir, "memory", "reflection-recovery-queue");
+  const bundleDir = path.dirname(recovery.bundlePath);
+  const relativeDir = path.relative(queueRoot, bundleDir);
+  if (relativeDir.startsWith("..") || path.isAbsolute(relativeDir)) return;
+
+  const archiveDir = path.join(recovery.bundle.workspaceDir, "memory", "reflection-recovery-queue-processed", relativeDir);
+  await mkdir(archiveDir, { recursive: true });
+  await rename(recovery.bundlePath, path.join(archiveDir, path.basename(recovery.bundlePath)));
+}
+
+async function listReflectionRecoveryBundles(queuePath: string): Promise<string[]> {
+  const resolvedQueuePath = path.resolve(queuePath);
+  let entries;
+  try {
+    entries = await readdir(resolvedQueuePath, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+
+  const bundles: string[] = [];
+  for (const entry of entries) {
+    const absPath = path.join(resolvedQueuePath, entry.name);
+    if (entry.isDirectory()) {
+      const childEntries = await readdir(absPath, { withFileTypes: true });
+      for (const child of childEntries) {
+        if (child.isFile() && child.name.endsWith(".json")) {
+          bundles.push(path.join(absPath, child.name));
+        }
+      }
+      continue;
+    }
+    if (entry.isFile() && entry.name.endsWith(".json")) {
+      bundles.push(absPath);
+    }
+  }
+  return bundles.sort();
+}
+
+async function processReflectionRecoveryQueue(
+  context: CLIContext,
+  queuePath: string,
+  options?: { force?: boolean; keepBundles?: boolean },
+): Promise<ReflectionRecoveryQueueProcessResult> {
+  if (!context.llmClient) {
+    throw new Error("LLM client is not configured for this plugin; reflection recovery is unavailable.");
+  }
+
+  const resolvedQueuePath = path.resolve(queuePath);
+  const bundlePaths = await listReflectionRecoveryBundles(resolvedQueuePath);
+  let processed = 0;
+  let failed = 0;
+
+  for (const bundleFile of bundlePaths) {
+    try {
+      const recovery = await generateReflectionRecoveryFromBundle(context, bundleFile);
+      await writeReflectionRecoveryResult(context, recovery, {
+        force: Boolean(options?.force),
+        archiveBundle: !options?.keepBundles,
+      });
+      processed += 1;
+      console.log(`processed\t${bundleFile}\t${recovery.outRelPath}`);
+    } catch (error) {
+      failed += 1;
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`failed\t${bundleFile}\t${message}`);
+    }
+  }
+
+  return {
+    queuePath: resolvedQueuePath,
+    processed,
+    failed,
+    total: bundlePaths.length,
+  };
 }
 
 function resolveOpenClawConfigPath(explicit?: string): string {
@@ -463,6 +826,127 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .description("Print plugin version")
     .action(() => {
       console.log(getPluginVersion());
+    });
+
+  memory
+    .command("reflection-recover <bundlePath>")
+    .description("Consume a queued reflection recovery bundle and generate a high-quality replacement reflection")
+    .option("--write", "Write the recovered reflection into the workspace instead of stdout")
+    .option("--force", "Overwrite the recovered reflection file if it already exists")
+    .action(async (bundlePath, options) => {
+      try {
+        const recovery = await generateReflectionRecoveryFromBundle(context, String(bundlePath));
+
+        if (!options.write) {
+          console.log(recovery.body);
+          return;
+        }
+
+        await writeReflectionRecoveryResult(context, recovery, { force: Boolean(options.force) });
+        console.log(recovery.outRelPath);
+      } catch (error) {
+        console.error("Reflection recovery failed:", error);
+        process.exit(1);
+      }
+    });
+
+  memory
+    .command("reflection-recover-queue [queuePath]")
+    .description("Process queued reflection recovery bundles and write recovered reflections into the workspace")
+    .option("--force", "Overwrite recovered reflection files if they already exist")
+    .option("--keep-bundles", "Keep processed queue bundles in place instead of archiving them")
+    .action(async (queuePath, options) => {
+      try {
+        const resolvedQueuePath = path.resolve(
+          typeof queuePath === "string" && queuePath.trim()
+            ? queuePath.trim()
+            : path.join(process.cwd(), "memory", "reflection-recovery-queue"),
+        );
+        const result = await processReflectionRecoveryQueue(context, resolvedQueuePath, {
+          force: Boolean(options.force),
+          keepBundles: Boolean(options.keepBundles),
+        });
+        if (result.total === 0) {
+          console.log(`No reflection recovery bundles found in ${result.queuePath}`);
+          return;
+        }
+
+        console.log(
+          `reflection-recover-queue complete: processed=${result.processed} failed=${result.failed} queue=${result.queuePath}`,
+        );
+        if (result.failed > 0) process.exit(1);
+      } catch (error) {
+        console.error("Reflection recovery queue failed:", error);
+        process.exit(1);
+      }
+    });
+
+  memory
+    .command("reflection-recover-worker [queuePath]")
+    .description("Watch the reflection recovery queue and repeatedly process queued bundles")
+    .option("--force", "Overwrite recovered reflection files if they already exist")
+    .option("--keep-bundles", "Keep processed queue bundles in place instead of archiving them")
+    .option("--interval <seconds>", "Polling interval in seconds for watch mode", "60")
+    .option("--once", "Run a single queue scan and exit")
+    .action(async (queuePath, options) => {
+      try {
+        const resolvedQueuePath = path.resolve(
+          typeof queuePath === "string" && queuePath.trim()
+            ? queuePath.trim()
+            : path.join(process.cwd(), "memory", "reflection-recovery-queue"),
+        );
+        const intervalSeconds = parseWorkerIntervalSeconds(options.interval, 60);
+
+        if (options.once) {
+          const result = await processReflectionRecoveryQueue(context, resolvedQueuePath, {
+            force: Boolean(options.force),
+            keepBundles: Boolean(options.keepBundles),
+          });
+          if (result.total === 0) {
+            console.log(`reflection-recover-worker idle: queue=${result.queuePath}`);
+            return;
+          }
+          console.log(
+            `reflection-recover-worker once: processed=${result.processed} failed=${result.failed} queue=${result.queuePath}`,
+          );
+          if (result.failed > 0) process.exit(1);
+          return;
+        }
+
+        let stopping = false;
+        const stop = () => {
+          stopping = true;
+        };
+        process.on("SIGINT", stop);
+        process.on("SIGTERM", stop);
+
+        console.log(`reflection-recover-worker watching: queue=${resolvedQueuePath} interval=${intervalSeconds}s`);
+
+        while (!stopping) {
+          const result = await processReflectionRecoveryQueue(context, resolvedQueuePath, {
+            force: Boolean(options.force),
+            keepBundles: Boolean(options.keepBundles),
+          });
+
+          if (result.total === 0) {
+            console.log(`reflection-recover-worker idle: queue=${result.queuePath}`);
+          } else {
+            console.log(
+              `reflection-recover-worker tick: processed=${result.processed} failed=${result.failed} queue=${result.queuePath}`,
+            );
+          }
+
+          if (stopping) break;
+          await sleep(intervalSeconds * 1000);
+        }
+
+        process.removeListener("SIGINT", stop);
+        process.removeListener("SIGTERM", stop);
+        console.log("reflection-recover-worker stopped");
+      } catch (error) {
+        console.error("Reflection recovery worker failed:", error);
+        process.exit(1);
+      }
     });
 
   const auth = memory

@@ -97,6 +97,7 @@ export function buildReflectionStorePayloads(params: BuildReflectionStorePayload
 
   if (params.writeLegacyCombined !== false && (slices.invariants.length > 0 || slices.derived.length > 0)) {
     payloads.push(buildLegacyCombinedPayload({
+      eventId,
       slices,
       scope: params.scope,
       sessionKey: params.sessionKey,
@@ -114,6 +115,7 @@ export function buildReflectionStorePayloads(params: BuildReflectionStorePayload
 }
 
 function buildLegacyCombinedPayload(params: {
+  eventId: string;
   slices: ReflectionSlices;
   sessionKey: string;
   sessionId: string;
@@ -147,6 +149,7 @@ function buildLegacyCombinedPayload(params: {
       type: "memory-reflection",
       stage: "reflect-store",
       reflectionVersion: 3,
+      eventId: params.eventId,
       sessionKey: params.sessionKey,
       sessionId: params.sessionId,
       agentId: params.agentId,
@@ -251,9 +254,10 @@ export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlice
 
   const itemRows = reflectionRows.filter(({ metadata }) => metadata.type === "memory-reflection-item");
   const legacyRows = reflectionRows.filter(({ metadata }) => metadata.type === "memory-reflection");
+  const finalizedEventIds = collectPreferredReflectionEventIds(itemRows, legacyRows);
 
-  const invariantCandidates = buildInvariantCandidates(itemRows, legacyRows);
-  const derivedCandidates = buildDerivedCandidates(itemRows, legacyRows);
+  const invariantCandidates = buildInvariantCandidates(itemRows, legacyRows, finalizedEventIds);
+  const derivedCandidates = buildDerivedCandidates(itemRows, legacyRows, finalizedEventIds);
 
   const invariants = rankReflectionLines(invariantCandidates, {
     now,
@@ -278,11 +282,13 @@ type WeightedLineCandidate = {
   baseWeight: number;
   quality: number;
   usedFallback: boolean;
+  eventId?: string;
 };
 
 function buildInvariantCandidates(
   itemRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>,
-  legacyRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>
+  legacyRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>,
+  finalizedEventIds: Set<string>,
 ): WeightedLineCandidate[] {
   const itemCandidates = itemRows
     .filter(({ metadata }) => metadata.itemKind === "invariant")
@@ -293,6 +299,10 @@ function buildInvariantCandidates(
 
       const defaults = getReflectionItemDecayDefaults("invariant");
       const timestamp = metadataTimestamp(metadata, entry.timestamp);
+      const eventId = reflectionEventId(metadata);
+      if (metadata.usedFallback === true && eventId && finalizedEventIds.has(eventId)) {
+        return [];
+      }
       return safeLines.map((line) => ({
         line,
         timestamp,
@@ -301,6 +311,7 @@ function buildInvariantCandidates(
         baseWeight: readPositiveNumber(metadata.baseWeight, defaults.baseWeight),
         quality: readClampedNumber(metadata.quality, defaults.quality, 0.2, 1),
         usedFallback: metadata.usedFallback === true,
+        eventId,
       }));
     });
 
@@ -310,6 +321,10 @@ function buildInvariantCandidates(
     const defaults = getReflectionItemDecayDefaults("invariant");
     const timestamp = metadataTimestamp(metadata, entry.timestamp);
     const lines = sanitizeInjectableReflectionLines(toStringArray(metadata.invariants));
+    const eventId = reflectionEventId(metadata);
+    if (metadata.usedFallback === true && eventId && finalizedEventIds.has(eventId)) {
+      return [];
+    }
     return lines.map((line) => ({
       line,
       timestamp,
@@ -318,13 +333,15 @@ function buildInvariantCandidates(
       baseWeight: defaults.baseWeight,
       quality: defaults.quality,
       usedFallback: metadata.usedFallback === true,
+      eventId,
     }));
   });
 }
 
 function buildDerivedCandidates(
   itemRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>,
-  legacyRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>
+  legacyRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>,
+  finalizedEventIds: Set<string>,
 ): WeightedLineCandidate[] {
   const itemCandidates = itemRows
     .filter(({ metadata }) => metadata.itemKind === "derived")
@@ -335,6 +352,10 @@ function buildDerivedCandidates(
 
       const defaults = getReflectionItemDecayDefaults("derived");
       const timestamp = metadataTimestamp(metadata, entry.timestamp);
+      const eventId = reflectionEventId(metadata);
+      if (metadata.usedFallback === true && eventId && finalizedEventIds.has(eventId)) {
+        return [];
+      }
       return safeLines.map((line) => ({
         line,
         timestamp,
@@ -343,6 +364,7 @@ function buildDerivedCandidates(
         baseWeight: readPositiveNumber(metadata.baseWeight, defaults.baseWeight),
         quality: readClampedNumber(metadata.quality, defaults.quality, 0.2, 1),
         usedFallback: metadata.usedFallback === true,
+        eventId,
       }));
     });
 
@@ -352,6 +374,11 @@ function buildDerivedCandidates(
     const timestamp = metadataTimestamp(metadata, entry.timestamp);
     const lines = sanitizeInjectableReflectionLines(toStringArray(metadata.derived));
     if (lines.length === 0) return [];
+
+    const eventId = reflectionEventId(metadata);
+    if (metadata.usedFallback === true && eventId && finalizedEventIds.has(eventId)) {
+      return [];
+    }
 
     const defaults = {
       midpointDays: REFLECTION_DERIVE_LOGISTIC_MIDPOINT_DAYS,
@@ -368,8 +395,28 @@ function buildDerivedCandidates(
       baseWeight: readPositiveNumber(metadata.deriveBaseWeight, defaults.baseWeight),
       quality: readClampedNumber(metadata.deriveQuality, defaults.quality, 0.2, 1),
       usedFallback: metadata.usedFallback === true,
+      eventId,
     }));
   });
+}
+
+function collectPreferredReflectionEventIds(
+  itemRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>,
+  legacyRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>,
+): Set<string> {
+  const preferred = new Set<string>();
+  for (const { metadata } of [...itemRows, ...legacyRows]) {
+    const eventId = reflectionEventId(metadata);
+    if (!eventId) continue;
+    if (metadata.usedFallback === true) continue;
+    preferred.add(eventId);
+  }
+  return preferred;
+}
+
+function reflectionEventId(metadata: Record<string, unknown>): string | undefined {
+  const value = typeof metadata.eventId === "string" ? metadata.eventId.trim() : "";
+  return value || undefined;
 }
 
 function rankReflectionLines(
