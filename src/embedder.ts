@@ -621,10 +621,30 @@ export class Embedder {
   }
 
   /** Wrap a single embedding operation with a global timeout via AbortSignal. */
-  private withTimeout<T>(promiseFactory: (signal: AbortSignal) => Promise<T>, _label: string): Promise<T> {
+  private withTimeout<T>(promiseFactory: (signal: AbortSignal) => Promise<T>, _label: string, externalSignal?: AbortSignal): Promise<T> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), EMBED_TIMEOUT_MS);
-    return promiseFactory(controller.signal).finally(() => clearTimeout(timeoutId));
+
+    // If caller passes an external signal, merge it with the internal timeout controller.
+    // Either signal aborting will cancel the promise.
+    let unsubscribe: (() => void) | undefined;
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        clearTimeout(timeoutId);
+        return Promise.reject(externalSignal.reason ?? new Error("aborted"));
+      }
+      const handler = () => {
+        controller.abort();
+        clearTimeout(timeoutId);
+      };
+      externalSignal.addEventListener("abort", handler, { once: true });
+      unsubscribe = () => externalSignal.removeEventListener("abort", handler);
+    }
+
+    return promiseFactory(controller.signal).finally(() => {
+      clearTimeout(timeoutId);
+      unsubscribe?.();
+    });
   }
 
   // --------------------------------------------------------------------------
@@ -650,24 +670,24 @@ export class Embedder {
   // Task-aware API
   // --------------------------------------------------------------------------
 
-  async embedQuery(text: string): Promise<number[]> {
-    return this.withTimeout((signal) => this.embedSingle(text, this._taskQuery, 0, signal), "embedQuery");
+  async embedQuery(text: string, signal?: AbortSignal): Promise<number[]> {
+    return this.withTimeout((sig) => this.embedSingle(text, this._taskQuery, 0, sig), "embedQuery", signal);
   }
 
-  async embedPassage(text: string): Promise<number[]> {
-    return this.withTimeout((signal) => this.embedSingle(text, this._taskPassage, 0, signal), "embedPassage");
+  async embedPassage(text: string, signal?: AbortSignal): Promise<number[]> {
+    return this.withTimeout((sig) => this.embedSingle(text, this._taskPassage, 0, sig), "embedPassage", signal);
   }
 
   // Note: embedBatchQuery/embedBatchPassage are NOT wrapped with withTimeout because
   // they handle multiple texts in a single API call. The timeout would fire after
   // EMBED_TIMEOUT_MS regardless of how many texts succeed. Individual text embedding
   // within the batch is protected by the SDK's own timeout handling.
-  async embedBatchQuery(texts: string[]): Promise<number[][]> {
-    return this.embedMany(texts, this._taskQuery);
+  async embedBatchQuery(texts: string[], signal?: AbortSignal): Promise<number[][]> {
+    return this.embedMany(texts, this._taskQuery, signal);
   }
 
-  async embedBatchPassage(texts: string[]): Promise<number[][]> {
-    return this.embedMany(texts, this._taskPassage);
+  async embedBatchPassage(texts: string[], signal?: AbortSignal): Promise<number[][]> {
+    return this.embedMany(texts, this._taskPassage, signal);
   }
 
   // --------------------------------------------------------------------------
@@ -836,7 +856,7 @@ export class Embedder {
     }
   }
 
-  private async embedMany(texts: string[], task?: string): Promise<number[][]> {
+  private async embedMany(texts: string[], task?: string, signal?: AbortSignal): Promise<number[][]> {
     if (!texts || texts.length === 0) {
       return [];
     }
@@ -858,7 +878,8 @@ export class Embedder {
 
     try {
       const response = await this.embedWithRetry(
-        this.buildPayload(validTexts, task)
+        this.buildPayload(validTexts, task),
+        signal,
       );
 
       // Create result array with proper length
@@ -899,7 +920,7 @@ export class Embedder {
 
               // Embed all chunks in parallel, then average.
               const embeddings = await Promise.all(
-                chunkResult.chunks.map((chunk) => this.embedSingle(chunk, task))
+                chunkResult.chunks.map((chunk) => this.embedSingle(chunk, task, 0, signal))
               );
 
               const avgEmbedding = embeddings.reduce(
