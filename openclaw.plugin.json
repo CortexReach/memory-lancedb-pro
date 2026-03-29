@@ -867,6 +867,12 @@
       "help": "Override vector dimensions for custom models not in the built-in lookup table",
       "advanced": true
     },
+    "embedding.requestDimensions": {
+      "label": "Request Dimensions",
+      "placeholder": "unset (do not send)",
+      "help": "Optional output dimension sent to the embedding API request only (dimensions/output_dimension depending on provider). If unset, no request dimension field is sent.",
+      "advanced": true
+    },
     "embedding.omitDimensions": {
       "label": "Omit Request Dimensions",
       "help": "Do not send the dimensions parameter to the embedding API even if embedding.dimensions is configured. Useful for local models like Qwen3-Embedding that reject the field.",
