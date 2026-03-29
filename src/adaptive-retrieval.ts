@@ -78,9 +78,9 @@ export function shouldSkipRetrieval(query: string, minLength?: number): boolean 
 
   // Too short to be meaningful
   // 含数字的字符串（如端口号 8080、issue 号 #123）携带语义信息，豁免长度截断
-  const hasCJKEarly = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(trimmed);
+  const hasCJK = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(trimmed);
   const hasDigit = /\d/.test(trimmed);
-  if (!hasDigit && trimmed.length < (hasCJKEarly ? 2 : 5)) return true;
+  if (!hasDigit && trimmed.length < (hasCJK ? 2 : 5)) return true;
 
   // Skip if matches any skip pattern
   if (SKIP_PATTERNS.some(p => p.test(trimmed))) return true;
@@ -94,7 +94,6 @@ export function shouldSkipRetrieval(query: string, minLength?: number): boolean 
   // Skip very short non-question messages (likely commands or affirmations)
   // CJK characters carry more meaning per character, so use a lower threshold
   // 含数字的字符串豁免此规则（端口号、issue 号等均属有语义内容）
-  const hasCJK = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(trimmed);
   const defaultMinLength = hasCJK ? 3 : 13;
   if (!hasDigit && trimmed.length < defaultMinLength && !trimmed.includes('?') && !trimmed.includes('？')) return true;
 
