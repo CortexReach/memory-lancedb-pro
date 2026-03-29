@@ -10,14 +10,14 @@ const SKIP_PATTERNS = [
   // Greetings & pleasantries
   /^(hi|hello|hey|good\s*(morning|afternoon|evening|night)|greetings|yo|sup|howdy|what'?s up)\b/i,
   // System/bot commands
-  /^\//,  // slash commands
+  /^\/[a-z][\w-]*\s*$/i,  // slash commands like /help, /recall
   /^(run|build|test|ls|cd|git|npm|pip|docker|curl|cat|grep|find|make|sudo)\b/i,
   // Simple affirmations/negations
   /^(yes|no|yep|nope|ok|okay|sure|fine|thanks|thank you|thx|ty|got it|understood|cool|nice|great|good|perfect|awesome|👍|👎|✅|❌)\s*[.!]?$/i,
   // Continuation prompts
   /^(go ahead|continue|proceed|do it|start|begin|next|实施|實施|开始|開始|继续|繼續|好的|可以|行)\s*[.!]?$/i,
   // Pure emoji
-  /^[\p{Emoji}\s]+$/u,
+  /^[\p{Extended_Pictographic}\u200d\ufe0f\s]+$/u,
   // Heartbeat/system (match anywhere, not just at start, to handle prefixed formats)
   /HEARTBEAT/i,
   /^\[System/i,
@@ -72,10 +72,15 @@ export function shouldSkipRetrieval(query: string, minLength?: number): boolean 
 
   // Force retrieve if query has memory-related intent (checked FIRST,
   // before length check, so short CJK queries like "你记得吗" aren't skipped)
-  if (FORCE_RETRIEVE_PATTERNS.some(p => p.test(trimmed))) return false;
+  // 注意：slash 命令（如 /recall）优先走 SKIP 路径，不走 FORCE 路径
+  const isSlashCmd = /^\/[a-z][\w-]*\s*$/i.test(trimmed);
+  if (!isSlashCmd && FORCE_RETRIEVE_PATTERNS.some(p => p.test(trimmed))) return false;
 
   // Too short to be meaningful
-  if (trimmed.length < 5) return true;
+  // 含数字的字符串（如端口号 8080、issue 号 #123）携带语义信息，豁免长度截断
+  const hasCJKEarly = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(trimmed);
+  const hasDigit = /\d/.test(trimmed);
+  if (!hasDigit && trimmed.length < (hasCJKEarly ? 2 : 5)) return true;
 
   // Skip if matches any skip pattern
   if (SKIP_PATTERNS.some(p => p.test(trimmed))) return true;
@@ -88,9 +93,10 @@ export function shouldSkipRetrieval(query: string, minLength?: number): boolean 
 
   // Skip very short non-question messages (likely commands or affirmations)
   // CJK characters carry more meaning per character, so use a lower threshold
+  // 含数字的字符串豁免此规则（端口号、issue 号等均属有语义内容）
   const hasCJK = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(trimmed);
-  const defaultMinLength = hasCJK ? 6 : 15;
-  if (trimmed.length < defaultMinLength && !trimmed.includes('?') && !trimmed.includes('？')) return true;
+  const defaultMinLength = hasCJK ? 3 : 13;
+  if (!hasDigit && trimmed.length < defaultMinLength && !trimmed.includes('?') && !trimmed.includes('？')) return true;
 
   // Default: do retrieve
   return false;
