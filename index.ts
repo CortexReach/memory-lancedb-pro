@@ -2562,11 +2562,11 @@ const memoryLanceDBProPlugin = {
     // Auto-capture: analyze and store important information after agent ends
     if (config.autoCapture !== false) {
       type AgentEndAutoCaptureHook = {
-        (event: any, ctx: any): void;
+        (event: any, ctx: any): Promise<void> | void;
         __lastRun?: Promise<void>;
       };
 
-      const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = (event, ctx) => {
+      const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = async (event, ctx) => {
         if (!event.success || !event.messages || event.messages.length === 0) {
           return;
         }
@@ -2898,7 +2898,20 @@ const memoryLanceDBProPlugin = {
         }
         })();
         agentEndAutoCaptureHook.__lastRun = backgroundRun;
-        void backgroundRun;
+
+        // Await backgroundRun with timeout to prevent process-exit race
+        // condition in CLI one-shot mode.  OpenClaw core calls runAgentEnd()
+        // fire-and-forget (.catch() only), so this await does NOT block
+        // session locks or channel deliveries (see Issue #260).
+        // The 15s timeout is a safety net for hung API calls.
+        try {
+          await Promise.race([
+            backgroundRun,
+            new Promise<void>(resolve => setTimeout(resolve, 15_000)),
+          ]);
+        } catch {
+          // Errors already logged inside backgroundRun
+        }
       };
 
       api.on("agent_end", agentEndAutoCaptureHook);
