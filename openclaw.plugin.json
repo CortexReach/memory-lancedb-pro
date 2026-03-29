@@ -34,7 +34,7 @@
                 "minItems": 1
               }
             ],
-            "description": "Single API key or array of keys for round-robin rotation"
+            "description": "Single API key or array of keys for round-robin rotation. Supports ${ENV_VAR} and bws://<secret-id> Bitwarden secret references."
           },
           "model": {
             "type": "string"
@@ -307,7 +307,7 @@
           },
           "rerankApiKey": {
             "type": "string",
-            "description": "API key for reranker service (enables cross-encoder reranking)"
+            "description": "API key for reranker service (enables cross-encoder reranking). Supports ${ENV_VAR} and bws://<secret-id> Bitwarden secret references."
           },
           "rerankModel": {
             "type": "string",
@@ -676,7 +676,8 @@
             "description": "LLM authentication mode. oauth uses the local Codex/ChatGPT login cache instead of llm.apiKey."
           },
           "apiKey": {
-            "type": "string"
+            "type": "string",
+            "description": "LLM API key. Supports ${ENV_VAR} and bws://<secret-id> Bitwarden secret references."
           },
           "model": {
             "type": "string",
@@ -842,8 +843,8 @@
     "embedding.apiKey": {
       "label": "API Key(s)",
       "sensitive": true,
-      "placeholder": "sk-proj-... or [\"key1\", \"key2\"] for rotation",
-      "help": "Single API key or array of keys for round-robin rotation with automatic failover on rate limits (or use ${OPENAI_API_KEY}; use a dummy value for keyless local endpoints)"
+      "placeholder": "sk-proj-... or bws://<secret-id> or [\"key1\", \"key2\"]",
+      "help": "Single API key or array of keys for round-robin rotation with automatic failover on rate limits. Supports ${OPENAI_API_KEY} and bws://<secret-id> Bitwarden refs. Use a dummy value for keyless local endpoints."
     },
     "embedding.model": {
       "label": "Embedding Model",
@@ -902,8 +903,8 @@
     "llm.apiKey": {
       "label": "LLM API Key",
       "sensitive": true,
-      "placeholder": "sk-... or ${GROQ_API_KEY}",
-      "help": "API key for LLM used by smart memory extraction (defaults to embedding.apiKey if omitted)"
+      "placeholder": "sk-... or ${GROQ_API_KEY} or bws://<secret-id>",
+      "help": "API key for LLM used by smart memory extraction (defaults to embedding.apiKey if omitted). Supports Bitwarden bws:// refs."
     },
     "llm.model": {
       "label": "LLM Model",
@@ -1062,8 +1063,8 @@
     "retrieval.rerankApiKey": {
       "label": "Reranker API Key",
       "sensitive": true,
-      "placeholder": "jina_... / sk-... / pcsk_...",
-      "help": "Reranker API key for cross-encoder reranking",
+      "placeholder": "jina_... / sk-... / pcsk_... / bws://<secret-id>",
+      "help": "Reranker API key for cross-encoder reranking. Supports Bitwarden bws:// refs.",
       "advanced": true
     },
     "retrieval.rerankModel": {

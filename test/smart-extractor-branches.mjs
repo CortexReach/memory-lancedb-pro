@@ -268,7 +268,7 @@ async function runScenario(mode) {
       `http://127.0.0.1:${port}`,
       logs,
     );
-    plugin.register(api);
+    await plugin.register(api);
     await seedPreference(dbPath);
 
     await runAgentEndHook(
@@ -450,7 +450,7 @@ async function runMultiRoundScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
-    plugin.register(api);
+    await plugin.register(api);
 
     const rounds = [
       ["最近我在调整饮品偏好。", "我喜欢乌龙茶。", "这条偏好以后都有效。", "请记住。"],
@@ -549,7 +549,7 @@ async function runInjectedRecallScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
-    plugin.register(api);
+    await plugin.register(api);
 
     await runAgentEndHook(
       api,
@@ -643,7 +643,7 @@ async function runPrependedRecallWithUserTextScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
-    plugin.register(api);
+    await plugin.register(api);
 
     await runAgentEndHook(
       api,
@@ -735,7 +735,7 @@ async function runInboundMetadataWrappedScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
-    plugin.register(api);
+    await plugin.register(api);
 
     await runAgentEndHook(
       api,
@@ -791,7 +791,7 @@ async function runSessionDeltaScenario() {
       "http://127.0.0.1:9",
       logs,
     );
-    plugin.register(api);
+    await plugin.register(api);
 
     await runAgentEndHook(
       api,
@@ -855,7 +855,7 @@ async function runPendingIngressScenario() {
       "http://127.0.0.1:9",
       logs,
     );
-    plugin.register(api);
+    await plugin.register(api);
 
     await api.hooks.message_received(
       { from: "discord:channel:1", content: "@jige_claw_bot 我的饮品偏好是乌龙茶" },
@@ -911,7 +911,7 @@ async function runRememberCommandContextScenario() {
       "http://127.0.0.1:9",
       logs,
     );
-    plugin.register(api);
+    await plugin.register(api);
 
     await api.hooks.message_received(
       { from: "discord:channel:1", content: "@jige_claw_bot 我的饮品偏好是乌龙茶" },
@@ -1036,7 +1036,7 @@ async function runUserMdExclusiveProfileScenario() {
         enabled: true,
       },
     };
-    plugin.register(api);
+    await plugin.register(api);
 
     await runAgentEndHook(
       api,
@@ -1134,7 +1134,7 @@ async function runBoundarySkipKeepsRegexFallbackScenario() {
         enabled: true,
       },
     };
-    plugin.register(api);
+    await plugin.register(api);
 
     await runAgentEndHook(
       api,
@@ -1236,7 +1236,7 @@ async function runInboundMetadataCleanupScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
-    plugin.register(api);
+    await plugin.register(api);
 
     await runAgentEndHook(
       api,

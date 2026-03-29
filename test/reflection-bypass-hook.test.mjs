@@ -114,7 +114,7 @@ async function invokeReflectionHooks({ workDir, agentId, explicitAgentId = agent
     pluginConfig,
   });
 
-  memoryLanceDBProPlugin.register(harness.api);
+  await memoryLanceDBProPlugin.register(harness.api);
 
   const promptHooks = harness.eventHandlers.get("before_prompt_build") || [];
 
