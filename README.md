@@ -462,6 +462,7 @@ Query → BM25 FTS ─────┘
   },
   "smartExtraction": true,
   "llm": {
+    "api": "openai-completions",
     "apiKey": "${OPENAI_API_KEY}",
     "model": "gpt-4o-mini",
     "baseURL": "https://api.openai.com/v1"
@@ -509,13 +510,21 @@ Any Jina-compatible rerank endpoint also works — set `rerankProvider: "jina"` 
 
 When `smartExtraction` is enabled (default: `true`), the plugin uses an LLM to intelligently extract and classify memories instead of regex-based triggers.
 
+Sensitive config fields support both `${ENV_VAR}` interpolation and direct Bitwarden Secrets Manager refs via `bws://<secret-id>`:
+
+- `embedding.apiKey`
+- `llm.apiKey`
+- `retrieval.rerankApiKey`
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `smartExtraction` | boolean | `true` | Enable/disable LLM-powered 6-category extraction |
+| `llm.api` | string | `openai-completions` | `openai-completions` uses OpenAI-compatible chat completions; `anthropic-messages` uses Anthropic-compatible `/v1/messages` |
 | `llm.auth` | string | `api-key` | `api-key` uses `llm.apiKey` / `embedding.apiKey`; `oauth` uses a plugin-scoped OAuth token file by default |
 | `llm.apiKey` | string | *(falls back to `embedding.apiKey`)* | API key for the LLM provider |
 | `llm.model` | string | `openai/gpt-oss-120b` | LLM model name |
 | `llm.baseURL` | string | *(falls back to `embedding.baseURL`)* | LLM API endpoint |
+| `llm.anthropicVersion` | string | `2023-06-01` | `anthropic-version` header used when `llm.api = anthropic-messages` |
 | `llm.oauthProvider` | string | `openai-codex` | OAuth provider id used when `llm.auth` is `oauth` |
 | `llm.oauthPath` | string | `~/.openclaw/.memory-lancedb-pro/oauth.json` | OAuth token file used when `llm.auth` is `oauth` |
 | `llm.timeoutMs` | number | `30000` | LLM request timeout in milliseconds |
@@ -527,6 +536,7 @@ OAuth `llm` config (use existing Codex / ChatGPT login cache for LLM calls):
 ```json
 {
   "llm": {
+    "api": "openai-completions",
     "auth": "oauth",
     "oauthProvider": "openai-codex",
     "model": "gpt-5.4",
@@ -538,11 +548,26 @@ OAuth `llm` config (use existing Codex / ChatGPT login cache for LLM calls):
 
 Notes for `llm.auth: "oauth"`:
 
+- OAuth currently requires `llm.api: "openai-completions"`.
 - `llm.oauthProvider` is currently `openai-codex`.
 - OAuth tokens default to `~/.openclaw/.memory-lancedb-pro/oauth.json`.
 - You can set `llm.oauthPath` if you want to store that file somewhere else.
 - `auth login` snapshots the previous api-key `llm` config next to the OAuth file, and `auth logout` restores that snapshot when available.
 - Switching from `api-key` to `oauth` does not automatically carry over `llm.baseURL`. Set it manually in OAuth mode only when you intentionally want a custom ChatGPT/Codex-compatible backend.
+
+Anthropic-compatible `llm` config:
+```json
+{
+  "llm": {
+    "api": "anthropic-messages",
+    "apiKey": "bws://YOUR-BWS-SECRET-UUID",
+    "model": "claude-sonnet-4-5",
+    "baseURL": "https://api.anthropic.com/v1",
+    "anthropicVersion": "2023-06-01",
+    "timeoutMs": 30000
+  }
+}
+```
 
 </details>
 

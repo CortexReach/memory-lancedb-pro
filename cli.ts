@@ -109,10 +109,12 @@ function resolveConfiguredOauthPath(configPath: string, rawPath: unknown): strin
 }
 
 type RestorableApiKeyLlmConfig = {
+  api?: "openai-completions" | "anthropic-messages";
   auth?: "api-key";
   apiKey?: string;
   model?: string;
   baseURL?: string;
+  anthropicVersion?: string;
   timeoutMs?: number;
 };
 
@@ -136,6 +138,9 @@ function extractRestorableApiKeyLlmConfig(value: unknown): RestorableApiKeyLlmCo
   }
 
   const result: RestorableApiKeyLlmConfig = {};
+  if (value.api === "openai-completions" || value.api === "anthropic-messages") {
+    result.api = value.api;
+  }
   if (value.auth === "api-key") {
     result.auth = "api-key";
   }
@@ -147,6 +152,9 @@ function extractRestorableApiKeyLlmConfig(value: unknown): RestorableApiKeyLlmCo
   }
   if (typeof value.baseURL === "string") {
     result.baseURL = value.baseURL;
+  }
+  if (typeof value.anthropicVersion === "string") {
+    result.anthropicVersion = value.anthropicVersion;
   }
   if (typeof value.timeoutMs === "number" && Number.isFinite(value.timeoutMs) && value.timeoutMs > 0) {
     result.timeoutMs = Math.trunc(value.timeoutMs);
@@ -160,6 +168,7 @@ function extractOauthSafeLlmConfig(value: unknown): RestorableApiKeyLlmConfig {
   }
 
   const result: RestorableApiKeyLlmConfig = {};
+  result.api = "openai-completions";
   if (typeof value.baseURL === "string") {
     result.baseURL = value.baseURL;
   }
@@ -540,6 +549,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         }
         pluginConfig.llm = {
           ...nextLlm,
+          api: "openai-completions",
           auth: "oauth",
           oauthProvider: selectedProvider.providerId,
           model: oauthModel,
@@ -589,6 +599,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
 
         console.log(`Config file: ${configPath}`);
         console.log(`Plugin: ${pluginId}`);
+        console.log(`llm.api: ${typeof llm.api === "string" ? llm.api : "openai-completions"}`);
         console.log(`llm.auth: ${typeof llm.auth === "string" ? llm.auth : "api-key"}`);
         console.log(`llm.oauthProvider: ${oauthProviderDisplay}`);
         console.log(`llm.model: ${typeof llm.model === "string" ? llm.model : "openai/gpt-oss-120b"}`);

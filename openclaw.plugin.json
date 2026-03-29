@@ -666,6 +666,15 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "api": {
+            "type": "string",
+            "enum": [
+              "openai-completions",
+              "anthropic-messages"
+            ],
+            "default": "openai-completions",
+            "description": "LLM API format. openai-completions for OpenAI-compatible endpoints, anthropic-messages for Anthropic /v1/messages."
+          },
           "auth": {
             "type": "string",
             "enum": [
@@ -676,7 +685,8 @@
             "description": "LLM authentication mode. oauth uses the local Codex/ChatGPT login cache instead of llm.apiKey."
           },
           "apiKey": {
-            "type": "string"
+            "type": "string",
+            "description": "LLM API key. Supports ${ENV_VAR} and bws://<secret-id> Bitwarden secret references."
           },
           "model": {
             "type": "string",
@@ -684,6 +694,11 @@
           },
           "baseURL": {
             "type": "string"
+          },
+          "anthropicVersion": {
+            "type": "string",
+            "default": "2023-06-01",
+            "description": "Anthropic API version header used when llm.api=anthropic-messages."
           },
           "oauthProvider": {
             "type": "string",
@@ -902,8 +917,13 @@
     "llm.apiKey": {
       "label": "LLM API Key",
       "sensitive": true,
-      "placeholder": "sk-... or ${GROQ_API_KEY}",
-      "help": "API key for LLM used by smart memory extraction (defaults to embedding.apiKey if omitted)"
+      "placeholder": "sk-... or ${GROQ_API_KEY} or bws://<secret-id>",
+      "help": "API key for LLM used by smart memory extraction (defaults to embedding.apiKey if omitted). Supports Bitwarden bws:// refs."
+    },
+    "llm.api": {
+      "label": "LLM API Format",
+      "help": "openai-completions for OpenAI-compatible chat endpoints, anthropic-messages for Anthropic-compatible /v1/messages endpoints.",
+      "advanced": true
     },
     "llm.model": {
       "label": "LLM Model",
@@ -913,7 +933,13 @@
     "llm.baseURL": {
       "label": "LLM Base URL",
       "placeholder": "https://api.groq.com/openai/v1",
-      "help": "OpenAI-compatible base URL for LLM (defaults to embedding.baseURL if omitted)",
+      "help": "Base URL for the configured llm.api format (defaults to embedding.baseURL if omitted for openai-completions)",
+      "advanced": true
+    },
+    "llm.anthropicVersion": {
+      "label": "Anthropic Version",
+      "placeholder": "2023-06-01",
+      "help": "Anthropic API version header used when llm.api=anthropic-messages",
       "advanced": true
     },
     "extractMinMessages": {
@@ -1292,7 +1318,7 @@
     },
     "llm.auth": {
       "label": "LLM Auth",
-      "help": "api-key uses llm.apiKey or embedding.apiKey. oauth uses a plugin-scoped OAuth token file by default.",
+      "help": "api-key uses llm.apiKey or embedding.apiKey. oauth uses a plugin-scoped OAuth token file by default and only supports llm.api=openai-completions.",
       "advanced": true
     },
     "llm.oauthProvider": {

@@ -163,10 +163,12 @@ interface PluginConfig {
   // Smart extraction config
   smartExtraction?: boolean;
   llm?: {
+    api?: "openai-completions" | "anthropic-messages";
     auth?: "api-key" | "oauth";
     apiKey?: string;
     model?: string;
     baseURL?: string;
+    anthropicVersion?: string;
     oauthProvider?: string;
     oauthPath?: string;
     timeoutMs?: number;
@@ -1705,11 +1707,14 @@ const memoryLanceDBProPlugin = {
           : undefined;
         const llmTimeoutMs = resolveLlmTimeoutMs(config);
 
+        const llmApi = config.llm?.api || "openai-completions";
         const llmClient = createLlmClient({
+          api: llmApi,
           auth: llmAuth,
           apiKey: llmApiKey,
           model: llmModel,
           baseURL: llmBaseURL,
+          anthropicVersion: config.llm?.anthropicVersion,
           oauthProvider: llmOauthProvider,
           oauthPath: llmOauthPath,
           timeoutMs: llmTimeoutMs,
@@ -2206,11 +2211,14 @@ const memoryLanceDBProPlugin = {
               ? config.llm?.oauthProvider
               : undefined;
             const llmTimeoutMs = resolveLlmTimeoutMs(config);
+            const llmApi = config.llm?.api || "openai-completions";
             return createLlmClient({
+              api: llmApi,
               auth: llmAuth,
               apiKey: llmApiKey,
               model: config.llm?.model || "openai/gpt-oss-120b",
               baseURL: llmBaseURL,
+              anthropicVersion: config.llm?.anthropicVersion,
               oauthProvider: llmOauthProvider,
               oauthPath: llmOauthPath,
               timeoutMs: llmTimeoutMs,

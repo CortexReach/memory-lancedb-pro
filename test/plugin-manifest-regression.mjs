@@ -72,6 +72,10 @@ for (const key of [
 }
 
 assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "api"),
+  "configSchema should declare llm.api",
+);
+assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "auth"),
   "configSchema should declare llm.auth",
 );
@@ -82,6 +86,10 @@ assert.ok(
 assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "oauthProvider"),
   "configSchema should declare llm.oauthProvider",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "anthropicVersion"),
+  "configSchema should declare llm.anthropicVersion",
 );
 
 assert.equal(

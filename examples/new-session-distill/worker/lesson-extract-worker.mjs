@@ -15,11 +15,13 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, execFile as execFileCallback } from "node:child_process";
 import readline from "node:readline";
+import { promisify } from "node:util";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const execFile = promisify(execFileCallback);
 
 // In your deployment, set LESSON_QUEUE_ROOT to your workspace queue.
 // By default we assume repo layout similar to OpenClaw-Memory.
@@ -31,8 +33,10 @@ const PROCESSING = path.join(QUEUE_ROOT, "processing");
 const DONE = path.join(QUEUE_ROOT, "done");
 const ERROR = path.join(QUEUE_ROOT, "error");
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3-flash-preview";
+const DISTILL_API = process.env.DISTILL_API || "gemini-native";
+const DISTILL_MODEL = process.env.DISTILL_MODEL || process.env.GEMINI_MODEL || "gemini-3-flash-preview";
+const DISTILL_BASE_URL = process.env.DISTILL_BASE_URL || "";
+const DISTILL_ANTHROPIC_VERSION = process.env.DISTILL_ANTHROPIC_VERSION || "2023-06-01";
 
 const ONCE = process.argv.includes("--once");
 
@@ -63,6 +67,58 @@ function safeJsonParse(text) {
   } catch {
     return null;
   }
+}
+
+function resolveEnvVars(value) {
+  return String(value).replace(/\$\{([^}]+)\}/g, (_, envVar) => {
+    const envValue = process.env[envVar];
+    if (!envValue) {
+      throw new Error(`Environment variable ${envVar} is not set`);
+    }
+    return envValue;
+  });
+}
+
+// NOTE: This duplicates the logic in src/secret-resolver.ts (parseBitwardenSecretRef +
+// resolveBitwardenSecret). This worker is a standalone ESM script that cannot import
+// the compiled TypeScript, so the logic lives here as well.
+// IMPORTANT: If you update either copy, keep the other in sync.
+async function resolveMaybeBitwardenSecret(value) {
+  const resolved = resolveEnvVars(String(value || "").trim());
+  if (!resolved) return "";
+  if (!resolved.startsWith("bws://")) return resolved;
+
+  const parsed = new URL(resolved);
+  const secretId = `${parsed.hostname}${parsed.pathname}`.replace(/^\/+/, "").replace(/^secret\//i, "");
+  if (!secretId) throw new Error(`Invalid Bitwarden secret reference: ${resolved}`);
+
+  const args = ["secret", "get", secretId, "--output", "json"];
+  const accessToken = parsed.searchParams.get("accessToken");
+  const configFile = parsed.searchParams.get("configFile");
+  const profile = parsed.searchParams.get("profile");
+  const serverUrl = parsed.searchParams.get("serverUrl");
+  if (accessToken) args.push("--access-token", resolveEnvVars(accessToken));
+  if (configFile) args.push("--config-file", resolveEnvVars(configFile));
+  if (profile) args.push("--profile", resolveEnvVars(profile));
+  if (serverUrl) args.push("--server-url", resolveEnvVars(serverUrl));
+
+  const { stdout } = await execFile("bws", args, { timeout: 10_000 });
+  const payload = JSON.parse(stdout);
+  if (typeof payload?.value !== "string" || !payload.value.trim()) {
+    throw new Error(`Bitwarden secret ${secretId} has no value`);
+  }
+  return payload.value;
+}
+
+async function resolveDistillApiKey() {
+  const raw = process.env.DISTILL_API_KEY || process.env.GEMINI_API_KEY || "";
+  if (!raw.trim()) {
+    if (DISTILL_API === "gemini-native") {
+      throw new Error("DISTILL_API_KEY or GEMINI_API_KEY is not set");
+    }
+    throw new Error("DISTILL_API_KEY is not set");
+  }
+  return resolveMaybeBitwardenSecret(raw);
 }
 
 function normalizeText(s) {
@@ -156,9 +212,8 @@ function buildMapPrompt({ lang, chunk }) {
 }
 
 async function geminiGenerateJson(prompt) {
-  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not set");
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const apiKey = await resolveDistillApiKey();
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${DISTILL_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
   const body = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
@@ -181,6 +236,56 @@ async function geminiGenerateJson(prompt) {
 
   const text = json?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
   return text;
+}
+
+function normalizeAnthropicEndpoint(baseURL) {
+  const trimmed = String(baseURL || "").trim();
+  if (!trimmed) return "https://api.anthropic.com/v1/messages";
+  if (/\/messages\/?$/i.test(trimmed)) return trimmed;
+  return `${trimmed.replace(/\/+$/, "")}/messages`;
+}
+
+// TODO: This builds Anthropic requests independently from createAnthropicApiKeyClient
+// in src/llm-client.ts. The two implementations may diverge over time (e.g. retry
+// logic, model defaults, streaming). Consider unifying into a shared module.
+async function anthropicGenerateJson(prompt) {
+  const apiKey = await resolveDistillApiKey();
+  const res = await fetch(normalizeAnthropicEndpoint(DISTILL_BASE_URL), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": DISTILL_ANTHROPIC_VERSION,
+    },
+    body: JSON.stringify({
+      model: DISTILL_MODEL,
+      system: "You extract high-signal technical lessons. Return valid JSON only.",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 4096,
+      temperature: 0.2,
+    }),
+  });
+
+  const json = await res.json();
+  if (!res.ok) {
+    throw new Error(`Anthropic error ${res.status}: ${JSON.stringify(json).slice(0, 500)}`);
+  }
+
+  const text = Array.isArray(json?.content)
+    ? json.content
+      .filter((part) => part && part.type === "text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join("")
+    : "";
+  return text;
+}
+
+async function generateJson(prompt) {
+  if (DISTILL_API === "anthropic-messages") {
+    return anthropicGenerateJson(prompt);
+  }
+  return geminiGenerateJson(prompt);
 }
 
 function coerceLessons(obj) {
@@ -297,7 +402,7 @@ async function processTaskFile(taskPath) {
     for (let idx = 0; idx < chunks.length; idx++) {
       const prompt = buildMapPrompt({ lang, chunk: chunks[idx] });
       try {
-        const text = await geminiGenerateJson(prompt);
+        const text = await generateJson(prompt);
         const obj = safeJsonParse(text);
         if (!obj) {
           mapErrors++;

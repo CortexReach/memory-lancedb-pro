@@ -65,4 +65,57 @@ describe("LLM api-key client", () => {
     ]);
     assert.equal(requestBody.temperature, 0.1);
   });
+
+  it("uses Anthropic-compatible messages semantics when llm.api=anthropic-messages", async () => {
+    let requestHeaders;
+    let requestBody;
+
+    server = http.createServer(async (req, res) => {
+      requestHeaders = req.headers;
+
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      requestBody = JSON.parse(body);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: "msg_test",
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: "{\"memories\":[]}",
+          },
+        ],
+      }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+
+    const llm = createLlmClient({
+      api: "anthropic-messages",
+      auth: "api-key",
+      apiKey: "anthropic-test-key",
+      model: "claude-sonnet-4-5",
+      baseURL: `http://127.0.0.1:${port}/v1`,
+      anthropicVersion: "2023-06-01",
+      timeoutMs: 4321,
+    });
+
+    const result = await llm.completeJson("hello", "anthropic-probe");
+    assert.deepEqual(result, { memories: [] });
+    assert.equal(requestHeaders["x-api-key"], "anthropic-test-key");
+    assert.equal(requestHeaders["anthropic-version"], "2023-06-01");
+    assert.equal(requestBody.model, "claude-sonnet-4-5");
+    assert.equal(requestBody.system, "You are a memory extraction assistant. Always respond with valid JSON only.");
+    assert.deepEqual(requestBody.messages, [
+      {
+        role: "user",
+        content: "hello",
+      },
+    ]);
+    assert.equal(requestBody.max_tokens, 2048);
+    assert.equal(requestBody.temperature, 0.1);
+  });
 });
