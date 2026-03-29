@@ -2999,7 +2999,9 @@ const memoryLanceDBProPlugin = {
         });
       }
 
-      api.logger.info("self-improvement: integrated hooks registered (agent:bootstrap, command:new, command:reset)");
+      (isCliMode() ? api.logger.debug : api.logger.info)(
+        "self-improvement: integrated hooks registered (agent:bootstrap, command:new, command:reset)"
+      );
     }
 
     // ========================================================================
@@ -3430,7 +3432,9 @@ const memoryLanceDBProPlugin = {
         name: "memory-lancedb-pro.memory-reflection.command-reset",
         description: "Generate reflection log before /reset",
       });
-      api.logger.info("memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_prompt_build, session_end)");
+      (isCliMode() ? api.logger.debug : api.logger.info)(
+        "memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_prompt_build, session_end)"
+      );
     }
 
     if (config.sessionStrategy === "systemSessionMemory") {
