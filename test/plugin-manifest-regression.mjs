@@ -139,6 +139,7 @@ try {
     {
       dbPath: path.join(workDir, "db"),
       autoRecall: false,
+      selfImprovement: { enabled: false },
       embedding: {
         provider: "openai-compatible",
         apiKey: "dummy",
