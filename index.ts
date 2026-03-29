@@ -783,6 +783,60 @@ function buildAutoCaptureConversationKeyFromSessionKey(sessionKey: string): stri
   return suffix || null;
 }
 
+function stripAutoCaptureInjectedPrefix(role: string, text: string): string {
+  if (role !== "user") {
+    return text.trim();
+  }
+
+  let normalized = text.trim();
+  normalized = normalized.replace(/^<relevant-memories>\s*[\s\S]*?<\/relevant-memories>\s*/i, "");
+  normalized = normalized.replace(
+    /^\[UNTRUSTED DATA[^\n]*\][\s\S]*?\[END UNTRUSTED DATA\]\s*/i,
+    "",
+  );
+  // Strip entire subagent-injected prompt block (defense-in-depth).
+  // Covers: [Subagent Context] ... [Subagent Task]: ...
+  // Single regex matches from the first [Subagent Context] through the
+  // [Subagent Task] line to end-of-string, removing the full injected block.
+  normalized = normalized.replace(
+    /^\[Subagent Context\][\s\S]*?\[Subagent Task\]:\s*[\s\S]*/i,
+    "",
+  );
+  // Edge case: standalone [Subagent Task] without preceding [Subagent Context]
+  normalized = normalized.replace(
+    /^\[Subagent Task\]:\s*[\s\S]*/i,
+    "",
+  );
+  // Strip inbound metadata blocks (Sender, Conversation info, etc.) before
+  // channel-specific prefixes so that the ^ anchor can match the timestamp.
+  normalized = stripLeadingInboundMetadata(normalized);
+  // Strip channel-specific prefixes injected before plugin hooks see the text.
+  // Webchat: "[Mon 2026-03-29 07:40 PDT] actual message"
+  normalized = normalized.replace(
+    /^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?\s*(?:P[SE]T|E[SD]T|C[SD]T|M[SD]T|UTC|GMT|[A-Z]{2,5})?\]\s*/,
+    "",
+  );
+  // Feishu: "[message_id: om_xxx]\nou_xxx: actual message"  (or other sender-id prefix)
+  normalized = normalized.replace(
+    /^\[message_id:\s*[^\]]+\]\s*\n?\s*(?:ou_[a-f0-9]+|[\w.-]+):\s*/,
+    "",
+  );
+  normalized = stripAutoCaptureSessionResetPrefix(normalized);
+  normalized = stripAutoCaptureAddressingPrefix(normalized);
+  return normalized.trim();
+}
+
+/** Module-level debug logger for auto-capture helpers; set during plugin registration. */
+let _autoCaptureDebugLog: (msg: string) => void = () => { };
+
+function normalizeAutoCaptureText(role: unknown, text: string): string | null {
+  if (typeof role !== "string") return null;
+  const normalized = stripAutoCaptureInjectedPrefix(role, text);
+  if (!normalized) return null;
+  if (shouldSkipReflectionMessage(role, normalized)) return null;
+  return normalized;
+}
+
 function redactSecrets(text: string): string {
   const patterns: RegExp[] = [
     /Bearer\s+[A-Za-z0-9\-._~+/]+=*/g,
@@ -1977,7 +2031,43 @@ const memoryLanceDBProPlugin = {
     // Track how many normalized user texts have already been seen per session snapshot.
     // All three Maps are pruned to AUTO_CAPTURE_MAP_MAX_ENTRIES to prevent unbounded
     // growth in long-running processes with many distinct sessions.
-    const autoCaptureSeenTextCount = new Map<string, number>();
+    // Persisted seen-text-count sidecar path (next to the LanceDB data)
+    const autoCaptureSeenCountPath = join(resolvedDbPath, "..", "auto-capture-seen-count.json");
+
+    function loadAutoCaptureSeenCount(): Map<string, number> {
+      try {
+        const raw = readFileSync(autoCaptureSeenCountPath, "utf8");
+        const parsed = JSON.parse(raw);
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+          const map = new Map<string, number>();
+          for (const [k, v] of Object.entries(parsed)) {
+            if (typeof v === "number" && Number.isFinite(v) && v >= 0) {
+              map.set(k, v);
+            }
+          }
+          api.logger.info(`memory-lancedb-pro: restored auto-capture seen-count for ${map.size} session(s)`);
+          return map;
+        }
+      } catch {
+        // File missing or corrupt — start fresh
+      }
+      return new Map<string, number>();
+    }
+
+    let autoCaptureSeenTextCount = loadAutoCaptureSeenCount();
+
+    function persistAutoCaptureSeenCount() {
+      try {
+        const obj: Record<string, number> = {};
+        for (const [k, v] of autoCaptureSeenTextCount) {
+          obj[k] = v;
+        }
+        writeFile(autoCaptureSeenCountPath, JSON.stringify(obj), "utf8").catch(() => {});
+      } catch {
+        // Non-critical — next restart will start with stale or empty state
+      }
+    }
+
     const autoCapturePendingIngressTexts = new Map<string, string[]>();
     const autoCaptureRecentTexts = new Map<string, string[]>();
 
@@ -2581,6 +2671,15 @@ const memoryLanceDBProPlugin = {
             : scopeManager.getDefaultScope(agentId);
           const sessionKey = ctx?.sessionKey || (event as any).sessionKey || "unknown";
 
+          // Skip autoCapture for subagent sessions to prevent injected
+          // [Subagent Context] / [Subagent Task] prompts from polluting memory.
+          if (sessionKey.includes(":subagent:")) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture skipped for subagent session ${sessionKey}`,
+            );
+            return;
+          }
+
           api.logger.debug(
             `memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`,
           );
@@ -2654,6 +2753,7 @@ const memoryLanceDBProPlugin = {
           }
           autoCaptureSeenTextCount.set(sessionKey, eligibleTexts.length);
           pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          persistAutoCaptureSeenCount();
 
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
           let texts = newTexts;
