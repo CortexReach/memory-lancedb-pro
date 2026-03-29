@@ -362,7 +362,7 @@ export class MemoryStore {
         // LanceDB @lancedb/lancedb >=0.26: use Index.fts() config
         const lancedb = await loadLanceDB();
         await table.createIndex("text", {
-          config: (lancedb as any).Index.fts(),
+          config: (lancedb as any).Index.fts({ withPosition: true }),
         });
       }
     } catch (err) {
