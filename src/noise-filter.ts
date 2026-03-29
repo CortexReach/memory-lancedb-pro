@@ -37,7 +37,7 @@ const META_QUESTION_PATTERNS = [
 
 // Session boilerplate
 const BOILERPLATE_PATTERNS = [
-  /^(hi|hello|hey|good morning|good evening|greetings)/i,
+  /^(hi|hello|hey|good morning|good evening|greetings)(\s+\w+)?[!,.]?\s*$/i,
   /^fresh session/i,
   /^new session/i,
   /^HEARTBEAT/i,
@@ -73,7 +73,8 @@ export function isNoise(text: string, options: NoiseFilterOptions = {}): boolean
   const opts = { ...DEFAULT_OPTIONS, ...options };
   const trimmed = text.trim();
 
-  if (trimmed.length < 5) return true;
+  const hasCJK = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(trimmed);
+  if (trimmed.length < (hasCJK ? 2 : 5)) return true;
 
   if (opts.filterDenials && DENIAL_PATTERNS.some(p => p.test(trimmed))) return true;
   if (opts.filterMetaQuestions && META_QUESTION_PATTERNS.some(p => p.test(trimmed))) return true;
