@@ -82,7 +82,8 @@ async function resolveBitwardenSecret(
   const execImpl = options?.execFileImpl ?? execFile;
   const env = getEnv(options);
   const args = ["secret", "get", ref.id, "--output", "json"];
-  if (ref.accessToken) args.push("--access-token", ref.accessToken);
+  // Pass access token via env var to avoid exposure in process listings.
+  const childEnv = ref.accessToken ? { ...env, BWS_ACCESS_TOKEN: ref.accessToken } : env;
   if (ref.configFile) args.push("--config-file", ref.configFile);
   if (ref.profile) args.push("--profile", ref.profile);
   if (ref.serverUrl) args.push("--server-url", ref.serverUrl);
@@ -91,7 +92,7 @@ async function resolveBitwardenSecret(
   let stderr = "";
   try {
     const result = await execImpl("bws", args, {
-      env,
+      env: childEnv,
       timeout: options?.timeoutMs ?? 10_000,
     });
     stdout = result.stdout;
@@ -130,7 +131,8 @@ function resolveBitwardenSecretSync(
 ): string {
   const env = options?.env ?? process.env;
   const args = ["secret", "get", ref.id, "--output", "json"];
-  if (ref.accessToken) args.push("--access-token", ref.accessToken);
+  // Pass access token via env var to avoid exposure in process listings.
+  const childEnv = ref.accessToken ? { ...env, BWS_ACCESS_TOKEN: ref.accessToken } : env;
   if (ref.configFile) args.push("--config-file", ref.configFile);
   if (ref.profile) args.push("--profile", ref.profile);
   if (ref.serverUrl) args.push("--server-url", ref.serverUrl);
@@ -138,7 +140,7 @@ function resolveBitwardenSecretSync(
   let stdout = "";
   try {
     stdout = execFileSync("bws", args, {
-      env,
+      env: childEnv,
       timeout: options?.timeoutMs ?? 10_000,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],

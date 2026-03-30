@@ -163,6 +163,7 @@ try {
     dbPath: path.join(workDir, "db-session-default"),
     autoCapture: false,
     autoRecall: false,
+    selfImprovement: { enabled: false },
     sessionMemory: {},
     embedding: {
       provider: "openai-compatible",
@@ -183,6 +184,7 @@ try {
     dbPath: path.join(workDir, "db-session-enabled"),
     autoCapture: false,
     autoRecall: false,
+    selfImprovement: { enabled: false },
     sessionMemory: { enabled: true },
     embedding: {
       provider: "openai-compatible",

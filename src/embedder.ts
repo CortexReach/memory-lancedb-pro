@@ -449,7 +449,9 @@ export class Embedder {
   constructor(config: EmbeddingConfig & { chunking?: boolean }) {
     // Normalize apiKey to array and resolve environment variables
     const apiKeys = Array.isArray(config.apiKey) ? config.apiKey : [config.apiKey];
-    const resolvedKeys = apiKeys.map(k => resolveEnvVars(k));
+    // Skip env-var expansion for keys that have already been resolved
+    // (e.g. pre-resolved Bitwarden secrets that contain no ${} placeholders).
+    const resolvedKeys = apiKeys.map(k => k.includes("\${") ? resolveEnvVars(k) : k);
 
     this._model = config.model;
     this._baseURL = config.baseURL;

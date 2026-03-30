@@ -1615,7 +1615,7 @@ const memoryLanceDBProPlugin = {
     "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, and management CLI",
   kind: "memory" as const,
 
-  async register(api: OpenClawPluginApi) {
+  register(api: OpenClawPluginApi): Promise<void> {
     // Parse and validate configuration
     const config = parsePluginConfig(api.pluginConfig);
 
@@ -1637,31 +1637,9 @@ const memoryLanceDBProPlugin = {
       config.embedding.dimensions,
     );
 
-    // Initialize core components
+    // store, scopeManager, decayEngine, tierManager, migrator are all sync —
+    // they do not need resolved secrets and are available immediately.
     const store = new MemoryStore({ dbPath: resolvedDbPath, vectorDim });
-    const resolvedEmbeddingApiKeys = await resolveSecretValues(config.embedding.apiKey);
-    const resolvedRerankApiKey = typeof config.retrieval?.rerankApiKey === "string" && config.retrieval.rerankApiKey.trim()
-      ? await resolveSecretValue(config.retrieval.rerankApiKey)
-      : undefined;
-    const resolvedRetrievalConfig = config.retrieval
-      ? {
-        ...config.retrieval,
-        ...(resolvedRerankApiKey ? { rerankApiKey: resolvedRerankApiKey } : {}),
-      }
-      : undefined;
-    const embedder = createEmbedder({
-      provider: "openai-compatible",
-      apiKey: resolvedEmbeddingApiKeys.length === 1 ? resolvedEmbeddingApiKeys[0] : resolvedEmbeddingApiKeys,
-      model: config.embedding.model || "text-embedding-3-small",
-      baseURL: config.embedding.baseURL,
-      dimensions: config.embedding.dimensions,
-      omitDimensions: config.embedding.omitDimensions,
-      taskQuery: config.embedding.taskQuery,
-      taskPassage: config.embedding.taskPassage,
-      normalized: config.embedding.normalized,
-      chunking: config.embedding.chunking,
-    });
-    // Initialize decay engine
     const decayEngine = createDecayEngine({
       ...DEFAULT_DECAY_CONFIG,
       ...(config.decay || {}),
@@ -1670,18 +1648,160 @@ const memoryLanceDBProPlugin = {
       ...DEFAULT_TIER_CONFIG,
       ...(config.tier || {}),
     });
-    const retriever = createRetriever(
-      store,
-      embedder,
-      {
-        ...DEFAULT_RETRIEVAL_CONFIG,
-        ...resolvedRetrievalConfig,
-      },
-      { decayEngine },
-    );
     const scopeManager = createScopeManager(config.scopes);
 
-    // ClawTeam integration: extend accessible scopes via env var
+    // embedder, retriever, and smartExtractor require async secret resolution.
+    // They are initialized in initPromise and must not be used before it resolves.
+    // Every hook that uses them awaits initPromise at its top.
+    // If initPromise rejects, initFailed is set and hooks silently skip.
+    let embedder!: ReturnType<typeof createEmbedder>;
+    let retriever!: ReturnType<typeof createRetriever>;
+    let smartExtractor: SmartExtractor | null = null;
+    let llmClientForCli: import("./src/llm-client.js").LlmClient | undefined;
+    let initFailed = false;
+
+    const initPromise: Promise<void> = (async () => {
+      const resolvedEmbeddingApiKeys = await resolveSecretValues(config.embedding.apiKey);
+      const resolvedRerankApiKey = typeof config.retrieval?.rerankApiKey === "string" && config.retrieval.rerankApiKey.trim()
+        ? await resolveSecretValue(config.retrieval.rerankApiKey)
+        : undefined;
+      const resolvedRetrievalConfig = config.retrieval
+        ? {
+          ...config.retrieval,
+          ...(resolvedRerankApiKey ? { rerankApiKey: resolvedRerankApiKey } : {}),
+        }
+        : undefined;
+      embedder = createEmbedder({
+        provider: "openai-compatible",
+        apiKey: resolvedEmbeddingApiKeys.length === 1 ? resolvedEmbeddingApiKeys[0] : resolvedEmbeddingApiKeys,
+        model: config.embedding.model || "text-embedding-3-small",
+        baseURL: config.embedding.baseURL,
+        dimensions: config.embedding.dimensions,
+        omitDimensions: config.embedding.omitDimensions,
+        taskQuery: config.embedding.taskQuery,
+        taskPassage: config.embedding.taskPassage,
+        normalized: config.embedding.normalized,
+        chunking: config.embedding.chunking,
+      });
+      retriever = createRetriever(
+        store,
+        embedder,
+        {
+          ...DEFAULT_RETRIEVAL_CONFIG,
+          ...resolvedRetrievalConfig,
+        },
+        { decayEngine },
+      );
+      // Initialize smart extraction inside initPromise
+      if (config.smartExtraction !== false) {
+        try {
+          const llmAuth = config.llm?.auth || "api-key";
+          const llmApiKey = llmAuth === "oauth"
+            ? undefined
+            : config.llm?.apiKey
+              ? await resolveSecretValue(config.llm.apiKey)
+              : await resolveFirstApiKey(config.embedding.apiKey);
+          const llmBaseURL = llmAuth === "oauth"
+            ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
+            : config.llm?.baseURL
+              ? resolveEnvVars(config.llm.baseURL)
+              : config.embedding.baseURL;
+          const llmModel = config.llm?.model || "openai/gpt-oss-120b";
+          const llmOauthPath = llmAuth === "oauth"
+            ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
+            : undefined;
+          const llmOauthProvider = llmAuth === "oauth"
+            ? config.llm?.oauthProvider
+            : undefined;
+          const llmTimeoutMs = resolveLlmTimeoutMs(config);
+
+          const llmClient = createLlmClient({
+            auth: llmAuth,
+            apiKey: llmApiKey,
+            model: llmModel,
+            baseURL: llmBaseURL,
+            oauthProvider: llmOauthProvider,
+            oauthPath: llmOauthPath,
+            timeoutMs: llmTimeoutMs,
+            log: (msg: string) => api.logger.debug(msg),
+            warnLog: (msg: string) => api.logger.warn(msg),
+          });
+
+          // Initialize embedding-based noise prototype bank (async, non-blocking)
+          const noiseBank = new NoisePrototypeBank(
+            (msg: string) => api.logger.debug(msg),
+          );
+          noiseBank.init(embedder).catch((err) =>
+            api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
+          );
+
+          const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(
+            config,
+            resolvedDbPath,
+            api,
+          );
+
+          smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+            user: "User",
+            extractMinMessages: config.extractMinMessages ?? 4,
+            extractMaxChars: config.extractMaxChars ?? 8000,
+            defaultScope: config.scopes?.default ?? "global",
+            workspaceBoundary: config.workspaceBoundary,
+            admissionControl: config.admissionControl,
+            onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
+            log: (msg: string) => api.logger.info(msg),
+            debugLog: (msg: string) => api.logger.debug(msg),
+            noiseBank,
+          });
+
+          (isCliMode() ? api.logger.debug : api.logger.info)(
+            "memory-lancedb-pro: smart extraction enabled (LLM model: "
+            + llmModel
+            + ", timeoutMs: "
+            + llmTimeoutMs
+            + ", noise bank: ON)",
+          );
+        } catch (err) {
+          api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+        }
+      }
+      // Build the CLI LLM client using already-resolved secrets.
+      if (config.smartExtraction !== false) {
+        try {
+          const llmAuth = config.llm?.auth || "api-key";
+          const llmApiKey = llmAuth === "oauth"
+            ? undefined
+            : config.llm?.apiKey
+              ? await resolveSecretValue(config.llm.apiKey)
+              : await resolveFirstApiKey(config.embedding.apiKey);
+          const llmBaseURL = llmAuth === "oauth"
+            ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
+            : config.llm?.baseURL
+              ? resolveEnvVars(config.llm.baseURL)
+              : config.embedding.baseURL;
+          const llmOauthPath = llmAuth === "oauth"
+            ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
+            : undefined;
+          const llmOauthProvider = llmAuth === "oauth" ? config.llm?.oauthProvider : undefined;
+          const llmTimeoutMs = resolveLlmTimeoutMs(config);
+          llmClientForCli = createLlmClient({
+            auth: llmAuth,
+            apiKey: llmApiKey,
+            model: config.llm?.model || "openai/gpt-oss-120b",
+            baseURL: llmBaseURL,
+            oauthProvider: llmOauthProvider,
+            oauthPath: llmOauthPath,
+            timeoutMs: llmTimeoutMs,
+            log: (msg: string) => api.logger.debug(msg),
+          });
+        } catch { /* llmClientForCli stays undefined */ }
+      }
+    })().catch((err: unknown) => {
+      initFailed = true;
+      api.logger.warn(`memory-lancedb-pro: async secret init failed: ${String(err)}`);
+    });
+
+    // ClawTeam integration: extend accessible scopes via env var (sync)
     const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
     if (clawteamScopes.length > 0) {
       applyClawteamScopes(scopeManager, clawteamScopes);
@@ -1689,81 +1809,6 @@ const memoryLanceDBProPlugin = {
     }
 
     const migrator = createMigrator(store);
-
-    // Initialize smart extraction
-    let smartExtractor: SmartExtractor | null = null;
-    if (config.smartExtraction !== false) {
-      try {
-        const llmAuth = config.llm?.auth || "api-key";
-        const llmApiKey = llmAuth === "oauth"
-          ? undefined
-          : config.llm?.apiKey
-            ? await resolveSecretValue(config.llm.apiKey)
-            : await resolveFirstApiKey(config.embedding.apiKey);
-        const llmBaseURL = llmAuth === "oauth"
-          ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
-          : config.llm?.baseURL
-            ? resolveEnvVars(config.llm.baseURL)
-            : config.embedding.baseURL;
-        const llmModel = config.llm?.model || "openai/gpt-oss-120b";
-        const llmOauthPath = llmAuth === "oauth"
-          ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
-          : undefined;
-        const llmOauthProvider = llmAuth === "oauth"
-          ? config.llm?.oauthProvider
-          : undefined;
-        const llmTimeoutMs = resolveLlmTimeoutMs(config);
-
-        const llmClient = createLlmClient({
-          auth: llmAuth,
-          apiKey: llmApiKey,
-          model: llmModel,
-          baseURL: llmBaseURL,
-          oauthProvider: llmOauthProvider,
-          oauthPath: llmOauthPath,
-          timeoutMs: llmTimeoutMs,
-          log: (msg: string) => api.logger.debug(msg),
-          warnLog: (msg: string) => api.logger.warn(msg),
-        });
-
-        // Initialize embedding-based noise prototype bank (async, non-blocking)
-        const noiseBank = new NoisePrototypeBank(
-          (msg: string) => api.logger.debug(msg),
-        );
-        noiseBank.init(embedder).catch((err) =>
-          api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
-        );
-
-        const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(
-          config,
-          resolvedDbPath,
-          api,
-        );
-
-        smartExtractor = new SmartExtractor(store, embedder, llmClient, {
-          user: "User",
-          extractMinMessages: config.extractMinMessages ?? 4,
-          extractMaxChars: config.extractMaxChars ?? 8000,
-          defaultScope: config.scopes?.default ?? "global",
-          workspaceBoundary: config.workspaceBoundary,
-          admissionControl: config.admissionControl,
-          onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
-          log: (msg: string) => api.logger.info(msg),
-          debugLog: (msg: string) => api.logger.debug(msg),
-          noiseBank,
-        });
-
-        (isCliMode() ? api.logger.debug : api.logger.info)(
-          "memory-lancedb-pro: smart extraction enabled (LLM model: "
-          + llmModel
-          + ", timeoutMs: "
-          + llmTimeoutMs
-          + ", noise bank: ON)",
-        );
-      } catch (err) {
-        api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
-      }
-    }
 
     // Extraction rate limiter (Feature 7: Adaptive Extraction Throttling)
     // NOTE: This rate limiter is global — shared across all agents in multi-agent setups.
@@ -2044,18 +2089,24 @@ const memoryLanceDBProPlugin = {
     // Register Tools
     // ========================================================================
 
+    // toolContext is mutated by initPromise once secrets are resolved.
+    const toolContext = {
+      retriever: retriever as ReturnType<typeof createRetriever>,
+      store,
+      scopeManager,
+      embedder: embedder as ReturnType<typeof createEmbedder> | undefined,
+      agentId: undefined as string | undefined,
+      workspaceDir: getDefaultWorkspaceDir(),
+      mdMirror,
+      workspaceBoundary: config.workspaceBoundary,
+    };
+    initPromise.then(() => {
+      toolContext.embedder = embedder;
+      toolContext.retriever = retriever;
+    });
     registerAllMemoryTools(
       api,
-      {
-        retriever,
-        store,
-        scopeManager,
-        embedder,
-        agentId: undefined, // Will be determined at runtime from context
-        workspaceDir: getDefaultWorkspaceDir(),
-        mdMirror,
-        workspaceBoundary: config.workspaceBoundary,
-      },
+      toolContext,
       {
         enableManagementTools: config.enableManagementTools,
         enableSelfImprovementTools: config.selfImprovement?.enabled !== false,
@@ -2188,46 +2239,22 @@ const memoryLanceDBProPlugin = {
     // Register CLI Commands
     // ========================================================================
 
+    // cliContext is mutated by initPromise once secrets are resolved.
+    const cliContext = {
+      store,
+      retriever: retriever as ReturnType<typeof createRetriever>,
+      scopeManager,
+      migrator,
+      embedder: embedder as ReturnType<typeof createEmbedder> | undefined,
+      llmClient: undefined as import("./src/llm-client.js").LlmClient | undefined,
+    };
+    initPromise.then(() => {
+      cliContext.retriever = retriever;
+      cliContext.embedder = embedder;
+      cliContext.llmClient = llmClientForCli;
+    });
     api.registerCli(
-      createMemoryCLI({
-        store,
-        retriever,
-        scopeManager,
-        migrator,
-        embedder,
-        llmClient: smartExtractor ? await (async () => {
-          try {
-            const llmAuth = config.llm?.auth || "api-key";
-            const llmApiKey = llmAuth === "oauth"
-              ? undefined
-              : config.llm?.apiKey
-                ? await resolveSecretValue(config.llm.apiKey)
-                : await resolveFirstApiKey(config.embedding.apiKey);
-            const llmBaseURL = llmAuth === "oauth"
-              ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
-              : config.llm?.baseURL
-                ? resolveEnvVars(config.llm.baseURL)
-                : config.embedding.baseURL;
-            const llmOauthPath = llmAuth === "oauth"
-              ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
-              : undefined;
-            const llmOauthProvider = llmAuth === "oauth"
-              ? config.llm?.oauthProvider
-              : undefined;
-            const llmTimeoutMs = resolveLlmTimeoutMs(config);
-            return createLlmClient({
-              auth: llmAuth,
-              apiKey: llmApiKey,
-              model: config.llm?.model || "openai/gpt-oss-120b",
-              baseURL: llmBaseURL,
-              oauthProvider: llmOauthProvider,
-              oauthPath: llmOauthPath,
-              timeoutMs: llmTimeoutMs,
-              log: (msg: string) => api.logger.debug(msg),
-            });
-          } catch { return undefined; }
-        })() : undefined,
-      }),
+      createMemoryCLI(cliContext),
       { commands: ["memory-pro"] },
     );
 
@@ -2258,6 +2285,8 @@ const memoryLanceDBProPlugin = {
 
       const AUTO_RECALL_TIMEOUT_MS = parsePositiveInt(config.autoRecallTimeoutMs) ?? 5_000; // configurable; default raised from 3s to 5s for remote embedding APIs behind proxies
       api.on("before_prompt_build", async (event: any, ctx: any) => {
+        await initPromise;
+        if (initFailed) return;
         // Manually increment turn counter for this session
         const sessionId = ctx?.sessionId || "default";
 
@@ -2582,6 +2611,8 @@ const memoryLanceDBProPlugin = {
         // See: https://github.com/CortexReach/memory-lancedb-pro/issues/260
         const backgroundRun = (async () => {
         try {
+          await initPromise;
+          if (initFailed) return;
           // Feature 7: Check extraction rate limit before any work
           if (extractionRateLimiter.isRateLimited()) {
             api.logger.debug(
@@ -3098,6 +3129,8 @@ const memoryLanceDBProPlugin = {
       }, { priority: 15 });
 
       api.on("before_prompt_build", async (_event: any, ctx: any) => {
+        await initPromise;
+        if (initFailed) return;
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
         if (reflectionInjectMode !== "inheritance-only" && reflectionInjectMode !== "inheritance+derived") return;
@@ -3125,6 +3158,8 @@ const memoryLanceDBProPlugin = {
       }, { priority: 12 });
 
       api.on("before_prompt_build", async (_event: any, ctx: any) => {
+        await initPromise;
+        if (initFailed) return;
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
         const agentId = resolveHookAgentId(
@@ -3527,6 +3562,8 @@ const memoryLanceDBProPlugin = {
 
       api.on("before_reset", async (event, ctx) => {
         if (event.reason !== "new") return;
+        await initPromise;
+        if (initFailed) return;
 
         try {
           const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
@@ -3632,6 +3669,10 @@ const memoryLanceDBProPlugin = {
     api.registerService({
       id: "memory-lancedb-pro",
       start: async () => {
+        // Wait for async secret resolution before running startup checks.
+        await initPromise;
+        if (initFailed) return;
+
         // IMPORTANT: Do not block gateway startup on external network calls.
         // If embedding/retrieval tests hang (bad network / slow provider), the gateway
         // may never bind its HTTP port, causing restart timeouts.
@@ -3725,6 +3766,8 @@ const memoryLanceDBProPlugin = {
         api.logger.info("memory-lancedb-pro: stopped");
       },
     });
+
+    return initPromise;
   },
 };
 

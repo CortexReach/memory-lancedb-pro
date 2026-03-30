@@ -44,6 +44,7 @@ function createApiHarness({ dbPath, embeddingBaseURL }) {
       dbPath,
       autoCapture: false,
       autoRecall: false,
+      selfImprovement: { enabled: false },
       sessionStrategy: "systemSessionMemory",
       embedding: {
         provider: "openai-compatible",
@@ -102,7 +103,7 @@ describe("systemSessionMemory before_reset", () => {
     const api = createApiHarness({ dbPath, embeddingBaseURL });
 
     memoryLanceDBProPlugin.register(api);
-
+    // register() is sync; before_reset is available immediately.
     assert.equal(typeof api.hooks.before_reset, "function");
     assert.equal(api.hooks["command:new"], undefined);
 
