@@ -2938,7 +2938,7 @@ const memoryLanceDBProPlugin = {
         description: "Inject self-improvement reminder on agent bootstrap",
       });
 
-      if (config.selfImprovement?.beforeResetNote !== false) {
+      if (config.selfImprovement?.enabled !== false && config.selfImprovement?.beforeResetNote !== false) {
         const appendSelfImprovementNote = async (event: any) => {
           try {
             const action = String(event?.action || "unknown");
