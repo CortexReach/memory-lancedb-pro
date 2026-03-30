@@ -3808,7 +3808,25 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecallPerItemMaxChars: parsePositiveInt(cfg.autoRecallPerItemMaxChars) ?? 180,
     maxRecallPerTurn: parsePositiveInt(cfg.maxRecallPerTurn) ?? 10,
     captureAssistant: cfg.captureAssistant === true,
-    retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null ? cfg.retrieval as any : undefined,
+    retrieval:
+      typeof cfg.retrieval === "object" && cfg.retrieval !== null
+        ? (() => {
+          const retrieval = { ...(cfg.retrieval as Record<string, unknown>) } as Record<string, unknown>;
+          if (typeof retrieval.rerankApiKey === "string") {
+            retrieval.rerankApiKey = resolveEnvVars(retrieval.rerankApiKey);
+          }
+          if (typeof retrieval.rerankEndpoint === "string") {
+            retrieval.rerankEndpoint = resolveEnvVars(retrieval.rerankEndpoint);
+          }
+          if (typeof retrieval.rerankModel === "string") {
+            retrieval.rerankModel = resolveEnvVars(retrieval.rerankModel);
+          }
+          if (typeof retrieval.rerankProvider === "string") {
+            retrieval.rerankProvider = resolveEnvVars(retrieval.rerankProvider);
+          }
+          return retrieval as any;
+        })()
+        : undefined,
     decay: typeof cfg.decay === "object" && cfg.decay !== null ? cfg.decay as any : undefined,
     tier: typeof cfg.tier === "object" && cfg.tier !== null ? cfg.tier as any : undefined,
     // Smart extraction config (Phase 1)
