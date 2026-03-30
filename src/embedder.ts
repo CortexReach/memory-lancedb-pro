@@ -476,8 +476,12 @@ export class Embedder {
       console.log(`[memory-lancedb-pro] Initialized ${this.clients.length} API keys for round-robin rotation`);
     }
 
-    // Internal dimension remains the single source of truth for local validation.
-    this.dimensions = getVectorDimensions(config.model, config.dimensions);
+    // Internal dimension用于本地校验，优先使用requestDimensions（如有），否则fallback到dimensions。
+    // 这样可变维度模型（如text-embedding-3-large + requestDimensions: 1024）本地校验与API一致。
+    const effectiveDims = this._requestDimensions && this._requestDimensions > 0
+      ? this._requestDimensions
+      : config.dimensions;
+    this.dimensions = getVectorDimensions(config.model, effectiveDims);
     this._cache = new EmbeddingCache(256, 30); // 256 entries, 30 min TTL
   }
 
