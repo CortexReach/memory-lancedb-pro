@@ -438,9 +438,10 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
                   );
                   return typeof content?.text === "string" ? content.text : null;
                 } catch (parseErr) {
-                  lastError = `memory-lancedb-pro: llm-client [${label}] failed to parse OAuth response body: ${parseErr instanceof Error ? parseErr.message : String(parseErr)} (preview=${JSON.stringify(previewText(bodyText))})`;
-                  logWarn(lastError);
-                  return null;
+                  // Propagate instead of silently returning null — caller deserves diagnostics
+                  throw new Error(
+                    `failed to parse OAuth response body: ${parseErr instanceof Error ? parseErr.message : String(parseErr)} (preview=${JSON.stringify(previewText(bodyText))})`
+                  );
                 }
               })();
 
@@ -553,8 +554,13 @@ export function buildClaudeCodeEnv(
     if (k === "ANTHROPIC_API_KEY" && hasExplicitKey) continue;
     if (shouldStripClaudeCodeEnvKey(k)) continue;
     // settings.json takes precedence for auth keys to prevent stale env vars from overriding fresh tokens
+    // settings.json auth keys take precedence over ambient env vars by default.
+    // Rationale: in interactive use, settings.json typically holds the freshest OAuth
+    // token written by the Claude Code desktop app. Env vars may be stale.
+    // CI/CD override: set CLAUDE_CODE_ENV_AUTH_PRIORITY=1 to make env vars win.
     const isAuthKey = k === "ANTHROPIC_API_KEY" || k === "ANTHROPIC_AUTH_TOKEN" || k === "CLAUDE_CODE_OAUTH_TOKEN";
-    if (isAuthKey && env[k]) continue; // already set from settings.json
+    const envAuthPriority = process.env["CLAUDE_CODE_ENV_AUTH_PRIORITY"] === "1";
+    if (isAuthKey && env[k] && !envAuthPriority) continue; // settings.json wins (default)
     env[k] = v;
   }
 
@@ -603,10 +609,23 @@ function resolveClaudeExecutable(configuredPath?: string): string {
       errNode.status === 127 ||
       reason.includes("not found") ||
       reason.includes("no such file");
+    const isPermission = errNode.code === "EACCES" || errNode.code === "EPERM";
+    const isDiskFull = errNode.code === "ENOSPC";
     if (isNotFound) {
       throw new Error(
         "The 'claude' executable was not found. " +
         "Install Claude Code (npm i -g @anthropic-ai/claude-code) or set llm.claudeCodePath in your config.",
+      );
+    }
+    if (isPermission) {
+      throw new Error(
+        `Could not execute 'claude': permission denied (${errNode.code}). ` +
+        "Check file permissions or set llm.claudeCodePath to an accessible binary.",
+      );
+    }
+    if (isDiskFull) {
+      throw new Error(
+        "Could not execute 'claude': disk full (ENOSPC). Free up disk space and retry.",
       );
     }
     throw new Error(
@@ -678,7 +697,11 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
           if (isNotFound) {
             cachedSdkError = "@anthropic-ai/claude-agent-sdk is not installed. Run: npm i @anthropic-ai/claude-agent-sdk";
           } else {
-            cachedSdkError = `failed to load @anthropic-ai/claude-agent-sdk: ${importErr instanceof Error ? importErr.message : String(importErr)}`;
+            // Preserve full stack to distinguish version conflicts, permission errors, etc.
+            const detail = importErr instanceof Error
+              ? (importErr.stack ?? importErr.message)
+              : String(importErr);
+            cachedSdkError = `failed to load @anthropic-ai/claude-agent-sdk: ${detail}`;
           }
           lastError = `memory-lancedb-pro: llm-client [${label}] ${cachedSdkError}`;
           logWarn(lastError);
