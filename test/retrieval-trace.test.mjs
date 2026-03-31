@@ -126,6 +126,36 @@ describe("TraceCollector", () => {
     assert.ok(summary.includes("2"));
   });
 
+  it("finalize includes empty fallbacks array by default", () => {
+    const tc = new TraceCollector();
+    tc.startStage("vector_search", ["a"]);
+    tc.endStage(["a"], [0.9]);
+
+    const trace = tc.finalize("q", "hybrid");
+    assert.deepEqual(trace.fallbacks, []);
+  });
+
+  it("records fallback events", () => {
+    const tc = new TraceCollector();
+    tc.startStage("rerank", ["a", "b"]);
+    tc.endStage(["a", "b"], [0.9, 0.8]);
+    tc.recordFallback("rerank", "rerank-to-cosine", "timeout");
+    tc.recordFallback("rerank", "rerank-to-cosine", "status 503");
+
+    const trace = tc.finalize("q", "hybrid");
+    assert.equal(trace.fallbacks.length, 2);
+    assert.deepEqual(trace.fallbacks[0], {
+      stage: "rerank",
+      type: "rerank-to-cosine",
+      reason: "timeout",
+    });
+    assert.deepEqual(trace.fallbacks[1], {
+      stage: "rerank",
+      type: "rerank-to-cosine",
+      reason: "status 503",
+    });
+  });
+
   it("summarize truncates long drop lists", () => {
     const tc = new TraceCollector();
     const ids = Array.from({ length: 10 }, (_, i) => `id-${i}`);
@@ -148,6 +178,7 @@ describe("TraceCollector zero-overhead", () => {
     // This pattern is used throughout retriever.ts
     trace?.startStage("test", ["a"]);
     trace?.endStage(["a"]);
+    trace?.recordFallback("rerank", "rerank-to-cosine", "timeout");
     // Should complete without error
     assert.ok(true);
   });
@@ -192,6 +223,7 @@ describe("RetrievalStatsCollector", () => {
             durationMs: 5,
           },
         ],
+        fallbacks: [],
         finalCount: 6,
         totalMs: 100,
       },
@@ -221,6 +253,7 @@ describe("RetrievalStatsCollector", () => {
             durationMs: 20,
           },
         ],
+        fallbacks: [],
         finalCount: 0,
         totalMs: 200,
       },
@@ -254,6 +287,7 @@ describe("RetrievalStatsCollector", () => {
           mode: "vector",
           startedAt: Date.now(),
           stages: [],
+          fallbacks: [],
           finalCount: 1,
           totalMs: i * 10,
         },
@@ -274,6 +308,7 @@ describe("RetrievalStatsCollector", () => {
         mode: "vector",
         startedAt: Date.now(),
         stages: [],
+        fallbacks: [],
         finalCount: 1,
         totalMs: 50,
       },
@@ -296,6 +331,7 @@ describe("RetrievalStatsCollector", () => {
           mode: "vector",
           startedAt: Date.now(),
           stages: [],
+          fallbacks: [],
           finalCount: 1,
           totalMs: 10,
         },

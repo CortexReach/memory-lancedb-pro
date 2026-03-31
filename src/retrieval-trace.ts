@@ -24,6 +24,12 @@ export interface RetrievalStageResult {
   durationMs: number;
 }
 
+export interface FallbackEvent {
+  stage: string;
+  type: "rerank-to-cosine" | "fts-to-lexical";
+  reason: string;
+}
+
 export interface RetrievalTrace {
   /** The original search query */
   query: string;
@@ -33,6 +39,8 @@ export interface RetrievalTrace {
   startedAt: number;
   /** Per-stage results in pipeline order */
   stages: RetrievalStageResult[];
+  /** Fallback events (e.g. rerank timeout, FTS unavailable) */
+  fallbacks: FallbackEvent[];
   /** Number of results after all stages */
   finalCount: number;
   /** Total wall-clock time in milliseconds */
@@ -52,6 +60,7 @@ interface PendingStage {
 export class TraceCollector {
   private readonly _startTime: number;
   private readonly _stages: RetrievalStageResult[] = [];
+  private readonly _fallbacks: FallbackEvent[] = [];
   private _pending: PendingStage | null = null;
 
   constructor() {
@@ -117,6 +126,17 @@ export class TraceCollector {
   }
 
   /**
+   * Record a fallback event (e.g. rerank timeout degrading to cosine).
+   */
+  recordFallback(
+    stage: string,
+    type: FallbackEvent["type"],
+    reason: string,
+  ): void {
+    this._fallbacks.push({ stage, type, reason });
+  }
+
+  /**
    * Finalize the trace and produce the complete RetrievalTrace object.
    */
   finalize(query: string, mode: string): RetrievalTrace {
@@ -131,6 +151,7 @@ export class TraceCollector {
       mode: mode as "hybrid" | "vector" | "bm25",
       startedAt: this._startTime,
       stages: this._stages,
+      fallbacks: this._fallbacks,
       finalCount: lastStage ? lastStage.outputCount : 0,
       totalMs: Date.now() - this._startTime,
     };

@@ -840,6 +840,7 @@ export class MemoryRetriever {
         query,
         queryVector,
         filtered.slice(0, candidatePoolSize),
+        trace,
       );
       trace?.endStage(
         reranked.map((r) => r.entry.id),
@@ -1066,6 +1067,7 @@ export class MemoryRetriever {
     query: string,
     queryVector: number[],
     results: RetrievalResult[],
+    trace?: TraceCollector,
   ): Promise<RetrievalResult[]> {
     if (results.length === 0) {
       return results;
@@ -1113,6 +1115,11 @@ export class MemoryRetriever {
             console.warn(
               "Rerank API: invalid response shape, falling back to cosine",
             );
+            trace?.recordFallback(
+              "rerank",
+              "rerank-to-cosine",
+              "invalid response",
+            );
           } else {
             // Build a Set of returned indices to identify unreturned candidates
             const returnedIndices = new Set(parsed.map((r) => r.index));
@@ -1157,12 +1164,21 @@ export class MemoryRetriever {
           console.warn(
             `Rerank API returned ${response.status}: ${errText.slice(0, 200)}, falling back to cosine`,
           );
+          trace?.recordFallback(
+            "rerank",
+            "rerank-to-cosine",
+            `status ${response.status}`,
+          );
         }
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
           console.warn("Rerank API timed out (5s), falling back to cosine");
+          trace?.recordFallback("rerank", "rerank-to-cosine", "timeout");
         } else {
+          const message =
+            error instanceof Error ? error.message : String(error);
           console.warn("Rerank API failed, falling back to cosine:", error);
+          trace?.recordFallback("rerank", "rerank-to-cosine", message);
         }
       }
     }
