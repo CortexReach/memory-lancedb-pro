@@ -49,7 +49,7 @@ describe("TraceCollector", () => {
 
   it("handles null scores (no score range)", () => {
     const tc = new TraceCollector();
-    tc.startStage("rrf_fusion", ["a", "b"]);
+    tc.startStage("weighted_fusion", ["a", "b"]);
     tc.endStage(["a", "b"]);
 
     const trace = tc.finalize("q", "vector");

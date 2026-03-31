@@ -13,7 +13,12 @@ import {
   lstatSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import {
+  buildSmartMetadata,
+  isMemoryActiveAt,
+  parseSmartMetadata,
+  stringifySmartMetadata,
+} from "./smart-metadata.js";
 
 // ============================================================================
 // Types
@@ -23,7 +28,13 @@ export interface MemoryEntry {
   id: string;
   text: string;
   vector: number[];
-  category: "preference" | "fact" | "decision" | "entity" | "other" | "reflection";
+  category:
+    | "preference"
+    | "fact"
+    | "decision"
+    | "entity"
+    | "other"
+    | "reflection";
   scope: string;
   importance: number;
   timestamp: number;
@@ -102,7 +113,10 @@ function isExplicitDenyAllScopeFilter(scopeFilter?: string[]): boolean {
   return Array.isArray(scopeFilter) && scopeFilter.length === 0;
 }
 
-function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight: number }>): number {
+function scoreLexicalHit(
+  query: string,
+  candidates: Array<{ text: string; weight: number }>,
+): number {
   const normalizedQuery = normalizeSearchText(query);
   if (!normalizedQuery) return 0;
 
@@ -111,7 +125,10 @@ function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight
     const normalized = normalizeSearchText(candidate.text);
     if (!normalized) continue;
     if (normalized.includes(normalizedQuery)) {
-      score = Math.max(score, Math.min(0.95, 0.72 + normalizedQuery.length * 0.02) * candidate.weight);
+      score = Math.max(
+        score,
+        Math.min(0.95, 0.72 + normalizedQuery.length * 0.02) * candidate.weight,
+      );
     }
   }
 
@@ -139,8 +156,8 @@ export function validateStoragePath(dbPath: string): string {
       } catch (err: any) {
         throw new Error(
           `dbPath "${dbPath}" is a symlink whose target does not exist.\n` +
-          `  Fix: Create the target directory, or update the symlink to point to a valid path.\n` +
-          `  Details: ${err.code || ""} ${err.message}`,
+            `  Fix: Create the target directory, or update the symlink to point to a valid path.\n` +
+            `  Details: ${err.code || ""} ${err.message}`,
         );
       }
     }
@@ -165,9 +182,9 @@ export function validateStoragePath(dbPath: string): string {
     } catch (err: any) {
       throw new Error(
         `Failed to create dbPath directory "${resolvedPath}".\n` +
-        `  Fix: Ensure the parent directory "${dirname(resolvedPath)}" exists and is writable,\n` +
-        `       or create it manually: mkdir -p "${resolvedPath}"\n` +
-        `  Details: ${err.code || ""} ${err.message}`,
+          `  Fix: Ensure the parent directory "${dirname(resolvedPath)}" exists and is writable,\n` +
+          `       or create it manually: mkdir -p "${resolvedPath}"\n` +
+          `  Details: ${err.code || ""} ${err.message}`,
       );
     }
   }
@@ -178,9 +195,9 @@ export function validateStoragePath(dbPath: string): string {
   } catch (err: any) {
     throw new Error(
       `dbPath directory "${resolvedPath}" is not writable.\n` +
-      `  Fix: Check permissions with: ls -la "${dirname(resolvedPath)}"\n` +
-      `       Or grant write access: chmod u+w "${resolvedPath}"\n` +
-      `  Details: ${err.code || ""} ${err.message}`,
+        `  Fix: Check permissions with: ls -la "${dirname(resolvedPath)}"\n` +
+        `       Or grant write access: chmod u+w "${resolvedPath}"\n` +
+        `  Details: ${err.code || ""} ${err.message}`,
     );
   }
 
@@ -200,20 +217,29 @@ export class MemoryStore {
   private ftsIndexCreated = false;
   private updateQueue: Promise<void> = Promise.resolve();
 
-  constructor(private readonly config: StoreConfig) { }
+  constructor(private readonly config: StoreConfig) {}
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
     if (!existsSync(lockPath)) {
-      try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
-      try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
+      try {
+        mkdirSync(dirname(lockPath), { recursive: true });
+      } catch {}
+      try {
+        const { writeFileSync } = await import("node:fs");
+        writeFileSync(lockPath, "", { flag: "wx" });
+      } catch {}
     }
     const release = await lockfile.lock(lockPath, {
       retries: { retries: 5, factor: 2, minTimeout: 100, maxTimeout: 2000 },
       stale: 10000,
     });
-    try { return await fn(); } finally { await release(); }
+    try {
+      return await fn();
+    } finally {
+      await release();
+    }
   }
 
   get dbPath(): string {
@@ -246,7 +272,7 @@ export class MemoryStore {
       const message = err.message || String(err);
       throw new Error(
         `Failed to open LanceDB at "${this.config.dbPath}": ${code} ${message}\n` +
-        `  Fix: Verify the path exists and is writable. Check parent directory permissions.`,
+          `  Fix: Verify the path exists and is writable. Check parent directory permissions.`,
       );
     }
 
@@ -261,14 +287,19 @@ export class MemoryStore {
       // Migrate legacy tables: add missing columns for backward compatibility
       try {
         const schema = await table.schema();
-        const fieldNames = new Set(schema.fields.map((f: { name: string }) => f.name));
+        const fieldNames = new Set(
+          schema.fields.map((f: { name: string }) => f.name),
+        );
 
         const missingColumns: Array<{ name: string; valueSql: string }> = [];
         if (!fieldNames.has("scope")) {
           missingColumns.push({ name: "scope", valueSql: "'global'" });
         }
         if (!fieldNames.has("timestamp")) {
-          missingColumns.push({ name: "timestamp", valueSql: "CAST(0 AS DOUBLE)" });
+          missingColumns.push({
+            name: "timestamp",
+            valueSql: "CAST(0 AS DOUBLE)",
+          });
         }
         if (!fieldNames.has("metadata")) {
           missingColumns.push({ name: "metadata", valueSql: "'{}'" });
@@ -287,9 +318,14 @@ export class MemoryStore {
         const msg = String(err);
         if (msg.includes("already exists")) {
           // Concurrent initialization race — another process already added the columns
-          console.log("memory-lancedb-pro: migration columns already exist (concurrent init)");
+          console.log(
+            "memory-lancedb-pro: migration columns already exist (concurrent init)",
+          );
         } else {
-          console.warn("memory-lancedb-pro: could not check/migrate table schema:", err);
+          console.warn(
+            "memory-lancedb-pro: could not check/migrate table schema:",
+            err,
+          );
         }
       }
     } catch (_openErr) {
@@ -444,14 +480,16 @@ export class MemoryStore {
     return res.length > 0;
   }
 
-  async getById(id: string, scopeFilter?: string[]): Promise<MemoryEntry | null> {
+  async getById(
+    id: string,
+    scopeFilter?: string[],
+  ): Promise<MemoryEntry | null> {
     await this.ensureInitialized();
 
     if (isExplicitDenyAllScopeFilter(scopeFilter)) return null;
 
     const safeId = escapeSqlLiteral(id);
-    const rows = await this.table!
-      .query()
+    const rows = await this.table!.query()
       .where(`id = '${safeId}'`)
       .limit(1)
       .toArray();
@@ -460,7 +498,11 @@ export class MemoryStore {
 
     const row = rows[0];
     const rowScope = (row.scope as string | undefined) ?? "global";
-    if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+    if (
+      scopeFilter &&
+      scopeFilter.length > 0 &&
+      !scopeFilter.includes(rowScope)
+    ) {
       return null;
     }
 
@@ -476,19 +518,27 @@ export class MemoryStore {
     };
   }
 
-  async vectorSearch(vector: number[], limit = 5, minScore = 0.3, scopeFilter?: string[], options?: { excludeInactive?: boolean }): Promise<MemorySearchResult[]> {
+  async vectorSearch(
+    vector: number[],
+    limit = 5,
+    minScore = 0.3,
+    scopeFilter?: string[],
+    options?: { excludeInactive?: boolean },
+  ): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
     if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
-    const safeLimit = clampInt(limit, 1, 20);
+    const safeLimit = clampInt(limit, 1, 50);
     // Over-fetch more aggressively when filtering inactive records,
     // because superseded historical rows can crowd out active ones.
     const inactiveFilter = options?.excludeInactive ?? false;
     const overFetchMultiplier = inactiveFilter ? 20 : 10;
     const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
 
-    let query = this.table!.vectorSearch(vector).distanceType('cosine').limit(fetchLimit);
+    let query = this.table!.vectorSearch(vector)
+      .distanceType("cosine")
+      .limit(fetchLimit);
 
     // Apply scope filter if provided
     if (scopeFilter && scopeFilter.length > 0) {
@@ -530,7 +580,10 @@ export class MemoryStore {
       };
 
       // Skip inactive (superseded) records when requested
-      if (inactiveFilter && !isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry))) {
+      if (
+        inactiveFilter &&
+        !isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry))
+      ) {
         continue;
       }
 
@@ -552,10 +605,12 @@ export class MemoryStore {
 
     if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
-    const safeLimit = clampInt(limit, 1, 20);
+    const safeLimit = clampInt(limit, 1, 50);
     const inactiveFilter = options?.excludeInactive ?? false;
     // Over-fetch when filtering inactive records to avoid crowding
-    const fetchLimit = inactiveFilter ? Math.min(safeLimit * 20, 200) : safeLimit;
+    const fetchLimit = inactiveFilter
+      ? Math.min(safeLimit * 20, 200)
+      : safeLimit;
 
     if (!this.ftsIndexCreated) {
       return this.lexicalFallbackSearch(query, safeLimit, scopeFilter, options);
@@ -597,18 +652,21 @@ export class MemoryStore {
           rawScore > 0 ? 1 / (1 + Math.exp(-rawScore / 5)) : 0.5;
 
         const entry: MemoryEntry = {
-            id: row.id as string,
-            text: row.text as string,
-            vector: row.vector as number[],
-            category: row.category as MemoryEntry["category"],
-            scope: rowScope,
-            importance: Number(row.importance),
-            timestamp: Number(row.timestamp),
-            metadata: (row.metadata as string) || "{}",
+          id: row.id as string,
+          text: row.text as string,
+          vector: row.vector as number[],
+          category: row.category as MemoryEntry["category"],
+          scope: rowScope,
+          importance: Number(row.importance),
+          timestamp: Number(row.timestamp),
+          metadata: (row.metadata as string) || "{}",
         };
 
         // Skip inactive (superseded) records when requested
-        if (inactiveFilter && !isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry))) {
+        if (
+          inactiveFilter &&
+          !isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry))
+        ) {
           continue;
         }
 
@@ -627,7 +685,12 @@ export class MemoryStore {
     }
   }
 
-  private async lexicalFallbackSearch(query: string, limit: number, scopeFilter?: string[], options?: { excludeInactive?: boolean }): Promise<MemorySearchResult[]> {
+  private async lexicalFallbackSearch(
+    query: string,
+    limit: number,
+    scopeFilter?: string[],
+    options?: { excludeInactive?: boolean },
+  ): Promise<MemorySearchResult[]> {
     if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
     const trimmedQuery = query.trim();
@@ -646,7 +709,7 @@ export class MemoryStore {
 
     if (scopeFilter && scopeFilter.length > 0) {
       const scopeConditions = scopeFilter
-        .map(scope => `scope = '${escapeSqlLiteral(scope)}'`)
+        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
         .join(" OR ");
       searchQuery = searchQuery.where(`(${scopeConditions}) OR scope IS NULL`);
     }
@@ -656,7 +719,11 @@ export class MemoryStore {
 
     for (const row of rows) {
       const rowScope = (row.scope as string | undefined) ?? "global";
-      if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+      if (
+        scopeFilter &&
+        scopeFilter.length > 0 &&
+        !scopeFilter.includes(rowScope)
+      ) {
         continue;
       }
 
@@ -690,7 +757,9 @@ export class MemoryStore {
     }
 
     return matches
-      .sort((a, b) => b.score - a.score || b.entry.timestamp - a.entry.timestamp)
+      .sort(
+        (a, b) => b.score - a.score || b.entry.timestamp - a.entry.timestamp,
+      )
       .slice(0, limit);
   }
 
@@ -874,122 +943,124 @@ export class MemoryStore {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
-    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
-      // Support both full UUID and short prefix (8+ hex chars), same as delete()
-      const uuidRegex =
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      const prefixRegex = /^[0-9a-f]{8,}$/i;
-      const isFullId = uuidRegex.test(id);
-      const isPrefix = !isFullId && prefixRegex.test(id);
+    return this.runWithFileLock(() =>
+      this.runSerializedUpdate(async () => {
+        // Support both full UUID and short prefix (8+ hex chars), same as delete()
+        const uuidRegex =
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        const prefixRegex = /^[0-9a-f]{8,}$/i;
+        const isFullId = uuidRegex.test(id);
+        const isPrefix = !isFullId && prefixRegex.test(id);
 
-      if (!isFullId && !isPrefix) {
-        throw new Error(`Invalid memory ID format: ${id}`);
-      }
-
-      let rows: any[];
-      if (isFullId) {
-        const safeId = escapeSqlLiteral(id);
-        rows = await this.table!.query()
-          .where(`id = '${safeId}'`)
-          .limit(1)
-          .toArray();
-      } else {
-        // Prefix match
-        const all = await this.table!.query()
-          .select([
-            "id",
-            "text",
-            "vector",
-            "category",
-            "scope",
-            "importance",
-            "timestamp",
-            "metadata",
-          ])
-          .limit(1000)
-          .toArray();
-        rows = all.filter((r: any) => (r.id as string).startsWith(id));
-        if (rows.length > 1) {
-          throw new Error(
-            `Ambiguous prefix "${id}" matches ${rows.length} memories. Use a longer prefix or full ID.`,
-          );
-        }
-      }
-
-      if (rows.length === 0) return null;
-
-      const row = rows[0];
-      const rowScope = (row.scope as string | undefined) ?? "global";
-
-      // Check scope permissions
-      if (
-        scopeFilter &&
-        scopeFilter.length > 0 &&
-        !scopeFilter.includes(rowScope)
-      ) {
-        throw new Error(`Memory ${id} is outside accessible scopes`);
-      }
-
-      const original: MemoryEntry = {
-        id: row.id as string,
-        text: row.text as string,
-        vector: Array.from(row.vector as Iterable<number>),
-        category: row.category as MemoryEntry["category"],
-        scope: rowScope,
-        importance: Number(row.importance),
-        timestamp: Number(row.timestamp),
-        metadata: (row.metadata as string) || "{}",
-      };
-
-      // Build updated entry, preserving original timestamp
-      const updated: MemoryEntry = {
-        ...original,
-        text: updates.text ?? original.text,
-        vector: updates.vector ?? original.vector,
-        category: updates.category ?? original.category,
-        scope: rowScope,
-        importance: updates.importance ?? original.importance,
-        timestamp: original.timestamp, // preserve original
-        metadata: updates.metadata ?? original.metadata,
-      };
-
-      // LanceDB doesn't support in-place update; delete + re-add.
-      // Serialize updates per store instance to avoid stale rollback races.
-      // If the add fails after delete, attempt best-effort recovery without
-      // overwriting a newer concurrent successful update.
-      const rollbackCandidate =
-        (await this.getById(original.id).catch(() => null)) ?? original;
-      const resolvedId = escapeSqlLiteral(row.id as string);
-      await this.table!.delete(`id = '${resolvedId}'`);
-      try {
-        await this.table!.add([updated]);
-      } catch (addError) {
-        const current = await this.getById(original.id).catch(() => null);
-        if (current) {
-          throw new Error(
-            `Failed to update memory ${id}: write failed after delete, but an existing record was preserved. ` +
-            `Write error: ${addError instanceof Error ? addError.message : String(addError)}`,
-          );
+        if (!isFullId && !isPrefix) {
+          throw new Error(`Invalid memory ID format: ${id}`);
         }
 
+        let rows: any[];
+        if (isFullId) {
+          const safeId = escapeSqlLiteral(id);
+          rows = await this.table!.query()
+            .where(`id = '${safeId}'`)
+            .limit(1)
+            .toArray();
+        } else {
+          // Prefix match
+          const all = await this.table!.query()
+            .select([
+              "id",
+              "text",
+              "vector",
+              "category",
+              "scope",
+              "importance",
+              "timestamp",
+              "metadata",
+            ])
+            .limit(1000)
+            .toArray();
+          rows = all.filter((r: any) => (r.id as string).startsWith(id));
+          if (rows.length > 1) {
+            throw new Error(
+              `Ambiguous prefix "${id}" matches ${rows.length} memories. Use a longer prefix or full ID.`,
+            );
+          }
+        }
+
+        if (rows.length === 0) return null;
+
+        const row = rows[0];
+        const rowScope = (row.scope as string | undefined) ?? "global";
+
+        // Check scope permissions
+        if (
+          scopeFilter &&
+          scopeFilter.length > 0 &&
+          !scopeFilter.includes(rowScope)
+        ) {
+          throw new Error(`Memory ${id} is outside accessible scopes`);
+        }
+
+        const original: MemoryEntry = {
+          id: row.id as string,
+          text: row.text as string,
+          vector: Array.from(row.vector as Iterable<number>),
+          category: row.category as MemoryEntry["category"],
+          scope: rowScope,
+          importance: Number(row.importance),
+          timestamp: Number(row.timestamp),
+          metadata: (row.metadata as string) || "{}",
+        };
+
+        // Build updated entry, preserving original timestamp
+        const updated: MemoryEntry = {
+          ...original,
+          text: updates.text ?? original.text,
+          vector: updates.vector ?? original.vector,
+          category: updates.category ?? original.category,
+          scope: rowScope,
+          importance: updates.importance ?? original.importance,
+          timestamp: original.timestamp, // preserve original
+          metadata: updates.metadata ?? original.metadata,
+        };
+
+        // LanceDB doesn't support in-place update; delete + re-add.
+        // Serialize updates per store instance to avoid stale rollback races.
+        // If the add fails after delete, attempt best-effort recovery without
+        // overwriting a newer concurrent successful update.
+        const rollbackCandidate =
+          (await this.getById(original.id).catch(() => null)) ?? original;
+        const resolvedId = escapeSqlLiteral(row.id as string);
+        await this.table!.delete(`id = '${resolvedId}'`);
         try {
-          await this.table!.add([rollbackCandidate]);
-        } catch (rollbackError) {
+          await this.table!.add([updated]);
+        } catch (addError) {
+          const current = await this.getById(original.id).catch(() => null);
+          if (current) {
+            throw new Error(
+              `Failed to update memory ${id}: write failed after delete, but an existing record was preserved. ` +
+                `Write error: ${addError instanceof Error ? addError.message : String(addError)}`,
+            );
+          }
+
+          try {
+            await this.table!.add([rollbackCandidate]);
+          } catch (rollbackError) {
+            throw new Error(
+              `Failed to update memory ${id}: write failed after delete, and rollback also failed. ` +
+                `Write error: ${addError instanceof Error ? addError.message : String(addError)}. ` +
+                `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+            );
+          }
+
           throw new Error(
-            `Failed to update memory ${id}: write failed after delete, and rollback also failed. ` +
-            `Write error: ${addError instanceof Error ? addError.message : String(addError)}. ` +
-            `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+            `Failed to update memory ${id}: write failed after delete, latest available record restored. ` +
+              `Write error: ${addError instanceof Error ? addError.message : String(addError)}`,
           );
         }
 
-        throw new Error(
-          `Failed to update memory ${id}: write failed after delete, latest available record restored. ` +
-          `Write error: ${addError instanceof Error ? addError.message : String(addError)}`,
-        );
-      }
-
-      return updated;
-    }));
+        return updated;
+      }),
+    );
   }
 
   private async runSerializedUpdate<T>(action: () => Promise<T>): Promise<T> {
@@ -1024,7 +1095,10 @@ export class MemoryStore {
     );
   }
 
-  async bulkDelete(scopeFilter: string[], beforeTimestamp?: number): Promise<number> {
+  async bulkDelete(
+    scopeFilter: string[],
+    beforeTimestamp?: number,
+  ): Promise<number> {
     await this.ensureInitialized();
 
     const conditions: string[] = [];
@@ -1050,7 +1124,9 @@ export class MemoryStore {
 
     return this.runWithFileLock(async () => {
       // Count first
-      const countResults = await this.table!.query().where(whereClause).toArray();
+      const countResults = await this.table!.query()
+        .where(whereClause)
+        .toArray();
       const deleteCount = countResults.length;
 
       // Then delete
@@ -1092,7 +1168,10 @@ export class MemoryStore {
           try {
             await this.table!.dropIndex((idx as any).name || "text");
           } catch (err) {
-            console.warn(`memory-lancedb-pro: dropIndex(${(idx as any).name || "text"}) failed:`, err);
+            console.warn(
+              `memory-lancedb-pro: dropIndex(${(idx as any).name || "text"}) failed:`,
+              err,
+            );
           }
         }
       }
@@ -1133,24 +1212,19 @@ export class MemoryStore {
 
     const whereClause = conditions.join(" AND ");
 
-    const results = await this.table!
-      .query()
-      .where(whereClause)
-      .toArray();
+    const results = await this.table!.query().where(whereClause).toArray();
 
-    return results
-      .slice(0, limit)
-      .map(
-        (row): MemoryEntry => ({
-          id: row.id as string,
-          text: row.text as string,
-          vector: Array.isArray(row.vector) ? (row.vector as number[]) : [],
-          category: row.category as MemoryEntry["category"],
-          scope: (row.scope as string | undefined) ?? "global",
-          importance: Number(row.importance),
-          timestamp: Number(row.timestamp),
-          metadata: (row.metadata as string) || "{}",
-        }),
-      );
+    return results.slice(0, limit).map(
+      (row): MemoryEntry => ({
+        id: row.id as string,
+        text: row.text as string,
+        vector: Array.isArray(row.vector) ? (row.vector as number[]) : [],
+        category: row.category as MemoryEntry["category"],
+        scope: (row.scope as string | undefined) ?? "global",
+        importance: Number(row.importance),
+        timestamp: Number(row.timestamp),
+        metadata: (row.metadata as string) || "{}",
+      }),
+    );
   }
 }
