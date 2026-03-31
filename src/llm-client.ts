@@ -39,7 +39,7 @@ export interface LlmClientConfig {
   log?: (msg: string) => void;
   /** Optional warn-level logger. Used for errors / warnings; falls back to `log` if not provided. */
   logWarn?: (msg: string) => void;
-  /** Plugin state directory. Used by claude-code auth to create an isolated cwd for subprocess sessions. */
+  /** Plugin state directory. Reserved for future use (isolated cwd currently disabled due to OAuth issues). */
   stateDir?: string;
 }
 
@@ -90,11 +90,34 @@ function extractJsonFromResponse(text: string): string | null {
     }
   }
 
+  // Track depth, ignoring brackets inside strings
   let depth = 0;
   let lastClose = -1;
+  let inString = false;
+  let escapeNext = false;
+  
   for (let i = startIdx; i < text.length; i++) {
-    if (text[i] === openChar) depth++;
-    else if (text[i] === closeChar) {
+    const ch = text[i];
+    
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+    
+    if (ch === "\\") {
+      escapeNext = true;
+      continue;
+    }
+    
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    
+    if (inString) continue;
+    
+    if (ch === openChar) depth++;
+    else if (ch === closeChar) {
       depth--;
       if (depth === 0) {
         lastClose = i;
@@ -460,6 +483,10 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
  *  Mirrors the logic in claude-mem's env-sanitizer.ts.
  */
 const CLAUDE_CODE_STRIP_PREFIXES = ["CLAUDECODE_", "CLAUDE_CODE_"];
+// CLAUDE_CODE_ENTRYPOINT is intentionally stripped from the parent process env and
+// then re-injected with value "sdk-ts" below. Stripping prevents the parent's
+// value from leaking into the subprocess; re-injecting marks this subprocess as
+// an SDK session so Claude Code does not refuse to launch inside another session.
 const CLAUDE_CODE_STRIP_EXACT = new Set(["CLAUDECODE", "CLAUDE_CODE_SESSION", "CLAUDE_CODE_ENTRYPOINT", "MCP_SESSION_ID"]);
 /** Keys that start with CLAUDE_CODE_ but must be preserved for subprocess auth */
 const CLAUDE_CODE_PRESERVE = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_GIT_BASH_PATH"]);
@@ -490,6 +517,8 @@ export function buildClaudeCodeEnv(
   explicitApiKey?: string,
   log?: (msg: string) => void,
   logWarn?: (msg: string) => void,
+  /** Override path for ~/.claude/settings.json — used in tests to bypass real settings. */
+  settingsPathOverride?: string,
 ): Record<string, string> {
   const hasExplicitKey = !!explicitApiKey;
   const env: Record<string, string> = {};
@@ -497,7 +526,7 @@ export function buildClaudeCodeEnv(
   // Load Claude Code's settings.json env (OAuth tokens, ANTHROPIC_BASE_URL, etc.)
   const warn = logWarn ?? log;
   try {
-    const settingsPath = join(homedir(), ".claude", "settings.json");
+    const settingsPath = settingsPathOverride ?? join(homedir(), ".claude", "settings.json");
     const settingsRaw = readFileSync(settingsPath, "utf-8");
     const settings = JSON.parse(settingsRaw) as { env?: Record<string, string> };
     if (settings.env && typeof settings.env === "object" && !Array.isArray(settings.env)) {
@@ -514,7 +543,8 @@ export function buildClaudeCodeEnv(
       // ENOENT (file not found) is expected; other errors (SyntaxError, permission) should warn
       const errType = settingsErr instanceof SyntaxError ? "JSON parse error" : 
                       code === "EACCES" ? "permission denied" : "read error";
-      warn?.(`memory-lancedb-pro: llm-client [claude-code] failed to load ~/.claude/settings.json (${errType}: ${settingsErr instanceof Error ? settingsErr.message : String(settingsErr)}) — OAuth tokens from settings.json will NOT be available; falling back to ambient environment only`);
+      const msg = `memory-lancedb-pro: llm-client [claude-code] failed to load ~/.claude/settings.json (${errType}: ${settingsErr instanceof Error ? settingsErr.message : String(settingsErr)}) — OAuth tokens from settings.json will NOT be available; falling back to ambient environment only`;
+      (warn ?? console.warn)(msg);
     }
   }
 
@@ -565,9 +595,22 @@ function resolveClaudeExecutable(configuredPath?: string): string {
     }
     return firstLine;
   } catch (execErr) {
+    const errNode = execErr as NodeJS.ErrnoException & { status?: number };
     const reason = execErr instanceof Error ? execErr.message : String(execErr);
+    // Distinguish "not found" (exit 127 / ENOENT) from runtime errors (ENOMEM, EACCES, etc.)
+    const isNotFound =
+      errNode.code === "ENOENT" ||
+      errNode.status === 127 ||
+      reason.includes("not found") ||
+      reason.includes("no such file");
+    if (isNotFound) {
+      throw new Error(
+        "The 'claude' executable was not found. " +
+        "Install Claude Code (npm i -g @anthropic-ai/claude-code) or set llm.claudeCodePath in your config.",
+      );
+    }
     throw new Error(
-      `Could not find the 'claude' executable (${reason}). ` +
+      `Could not locate the 'claude' executable due to a system error (${reason}). ` +
       "Install Claude Code (npm i -g @anthropic-ai/claude-code) or set llm.claudeCodePath in your config.",
     );
   }
@@ -665,9 +708,15 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
       const claudePath = cachedClaudePath;
 
       // Isolated cwd to keep memory-agent sessions out of user's claude history
-      const baseDir = (config.stateDir && config.stateDir.length > 1)
-        ? config.stateDir
-        : join(homedir(), ".openclaw", "memory-lancedb-pro");
+      let baseDir: string;
+      if (config.stateDir && config.stateDir.length > 1) {
+        baseDir = config.stateDir;
+      } else {
+        if (config.stateDir !== undefined && config.stateDir.length <= 1) {
+          logWarn(`memory-lancedb-pro: llm-client [claude-code] ignoring unsafe stateDir="${config.stateDir}" (path too short); using default path`);
+        }
+        baseDir = join(homedir(), ".openclaw", "memory-lancedb-pro");
+      }
       const sessionDir = join(baseDir, "claude-code-sessions");
       try {
         mkdirSync(sessionDir, { recursive: true }); // no-op if already exists
@@ -717,9 +766,13 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
               logWarn(lastError);
               return null;
             }
-            raw = typeof msg.result === "string" ? msg.result : null;
-            if (raw === null) {
-              log?.(`memory-lancedb-pro: llm-client [${label}] result.result is not a string (type=${typeof msg.result}), will attempt assistant fallback`);
+            if (typeof msg.result === "string") {
+              raw = msg.result;
+            } else {
+              // SDK returned non-string result - log as warning and set lastError for debugging
+              lastError = `memory-lancedb-pro: llm-client [${label}] result.result is not a string (type=${typeof msg.result}), will attempt assistant fallback`;
+              logWarn(lastError);
+              raw = null;
             }
             break;
           }
@@ -727,9 +780,11 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
             const text = extractTextFromSdkMessage(message);
             if (text) raw = text; // keep last assistant text as fallback
           } else if (message.type === "error") {
-            // SDK error message type
+            // SDK error message type - treat as fatal, not debug
             const errMsg = message as { error?: string; message?: string };
-            log?.(`memory-lancedb-pro: llm-client [${label}] SDK error message: ${errMsg.error ?? errMsg.message ?? JSON.stringify(message)}`);
+            lastError = `memory-lancedb-pro: llm-client [${label}] SDK error: ${errMsg.error ?? errMsg.message ?? JSON.stringify(message)}`;
+            logWarn(lastError);
+            return null;
           } else if (message.type !== "system" && message.type !== "user") {
             // Log unknown message types for debugging SDK changes
             log?.(`memory-lancedb-pro: llm-client [${label}] unknown SDK message type=${message.type}`);

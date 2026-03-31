@@ -78,11 +78,9 @@ describe("buildClaudeCodeEnv", () => {
     }
   });
 
-  it("logs warning when no auth source is present (env-only, skips settings.json)", () => {
-    // Note: This test verifies the warning logic for ambient env only.
-    // On machines with ~/.claude/settings.json containing ANTHROPIC_AUTH_TOKEN,
-    // the warning won't fire because buildClaudeCodeEnv reads from settings.json.
-    // We test the env object result instead to ensure no auth keys are present.
+  it("logs warning when no auth source is present (uses empty settings mock)", () => {
+    // Use settingsPathOverride pointing to /dev/null so no auth comes from settings.json,
+    // making this test deterministic regardless of the dev machine's ~/.claude/settings.json.
     const savedKey = process.env.ANTHROPIC_API_KEY;
     const savedToken = process.env.ANTHROPIC_AUTH_TOKEN;
     const savedOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -91,21 +89,17 @@ describe("buildClaudeCodeEnv", () => {
     delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
 
     const logs = [];
-    const env = buildClaudeCodeEnv(undefined, (msg) => logs.push(msg));
-    // If settings.json provides auth, no warning fires (expected on dev machines)
-    // If no settings.json, warning should fire
-    const hasAuthFromSettings = env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN || env.CLAUDE_CODE_OAUTH_TOKEN;
-    if (!hasAuthFromSettings) {
-      assert.ok(logs.some(l => l.includes("no ANTHROPIC")), "should warn when no auth source");
-    }
-    // Either way, the test passes — we're verifying behavior, not CI-specific state
+    // Pass a nonexistent path so settings.json loading is skipped (ENOENT → silent),
+    // making the test deterministic regardless of the dev machine's ~/.claude/settings.json.
+    buildClaudeCodeEnv(undefined, (msg) => logs.push(msg), undefined, "/tmp/memory-lancedb-pro-no-such-settings-test.json");
+    assert.ok(logs.some(l => l.includes("no ANTHROPIC")), "should warn when no auth source");
 
     if (savedKey !== undefined) process.env.ANTHROPIC_API_KEY = savedKey;
     if (savedToken !== undefined) process.env.ANTHROPIC_AUTH_TOKEN = savedToken;
     if (savedOauth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOauth;
   });
 
-  it("routes no-auth warning to logWarn when provided (env-only)", () => {
+  it("routes no-auth warning to logWarn when provided (uses empty settings mock)", () => {
     const savedKey = process.env.ANTHROPIC_API_KEY;
     const savedToken = process.env.ANTHROPIC_AUTH_TOKEN;
     const savedOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -115,12 +109,11 @@ describe("buildClaudeCodeEnv", () => {
 
     const debugLogs = [];
     const warnLogs = [];
-    const env = buildClaudeCodeEnv(undefined, (msg) => debugLogs.push(msg), (msg) => warnLogs.push(msg));
-    const hasAuthFromSettings = env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN || env.CLAUDE_CODE_OAUTH_TOKEN;
-    if (!hasAuthFromSettings) {
-      assert.ok(warnLogs.some(l => l.includes("no ANTHROPIC")), "warning should go to logWarn");
-      assert.ok(!debugLogs.some(l => l.includes("no ANTHROPIC")), "warning should not go to debug log");
-    }
+    // Pass a nonexistent path so settings.json loading is skipped (ENOENT → silent),
+    // making the test deterministic regardless of the dev machine's ~/.claude/settings.json.
+    buildClaudeCodeEnv(undefined, (msg) => debugLogs.push(msg), (msg) => warnLogs.push(msg), "/tmp/memory-lancedb-pro-no-such-settings-test.json");
+    assert.ok(warnLogs.some(l => l.includes("no ANTHROPIC")), "warning should go to logWarn");
+    assert.ok(!debugLogs.some(l => l.includes("no ANTHROPIC")), "warning should not go to debug log");
 
     if (savedKey !== undefined) process.env.ANTHROPIC_API_KEY = savedKey;
     if (savedToken !== undefined) process.env.ANTHROPIC_AUTH_TOKEN = savedToken;
