@@ -109,6 +109,8 @@ interface PluginConfig {
   /** Hard per-turn injection cap (safety valve). Overrides autoRecallMaxItems if lower. Default: 10. */
   maxRecallPerTurn?: number;
   recallMode?: "full" | "summary" | "adaptive" | "off";
+  /** Agent IDs excluded from auto-recall injection. Useful for background agents (e.g. memory-distiller, cron workers) whose output should not be contaminated by injected memory context. */
+  autoRecallExcludeAgents?: string[];
   captureAssistant?: boolean;
   retrieval?: {
     mode?: "hybrid" | "vector";
@@ -2258,6 +2260,20 @@ const memoryLanceDBProPlugin = {
 
       const AUTO_RECALL_TIMEOUT_MS = parsePositiveInt(config.autoRecallTimeoutMs) ?? 5_000; // configurable; default raised from 3s to 5s for remote embedding APIs behind proxies
       api.on("before_prompt_build", async (event: any, ctx: any) => {
+        // Per-agent exclusion: skip auto-recall for agents in the exclusion list.
+        const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+        if (
+          Array.isArray(config.autoRecallExcludeAgents) &&
+          config.autoRecallExcludeAgents.length > 0 &&
+          agentId !== undefined &&
+          config.autoRecallExcludeAgents.includes(agentId)
+        ) {
+          api.logger.debug?.(
+            `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}'`,
+          );
+          return;
+        }
+
         // Manually increment turn counter for this session
         const sessionId = ctx?.sessionId || "default";
 
@@ -3830,6 +3846,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecallMaxChars: parsePositiveInt(cfg.autoRecallMaxChars) ?? 600,
     autoRecallPerItemMaxChars: parsePositiveInt(cfg.autoRecallPerItemMaxChars) ?? 180,
     maxRecallPerTurn: parsePositiveInt(cfg.maxRecallPerTurn) ?? 10,
+    recallMode: (cfg.recallMode === "full" || cfg.recallMode === "summary" || cfg.recallMode === "adaptive" || cfg.recallMode === "off") ? cfg.recallMode : "full",
+    autoRecallExcludeAgents: Array.isArray(cfg.autoRecallExcludeAgents)
+      ? cfg.autoRecallExcludeAgents.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+      : undefined,
     captureAssistant: cfg.captureAssistant === true,
     retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null ? cfg.retrieval as any : undefined,
     decay: typeof cfg.decay === "object" && cfg.decay !== null ? cfg.decay as any : undefined,
