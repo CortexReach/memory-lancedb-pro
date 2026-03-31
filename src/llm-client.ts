@@ -60,24 +60,51 @@ function extractJsonFromResponse(text: string): string | null {
     return fenceMatch[1].trim();
   }
 
+  // Find the first JSON structure (object or array)
   const firstBrace = text.indexOf("{");
-  if (firstBrace === -1) return null;
+  const firstBracket = text.indexOf("[");
+  
+  let startIdx: number;
+  let openChar: string;
+  let closeChar: string;
+  
+  if (firstBrace === -1 && firstBracket === -1) return null;
+  if (firstBrace === -1) {
+    startIdx = firstBracket;
+    openChar = "[";
+    closeChar = "]";
+  } else if (firstBracket === -1) {
+    startIdx = firstBrace;
+    openChar = "{";
+    closeChar = "}";
+  } else {
+    // Use whichever comes first
+    if (firstBrace < firstBracket) {
+      startIdx = firstBrace;
+      openChar = "{";
+      closeChar = "}";
+    } else {
+      startIdx = firstBracket;
+      openChar = "[";
+      closeChar = "]";
+    }
+  }
 
   let depth = 0;
-  let lastBrace = -1;
-  for (let i = firstBrace; i < text.length; i++) {
-    if (text[i] === "{") depth++;
-    else if (text[i] === "}") {
+  let lastClose = -1;
+  for (let i = startIdx; i < text.length; i++) {
+    if (text[i] === openChar) depth++;
+    else if (text[i] === closeChar) {
       depth--;
       if (depth === 0) {
-        lastBrace = i;
+        lastClose = i;
         break;
       }
     }
   }
 
-  if (lastBrace === -1) return null;
-  return text.substring(firstBrace, lastBrace + 1);
+  if (lastClose === -1) return null;
+  return text.substring(startIdx, lastClose + 1);
 }
 
 function previewText(value: string, maxLen = 200): string {
@@ -485,7 +512,9 @@ export function buildClaudeCodeEnv(
     const code = (settingsErr as NodeJS.ErrnoException).code;
     if (code !== "ENOENT") {
       // ENOENT (file not found) is expected; other errors (SyntaxError, permission) should warn
-      warn?.(`memory-lancedb-pro: llm-client [claude-code] failed to load ~/.claude/settings.json (${settingsErr instanceof Error ? settingsErr.message : String(settingsErr)}) — falling back to ambient environment only`);
+      const errType = settingsErr instanceof SyntaxError ? "JSON parse error" : 
+                      code === "EACCES" ? "permission denied" : "read error";
+      warn?.(`memory-lancedb-pro: llm-client [claude-code] failed to load ~/.claude/settings.json (${errType}: ${settingsErr instanceof Error ? settingsErr.message : String(settingsErr)}) — OAuth tokens from settings.json will NOT be available; falling back to ambient environment only`);
     }
   }
 
@@ -493,6 +522,9 @@ export function buildClaudeCodeEnv(
     if (v === undefined) continue;
     if (k === "ANTHROPIC_API_KEY" && hasExplicitKey) continue;
     if (shouldStripClaudeCodeEnvKey(k)) continue;
+    // settings.json takes precedence for auth keys to prevent stale env vars from overriding fresh tokens
+    const isAuthKey = k === "ANTHROPIC_API_KEY" || k === "ANTHROPIC_AUTH_TOKEN" || k === "CLAUDE_CODE_OAUTH_TOKEN";
+    if (isAuthKey && env[k]) continue; // already set from settings.json
     env[k] = v;
   }
 
@@ -671,8 +703,10 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
         // error_max_turns, error_max_budget_usd) are surfaced explicitly.
         // Falling back to the last `assistant` message handles edge cases where `result` is absent.
         let raw: string | null = null;
+        let sawResultMessage = false;
         for await (const message of result) {
           if (message.type === "result") {
+            sawResultMessage = true;
             const msg = message as { subtype?: string; result?: string; errors?: unknown[] };
             if (msg.subtype !== "success") {
               // Subprocess reported an error (auth failure, budget exceeded, etc.)
@@ -684,12 +718,27 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
               return null;
             }
             raw = typeof msg.result === "string" ? msg.result : null;
+            if (raw === null) {
+              log?.(`memory-lancedb-pro: llm-client [${label}] result.result is not a string (type=${typeof msg.result}), will attempt assistant fallback`);
+            }
             break;
           }
           if (message.type === "assistant") {
             const text = extractTextFromSdkMessage(message);
             if (text) raw = text; // keep last assistant text as fallback
+          } else if (message.type === "error") {
+            // SDK error message type
+            const errMsg = message as { error?: string; message?: string };
+            log?.(`memory-lancedb-pro: llm-client [${label}] SDK error message: ${errMsg.error ?? errMsg.message ?? JSON.stringify(message)}`);
+          } else if (message.type !== "system" && message.type !== "user") {
+            // Log unknown message types for debugging SDK changes
+            log?.(`memory-lancedb-pro: llm-client [${label}] unknown SDK message type=${message.type}`);
           }
+        }
+        
+        // If we used assistant fallback without a result message, log it
+        if (!sawResultMessage && raw) {
+          log?.(`memory-lancedb-pro: llm-client [${label}] no result message received, using assistant text fallback`);
         }
 
         if (!raw) {

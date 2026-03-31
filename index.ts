@@ -1791,7 +1791,10 @@ const memoryLanceDBProPlugin = {
           + ", noise bank: ON)",
         );
       } catch (err) {
-        api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+        // Clear resolvedLlmClient so CLI doesn't attempt to use a potentially broken client
+        resolvedLlmClient = undefined;
+        const authMode = config.llm?.auth || "api-key";
+        api.logger.warn(`memory-lancedb-pro: smart extraction init failed (auth=${authMode}), LLM extraction disabled — falling back to regex only: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
       }
     }
 
