@@ -1742,7 +1742,8 @@ const memoryLanceDBProPlugin = {
     let smartExtractor: SmartExtractor | null = null;
     if (config.smartExtraction !== false) {
       try {
-        const llmClient = createLlmClient(resolveLlmClientConfig(config, api));
+        const resolvedLlmConfig = resolveLlmClientConfig(config, api);
+        const llmClient = createLlmClient(resolvedLlmConfig);
 
         // Initialize embedding-based noise prototype bank (async, non-blocking)
         const noiseBank = new NoisePrototypeBank(
@@ -1773,9 +1774,9 @@ const memoryLanceDBProPlugin = {
 
         (isCliMode() ? api.logger.debug : api.logger.info)(
           "memory-lancedb-pro: smart extraction enabled (LLM model: "
-          + llmModel
+          + resolvedLlmConfig.model
           + ", timeoutMs: "
-          + llmTimeoutMs
+          + resolvedLlmConfig.timeoutMs
           + ", noise bank: ON)",
         );
       } catch (err) {

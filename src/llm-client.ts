@@ -582,7 +582,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
       }
 
       const env = buildClaudeCodeEnv(config.apiKey, log);
-      const model = config.model || "claude-sonnet-4-5";
+      const model = config.model;
 
       // Tools we never want the memory subprocess to use
       const disallowedTools = [
