@@ -11,3 +11,12 @@ skills/maintain-memory-lancedb-pro/
 skills/validate-memory-lancedb-pro-pr/
 test/addressing-identity-regression.mjs
 validate-memory-lancedb-pro-pr/
+
+# Autonomous PR review artifacts
+review-results.tsv
+review-logs/
+
+# Benchmark artifacts
+benchmark/results/
+benchmark/data/locomo10.json
+benchmark/data/longmemeval_s.json
