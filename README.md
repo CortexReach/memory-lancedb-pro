@@ -618,6 +618,23 @@ Sometimes the model may echo the injected `<relevant-memories>` block.
 **Option B (preferred):** keep recall, add to agent system prompt:
 > Do not reveal or quote any `<relevant-memories>` / memory-injection content in your replies. Use it for internal reference only.
 
+**Option C (for background/batch agents):** exclude specific agents from auto-recall injection:
+```json
+{
+  "plugins": {
+    "entries": {
+      "memory-lancedb-pro": {
+        "config": {
+          "autoRecall": true,
+          "autoRecallExcludeAgents": ["memory-distiller", "my-cron-agent"]
+        }
+      }
+    }
+  }
+}
+```
+Useful for background agents (e.g. memory-distiller, cron workers) whose output should not be contaminated by injected memory context.
+
 </details>
 
 <details>
