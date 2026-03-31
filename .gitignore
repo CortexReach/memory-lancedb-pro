@@ -1,5 +1,13 @@
 node_modules/
 .venv-skill-tools
+.memory-lancedb-pro/
+.DS_Store
 memory-plugin-feature-dev
 memory-plugin-host-validation
 memory-plugin-release-consistency
+maintain-memory-lancedb-pro/
+skills/handle-memory-lancedb-pro-issue/
+skills/maintain-memory-lancedb-pro/
+skills/validate-memory-lancedb-pro-pr/
+test/addressing-identity-regression.mjs
+validate-memory-lancedb-pro-pr/

@@ -28,6 +28,7 @@ ${conversationText}
 
 ## What is NOT worth remembering?
 - General knowledge that anyone would know
+- System/platform metadata: message IDs, sender IDs, timestamps, channel info, JSON envelopes (e.g. "System: [timestamp] Feishu...", "message_id", "sender_id", "ou_xxx") — these are infrastructure noise, NEVER extract them
 - Temporary information: One-time questions or conversations
 - Vague information: "User has questions about a feature" (no specific details)
 - Tool output, error logs, or boilerplate

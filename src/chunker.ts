@@ -163,6 +163,32 @@ function sliceTrimWithIndices(text: string, start: number, end: number): { chunk
 }
 
 // ============================================================================
+// CJK Detection
+// ============================================================================
+
+// CJK Unicode ranges: Unified Ideographs, Extension A, Compatibility,
+// Hangul Syllables, Katakana, Hiragana
+const CJK_RE =
+  /[\u3040-\u309F\u30A0-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF]/;
+
+/** Ratio of CJK characters to total non-whitespace characters. */
+function getCjkRatio(text: string): number {
+  let cjk = 0;
+  let total = 0;
+  for (const ch of text) {
+    if (/\s/.test(ch)) continue;
+    total++;
+    if (CJK_RE.test(ch)) cjk++;
+  }
+  return total === 0 ? 0 : cjk / total;
+}
+
+// CJK chars are ~2-3 tokens each. When text is predominantly CJK, we divide
+// char limits by this factor to stay within the model's token budget.
+const CJK_CHAR_TOKEN_DIVISOR = 2.5;
+const CJK_RATIO_THRESHOLD = 0.3;
+
+// ============================================================================
 // Chunking Core
 // ============================================================================
 
@@ -239,10 +265,15 @@ export function smartChunk(text: string, embedderModel?: string): ChunkResult {
   const limit = embedderModel ? EMBEDDING_CONTEXT_LIMITS[embedderModel] : undefined;
   const base = limit ?? 8192;
 
+  // CJK characters consume ~2-3 tokens each, so a char-based limit that works
+  // for Latin text will vastly overshoot the token budget for CJK-heavy text.
+  const cjkHeavy = getCjkRatio(text) > CJK_RATIO_THRESHOLD;
+  const divisor = cjkHeavy ? CJK_CHAR_TOKEN_DIVISOR : 1;
+
   const config: ChunkerConfig = {
-    maxChunkSize: Math.max(1000, Math.floor(base * 0.7)),
-    overlapSize: Math.max(0, Math.floor(base * 0.05)),
-    minChunkSize: Math.max(100, Math.floor(base * 0.1)),
+    maxChunkSize: Math.max(200, Math.floor(base * 0.7 / divisor)),
+    overlapSize: Math.max(0, Math.floor(base * 0.05 / divisor)),
+    minChunkSize: Math.max(100, Math.floor(base * 0.1 / divisor)),
     semanticSplit: true,
     maxLinesPerChunk: 50,
   };

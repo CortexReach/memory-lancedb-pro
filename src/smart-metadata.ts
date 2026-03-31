@@ -26,6 +26,15 @@ export interface MemoryRelation {
   targetId: string;
 }
 
+export type MemoryState = "pending" | "confirmed" | "archived";
+export type MemoryLayer = "durable" | "working" | "reflection" | "archive";
+export type MemorySource =
+  | "manual"
+  | "auto-capture"
+  | "reflection"
+  | "session-summary"
+  | "legacy";
+
 export interface SmartMemoryMetadata {
   l0_abstract: string;
   l1_overview: string;
@@ -42,6 +51,15 @@ export interface SmartMemoryMetadata {
   superseded_by?: string;
   relations?: MemoryRelation[];
   source_session?: string;
+  state: MemoryState;
+  source: MemorySource;
+  memory_layer: MemoryLayer;
+  injected_count: number;
+  last_injected_at?: number;
+  last_confirmed_use_at?: number;
+  bad_recall_count: number;
+  suppressed_until_turn: number;
+  canonical_id?: string;
   [key: string]: unknown;
 }
 
@@ -76,6 +94,59 @@ function normalizeTier(value: unknown): MemoryTier {
     default:
       return "working";
   }
+}
+
+function normalizeState(value: unknown): MemoryState {
+  switch (value) {
+    case "pending":
+    case "confirmed":
+    case "archived":
+      return value;
+    default:
+      return "confirmed";
+  }
+}
+
+function normalizeSource(value: unknown): MemorySource {
+  switch (value) {
+    case "manual":
+    case "auto-capture":
+    case "reflection":
+    case "session-summary":
+    case "legacy":
+      return value;
+    default:
+      return "legacy";
+  }
+}
+
+function normalizeLayer(value: unknown): MemoryLayer {
+  switch (value) {
+    case "durable":
+    case "working":
+    case "reflection":
+    case "archive":
+      return value;
+    default:
+      return "working";
+  }
+}
+
+function deriveDefaultLayer(
+  source: MemorySource,
+  memoryCategory: MemoryCategory,
+  state: MemoryState,
+): MemoryLayer {
+  if (source === "reflection" || source === "session-summary") return "reflection";
+  if (state === "archived") return "archive";
+  if (
+    memoryCategory === "profile" ||
+    memoryCategory === "preferences" ||
+    memoryCategory === "events"
+  ) {
+    return "durable";
+  }
+  return "working";
 }
 
 export function reverseMapLegacyCategory(
@@ -190,6 +261,19 @@ export function parseSmartMetadata(
   const l2 = normalizeText(parsed.l2_content, text);
   const validFrom = normalizeTimestamp(parsed.valid_from, timestamp);
   const invalidatedAt = normalizeOptionalTimestamp(parsed.invalidated_at);
+  const fallbackSource =
+    parsed.type === "session-summary"
+      ? "session-summary"
+      : parsed.type === "memory-reflection" || parsed.type === "memory-reflection-item"
+        ? "reflection"
+        : "legacy";
+  const source = normalizeSource(parsed.source ?? fallbackSource);
+  const defaultState =
+    source === "session-summary" ? "archived" : "confirmed";
+  const state = normalizeState(parsed.state ?? defaultState);
+  const memoryLayer = normalizeLayer(
+    parsed.memory_layer ?? deriveDefaultLayer(source, memoryCategory, state),
+  );
   const normalized: SmartMemoryMetadata = {
     ...parsed,
     l0_abstract: l0,
@@ -218,6 +302,15 @@ export function parseSmartMetadata(
     superseded_by: normalizeOptionalString(parsed.superseded_by),
     source_session:
       typeof parsed.source_session === "string" ? parsed.source_session : undefined,
+    state,
+    source,
+    memory_layer: memoryLayer,
+    injected_count: clampCount(parsed.injected_count, 0),
+    last_injected_at: normalizeOptionalTimestamp(parsed.last_injected_at),
+    last_confirmed_use_at: normalizeOptionalTimestamp(parsed.last_confirmed_use_at),
+    bad_recall_count: clampCount(parsed.bad_recall_count, 0),
+    suppressed_until_turn: clampCount(parsed.suppressed_until_turn, 0),
+    canonical_id: normalizeOptionalString(parsed.canonical_id),
   };
 
   return normalized;
@@ -233,6 +326,14 @@ export function buildSmartMetadata(
     typeof patch.memory_category === "string"
       ? patch.memory_category
       : base.memory_category;
+  const nextSource =
+    patch.source !== undefined ? normalizeSource(patch.source) : base.source;
+  const nextState =
+    patch.state !== undefined ? normalizeState(patch.state) : base.state;
+  const nextLayer =
+    patch.memory_layer !== undefined
+      ? normalizeLayer(patch.memory_layer)
+      : base.memory_layer;
   const validFrom = normalizeTimestamp(patch.valid_from, base.valid_from);
   const invalidatedAt =
     patch.invalidated_at === undefined
@@ -271,6 +372,27 @@ export function buildSmartMetadata(
       typeof patch.source_session === "string"
         ? patch.source_session
         : base.source_session,
+    source: nextSource,
+    state: nextState,
+    memory_layer: nextLayer,
+    injected_count: clampCount(patch.injected_count, base.injected_count),
+    last_injected_at:
+      patch.last_injected_at === undefined
+        ? base.last_injected_at
+        : normalizeOptionalTimestamp(patch.last_injected_at),
+    last_confirmed_use_at:
+      patch.last_confirmed_use_at === undefined
+        ? base.last_confirmed_use_at
+        : normalizeOptionalTimestamp(patch.last_confirmed_use_at),
+    bad_recall_count: clampCount(patch.bad_recall_count, base.bad_recall_count),
+    suppressed_until_turn: clampCount(
+      patch.suppressed_until_turn,
+      base.suppressed_until_turn,
+    ),
+    canonical_id:
+      patch.canonical_id === undefined
+        ? base.canonical_id
+        : normalizeOptionalString(patch.canonical_id),
   };
 }
 

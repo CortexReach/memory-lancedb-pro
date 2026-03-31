@@ -86,6 +86,46 @@ await runScenario("reranker omitted candidate", {
   results: [{ index: 1, relevance_score: 0.9 }],
 });
 
+async function runTeiScenario() {
+  const originalFetch = globalThis.fetch;
+  let capturedBody;
+
+  globalThis.fetch = async (_url, init) => {
+    capturedBody = JSON.parse(init.body);
+    return {
+      ok: true,
+      async json() {
+        return [{ index: 0, score: 0.99 }];
+      },
+    };
+  };
+
+  try {
+    const retriever = createRetriever(fakeStore, fakeEmbedder, {
+      ...retrieverConfig,
+      rerankProvider: "tei",
+      rerankEndpoint: "http://127.0.0.1:8081/rerank",
+      rerankModel: "BAAI/bge-reranker-v2-m3",
+    });
+    const results = await retriever.retrieve({
+      query: "TESTMEM-20260306-092541",
+      limit: 5,
+      scopeFilter: ["global"],
+    });
+
+    assert.deepEqual(capturedBody, {
+      query: "TESTMEM-20260306-092541",
+      texts: [entry.text],
+    });
+    assert.equal(results.length, 1, "TEI rerank should return the expected result");
+    assert.equal(results[0].sources.reranked?.score, 0.99, "TEI rerank score should be preserved");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+await runTeiScenario();
+
 console.log("OK: rerank regression test passed");
 
 const lexicalEntry = {

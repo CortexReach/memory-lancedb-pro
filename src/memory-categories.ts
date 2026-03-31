@@ -70,6 +70,8 @@ export type ExtractionStats = {
   created: number;
   merged: number;
   skipped: number;
+  rejected?: number; // admission control rejections
+  boundarySkipped?: number;
   supported?: number; // context-aware support count
   superseded?: number; // temporal fact replacements
 };

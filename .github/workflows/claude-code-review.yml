@@ -12,6 +12,10 @@ on:
 
 jobs:
   claude-review:
+    # Skip fork PRs: Claude Code review needs secrets/OIDC that are not available
+    # on fork-based pull_request events. Same-repo PRs still run normally.
+    if: ${{ github.event.pull_request.head.repo.fork == false }}
+
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||

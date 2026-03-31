@@ -4,4 +4,3 @@ export function stringEnum(values) {
     enum: Array.isArray(values) ? values : [],
   };
 }
-
