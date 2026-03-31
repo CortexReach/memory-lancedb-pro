@@ -1,9 +1,10 @@
 /**
  * LLM Client for memory extraction and dedup decisions.
- * Uses OpenAI-compatible API (reuses the embedding provider config).
+ * Supports OpenAI-compatible API, Anthropic native API, and OAuth.
  */
 
 import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 import {
   buildOauthEndpoint,
   extractOutputTextFromSse,
@@ -18,7 +19,13 @@ export interface LlmClientConfig {
   apiKey?: string;
   model: string;
   baseURL?: string;
-  auth?: "api-key" | "oauth";
+  /**
+   * LLM provider type.
+   * - "api-key" (default): OpenAI-compatible endpoint (openai npm package)
+   * - "anthropic": Anthropic native Messages API (@anthropic-ai/sdk)
+   * - "oauth": OAuth-based endpoint (e.g. ChatGPT)
+   */
+  auth?: "api-key" | "anthropic" | "oauth";
   oauthPath?: string;
   oauthProvider?: string;
   timeoutMs?: number;
@@ -259,6 +266,75 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void)
   };
 }
 
+function createAnthropicClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
+  if (!config.apiKey) {
+    throw new Error("LLM anthropic mode requires llm.apiKey");
+  }
+
+  const client = new Anthropic({
+    apiKey: config.apiKey,
+    baseURL: config.baseURL,
+    timeout: config.timeoutMs ?? 30000,
+  });
+  let lastError: string | null = null;
+
+  return {
+    async completeJson<T>(prompt: string, label = "generic"): Promise<T | null> {
+      lastError = null;
+      try {
+        const response = await client.messages.create({
+          model: config.model,
+          max_tokens: 4096,
+          system: "You are a memory extraction assistant. Always respond with valid JSON only.",
+          messages: [{ role: "user", content: prompt }],
+        });
+
+        const block = response.content?.[0];
+        const raw = block?.type === "text" ? block.text : null;
+        if (!raw) {
+          lastError = `memory-lancedb-pro: llm-client [${label}] empty Anthropic response from model ${config.model}`;
+          log(lastError);
+          return null;
+        }
+
+        const jsonStr = extractJsonFromResponse(raw);
+        if (!jsonStr) {
+          lastError = `memory-lancedb-pro: llm-client [${label}] no JSON found in Anthropic response (chars=${raw.length}, preview=${JSON.stringify(previewText(raw))})`;
+          log(lastError);
+          return null;
+        }
+
+        try {
+          return JSON.parse(jsonStr) as T;
+        } catch (err) {
+          const repairedJsonStr = repairCommonJson(jsonStr);
+          if (repairedJsonStr !== jsonStr) {
+            try {
+              const repaired = JSON.parse(repairedJsonStr) as T;
+              log(`memory-lancedb-pro: llm-client [${label}] recovered malformed Anthropic JSON via repair (jsonChars=${jsonStr.length})`);
+              return repaired;
+            } catch (repairErr) {
+              lastError = `memory-lancedb-pro: llm-client [${label}] Anthropic JSON.parse failed: ${err instanceof Error ? err.message : String(err)}; repair failed: ${repairErr instanceof Error ? repairErr.message : String(repairErr)}`;
+              log(lastError);
+              return null;
+            }
+          }
+          lastError = `memory-lancedb-pro: llm-client [${label}] Anthropic JSON.parse failed: ${err instanceof Error ? err.message : String(err)} (jsonChars=${jsonStr.length}, preview=${JSON.stringify(previewText(jsonStr))})`;
+          log(lastError);
+          return null;
+        }
+      } catch (err) {
+        lastError = `memory-lancedb-pro: llm-client [${label}] Anthropic request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
+        log(lastError);
+        return null;
+      }
+    },
+    getLastError(): string | null {
+      return lastError;
+    },
+  };
+}
+
 function createOauthClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
   if (!config.oauthPath) {
     throw new Error("LLM oauth mode requires llm.oauthPath");
@@ -414,6 +490,9 @@ export function createLlmClient(config: LlmClientConfig): LlmClient {
   const log = config.log ?? (() => {});
   if (config.auth === "oauth") {
     return createOauthClient(config, log);
+  }
+  if (config.auth === "anthropic") {
+    return createAnthropicClient(config, log);
   }
   return createApiKeyClient(config, log);
 }

@@ -25,6 +25,7 @@
   "author": "win4r",
   "license": "MIT",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.80.0",
     "@lancedb/lancedb": "^0.26.2",
     "@sinclair/typebox": "0.34.48",
     "apache-arrow": "18.1.0",

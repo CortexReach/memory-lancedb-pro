@@ -163,7 +163,7 @@ interface PluginConfig {
   // Smart extraction config
   smartExtraction?: boolean;
   llm?: {
-    auth?: "api-key" | "oauth";
+    auth?: "api-key" | "anthropic" | "oauth";
     apiKey?: string;
     model?: string;
     baseURL?: string;
