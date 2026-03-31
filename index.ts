@@ -355,7 +355,8 @@ function resolveLlmClientConfig(
     claudeCodePath,
     stateDir: api.resolvePath("."),
     timeoutMs: resolveLlmTimeoutMs(config),
-    log: (msg: string) => msg.includes("WARNING") ? api.logger.warn(msg) : api.logger.debug(msg),
+    log: (msg: string) => api.logger.debug(msg),
+    logWarn: (msg: string) => api.logger.warn(msg),
   };
 }
 
@@ -1748,17 +1749,19 @@ const memoryLanceDBProPlugin = {
 
     // Initialize smart extraction
     let smartExtractor: SmartExtractor | null = null;
+    let resolvedLlmClient: ReturnType<typeof createLlmClient> | undefined;
     if (config.smartExtraction !== false) {
       try {
         const resolvedLlmConfig = resolveLlmClientConfig(config, api);
         const llmClient = createLlmClient(resolvedLlmConfig);
+        resolvedLlmClient = llmClient;
 
         // Initialize embedding-based noise prototype bank (async, non-blocking)
         const noiseBank = new NoisePrototypeBank(
           (msg: string) => api.logger.debug(msg),
         );
         noiseBank.init(embedder).catch((err) =>
-          api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
+          api.logger.warn(`memory-lancedb-pro: noise bank init failed: ${err instanceof Error ? err.message : String(err)}`),
         );
 
         const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(
@@ -1788,7 +1791,7 @@ const memoryLanceDBProPlugin = {
           + ", noise bank: ON)",
         );
       } catch (err) {
-        api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+        api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
       }
     }
 
@@ -2135,14 +2138,7 @@ const memoryLanceDBProPlugin = {
         scopeManager,
         migrator,
         embedder,
-        llmClient: smartExtractor ? (() => {
-          try {
-            return createLlmClient(resolveLlmClientConfig(config, api));
-          } catch (err) {
-            api.logger.warn(`memory-lancedb-pro: failed to create LLM client for CLI: ${err instanceof Error ? err.message : String(err)}`);
-            return undefined;
-          }
-        })() : undefined,
+        llmClient: resolvedLlmClient,
       }),
       { commands: ["memory-pro"] },
     );

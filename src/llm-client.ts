@@ -4,7 +4,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { mkdirSync, existsSync, accessSync, constants as fsConstants } from "node:fs";
+import { mkdirSync, accessSync, constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import OpenAI from "openai";
@@ -37,6 +37,8 @@ export interface LlmClientConfig {
   oauthProvider?: string;
   timeoutMs?: number;
   log?: (msg: string) => void;
+  /** Optional warn-level logger. Used for errors / warnings; falls back to `log` if not provided. */
+  logWarn?: (msg: string) => void;
   /** Plugin state directory. Used by claude-code auth to create an isolated cwd for subprocess sessions. */
   stateDir?: string;
 }
@@ -230,7 +232,7 @@ function createTimeoutSignal(timeoutMs?: number): { signal: AbortSignal; dispose
   };
 }
 
-function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
+function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void, logWarn: (msg: string) => void): LlmClient {
   if (!config.apiKey) {
     throw new Error("LLM api-key mode requires llm.apiKey or embedding.apiKey");
   }
@@ -263,27 +265,27 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void)
         if (!raw) {
           lastError =
             `memory-lancedb-pro: llm-client [${label}] empty response content from model ${config.model}`;
-          log(lastError);
+          logWarn(lastError);
           return null;
         }
         if (typeof raw !== "string") {
           lastError =
             `memory-lancedb-pro: llm-client [${label}] non-string response content type=${Array.isArray(raw) ? "array" : typeof raw} from model ${config.model}`;
-          log(lastError);
+          logWarn(lastError);
           return null;
         }
 
         const parsed = parseJsonWithRepair<T>(raw, label, "api-key", log);
         if (parsed.error) {
           lastError = parsed.error;
-          log(lastError);
+          logWarn(lastError);
           return null;
         }
         return parsed.value;
       } catch (err) {
         lastError =
           `memory-lancedb-pro: llm-client [${label}] request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
-        log(lastError);
+        logWarn(lastError);
         return null;
       }
     },
@@ -293,7 +295,7 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void)
   };
 }
 
-function createOauthClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
+function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, logWarn: (msg: string) => void): LlmClient {
   if (!config.oauthPath) {
     throw new Error("LLM oauth mode requires llm.oauthPath");
   }
@@ -387,7 +389,7 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void):
                   return typeof content?.text === "string" ? content.text : null;
                 } catch (parseErr) {
                   lastError = `memory-lancedb-pro: llm-client [${label}] failed to parse OAuth response body: ${parseErr instanceof Error ? parseErr.message : String(parseErr)} (preview=${JSON.stringify(previewText(bodyText))})`;
-                  log(lastError);
+                  logWarn(lastError);
                   return null;
                 }
               })();
@@ -395,14 +397,14 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void):
           if (!raw) {
             lastError =
               `memory-lancedb-pro: llm-client [${label}] empty OAuth response content from model ${config.model}`;
-            log(lastError);
+            logWarn(lastError);
             return null;
           }
 
           const parsed = parseJsonWithRepair<T>(raw, label, "OAuth", log);
           if (parsed.error) {
             lastError = parsed.error;
-            log(lastError);
+            logWarn(lastError);
             return null;
           }
           return parsed.value;
@@ -412,7 +414,7 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void):
       } catch (err) {
         lastError =
           `memory-lancedb-pro: llm-client [${label}] OAuth request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
-        log(lastError);
+        logWarn(lastError);
         return null;
       }
     },
@@ -454,11 +456,13 @@ function shouldStripClaudeCodeEnvKey(key: string): boolean {
  *   "cannot be launched inside another Claude Code session" errors.
  *
  * @param explicitApiKey - API key from llm.apiKey config. Pass undefined to rely on ambient auth.
- * @param log - Optional logger; used to emit a warning when stripping ambient ANTHROPIC_API_KEY.
+ * @param log - Optional debug-level logger.
+ * @param logWarn - Optional warn-level logger; used for auth-related warnings. Falls back to `log`.
  */
 export function buildClaudeCodeEnv(
   explicitApiKey?: string,
   log?: (msg: string) => void,
+  logWarn?: (msg: string) => void,
 ): Record<string, string> {
   const hasExplicitKey = !!explicitApiKey;
   const env: Record<string, string> = {};
@@ -473,13 +477,14 @@ export function buildClaudeCodeEnv(
   // Mark as SDK subprocess to prevent "nested Claude Code" errors
   env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-ts";
 
+  const warn = logWarn ?? log;
   if (hasExplicitKey) {
     // Explicit key takes precedence; warn so operators know which auth path is active
     log?.("memory-lancedb-pro: llm-client [claude-code] using explicit llm.apiKey; ambient ANTHROPIC_API_KEY suppressed");
     env["ANTHROPIC_API_KEY"] = explicitApiKey!;
   } else if (!process.env["ANTHROPIC_API_KEY"] && !process.env["ANTHROPIC_AUTH_TOKEN"] && !process.env["CLAUDE_CODE_OAUTH_TOKEN"]) {
     // No auth source at all — warn early rather than letting the subprocess fail silently
-    log?.("memory-lancedb-pro: llm-client [claude-code] WARNING: no ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or CLAUDE_CODE_OAUTH_TOKEN found; Claude Code subprocess may fail to authenticate");
+    warn?.("memory-lancedb-pro: llm-client [claude-code] no ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or CLAUDE_CODE_OAUTH_TOKEN found; Claude Code subprocess may fail to authenticate");
   }
 
   return env;
@@ -489,14 +494,17 @@ function resolveClaudeExecutable(configuredPath?: string): string {
   if (configuredPath) {
     try {
       accessSync(configuredPath, fsConstants.X_OK);
-    } catch {
-      throw new Error(`claude executable not found or not executable at configured path: ${configuredPath}`);
+    } catch (accessErr) {
+      const reason = accessErr instanceof Error ? accessErr.message : String(accessErr);
+      throw new Error(`claude executable at configured path ${configuredPath} is not accessible: ${reason}`);
     }
     return configuredPath;
   }
   try {
     const cmd = process.platform === "win32" ? "where claude" : "which claude";
-    return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const output = execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const firstLine = output.split(/\r?\n/)[0].trim();
+    return firstLine;
   } catch (execErr) {
     const reason = execErr instanceof Error ? execErr.message : String(execErr);
     throw new Error(
@@ -527,7 +535,7 @@ function extractTextFromSdkMessage(message: unknown): string | null {
   return null;
 }
 
-function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
+function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => void, logWarn: (msg: string) => void): LlmClient {
   let lastError: string | null = null;
   // Cache the resolved claude path — and any resolution failure — so we don't
   // fork a shell on every request even after a permanent failure.
@@ -549,7 +557,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
       // repeated calls don't re-import or retry a broken/missing module.
       if (cachedSdkError) {
         lastError = `memory-lancedb-pro: llm-client [${label}] ${cachedSdkError}`;
-        log(lastError);
+        logWarn(lastError);
         return null;
       }
       if (!cachedQueryFn) {
@@ -571,7 +579,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
             cachedSdkError = `failed to load @anthropic-ai/claude-agent-sdk: ${importErr instanceof Error ? importErr.message : String(importErr)}`;
           }
           lastError = `memory-lancedb-pro: llm-client [${label}] ${cachedSdkError}`;
-          log(lastError);
+          logWarn(lastError);
           return null;
         }
       }
@@ -582,7 +590,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
       // tagged with the label from the first failing call.
       if (cachedClaudePathError) {
         lastError = `memory-lancedb-pro: llm-client [${label}] ${cachedClaudePathError}`;
-        log(lastError);
+        logWarn(lastError);
         return null;
       }
       if (!cachedClaudePath) {
@@ -591,7 +599,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
         } catch (err) {
           cachedClaudePathError = err instanceof Error ? err.message : String(err);
           lastError = `memory-lancedb-pro: llm-client [${label}] ${cachedClaudePathError}`;
-          log(lastError);
+          logWarn(lastError);
           return null;
         }
       }
@@ -603,11 +611,11 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
         mkdirSync(sessionDir, { recursive: true }); // no-op if already exists
       } catch (err) {
         lastError = `memory-lancedb-pro: llm-client [${label}] failed to create session dir ${sessionDir}: ${err instanceof Error ? err.message : String(err)}`;
-        log(lastError);
+        logWarn(lastError);
         return null;
       }
 
-      const env = buildClaudeCodeEnv(config.apiKey, log);
+      const env = buildClaudeCodeEnv(config.apiKey, log, logWarn);
       const model = config.model;
 
       const effectiveTimeoutMs = resolveTimeoutMs(config.timeoutMs);
@@ -642,7 +650,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
                 ? msg.errors.map((e) => (typeof e === "string" ? e : JSON.stringify(e))).join("; ")
                 : (msg.subtype ?? "unknown");
               lastError = `memory-lancedb-pro: llm-client [${label}] claude-code subprocess failed (subtype=${msg.subtype ?? "unknown"}): ${errorDetail}`;
-              log(lastError);
+              logWarn(lastError);
               return null;
             }
             raw = typeof msg.result === "string" ? msg.result : null;
@@ -656,14 +664,14 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
 
         if (!raw) {
           lastError = `memory-lancedb-pro: llm-client [${label}] claude-code returned empty response for model ${model}`;
-          log(lastError);
+          logWarn(lastError);
           return null;
         }
 
         const parsed = parseJsonWithRepair<T>(raw, label, "claude-code", log);
         if (parsed.error) {
           lastError = parsed.error;
-          log(lastError);
+          logWarn(lastError);
           return null;
         }
         return parsed.value;
@@ -674,7 +682,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
         } else {
           lastError = `memory-lancedb-pro: llm-client [${label}] claude-code request failed for model ${model}: ${err instanceof Error ? err.message : String(err)}`;
         }
-        log(lastError);
+        logWarn(lastError);
         return null;
       } finally {
         disposeTimeout();
@@ -688,13 +696,14 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
 
 export function createLlmClient(config: LlmClientConfig): LlmClient {
   const log = config.log ?? (() => {});
+  const logWarn = config.logWarn ?? log;
   if (config.auth === "oauth") {
-    return createOauthClient(config, log);
+    return createOauthClient(config, log, logWarn);
   }
   if (config.auth === "claude-code") {
-    return createClaudeCodeClient(config, log);
+    return createClaudeCodeClient(config, log, logWarn);
   }
-  return createApiKeyClient(config, log);
+  return createApiKeyClient(config, log, logWarn);
 }
 
 export { extractJsonFromResponse, repairCommonJson };
