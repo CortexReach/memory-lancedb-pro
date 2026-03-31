@@ -468,6 +468,7 @@ export function buildClaudeCodeEnv(
   const env: Record<string, string> = {};
 
   // Load Claude Code's settings.json env (OAuth tokens, ANTHROPIC_BASE_URL, etc.)
+  const warn = logWarn ?? log;
   try {
     const settingsPath = join(homedir(), ".claude", "settings.json");
     const settingsRaw = readFileSync(settingsPath, "utf-8");
@@ -491,7 +492,6 @@ export function buildClaudeCodeEnv(
   // Mark as SDK subprocess to prevent "nested Claude Code" errors
   env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-ts";
 
-  const warn = logWarn ?? log;
   if (hasExplicitKey) {
     // Explicit key takes precedence; warn so operators know which auth path is active
     log?.("memory-lancedb-pro: llm-client [claude-code] using explicit llm.apiKey; ambient ANTHROPIC_API_KEY suppressed");
