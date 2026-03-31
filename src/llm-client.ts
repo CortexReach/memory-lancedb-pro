@@ -4,7 +4,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, accessSync, constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import OpenAI from "openai";
@@ -489,8 +489,10 @@ export function buildClaudeCodeEnv(
 
 function resolveClaudeExecutable(configuredPath?: string): string {
   if (configuredPath) {
-    if (!existsSync(configuredPath)) {
-      throw new Error(`claude executable not found at configured path: ${configuredPath}`);
+    try {
+      accessSync(configuredPath, fsConstants.X_OK);
+    } catch {
+      throw new Error(`claude executable not found or not executable at configured path: ${configuredPath}`);
     }
     return configuredPath;
   }
@@ -506,6 +508,13 @@ function resolveClaudeExecutable(configuredPath?: string): string {
   }
 }
 
+// Tools we never want the memory subprocess to use (static — hoisted out of completeJson)
+const CLAUDE_CODE_DISALLOWED_TOOLS = [
+  "Bash", "Read", "Write", "Edit", "MultiEdit", "Grep", "Glob",
+  "WebFetch", "WebSearch", "Task", "NotebookEdit",
+  "AskUserQuestion", "TodoWrite", "TodoRead", "LS",
+];
+
 function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
   let lastError: string | null = null;
   // Cache the resolved claude path — and any resolution failure — so we don't
@@ -514,7 +523,9 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
   // replaying a stale label from the first failing call into subsequent calls.
   let cachedClaudePath: string | undefined;
   let cachedClaudePathError: string | null = null;
-  // Cache SDK import failure similarly — no need to retry a missing/broken module.
+  // Cache SDK import result (both success and failure) — no need to re-import
+  // on every call. Error stored as bare message (no label) to match cachedClaudePathError pattern.
+  let cachedQueryFn: ((typeof import("@anthropic-ai/claude-agent-sdk"))["query"]) | undefined;
   let cachedSdkError: string | null = null;
 
   return {
@@ -522,34 +533,37 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
       lastError = null;
 
       // Dynamic import — optional dep; gives a clear error if not installed.
-      // Failure is cached so repeated calls don't retry a broken/missing module.
+      // Both success (queryFn) and failure (cachedSdkError) are cached so
+      // repeated calls don't re-import or retry a broken/missing module.
       if (cachedSdkError) {
-        lastError = cachedSdkError;
+        lastError = `memory-lancedb-pro: llm-client [${label}] ${cachedSdkError}`;
         log(lastError);
         return null;
       }
-      let queryFn: (typeof import("@anthropic-ai/claude-agent-sdk"))["query"];
-      try {
-        const sdk = await import("@anthropic-ai/claude-agent-sdk");
-        if (typeof sdk.query !== "function") {
-          throw new Error("sdk.query is not a function — package may be corrupted or incompatible");
+      if (!cachedQueryFn) {
+        try {
+          const sdk = await import("@anthropic-ai/claude-agent-sdk");
+          if (typeof sdk.query !== "function") {
+            throw new Error("sdk.query is not a function — package may be corrupted or incompatible");
+          }
+          cachedQueryFn = sdk.query;
+        } catch (importErr) {
+          const isNotFound =
+            importErr instanceof Error &&
+            (("code" in importErr && (importErr as NodeJS.ErrnoException).code === "MODULE_NOT_FOUND") ||
+              importErr.message.includes("Cannot find module") ||
+              importErr.message.includes("Cannot find package"));
+          if (isNotFound) {
+            cachedSdkError = "@anthropic-ai/claude-agent-sdk is not installed. Run: npm i @anthropic-ai/claude-agent-sdk";
+          } else {
+            cachedSdkError = `failed to load @anthropic-ai/claude-agent-sdk: ${importErr instanceof Error ? importErr.message : String(importErr)}`;
+          }
+          lastError = `memory-lancedb-pro: llm-client [${label}] ${cachedSdkError}`;
+          log(lastError);
+          return null;
         }
-        queryFn = sdk.query;
-      } catch (importErr) {
-        const isNotFound =
-          importErr instanceof Error &&
-          (("code" in importErr && (importErr as NodeJS.ErrnoException).code === "MODULE_NOT_FOUND") ||
-            importErr.message.includes("Cannot find module") ||
-            importErr.message.includes("Cannot find package"));
-        if (isNotFound) {
-          cachedSdkError = "memory-lancedb-pro: llm-client [claude-code] @anthropic-ai/claude-agent-sdk is not installed. Run: npm i @anthropic-ai/claude-agent-sdk";
-        } else {
-          cachedSdkError = `memory-lancedb-pro: llm-client [claude-code] failed to load @anthropic-ai/claude-agent-sdk: ${importErr instanceof Error ? importErr.message : String(importErr)}`;
-        }
-        lastError = cachedSdkError;
-        log(lastError);
-        return null;
       }
+      const queryFn = cachedQueryFn;
 
       // Resolve claude binary (cached per client instance; failure also cached).
       // The error is stored without a label so replayed errors are not misleadingly
@@ -584,13 +598,6 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
       const env = buildClaudeCodeEnv(config.apiKey, log);
       const model = config.model;
 
-      // Tools we never want the memory subprocess to use
-      const disallowedTools = [
-        "Bash", "Read", "Write", "Edit", "MultiEdit", "Grep", "Glob",
-        "WebFetch", "WebSearch", "Task", "NotebookEdit",
-        "AskUserQuestion", "TodoWrite", "TodoRead", "LS",
-      ];
-
       const effectiveTimeoutMs =
         typeof config.timeoutMs === "number" && Number.isFinite(config.timeoutMs) && config.timeoutMs > 0
           ? config.timeoutMs
@@ -605,7 +612,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
             model,
             cwd: sessionDir,
             pathToClaudeCodeExecutable: claudePath,
-            disallowedTools,
+            disallowedTools: CLAUDE_CODE_DISALLOWED_TOOLS,
             env,
             abortController,
           },
