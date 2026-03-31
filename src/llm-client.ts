@@ -496,8 +496,8 @@ export function buildClaudeCodeEnv(
     // Explicit key takes precedence; warn so operators know which auth path is active
     log?.("memory-lancedb-pro: llm-client [claude-code] using explicit llm.apiKey; ambient ANTHROPIC_API_KEY suppressed");
     env["ANTHROPIC_API_KEY"] = explicitApiKey!;
-  } else if (!process.env["ANTHROPIC_API_KEY"] && !process.env["ANTHROPIC_AUTH_TOKEN"] && !process.env["CLAUDE_CODE_OAUTH_TOKEN"]) {
-    // No auth source at all — warn early rather than letting the subprocess fail silently
+  } else if (!env["ANTHROPIC_API_KEY"] && !env["ANTHROPIC_AUTH_TOKEN"] && !env["CLAUDE_CODE_OAUTH_TOKEN"]) {
+    // No auth source at all (neither settings.json nor ambient env) — warn early
     warn?.("memory-lancedb-pro: llm-client [claude-code] no ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or CLAUDE_CODE_OAUTH_TOKEN found; Claude Code subprocess may fail to authenticate");
   }
 
