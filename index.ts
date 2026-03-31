@@ -1606,6 +1606,186 @@ function getPluginVersion(): string {
 const pluginVersion = getPluginVersion();
 
 // ============================================================================
+// Singleton State & Hook Dedup
+// ============================================================================
+//
+// OpenClaw calls register() once per scope init (5× at startup, 4× per inbound
+// message that triggers a scope cache-miss). Without guarding:
+//   1. Heavy resources (MemoryStore, embedder, SmartExtractor, etc.) are recreated
+//      on every call — wasteful and loses accumulated session Map state.
+//   2. api.registerHook() pushes handlers into a global internal hooks Map
+//      (registerInternalHook) which has no dedup. Handlers accumulate unboundedly.
+//      After hours of uptime, a single /reset can trigger 200+ duplicate handler
+//      invocations, each making Ollama embedding calls.
+//
+// Fix (1): Singleton pattern — heavy resources created once, reused via closure.
+// Fix (2): Handler-level idempotency — each hook handler checks a dedup Set
+// keyed on (handlerName, sessionKey, timestamp) and skips if already processed.
+// We cannot guard at registration time because the framework calls
+// clearInternalHooks() between the first and subsequent register() calls.
+
+interface PluginSingletonState {
+  config: ReturnType<typeof parsePluginConfig>;
+  resolvedDbPath: string;
+  store: MemoryStore;
+  embedder: ReturnType<typeof createEmbedder>;
+  decayEngine: ReturnType<typeof createDecayEngine>;
+  tierManager: ReturnType<typeof createTierManager>;
+  retriever: ReturnType<typeof createRetriever>;
+  scopeManager: ReturnType<typeof createScopeManager>;
+  migrator: ReturnType<typeof createMigrator>;
+  smartExtractor: SmartExtractor | null;
+  mdMirror: MdMirrorWriter | null;
+  reflectionErrorStateBySession: Map<string, ReflectionErrorState>;
+  reflectionDerivedBySession: Map<string, { updatedAt: number; derived: string[] }>;
+  reflectionByAgentCache: Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>;
+  recallHistory: Map<string, Map<string, number>>;
+  turnCounter: Map<string, number>;
+  autoCaptureSeenTextCount: Map<string, number>;
+  autoCapturePendingIngressTexts: Map<string, string[]>;
+  autoCaptureRecentTexts: Map<string, string[]>;
+  backupTimer: ReturnType<typeof setInterval> | null;
+}
+
+let _singletonState: PluginSingletonState | null = null;
+
+/** Dedup guard for internal hook handlers. See module comment above. */
+const _hookEventDedup = new Set<string>();
+function _dedupHookEvent(handlerName: string, event: any): boolean {
+  const sk = typeof event?.sessionKey === "string" ? event.sessionKey : "?";
+  const ts = event?.timestamp instanceof Date ? event.timestamp.getTime() : Date.now();
+  const key = `${handlerName}:${sk}:${ts}`;
+  if (_hookEventDedup.has(key)) return true; // duplicate — skip
+  _hookEventDedup.add(key);
+  if (_hookEventDedup.size > 200) {
+    const iter = _hookEventDedup.values();
+    for (let i = 0; i < 100; i++) {
+      const v = iter.next();
+      if (!v.done) _hookEventDedup.delete(v.value);
+    }
+  }
+  return false; // first occurrence — proceed
+}
+
+function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
+  const config = parsePluginConfig(api.pluginConfig);
+  const resolvedDbPath = api.resolvePath(config.dbPath || getDefaultDbPath());
+
+  try {
+    validateStoragePath(resolvedDbPath);
+  } catch (err) {
+    api.logger.warn(
+      `memory-lancedb-pro: storage path issue — ${String(err)}\n` +
+      `  The plugin will still attempt to start, but writes may fail.`,
+    );
+  }
+
+  const vectorDim = getVectorDimensions(
+    config.embedding.model || "text-embedding-3-small",
+    config.embedding.dimensions,
+  );
+
+  const store = new MemoryStore({ dbPath: resolvedDbPath, vectorDim });
+  const embedder = createEmbedder({
+    provider: "openai-compatible",
+    apiKey: config.embedding.apiKey,
+    model: config.embedding.model || "text-embedding-3-small",
+    baseURL: config.embedding.baseURL,
+    dimensions: config.embedding.dimensions,
+    taskQuery: config.embedding.taskQuery,
+    taskPassage: config.embedding.taskPassage,
+    normalized: config.embedding.normalized,
+    chunking: config.embedding.chunking,
+  });
+  const decayEngine = createDecayEngine({
+    ...DEFAULT_DECAY_CONFIG,
+    ...(config.decay || {}),
+  });
+  const tierManager = createTierManager({
+    ...DEFAULT_TIER_CONFIG,
+    ...(config.tier || {}),
+  });
+  const retriever = createRetriever(
+    store,
+    embedder,
+    {
+      ...DEFAULT_RETRIEVAL_CONFIG,
+      ...config.retrieval,
+    },
+    { decayEngine },
+  );
+  const scopeManager = createScopeManager(config.scopes);
+  const migrator = createMigrator(store);
+
+  let smartExtractor: SmartExtractor | null = null;
+  if (config.smartExtraction !== false) {
+    try {
+      const llmApiKey = config.llm?.apiKey
+        ? resolveEnvVars(config.llm.apiKey)
+        : resolveEnvVars(config.embedding.apiKey);
+      const llmBaseURL = config.llm?.baseURL
+        ? resolveEnvVars(config.llm.baseURL)
+        : config.embedding.baseURL;
+      const llmModel = config.llm?.model || "openai/gpt-oss-120b";
+
+      const llmClient = createLlmClient({
+        apiKey: llmApiKey,
+        model: llmModel,
+        baseURL: llmBaseURL,
+        timeoutMs: 30000,
+        log: (msg: string) => api.logger.debug(msg),
+      });
+
+      const noiseBank = new NoisePrototypeBank(
+        (msg: string) => api.logger.debug(msg),
+      );
+      noiseBank.init(embedder).catch((err) =>
+        api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
+      );
+
+      smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+        user: "User",
+        extractMinMessages: config.extractMinMessages ?? 2,
+        extractMaxChars: config.extractMaxChars ?? 8000,
+        defaultScope: config.scopes?.default ?? "global",
+        log: (msg: string) => api.logger.info(msg),
+        debugLog: (msg: string) => api.logger.debug(msg),
+        noiseBank,
+      });
+
+      api.logger.info("memory-lancedb-pro: smart extraction enabled (LLM model: " + llmModel + ", noise bank: ON)");
+    } catch (err) {
+      api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+    }
+  }
+
+  const mdMirror = createMdMirrorWriter(api, config);
+
+  return {
+    config,
+    resolvedDbPath,
+    store,
+    embedder,
+    decayEngine,
+    tierManager,
+    retriever,
+    scopeManager,
+    migrator,
+    smartExtractor,
+    mdMirror,
+    reflectionErrorStateBySession: new Map(),
+    reflectionDerivedBySession: new Map(),
+    reflectionByAgentCache: new Map(),
+    recallHistory: new Map(),
+    turnCounter: new Map(),
+    autoCaptureSeenTextCount: new Map(),
+    autoCapturePendingIngressTexts: new Map(),
+    autoCaptureRecentTexts: new Map(),
+    backupTimer: null,
+  };
+}
+
+// ============================================================================
 // Plugin Definition
 // ============================================================================
 
@@ -1617,381 +1797,30 @@ const memoryLanceDBProPlugin = {
   kind: "memory" as const,
 
   register(api: OpenClawPluginApi) {
-    // Parse and validate configuration
-    const config = parsePluginConfig(api.pluginConfig);
-
-    const resolvedDbPath = api.resolvePath(config.dbPath || getDefaultDbPath());
-
-    // Pre-flight: validate storage path (symlink resolution, mkdir, write check).
-    // Runs synchronously and logs warnings; does NOT block gateway startup.
-    try {
-      validateStoragePath(resolvedDbPath);
-    } catch (err) {
-      api.logger.warn(
-        `memory-lancedb-pro: storage path issue — ${String(err)}\n` +
-        `  The plugin will still attempt to start, but writes may fail.`,
+    // Singleton init — heavy resources created once, reused across scope inits
+    if (!_singletonState) {
+      _singletonState = _initPluginState(api);
+      const logReg = isCliMode() ? api.logger.debug : api.logger.info;
+      logReg(
+        `memory-lancedb-pro@${pluginVersion}: plugin registered [singleton init] ` +
+        `(db: ${_singletonState.resolvedDbPath}, model: ${_singletonState.config.embedding.model || "text-embedding-3-small"}, ` +
+        `smartExtraction: ${_singletonState.smartExtractor ? 'ON' : 'OFF'})`
       );
+      logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
     }
 
-    const vectorDim = getVectorDimensions(
-      config.embedding.model || "text-embedding-3-small",
-      config.embedding.dimensions,
-    );
+    // Destructure singleton for use in closures below
+    const {
+      config, resolvedDbPath, store, embedder, decayEngine, tierManager,
+      retriever, scopeManager, migrator, smartExtractor, mdMirror,
+      reflectionErrorStateBySession, reflectionDerivedBySession,
+      reflectionByAgentCache, recallHistory, turnCounter,
+      autoCaptureSeenTextCount, autoCapturePendingIngressTexts,
+      autoCaptureRecentTexts,
+    } = _singletonState;
 
-    // Initialize core components
-    const store = new MemoryStore({ dbPath: resolvedDbPath, vectorDim });
-    const embedder = createEmbedder({
-      provider: "openai-compatible",
-      apiKey: config.embedding.apiKey,
-      model: config.embedding.model || "text-embedding-3-small",
-      baseURL: config.embedding.baseURL,
-      dimensions: config.embedding.dimensions,
-      omitDimensions: config.embedding.omitDimensions,
-      taskQuery: config.embedding.taskQuery,
-      taskPassage: config.embedding.taskPassage,
-      normalized: config.embedding.normalized,
-      chunking: config.embedding.chunking,
-    });
-    // Initialize decay engine
-    const decayEngine = createDecayEngine({
-      ...DEFAULT_DECAY_CONFIG,
-      ...(config.decay || {}),
-    });
-    const tierManager = createTierManager({
-      ...DEFAULT_TIER_CONFIG,
-      ...(config.tier || {}),
-    });
-    const retriever = createRetriever(
-      store,
-      embedder,
-      {
-        ...DEFAULT_RETRIEVAL_CONFIG,
-        ...config.retrieval,
-      },
-      { decayEngine },
-    );
-    const scopeManager = createScopeManager(config.scopes);
-
-    // ClawTeam integration: extend accessible scopes via env var
-    const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
-    if (clawteamScopes.length > 0) {
-      applyClawteamScopes(scopeManager, clawteamScopes);
-      api.logger.info(`memory-lancedb-pro: CLAWTEAM_MEMORY_SCOPE added scopes: ${clawteamScopes.join(", ")}`);
-    }
-
-    const migrator = createMigrator(store);
-
-    // Initialize smart extraction
-    let smartExtractor: SmartExtractor | null = null;
-    if (config.smartExtraction !== false) {
-      try {
-        const llmAuth = config.llm?.auth || "api-key";
-        const llmApiKey = llmAuth === "oauth"
-          ? undefined
-          : config.llm?.apiKey
-            ? resolveEnvVars(config.llm.apiKey)
-            : resolveFirstApiKey(config.embedding.apiKey);
-        const llmBaseURL = llmAuth === "oauth"
-          ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
-          : config.llm?.baseURL
-            ? resolveEnvVars(config.llm.baseURL)
-            : config.embedding.baseURL;
-        const llmModel = config.llm?.model || "openai/gpt-oss-120b";
-        const llmOauthPath = llmAuth === "oauth"
-          ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
-          : undefined;
-        const llmOauthProvider = llmAuth === "oauth"
-          ? config.llm?.oauthProvider
-          : undefined;
-        const llmTimeoutMs = resolveLlmTimeoutMs(config);
-
-        const llmClient = createLlmClient({
-          auth: llmAuth,
-          apiKey: llmApiKey,
-          model: llmModel,
-          baseURL: llmBaseURL,
-          oauthProvider: llmOauthProvider,
-          oauthPath: llmOauthPath,
-          timeoutMs: llmTimeoutMs,
-          log: (msg: string) => api.logger.debug(msg),
-        });
-
-        // Initialize embedding-based noise prototype bank (async, non-blocking)
-        const noiseBank = new NoisePrototypeBank(
-          (msg: string) => api.logger.debug(msg),
-        );
-        noiseBank.init(embedder).catch((err) =>
-          api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
-        );
-
-        const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(
-          config,
-          resolvedDbPath,
-          api,
-        );
-
-        smartExtractor = new SmartExtractor(store, embedder, llmClient, {
-          user: "User",
-          extractMinMessages: config.extractMinMessages ?? 4,
-          extractMaxChars: config.extractMaxChars ?? 8000,
-          defaultScope: config.scopes?.default ?? "global",
-          workspaceBoundary: config.workspaceBoundary,
-          admissionControl: config.admissionControl,
-          onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
-          log: (msg: string) => api.logger.info(msg),
-          debugLog: (msg: string) => api.logger.debug(msg),
-          noiseBank,
-        });
-
-        (isCliMode() ? api.logger.debug : api.logger.info)(
-          "memory-lancedb-pro: smart extraction enabled (LLM model: "
-          + llmModel
-          + ", timeoutMs: "
-          + llmTimeoutMs
-          + ", noise bank: ON)",
-        );
-      } catch (err) {
-        api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
-      }
-    }
-
-    // Extraction rate limiter (Feature 7: Adaptive Extraction Throttling)
-    // NOTE: This rate limiter is global — shared across all agents in multi-agent setups.
-    const extractionRateLimiter = createExtractionRateLimiter({
-      maxExtractionsPerHour: config.extractionThrottle?.maxExtractionsPerHour,
-    });
-
-    async function sleep(ms: number): Promise<void> {
-      await new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    async function retrieveWithRetry(params: {
-      query: string;
-      limit: number;
-      scopeFilter?: string[];
-      category?: string;
-    }) {
-      let results = await retriever.retrieve(params);
-      if (results.length === 0) {
-        await sleep(75);
-        results = await retriever.retrieve(params);
-      }
-      return results;
-    }
-
-    async function runRecallLifecycle(
-      results: Array<{ entry: { id: string; text: string; category: "preference" | "fact" | "decision" | "entity" | "other"; scope: string; importance: number; timestamp: number; metadata?: string } }>,
-      scopeFilter?: string[],
-    ): Promise<Map<string, string>> {
-      const now = Date.now();
-      type LifecycleEntry = {
-        id: string;
-        text: string;
-        category: "preference" | "fact" | "decision" | "entity" | "other";
-        scope: string;
-        importance: number;
-        timestamp: number;
-        metadata?: string;
-      };
-      const lifecycleEntries = new Map<string, LifecycleEntry>();
-      const tierOverrides = new Map<string, string>();
-
-      await Promise.allSettled(
-        results.map(async (result) => {
-          const metadata = parseSmartMetadata(result.entry.metadata, result.entry);
-          const updated = await store.patchMetadata(
-            result.entry.id,
-            {
-              access_count: metadata.access_count + 1,
-              last_accessed_at: now,
-            },
-            scopeFilter,
-          );
-          lifecycleEntries.set(result.entry.id, updated ?? result.entry);
-        }),
-      );
-
-      try {
-        if (scopeFilter !== undefined) {
-          const recentEntries = await store.list(scopeFilter, undefined, 100, 0);
-          for (const entry of recentEntries) {
-            if (!lifecycleEntries.has(entry.id)) {
-              lifecycleEntries.set(entry.id, entry);
-            }
-          }
-        } else {
-          api.logger.debug(`memory-lancedb-pro: skipping tier maintenance preload for bypass scope filter`);
-        }
-      } catch (err) {
-        api.logger.warn(`memory-lancedb-pro: tier maintenance preload failed: ${String(err)}`);
-      }
-
-      const candidates = Array.from(lifecycleEntries.values())
-        .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
-        .filter((entry) => parseSmartMetadata(entry.metadata, entry).type !== "session-summary");
-
-      if (candidates.length === 0) {
-        return tierOverrides;
-      }
-
-      try {
-        const memories = candidates.map((entry) => toLifecycleMemory(entry.id, entry));
-        const decayScores = decayEngine.scoreAll(memories, now);
-        const transitions = tierManager.evaluateAll(memories, decayScores, now);
-
-        await Promise.allSettled(
-          transitions.map(async (transition) => {
-            await store.patchMetadata(
-              transition.memoryId,
-              {
-                tier: transition.toTier,
-                tier_updated_at: now,
-              },
-              scopeFilter,
-            );
-            tierOverrides.set(transition.memoryId, transition.toTier);
-          }),
-        );
-
-        if (transitions.length > 0) {
-          api.logger.info(
-            `memory-lancedb-pro: tier maintenance applied ${transitions.length} transition(s)`,
-          );
-        }
-      } catch (err) {
-        api.logger.warn(`memory-lancedb-pro: tier maintenance failed: ${String(err)}`);
-      }
-
-      return tierOverrides;
-    }
-    const reflectionErrorStateBySession = new Map<string, ReflectionErrorState>();
-    const reflectionDerivedBySession = new Map<string, { updatedAt: number; derived: string[] }>();
-    const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
-
-    const pruneOldestByUpdatedAt = <T extends { updatedAt: number }>(map: Map<string, T>, maxSize: number) => {
-      if (map.size <= maxSize) return;
-      const sorted = [...map.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt);
-      const removeCount = map.size - maxSize;
-      for (let i = 0; i < removeCount; i++) {
-        const key = sorted[i]?.[0];
-        if (key) map.delete(key);
-      }
-    };
-
-    const pruneReflectionSessionState = (now = Date.now()) => {
-      for (const [key, state] of reflectionErrorStateBySession.entries()) {
-        if (now - state.updatedAt > DEFAULT_REFLECTION_SESSION_TTL_MS) {
-          reflectionErrorStateBySession.delete(key);
-        }
-      }
-      for (const [key, state] of reflectionDerivedBySession.entries()) {
-        if (now - state.updatedAt > DEFAULT_REFLECTION_SESSION_TTL_MS) {
-          reflectionDerivedBySession.delete(key);
-        }
-      }
-      pruneOldestByUpdatedAt(reflectionErrorStateBySession, DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS);
-      pruneOldestByUpdatedAt(reflectionDerivedBySession, DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS);
-    };
-
-    const getReflectionErrorState = (sessionKey: string): ReflectionErrorState => {
-      const key = sessionKey.trim();
-      const current = reflectionErrorStateBySession.get(key);
-      if (current) {
-        current.updatedAt = Date.now();
-        return current;
-      }
-      const created: ReflectionErrorState = { entries: [], lastInjectedCount: 0, signatureSet: new Set<string>(), updatedAt: Date.now() };
-      reflectionErrorStateBySession.set(key, created);
-      return created;
-    };
-
-    const addReflectionErrorSignal = (sessionKey: string, signal: ReflectionErrorSignal, dedupeEnabled: boolean) => {
-      if (!sessionKey.trim()) return;
-      pruneReflectionSessionState();
-      const state = getReflectionErrorState(sessionKey);
-      if (dedupeEnabled && state.signatureSet.has(signal.signatureHash)) return;
-      state.entries.push(signal);
-      state.signatureSet.add(signal.signatureHash);
-      state.updatedAt = Date.now();
-      if (state.entries.length > 30) {
-        const removed = state.entries.length - 30;
-        state.entries.splice(0, removed);
-        state.lastInjectedCount = Math.max(0, state.lastInjectedCount - removed);
-        state.signatureSet = new Set(state.entries.map((e) => e.signatureHash));
-      }
-    };
-
-    const getPendingReflectionErrorSignalsForPrompt = (sessionKey: string, maxEntries: number): ReflectionErrorSignal[] => {
-      pruneReflectionSessionState();
-      const state = reflectionErrorStateBySession.get(sessionKey.trim());
-      if (!state) return [];
-      state.updatedAt = Date.now();
-      state.lastInjectedCount = Math.min(state.lastInjectedCount, state.entries.length);
-      const pending = state.entries.slice(state.lastInjectedCount);
-      if (pending.length === 0) return [];
-      const clipped = pending.slice(-maxEntries);
-      state.lastInjectedCount = state.entries.length;
-      return clipped;
-    };
-
-    const loadAgentReflectionSlices = async (agentId: string, scopeFilter?: string[]) => {
-      const scopeKey = Array.isArray(scopeFilter)
-        ? `scopes:${[...scopeFilter].sort().join(",")}`
-        : "<NO_SCOPE_FILTER>";
-      const cacheKey = `${agentId}::${scopeKey}`;
-      const cached = reflectionByAgentCache.get(cacheKey);
-      if (cached && Date.now() - cached.updatedAt < 15_000) return cached;
-
-      // Prefer reflection-category rows to avoid full-table reads on bypass callers.
-      // Fall back to an uncategorized scan only when the category query produced no
-      // agent-owned reflection slices, preserving backward compatibility with mixed-schema stores.
-      let entries = await store.list(scopeFilter, "reflection", 240, 0);
-      let slices = loadAgentReflectionSlicesFromEntries({
-        entries,
-        agentId,
-        deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
-      });
-      if (slices.invariants.length === 0 && slices.derived.length === 0) {
-        const legacyEntries = await store.list(scopeFilter, undefined, 240, 0);
-        entries = legacyEntries.filter((entry) => {
-          try {
-            const metadata = parseReflectionMetadata(entry.metadata);
-            return isReflectionMetadataType(metadata.type) && isOwnedByAgent(metadata, agentId);
-          } catch {
-            return false;
-          }
-        });
-        slices = loadAgentReflectionSlicesFromEntries({
-          entries,
-          agentId,
-          deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
-        });
-      }
-      const { invariants, derived } = slices;
-      const next = { updatedAt: Date.now(), invariants, derived };
-      reflectionByAgentCache.set(cacheKey, next);
-      return next;
-    };
-
-    // Session-based recall history to prevent redundant injections
-    // Map<sessionId, Map<memoryId, turnIndex>>
-    const recallHistory = new Map<string, Map<string, number>>();
-
-    // Map<sessionId, turnCounter> - manual turn tracking per session
-    const turnCounter = new Map<string, number>();
-
-    // Track how many normalized user texts have already been seen per session snapshot.
-    // All three Maps are pruned to AUTO_CAPTURE_MAP_MAX_ENTRIES to prevent unbounded
-    // growth in long-running processes with many distinct sessions.
-    const autoCaptureSeenTextCount = new Map<string, number>();
-    const autoCapturePendingIngressTexts = new Map<string, string[]>();
-    const autoCaptureRecentTexts = new Map<string, string[]>();
-
-    const logReg = isCliMode() ? api.logger.debug : api.logger.info;
-    logReg(
-      `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
-    );
-    logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
+    // Wire up the module-level debug logger to the latest api scope
+    _autoCaptureDebugLog = (msg: string) => api.logger.debug(msg);
 
     api.on("message_received", (event: any, ctx: any) => {
       const conversationKey = buildAutoCaptureConversationKeyFromIngress(
@@ -2028,7 +1857,7 @@ const memoryLanceDBProPlugin = {
     // Markdown Mirror
     // ========================================================================
 
-    const mdMirror = createMdMirrorWriter(api, config);
+    // mdMirror destructured from _singletonState above
 
     // ========================================================================
     // Register Tools
@@ -2904,6 +2733,7 @@ const memoryLanceDBProPlugin = {
 
     if (config.selfImprovement?.enabled !== false) {
       api.registerHook("agent:bootstrap", async (event) => {
+        if (_dedupHookEvent("bootstrap", event)) return;
         try {
           const context = (event.context || {}) as Record<string, unknown>;
           const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
@@ -2947,6 +2777,7 @@ const memoryLanceDBProPlugin = {
 
       if (config.selfImprovement?.beforeResetNote !== false) {
         const appendSelfImprovementNote = async (event: any) => {
+          if (_dedupHookEvent("selfImprovement", event)) return;
           try {
             const action = String(event?.action || "unknown");
             const sessionKeyForLog = typeof event?.sessionKey === "string" ? event.sessionKey : "";
@@ -3159,6 +2990,7 @@ const memoryLanceDBProPlugin = {
       }, { priority: 20 });
 
       const runMemoryReflection = async (event: any) => {
+        if (_dedupHookEvent("reflection", event)) return;
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
         try {
           pruneReflectionSessionState();
@@ -3551,7 +3383,7 @@ const memoryLanceDBProPlugin = {
     // Auto-Backup (daily JSONL export)
     // ========================================================================
 
-    let backupTimer: ReturnType<typeof setInterval> | null = null;
+    // backupTimer is managed via _singletonState to prevent interval leak on re-registration
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
     async function runBackup() {
@@ -3689,13 +3521,16 @@ const memoryLanceDBProPlugin = {
         }, 5_000);
 
         // Run initial backup after a short delay, then schedule daily
-        setTimeout(() => void runBackup(), 60_000); // 1 min after start
-        backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+        // Guard: only start one interval across all scope inits
+        if (!_singletonState!.backupTimer) {
+          setTimeout(() => void runBackup(), 60_000); // 1 min after start
+          _singletonState!.backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+        }
       },
       stop: async () => {
-        if (backupTimer) {
-          clearInterval(backupTimer);
-          backupTimer = null;
+        if (_singletonState?.backupTimer) {
+          clearInterval(_singletonState.backupTimer);
+          _singletonState.backupTimer = null;
         }
         api.logger.info("memory-lancedb-pro: stopped");
       },
