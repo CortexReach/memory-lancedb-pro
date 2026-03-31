@@ -1049,6 +1049,20 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       "--openclaw-home <path>",
       "OpenClaw home directory (default: ~/.openclaw)",
     )
+    .option(
+      "--dedup",
+      "Skip entries already in store (scope-aware exact match, requires store.bm25Search)",
+    )
+    .option(
+      "--min-text-length <n>",
+      "Minimum text length to import (default: 5)",
+      "5",
+    )
+    .option(
+      "--importance <n>",
+      "Importance score for imported entries, 0.0-1.0 (default: 0.7)",
+      "0.7",
+    )
     .action(async (workspaceGlob, options) => {
       const openclawHome = options.openclawHome
         ? path.resolve(options.openclawHome)
@@ -1116,19 +1130,26 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       }
 
       const targetScope = options.scope || "global";
+      const minTextLength = parseInt(options.minTextLength ?? "5", 10);
+      const importanceDefault = parseFloat(options.importance ?? "0.7");
+      const dedupEnabled = !!options.dedup;
 
       // Parse each file for memory entries (lines starting with "- ")
       for (const { filePath, scope } of mdFiles) {
         foundFiles++;
         const { readFile } = await import("node:fs/promises");
-        const content = await readFile(filePath, "utf-8");
-        const lines = content.split("\n");
+        let content = await readFile(filePath, "utf-8");
+        // Strip UTF-8 BOM (e.g. from Windows Notepad-saved files)
+        content = content.replace(/^\uFEFF/, "");
+        // Normalize line endings: handle both CRLF (\r\n) and LF (\n)
+        const lines = content.split(/\r?\n/);
 
         for (const line of lines) {
           // Skip non-memory lines
-          if (!line.startsWith("- ")) continue;
+          // Supports: "- text", "* text", "+ text" (standard Markdown bullet formats)
+          if (!/^[-*+]\s/.test(line)) continue;
           const text = line.slice(2).trim();
-          if (text.length < 5) { skipped++; continue; }
+          if (text.length < minTextLength) { skipped++; continue; }
 
           if (options.dryRun) {
             console.log(`  [dry-run] would import: ${text.slice(0, 80)}...`);
@@ -1136,12 +1157,26 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
             continue;
           }
 
+          // ── Deduplication check (scope-aware exact match) ───────────────────
+          if (dedupEnabled) {
+            try {
+              const existing = await context.store.bm25Search(text, 1, [targetScope]);
+              if (existing.length > 0 && existing[0].entry.text === text) {
+                skipped++;
+                console.log(`  [skip] already imported: ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`);
+                continue;
+              }
+            } catch {
+              // bm25Search not available on this store implementation; proceed with import
+            }
+          }
+
           try {
             const vector = await context.embedder!.embedQuery(text);
             await context.store.store({
               text,
               vector,
-              importance: 0.7,
+              importance: importanceDefault,
               category: "other",
               scope: targetScope,
               metadata: { importedFrom: filePath, sourceScope: scope },
@@ -1155,9 +1190,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       }
 
       if (options.dryRun) {
-        console.log(`\nDRY RUN — found ${foundFiles} files, ${imported} entries would be imported, ${skipped} skipped`);
+        console.log(`\nDRY RUN — found ${foundFiles} files, ${imported} entries would be imported, ${skipped} skipped${dedupEnabled ? " [dedup enabled]" : ""}`);
       } else {
-        console.log(`\nImport complete: ${imported} imported, ${skipped} skipped (scanned ${foundFiles} files)`);
+        console.log(`\nImport complete: ${imported} imported, ${skipped} skipped (scanned ${foundFiles} files)${dedupEnabled ? " [dedup enabled]" : ""}`);
       }
     });
 
