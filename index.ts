@@ -1653,7 +1653,8 @@ const memoryLanceDBProPlugin = {
     // embedder, retriever, and smartExtractor require async secret resolution.
     // They are initialized in initPromise and must not be used before it resolves.
     // Every hook that uses them awaits initPromise at its top.
-    // If initPromise rejects, initFailed is set and hooks silently skip.
+    // If initPromise rejects, initFailed is set; service.start() logs a warn so
+    // the user knows why memory features are unavailable.
     let embedder!: ReturnType<typeof createEmbedder>;
     let retriever!: ReturnType<typeof createRetriever>;
     let smartExtractor: SmartExtractor | null = null;
@@ -1793,6 +1794,7 @@ const memoryLanceDBProPlugin = {
             oauthPath: llmOauthPath,
             timeoutMs: llmTimeoutMs,
             log: (msg: string) => api.logger.debug(msg),
+            warnLog: (msg: string) => api.logger.warn(msg),
           });
         } catch { /* llmClientForCli stays undefined */ }
       }
@@ -3671,7 +3673,14 @@ const memoryLanceDBProPlugin = {
       start: async () => {
         // Wait for async secret resolution before running startup checks.
         await initPromise;
-        if (initFailed) return;
+        if (initFailed) {
+          api.logger.warn(
+            "memory-lancedb-pro: secret resolution failed during startup — " +
+            "embedding, recall, and capture hooks are disabled. " +
+            "Check your embedding.apiKey / retrieval.rerankApiKey config.",
+          );
+          return;
+        }
 
         // IMPORTANT: Do not block gateway startup on external network calls.
         // If embedding/retrieval tests hang (bad network / slow provider), the gateway

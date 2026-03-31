@@ -102,8 +102,9 @@ describe("systemSessionMemory before_reset", () => {
     const dbPath = path.join(workDir, "db");
     const api = createApiHarness({ dbPath, embeddingBaseURL });
 
-    memoryLanceDBProPlugin.register(api);
-    // register() is sync; before_reset is available immediately.
+    await memoryLanceDBProPlugin.register(api);
+    // register() returns initPromise; awaiting it ensures secrets are resolved
+    // and hooks (including before_reset) are fully initialized.
     assert.equal(typeof api.hooks.before_reset, "function");
     assert.equal(api.hooks["command:new"], undefined);
 
