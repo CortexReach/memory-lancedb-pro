@@ -1609,6 +1609,8 @@ const pluginVersion = getPluginVersion();
 // Plugin Definition
 // ============================================================================
 
+let _initialized = false;
+
 const memoryLanceDBProPlugin = {
   id: "memory-lancedb-pro",
   name: "Memory (LanceDB Pro)",
@@ -1617,6 +1619,14 @@ const memoryLanceDBProPlugin = {
   kind: "memory" as const,
 
   register(api: OpenClawPluginApi) {
+
+    // Idempotent guard: skip re-init on repeated register() calls
+    if (_initialized) {
+      api.logger.debug("memory-lancedb-pro: register() called again — skipping re-init (idempotent)");
+      return;
+    }
+    _initialized = true;
+
     // Parse and validate configuration
     const config = parsePluginConfig(api.pluginConfig);
 
@@ -2359,10 +2369,12 @@ const memoryLanceDBProPlugin = {
             const meta = parseSmartMetadata(r.entry.metadata, r.entry);
             if (meta.state !== "confirmed") {
               stateFilteredCount++;
+              api.logger.debug(`memory-lancedb-pro: governance: filtered id=${r.entry.id} reason=state(${meta.state}) score=${r.score?.toFixed(3)} text=${r.entry.text.slice(0, 50)}`);
               return false;
             }
             if (meta.memory_layer === "archive" || meta.memory_layer === "reflection") {
               stateFilteredCount++;
+              api.logger.debug(`memory-lancedb-pro: governance: filtered id=${r.entry.id} reason=layer(${meta.memory_layer}) score=${r.score?.toFixed(3)} text=${r.entry.text.slice(0, 50)}`);
               return false;
             }
             if (meta.suppressed_until_turn > 0 && currentTurn <= meta.suppressed_until_turn) {
@@ -3955,5 +3967,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         : { skipLowValue: false, maxExtractionsPerHour: 30 },
   };
 }
+
+export function _resetInitialized() { _initialized = false; }
 
 export default memoryLanceDBProPlugin;
