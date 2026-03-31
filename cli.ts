@@ -1036,6 +1036,131 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       }
     });
 
+  /**
+   * import-markdown: Import memories from Markdown memory files into the plugin store.
+   * Targets MEMORY.md and memory/YYYY-MM-DD.md files found in OpenClaw workspaces.
+   */
+  memory
+    .command("import-markdown [workspace-glob]")
+    .description("Import memories from Markdown files (MEMORY.md, memory/YYYY-MM-DD.md) into the plugin store")
+    .option("--dry-run", "Show what would be imported without importing")
+    .option("--scope <scope>", "Import into specific scope (default: global)")
+    .option(
+      "--openclaw-home <path>",
+      "OpenClaw home directory (default: ~/.openclaw)",
+    )
+    .action(async (workspaceGlob, options) => {
+      const openclawHome = options.openclawHome
+        ? path.resolve(options.openclawHome)
+        : path.join(homedir(), ".openclaw");
+
+      const workspaceDir = path.join(openclawHome, "workspace");
+      let imported = 0;
+      let skipped = 0;
+      let foundFiles = 0;
+
+      if (!context.embedder) {
+        console.error(
+          "import-markdown requires an embedder. Use via plugin CLI or ensure embedder is configured.",
+        );
+        process.exit(1);
+      }
+
+      // Scan workspace directories
+      let workspaceEntries: string[];
+      try {
+        const fsPromises = await import("node:fs/promises");
+        workspaceEntries = await fsPromises.readdir(workspaceDir, { withFileTypes: true });
+      } catch {
+        console.error(`Failed to read workspace directory: ${workspaceDir}`);
+        process.exit(1);
+      }
+
+      // Collect all markdown files to scan
+      const mdFiles: Array<{ filePath: string; scope: string }> = [];
+
+      for (const entry of workspaceEntries) {
+        if (!entry.isDirectory()) continue;
+        if (workspaceGlob && !entry.name.includes(workspaceGlob)) continue;
+
+        const workspacePath = path.join(workspaceDir, entry.name);
+
+        // MEMORY.md
+        const memoryMd = path.join(workspacePath, "MEMORY.md");
+        try {
+          const { stat } = await import("node:fs/promises");
+          await stat(memoryMd);
+          mdFiles.push({ filePath: memoryMd, scope: entry.name });
+        } catch { /* not found */ }
+
+        // memory/ directory
+        const memoryDir = path.join(workspacePath, "memory");
+        try {
+          const { stat } = await import("node:fs/promises");
+          const stats = await stat(memoryDir);
+          if (stats.isDirectory()) {
+            const { readdir } = await import("node:fs/promises");
+            const files = await readdir(memoryDir);
+            for (const f of files) {
+              if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
+                mdFiles.push({ filePath: path.join(memoryDir, f), scope: entry.name });
+              }
+            }
+          }
+        } catch { /* not found */ }
+      }
+
+      if (mdFiles.length === 0) {
+        console.log("No Markdown memory files found.");
+        return;
+      }
+
+      const targetScope = options.scope || "global";
+
+      // Parse each file for memory entries (lines starting with "- ")
+      for (const { filePath, scope } of mdFiles) {
+        foundFiles++;
+        const { readFile } = await import("node:fs/promises");
+        const content = await readFile(filePath, "utf-8");
+        const lines = content.split("\n");
+
+        for (const line of lines) {
+          // Skip non-memory lines
+          if (!line.startsWith("- ")) continue;
+          const text = line.slice(2).trim();
+          if (text.length < 5) { skipped++; continue; }
+
+          if (options.dryRun) {
+            console.log(`  [dry-run] would import: ${text.slice(0, 80)}...`);
+            imported++;
+            continue;
+          }
+
+          try {
+            const vector = await context.embedder!.embedQuery(text);
+            await context.store.store({
+              text,
+              vector,
+              importance: 0.7,
+              category: "other",
+              scope: targetScope,
+              metadata: { importedFrom: filePath, sourceScope: scope },
+            });
+            imported++;
+          } catch (err) {
+            console.warn(`  Failed to import: ${text.slice(0, 60)}... — ${err}`);
+            skipped++;
+          }
+        }
+      }
+
+      if (options.dryRun) {
+        console.log(`\nDRY RUN — found ${foundFiles} files, ${imported} entries would be imported, ${skipped} skipped`);
+      } else {
+        console.log(`\nImport complete: ${imported} imported, ${skipped} skipped (scanned ${foundFiles} files)`);
+      }
+    });
+
   // Re-embed an existing LanceDB into the current target DB (A/B testing)
   memory
     .command("reembed")
