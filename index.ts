@@ -2007,6 +2007,15 @@ const memoryLanceDBProPlugin = {
     );
     logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
 
+    // Dual-memory model warning: help users understand the two-layer architecture
+    // Runs synchronously and logs warnings; does NOT block gateway startup.
+    api.logger.info(
+      `[memory-lancedb-pro] memory_recall queries the plugin store (LanceDB), not MEMORY.md.\n` +
+      `  - Plugin memory (LanceDB) = primary recall source for semantic search\n` +
+      `  - MEMORY.md / memory/YYYY-MM-DD.md = startup context / journal only\n` +
+      `  - Use memory_store or auto-capture for recallable memories.\n`
+    );
+
     api.on("message_received", (event: any, ctx: any) => {
       const conversationKey = buildAutoCaptureConversationKeyFromIngress(
         ctx.channelId,
