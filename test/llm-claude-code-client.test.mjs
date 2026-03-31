@@ -4,6 +4,9 @@
  */
 import assert from "node:assert/strict";
 import { describe, it, mock } from "node:test";
+import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
@@ -308,6 +311,82 @@ describe("createLlmClient factory auth validation", () => {
     assert.throws(
       () => createLlmClient({ auth: "oauth", model: "gpt-4" }),
       /oauth.*requires.*oauthPath|requires.*oauthPath/i,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildClaudeCodeEnv — settings.json loading (via override path)
+// ---------------------------------------------------------------------------
+
+describe("buildClaudeCodeEnv settings.json loading", () => {
+  it("loads auth token from settings.json and uses it over ambient env", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "llm-client-test-"));
+    try {
+      const settingsPath = join(dir, "settings.json");
+      writeFileSync(settingsPath, JSON.stringify({ env: { ANTHROPIC_API_KEY: "from-settings" } }));
+
+      const savedKey = process.env.ANTHROPIC_API_KEY;
+      process.env.ANTHROPIC_API_KEY = "from-ambient";
+      try {
+        const env = buildClaudeCodeEnv(undefined, undefined, undefined, settingsPath);
+        // settings.json auth key takes precedence over ambient
+        assert.equal(env.ANTHROPIC_API_KEY, "from-settings", "settings.json key should win over ambient");
+      } finally {
+        if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = savedKey;
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not inject strip-listed keys from settings.json", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "llm-client-test-"));
+    try {
+      const settingsPath = join(dir, "settings.json");
+      writeFileSync(settingsPath, JSON.stringify({ env: { CLAUDE_CODE_SESSION: "should-be-stripped" } }));
+      const env = buildClaudeCodeEnv(undefined, undefined, undefined, settingsPath);
+      assert.equal(env.CLAUDE_CODE_SESSION, undefined, "CLAUDE_CODE_SESSION from settings.json should be stripped");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("warns (not throws) on settings.json parse error", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "llm-client-test-"));
+    try {
+      const settingsPath = join(dir, "settings.json");
+      writeFileSync(settingsPath, "{ invalid json }");
+      const warnLogs = [];
+      assert.doesNotThrow(() => {
+        buildClaudeCodeEnv(undefined, undefined, (msg) => warnLogs.push(msg), settingsPath);
+      });
+      assert.ok(warnLogs.some(l => l.includes("settings.json")), "should warn on parse error");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stateDir safety guard
+// ---------------------------------------------------------------------------
+
+describe("createLlmClient stateDir guard", () => {
+  it("warns when stateDir is '/' (single-char path) and uses default instead", async () => {
+    const warnLogs = [];
+    const llm = createLlmClient({
+      auth: "claude-code",
+      model: "claude-haiku-4-5",
+      stateDir: "/",
+      claudeCodePath: "/nonexistent/claude-stateDir-test",
+      logWarn: (msg) => warnLogs.push(msg),
+    });
+    await llm.completeJson("test", "label");
+    assert.ok(
+      warnLogs.some(l => l.includes("unsafe stateDir") || l.includes("stateDir")),
+      `should warn about unsafe stateDir, got: ${JSON.stringify(warnLogs)}`,
     );
   });
 });

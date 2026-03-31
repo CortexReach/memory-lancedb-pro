@@ -411,12 +411,12 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
             }),
           });
 
+          // Read the body once — HTTP response bodies can only be consumed once.
+          // Use it for error details if !ok, or for parsing if ok.
+          const bodyText = await response.text().catch(() => "");
           if (!response.ok) {
-            const detail = await response.text().catch(() => "");
-            throw new Error(`HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 500)}`);
+            throw new Error(`HTTP ${response.status} ${response.statusText}: ${bodyText.slice(0, 500)}`);
           }
-
-          const bodyText = await response.text();
           const raw = (
             response.headers.get("content-type")?.includes("text/event-stream") ||
             looksLikeSseResponse(bodyText)
