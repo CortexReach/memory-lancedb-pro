@@ -438,23 +438,50 @@ const CLAUDE_CODE_STRIP_PREFIXES = ["CLAUDECODE_", "CLAUDE_CODE_"];
 const CLAUDE_CODE_STRIP_EXACT = new Set(["CLAUDECODE", "CLAUDE_CODE_SESSION", "CLAUDE_CODE_ENTRYPOINT", "MCP_SESSION_ID"]);
 /** Keys that start with CLAUDE_CODE_ but must be preserved for subprocess auth */
 const CLAUDE_CODE_PRESERVE = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_GIT_BASH_PATH"]);
-/** Keys to always strip — prevent accidental billing via project .env ANTHROPIC_API_KEY */
-const CLAUDE_CODE_BLOCK_EXACT = new Set(["ANTHROPIC_API_KEY"]);
-
-function buildClaudeCodeEnv(explicitApiKey?: string): Record<string, string> {
+/**
+ * Build a sanitized environment for the Claude Code subprocess.
+ *
+ * Strategy (mirrors claude-mem's env-sanitizer + EnvManager):
+ * - If `explicitApiKey` is provided: strip ambient ANTHROPIC_API_KEY and re-inject
+ *   the explicit one so the configured key takes precedence.
+ * - If `explicitApiKey` is NOT provided: preserve ambient ANTHROPIC_API_KEY so that
+ *   users relying on an environment-level key (e.g. CI) still authenticate correctly.
+ *   CLI subscription auth (ANTHROPIC_AUTH_TOKEN) also passes through.
+ * - Always strip CLAUDECODE_* / CLAUDE_CODE_* vars (except preserved ones) to prevent
+ *   "cannot be launched inside another Claude Code session" errors.
+ *
+ * @param explicitApiKey - API key from llm.apiKey config. Pass undefined to rely on ambient auth.
+ * @param log - Optional logger; used to emit a warning when stripping ambient ANTHROPIC_API_KEY.
+ */
+export function buildClaudeCodeEnv(
+  explicitApiKey?: string,
+  log?: (msg: string) => void,
+): Record<string, string> {
+  const hasExplicitKey = !!explicitApiKey;
   const env: Record<string, string> = {};
+
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    if (CLAUDE_CODE_BLOCK_EXACT.has(k)) continue;
+    // Strip ambient ANTHROPIC_API_KEY only when an explicit key is provided
+    if (k === "ANTHROPIC_API_KEY" && hasExplicitKey) continue;
     if (CLAUDE_CODE_PRESERVE.has(k)) { env[k] = v; continue; }
     if (CLAUDE_CODE_STRIP_EXACT.has(k)) continue;
     if (CLAUDE_CODE_STRIP_PREFIXES.some(p => k.startsWith(p))) continue;
     env[k] = v;
   }
+
   // Mark as SDK subprocess to prevent "nested Claude Code" errors
   env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-ts";
-  // Re-inject explicit API key if provided (takes precedence over ambient auth)
-  if (explicitApiKey) env["ANTHROPIC_API_KEY"] = explicitApiKey;
+
+  if (hasExplicitKey) {
+    // Explicit key takes precedence; warn so operators know which auth path is active
+    log?.("memory-lancedb-pro: llm-client [claude-code] using explicit llm.apiKey; ambient ANTHROPIC_API_KEY suppressed");
+    env["ANTHROPIC_API_KEY"] = explicitApiKey!;
+  } else if (!process.env["ANTHROPIC_API_KEY"] && !process.env["ANTHROPIC_AUTH_TOKEN"] && !process.env["CLAUDE_CODE_OAUTH_TOKEN"]) {
+    // No auth source at all — warn early rather than letting the subprocess fail silently
+    log?.("memory-lancedb-pro: llm-client [claude-code] WARNING: no ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or CLAUDE_CODE_OAUTH_TOKEN found; Claude Code subprocess may fail to authenticate");
+  }
+
   return env;
 }
 
@@ -501,9 +528,18 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
 
       // Isolated cwd to keep memory-agent sessions out of user's claude history
       const sessionDir = join(config.stateDir ?? join(homedir(), ".openclaw", "memory-lancedb-pro"), "claude-code-sessions");
-      try { mkdirSync(sessionDir, { recursive: true }); } catch { /* already exists */ }
+      try {
+        mkdirSync(sessionDir, { recursive: true });
+      } catch (err) {
+        // Only ignore EEXIST (directory already exists); surface real errors (e.g. EACCES)
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+          lastError = `memory-lancedb-pro: llm-client [${label}] failed to create session dir ${sessionDir}: ${err instanceof Error ? err.message : String(err)}`;
+          log(lastError);
+          return null;
+        }
+      }
 
-      const env = buildClaudeCodeEnv(config.apiKey);
+      const env = buildClaudeCodeEnv(config.apiKey, log);
       const model = config.model || "claude-sonnet-4-5";
 
       // Tools we never want the memory subprocess to use
@@ -525,19 +561,30 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
           },
         });
 
+        // Collect the final result from the SDK stream.
+        // We prefer the `result` message (subtype=success) which contains the
+        // aggregated assistant output. Falling back to the last `assistant`
+        // message handles edge cases where `result` is absent.
         let raw: string | null = null;
         for await (const message of result) {
+          if (message.type === "result") {
+            // `result.result` is the final aggregated text output
+            if (typeof (message as { result?: string }).result === "string") {
+              raw = (message as { result: string }).result;
+            }
+            break;
+          }
           if (message.type === "assistant") {
-            const content = message.message?.content;
+            const content = (message as { message?: { content?: unknown } }).message?.content;
             if (Array.isArray(content)) {
-              raw = content
-                .filter((b: { type: string }) => b.type === "text")
-                .map((b: { type: string; text?: string }) => b.text ?? "")
+              const text = content
+                .filter((b: unknown) => typeof b === "object" && b !== null && (b as { type: string }).type === "text")
+                .map((b: unknown) => (b as { text?: string }).text ?? "")
                 .join("\n");
+              if (text) raw = text; // keep last assistant text as fallback
             } else if (typeof content === "string") {
               raw = content;
             }
-            break; // We only need the first assistant response
           }
         }
 

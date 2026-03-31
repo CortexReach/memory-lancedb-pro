@@ -1,43 +1,144 @@
 /**
  * Unit tests for the claude-code LLM client.
- * Mocks @anthropic-ai/claude-agent-sdk to avoid spawning real subprocesses.
+ * Covers: env sanitization, JSON extraction, error paths.
  */
 import assert from "node:assert/strict";
-import { describe, it, mock, before, after } from "node:test";
-import { createRequire } from "node:module";
-import { register } from "node:module";
+import { describe, it, before, after } from "node:test";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
-const { createLlmClient } = jiti("../src/llm-client.ts");
+const { createLlmClient, buildClaudeCodeEnv, extractJsonFromResponse, repairCommonJson } = jiti("../src/llm-client.ts");
 
 // ---------------------------------------------------------------------------
-// Helpers
+// buildClaudeCodeEnv — env sanitization (most critical security logic)
 // ---------------------------------------------------------------------------
 
-/**
- * Build a fake async generator that yields SDK-style messages and then a result.
- */
-async function* makeQueryResult(assistantText) {
-  yield { type: "system", subtype: "init" };
-  yield {
-    type: "assistant",
-    message: {
-      content: [{ type: "text", text: assistantText }],
-    },
-  };
-  yield { type: "result", subtype: "success", result: assistantText };
-}
+describe("buildClaudeCodeEnv", () => {
+  it("preserves ANTHROPIC_API_KEY when no explicit key provided (ambient auth)", () => {
+    const saved = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "ambient-key";
+    try {
+      const env = buildClaudeCodeEnv(undefined);
+      assert.equal(env.ANTHROPIC_API_KEY, "ambient-key", "should preserve ambient key when no explicit key");
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = saved;
+    }
+  });
+
+  it("replaces ANTHROPIC_API_KEY when explicit key provided", () => {
+    const saved = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "ambient-key";
+    try {
+      const env = buildClaudeCodeEnv("explicit-key");
+      assert.equal(env.ANTHROPIC_API_KEY, "explicit-key", "explicit key should override ambient");
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = saved;
+    }
+  });
+
+  it("always sets CLAUDE_CODE_ENTRYPOINT=sdk-ts", () => {
+    const env = buildClaudeCodeEnv();
+    assert.equal(env.CLAUDE_CODE_ENTRYPOINT, "sdk-ts");
+  });
+
+  it("strips CLAUDECODE (exact) to prevent nested-session errors", () => {
+    const saved = process.env.CLAUDECODE;
+    process.env.CLAUDECODE = "1";
+    try {
+      const env = buildClaudeCodeEnv();
+      assert.equal(env.CLAUDECODE, undefined, "CLAUDECODE should be stripped");
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDECODE;
+      else process.env.CLAUDECODE = saved;
+    }
+  });
+
+  it("strips CLAUDECODE_* prefixed vars", () => {
+    process.env.CLAUDECODE_SOME_VAR = "should-be-stripped";
+    try {
+      const env = buildClaudeCodeEnv();
+      assert.equal(env.CLAUDECODE_SOME_VAR, undefined);
+    } finally {
+      delete process.env.CLAUDECODE_SOME_VAR;
+    }
+  });
+
+  it("strips CLAUDE_CODE_SESSION but preserves CLAUDE_CODE_OAUTH_TOKEN", () => {
+    process.env.CLAUDE_CODE_SESSION = "strip-me";
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "keep-me";
+    try {
+      const env = buildClaudeCodeEnv();
+      assert.equal(env.CLAUDE_CODE_SESSION, undefined);
+      assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "keep-me");
+    } finally {
+      delete process.env.CLAUDE_CODE_SESSION;
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+  });
+
+  it("logs warning when no auth source is present", () => {
+    const savedKey = process.env.ANTHROPIC_API_KEY;
+    const savedToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    const savedOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_AUTH_TOKEN;
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+
+    const logs = [];
+    buildClaudeCodeEnv(undefined, (msg) => logs.push(msg));
+    assert.ok(logs.some(l => l.includes("WARNING") || l.includes("no ANTHROPIC")), "should warn when no auth source");
+
+    if (savedKey !== undefined) process.env.ANTHROPIC_API_KEY = savedKey;
+    if (savedToken !== undefined) process.env.ANTHROPIC_AUTH_TOKEN = savedToken;
+    if (savedOauth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOauth;
+  });
+});
 
 // ---------------------------------------------------------------------------
-// Tests
+// JSON extraction helpers
 // ---------------------------------------------------------------------------
 
-describe("LLM claude-code client", () => {
-  it("returns null with a clear error when @anthropic-ai/claude-agent-sdk is not installed", async () => {
-    // We can test this by creating a client that will try to import a non-existent module.
-    // Instead, we verify the error message shape by checking the module resolution path.
-    // For now we just confirm createLlmClient doesn't throw synchronously.
+describe("extractJsonFromResponse", () => {
+  it("extracts plain JSON", () => {
+    const raw = '{"memories":[{"text":"test","category":"fact"}]}';
+    const jsonStr = extractJsonFromResponse(raw);
+    assert.notEqual(jsonStr, null);
+    assert.deepEqual(JSON.parse(jsonStr), { memories: [{ text: "test", category: "fact" }] });
+  });
+
+  it("handles markdown fences", () => {
+    const raw = "Here is the result:\n```json\n{\"ok\":true}\n```";
+    const jsonStr = extractJsonFromResponse(raw);
+    assert.notEqual(jsonStr, null);
+    assert.deepEqual(JSON.parse(jsonStr), { ok: true });
+  });
+
+  it("returns null for non-JSON text", () => {
+    assert.equal(extractJsonFromResponse("no json here"), null);
+  });
+});
+
+describe("repairCommonJson", () => {
+  it("removes trailing commas", () => {
+    const broken = '{"a":1,"b":2,}';
+    assert.doesNotThrow(() => JSON.parse(repairCommonJson(broken)));
+  });
+
+  it("escapes unescaped newlines in strings", () => {
+    const broken = '{"text":"line1\nline2"}';
+    const repaired = repairCommonJson(broken);
+    assert.doesNotThrow(() => JSON.parse(repaired));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createLlmClient — claude-code client instantiation
+// ---------------------------------------------------------------------------
+
+describe("createLlmClient claude-code", () => {
+  it("returns a client with completeJson and getLastError functions", () => {
     const llm = createLlmClient({
       auth: "claude-code",
       model: "claude-haiku-4-5",
@@ -45,30 +146,6 @@ describe("LLM claude-code client", () => {
     });
     assert.equal(typeof llm.completeJson, "function");
     assert.equal(typeof llm.getLastError, "function");
-  });
-
-  it("extracts JSON from assistant response text", async () => {
-    // We test the JSON extraction path directly by mocking query to return a known response.
-    // This validates the parsing logic without spawning a real subprocess.
-    const { extractJsonFromResponse, repairCommonJson } = jiti("../src/llm-client.ts");
-    const raw = '{"memories":[{"text":"test","category":"fact"}]}';
-    const jsonStr = extractJsonFromResponse(raw);
-    assert.notEqual(jsonStr, null, "should extract JSON from clean response");
-    assert.deepEqual(JSON.parse(jsonStr), { memories: [{ text: "test", category: "fact" }] });
-  });
-
-  it("extractJsonFromResponse handles markdown fences", () => {
-    const { extractJsonFromResponse } = jiti("../src/llm-client.ts");
-    const raw = "Here is the result:\n```json\n{\"ok\":true}\n```";
-    const jsonStr = extractJsonFromResponse(raw);
-    assert.notEqual(jsonStr, null);
-    assert.deepEqual(JSON.parse(jsonStr), { ok: true });
-  });
-
-  it("repairCommonJson handles trailing commas", () => {
-    const { repairCommonJson } = jiti("../src/llm-client.ts");
-    const broken = '{"a":1,"b":2,}';
-    const repaired = repairCommonJson(broken);
-    assert.doesNotThrow(() => JSON.parse(repaired));
+    assert.equal(llm.getLastError(), null, "no error before any call");
   });
 });

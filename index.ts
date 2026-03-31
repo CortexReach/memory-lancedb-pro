@@ -305,6 +305,52 @@ function resolveLlmTimeoutMs(config: PluginConfig): number {
   return parsePositiveInt(config.llm?.timeoutMs) ?? 30000;
 }
 
+/**
+ * Resolve the LlmClientConfig fields from PluginConfig.
+ * Centralised to avoid duplicating the same auth-branching logic in multiple call sites.
+ */
+function resolveLlmClientConfig(
+  config: PluginConfig,
+  api: Pick<OpenClawPluginApi, "resolvePath" | "logger">,
+): Parameters<typeof createLlmClient>[0] {
+  const llmAuth = config.llm?.auth || "api-key";
+  const isClaudeCode = llmAuth === "claude-code";
+  const isOauth = llmAuth === "oauth";
+
+  const apiKey = (isOauth || isClaudeCode)
+    ? (isClaudeCode && config.llm?.apiKey ? resolveEnvVars(config.llm.apiKey) : undefined)
+    : config.llm?.apiKey
+      ? resolveEnvVars(config.llm.apiKey)
+      : resolveFirstApiKey(config.embedding.apiKey);
+
+  const baseURL = (isOauth || isClaudeCode)
+    ? (isOauth && config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
+    : config.llm?.baseURL
+      ? resolveEnvVars(config.llm.baseURL)
+      : config.embedding.baseURL;
+
+  const model = config.llm?.model || (isClaudeCode ? "claude-sonnet-4-5" : "openai/gpt-oss-120b");
+
+  const oauthPath = isOauth
+    ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
+    : undefined;
+  const oauthProvider = isOauth ? config.llm?.oauthProvider : undefined;
+  const claudeCodePath = isClaudeCode ? config.llm?.claudeCodePath : undefined;
+
+  return {
+    auth: llmAuth,
+    apiKey,
+    model,
+    baseURL,
+    oauthProvider,
+    oauthPath,
+    claudeCodePath,
+    stateDir: api.resolvePath("."),
+    timeoutMs: resolveLlmTimeoutMs(config),
+    log: (msg: string) => api.logger.debug(msg),
+  };
+}
+
 function resolveHookAgentId(
   explicitAgentId: string | undefined,
   sessionKey: string | undefined,
@@ -1696,39 +1742,7 @@ const memoryLanceDBProPlugin = {
     let smartExtractor: SmartExtractor | null = null;
     if (config.smartExtraction !== false) {
       try {
-        const llmAuth = config.llm?.auth || "api-key";
-        const isClaudeCode = llmAuth === "claude-code";
-        const isOauth = llmAuth === "oauth";
-        const llmApiKey = (isOauth || isClaudeCode)
-          ? (isClaudeCode && config.llm?.apiKey ? resolveEnvVars(config.llm.apiKey) : undefined)
-          : config.llm?.apiKey
-            ? resolveEnvVars(config.llm.apiKey)
-            : resolveFirstApiKey(config.embedding.apiKey);
-        const llmBaseURL = (isOauth || isClaudeCode)
-          ? (isOauth && config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
-          : config.llm?.baseURL
-            ? resolveEnvVars(config.llm.baseURL)
-            : config.embedding.baseURL;
-        const llmModel = config.llm?.model || (isClaudeCode ? "claude-sonnet-4-5" : "openai/gpt-oss-120b");
-        const llmOauthPath = isOauth
-          ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
-          : undefined;
-        const llmOauthProvider = isOauth ? config.llm?.oauthProvider : undefined;
-        const llmClaudeCodePath = isClaudeCode ? config.llm?.claudeCodePath : undefined;
-        const llmTimeoutMs = resolveLlmTimeoutMs(config);
-
-        const llmClient = createLlmClient({
-          auth: llmAuth,
-          apiKey: llmApiKey,
-          model: llmModel,
-          baseURL: llmBaseURL,
-          oauthProvider: llmOauthProvider,
-          oauthPath: llmOauthPath,
-          claudeCodePath: llmClaudeCodePath,
-          stateDir: api.resolvePath("."),
-          timeoutMs: llmTimeoutMs,
-          log: (msg: string) => api.logger.debug(msg),
-        });
+        const llmClient = createLlmClient(resolveLlmClientConfig(config, api));
 
         // Initialize embedding-based noise prototype bank (async, non-blocking)
         const noiseBank = new NoisePrototypeBank(
@@ -2201,37 +2215,7 @@ const memoryLanceDBProPlugin = {
         embedder,
         llmClient: smartExtractor ? (() => {
           try {
-            const llmAuth = config.llm?.auth || "api-key";
-            const isClaudeCode2 = llmAuth === "claude-code";
-            const isOauth2 = llmAuth === "oauth";
-            const llmApiKey = (isOauth2 || isClaudeCode2)
-              ? (isClaudeCode2 && config.llm?.apiKey ? resolveEnvVars(config.llm.apiKey) : undefined)
-              : config.llm?.apiKey
-                ? resolveEnvVars(config.llm.apiKey)
-                : resolveFirstApiKey(config.embedding.apiKey);
-            const llmBaseURL = (isOauth2 || isClaudeCode2)
-              ? (isOauth2 && config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
-              : config.llm?.baseURL
-                ? resolveEnvVars(config.llm.baseURL)
-                : config.embedding.baseURL;
-            const llmOauthPath = isOauth2
-              ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
-              : undefined;
-            const llmOauthProvider = isOauth2 ? config.llm?.oauthProvider : undefined;
-            const llmClaudeCodePath2 = isClaudeCode2 ? config.llm?.claudeCodePath : undefined;
-            const llmTimeoutMs = resolveLlmTimeoutMs(config);
-            return createLlmClient({
-              auth: llmAuth,
-              apiKey: llmApiKey,
-              model: config.llm?.model || (isClaudeCode2 ? "claude-sonnet-4-5" : "openai/gpt-oss-120b"),
-              baseURL: llmBaseURL,
-              oauthProvider: llmOauthProvider,
-              oauthPath: llmOauthPath,
-              claudeCodePath: llmClaudeCodePath2,
-              stateDir: api.resolvePath("."),
-              timeoutMs: llmTimeoutMs,
-              log: (msg: string) => api.logger.debug(msg),
-            });
+            return createLlmClient(resolveLlmClientConfig(config, api));
           } catch { return undefined; }
         })() : undefined,
       }),
