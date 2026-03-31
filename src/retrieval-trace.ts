@@ -10,7 +10,7 @@
 // ============================================================================
 
 export interface RetrievalStageResult {
-  /** Stage name, e.g. "vector_search", "bm25_search", "rrf_fusion" */
+  /** Stage name, e.g. "vector_search", "bm25_search", "weighted_fusion" */
   name: string;
   /** Number of entries entering this stage */
   inputCount: number;
