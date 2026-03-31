@@ -20,6 +20,12 @@ import {
   generateAnswer,
   type LoCoMoConversation,
 } from "./adapters/locomo-adapter.js";
+import {
+  parseLongMemEvalData,
+  extractFactsFromTurn,
+  factsToMemories as lmeFacts,
+  type LongMemEvalUser,
+} from "./adapters/longmemeval-adapter.js";
 
 // ============================================================================
 // CLI Argument Parsing
@@ -107,7 +113,9 @@ function createRunners(): BenchmarkRunner[] {
 // LoCoMo Benchmark
 // ============================================================================
 
-async function runLoComoBenchmark(runners: BenchmarkRunner[]): Promise<ScoreRow[]> {
+async function runLoComoBenchmark(
+  runners: BenchmarkRunner[],
+): Promise<ScoreRow[]> {
   const dataPath = join(__dirname, "data", "locomo10.json");
   if (!existsSync(dataPath)) {
     console.error(`LoCoMo data not found at ${dataPath}`);
@@ -115,7 +123,9 @@ async function runLoComoBenchmark(runners: BenchmarkRunner[]): Promise<ScoreRow[
     process.exit(1);
   }
 
-  const conversations: LoCoMoConversation[] = JSON.parse(readFileSync(dataPath, "utf-8"));
+  const conversations: LoCoMoConversation[] = JSON.parse(
+    readFileSync(dataPath, "utf-8"),
+  );
   const llmClient = new OpenAI({
     apiKey: LLM_API_KEY,
     ...(LLM_BASE_URL ? { baseURL: LLM_BASE_URL } : {}),
@@ -139,14 +149,18 @@ async function runLoComoBenchmark(runners: BenchmarkRunner[]): Promise<ScoreRow[
         const facts = await extractFacts(turn, llmClient, LLM_MODEL);
         allFacts.push(...facts);
       }
-      console.log(`    Extracted ${allFacts.length} facts from ${turns.length} turns`);
+      console.log(
+        `    Extracted ${allFacts.length} facts from ${turns.length} turns`,
+      );
 
       // 2. Convert to memories and seed runner
       const memories = factsToMemories(allFacts, conv.conversation_id);
       await runner.seed(memories);
 
       // 3. Run QA pairs (categories 1-4 only, skip 5 per industry convention)
-      const qaPairs = conv.qa_pairs.filter((qa) => qa.category >= 1 && qa.category <= 4);
+      const qaPairs = conv.qa_pairs.filter(
+        (qa) => qa.category >= 1 && qa.category <= 4,
+      );
 
       for (const qa of qaPairs) {
         const results = await runner.query({
@@ -163,10 +177,21 @@ async function runLoComoBenchmark(runners: BenchmarkRunner[]): Promise<ScoreRow[
           return { text: mem?.text ?? "", score: r.score };
         });
 
-        const predicted = await generateAnswer(memoryTexts, qa.question, llmClient, LLM_MODEL);
+        const predicted = await generateAnswer(
+          memoryTexts,
+          qa.question,
+          llmClient,
+          LLM_MODEL,
+        );
 
         // Judge
-        const judgment = await llmJudge(qa.question, predicted, qa.answer, llmClient, LLM_MODEL);
+        const judgment = await llmJudge(
+          qa.question,
+          predicted,
+          qa.answer,
+          llmClient,
+          LLM_MODEL,
+        );
         const f1 = tokenF1(predicted, qa.answer);
 
         if (judgment.correct) totalCorrect++;
@@ -207,6 +232,120 @@ async function runLoComoBenchmark(runners: BenchmarkRunner[]): Promise<ScoreRow[
 }
 
 // ============================================================================
+// LongMemEval Benchmark
+// ============================================================================
+
+async function runLongMemEvalBenchmark(
+  runners: BenchmarkRunner[],
+): Promise<ScoreRow[]> {
+  const dataPath = join(__dirname, "data", "longmemeval_s.json");
+  if (!existsSync(dataPath)) {
+    console.error(`LongMemEval data not found at ${dataPath}`);
+    console.error(
+      "Download from: https://huggingface.co/datasets/xiaowu0162/LongMemEval",
+    );
+    process.exit(1);
+  }
+
+  const rawData: LongMemEvalUser[] = JSON.parse(
+    readFileSync(dataPath, "utf-8"),
+  );
+  const llmClient = new OpenAI({
+    apiKey: LLM_API_KEY,
+    ...(LLM_BASE_URL ? { baseURL: LLM_BASE_URL } : {}),
+  });
+  const scores: ScoreRow[] = [];
+
+  for (const runner of runners) {
+    console.log(`\n=== Runner: ${runner.name} (LongMemEval) ===`);
+
+    let totalCorrect = 0;
+    let totalF1 = 0;
+    let totalQueries = 0;
+
+    for (const userData of rawData) {
+      const parsed = parseLongMemEvalData(userData);
+      console.log(
+        `  Processing user ${parsed.userId} (${parsed.turns.length} turns, ${parsed.questions.length} questions)...`,
+      );
+
+      // Extract facts from user turns only
+      const allFacts: Array<{ text: string; turnIndex: number }> = [];
+      for (const turn of parsed.turns) {
+        const facts = await extractFactsFromTurn(turn, llmClient, LLM_MODEL);
+        allFacts.push(...facts);
+      }
+      console.log(`    Extracted ${allFacts.length} facts`);
+
+      // Seed
+      const memories = lmeFacts(allFacts, parsed.userId);
+      await runner.seed(memories);
+
+      // Run questions
+      for (const q of parsed.questions) {
+        const results = await runner.query({
+          id: q.id,
+          text: q.text,
+          relevantMemoryIds: [],
+          intent: "semantic",
+          goldAnswer: q.goldAnswer,
+        });
+
+        const memoryTexts = results.map((r) => {
+          const mem = memories.find((m) => m.id === r.id);
+          return { text: mem?.text ?? "", score: r.score };
+        });
+
+        const predicted = await generateAnswer(
+          memoryTexts,
+          q.text,
+          llmClient,
+          LLM_MODEL,
+        );
+        const judgment = await llmJudge(
+          q.text,
+          predicted,
+          q.goldAnswer,
+          llmClient,
+          LLM_MODEL,
+        );
+        const f1 = tokenF1(predicted, q.goldAnswer);
+
+        if (judgment.correct) totalCorrect++;
+        totalF1 += f1;
+        totalQueries++;
+
+        if (totalQueries % 50 === 0) {
+          console.log(`    Progress: ${totalQueries} queries processed`);
+        }
+      }
+
+      await runner.teardown();
+    }
+
+    const latency = computePercentiles(runner.timings.queryMs);
+    scores.push({
+      runner: runner.name,
+      overall: {
+        recallAt5: 0,
+        mrr: 0,
+        ndcgAt5: 0,
+        llmJudgeAccuracy: totalQueries > 0 ? totalCorrect / totalQueries : 0,
+        f1: totalQueries > 0 ? totalF1 / totalQueries : 0,
+      },
+      performance: latency,
+    });
+
+    console.log(
+      `  Results: LLM-Judge=${(totalCorrect / Math.max(totalQueries, 1)).toFixed(3)}, ` +
+        `F1=${(totalF1 / Math.max(totalQueries, 1)).toFixed(3)}, Queries=${totalQueries}`,
+    );
+  }
+
+  return scores;
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -222,8 +361,12 @@ async function main(): Promise<void> {
 
   if (args.benchmark === "locomo") {
     scores = await runLoComoBenchmark(runners);
+  } else if (args.benchmark === "longmemeval") {
+    scores = await runLongMemEvalBenchmark(runners);
   } else {
-    console.error(`Unknown benchmark: ${args.benchmark}. Available: locomo`);
+    console.error(
+      `Unknown benchmark: ${args.benchmark}. Available: locomo, longmemeval`,
+    );
     process.exit(1);
   }
 
