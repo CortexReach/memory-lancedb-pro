@@ -319,6 +319,12 @@
             "default": "https://api.jina.ai/v1/rerank",
             "description": "Reranker API endpoint URL. Compatible with Jina-compatible endpoints and dedicated adapters such as TEI, SiliconFlow, Voyage, Pinecone, and DashScope."
           },
+          "rerankTimeoutMs": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 5000,
+            "description": "Rerank API timeout in milliseconds (default: 5000). Increase for local/CPU-based rerank servers."
+          },
           "rerankProvider": {
             "type": "string",
             "enum": [
@@ -1076,6 +1082,12 @@
       "label": "Reranker Endpoint",
       "placeholder": "https://api.jina.ai/v1/rerank",
       "help": "Custom reranker API endpoint URL",
+      "advanced": true
+    },
+    "retrieval.rerankTimeoutMs": {
+      "label": "Rerank Timeout (ms)",
+      "placeholder": "5000",
+      "help": "Rerank API timeout in milliseconds. Increase for local/CPU-based rerank servers.",
       "advanced": true
     },
     "retrieval.rerankProvider": {

@@ -120,6 +120,8 @@ interface PluginConfig {
     rerankApiKey?: string;
     rerankModel?: string;
     rerankEndpoint?: string;
+    /** Rerank API timeout in milliseconds (default: 5000). Increase for local/CPU-based rerank servers. */
+    rerankTimeoutMs?: number;
     rerankProvider?:
       | "jina"
       | "siliconflow"
