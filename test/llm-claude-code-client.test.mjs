@@ -88,11 +88,50 @@ describe("buildClaudeCodeEnv", () => {
 
     const logs = [];
     buildClaudeCodeEnv(undefined, (msg) => logs.push(msg));
-    assert.ok(logs.some(l => l.includes("WARNING") || l.includes("no ANTHROPIC")), "should warn when no auth source");
+    assert.ok(logs.some(l => l.includes("no ANTHROPIC")), "should warn when no auth source");
 
     if (savedKey !== undefined) process.env.ANTHROPIC_API_KEY = savedKey;
     if (savedToken !== undefined) process.env.ANTHROPIC_AUTH_TOKEN = savedToken;
     if (savedOauth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOauth;
+  });
+
+  it("routes no-auth warning to logWarn when provided", () => {
+    const savedKey = process.env.ANTHROPIC_API_KEY;
+    const savedToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    const savedOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_AUTH_TOKEN;
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+
+    const debugLogs = [];
+    const warnLogs = [];
+    buildClaudeCodeEnv(undefined, (msg) => debugLogs.push(msg), (msg) => warnLogs.push(msg));
+    assert.ok(warnLogs.some(l => l.includes("no ANTHROPIC")), "warning should go to logWarn");
+    assert.ok(!debugLogs.some(l => l.includes("no ANTHROPIC")), "warning should not go to debug log");
+
+    if (savedKey !== undefined) process.env.ANTHROPIC_API_KEY = savedKey;
+    if (savedToken !== undefined) process.env.ANTHROPIC_AUTH_TOKEN = savedToken;
+    if (savedOauth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOauth;
+  });
+
+  it("strips MCP_SESSION_ID", () => {
+    process.env.MCP_SESSION_ID = "strip-me";
+    try {
+      const env = buildClaudeCodeEnv();
+      assert.equal(env.MCP_SESSION_ID, undefined, "MCP_SESSION_ID should be stripped");
+    } finally {
+      delete process.env.MCP_SESSION_ID;
+    }
+  });
+
+  it("preserves CLAUDE_CODE_GIT_BASH_PATH", () => {
+    process.env.CLAUDE_CODE_GIT_BASH_PATH = "/usr/bin/bash";
+    try {
+      const env = buildClaudeCodeEnv();
+      assert.equal(env.CLAUDE_CODE_GIT_BASH_PATH, "/usr/bin/bash", "CLAUDE_CODE_GIT_BASH_PATH should be preserved");
+    } finally {
+      delete process.env.CLAUDE_CODE_GIT_BASH_PATH;
+    }
   });
 });
 
@@ -188,4 +227,40 @@ describe("createLlmClient claude-code", () => {
       `first error should mention path, got: ${err1}`,
     );
   });
+
+  it("includes system error reason in accessSync failure message", async () => {
+    const llm = createLlmClient({
+      auth: "claude-code",
+      model: "claude-haiku-4-5",
+      stateDir: "/tmp/test-state",
+      claudeCodePath: "/nonexistent/path/to/claude-reason-test",
+    });
+    await llm.completeJson("test", "label");
+    const err = llm.getLastError();
+    assert.ok(err !== null);
+    // Error should include system error detail (ENOENT or similar), not just "not found or not executable"
+    assert.ok(
+      err.includes("not accessible") || err.includes("nonexistent"),
+      `error should describe access failure with detail, got: ${err}`,
+    );
+  });
+
+  it("routes client errors to logWarn and not log when both callbacks provided", async () => {
+    const debugLogs = [];
+    const warnLogs = [];
+    const llm = createLlmClient({
+      auth: "claude-code",
+      model: "claude-haiku-4-5",
+      stateDir: "/tmp/test-state",
+      claudeCodePath: "/nonexistent/path/to/claude-logwarn-test",
+      log: (msg) => debugLogs.push(msg),
+      logWarn: (msg) => warnLogs.push(msg),
+    });
+    const result = await llm.completeJson("test", "label");
+    assert.equal(result, null, "should fail for nonexistent path");
+    assert.ok(warnLogs.length > 0, "error should be logged to logWarn");
+    assert.equal(debugLogs.filter(m => m.includes("nonexistent") || m.includes("not accessible")).length, 0,
+      "error should not appear in debug log when logWarn is provided");
+  });
 });
+
