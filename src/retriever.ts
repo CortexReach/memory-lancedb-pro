@@ -58,6 +58,8 @@ export interface RetrievalConfig {
     | "pinecone"
     | "dashscope"
     | "tei";
+  /** Rerank API timeout in milliseconds (default: 5000). Increase for local/CPU-based rerank servers. */
+  rerankTimeoutMs?: number;
   /**
    * Length normalization: penalize long entries that dominate via sheer keyword
    * density. Formula: score *= 1 / (1 + log2(charLen / anchor)).
@@ -127,6 +129,7 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   filterNoise: true,
   rerankModel: "jina-reranker-v3",
   rerankEndpoint: "https://api.jina.ai/v1/rerank",
+  rerankTimeoutMs: 5000,
   lengthNormAnchor: 500,
   hardMinScore: 0.35,
   timeDecayHalfLifeDays: 60,
@@ -858,9 +861,9 @@ export class MemoryRetriever {
           results.length,
         );
 
-        // Timeout: 5 seconds to prevent stalling retrieval pipeline
+        // Timeout: configurable via rerankTimeoutMs (default: 5000ms)
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
+        const timeout = setTimeout(() => controller.abort(), this.config.rerankTimeoutMs ?? 5000);
 
         const response = await fetch(endpoint, {
           method: "POST",
@@ -928,7 +931,7 @@ export class MemoryRetriever {
         }
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
-          console.warn("Rerank API timed out (5s), falling back to cosine");
+          console.warn(`Rerank API timed out (${this.config.rerankTimeoutMs ?? 5000}ms), falling back to cosine`);
         } else {
           console.warn("Rerank API failed, falling back to cosine:", error);
         }
