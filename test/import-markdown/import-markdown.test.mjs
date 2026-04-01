@@ -1,4 +1,4 @@
-/**
+﻿/**
  * import-markdown.test.mjs
  * Integration tests for the import-markdown CLI command.
  * Tests: BOM handling, CRLF normalization, bullet formats, dedup logic,
@@ -8,7 +8,7 @@
  */
 import { jest } from "@jest/globals";
 
-// ─── Mock implementations ───────────────────────────────────────────────────────
+// ??? Mock implementations ???????????????????????????????????????????????????????
 
 const storedRecords = [];
 const mockEmbedder = {
@@ -65,7 +65,7 @@ function hashString(s) {
   return h;
 }
 
-// ─── Test helpers ─────────────────────────────────────────────────────────────
+// ??? Test helpers ?????????????????????????????????????????????????????????????
 
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -85,7 +85,7 @@ async function writeMem(wsDir, content) {
   await writeFile(join(wsDir, "MEMORY.md"), content, "utf-8");
 }
 
-// ─── Setup / Teardown ─────────────────────────────────────────────────────────
+// ??? Setup / Teardown ?????????????????????????????????????????????????????????
 
 beforeAll(async () => {
   testWorkspaceDir = join(tmpdir(), "import-markdown-test-" + Date.now());
@@ -102,7 +102,7 @@ afterAll(async () => {
   // Cleanup is handled by OS (tmpdir cleanup)
 });
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
+// ??? Tests ????????????????????????????????????????????????????????????????????
 
 describe("import-markdown CLI", () => {
   // Lazy-import to avoid hoisting issues
@@ -111,7 +111,7 @@ describe("import-markdown CLI", () => {
   beforeAll(async () => {
     // We test the core logic directly instead of via CLI to avoid complex setup
     const mod = await import("../cli.ts");
-    importMarkdown = mod.importMarkdownForTest ?? null;
+    importMarkdown = mod.runImportMarkdown ?? null;
   });
 
   describe("BOM handling", () => {
@@ -120,7 +120,7 @@ describe("import-markdown CLI", () => {
       const wsDir = await setupWorkspace("bom-test");
       // BOM byte followed by a valid bullet line
       const bomHex = "\ufeff";
-      await writeFile(join(wsDir, "MEMORY.md"), bomHex + "- 正常記憶項目內容\n", "utf-8");
+      await writeFile(join(wsDir, "MEMORY.md"), bomHex + "- 甇?虜閮??批捆\n", "utf-8");
 
       const ctx = { embedder: mockEmbedder, store: mockStore };
       const { imported, skipped } = await runImportMarkdown(ctx, {
@@ -136,7 +136,7 @@ describe("import-markdown CLI", () => {
   describe("CRLF normalization", () => {
     it("handles Windows CRLF line endings", async () => {
       const wsDir = await setupWorkspace("crlf-test");
-      await writeFile(join(wsDir, "MEMORY.md"), "- Windows CRLF 記憶\r\n- 第二筆記\r\n", "utf-8");
+      await writeFile(join(wsDir, "MEMORY.md"), "- Windows CRLF 閮\r\n- 蝚砌?蝑?\r\n", "utf-8");
 
       const ctx = { embedder: mockEmbedder, store: mockStore };
       const { imported } = await runImportMarkdown(ctx, {
@@ -172,7 +172,7 @@ describe("import-markdown CLI", () => {
     it("skips lines shorter than minTextLength", async () => {
       const wsDir = await setupWorkspace("min-len-test");
       await writeFile(join(wsDir, "MEMORY.md"),
-        "- 好\n- 測試\n- 正常長度的記憶項目\n",
+        "- 憟穀n- 皜祈岫\n- 甇?虜?瑕漲???園??娉n",
         "utf-8");
 
       const ctx = { embedder: mockEmbedder, store: mockStore };
@@ -182,15 +182,15 @@ describe("import-markdown CLI", () => {
         minTextLength: 5,
       });
 
-      expect(imported).toBe(1); // "正常長度的記憶項目"
-      expect(skipped).toBe(2); // "好", "測試"
+      expect(imported).toBe(1); // "甇?虜?瑕漲???園???
+      expect(skipped).toBe(2); // "憟?, "皜祈岫"
     });
   });
 
   describe("importance option", () => {
     it("uses custom importance value", async () => {
       const wsDir = await setupWorkspace("importance-test");
-      await writeFile(join(wsDir, "MEMORY.md"), "- 重要性測試記憶\n", "utf-8");
+      await writeFile(join(wsDir, "MEMORY.md"), "- ???扳葫閰西??跚n", "utf-8");
 
       const ctx = { embedder: mockEmbedder, store: mockStore };
       await runImportMarkdown(ctx, {
@@ -206,7 +206,7 @@ describe("import-markdown CLI", () => {
   describe("dedup logic", () => {
     it("skips already-imported entries in same scope when dedup is enabled", async () => {
       const wsDir = await setupWorkspace("dedup-test");
-      await writeFile(join(wsDir, "MEMORY.md"), "- 第一次匯入的記憶\n", "utf-8");
+      await writeFile(join(wsDir, "MEMORY.md"), "- 蝚砌?甈∪?亦?閮\n", "utf-8");
 
       const ctx = { embedder: mockEmbedder, store: mockStore };
 
@@ -218,7 +218,7 @@ describe("import-markdown CLI", () => {
       });
       expect(mockStore.storedRecords.length).toBe(1);
 
-      // Second import WITH dedup — should skip the duplicate
+      // Second import WITH dedup ??should skip the duplicate
       const { imported, skipped } = await runImportMarkdown(ctx, {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "dedup-test",
@@ -232,7 +232,7 @@ describe("import-markdown CLI", () => {
 
     it("imports same text into different scope even with dedup enabled", async () => {
       const wsDir = await setupWorkspace("dedup-scope-test");
-      await writeFile(join(wsDir, "MEMORY.md"), "- 跨 scope 測試記憶\n", "utf-8");
+      await writeFile(join(wsDir, "MEMORY.md"), "- 頝?scope 皜祈岫閮\n", "utf-8");
 
       const ctx = { embedder: mockEmbedder, store: mockStore };
 
@@ -245,7 +245,7 @@ describe("import-markdown CLI", () => {
       });
       expect(mockStore.storedRecords.length).toBe(1);
 
-      // Second import to scope-B — should NOT skip (different scope)
+      // Second import to scope-B ??should NOT skip (different scope)
       const { imported } = await runImportMarkdown(ctx, {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "dedup-scope-test",
@@ -261,7 +261,7 @@ describe("import-markdown CLI", () => {
   describe("dry-run mode", () => {
     it("does not write to store in dry-run mode", async () => {
       const wsDir = await setupWorkspace("dryrun-test");
-      await writeFile(join(wsDir, "MEMORY.md"), "- 乾燥跑測試記憶\n", "utf-8");
+      await writeFile(join(wsDir, "MEMORY.md"), "- 銋曄頝葫閰西??跚n", "utf-8");
 
       const ctx = { embedder: mockEmbedder, store: mockStore };
       const { imported } = await runImportMarkdown(ctx, {
@@ -279,7 +279,7 @@ describe("import-markdown CLI", () => {
     it("continues processing after a store failure", async () => {
       const wsDir = await setupWorkspace("error-test");
       await writeFile(join(wsDir, "MEMORY.md"),
-        "- 第一筆記\n- 第二筆記\n- 第三筆記\n",
+        "- 蝚砌?蝑?\n- 蝚砌?蝑?\n- 蝚砌?蝑?\n",
         "utf-8");
 
       let callCount = 0;
@@ -307,7 +307,7 @@ describe("import-markdown CLI", () => {
   });
 });
 
-// ─── Test runner helper ────────────────────────────────────────────────────────
+// ??? Test runner helper ????????????????????????????????????????????????????????
 // This is a simplified version that calls the CLI logic directly.
 // In a full integration test, you would use the actual CLI entry point.
 
@@ -315,93 +315,28 @@ describe("import-markdown CLI", () => {
  * Run the import-markdown logic for testing.
  * This simulates the CLI action without requiring the full plugin context.
  */
+/**
+ * Thin adapter: delegates to the production runImportMarkdown exported from ../cli.ts.
+ * Keeps existing test call signatures working while ensuring tests always exercise the
+ * real implementation (no duplicate logic drift).
+ */
 async function runImportMarkdown(context, options = {}) {
-  const {
-    openclawHome,
-    workspaceGlob = null,
-    scope = "global",
-    dryRun = false,
-    dedup = false,
-    minTextLength = 5,
-    importance = 0.7,
-  } = options;
-
-  const { readdir, readFile, stat } = await import("node:fs/promises");
-  const path = await import("node:path");
-
-  let imported = 0;
-  let skipped = 0;
-  let foundFiles = 0;
-
-  if (!context.embedder) throw new Error("No embedder");
-
-  const workspaceDir = path.join(openclawHome, "workspace");
-  let workspaceEntries;
-  try {
-    workspaceEntries = await readdir(workspaceDir, { withFileTypes: true });
-  } catch {
-    throw new Error(`Failed to read workspace directory: ${workspaceDir}`);
+  if (typeof importMarkdown === "function") {
+    // Production signature: runImportMarkdown(ctx, workspaceGlob, options)
+    // Test passes workspaceGlob as options.workspaceGlob
+    return importMarkdown(
+      context,
+      options.workspaceGlob ?? null,
+      {
+        dryRun: !!options.dryRun,
+        scope: options.scope,
+        openclawHome: options.openclawHome,
+        dedup: !!options.dedup,
+        minTextLength: String(options.minTextLength ?? 5),
+        importance: String(options.importance ?? 0.7),
+      },
+    );
   }
-
-  const mdFiles = [];
-  for (const entry of workspaceEntries) {
-    if (!entry.isDirectory()) continue;
-    if (workspaceGlob && !entry.name.includes(workspaceGlob)) continue;
-
-    const workspacePath = path.join(workspaceDir, entry.name);
-    const memoryMd = path.join(workspacePath, "MEMORY.md");
-    try {
-      await stat(memoryMd);
-      mdFiles.push({ filePath: memoryMd, scope: entry.name });
-    } catch { /* not found */ }
-  }
-
-  if (mdFiles.length === 0) return { imported, skipped, foundFiles };
-
-  const dedupEnabled = dedup;
-
-  for (const { filePath, scope: srcScope } of mdFiles) {
-    foundFiles++;
-    let content = await readFile(filePath, "utf-8");
-    content = content.replace(/^\uFEFF/, ""); // BOM strip
-    const lines = content.split(/\r?\n/);
-
-    for (const line of lines) {
-      if (!/^[-*+]\s/.test(line)) continue;
-      const text = line.slice(2).trim();
-      if (text.length < minTextLength) { skipped++; continue; }
-
-      if (dryRun) {
-        imported++;
-        continue;
-      }
-
-      if (dedupEnabled) {
-        try {
-          const existing = await context.store.bm25Search(text, 1, [scope]);
-          if (existing.length > 0 && existing[0].entry.text === text) {
-            skipped++;
-            continue;
-          }
-        } catch { /* bm25Search not available */ }
-      }
-
-      try {
-        const vector = await context.embedder.embedPassage(text);
-        await context.store.store({
-          text,
-          vector,
-          importance,
-          category: "other",
-          scope,
-          metadata: JSON.stringify({ importedFrom: filePath, sourceScope: srcScope }),
-        });
-        imported++;
-      } catch (err) {
-        skipped++;
-      }
-    }
-  }
-
-  return { imported, skipped, foundFiles };
+  return { imported: 0, skipped: 0, foundFiles: 0 };
 }
+
