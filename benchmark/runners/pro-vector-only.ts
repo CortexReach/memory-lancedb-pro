@@ -67,19 +67,28 @@ export class ProVectorOnlyRunner implements BenchmarkRunner {
     );
 
     const now = Date.now();
-    for (const mem of memories) {
-      const vector = await this.embedder.embedPassage(mem.text);
-      const timestamp = now + mem.ageDays * 86_400_000;
-      await this.store.importEntry({
-        id: mem.id,
-        text: mem.text,
-        vector,
-        category: mem.category,
-        scope: mem.scope,
-        importance: mem.importance,
-        timestamp,
-        metadata: JSON.stringify({ tags: mem.tags }),
-      });
+    const BATCH_SIZE = 50;
+    for (let i = 0; i < memories.length; i += BATCH_SIZE) {
+      const batch = memories.slice(i, i + BATCH_SIZE);
+      const texts = batch.map((m) => m.text);
+      const vectors = await this.embedder.embedBatchPassage(texts);
+
+      for (let j = 0; j < batch.length; j++) {
+        const mem = batch[j];
+        const vector = vectors[j];
+        if (!vector || vector.length === 0) continue;
+        const timestamp = now + mem.ageDays * 86_400_000;
+        await this.store.importEntry({
+          id: mem.id,
+          text: mem.text,
+          vector,
+          category: mem.category,
+          scope: mem.scope,
+          importance: mem.importance,
+          timestamp,
+          metadata: JSON.stringify({ tags: mem.tags }),
+        });
+      }
     }
 
     this.timings.seedMs.push(Date.now() - start);
