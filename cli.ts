@@ -1080,8 +1080,25 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         process.exit(1);
       }
 
-      // Scan workspace directories
+      // Infer workspace scope from openclaw.json agents list
+      // (flat memory/ files have no per-file metadata, so we derive scope from config)
       const fsPromises = await import("node:fs/promises");
+      let workspaceScope = ""; // empty = no scope override for nested workspaces
+      try {
+        const configPath = path.join(openclawHome, "openclaw.json");
+        const configContent = await fsPromises.readFile(configPath, "utf-8");
+        const config = JSON.parse(configContent);
+        const agentsList: Array<{ id?: string; workspace?: string }> = config?.agents?.list ?? [];
+        const matched = agentsList.find((a) => {
+          if (!a.workspace) return false;
+          return path.normalize(a.workspace) === workspaceDir;
+        });
+        if (matched?.id) {
+          workspaceScope = matched.id;
+        }
+      } catch { /* use default */ }
+
+      // Scan workspace directories
       let workspaceEntries: Dirent[];
       try {
         workspaceEntries = await fsPromises.readdir(workspaceDir, { withFileTypes: true });
@@ -1136,7 +1153,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           let added = 0;
           for (const f of files) {
             if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
-              mdFiles.push({ filePath: path.join(flatMemoryDir, f), scope: "memory" });
+              mdFiles.push({ filePath: path.join(flatMemoryDir, f), scope: workspaceScope || "shared" });
               added++;
             }
           }
