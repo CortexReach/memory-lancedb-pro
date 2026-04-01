@@ -1138,30 +1138,31 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         } catch { /* not found */ }
       }
 
+      // Also scan the flat `workspace/memory/` directory directly under workspace root
+      // (not inside any workspace subdirectory — supports James's actual structure).
+      // This scan runs regardless of whether nested workspace mdFiles were found,
+      // so flat memory is always reachable even when all nested workspaces are empty.
+      // Skip if a specific workspace was requested (workspaceGlob), to avoid importing
+      // root flat memory when the user meant to import only one workspace.
+      if (!workspaceGlob) {
+        const flatMemoryDir = path.join(workspaceDir, "memory");
+        try {
+          const stats = await fsPromises.stat(flatMemoryDir);
+          if (stats.isDirectory()) {
+            const files = await fsPromises.readdir(flatMemoryDir);
+            for (const f of files) {
+              if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
+                mdFiles.push({ filePath: path.join(flatMemoryDir, f), scope: workspaceScope || "shared" });
+              }
+            }
+          }
+        } catch { /* not found */ }
+      }
+
       if (mdFiles.length === 0) {
         console.log("No Markdown memory files found.");
         return;
       }
-
-      // Also scan the flat `workspace/memory/` directory directly under workspace root
-      // (not inside any workspace subdirectory — supports James's actual structure)
-      const flatMemoryDir = path.join(workspaceDir, "memory");
-      try {
-        const stats = await fsPromises.stat(flatMemoryDir);
-        if (stats.isDirectory()) {
-          const files = await fsPromises.readdir(flatMemoryDir);
-          let added = 0;
-          for (const f of files) {
-            if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
-              mdFiles.push({ filePath: path.join(flatMemoryDir, f), scope: workspaceScope || "shared" });
-              added++;
-            }
-          }
-          if (added > 0) {
-            console.log(`Found ${added} entries in flat memory directory (scope: memory).`);
-          }
-        }
-      } catch { /* not found */ }
 
       const targetScope = options.scope || "global";
       const minTextLength = parseInt(options.minTextLength ?? "5", 10);

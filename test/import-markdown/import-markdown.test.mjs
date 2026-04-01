@@ -23,6 +23,17 @@ const mockEmbedder = {
     }
     return vec;
   }),
+  embedPassage: jest.fn(async (text) => {
+    // Use same deterministic vector as embedQuery for test consistency
+    const dim = 384;
+    const vec = [];
+    let seed = hashString(text);
+    for (let i = 0; i < dim; i++) {
+      seed = (seed * 1664525 + 1013904223) & 0xffffffff;
+      vec.push((seed >>> 8) / 16777215 - 1);
+    }
+    return vec;
+  }),
 };
 
 const mockStore = {
@@ -63,7 +74,9 @@ import { tmpdir } from "node:os";
 let testWorkspaceDir;
 
 async function setupWorkspace(name) {
-  const wsDir = join(testWorkspaceDir, name);
+  // Files must be created at: <testWorkspaceDir>/workspace/<name>/
+  // because runImportMarkdown looks for path.join(openclawHome, "workspace")
+  const wsDir = join(testWorkspaceDir, "workspace", name);
   await mkdir(wsDir, { recursive: true });
   return wsDir;
 }
@@ -82,6 +95,7 @@ beforeAll(async () => {
 afterEach(async () => {
   mockStore.reset();
   mockEmbedder.embedQuery.mockClear();
+  mockEmbedder.embedPassage.mockClear();
 });
 
 afterAll(async () => {
@@ -373,14 +387,14 @@ async function runImportMarkdown(context, options = {}) {
       }
 
       try {
-        const vector = await context.embedder.embedQuery(text);
+        const vector = await context.embedder.embedPassage(text);
         await context.store.store({
           text,
           vector,
           importance,
           category: "other",
           scope,
-          metadata: { importedFrom: filePath, sourceScope: srcScope },
+          metadata: JSON.stringify({ importedFrom: filePath, sourceScope: srcScope }),
         });
         imported++;
       } catch (err) {
