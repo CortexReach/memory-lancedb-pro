@@ -3137,6 +3137,7 @@ const memoryLanceDBProPlugin = {
           }
         }
         if (sessionKey) globalLock.set(sessionKey, true);
+        let reflectionRan = false;
         try {
           pruneReflectionSessionState();
           const action = String(event?.action || "unknown");
@@ -3201,6 +3202,11 @@ const memoryLanceDBProPlugin = {
             );
             return;
           }
+
+          // Mark that reflection will actually run — cooldown is only recorded
+          // for runs that pass all pre-condition checks, not for early exits
+          // (missing cfg, session file, or conversation).
+          reflectionRan = true;
 
           const now = new Date(typeof event.timestamp === "number" ? event.timestamp : Date.now());
           const nowTs = now.getTime();
@@ -3397,7 +3403,9 @@ const memoryLanceDBProPlugin = {
           if (sessionKey) {
             reflectionErrorStateBySession.delete(sessionKey);
             getGlobalReflectionLock().delete(sessionKey);
-            getSerialGuardMap().set(sessionKey, Date.now());
+            if (reflectionRan) {
+              getSerialGuardMap().set(sessionKey, Date.now());
+            }
           }
           pruneReflectionSessionState();
         }
