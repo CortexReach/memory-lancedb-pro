@@ -224,11 +224,11 @@ async function runLoComoBenchmark(
         const judgment = await llmJudge(
           qa.question,
           predicted,
-          qa.answer,
+          String(qa.answer),
           llmClient,
           LLM_MODEL,
         );
-        const f1 = tokenF1(predicted, qa.answer);
+        const f1 = tokenF1(predicted, String(qa.answer));
 
         if (judgment.correct) totalCorrect++;
         totalF1 += f1;
@@ -338,11 +338,11 @@ async function runLongMemEvalBenchmark(
         const judgment = await llmJudge(
           q.text,
           predicted,
-          q.goldAnswer,
+          String(q.goldAnswer),
           llmClient,
           LLM_MODEL,
         );
-        const f1 = tokenF1(predicted, q.goldAnswer);
+        const f1 = tokenF1(predicted, String(q.goldAnswer));
 
         if (judgment.correct) totalCorrect++;
         totalF1 += f1;
