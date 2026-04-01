@@ -16,22 +16,40 @@ export async function extractFacts(
   client: OpenAI,
   model = "gpt-4o-mini",
 ): Promise<Array<{ text: string; turnIndex: number }>> {
-  const response = await client.chat.completions.create({
-    model,
-    temperature: 0,
-    messages: [
-      { role: "system", content: EXTRACTION_PROMPT },
-      { role: "user", content: `[Turn ${turn.turnIndex}] ${turn.speaker}: ${turn.text}` },
-    ],
-  });
+  try {
+    const response = await client.chat.completions.create({
+      model,
+      temperature: 0,
+      messages: [
+        { role: "system", content: EXTRACTION_PROMPT },
+        {
+          role: "user",
+          content: `[Turn ${turn.turnIndex}] ${turn.speaker}: ${turn.text}`,
+        },
+      ],
+    });
 
-  const content = response.choices[0]?.message?.content?.trim() ?? "";
-  if (content === "NONE" || !content) return [];
+    const content = response.choices[0]?.message?.content?.trim() ?? "";
+    if (content === "NONE" || !content) return [];
 
-  return parseExtractionResponse(content).map((text) => ({
-    text,
-    turnIndex: turn.turnIndex,
-  }));
+    return parseExtractionResponse(content).map((text) => ({
+      text,
+      turnIndex: turn.turnIndex,
+    }));
+  } catch (err: any) {
+    // Azure content filter or other API errors — skip this turn, don't crash
+    const code = err?.status ?? err?.code ?? "";
+    if (
+      code === 400 ||
+      /content.*filter|content.*management/i.test(String(err))
+    ) {
+      console.warn(
+        `    [skip] Turn ${turn.turnIndex} filtered by content policy`,
+      );
+      return [];
+    }
+    throw err;
+  }
 }
 
 export function parseExtractionResponse(response: string): string[] {
@@ -49,9 +67,7 @@ export function buildGenerationPrompt(
   memories: Array<{ text: string; score: number }>,
   question: string,
 ): string {
-  const memoryBlock = memories
-    .map((m, i) => `${i + 1}. ${m.text}`)
-    .join("\n");
+  const memoryBlock = memories.map((m, i) => `${i + 1}. ${m.text}`).join("\n");
 
   return `Given these memory entries:
 ${memoryBlock}
@@ -68,33 +84,43 @@ export async function generateAnswer(
   client: OpenAI,
   model = "gpt-4o-mini",
 ): Promise<string> {
-  const prompt = buildGenerationPrompt(memories, question);
+  try {
+    const prompt = buildGenerationPrompt(memories, question);
 
-  const response = await client.chat.completions.create({
-    model,
-    temperature: 0,
-    messages: [{ role: "user", content: prompt }],
-  });
+    const response = await client.chat.completions.create({
+      model,
+      temperature: 0,
+      messages: [{ role: "user", content: prompt }],
+    });
 
-  return response.choices[0]?.message?.content?.trim() ?? "";
+    return response.choices[0]?.message?.content?.trim() ?? "";
+  } catch (err: any) {
+    if (err?.status === 400) {
+      console.warn(`    [skip] Generation filtered by content policy`);
+      return "I don't know.";
+    }
+    throw err;
+  }
 }
 
 // ============================================================================
 // LoCoMo Data Types & Loader
 // ============================================================================
 
+/**
+ * Actual LoCoMo data format (locomo10.json):
+ * - Top level: array of conversation objects
+ * - conversation: { speaker_a, speaker_b, session_1: [{speaker, text, dia_id}], session_2: [...], ... }
+ * - qa: [{question, answer, evidence, category}]
+ * - sample_id: "conv-26"
+ */
 export interface LoCoMoConversation {
-  conversation_id: string;
-  sessions: Array<{
-    session_id: string;
-    turns: Array<{
-      speaker: string;
-      text: string;
-    }>;
-  }>;
-  qa_pairs: Array<{
+  sample_id: string;
+  conversation: Record<string, unknown>;
+  qa: Array<{
     question: string;
     answer: string;
+    evidence: string[];
     category: number;
   }>;
 }
@@ -104,11 +130,28 @@ export function flattenTurns(
 ): Array<{ speaker: string; text: string; turnIndex: number }> {
   const turns: Array<{ speaker: string; text: string; turnIndex: number }> = [];
   let idx = 0;
-  for (const session of conv.sessions) {
-    for (const turn of session.turns) {
-      turns.push({ ...turn, turnIndex: idx++ });
+  const c = conv.conversation;
+
+  // Sessions are stored as session_1, session_2, ... (arrays of {speaker, text, dia_id})
+  for (let s = 1; s <= 100; s++) {
+    const session = c[`session_${s}`];
+    if (!Array.isArray(session)) break;
+    for (const turn of session) {
+      if (
+        turn &&
+        typeof turn === "object" &&
+        "speaker" in turn &&
+        "text" in turn
+      ) {
+        turns.push({
+          speaker: (turn as any).speaker,
+          text: (turn as any).text,
+          turnIndex: idx++,
+        });
+      }
     }
   }
+
   return turns;
 }
 

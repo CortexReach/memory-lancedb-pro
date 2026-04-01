@@ -37,28 +37,36 @@ export async function llmJudge(
   client: OpenAI,
   model = "gpt-4o-mini",
 ): Promise<{ correct: boolean; raw: string }> {
-  const response = await client.chat.completions.create({
-    model,
-    temperature: 0,
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are evaluating whether an AI assistant's answer is correct. " +
-          "Compare the predicted answer with the gold answer. " +
-          "Reply with exactly CORRECT or WRONG. " +
-          "Be generous: if the predicted answer captures the key facts from the gold answer, mark it CORRECT even if wording differs.",
-      },
-      {
-        role: "user",
-        content: `Question: ${question}\n\nGold Answer: ${gold}\n\nPredicted Answer: ${predicted}\n\nVerdict:`,
-      },
-    ],
-  });
+  try {
+    const response = await client.chat.completions.create({
+      model,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are evaluating whether an AI assistant's answer is correct. " +
+            "Compare the predicted answer with the gold answer. " +
+            "Reply with exactly CORRECT or WRONG. " +
+            "Be generous: if the predicted answer captures the key facts from the gold answer, mark it CORRECT even if wording differs.",
+        },
+        {
+          role: "user",
+          content: `Question: ${question}\n\nGold Answer: ${gold}\n\nPredicted Answer: ${predicted}\n\nVerdict:`,
+        },
+      ],
+    });
 
-  const raw = response.choices[0]?.message?.content?.trim() ?? "";
-  const correct = raw.toUpperCase().startsWith("CORRECT");
-  return { correct, raw };
+    const raw = response.choices[0]?.message?.content?.trim() ?? "";
+    const correct = raw.toUpperCase().startsWith("CORRECT");
+    return { correct, raw };
+  } catch (err: any) {
+    if (err?.status === 400) {
+      console.warn(`    [skip] Judge filtered by content policy`);
+      return { correct: false, raw: "FILTERED" };
+    }
+    throw err;
+  }
 }
 
 export interface EndToEndResult {

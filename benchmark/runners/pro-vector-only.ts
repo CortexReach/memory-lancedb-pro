@@ -38,11 +38,12 @@ export class ProVectorOnlyRunner implements BenchmarkRunner {
     const resolvedPath = validateStoragePath(this.dbPath);
 
     this.embedder = createEmbedder({
-      provider: "openai-compatible",
+      provider: this.config.embeddingConfig.provider as any,
       apiKey: this.config.embeddingConfig.apiKey,
       model: this.config.embeddingConfig.model,
       baseURL: this.config.embeddingConfig.baseURL,
       dimensions: this.config.embeddingConfig.dimensions,
+      apiVersion: this.config.embeddingConfig.apiVersion,
     });
 
     this.store = new MemoryStore({

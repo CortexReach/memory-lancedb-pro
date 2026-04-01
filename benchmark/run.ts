@@ -70,9 +70,13 @@ const EMBEDDING_DIMENSIONS = (() => {
 const LLM_API_KEY = requireEnv("LLM_API_KEY");
 const LLM_MODEL = process.env.LLM_MODEL ?? "gpt-4o-mini";
 const LLM_BASE_URL = process.env.LLM_BASE_URL;
+const EMBEDDING_PROVIDER =
+  process.env.EMBEDDING_PROVIDER ?? "openai-compatible";
+const EMBEDDING_API_VERSION = process.env.EMBEDDING_API_VERSION;
 const RERANK_API_KEY = process.env.RERANK_API_KEY;
 const RERANK_MODEL = process.env.RERANK_MODEL;
 const RERANK_ENDPOINT = process.env.RERANK_ENDPOINT;
+const RERANK_PROVIDER = process.env.RERANK_PROVIDER;
 
 // ============================================================================
 // Resolve __dirname for ESM
@@ -87,15 +91,17 @@ const __dirname = dirname(__filename);
 
 const runnerConfig: RunnerConfig = {
   embeddingConfig: {
-    provider: "openai-compatible",
+    provider: EMBEDDING_PROVIDER,
     apiKey: EMBEDDING_API_KEY,
     model: EMBEDDING_MODEL,
     baseURL: EMBEDDING_BASE_URL,
     dimensions: EMBEDDING_DIMENSIONS,
+    apiVersion: EMBEDDING_API_VERSION,
   },
   rerankApiKey: RERANK_API_KEY,
   rerankModel: RERANK_MODEL,
   rerankEndpoint: RERANK_ENDPOINT,
+  rerankProvider: RERANK_PROVIDER,
 };
 
 function createRunners(): BenchmarkRunner[] {
@@ -119,6 +125,30 @@ function createRunners(): BenchmarkRunner[] {
 }
 
 // ============================================================================
+// LLM Client Factory
+// ============================================================================
+
+function createLlmClient(): OpenAI {
+  const isAzureLlm = LLM_BASE_URL && /\.openai\.azure\.com/i.test(LLM_BASE_URL);
+
+  if (isAzureLlm) {
+    return new OpenAI({
+      apiKey: LLM_API_KEY,
+      baseURL: LLM_BASE_URL,
+      defaultHeaders: { "api-key": LLM_API_KEY },
+      defaultQuery: {
+        "api-version": EMBEDDING_API_VERSION ?? "2024-12-01-preview",
+      },
+    });
+  }
+
+  return new OpenAI({
+    apiKey: LLM_API_KEY,
+    ...(LLM_BASE_URL ? { baseURL: LLM_BASE_URL } : {}),
+  });
+}
+
+// ============================================================================
 // LoCoMo Benchmark
 // ============================================================================
 
@@ -135,10 +165,7 @@ async function runLoComoBenchmark(
   const conversations: LoCoMoConversation[] = JSON.parse(
     readFileSync(dataPath, "utf-8"),
   );
-  const llmClient = new OpenAI({
-    apiKey: LLM_API_KEY,
-    ...(LLM_BASE_URL ? { baseURL: LLM_BASE_URL } : {}),
-  });
+  const llmClient = createLlmClient();
   const scores: ScoreRow[] = [];
 
   for (const runner of runners) {
@@ -149,7 +176,7 @@ async function runLoComoBenchmark(
     let totalQueries = 0;
 
     for (const conv of conversations) {
-      console.log(`  Processing conversation ${conv.conversation_id}...`);
+      console.log(`  Processing conversation ${conv.sample_id}...`);
 
       // 1. Extract facts from conversation turns
       const turns = flattenTurns(conv);
@@ -163,17 +190,17 @@ async function runLoComoBenchmark(
       );
 
       // 2. Convert to memories and seed runner
-      const memories = factsToMemories(allFacts, conv.conversation_id);
+      const memories = factsToMemories(allFacts, conv.sample_id);
       await runner.seed(memories);
 
       // 3. Run QA pairs (categories 1-4 only, skip 5 per industry convention)
-      const qaPairs = conv.qa_pairs.filter(
+      const qaPairs = conv.qa.filter(
         (qa) => qa.category >= 1 && qa.category <= 4,
       );
 
       for (const qa of qaPairs) {
         const results = await runner.query({
-          id: `${conv.conversation_id}-q-${totalQueries}`,
+          id: `${conv.sample_id}-q-${totalQueries}`,
           text: qa.question,
           relevantMemoryIds: [],
           intent: "semantic",
@@ -259,10 +286,7 @@ async function runLongMemEvalBenchmark(
   const rawData: LongMemEvalUser[] = JSON.parse(
     readFileSync(dataPath, "utf-8"),
   );
-  const llmClient = new OpenAI({
-    apiKey: LLM_API_KEY,
-    ...(LLM_BASE_URL ? { baseURL: LLM_BASE_URL } : {}),
-  });
+  const llmClient = createLlmClient();
   const scores: ScoreRow[] = [];
 
   for (const runner of runners) {

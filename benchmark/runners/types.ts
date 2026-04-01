@@ -33,8 +33,10 @@ export interface RunnerConfig {
     model: string;
     baseURL?: string;
     dimensions?: number;
+    apiVersion?: string;
   };
   rerankApiKey?: string;
   rerankModel?: string;
   rerankEndpoint?: string;
+  rerankProvider?: string;
 }
