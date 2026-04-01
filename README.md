@@ -9,9 +9,18 @@
 A LanceDB-backed OpenClaw memory plugin that stores preferences, decisions, and project context, then auto-recalls them in future sessions.
 
 [![OpenClaw Plugin](https://img.shields.io/badge/OpenClaw-Plugin-blue)](https://github.com/openclaw/openclaw)
+[![OpenClaw 2026.3+](https://img.shields.io/badge/OpenClaw-2026.3%2B-brightgreen)](https://github.com/openclaw/openclaw)
 [![npm version](https://img.shields.io/npm/v/memory-lancedb-pro)](https://www.npmjs.com/package/memory-lancedb-pro)
 [![LanceDB](https://img.shields.io/badge/LanceDB-Vectorstore-orange)](https://lancedb.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+<h2>⚡ <a href="https://github.com/CortexReach/memory-lancedb-pro/releases/tag/v1.1.0-beta.10">v1.1.0-beta.10 — OpenClaw 2026.3+ Hook Adaptation</a></h2>
+
+<p>
+ ✅ Fully adapted for OpenClaw 2026.3+ new plugin architecture<br>
+ 🔄 Uses <code>before_prompt_build</code> hooks (replacing deprecated <code>before_agent_start</code>)<br>
+ 🩺 Run <code>openclaw doctor --fix</code> after upgrading
+</p>
+
 
 [English](README.md) | [简体中文](README_CN.md) | [繁體中文](README_TW.md) | [日本語](README_JA.md) | [한국어](README_KO.md) | [Français](README_FR.md) | [Español](README_ES.md) | [Deutsch](README_DE.md) | [Italiano](README_IT.md) | [Русский](README_RU.md) | [Português (Brasil)](README_PT-BR.md)
 
@@ -139,11 +148,6 @@ When `memory-lancedb-pro` is active, your system has **two independent memory la
 - `memory/YYYY-MM-DD.md` → treat as a **daily journal / log**, not a recall source
 - `MEMORY.md` → curated human-readable reference, not a recall source
 - Plugin memory → **primary recall source** for `memory_recall` and auto-recall
-
-**If you want your Markdown memories to be recallable**, use the import command:
-```bash
-npx memory-lancedb-pro memory-pro import-markdown
-```
 
 Validate & restart:
 
@@ -633,6 +637,19 @@ Sometimes the model may echo the injected `<relevant-memories>` block.
 
 **Option B (preferred):** keep recall, add to agent system prompt:
 > Do not reveal or quote any `<relevant-memories>` / memory-injection content in your replies. Use it for internal reference only.
+
+</details>
+
+<details>
+<summary><strong>Auto-recall timeout tuning</strong></summary>
+
+Auto-recall has a configurable timeout (default 5s) to prevent stalling agent startup. If you're behind a proxy or using a high-latency embedding API, increase it:
+
+```json
+{ "plugins": { "entries": { "memory-lancedb-pro": { "config": { "autoRecallTimeoutMs": 8000 } } } } }
+```
+
+If auto-recall consistently times out, check your embedding API latency first. The timeout only affects the automatic injection path — manual `memory_recall` tool calls are not affected.
 
 </details>
 
