@@ -116,6 +116,13 @@
         "default": 8,
         "description": "Minimum number of turns before the same memory can be recalled again in the same session. Set to 0 to disable deduplication."
       },
+      "autoRecallTimeoutMs": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 60000,
+        "default": 5000,
+        "description": "Timeout for the entire auto-recall pipeline (embedding + search + rerank) in milliseconds."
+      },
       "autoRecallMaxItems": {
         "type": "integer",
         "minimum": 1,
