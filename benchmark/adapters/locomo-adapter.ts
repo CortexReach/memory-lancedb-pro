@@ -16,40 +16,54 @@ export async function extractFacts(
   client: OpenAI,
   model = "gpt-4o-mini",
 ): Promise<Array<{ text: string; turnIndex: number }>> {
-  try {
-    const response = await client.chat.completions.create({
-      model,
-      temperature: 0,
-      messages: [
-        { role: "system", content: EXTRACTION_PROMPT },
-        {
-          role: "user",
-          content: `[Turn ${turn.turnIndex}] ${turn.speaker}: ${turn.text}`,
-        },
-      ],
-    });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await client.chat.completions.create({
+        model,
+        temperature: 0,
+        messages: [
+          { role: "system", content: EXTRACTION_PROMPT },
+          {
+            role: "user",
+            content: `[Turn ${turn.turnIndex}] ${turn.speaker}: ${turn.text}`,
+          },
+        ],
+      });
 
-    const content = response.choices[0]?.message?.content?.trim() ?? "";
-    if (content === "NONE" || !content) return [];
+      const content = response.choices[0]?.message?.content?.trim() ?? "";
+      if (content === "NONE" || !content) return [];
 
-    return parseExtractionResponse(content).map((text) => ({
-      text,
-      turnIndex: turn.turnIndex,
-    }));
-  } catch (err: any) {
-    // Azure content filter or other API errors — skip this turn, don't crash
-    const code = err?.status ?? err?.code ?? "";
-    if (
-      code === 400 ||
-      /content.*filter|content.*management/i.test(String(err))
-    ) {
-      console.warn(
-        `    [skip] Turn ${turn.turnIndex} filtered by content policy`,
+      return parseExtractionResponse(content).map((text) => ({
+        text,
+        turnIndex: turn.turnIndex,
+      }));
+    } catch (err: any) {
+      // Azure content filter — skip turn
+      const code = err?.status ?? err?.code ?? "";
+      if (
+        code === 400 ||
+        /content.*filter|content.*management/i.test(String(err))
+      ) {
+        console.warn(
+          `    [skip] Turn ${turn.turnIndex} filtered by content policy`,
+        );
+        return [];
+      }
+      // Transient network errors — retry
+      const isTransient = /ECONNRESET|ETIMEDOUT|abort|socket|network/i.test(
+        String(err),
       );
-      return [];
+      if (isTransient && attempt < 2) {
+        console.warn(
+          `    [retry] Extraction turn ${turn.turnIndex} attempt ${attempt + 1}: ${String(err).slice(0, 60)}`,
+        );
+        await new Promise((r) => setTimeout(r, 3000 * (attempt + 1)));
+        continue;
+      }
+      throw err;
     }
-    throw err;
   }
+  return [];
 }
 
 export function parseExtractionResponse(response: string): string[] {
