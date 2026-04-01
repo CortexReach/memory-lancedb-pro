@@ -44,6 +44,7 @@ function createApiHarness({ dbPath, embeddingBaseURL }) {
       dbPath,
       autoCapture: false,
       autoRecall: false,
+      selfImprovement: { enabled: false },
       sessionStrategy: "systemSessionMemory",
       embedding: {
         provider: "openai-compatible",

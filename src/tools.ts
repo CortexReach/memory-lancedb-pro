@@ -1980,7 +1980,7 @@ export function registerMemoryArchiveTool(
   );
 }
 
-export function registerMemoryCompactTool(
+export function registerMemoryDeduplicateTool(
   api: OpenClawPluginApi,
   context: ToolContext,
 ) {
@@ -1988,8 +1988,8 @@ export function registerMemoryCompactTool(
     (toolCtx) => {
       const runtimeContext = resolveToolContext(context, toolCtx);
       return {
-        name: "memory_compact",
-        label: "Memory Compact",
+        name: "memory_deduplicate",
+        label: "Memory Deduplicate",
         description:
           "Compact duplicate low-value memories by archiving redundant entries and linking them to a canonical memory.",
         parameters: Type.Object({
@@ -2074,7 +2074,7 @@ export function registerMemoryCompactTool(
         },
       };
     },
-    { name: "memory_compact" },
+    { name: "memory_deduplicate" },
   );
 }
 
@@ -2183,7 +2183,7 @@ export function registerAllMemoryTools(
     registerMemoryListTool(api, context);
     registerMemoryPromoteTool(api, context);
     registerMemoryArchiveTool(api, context);
-    registerMemoryCompactTool(api, context);
+    registerMemoryDeduplicateTool(api, context);
     registerMemoryExplainRankTool(api, context);
   }
   if (options.enableSelfImprovementTools !== false) {

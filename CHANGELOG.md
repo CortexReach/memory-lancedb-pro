@@ -1,6 +1,13 @@
 # Changelog
 
-## 1.1.0-beta.2 (Smart Memory Beta + Access Reinforcement)
+## 1.1.0-beta.11 (Tool Naming & Parameter Consistency)
+
+- **Breaking Change**: Renamed the original `memory_compact` tool (deduplication) to `memory_deduplicate` to distinguish it from progressive summarization.
+- **Breaking Change**: Standardized `memory_compact` (progressive summarization) and `memory_deduplicate` parameters to use **camelCase** (`dryRun`, `minAgeDays`, `similarityThreshold`).
+- **Feat**: Both `memory_compact` and `memory_deduplicate` now default to `dryRun: true` (preview mode) for safety.
+- **Fix**: Updated governance tests to reflect the rename and parameter changes.
+
+## 1.1.0-beta.10 (Smart Memory Beta + Access Reinforcement)
 
 This is a **beta** release published under the npm dist-tag **`beta`** (it does not affect the stable `latest` channel).
 

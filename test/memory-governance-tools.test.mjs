@@ -154,10 +154,10 @@ describe("memory governance tools", () => {
     };
 
     const tools = createToolSet(context);
-    const compact = tools.get("memory_compact");
+    const deduplicate = tools.get("memory_deduplicate");
     const explain = tools.get("memory_explain_rank");
 
-    const compactRes = await compact.execute(null, { dryRun: true });
+    const compactRes = await deduplicate.execute(null, { dryRun: true });
     assert.match(compactRes.content[0].text, /Compaction preview/);
     assert.equal(compactRes.details.duplicates, 1);
 

@@ -2088,19 +2088,19 @@ const memoryLanceDBProPlugin = {
         description:
           "Consolidate semantically similar old memories into refined single entries " +
           "(progressive summarization). Reduces noise and improves retrieval quality over time. " +
-          "Use dry_run:true first to preview the compaction plan without making changes.",
+          "Use dryRun:true (default) first to preview the compaction plan without making changes.",
         inputSchema: {
           type: "object" as const,
           properties: {
-            dry_run: {
+            dryRun: {
               type: "boolean",
-              description: "Preview clusters without writing changes. Default: false.",
+              description: "Preview clusters without writing changes. Default: true.",
             },
-            min_age_days: {
+            minAgeDays: {
               type: "number",
               description: "Only compact memories at least this many days old. Default: 7.",
             },
-            similarity_threshold: {
+            similarityThreshold: {
               type: "number",
               description: "Cosine similarity threshold for clustering [0-1]. Default: 0.88.",
             },
@@ -2116,16 +2116,16 @@ const memoryLanceDBProPlugin = {
           const compactionCfg: CompactionConfig = {
             enabled: true,
             minAgeDays:
-              typeof args.min_age_days === "number"
-                ? args.min_age_days
+              typeof args.minAgeDays === "number"
+                ? args.minAgeDays
                 : (config.memoryCompaction?.minAgeDays ?? 7),
             similarityThreshold:
-              typeof args.similarity_threshold === "number"
-                ? Math.max(0, Math.min(1, args.similarity_threshold))
+              typeof args.similarityThreshold === "number"
+                ? Math.max(0, Math.min(1, args.similarityThreshold))
                 : (config.memoryCompaction?.similarityThreshold ?? 0.88),
             minClusterSize: config.memoryCompaction?.minClusterSize ?? 2,
             maxMemoriesToScan: config.memoryCompaction?.maxMemoriesToScan ?? 200,
-            dryRun: args.dry_run === true,
+            dryRun: args.dryRun !== false,
             cooldownHours: config.memoryCompaction?.cooldownHours ?? 24,
           };
           const scopes =

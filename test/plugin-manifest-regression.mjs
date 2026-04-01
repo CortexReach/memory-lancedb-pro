@@ -40,8 +40,15 @@ function createMockApi(pluginConfig, options = {}) {
       return value;
     },
     registerTool(toolOrFactory, meta) {
-      this.toolFactories[meta.name] =
-        typeof toolOrFactory === "function" ? toolOrFactory : () => toolOrFactory;
+      if (!meta && toolOrFactory && typeof toolOrFactory === "object") {
+        // Direct tool registration (used in index.ts)
+        const tool = toolOrFactory;
+        this.toolFactories[tool.name] = () => tool;
+      } else if (meta) {
+        // Factory registration (used in src/tools.ts)
+        this.toolFactories[meta.name] =
+          typeof toolOrFactory === "function" ? toolOrFactory : () => toolOrFactory;
+      }
     },
     registerCli() {},
     registerService(service) {
@@ -139,6 +146,8 @@ try {
     {
       dbPath: path.join(workDir, "db"),
       autoRecall: false,
+      enableManagementTools: true,
+      selfImprovement: { enabled: false },
       embedding: {
         provider: "openai-compatible",
         apiKey: "dummy",
@@ -153,6 +162,20 @@ try {
   assert.equal(services.length, 1, "plugin should register its background service");
   assert.equal(typeof api.hooks.agent_end, "function", "autoCapture should remain enabled by default");
   assert.equal(typeof api.hooks["command:new"], "function", "selfImprovement command:new hook should be registered by default (#391)");
+
+  // Verify tool registration and parameter naming (must fix)
+  assert.ok(api.toolFactories.memory_compact, "memory_compact should be registered");
+  assert.ok(api.toolFactories.memory_deduplicate, "memory_deduplicate should be registered");
+
+  const compactTool = api.toolFactories.memory_compact({});
+  assert.ok(compactTool.inputSchema.properties.dryRun, "memory_compact should use camelCase dryRun");
+  assert.ok(compactTool.inputSchema.properties.minAgeDays, "memory_compact should use camelCase minAgeDays");
+  assert.ok(compactTool.inputSchema.properties.similarityThreshold, "memory_compact should use camelCase similarityThreshold");
+  assert.strictEqual(compactTool.inputSchema.properties.dryRun.description.includes("Default: true"), true, "memory_compact dryRun should default to true");
+
+  const dedupTool = api.toolFactories.memory_deduplicate({});
+  assert.ok(dedupTool.parameters.properties.dryRun, "memory_deduplicate should use camelCase dryRun");
+
   await assert.doesNotReject(
     services[0].stop(),
     "service stop should not throw when no access tracker is configured",
@@ -162,6 +185,7 @@ try {
     dbPath: path.join(workDir, "db-session-default"),
     autoCapture: false,
     autoRecall: false,
+    selfImprovement: { enabled: false },
     sessionMemory: {},
     embedding: {
       provider: "openai-compatible",
@@ -183,6 +207,7 @@ try {
     dbPath: path.join(workDir, "db-session-enabled"),
     autoCapture: false,
     autoRecall: false,
+    selfImprovement: { enabled: false },
     sessionMemory: { enabled: true },
     embedding: {
       provider: "openai-compatible",
