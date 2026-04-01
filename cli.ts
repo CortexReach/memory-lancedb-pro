@@ -1185,24 +1185,27 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           const text = line.slice(2).trim();
           if (text.length < minTextLength) { skipped++; continue; }
 
-          if (options.dryRun) {
-            console.log(`  [dry-run] would import: ${text.slice(0, 80)}...`);
-            imported++;
-            continue;
-          }
-
           // ── Deduplication check (scope-aware exact match) ───────────────────
+          // Run even in dry-run so --dry-run --dedup reports accurate counts
           if (dedupEnabled) {
             try {
               const existing = await context.store.bm25Search(text, 1, [targetScope]);
               if (existing.length > 0 && existing[0].entry.text === text) {
                 skipped++;
-                console.log(`  [skip] already imported: ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`);
+                if (!options.dryRun) {
+                  console.log(`  [skip] already imported: ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`);
+                }
                 continue;
               }
             } catch {
               // bm25Search not available on this store implementation; proceed with import
             }
+          }
+
+          if (options.dryRun) {
+            console.log(`  [dry-run] would import: ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
+            imported++;
+            continue;
           }
 
           try {
