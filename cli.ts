@@ -1126,6 +1126,26 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         return;
       }
 
+      // Also scan the flat `workspace/memory/` directory directly under workspace root
+      // (not inside any workspace subdirectory — supports James's actual structure)
+      const flatMemoryDir = path.join(workspaceDir, "memory");
+      try {
+        const stats = await fsPromises.stat(flatMemoryDir);
+        if (stats.isDirectory()) {
+          const files = await fsPromises.readdir(flatMemoryDir);
+          let added = 0;
+          for (const f of files) {
+            if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
+              mdFiles.push({ filePath: path.join(flatMemoryDir, f), scope: "memory" });
+              added++;
+            }
+          }
+          if (added > 0) {
+            console.log(`Found ${added} entries in flat memory directory (scope: memory).`);
+          }
+        }
+      } catch { /* not found */ }
+
       const targetScope = options.scope || "global";
       const minTextLength = parseInt(options.minTextLength ?? "5", 10);
       const importanceDefault = parseFloat(options.importance ?? "0.7");
