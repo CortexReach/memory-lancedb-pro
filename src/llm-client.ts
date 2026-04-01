@@ -644,11 +644,18 @@ const CLAUDE_CODE_DISALLOWED_TOOLS = [
 
 /** Extract text from an SDK assistant message (content may be a block array or plain string). */
 function extractTextFromSdkMessage(message: unknown): string | null {
-  const content = (message as { message?: { content?: unknown } }).message?.content;
+  if (typeof message !== "object" || message === null) return null;
+  const outer = message as Record<string, unknown>;
+  if (typeof outer.message !== "object" || outer.message === null) return null;
+  const inner = outer.message as Record<string, unknown>;
+  const content = inner.content;
   if (Array.isArray(content)) {
     const text = content
-      .filter((b: unknown) => typeof b === "object" && b !== null && (b as { type: string }).type === "text")
-      .map((b: unknown) => (b as { text?: string }).text ?? "")
+      .filter((b: unknown) => typeof b === "object" && b !== null && (b as Record<string, unknown>).type === "text")
+      .map((b: unknown) => {
+        const block = b as Record<string, unknown>;
+        return typeof block.text === "string" ? block.text : "";
+      })
       .join("\n");
     return text || null;
   }
@@ -761,7 +768,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
           prompt,
           options: {
             model,
-            // cwd: sessionDir, // Temporarily disabled: isolated cwd may cause Claude Code auth issues
+            cwd: sessionDir,
             pathToClaudeCodeExecutable: claudePath,
             disallowedTools: CLAUDE_CODE_DISALLOWED_TOOLS,
             env,
