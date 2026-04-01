@@ -3,7 +3,7 @@
  */
 
 import type { Command } from "commander";
-import { readFileSync } from "node:fs";
+import { readFileSync, type Dirent } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -1081,7 +1081,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       }
 
       // Scan workspace directories
-      let workspaceEntries: string[];
+      let workspaceEntries: Dirent[];
       try {
         const fsPromises = await import("node:fs/promises");
         workspaceEntries = await fsPromises.readdir(workspaceDir, { withFileTypes: true });
@@ -1102,19 +1102,16 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         // MEMORY.md
         const memoryMd = path.join(workspacePath, "MEMORY.md");
         try {
-          const { stat } = await import("node:fs/promises");
-          await stat(memoryMd);
+          await fsPromises.stat(memoryMd);
           mdFiles.push({ filePath: memoryMd, scope: entry.name });
         } catch { /* not found */ }
 
         // memory/ directory
         const memoryDir = path.join(workspacePath, "memory");
         try {
-          const { stat } = await import("node:fs/promises");
-          const stats = await stat(memoryDir);
+          const stats = await fsPromises.stat(memoryDir);
           if (stats.isDirectory()) {
-            const { readdir } = await import("node:fs/promises");
-            const files = await readdir(memoryDir);
+            const files = await fsPromises.readdir(memoryDir);
             for (const f of files) {
               if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
                 mdFiles.push({ filePath: path.join(memoryDir, f), scope: entry.name });
@@ -1137,8 +1134,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       // Parse each file for memory entries (lines starting with "- ")
       for (const { filePath, scope } of mdFiles) {
         foundFiles++;
-        const { readFile } = await import("node:fs/promises");
-        let content = await readFile(filePath, "utf-8");
+        let content = await fsPromises.readFile(filePath, "utf-8");
         // Strip UTF-8 BOM (e.g. from Windows Notepad-saved files)
         content = content.replace(/^\uFEFF/, "");
         // Normalize line endings: handle both CRLF (\r\n) and LF (\n)
@@ -1172,14 +1168,14 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           }
 
           try {
-            const vector = await context.embedder!.embedQuery(text);
+            const vector = await context.embedder!.embedPassage(text);
             await context.store.store({
               text,
               vector,
               importance: importanceDefault,
               category: "other",
               scope: targetScope,
-              metadata: { importedFrom: filePath, sourceScope: scope },
+              metadata: JSON.stringify({ importedFrom: filePath, sourceScope: scope }),
             });
             imported++;
           } catch (err) {
