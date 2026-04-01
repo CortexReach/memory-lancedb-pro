@@ -947,7 +947,7 @@ export class MemoryRetriever {
       limit,
       0.1,
       scopeFilter,
-      { excludeInactive: true },
+      { excludeInactive: true, maxLimit: 50 },
     );
 
     // Filter by category if specified
@@ -969,6 +969,7 @@ export class MemoryRetriever {
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
     const results = await this.store.bm25Search(query, limit, scopeFilter, {
       excludeInactive: true,
+      maxLimit: 50,
     });
 
     // Filter by category if specified

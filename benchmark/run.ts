@@ -55,9 +55,18 @@ function requireEnv(name: string): string {
 const EMBEDDING_API_KEY = requireEnv("EMBEDDING_API_KEY");
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL ?? "text-embedding-3-small";
 const EMBEDDING_BASE_URL = process.env.EMBEDDING_BASE_URL;
-const EMBEDDING_DIMENSIONS = process.env.EMBEDDING_DIMENSIONS
-  ? parseInt(process.env.EMBEDDING_DIMENSIONS)
-  : undefined;
+const EMBEDDING_DIMENSIONS = (() => {
+  const raw = process.env.EMBEDDING_DIMENSIONS;
+  if (!raw) return undefined;
+  const d = parseInt(raw, 10);
+  if (!Number.isFinite(d) || d <= 0) {
+    console.error(
+      `Invalid EMBEDDING_DIMENSIONS: "${raw}" (must be a positive integer)`,
+    );
+    process.exit(1);
+  }
+  return d;
+})();
 const LLM_API_KEY = requireEnv("LLM_API_KEY");
 const LLM_MODEL = process.env.LLM_MODEL ?? "gpt-4o-mini";
 const LLM_BASE_URL = process.env.LLM_BASE_URL;

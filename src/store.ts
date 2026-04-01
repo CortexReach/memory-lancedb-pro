@@ -523,13 +523,13 @@ export class MemoryStore {
     limit = 5,
     minScore = 0.3,
     scopeFilter?: string[],
-    options?: { excludeInactive?: boolean },
+    options?: { excludeInactive?: boolean; maxLimit?: number },
   ): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
     if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
-    const safeLimit = clampInt(limit, 1, 50);
+    const safeLimit = clampInt(limit, 1, options?.maxLimit ?? 20);
     // Over-fetch more aggressively when filtering inactive records,
     // because superseded historical rows can crowd out active ones.
     const inactiveFilter = options?.excludeInactive ?? false;
@@ -599,13 +599,13 @@ export class MemoryStore {
     query: string,
     limit = 5,
     scopeFilter?: string[],
-    options?: { excludeInactive?: boolean },
+    options?: { excludeInactive?: boolean; maxLimit?: number },
   ): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
     if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
-    const safeLimit = clampInt(limit, 1, 50);
+    const safeLimit = clampInt(limit, 1, options?.maxLimit ?? 20);
     const inactiveFilter = options?.excludeInactive ?? false;
     // Over-fetch when filtering inactive records to avoid crowding
     const fetchLimit = inactiveFilter

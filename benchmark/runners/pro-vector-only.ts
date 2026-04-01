@@ -33,6 +33,8 @@ export class ProVectorOnlyRunner implements BenchmarkRunner {
 
   async seed(memories: BenchmarkMemory[]): Promise<void> {
     const start = Date.now();
+    // Generate fresh dbPath for each seed to avoid stale state after teardown
+    this.dbPath = join(tmpdir(), `bench-vector-only-${randomUUID()}`);
     const resolvedPath = validateStoragePath(this.dbPath);
 
     this.embedder = createEmbedder({
