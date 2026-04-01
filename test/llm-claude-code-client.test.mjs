@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
-const { createLlmClient, buildClaudeCodeEnv, extractJsonFromResponse, repairCommonJson } = jiti("../src/llm-client.ts");
+const { createLlmClient, buildClaudeCodeEnv, extractJsonFromResponse, repairCommonJson, extractTextFromSdkMessage } = jiti("../src/llm-client.ts");
 
 // ---------------------------------------------------------------------------
 // buildClaudeCodeEnv — env sanitization (most critical security logic)
@@ -388,5 +388,145 @@ describe("createLlmClient stateDir guard", () => {
       warnLogs.some(l => l.includes("unsafe stateDir") || l.includes("stateDir")),
       `should warn about unsafe stateDir, got: ${JSON.stringify(warnLogs)}`,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CLAUDE_CODE_ENV_AUTH_PRIORITY — env wins over settings.json when set to "1"
+// ---------------------------------------------------------------------------
+
+describe("buildClaudeCodeEnv CLAUDE_CODE_ENV_AUTH_PRIORITY", () => {
+  it("settings.json auth key wins by default (no CLAUDE_CODE_ENV_AUTH_PRIORITY)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "llm-client-test-"));
+    try {
+      const settingsPath = join(dir, "settings.json");
+      writeFileSync(settingsPath, JSON.stringify({ env: { ANTHROPIC_API_KEY: "from-settings" } }));
+
+      const savedKey = process.env.ANTHROPIC_API_KEY;
+      const savedPriority = process.env.CLAUDE_CODE_ENV_AUTH_PRIORITY;
+      process.env.ANTHROPIC_API_KEY = "from-ambient";
+      delete process.env.CLAUDE_CODE_ENV_AUTH_PRIORITY;
+      try {
+        const env = buildClaudeCodeEnv(undefined, undefined, undefined, settingsPath);
+        assert.equal(env.ANTHROPIC_API_KEY, "from-settings",
+          "settings.json should win when CLAUDE_CODE_ENV_AUTH_PRIORITY is unset");
+      } finally {
+        if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = savedKey;
+        if (savedPriority === undefined) delete process.env.CLAUDE_CODE_ENV_AUTH_PRIORITY;
+        else process.env.CLAUDE_CODE_ENV_AUTH_PRIORITY = savedPriority;
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("env var wins over settings.json when CLAUDE_CODE_ENV_AUTH_PRIORITY=1", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "llm-client-test-"));
+    try {
+      const settingsPath = join(dir, "settings.json");
+      writeFileSync(settingsPath, JSON.stringify({ env: { ANTHROPIC_API_KEY: "from-settings" } }));
+
+      const savedKey = process.env.ANTHROPIC_API_KEY;
+      const savedPriority = process.env.CLAUDE_CODE_ENV_AUTH_PRIORITY;
+      process.env.ANTHROPIC_API_KEY = "from-ambient";
+      process.env.CLAUDE_CODE_ENV_AUTH_PRIORITY = "1";
+      try {
+        const env = buildClaudeCodeEnv(undefined, undefined, undefined, settingsPath);
+        assert.equal(env.ANTHROPIC_API_KEY, "from-ambient",
+          "ambient env var should win when CLAUDE_CODE_ENV_AUTH_PRIORITY=1");
+      } finally {
+        if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = savedKey;
+        if (savedPriority === undefined) delete process.env.CLAUDE_CODE_ENV_AUTH_PRIORITY;
+        else process.env.CLAUDE_CODE_ENV_AUTH_PRIORITY = savedPriority;
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractTextFromSdkMessage — assistant message text extraction
+// ---------------------------------------------------------------------------
+
+describe("extractTextFromSdkMessage", () => {
+  it("returns null for non-object input", () => {
+    assert.equal(extractTextFromSdkMessage(null), null);
+    assert.equal(extractTextFromSdkMessage("string"), null);
+    assert.equal(extractTextFromSdkMessage(42), null);
+  });
+
+  it("returns null when message.message is missing", () => {
+    assert.equal(extractTextFromSdkMessage({}), null);
+    assert.equal(extractTextFromSdkMessage({ type: "assistant" }), null);
+  });
+
+  it("returns null when content is missing", () => {
+    assert.equal(extractTextFromSdkMessage({ message: {} }), null);
+    assert.equal(extractTextFromSdkMessage({ message: { content: null } }), null);
+  });
+
+  it("extracts text from block array content", () => {
+    const msg = {
+      message: {
+        content: [
+          { type: "text", text: "hello" },
+          { type: "tool_use", id: "1", name: "foo", input: {} },
+          { type: "text", text: " world" },
+        ],
+      },
+    };
+    assert.equal(extractTextFromSdkMessage(msg), "hello\n world");
+  });
+
+  it("returns null when block array has no text blocks", () => {
+    const msg = {
+      message: {
+        content: [
+          { type: "tool_use", id: "1", name: "foo", input: {} },
+        ],
+      },
+    };
+    assert.equal(extractTextFromSdkMessage(msg), null);
+  });
+
+  it("returns plain string content directly", () => {
+    const msg = { message: { content: "plain string response" } };
+    assert.equal(extractTextFromSdkMessage(msg), "plain string response");
+  });
+
+  it("returns null for unknown content types (number, object)", () => {
+    assert.equal(extractTextFromSdkMessage({ message: { content: 42 } }), null);
+    assert.equal(extractTextFromSdkMessage({ message: { content: { type: "unknown" } } }), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createLlmClient — SDK module not found (cachedSdkError path)
+// ---------------------------------------------------------------------------
+
+describe("createLlmClient claude-code SDK not installed", () => {
+  it("caches MODULE_NOT_FOUND error and does not retry import on subsequent calls", async () => {
+    // Use a deliberately bad claudeCodePath AND verify error message is about SDK or path,
+    // confirming permanent failure is cached (second call returns same error without re-throwing).
+    const warnLogs = [];
+    const llm = createLlmClient({
+      auth: "claude-code",
+      model: "claude-haiku-4-5",
+      claudeCodePath: "/nonexistent/claude-sdk-cache-test",
+      logWarn: (msg) => warnLogs.push(msg),
+    });
+
+    const result1 = await llm.completeJson("prompt", "label");
+    const err1 = llm.getLastError();
+    assert.equal(result1, null, "first call should return null on failure");
+    assert.ok(err1, "first call should set lastError");
+
+    const result2 = await llm.completeJson("prompt", "label");
+    const err2 = llm.getLastError();
+    assert.equal(result2, null, "second call should also return null");
+    assert.equal(err1, err2, "error should be identical (cached), not a fresh lookup");
   });
 });

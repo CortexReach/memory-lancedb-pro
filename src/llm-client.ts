@@ -644,7 +644,7 @@ const CLAUDE_CODE_DISALLOWED_TOOLS = [
 ];
 
 /** Extract text from an SDK assistant message (content may be a block array or plain string). */
-function extractTextFromSdkMessage(message: unknown): string | null {
+export function extractTextFromSdkMessage(message: unknown): string | null {
   if (typeof message !== "object" || message === null) return null;
   const outer = message as Record<string, unknown>;
   if (typeof outer.message !== "object" || outer.message === null) return null;
