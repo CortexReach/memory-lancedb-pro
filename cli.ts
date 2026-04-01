@@ -1081,9 +1081,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       }
 
       // Scan workspace directories
+      const fsPromises = await import("node:fs/promises");
       let workspaceEntries: Dirent[];
       try {
-        const fsPromises = await import("node:fs/promises");
         workspaceEntries = await fsPromises.readdir(workspaceDir, { withFileTypes: true });
       } catch {
         console.error(`Failed to read workspace directory: ${workspaceDir}`);
