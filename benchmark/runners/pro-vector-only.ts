@@ -98,15 +98,33 @@ export class ProVectorOnlyRunner implements BenchmarkRunner {
     if (!this.retriever) throw new Error("Runner not seeded");
     const start = Date.now();
 
-    const results = await this.retriever.retrieve({
-      query: q.text,
-      limit: 10,
-      source: "manual",
-    });
+    let results;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        results = await this.retriever.retrieve({
+          query: q.text,
+          limit: 10,
+          source: "manual",
+        });
+        break;
+      } catch (err: any) {
+        const isTransient = /abort|timeout|ECONNRESET|ETIMEDOUT/i.test(
+          String(err),
+        );
+        if (isTransient && attempt < 2) {
+          console.warn(
+            `    [retry] Query "${q.id}" attempt ${attempt + 1} failed: ${String(err).slice(0, 80)}`,
+          );
+          await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+          continue;
+        }
+        throw err;
+      }
+    }
 
     this.timings.queryMs.push(Date.now() - start);
 
-    return results.map((r, i) => ({
+    return (results ?? []).map((r, i) => ({
       id: r.entry.id,
       score: r.score,
       rank: i + 1,
