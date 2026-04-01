@@ -32,6 +32,9 @@
     "openai": "^6.21.0",
     "proper-lockfile": "^4.1.2"
   },
+  "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.88"
+  },
   "openclaw": {
     "extensions": [
       "./index.ts"
