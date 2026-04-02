@@ -125,6 +125,8 @@ interface PluginConfig {
     rerankApiKey?: string;
     rerankModel?: string;
     rerankEndpoint?: string;
+    /** Rerank API timeout in milliseconds (default: 5000). Increase for local/CPU-based rerank servers. */
+    rerankTimeoutMs?: number;
     rerankProvider?:
       | "jina"
       | "siliconflow"
@@ -2049,6 +2051,15 @@ const memoryLanceDBProPlugin = {
       `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
     );
     logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
+
+    // Dual-memory model warning: help users understand the two-layer architecture
+    // Runs synchronously and logs warnings; does NOT block gateway startup.
+    api.logger.info(
+      `[memory-lancedb-pro] memory_recall queries the plugin store (LanceDB), not MEMORY.md.\n` +
+      `  - Plugin memory (LanceDB) = primary recall source for semantic search\n` +
+      `  - MEMORY.md / memory/YYYY-MM-DD.md = startup context / journal only\n` +
+      `  - Use memory_store or auto-capture for recallable memories.\n`
+    );
 
     api.on("message_received", (event: any, ctx: any) => {
       const conversationKey = buildAutoCaptureConversationKeyFromIngress(
