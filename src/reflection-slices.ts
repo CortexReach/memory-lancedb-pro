@@ -316,3 +316,101 @@ export function extractReflectionSliceItems(reflectionText: string): ReflectionS
 export function extractInjectableReflectionSliceItems(reflectionText: string): ReflectionSliceItem[] {
   return buildReflectionSliceItemsFromSlices(extractInjectableReflectionSlices(reflectionText));
 }
+
+/**
+ * 載入 Agent 的 reflection slices（同步版本，不包含 BM25 擴展）
+ * 這是給需要同步操作的場景使用
+ *
+ * 注意：實際的完整實現在 reflection-store.ts 的 loadAgentReflectionSlicesFromEntries。
+ * reflection-slices.ts 此處的實作為了避免循環依賴，延遲到需要時再動態載入。
+ */
+export async function loadAgentReflectionSlicesFromEntries(params: {
+  entries: Array<{ text: string; metadata: Record<string, unknown>; timestamp: number }>;
+  agentId: string;
+  now?: number;
+  deriveMaxAgeMs?: number;
+  invariantMaxAgeMs?: number;
+}): Promise<{
+  invariants: string[];
+  derived: string[];
+}> {
+  // 動態 import 避免循環依賴 reflection-store.ts
+  const { loadAgentReflectionSlicesFromEntries: realLoad } = await import("./reflection-store.js");
+  return realLoad(params);
+}
+
+/**
+ * 帶有 BM25 鄰居擴展的 slices 載入（異步版本）
+ *
+ * @param store - MemoryStore 實例，用於執行 BM25 搜尋
+ * @param params - 與 loadAgentReflectionSlicesFromEntries 相同的參數
+ * @param options.bm25TopK - 每個 slice 擴展的鄰居數量（預設 2）
+ * @param options.bm25Scope - BM25 搜尋的 scope 篩選（undefined 表示 global）
+ * @param options.excludeInactive - 是否排除 inactive 的記錄（預設 true）
+ *
+ * 工作流程：
+ * 1. 先呼叫 loadAgentReflectionSlicesFromEntries 取得基礎 slices（invariants + derived）
+ * 2. 對每個 derived slice 使用 BM25 搜尋相關記憶
+ * 3. 將搜尋結果加入 expanded derived 清單（去重）
+ * 4. 回傳 base invariants + expanded derived
+ */
+export async function loadAgentReflectionSlicesWithBm25Expansion(
+  store: { bm25Search: (query: string, limit?: number, scopeFilter?: string[], options?: { excludeInactive?: boolean }) => Promise<Array<{ entry: { text: string } }>> },
+  params: {
+    entries: Array<{ text: string; metadata: Record<string, unknown>; timestamp: number }>;
+    agentId: string;
+    now?: number;
+    deriveMaxAgeMs?: number;
+    invariantMaxAgeMs?: number;
+  },
+  options?: {
+    bm25TopK?: number;
+    bm25Scope?: string[] | undefined;
+    excludeInactive?: boolean;
+  }
+): Promise<{
+  invariants: string[];
+  derived: string[];
+  expandedFrom?: number;
+}> {
+  // Step 1: 先呼叫 loadAgentReflectionSlicesFromEntries 取得基礎 slices
+  const { loadAgentReflectionSlicesFromEntries: loadBaseSlices } = await import("./reflection-store.js");
+  const base = loadBaseSlices(params);
+
+  const topK = options?.bm25TopK ?? 2;
+  const scopeFilter = options?.bm25Scope;
+  const excludeInactive = options?.excludeInactive ?? true;
+
+  // Step 2: 若有 derived slices，進行 BM25 擴展
+  if (base.derived.length > 0) {
+    const expanded: string[] = [];
+    const seen = new Set<string>(base.derived); // 已有的 derived 不重複
+
+    for (const text of base.derived) {
+      const trimmed = text.trim();
+      if (!trimmed || seen.has(trimmed)) continue;
+
+      try {
+        const neighbors = await store.bm25Search(trimmed, topK, scopeFilter, { excludeInactive });
+        for (const neighbor of neighbors) {
+          const neighborText = neighbor.entry?.text?.trim();
+          if (neighborText && !seen.has(neighborText)) {
+            seen.add(neighborText);
+            expanded.push(neighborText);
+          }
+        }
+      } catch {
+        // BM25 搜尋失敗時跳過該條
+        continue;
+      }
+    }
+
+    return {
+      invariants: base.invariants,
+      derived: expanded,
+      expandedFrom: expanded.length,
+    };
+  }
+
+  return { invariants: base.invariants, derived: [], expandedFrom: 0 };
+}
