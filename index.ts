@@ -74,6 +74,17 @@ interface PluginConfig {
   autoRecall?: boolean;
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
+  // Proposal A (#445): Dynamic importance feedback signals
+  feedbackSignal?: {
+    /** Boost per successful use (default: 0.05) */
+    importanceBoostPerUse?: number;
+    /** Boost per user confirmation (default: 0.15) */
+    importanceBoostPerConfirmation?: number;
+    /** Penalty per miss (default: 0.03) */
+    importancePenaltyPerMiss?: number;
+    /** Minimum recall count before applying penalty (default: 2) */
+    minRecallCountForPenalty?: number;
+  };
   captureAssistant?: boolean;
   retrieval?: {
     mode?: "hybrid" | "vector";
@@ -2009,6 +2020,10 @@ const memoryLanceDBProPlugin = {
             source: "auto-recall",
           });
 
+          // Store recalled IDs for Proposal A feedback signals (#445):
+          // Phase 1 (recall boost) and Phase 2 (unused penalty + user confirmation)
+          (ctx as any).__recalledMemoryIds = results.map((r: any) => r.entry.id);
+
           if (results.length === 0) {
             return;
           }
@@ -2080,6 +2095,168 @@ const memoryLanceDBProPlugin = {
           api.logger.warn(`memory-lancedb-pro: recall failed: ${String(err)}`);
         }
       });
+    }
+
+    // ========================================================================
+    // Proposal A: Dynamic Importance Feedback Signals (#445)
+    // ========================================================================
+    // Phase 1 (recall boost): recalled AND used → importance += importanceBoostPerUse
+    // Phase 2 (unused penalty): recalled 2+ times but not used → importance -= importancePenaltyPerMiss
+    // Phase 2 (user confirmation): user says correct/yes → importance += importanceBoostPerConfirmation
+
+    const fs = config.feedbackSignal;
+    if (fs) {
+      // Helper: check if a memory text appears in response (heuristic for "used")
+      const isUsedInResponse = async (memId: string, responseText: string): Promise<boolean> => {
+        const entry = await store.getById(memId);
+        if (!entry) return false;
+        return responseText.includes(entry.text.toLowerCase().slice(0, 20));
+      };
+
+      /**
+       * Phase 1: Recall boost — if a recalled memory was actually used in response,
+       * boost its importance to reinforce high-value memories.
+       */
+      if (fs.importanceBoostPerUse) {
+        api.on("agent_end", async (event, ctx) => {
+          if (!event?.messages || event.messages.length === 0) return;
+          const sessionKey = typeof ctx?.sessionKey === "string" ? ctx.sessionKey : "";
+          if (!sessionKey) return;
+
+          const recalledIds = (ctx as any).__recalledMemoryIds || [];
+          if (recalledIds.length === 0) return;
+
+          const responseText = event.messages
+            .map((m: any) => typeof m.content === "string" ? m.content : "")
+            .join(" ")
+            .toLowerCase();
+
+          const boost = fs.importanceBoostPerUse;
+          let boosted = 0;
+
+          try {
+            for (const memId of recalledIds) {
+              const used = await isUsedInResponse(memId, responseText);
+              if (!used) continue;
+
+              const entry = await store.getById(memId);
+              if (!entry) continue;
+
+              const currentImportance = Number(entry.importance) || 0.5;
+              const newImportance = Math.min(1.0, currentImportance + boost);
+              if (newImportance !== currentImportance) {
+                await store.update(memId, { importance: newImportance });
+                boosted++;
+              }
+            }
+            if (boosted > 0) {
+              api.logger.debug(
+                `memory-lancedb-pro: [ProposalA] recall-boost +${boost} for ${boosted}/${recalledIds.length} memories`,
+              );
+            }
+          } catch (err) {
+            api.logger.warn(`memory-lancedb-pro: [ProposalA] recall-boost failed: ${String(err)}`);
+          }
+        }, { priority: 50 });
+      }
+
+      /**
+       * Phase 2: Unused penalty — if a memory was recalled 2+ times but never used,
+       * apply a small penalty. Guard (minRecallCountForPenalty) protects new memories.
+       */
+      if (fs.importancePenaltyPerMiss) {
+        api.on("agent_end", async (event, ctx) => {
+          if (!event?.messages || event.messages.length === 0) return;
+          const sessionKey = typeof ctx?.sessionKey === "string" ? ctx.sessionKey : "";
+          if (!sessionKey) return;
+
+          const recalledIds = (ctx as any).__recalledMemoryIds || [];
+          if (recalledIds.length === 0) return;
+
+          const responseText = event.messages
+            .map((m: any) => typeof m.content === "string" ? m.content : "")
+            .join(" ")
+            .toLowerCase();
+
+          const penalty = fs.importancePenaltyPerMiss;
+          const minCount = fs.minRecallCountForPenalty ?? 2;
+          let penalized = 0;
+
+          try {
+            for (const memId of recalledIds) {
+              // Skip if memory was actually used (Phase 1 should have handled it)
+              const used = await isUsedInResponse(memId, responseText);
+              if (used) continue;
+
+              const entry = await store.getById(memId);
+              if (!entry) continue;
+
+              // Guard: protect new memories from premature penalty
+              let injectedCount = 0;
+              try {
+                const meta = JSON.parse(entry.metadata || "{}");
+                injectedCount = Number(meta.injected_count) || 0;
+              } catch { /* ignore */ }
+              if (injectedCount < minCount) continue;
+
+              const currentImportance = Number(entry.importance) || 0.5;
+              const newImportance = Math.max(0.1, currentImportance - penalty);
+              if (newImportance !== currentImportance) {
+                await store.update(memId, { importance: newImportance });
+                penalized++;
+              }
+            }
+            if (penalized > 0) {
+              api.logger.debug(
+                `memory-lancedb-pro: [ProposalA] unused-penalty -${penalty} for ${penalized}/${recalledIds.length} memories`,
+              );
+            }
+          } catch (err) {
+            api.logger.warn(`memory-lancedb-pro: [ProposalA] unused-penalty failed: ${String(err)}`);
+          }
+        }, { priority: 51 });
+      }
+
+      /**
+       * Phase 2: User confirmation — detect explicit user confirmation ("yes"/"correct"/"right").
+       * When confirmed, boost the most recently recalled memory.
+       */
+      if (fs.importanceBoostPerConfirmation) {
+        api.on("before_prompt_build", async (event: any, ctx: any) => {
+          const sessionKey = typeof ctx?.sessionKey === "string" ? ctx.sessionKey : "";
+          if (!sessionKey) return;
+
+          const lastUserMsg = event?.messages?.slice()?.reverse()?.find((m: any) => m.role === "user");
+          if (!lastUserMsg) return;
+
+          const text = (typeof lastUserMsg.content === "string" ? lastUserMsg.content : "").toLowerCase();
+          const confirmPatterns = [
+            "yes", "yeah", "correct", "right", "對", "正確", "沒錯", "good",
+            "yep", "sure", "exactly", "that's right", "that is right"
+          ];
+          if (!confirmPatterns.some(p => text.includes(p))) return;
+
+          const recalledIds = (ctx as any).__recalledMemoryIds || [];
+          if (recalledIds.length === 0) return;
+
+          const boost = fs.importanceBoostPerConfirmation;
+          try {
+            const entry = await store.getById(recalledIds[0]);
+            if (entry) {
+              const currentImportance = Number(entry.importance) || 0.5;
+              const newImportance = Math.min(1.0, currentImportance + boost);
+              if (newImportance !== currentImportance) {
+                await store.update(recalledIds[0], { importance: newImportance });
+                api.logger.debug(
+                  `memory-lancedb-pro: [ProposalA] user-confirmation +${boost} for ${recalledIds[0].slice(0, 8)}`,
+                );
+              }
+            }
+          } catch (err) {
+            api.logger.warn(`memory-lancedb-pro: [ProposalA] user-confirmation boost failed: ${String(err)}`);
+          }
+        }, { priority: 100 });
+      }
     }
 
     // Auto-capture: analyze and store important information after agent ends
