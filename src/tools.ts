@@ -768,12 +768,16 @@ export function registerMemoryStoreTool(
           const safeImportance = clamp01(importance, 0.7);
           const vector = await runtimeContext.embedder.embedPassage(text);
 
-          // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
+          // Check for duplicates / supersede candidates using raw vector similarity
+          // (bypasses importance/recency weighting).
           // Fail-open by design: dedup must never block a legitimate memory write.
           // excludeInactive: superseded historical records must not block new writes.
+          const SUPERSEDE_ELIGIBLE: ReadonlySet<string> = new Set([
+            "preference", "fact", "entity", "other",
+          ]);
           let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
           try {
-            existing = await runtimeContext.store.vectorSearch(vector, 1, 0.1, [
+            existing = await runtimeContext.store.vectorSearch(vector, 3, 0.1, [
               targetScope,
             ], { excludeInactive: true });
           } catch (err) {
@@ -796,6 +800,105 @@ export function registerMemoryStoreTool(
                 existingText: existing[0].entry.text,
                 existingScope: existing[0].entry.scope,
                 similarity: existing[0].score,
+              },
+            };
+          }
+
+          // Auto-supersede: if a similar memory exists (0.95-0.98 similarity),
+          // same storage-layer category, and category is eligible, mark the old
+          // one as superseded and store the new one with a supersedes link.
+          const supersedeCandidate = existing.find(
+            (r) =>
+              r.score > 0.95 &&
+              r.score <= 0.98 &&
+              r.entry.category === category &&
+              SUPERSEDE_ELIGIBLE.has(r.entry.category),
+          );
+
+          if (supersedeCandidate) {
+            const oldEntry = supersedeCandidate.entry;
+            const oldMeta = parseSmartMetadata(oldEntry.metadata, oldEntry);
+            const now = Date.now();
+            const factKey =
+              oldMeta.fact_key ?? deriveFactKey(oldMeta.memory_category, text);
+
+            // Store new memory with supersedes link
+            const newMeta = buildSmartMetadata(
+              { text, category: category as any, importance: safeImportance },
+              {
+                l0_abstract: text,
+                l1_overview: `- ${text}`,
+                l2_content: text,
+                source: "manual",
+                state: "confirmed",
+                memory_layer: deriveManualMemoryLayer(category as string),
+                last_confirmed_use_at: now,
+                bad_recall_count: 0,
+                suppressed_until_turn: 0,
+                valid_from: now,
+                fact_key: factKey,
+                supersedes: oldEntry.id,
+                relations: appendRelation([], {
+                  type: "supersedes",
+                  targetId: oldEntry.id,
+                }),
+              },
+            );
+
+            const newEntry = await runtimeContext.store.store({
+              text,
+              vector,
+              importance: safeImportance,
+              category: category as any,
+              scope: targetScope,
+              metadata: stringifySmartMetadata(newMeta),
+            });
+
+            // Invalidate old record
+            try {
+              await runtimeContext.store.patchMetadata(
+                oldEntry.id,
+                {
+                  fact_key: factKey,
+                  invalidated_at: now,
+                  superseded_by: newEntry.id,
+                  relations: appendRelation(oldMeta.relations, {
+                    type: "superseded_by",
+                    targetId: newEntry.id,
+                  }),
+                },
+                [targetScope],
+              );
+            } catch (patchErr) {
+              // New record is already the source of truth; log but don't fail
+              console.warn(
+                `memory-pro: failed to patch superseded record ${oldEntry.id.slice(0, 8)}: ${patchErr}`,
+              );
+            }
+
+            // Dual-write to Markdown mirror if enabled
+            if (context.mdMirror) {
+              await context.mdMirror(
+                { text, category: category as string, scope: targetScope, timestamp: newEntry.timestamp },
+                { source: "memory_store", agentId },
+              );
+            }
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Superseded memory ${oldEntry.id.slice(0, 8)}... → new version ${newEntry.id.slice(0, 8)}...: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`,
+                },
+              ],
+              details: {
+                action: "superseded",
+                id: newEntry.id,
+                supersededId: oldEntry.id,
+                scope: newEntry.scope,
+                category: newEntry.category,
+                importance: newEntry.importance,
+                similarity: supersedeCandidate.score,
               },
             };
           }

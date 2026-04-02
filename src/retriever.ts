@@ -15,8 +15,6 @@ import type { DecayEngine, DecayableMemory } from "./decay-engine.js";
 import type { TierManager } from "./tier-manager.js";
 import {
   getDecayableFromEntry,
-  isMemoryActiveAt,
-  parseSmartMetadata,
   toLifecycleMemory,
 } from "./smart-metadata.js";
 import { TraceCollector, type RetrievalTrace } from "./retrieval-trace.js";
@@ -382,12 +380,6 @@ export class MemoryRetriever {
   /** Get the stats collector (if set). */
   getStatsCollector(): RetrievalStatsCollector | null {
     return this._statsCollector;
-  }
-
-  private filterActiveResults<T extends MemorySearchResult>(results: T[]): T[] {
-    return results.filter((result) =>
-      isMemoryActiveAt(parseSmartMetadata(result.entry.metadata, result.entry)),
-    );
   }
 
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
