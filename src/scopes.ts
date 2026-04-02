@@ -75,6 +75,43 @@ export function isSystemBypassId(agentId?: string): boolean {
   return typeof agentId === "string" && SYSTEM_BYPASS_IDS.has(agentId);
 }
 
+export function summarizeScopesByType(scopes: string[]): {
+  totalScopes: number;
+  scopesByType: Record<string, number>;
+} {
+  const scopesByType: Record<string, number> = {
+    global: 0,
+    agent: 0,
+    custom: 0,
+    project: 0,
+    user: 0,
+    other: 0,
+  };
+
+  for (const scope of scopes) {
+    if (scope === "global") {
+      scopesByType.global++;
+    } else if (scope.startsWith("agent:")) {
+      scopesByType.agent++;
+    } else if (scope.startsWith("custom:")) {
+      scopesByType.custom++;
+    } else if (scope.startsWith("project:")) {
+      scopesByType.project++;
+    } else if (scope.startsWith("user:") || scope.startsWith("reflection:")) {
+      // TODO: add a dedicated `reflection` bucket once downstream dashboards accept it.
+      // For now, reflection scopes are counted under `user` for schema compatibility.
+      scopesByType.user++;
+    } else {
+      scopesByType.other++;
+    }
+  }
+
+  return {
+    totalScopes: scopes.length,
+    scopesByType,
+  };
+}
+
 /** @internal Exported for testing only — resets the legacy warning throttle. */
 export function _resetLegacyFallbackWarningState(): void {
   warnedLegacyFallbackBypassIds.clear();
@@ -412,37 +449,12 @@ export class MemoryScopeManager implements ScopeManager {
     scopesByType: Record<string, number>;
   } {
     const scopes = this.getAllScopes();
-    const scopesByType: Record<string, number> = {
-      global: 0,
-      agent: 0,
-      custom: 0,
-      project: 0,
-      user: 0,
-      other: 0,
-    };
-
-    for (const scope of scopes) {
-      if (scope === "global") {
-        scopesByType.global++;
-      } else if (scope.startsWith("agent:")) {
-        scopesByType.agent++;
-      } else if (scope.startsWith("custom:")) {
-        scopesByType.custom++;
-      } else if (scope.startsWith("project:")) {
-        scopesByType.project++;
-      } else if (scope.startsWith("user:") || scope.startsWith("reflection:")) {
-        // TODO: add a dedicated `reflection` bucket once downstream dashboards accept it.
-        // For now, reflection scopes are counted under `user` for schema compatibility.
-        scopesByType.user++;
-      } else {
-        scopesByType.other++;
-      }
-    }
+    const summary = summarizeScopesByType(scopes);
 
     return {
-      totalScopes: scopes.length,
+      totalScopes: summary.totalScopes,
       agentsWithCustomAccess: Object.keys(this.config.agentAccess).length,
-      scopesByType,
+      scopesByType: summary.scopesByType,
     };
   }
 }

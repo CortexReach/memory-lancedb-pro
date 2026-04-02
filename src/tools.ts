@@ -11,7 +11,7 @@ import { join } from "node:path";
 import type { MemoryRetriever, RetrievalResult } from "./retriever.js";
 import type { MemoryStore } from "./store.js";
 import { isNoise } from "./noise-filter.js";
-import { isSystemBypassId, resolveScopeFilter, parseAgentIdFromSessionKey, type MemoryScopeManager } from "./scopes.js";
+import { isSystemBypassId, resolveScopeFilter, parseAgentIdFromSessionKey, summarizeScopesByType, type MemoryScopeManager } from "./scopes.js";
 import type { Embedder } from "./embedder.js";
 import {
   appendRelation,
@@ -1335,15 +1335,27 @@ export function registerMemoryStatsTool(
           }
 
           const stats = await context.store.stats(scopeFilter);
-          const scopeManagerStats = context.scopeManager.getStats();
+          const configuredScopeStats = context.scopeManager.getStats();
+          const observedScopeStats = summarizeScopesByType(Object.keys(stats.scopeCounts));
           const retrievalConfig = context.retriever.getConfig();
 
           const textLines = [
             `Memory Statistics:`,
             `\u2022 Total memories: ${stats.totalCount}`,
-            `\u2022 Available scopes: ${scopeManagerStats.totalScopes}`,
+            `\u2022 Configured scopes: ${configuredScopeStats.totalScopes}`,
+            `\u2022 Observed scopes in DB: ${observedScopeStats.totalScopes}`,
             `\u2022 Retrieval mode: ${retrievalConfig.mode}`,
             `\u2022 FTS support: ${context.store.hasFtsSupport ? "Yes" : "No"}`,
+            ``,
+            `Observed scopes by type:`,
+            ...Object.entries(observedScopeStats.scopesByType).map(
+              ([s, count]) => `  \u2022 ${s}: ${count}`,
+            ),
+            ``,
+            `Configured scopes by type:`,
+            ...Object.entries(configuredScopeStats.scopesByType).map(
+              ([s, count]) => `  \u2022 ${s}: ${count}`,
+            ),
             ``,
             `Memories by scope:`,
             ...Object.entries(stats.scopeCounts).map(
@@ -1385,7 +1397,13 @@ export function registerMemoryStatsTool(
             content: [{ type: "text", text }],
             details: {
               stats,
-              scopeManagerStats,
+              scopeManagerStats: {
+                totalScopes: configuredScopeStats.totalScopes,
+                agentsWithCustomAccess: configuredScopeStats.agentsWithCustomAccess,
+                scopesByType: configuredScopeStats.scopesByType,
+                configured: configuredScopeStats,
+                observed: observedScopeStats,
+              },
               retrievalConfig: {
                 ...retrievalConfig,
                 rerankApiKey: retrievalConfig.rerankApiKey ? "***" : undefined,

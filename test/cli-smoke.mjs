@@ -75,7 +75,21 @@ async function runCliSmoke() {
   const context = {
     store,
     retriever: { retrieve: async () => [] },
-    scopeManager: { getDefaultScope: () => "global" },
+    scopeManager: {
+      getDefaultScope: () => "global",
+      getStats: () => ({
+        totalScopes: 1,
+        agentsWithCustomAccess: 0,
+        scopesByType: {
+          global: 1,
+          agent: 0,
+          custom: 0,
+          project: 0,
+          user: 0,
+          other: 0,
+        },
+      }),
+    },
     migrator: {},
     embedder: {
       embedPassage: async () => [0, 0, 0, 0],
@@ -206,6 +220,13 @@ async function runCliSmoke() {
       async hasId(id) {
         return id === entry.id;
       },
+      async stats() {
+        return {
+          totalCount: 1,
+          scopeCounts: { global: 1, "agent:main": 2 },
+          categoryCounts: { fact: 1 },
+        };
+      },
     },
     retriever: {
       async retrieve() {
@@ -228,7 +249,22 @@ async function runCliSmoke() {
         };
       },
     },
-    scopeManager: {},
+    scopeManager: {
+      getStats() {
+        return {
+          totalScopes: 1,
+          agentsWithCustomAccess: 0,
+          scopesByType: {
+            global: 1,
+            agent: 0,
+            custom: 0,
+            project: 0,
+            user: 0,
+            other: 0,
+          },
+        };
+      },
+    },
     migrator: {},
     embedder: {
       async embedQuery() {
@@ -255,6 +291,21 @@ async function runCliSmoke() {
   });
 
   assert.match(searchOutput, /search_regression_1/);
+
+  const statsOutput = await captureStdout(async () => {
+    await searchProgram.parseAsync([
+      "node",
+      "openclaw",
+      "memory-pro",
+      "stats",
+      "--json",
+    ]);
+  });
+  const statsJson = JSON.parse(statsOutput);
+  assert.ok(statsJson.scopes?.configured);
+  assert.ok(statsJson.scopes?.observed);
+  assert.equal(typeof statsJson.scopes.configured.totalScopes, "number");
+  assert.equal(typeof statsJson.scopes.observed.totalScopes, "number");
 
   const lexicalStore = new MemoryStore({
     dbPath: path.join(workDir, "lexical-db"),

@@ -11,7 +11,7 @@ import * as readline from "node:readline";
 import JSON5 from "json5";
 import { loadLanceDB, type MemoryEntry, type MemoryStore } from "./src/store.js";
 import { createRetriever, type MemoryRetriever } from "./src/retriever.js";
-import type { MemoryScopeManager } from "./src/scopes.js";
+import { summarizeScopesByType, type MemoryScopeManager } from "./src/scopes.js";
 import type { MemoryMigrator } from "./src/migrate.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
 import type { LlmClient } from "./src/llm-client.js";
@@ -749,12 +749,19 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         }
 
         const stats = await context.store.stats(scopeFilter);
-        const scopeStats = context.scopeManager.getStats();
+        const configuredScopeStats = context.scopeManager.getStats();
+        const observedScopeStats = summarizeScopesByType(Object.keys(stats.scopeCounts));
         const retrievalConfig = context.retriever.getConfig();
 
         const summary = {
           memory: stats,
-          scopes: scopeStats,
+          scopes: {
+            totalScopes: configuredScopeStats.totalScopes,
+            agentsWithCustomAccess: configuredScopeStats.agentsWithCustomAccess,
+            scopesByType: configuredScopeStats.scopesByType,
+            configured: configuredScopeStats,
+            observed: observedScopeStats,
+          },
           retrieval: {
             mode: retrievalConfig.mode,
             hasFtsSupport: context.store.hasFtsSupport,
@@ -766,9 +773,22 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         } else {
           console.log(`Memory Statistics:`);
           console.log(`• Total memories: ${stats.totalCount}`);
-          console.log(`• Available scopes: ${scopeStats.totalScopes}`);
+          console.log(`• Configured scopes: ${configuredScopeStats.totalScopes}`);
+          console.log(`• Observed scopes in DB: ${observedScopeStats.totalScopes}`);
           console.log(`• Retrieval mode: ${retrievalConfig.mode}`);
           console.log(`• FTS support: ${context.store.hasFtsSupport ? 'Yes' : 'No'}`);
+          console.log();
+
+          console.log("Observed scopes by type:");
+          Object.entries(observedScopeStats.scopesByType).forEach(([type, count]) => {
+            console.log(`  • ${type}: ${count}`);
+          });
+          console.log();
+
+          console.log("Configured scopes by type:");
+          Object.entries(configuredScopeStats.scopesByType).forEach(([type, count]) => {
+            console.log(`  • ${type}: ${count}`);
+          });
           console.log();
 
           console.log("Memories by scope:");
