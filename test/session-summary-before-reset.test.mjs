@@ -143,7 +143,7 @@ describe("systemSessionMemory before_reset", () => {
     const dbPath = path.join(workDir, "db-reset");
     const api = createApiHarness({ dbPath, embeddingBaseURL });
 
-    memoryLanceDBProPlugin.register(api);
+    await memoryLanceDBProPlugin.register(api);
 
     await api.hooks.before_reset(
       {
