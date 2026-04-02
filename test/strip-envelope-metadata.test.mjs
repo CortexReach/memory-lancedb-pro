@@ -118,6 +118,30 @@ describe("stripEnvelopeMetadata", () => {
   // -----------------------------------------------------------------------
   // Edge cases
   // -----------------------------------------------------------------------
+  it("strips subagent runtime wrapper lines but preserves real conversation that follows", () => {
+    const input = [
+      "[Subagent Context] You are running as a subagent (depth 1/1). Results auto-announce to your requester.",
+      "[Subagent Task] Reply with a brief acknowledgment only.",
+      "Actual user content starts here.",
+    ].join("\n");
+
+    const result = stripEnvelopeMetadata(input);
+    assert.equal(result, "Actual user content starts here.");
+  });
+
+  it("strips multiline wrapper continuation text but preserves following conversation", () => {
+    const input = [
+      "[Subagent Context] You are running as a subagent (depth 1/1).",
+      "Results auto-announce to your requester.",
+      "[Subagent Task] Reply with a brief acknowledgment only.",
+      "Do not use any memory tools.",
+      "Actual user content starts here.",
+    ].join("\n");
+
+    const result = stripEnvelopeMetadata(input);
+    assert.equal(result, "Actual user content starts here.");
+  });
+
   it("handles Telegram-style envelope headers", () => {
     const input = [
       "System: [2026-03-18 14:21:36 GMT+8] Telegram[bot123] DM | user_456 [msg:12345]",
