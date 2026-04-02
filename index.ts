@@ -74,6 +74,7 @@ interface PluginConfig {
   autoRecall?: boolean;
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
+  autoRecallMaxQueryLength?: number;
   captureAssistant?: boolean;
   retrieval?: {
     mode?: "hybrid" | "vector";
@@ -2002,8 +2003,18 @@ const memoryLanceDBProPlugin = {
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
 
+          // FR-04: Truncate long prompts (e.g. file attachments) before embedding.
+          // Auto-recall only needs the user's intent, not full attachment text.
+          const MAX_RECALL_QUERY_LENGTH = config.autoRecallMaxQueryLength ?? 2_000;
+          let recallQuery = event.prompt;
+          if (recallQuery.length > MAX_RECALL_QUERY_LENGTH) {
+            const originalLength = recallQuery.length;
+            recallQuery = recallQuery.slice(0, MAX_RECALL_QUERY_LENGTH);
+            api.logger.info?.(`memory-lancedb-pro: auto-recall query truncated from ${originalLength} to ${MAX_RECALL_QUERY_LENGTH} chars`);
+          }
+
           const results = await retrieveWithRetry({
-            query: event.prompt,
+            query: recallQuery,
             limit: 3,
             scopeFilter: accessibleScopes,
             source: "auto-recall",
@@ -3250,6 +3261,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecall: cfg.autoRecall === true,
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
+    autoRecallMaxQueryLength: parsePositiveInt(cfg.autoRecallMaxQueryLength) ?? 2_000,
     captureAssistant: cfg.captureAssistant === true,
     retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null ? cfg.retrieval as any : undefined,
     decay: typeof cfg.decay === "object" && cfg.decay !== null ? cfg.decay as any : undefined,

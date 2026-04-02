@@ -105,6 +105,13 @@
         "default": 0,
         "description": "Minimum number of turns before the same memory can be recalled again in the same session. Set to 0 to disable deduplication (default behavior: inject all memories)."
       },
+      "autoRecallMaxQueryLength": {
+        "type": "integer",
+        "minimum": 100,
+        "maximum": 10000,
+        "default": 2000,
+        "description": "Maximum character length of the auto-recall query before truncation. Default: 2000."
+      },
       "captureAssistant": {
         "type": "boolean"
       },
