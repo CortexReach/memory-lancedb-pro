@@ -2005,6 +2005,29 @@ const memoryLanceDBProPlugin = {
       `  - Use memory_store or auto-capture for recallable memories.\n`
     );
 
+    // ========================================================================
+    // Stub Memory Runtime (satisfies openclaw doctor memory plugin check)
+    // memory-lancedb-pro uses a tool-based architecture, not the built-in memory-core
+    // runtime interface, so we register a minimal stub to satisfy the check.
+    // See: https://github.com/CortexReach/memory-lancedb-pro/issues/434
+    // ========================================================================
+    if (typeof api.registerMemoryRuntime === "function") {
+      api.registerMemoryRuntime({
+        async getMemorySearchManager(_params: any) {
+          return {
+            manager: {
+              status: () => ({ backend: "builtin" as const, provider: "memory-lancedb-pro" }),
+              probeEmbeddingAvailability: async () => ({ ok: true }),
+              probeVectorAvailability: async () => true,
+            },
+          };
+        },
+        resolveMemoryBackendConfig() {
+          return { backend: "builtin" as const };
+        },
+      });
+    }
+
     api.on("message_received", (event: any, ctx: any) => {
       const conversationKey = buildAutoCaptureConversationKeyFromIngress(
         ctx.channelId,
