@@ -104,7 +104,8 @@ describe("systemSessionMemory before_reset", () => {
     memoryLanceDBProPlugin.register(api);
 
     assert.equal(typeof api.hooks.before_reset, "function");
-    assert.equal(api.hooks["command:new"], undefined);
+    // selfImprovement registers command:new by default (#391)
+    assert.equal(typeof api.hooks["command:new"], "function");
 
     await api.hooks.before_reset(
       {
