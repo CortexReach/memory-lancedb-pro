@@ -74,6 +74,12 @@ interface PluginConfig {
   autoRecall?: boolean;
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
+  // Proposal A Phase 1 (#445): Dynamic importance - recall boost
+  // Signal: Memory recalled AND used in response → importance += importanceBoostPerUse
+  feedbackSignal?: {
+    /** Boost per successful use (default: 0.05) */
+    importanceBoostPerUse?: number;
+  };
   captureAssistant?: boolean;
   retrieval?: {
     mode?: "hybrid" | "vector";
@@ -2009,6 +2015,9 @@ const memoryLanceDBProPlugin = {
             source: "auto-recall",
           });
 
+          // Store recalled IDs for feedback-signal Phase 2 hook (A-Phase1 #445)
+          (ctx as any).__recalledMemoryIds = results.map((r: any) => r.entry.id);
+
           if (results.length === 0) {
             return;
           }
@@ -2080,6 +2089,61 @@ const memoryLanceDBProPlugin = {
           api.logger.warn(`memory-lancedb-pro: recall failed: ${String(err)}`);
         }
       });
+    }
+
+    // ========================================================================
+    // Proposal A Phase 1: Dynamic Importance — Recall Boost (#445)
+    // ========================================================================
+    // Signal: When a recalled memory is actually used in the response,
+    //         boost its importance to reinforce high-value memories.
+    // Mechanism: Compare recalled memory IDs against the agent's response text.
+    if (config.feedbackSignal?.importanceBoostPerUse) {
+      api.on("agent_end", async (event, ctx) => {
+        if (!event?.messages || event.messages.length === 0) return;
+        const sessionKey = typeof ctx?.sessionKey === "string" ? ctx.sessionKey : "";
+        if (!sessionKey) return;
+
+        const recalledIds = (ctx as any).__recalledMemoryIds || [];
+        if (recalledIds.length === 0) return;
+
+        // Build response text for relevance check
+        const responseText = event.messages
+          .map((m: any) => typeof m.content === "string" ? m.content : "")
+          .join(" ")
+          .toLowerCase();
+
+        const boost = config.feedbackSignal.importanceBoostPerUse;
+        let boosted = 0;
+
+        try {
+          for (const memId of recalledIds) {
+            // Heuristic: if the memory text appears in the response, consider it "used"
+            // (simple keyword-based check — low false-positive rate for meaningful memories)
+            const entry = await store.getById(memId);
+            if (!entry) continue;
+
+            // Extract key terms from memory text for relevance check
+            const memTextLower = entry.text.toLowerCase();
+            const isUsed = responseText.includes(memTextLower.slice(0, 20));
+
+            if (isUsed) {
+              const currentImportance = Number(entry.importance) || 0.5;
+              const newImportance = Math.min(1.0, currentImportance + boost);
+              if (newImportance !== currentImportance) {
+                await store.update(memId, { importance: newImportance });
+                boosted++;
+              }
+            }
+          }
+          if (boosted > 0) {
+            api.logger.debug(
+              `memory-lancedb-pro: [A-Phase1] recall-boost +${boost} for ${boosted}/${recalledIds.length} memories`,
+            );
+          }
+        } catch (err) {
+          api.logger.warn(`memory-lancedb-pro: [A-Phase1] recall-boost failed: ${String(err)}`);
+        }
+      }, { priority: 50 });
     }
 
     // Auto-capture: analyze and store important information after agent ends
