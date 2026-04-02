@@ -3960,6 +3960,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecall: cfg.autoRecall === true,
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated) ?? 8,
+    autoRecallTimeoutMs: parsePositiveInt(cfg.autoRecallTimeoutMs) ?? 3000,
     autoRecallMaxItems: parsePositiveInt(cfg.autoRecallMaxItems) ?? 3,
     autoRecallMaxChars: parsePositiveInt(cfg.autoRecallMaxChars) ?? 600,
     autoRecallPerItemMaxChars: parsePositiveInt(cfg.autoRecallPerItemMaxChars) ?? 180,
