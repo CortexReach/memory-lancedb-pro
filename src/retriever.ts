@@ -78,6 +78,10 @@ export interface RetrievalConfig {
   /** Maximum half-life multiplier from access reinforcement.
    *  Prevents frequently accessed memories from becoming immortal. (default: 3) */
   maxHalfLifeMultiplier: number;
+  /** Enable neighbor enrichment for auto-recall results (Proposal B Phase 2, #445).
+   *  When true, for each retrieved memory performs vectorSearch(text, topK=2, scope=same)
+   *  and merges neighbors, re-sorted by similarity + importance. (default: true) */
+  enableNeighborEnrichment?: boolean;
 }
 
 export interface RetrievalContext {
@@ -119,6 +123,7 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   timeDecayHalfLifeDays: 60,
   reinforcementFactor: 0.5,
   maxHalfLifeMultiplier: 3,
+  enableNeighborEnrichment: true,
 };
 
 // ============================================================================
@@ -364,7 +369,82 @@ export class MemoryRetriever {
       this.accessTracker.recordAccess(results.map((r) => r.entry.id));
     }
 
+    // ========================================================================
+    // Proposal B Phase 2: Neighbor Enrichment for Auto-Recall (#445)
+    // After retrieval + MMR, find vector neighbors of each result and merge.
+    // Only for auto-recall source to avoid adding latency to manual retrieval.
+    if (source === "auto-recall" && this.config.enableNeighborEnrichment !== false) {
+      results = await this.enrichWithNeighbors(results, safeLimit);
+    }
+
     return results;
+  }
+
+  /**
+   * B-2: Neighbor enrichment — for each retrieved memory, find vector neighbors
+   * in the same scope and merge them into results.
+   * - For each result: vectorSearch(text, topK=2, scope=same)
+   * - Merge and deduplicate
+   * - Re-sort by combined similarity + importance score
+   * - Total cap: 20 entries
+   */
+  private async enrichWithNeighbors(
+    results: RetrievalResult[],
+    limit: number,
+  ): Promise<RetrievalResult[]> {
+    const MAX_NEIGHBORS_PER_RESULT = 2;
+    const NEIGHBOR_MIN_SCORE = 0.3;
+
+    const seenIds = new Set(results.map((r) => r.entry.id));
+    const neighbors: RetrievalResult[] = [];
+
+    for (const result of results) {
+      if (neighbors.length >= limit) break; // Already at cap
+
+      try {
+        const vector = await this.embedder.embedQuery(result.entry.text);
+        const neighborResults = await this.store.vectorSearch(
+          vector,
+          MAX_NEIGHBORS_PER_RESULT,
+          NEIGHBOR_MIN_SCORE,
+          [result.entry.scope],
+        );
+
+        for (const nr of neighborResults) {
+          if (neighbors.length >= limit) break;
+          if (nr.entry.id === result.entry.id) continue; // Don't include self
+          if (seenIds.has(nr.entry.id)) continue; // Already in results
+
+          // Build a RetrievalResult from MemorySearchResult
+          neighbors.push({
+            ...nr,
+            sources: {
+              vector: { score: nr.score, rank: 0 },
+            },
+          });
+          seenIds.add(nr.entry.id);
+        }
+      } catch (err) {
+        // Skip failed neighbor lookups silently
+        void err;
+      }
+    }
+
+    if (neighbors.length === 0) return results;
+
+    // Merge: original results first, then neighbors
+    const merged = [...results, ...neighbors];
+
+    // Re-sort by combined score: similarity * (0.7 + 0.3 * importance)
+    const withImportance = merged.map((r) => {
+      const baseSimilarity = r.sources?.vector?.score ?? r.score ?? 0;
+      const importance = Number(r.entry.importance) || 0.5;
+      const effectiveScore = baseSimilarity * (0.7 + 0.3 * importance);
+      return { ...r, effectiveScore };
+    });
+
+    withImportance.sort((a, b) => b.effectiveScore - a.effectiveScore);
+    return withImportance.slice(0, limit) as RetrievalResult[];
   }
 
   private async vectorOnlyRetrieval(
