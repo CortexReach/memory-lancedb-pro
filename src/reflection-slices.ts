@@ -316,3 +316,72 @@ export function extractReflectionSliceItems(reflectionText: string): ReflectionS
 export function extractInjectableReflectionSliceItems(reflectionText: string): ReflectionSliceItem[] {
   return buildReflectionSliceItemsFromSlices(extractInjectableReflectionSlices(reflectionText));
 }
+
+// ============================================================
+// Phase 2 Feedback Signal — isRecallUsed（v9 spec）
+// ============================================================
+
+/**
+ * 判斷回應（response）是否使用了召回的記憶內容（recall）。
+ * 用於 Phase 2 Feedback Signal，記錄記憶是否在回應中被引用。
+ *
+ * v9 設計規格：
+ * - 短文本（recall.length ≤ 90）：全段作為 snippet 比對
+ * - 長文本（recall.length > 90）：取 slice(20, 70) 避開前綴
+ * - snippet.length < 5 → 回傳 false（snippet 太短無意義）
+ * - 回應長度必須 > 24 字（response.length > 24）
+ *
+ * @param recall - 召回的記憶文本（來自 memory/lancedb）
+ * @param response - 使用者的回應文本
+ * @returns true 表示回應使用了記憶內容，否則 false
+ */
+export function isRecallUsed(recall: string, response: string): boolean {
+  // 參數驗證：recall 和 response 都必須是有效非空字串
+  if (!recall || typeof recall !== "string") return false;
+  if (!response || typeof response !== "string") return false;
+
+  const text = recall.trim();
+
+  // 第一關：recall 長度不足
+  if (text.length < 5) return false;
+
+  // 決定 snippet 取法（v9 threshold = 90）
+  // - recall.length ≤ 90 → 全段作為 snippet
+  // - recall.length > 90 → 取 slice(20, 70) 避開前綴
+  const snippet = text.length > 90
+    ? text.slice(20, 70)
+    : text;
+
+  // 第二關：snippet 長度不足 5 → false
+  if (snippet.length < 5) return false;
+
+  // 第三關：回應長度必須 > 24
+  if (response.length <= 24) return false;
+
+  // 第四關：snippet 全是空白或純標點（無實際內容）
+  if (/^[\s\p{P}]+$/u.test(snippet)) return false;
+
+  // 正式比對：大寫不敏感（case-insensitive includes）
+  return response.toLowerCase().includes(snippet.toLowerCase());
+}
+
+/**
+ * 從對話歷史中找出第一個 timestamp > afterTimestamp 的 user 訊息內容。
+ * 用於 Phase 2 Feedback Signal，從對話歷史抓取 user 回應，判斷 recall 是否被確認使用。
+ *
+ * @param messages - 對話訊息陣列，每個訊息包含 role、content、timestamp
+ * @param afterTimestamp - 時間戳門檻（只找 > 此值的訊息）
+ * @returns 第一個符合條件的 user 訊息 content，若無則回傳 null
+ */
+export function extractUserResponseAfter(
+  messages: Array<{ role: string; content: string; timestamp?: number }>,
+  afterTimestamp: number,
+): string | null {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return null;
+  }
+  const userMsg = messages.find(
+    (m) => m.role === "user" && (m.timestamp ?? 0) > afterTimestamp,
+  );
+  return userMsg?.content ?? null;
+}

@@ -46,6 +46,7 @@ import {
 import {
   extractReflectionLearningGovernanceCandidates,
   extractInjectableReflectionMappedMemoryItems,
+  isRecallUsed,
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
@@ -220,6 +221,17 @@ interface PluginConfig {
   extractionThrottle?: {
     skipLowValue?: boolean;
     maxExtractionsPerHour?: number;
+  };
+  /** Phase 2/3: Dynamic importance feedback signals (Proposal A) */
+  feedbackSignal?: {
+    /** Boost per successful use (default: 0.05) */
+    importanceBoostPerUse?: number;
+    /** Boost per user confirmation (default: 0.15) */
+    importanceBoostPerConfirmation?: number;
+    /** Penalty per miss (default: 0.03) */
+    importancePenaltyPerMiss?: number;
+    /** Minimum injected_count before applying penalty (default: 2) */
+    minRecallCountForPenalty?: number;
   };
 }
 
@@ -1983,6 +1995,9 @@ const memoryLanceDBProPlugin = {
     // Map<sessionId, turnCounter> - manual turn tracking per session
     const turnCounter = new Map<string, number>();
 
+    // Phase 2: Feedback Signal — track injected recall IDs and agent response for quality scoring
+    const pendingRecall = new Map<string, { recallIds: string[]; responseText: string; injectedAt: number; injectedTurn: number }>();
+
     // Track how many normalized user texts have already been seen per session snapshot.
     // All three Maps are pruned to AUTO_CAPTURE_MAP_MAX_ENTRIES to prevent unbounded
     // growth in long-running processes with many distinct sessions.
@@ -2258,6 +2273,82 @@ const memoryLanceDBProPlugin = {
         if (text) lastRawUserMessage.set(cacheKey, text);
       });
 
+      // ========================================================================
+      // Phase 2 + Phase 3 before_prompt_build — runs BEFORE auto-recall (priority 5)
+      // Checks previous turn's recall quality and adjusts importance
+      // ========================================================================
+
+      /**
+       * Phase 2 + Phase 3 before_prompt_build — runs before auto-recall (priority 5)
+       * Checks if previously injected recalls were actually used in the agent's response.
+       * Phase 2: records confirmation / miss as feedback signal.
+       * Phase 3: adjusts memory importance (boost on use, gentle penalty on miss).
+       */
+      api.on("before_prompt_build", async (event: any, ctx: any) => {
+        const sessionId = ctx?.sessionId || "default";
+        const pending = pendingRecall.get(sessionId);
+        pendingRecall.delete(sessionId);
+        if (!pending || pending.recallIds.length === 0) return;
+
+        for (const id of pending.recallIds) {
+          try {
+            const entry = await store.get(id);
+            if (!entry) continue;
+            const prevMeta = parseSmartMetadata(entry.metadata, entry);
+            const used = isRecallUsed(entry.text, pending.responseText);
+
+            if (used) {
+              await store.patchMetadata(id, {
+                last_confirmed_use_at: Date.now(),
+                bad_recall_count: 0,
+              });
+              const boost = config.feedbackSignal?.importanceBoostPerUse ?? 0.05;
+              const imp = entry.importance ?? 0.7;
+              const newImp = Math.min(1.0, imp + boost);
+              if (newImp !== imp) {
+                await store.update(id, { importance: newImp });
+              }
+              api.logger.debug?.(`memory-lancedb-pro: Phase2/3 used=${id} importance ${imp.toFixed(3)}→${newImp.toFixed(3)}`);
+            } else {
+              const newCount = (prevMeta.bad_recall_count ?? 0) + 1;
+              await store.patchMetadata(id, { bad_recall_count: newCount });
+              const minCount = config.feedbackSignal?.minRecallCountForPenalty ?? 2;
+              const penalty = config.feedbackSignal?.importancePenaltyPerMiss ?? 0.03;
+              if (newCount >= minCount) {
+                const imp = entry.importance ?? 0.7;
+                const newImp = Math.max(0.1, imp - penalty);
+                if (newImp !== imp) {
+                  await store.update(id, { importance: newImp });
+                  api.logger.debug?.(`memory-lancedb-pro: Phase3 penalty=${id} importance ${imp.toFixed(3)}→${newImp.toFixed(3)} bad=${newCount}`);
+                }
+              }
+            }
+          } catch (err) {
+            api.logger.warn(`memory-lancedb-pro: Phase2/3 update failed id=${id} err=${String(err)}`);
+          }
+        }
+      }, { priority: 5 });
+
+      // ========================================================================
+      // Phase 2 agent_end — capture agent response into pendingRecall
+      // ========================================================================
+      api.on("agent_end", async (event: any, ctx: any) => {
+        const sessionId = ctx?.sessionId || "default";
+        const messages: any[] = Array.isArray(event?.messages) ? event.messages : [];
+        const lastMsg = messages[messages.length - 1];
+        const responseText = typeof lastMsg?.content === "string" ? lastMsg.content : "";
+        const pending = pendingRecall.get(sessionId);
+        if (!pending || pending.recallIds.length === 0) return;
+        pending.responseText = responseText;
+        api.logger.debug?.(`memory-lancedb-pro: agent_end stored response len=${responseText.length} for session=${sessionId}`);
+      });
+
+      // Phase 2 session_end — cleanup pendingRecall
+      api.on("session_end", (_event: any, ctx: any) => {
+        const sessionId = ctx?.sessionId || "default";
+        pendingRecall.delete(sessionId);
+      }, { priority: 20 });
+
       const AUTO_RECALL_TIMEOUT_MS = parsePositiveInt(config.autoRecallTimeoutMs) ?? 5_000; // configurable; default raised from 3s to 5s for remote embedding APIs behind proxies
       api.on("before_prompt_build", async (event: any, ctx: any) => {
         // Manually increment turn counter for this session
@@ -2513,6 +2604,16 @@ const memoryLanceDBProPlugin = {
           api.logger.info?.(
             `memory-lancedb-pro: injecting ${selected.length} memories into context for agent ${agentId}`,
           );
+
+          // Phase 2: track injected IDs for Feedback Signal comparison
+          if (selected.length > 0) {
+            pendingRecall.set(sessionId, {
+              recallIds: selected.map((item) => item.id),
+              responseText: "",
+              injectedAt,
+              injectedTurn: currentTurn,
+            });
+          }
 
           return {
             prependContext:
@@ -3980,6 +4081,27 @@ export function parsePluginConfig(value: unknown): PluginConfig {
                 : 30,
           }
         : { skipLowValue: false, maxExtractionsPerHour: 30 },
+    feedbackSignal:
+      typeof cfg.feedbackSignal === "object" && cfg.feedbackSignal !== null
+        ? {
+            importanceBoostPerUse:
+              typeof (cfg.feedbackSignal as Record<string, unknown>).importanceBoostPerUse === "number"
+                ? ((cfg.feedbackSignal as Record<string, unknown>).importanceBoostPerUse as number)
+                : 0.05,
+            importanceBoostPerConfirmation:
+              typeof (cfg.feedbackSignal as Record<string, unknown>).importanceBoostPerConfirmation === "number"
+                ? ((cfg.feedbackSignal as Record<string, unknown>).importanceBoostPerConfirmation as number)
+                : 0.15,
+            importancePenaltyPerMiss:
+              typeof (cfg.feedbackSignal as Record<string, unknown>).importancePenaltyPerMiss === "number"
+                ? ((cfg.feedbackSignal as Record<string, unknown>).importancePenaltyPerMiss as number)
+                : 0.03,
+            minRecallCountForPenalty:
+              typeof (cfg.feedbackSignal as Record<string, unknown>).minRecallCountForPenalty === "number"
+                ? ((cfg.feedbackSignal as Record<string, unknown>).minRecallCountForPenalty as number)
+                : 2,
+          }
+        : undefined,
   };
 }
 
