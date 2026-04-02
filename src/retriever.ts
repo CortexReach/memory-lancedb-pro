@@ -16,6 +16,8 @@ import type { DecayEngine, DecayableMemory } from "./decay-engine.js";
 import type { TierManager } from "./tier-manager.js";
 import {
   getDecayableFromEntry,
+  isMemoryExpired,
+  parseSmartMetadata,
   toLifecycleMemory,
 } from "./smart-metadata.js";
 import { TraceCollector, type RetrievalTrace } from "./retrieval-trace.js";
@@ -871,8 +873,15 @@ export class MemoryRetriever {
     trace?.endStage(denoised.map((r) => r.entry.id), denoised.map((r) => r.score));
     if (diagnostics) diagnostics.stageCounts.afterNoiseFilter = denoised.length;
 
-    trace?.startStage("mmr_diversity", denoised.map((r) => r.entry.id));
-    const deduplicated = this.applyMMRDiversity(denoised);
+    trace?.startStage("expiry_filter", denoised.map((r) => r.entry.id));
+    const unexpired = denoised.filter((r) => {
+      const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
+      return !isMemoryExpired(metadata);
+    });
+    trace?.endStage(unexpired.map((r) => r.entry.id), unexpired.map((r) => r.score));
+
+    trace?.startStage("mmr_diversity", unexpired.map((r) => r.entry.id));
+    const deduplicated = this.applyMMRDiversity(unexpired);
     const finalResults = deduplicated.slice(0, limit);
     trace?.endStage(finalResults.map((r) => r.entry.id), finalResults.map((r) => r.score));
     if (diagnostics) diagnostics.stageCounts.afterDiversity = deduplicated.length;
@@ -1436,8 +1445,13 @@ export class MemoryRetriever {
       const { accessCount, lastAccessedAt } = parseAccessMetadata(
         r.entry.metadata,
       );
+
+      // Dynamic memories decay 3x faster than static ones
+      const meta = parseSmartMetadata(r.entry.metadata, r.entry);
+      const baseHL = meta.memory_temporal_type === "dynamic" ? halfLife / 3 : halfLife;
+
       const effectiveHL = computeEffectiveHalfLife(
-        halfLife,
+        baseHL,
         accessCount,
         lastAccessedAt,
         this.config.reinforcementFactor,

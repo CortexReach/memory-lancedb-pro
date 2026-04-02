@@ -48,6 +48,7 @@ import {
   isUserMdExclusiveMemory,
   type WorkspaceBoundaryConfig,
 } from "./workspace-boundary.js";
+import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
 import { inferAtomicBrandItemPreferenceSlot } from "./preference-slots.js";
 import { batchDedup } from "./batch-dedup.js";
 
@@ -974,6 +975,7 @@ export class SmartExtractor {
     const factKey =
       existingMeta.fact_key ?? deriveFactKey(candidate.category, candidate.abstract);
     const storeCategory = this.mapToStoreCategory(candidate.category);
+    const supersedeClassifyText = candidate.content || candidate.abstract;
     const created = await this.store.store({
       text: candidate.abstract,
       vector,
@@ -1008,6 +1010,8 @@ export class SmartExtractor {
               type: "supersedes",
               targetId: matchId,
             }),
+            memory_temporal_type: classifyTemporal(supersedeClassifyText),
+            valid_until: inferExpiry(supersedeClassifyText),
           },
         ),
       ),
@@ -1198,6 +1202,7 @@ export class SmartExtractor {
     // Map 6-category to existing store categories for backward compatibility
     const storeCategory = this.mapToStoreCategory(candidate.category);
 
+    const classifyText = candidate.content || candidate.abstract;
     const metadata = stringifySmartMetadata(
       buildSmartMetadata(
         {
@@ -1219,6 +1224,8 @@ export class SmartExtractor {
           injected_count: 0,
           bad_recall_count: 0,
           suppressed_until_turn: 0,
+          memory_temporal_type: classifyTemporal(classifyText),
+          valid_until: inferExpiry(classifyText),
         },
       ),
     );
