@@ -316,3 +316,115 @@ export function extractReflectionSliceItems(reflectionText: string): ReflectionS
 export function extractInjectableReflectionSliceItems(reflectionText: string): ReflectionSliceItem[] {
   return buildReflectionSliceItemsFromSlices(extractInjectableReflectionSlices(reflectionText));
 }
+
+// ============================================================================
+// Phase 1 B-1: Scope-Aware BM25 Neighbor Expansion for Reflection Slices
+// ============================================================================
+//
+// When loading reflection slices, proactively find "neighbor" memories (via BM25)
+// that share the same scope as each slice entry, then merge + deduplicate.
+// This enriches the reflection context with related memories without affecting
+// main retrieval latency.
+//
+// Issue: #445 (AliceLJY reviewer feedback)
+// - Previously: bm25Search(text, topK=2, scopeFilter=undefined) → global expansion
+// - Now: bm25Search(text, topK=2, scopeFilter=[entry.scope]) → scope-aware expansion
+
+export interface Bm25SearchFn {
+  (query: string, limit: number, scopeFilter: string[]): Promise<Array<{
+    entry: { id: string; text: string; scope: string };
+    score: number;
+  }>>;
+}
+
+export interface ReflectionSliceEntry {
+  text: string;
+  scope: string;
+  timestamp: number;
+}
+
+export interface LoadAgentReflectionSlicesWithBm25ExpansionOptions {
+  /** Existing reflection slice entries (from loadAgentReflectionSlicesFromEntries output) */
+  entries: ReflectionSliceEntry[];
+  /** BM25 search function (typically store.bm25Search) */
+  bm25Search: Bm25SearchFn;
+  /** Number of neighbor results to retrieve per entry (default: 2) */
+  topK?: number;
+  /** Minimum BM25 score threshold (default: 0.1) */
+  minScore?: number;
+}
+
+/**
+ * Scope-aware BM25 neighbor expansion for reflection slices.
+ *
+ * For each reflection slice entry, performs a BM25 search scoped to the entry's own scope
+ * (not global) to find related neighbor memories. This implements Proposal B-1 from #445.
+ *
+ * @param options - Configuration options
+ * @returns Expanded slice entries including neighbors, deduplicated
+ */
+export async function loadAgentReflectionSlicesWithBm25Expansion(
+  options: LoadAgentReflectionSlicesWithBm25ExpansionOptions,
+): Promise<ReflectionSliceEntry[]> {
+  const {
+    entries,
+    bm25Search,
+    topK = 2,
+    minScore = 0.1,
+  } = options;
+
+  if (entries.length === 0) {
+    return [];
+  }
+
+  // Track seen entries by text to deduplicate
+  const seenTexts = new Set<string>();
+  const resultMap = new Map<string, ReflectionSliceEntry>();
+
+  // First, add all original entries
+  for (const entry of entries) {
+    const normalizedText = entry.text.trim().toLowerCase();
+    if (!seenTexts.has(normalizedText)) {
+      seenTexts.add(normalizedText);
+      resultMap.set(entry.text, entry);
+    }
+  }
+
+  // For each entry, find neighbors via BM25 with SCOPE-AWARE expansion
+  // (scopeFilter = [entry.scope], NOT undefined which would do global expansion)
+  for (const entry of entries) {
+    try {
+      const neighbors = await bm25Search(entry.text, topK, [entry.scope]);
+
+      for (const neighbor of neighbors) {
+        // Skip if below minimum score threshold
+        if (neighbor.score < minScore) {
+          continue;
+        }
+
+        // Skip if same text as original entry
+        const normalizedNeighborText = neighbor.entry.text.trim().toLowerCase();
+        if (seenTexts.has(normalizedNeighborText)) {
+          continue;
+        }
+
+        // Skip if same ID as original (exact duplicate)
+        if (neighbor.entry.id === entry.text) {
+          continue;
+        }
+
+        seenTexts.add(normalizedNeighborText);
+        resultMap.set(neighbor.entry.text, {
+          text: neighbor.entry.text,
+          scope: neighbor.entry.scope,
+          timestamp: entry.timestamp, // Preserve original entry's timestamp
+        });
+      }
+    } catch (err) {
+      // Log but don't fail - BM25 expansion is best-effort
+      // (This function is called in a context where logging may not be available)
+    }
+  }
+
+  return Array.from(resultMap.values());
+}
