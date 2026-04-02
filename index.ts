@@ -2093,6 +2093,109 @@ const memoryLanceDBProPlugin = {
     );
 
     // ========================================================================
+    // Register Memory Runtime (required by OpenClaw 2026.4.1+)
+    // ========================================================================
+
+    api.registerMemoryRuntime({
+      async getMemorySearchManager(params: { cfg: unknown; agentId: string; purpose?: "default" | "status" }) {
+        const accessibleScopes = resolveScopeFilter(scopeManager, params.agentId);
+        const scopeFilter = accessibleScopes;
+        const syntheticPathForId = (id: string, scope: string) => `memory-lancedb-pro/${scope || "global"}/${id}.md`;
+
+        return {
+          manager: {
+            async search(query: string, opts?: { maxResults?: number; minScore?: number; sessionKey?: string }) {
+              const limit = clampInt(opts?.maxResults ?? 5, 1, 20);
+              const minScore = typeof opts?.minScore === "number" ? opts.minScore : 0;
+              const results = await retriever.retrieve({
+                query,
+                limit,
+                scopeFilter,
+                source: "manual",
+              });
+              return results
+                .filter((result) => result.score >= minScore)
+                .map((result) => {
+                  const text = result.entry.text || "";
+                  const lines = text.split(/\r?\n/);
+                  return {
+                    path: syntheticPathForId(result.entry.id, result.entry.scope),
+                    startLine: 1,
+                    endLine: Math.max(1, lines.length),
+                    score: result.score,
+                    snippet: text,
+                    source: "memory" as const,
+                  };
+                });
+            },
+            async readFile(params: { relPath: string; from?: number; lines?: number }) {
+              const relPath = typeof params.relPath === "string" ? params.relPath : "";
+              const base = basename(relPath).replace(/\.md$/i, "");
+              const entry = base ? await store.getById(base, scopeFilter) : null;
+              if (!entry) {
+                throw new Error(`memory entry not found: ${relPath}`);
+              }
+              const allLines = (entry.text || "").split(/\r?\n/);
+              const from = Math.max(1, Math.floor(params.from ?? 1));
+              const lineCount = Math.max(1, Math.floor(params.lines ?? allLines.length));
+              const text = allLines.slice(from - 1, from - 1 + lineCount).join("\n");
+              return {
+                text,
+                path: relPath || syntheticPathForId(entry.id, entry.scope),
+              };
+            },
+            status() {
+              return {
+                backend: "builtin" as const,
+                provider: "memory-lancedb-pro",
+                model: config.embedding.model || "text-embedding-3-small",
+                dbPath: resolvedDbPath,
+                sources: ["memory" as const],
+                workspaceDir: getDefaultWorkspaceDir(),
+                vector: {
+                  enabled: true,
+                  dims: vectorDim,
+                },
+                custom: {
+                  scopeFilter,
+                  purpose: params.purpose || "default",
+                },
+              };
+            },
+            async probeEmbeddingAvailability() {
+              try {
+                await embedder.embedQuery("memory runtime health check");
+                return { ok: true };
+              } catch (err) {
+                return {
+                  ok: false,
+                  error: err instanceof Error ? err.message : String(err),
+                };
+              }
+            },
+            async probeVectorAvailability() {
+              try {
+                await store.stats(scopeFilter);
+                return true;
+              } catch {
+                return false;
+              }
+            },
+            async close() {
+              // no-op: plugin-level store lifecycle is owned by the plugin runtime
+            },
+          },
+        };
+      },
+      resolveMemoryBackendConfig() {
+        return { backend: "builtin" as const };
+      },
+      async closeAllMemorySearchManagers() {
+        // no-op: plugin-level store lifecycle is owned by the plugin runtime
+      },
+    });
+
+    // ========================================================================
     // Register CLI Commands
     // ========================================================================
 
