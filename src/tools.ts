@@ -772,8 +772,11 @@ export function registerMemoryStoreTool(
           // (bypasses importance/recency weighting).
           // Fail-open by design: dedup must never block a legitimate memory write.
           // excludeInactive: superseded historical records must not block new writes.
+          // Align with TEMPORAL_VERSIONED_CATEGORIES: only preference and entity
+          // are semantically version-controlled. "fact"/"other" can reverse-map
+          // to unrelated semantic categories, risking cross-supersede.
           const SUPERSEDE_ELIGIBLE: ReadonlySet<string> = new Set([
-            "preference", "fact", "entity", "other",
+            "preference", "entity",
           ]);
           let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
           try {
@@ -822,13 +825,16 @@ export function registerMemoryStoreTool(
             const factKey =
               oldMeta.fact_key ?? deriveFactKey(oldMeta.memory_category, text);
 
-            // Store new memory with supersedes link
+            // Store new memory with supersedes link, preserving canonical fields
+            // from the old entry (aligns with memory_update supersede path).
             const newMeta = buildSmartMetadata(
               { text, category: category as any, importance: safeImportance },
               {
                 l0_abstract: text,
-                l1_overview: `- ${text}`,
+                l1_overview: oldMeta.l1_overview || `- ${text}`,
                 l2_content: text,
+                memory_category: oldMeta.memory_category,
+                tier: oldMeta.tier,
                 source: "manual",
                 state: "confirmed",
                 memory_layer: deriveManualMemoryLayer(category as string),
