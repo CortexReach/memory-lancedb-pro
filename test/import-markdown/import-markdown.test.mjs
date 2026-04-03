@@ -8,6 +8,8 @@
  */
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import jitiFactory from "jiti";
+const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 
 // ────────────────────────────────────────────────────────────────────────────── Mock implementations ──────────────────────────────────────────────────────────────────────────────
 
@@ -107,8 +109,8 @@ after(async () => {
 
 describe("import-markdown CLI", () => {
   before(async () => {
-    // Lazy-import to avoid hoisting issues
-    const mod = await import("../../cli.ts");
+    // Lazy-import via jiti to handle TypeScript compilation
+    const mod = jiti("../../cli.ts");
     importMarkdown = mod.runImportMarkdown ?? null;
   });
 
