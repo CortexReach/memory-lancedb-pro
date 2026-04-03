@@ -106,6 +106,8 @@ interface PluginConfig {
   autoRecallMaxItems?: number;
   autoRecallMaxChars?: number;
   autoRecallPerItemMaxChars?: number;
+  /** Max query string length before embedding search (safety valve). Default: 2000, range: 100-10000. */
+  autoRecallMaxQueryLength?: number;
   /** Hard per-turn injection cap (safety valve). Overrides autoRecallMaxItems if lower. Default: 10. */
   maxRecallPerTurn?: number;
   recallMode?: "full" | "summary" | "adaptive" | "off";
@@ -2279,13 +2281,13 @@ const memoryLanceDBProPlugin = {
 
           // FR-04: Truncate long prompts (e.g. file attachments) before embedding.
           // Auto-recall only needs the user's intent, not full attachment text.
-          const MAX_RECALL_QUERY_LENGTH = 1_000;
+          const maxQueryLen = config.autoRecallMaxQueryLength;
           let recallQuery = event.prompt;
-          if (recallQuery.length > MAX_RECALL_QUERY_LENGTH) {
+          if (recallQuery.length > maxQueryLen) {
             const originalLength = recallQuery.length;
-            recallQuery = recallQuery.slice(0, MAX_RECALL_QUERY_LENGTH);
+            recallQuery = recallQuery.slice(0, maxQueryLen);
             api.logger.info(
-              `memory-lancedb-pro: auto-recall query truncated from ${originalLength} to ${MAX_RECALL_QUERY_LENGTH} chars`
+              `memory-lancedb-pro: auto-recall query truncated from ${originalLength} to ${maxQueryLen} chars`
             );
           }
 
@@ -3833,6 +3835,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecallMaxItems: parsePositiveInt(cfg.autoRecallMaxItems) ?? 3,
     autoRecallMaxChars: parsePositiveInt(cfg.autoRecallMaxChars) ?? 600,
     autoRecallPerItemMaxChars: parsePositiveInt(cfg.autoRecallPerItemMaxChars) ?? 180,
+    autoRecallMaxQueryLength: clampInt(parsePositiveInt(cfg.autoRecallMaxQueryLength) ?? 2_000, 100, 10_000),
     maxRecallPerTurn: parsePositiveInt(cfg.maxRecallPerTurn) ?? 10,
     captureAssistant: cfg.captureAssistant === true,
     retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null ? cfg.retrieval as any : undefined,
