@@ -628,7 +628,7 @@ export function registerMemoryRecallTool(
             content: [
               {
                 type: "text",
-                text: `Found ${results.length} memories:\n\n${text}`,
+                text: `<relevant-memories>\n<mode:${includeFullText ? "full" : "summary"}>\nFound ${results.length} memories:\n\n${text}\n</relevant-memories>`,
               },
             ],
             details: {
@@ -637,6 +637,7 @@ export function registerMemoryRecallTool(
               query,
               scopes: scopeFilter,
               retrievalMode: runtimeContext.retriever.getConfig().mode,
+              recallMode: includeFullText ? "full" : "summary",
             },
           };
         } catch (error) {
