@@ -1,12 +1,12 @@
 /**
- * B-1 BM25 Expansion — Unit Tests
+ * B-1 BM25 Expansion ??Unit Tests
  *
  * Tests the core B-1 logic in isolation:
  *   D1: seen = new Set() empty init (not preloaded with base)
- *   D2: scopeFilter guard — expansion skipped when undefined
+ *   D2: scopeFilter guard ??expansion skipped when undefined
  *   D3: hard cap at 16 total derived
  *   D4: truncate to first line, 120 chars
- *   D6: merge, not replace — base derived preserved
+ *   D6: merge, not replace ??base derived preserved
  *   Fail-safe: bm25Search error does not crash
  *
  * These tests mock store.bm25Search to test the B-1 logic directly,
@@ -37,7 +37,8 @@ function applyBm25Expansion({
 
     for (const derivedLine of derived) {
       try {
-        const bm25Hits = bm25Search(derivedLine, 2, scopeFilter);
+        // Pass fourth options param to match production signature: bm25Search(query, topK, scopeFilter, options)
+        const bm25Hits = bm25Search(derivedLine, 2, scopeFilter, { excludeInactive: true });
         for (const hit of bm25Hits) {
           if (seen.has(hit.entry.id)) continue; // ID dedupe
           seen.add(hit.entry.id);
@@ -64,7 +65,7 @@ function applyBm25Expansion({
 describe("B-1 BM25 Expansion Logic", () => {
 
   // -------------------------------------------------------------------------
-  // D1: seen = new Set() — empty init, not preloaded
+  // D1: seen = new Set() ??empty init, not preloaded
   // -------------------------------------------------------------------------
   it("D1: seen set is empty at start (PR #463 lesson)", () => {
     let seenSnapshot = null;
@@ -94,7 +95,7 @@ describe("B-1 BM25 Expansion Logic", () => {
   // -------------------------------------------------------------------------
   it("D2: expansion is skipped when scopeFilter is undefined", () => {
     let callCount = 0;
-    const mockBm25 = (query, topK, scopeFilter) => {
+    const mockBm25 = (query, topK, scopeFilter, options) => {
       callCount++;
       return [];
     };
@@ -205,7 +206,7 @@ describe("B-1 BM25 Expansion Logic", () => {
   });
 
   // -------------------------------------------------------------------------
-  // D6: merge, not replace — base derived preserved
+  // D6: merge, not replace ??base derived preserved
   // -------------------------------------------------------------------------
   it("D6: base derived lines are preserved (not replaced by neighbors)", () => {
     const mockBm25 = () => [
@@ -242,7 +243,7 @@ describe("B-1 BM25 Expansion Logic", () => {
   // -------------------------------------------------------------------------
   // Fail-safe: bm25Search errors must not crash
   // -------------------------------------------------------------------------
-  it("fail-safe: bm25Search throw does not crash — returns base derived", () => {
+  it("fail-safe: bm25Search throw does not crash ??returns base derived", () => {
     const mockBm25 = () => {
       throw new Error("simulated BM25 failure");
     };
@@ -264,7 +265,7 @@ describe("B-1 BM25 Expansion Logic", () => {
     assert.deepStrictEqual(result, ["BASE ONE", "BASE TWO"], "should return base derived on error");
   });
 
-  it("fail-safe: partial bm25Search failure in loop — returns base + successful neighbors", () => {
+  it("fail-safe: partial bm25Search failure in loop ??returns base + successful neighbors", () => {
     let callCount = 0;
     const mockBm25 = () => {
       callCount++;
