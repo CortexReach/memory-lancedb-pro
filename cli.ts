@@ -640,7 +640,8 @@ const openclawHome = options.openclawHome
       } else {
         console.log(`\nImport complete: ${imported} imported, ${skipped} skipped (scanned ${foundFiles} files)${dedupEnabled ? " [dedup enabled]" : ""}`);
       }
-}
+      return { imported, skipped, foundFiles };
+    }
 
 export function registerMemoryCLI(program: Command, context: CLIContext): void {
   const getSearchRetriever = (): MemoryRetriever => {
