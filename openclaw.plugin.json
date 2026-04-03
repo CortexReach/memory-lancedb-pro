@@ -118,7 +118,7 @@
       },
       "autoRecallTimeoutMs": {
         "type": "integer",
-        "minimum": 1,
+        "minimum": 500,
         "maximum": 60000,
         "default": 5000,
         "description": "Timeout for the entire auto-recall pipeline (embedding + search + rerank) in milliseconds."
@@ -328,7 +328,7 @@
           },
           "rerankTimeoutMs": {
             "type": "integer",
-            "minimum": 1,
+            "minimum": 500,
             "default": 5000,
             "description": "Rerank API timeout in milliseconds (default: 5000). Increase for local/CPU-based rerank servers."
           },
@@ -708,7 +708,7 @@
           },
           "timeoutMs": {
             "type": "integer",
-            "minimum": 1,
+            "minimum": 500,
             "default": 30000
           }
         }
