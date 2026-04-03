@@ -2014,7 +2014,7 @@ const memoryLanceDBProPlugin = {
           } catch (_err) {
             // Defense: bm25Search failure must not crash the reflection loading path.
             // Log and continue without expansion.
-            api.logger.debug(`memory-lancedb-pro: B-1 bm25Search failed, skipping expansion: ${String(_err)}`);
+            api.logger.debug?.(`memory-lancedb-pro: B-1 bm25Search failed, skipping expansion: ${String(_err)}`);
           }
         }
 
