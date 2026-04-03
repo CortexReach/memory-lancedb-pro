@@ -73,6 +73,7 @@ export interface LifecycleMemory {
   accessCount: number;
   createdAt: number;
   lastAccessedAt: number;
+  temporalType?: "static" | "dynamic";
 }
 
 function clamp01(value: unknown, fallback: number): number {
@@ -494,6 +495,9 @@ export function toLifecycleMemory(
     accessCount: metadata.access_count,
     createdAt,
     lastAccessedAt: metadata.last_accessed_at || createdAt,
+    temporalType: metadata.memory_temporal_type === "dynamic" ? "dynamic"
+      : metadata.memory_temporal_type === "static" ? "static"
+      : undefined,
   };
 }
 
@@ -521,6 +525,9 @@ export function getDecayableFromEntry(
     accessCount: meta.access_count,
     createdAt,
     lastAccessedAt: meta.last_accessed_at || createdAt,
+    temporalType: meta.memory_temporal_type === "dynamic" ? "dynamic"
+      : meta.memory_temporal_type === "static" ? "static"
+      : undefined,
   };
 
   return { memory, meta };

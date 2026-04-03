@@ -720,11 +720,12 @@ export class MemoryRetriever {
   ): Promise<RetrievalResult[]> {
     let failureStage: RetrievalDiagnostics["failureStage"] = "vector.embedQuery";
     try {
+      const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
       const queryVector = await this.embedder.embedQuery(query);
       failureStage = "vector.vectorSearch";
       const results = await this.store.vectorSearch(
         queryVector,
-        limit,
+        candidatePoolSize,
         this.config.minScore,
         scopeFilter,
         { excludeInactive: true },
@@ -733,14 +734,21 @@ export class MemoryRetriever {
       const filtered = category
         ? results.filter((r) => r.entry.category === category)
         : results;
+
+      // Filter expired memories early — before scoring — so they don't
+      // occupy candidate slots that should go to live memories.
+      const unexpired = filtered.filter((r) => {
+        const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
+        return !isMemoryExpired(metadata);
+      });
       if (diagnostics) {
-        diagnostics.vectorResultCount = filtered.length;
-        diagnostics.fusedResultCount = filtered.length;
-        diagnostics.stageCounts.afterMinScore = filtered.length;
-        diagnostics.stageCounts.rerankInput = filtered.length;
+        diagnostics.vectorResultCount = unexpired.length;
+        diagnostics.fusedResultCount = unexpired.length;
+        diagnostics.stageCounts.afterMinScore = unexpired.length;
+        diagnostics.stageCounts.rerankInput = unexpired.length;
       }
 
-      const mapped = filtered.map(
+      const mapped = unexpired.map(
         (result, index) =>
           ({
             ...result,
@@ -809,7 +817,12 @@ export class MemoryRetriever {
       const textLower = r.entry.text.toLowerCase();
       return tagTokens.every((t) => textLower.includes(t.toLowerCase()));
     });
-    const mapped = mustContainFiltered.map(
+    // Filter expired memories early — before scoring
+    const unexpiredResults = mustContainFiltered.filter((r) => {
+      const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
+      return !isMemoryExpired(metadata);
+    });
+    const mapped = unexpiredResults.map(
       (result, index) =>
         ({
           ...result,
@@ -873,15 +886,8 @@ export class MemoryRetriever {
     trace?.endStage(denoised.map((r) => r.entry.id), denoised.map((r) => r.score));
     if (diagnostics) diagnostics.stageCounts.afterNoiseFilter = denoised.length;
 
-    trace?.startStage("expiry_filter", denoised.map((r) => r.entry.id));
-    const unexpired = denoised.filter((r) => {
-      const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
-      return !isMemoryExpired(metadata);
-    });
-    trace?.endStage(unexpired.map((r) => r.entry.id), unexpired.map((r) => r.score));
-
-    trace?.startStage("mmr_diversity", unexpired.map((r) => r.entry.id));
-    const deduplicated = this.applyMMRDiversity(unexpired);
+    trace?.startStage("mmr_diversity", denoised.map((r) => r.entry.id));
+    const deduplicated = this.applyMMRDiversity(denoised);
     const finalResults = deduplicated.slice(0, limit);
     trace?.endStage(finalResults.map((r) => r.entry.id), finalResults.map((r) => r.score));
     if (diagnostics) diagnostics.stageCounts.afterDiversity = deduplicated.length;
@@ -959,8 +965,14 @@ export class MemoryRetriever {
       if (diagnostics) diagnostics.fusedResultCount = fusedResults.length;
 
       trace?.startStage("min_score_filter", fusedResults.map((r) => r.entry.id));
-      const filtered = fusedResults.filter((r) => r.score >= this.config.minScore);
-      trace?.endStage(filtered.map((r) => r.entry.id), filtered.map((r) => r.score));
+      const scoreFiltered = fusedResults.filter((r) => r.score >= this.config.minScore);
+      trace?.endStage(scoreFiltered.map((r) => r.entry.id), scoreFiltered.map((r) => r.score));
+
+      // Filter expired memories early — before rerank/scoring
+      const filtered = scoreFiltered.filter((r) => {
+        const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
+        return !isMemoryExpired(metadata);
+      });
       if (diagnostics) diagnostics.stageCounts.afterMinScore = filtered.length;
 
       const rerankInput =
