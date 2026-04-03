@@ -3296,7 +3296,7 @@ const memoryLanceDBProPlugin = {
                 }
                 await store.update(recallId, { importance: newImportance }, undefined);
                 await store.patchMetadata(recallId, { bad_recall_count: badCount }, undefined);
-              } else if (badCount >= 3) {
+              } else if (badCount >= 2) {
                 if ((meta.injected_count || 0) >= minRecallCountForPenalty) {
                   newImportance = Math.max(0.1, newImportance - penaltyOnMiss);
                 }
