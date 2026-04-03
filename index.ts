@@ -2723,7 +2723,8 @@ const memoryLanceDBProPlugin = {
           // sees a matching pair: Turn N recallIds + Turn N responseText.
           // agent_end will write responseText into this same pendingRecall
           // entry (only updating responseText, never clearing recallIds).
-          const sessionKeyForRecall = ctx?.sessionKey || ctx?.sessionId || "default";
+          // Include agentId in the key so different agents in the same session do not overwrite each other's pendingRecall.
+          const sessionKeyForRecall = `${ctx?.sessionKey || ctx?.sessionId || "default"}:${agentId ?? ""}`;
           // Bug 1 fix: also store the injected summary lines so the feedback hook
           // can detect usage even when the agent doesn't use stock phrases or IDs
           // but directly incorporates the memory content into the response.
@@ -3139,7 +3140,9 @@ const memoryLanceDBProPlugin = {
     // This ensures recallIds (written by auto-recall in the same turn) and
     // responseText (written here) remain paired for the feedback hook.
     api.on("agent_end", (event: any, ctx: any) => {
-      const sessionKey = ctx?.sessionKey || ctx?.sessionId || "default";
+      // Use same key format as auto-recall hook (sessionKey:agentId) so we update the right entry.
+      const agentIdForKey = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+      const sessionKey = `${ctx?.sessionKey || ctx?.sessionId || "default"}:${agentIdForKey ?? ""}`;
       if (!sessionKey) return;
 
       // Get the last message content
@@ -3164,7 +3167,9 @@ const memoryLanceDBProPlugin = {
     // Proposal A Phase 1: before_prompt_build hook (priority 5) - Score recalls
     // ========================================================================
     api.on("before_prompt_build", async (event: any, ctx: any) => {
-      const sessionKey = ctx?.sessionKey || ctx?.sessionId || "default";
+      // Use same key format as auto-recall hook (sessionKey:agentId) so we read the right entry.
+      const agentIdForKey = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+      const sessionKey = `${ctx?.sessionKey || ctx?.sessionId || "default"}:${agentIdForKey ?? ""}`;
       const pending = pendingRecall.get(sessionKey);
       if (!pending) return;
 
@@ -3206,22 +3211,28 @@ const memoryLanceDBProPlugin = {
       const confirmKeywords = fb.confirmKeywords ?? ["正確", "是", "對", "right", "yes", "沒錯", "對的"];
       const errorKeywords = fb.errorKeywords ?? ["不", "錯", "不是", "wrong", "no", "not right"];
 
-      // Bug 2 fix: confirm/error keywords must be read from the NEXT turn's user
-      // prompt (event.prompt), not from the previous assistant response (responseText).
-      // event.prompt is an array of {role, content} message objects.
+      // event.prompt is a plain string in the current hook contract (confirmed by codebase usage).
+      // We extract the user's last message from event.messages array instead.
       let userPromptText = "";
       try {
-        const promptMessages = Array.isArray(event.prompt) ? event.prompt : [];
-        // Walk backwards to find the last user message
-        for (let i = promptMessages.length - 1; i >= 0; i--) {
-          const msg = promptMessages[i];
-          if (msg && msg.role === "user" && typeof msg.content === "string" && msg.content.trim().length > 0) {
-            userPromptText = msg.content.trim();
-            break;
+        if (event.messages && Array.isArray(event.messages)) {
+          for (let i = event.messages.length - 1; i >= 0; i--) {
+            const msg = event.messages[i];
+            if (msg && msg.role === "user" && typeof msg.content === "string" && msg.content.trim().length > 0) {
+              userPromptText = msg.content.trim();
+              break;
+            }
+            if (msg && msg.role === "user" && Array.isArray(msg.content)) {
+              // Handle array-form content
+              const text = extractTextContent(msg.content);
+              if (text && text.trim().length > 0) {
+                userPromptText = text.trim();
+                break;
+              }
+            }
           }
         }
       } catch (_e) {
-        // If we can't read event.prompt, fall back to empty (keyword checks will be skipped)
         userPromptText = "";
       }
 
@@ -3230,91 +3241,65 @@ const memoryLanceDBProPlugin = {
         keywords.some((kw) => text.toLowerCase().includes(kw.toLowerCase()));
 
       // Score the recall - update importance based on usage
+      // Score each recall individually — do NOT compute a single usedRecall for the whole batch.
+      // Bug 1 fix (P1): when auto-recall injects multiple memories, the agent may use only some of them.
+      // Scoring them all with one decision corrupts ranking: unused memories get boosted, used ones get penalized.
       if (injectedIds.length > 0) {
         try {
+          // Build lookup: recallId -> injected summary text for this specific recall
+          const summaryMap = new Map<string, string>();
+          for (let i = 0; i < injectedIds.length; i++) {
+            if (injectedSummaries[i]) {
+              summaryMap.set(injectedIds[i], injectedSummaries[i]);
+            }
+          }
+
           for (const recallId of injectedIds) {
-            // Bug 2 fix: use store.getById to retrieve the real entry so we
-            // get the actual importance value, instead of calling
-            // parseSmartMetadata with empty placeholder metadata.
+            const summaryText = summaryMap.get(recallId) ?? "";
+            // Score this specific recall independently
+            const usedRecall = isRecallUsed(
+              responseText,
+              [recallId],
+              summaryText ? [summaryText] : [],
+            );
+
             const entry = await store.getById(recallId, undefined);
             if (!entry) continue;
             const meta = parseSmartMetadata(entry.metadata, entry);
             const currentImportance = meta.importance ?? entry.importance ?? 0.5;
 
             if (usedRecall) {
-              // Recall was used - increase importance (cap at 1.0)
-              // Bug 3 fix: use store.update to directly update the row-level
-              // importance column. patchMetadata only updates the metadata JSON
-              // blob but NOT the entry.importance field, so importance changes
-              // never affected ranking (applyImportanceWeight reads entry.importance).
-              // Bug 4 fix (this file): also fall back to entry.importance (row-level)
-              // so old records that have no importance in metadata JSON still
-              // get a correct boost instead of always landing at 0.5.
               let newImportance = Math.min(1.0, currentImportance + boostOnUse);
-
-              // Phase 2 feature (merged into Phase 1): user explicit confirmation signal (+0.15)
-              // Bug 2 fix: check the next-turn user prompt for confirmation keywords,
-              // not the previous-turn assistant response.
               if (containsKeyword(userPromptText, confirmKeywords)) {
                 newImportance = Math.min(1.0, newImportance + boostOnConfirm);
               }
-
-              await store.update(
-                recallId,
-                { importance: newImportance },
-                undefined,
-              );
-              // Also update metadata JSON fields via patchMetadata (separate concern)
+              await store.update(recallId, { importance: newImportance }, undefined);
               await store.patchMetadata(
                 recallId,
                 { last_confirmed_use_at: Date.now(), bad_recall_count: 0 },
                 undefined,
               );
             } else {
-              // Recall was not used.
-              // Bug 4 fix: do NOT add +1 here — bad_recall_count was already
-              // incremented by the auto-recall path when this memory was injected
-              // (staleInjected branch). Adding +1 again would double-count and
-              // cause the 3-consecutive-miss penalty to trigger after only 2 misses.
               const badCount = meta.bad_recall_count || 0;
               let newImportance = currentImportance;
-
-              // Phase 2 feature (merged into Phase 1): user explicit error signal (-0.10)
-              // Only apply when user explicitly corrects/negates.
-              // Bug 2 fix: check the next-turn user prompt for error keywords,
-              // not the previous-turn assistant response.
               if (containsKeyword(userPromptText, errorKeywords)) {
-                // Only penalize if this memory has been recalled at least minRecallCountForPenalty times
-                // to avoid penalizing a memory that was just recalled once and didn't fit the context
                 if ((meta.injected_count || 0) >= minRecallCountForPenalty) {
                   newImportance = Math.max(0.1, newImportance - penaltyOnError);
                 }
-              } else {
-                // Normal miss: apply penalty after threshold (3 consecutive unused)
-                // Also gated by minRecallCountForPenalty to avoid penalizing rarely-recalled memories
-                if (badCount >= 3 && (meta.injected_count || 0) >= minRecallCountForPenalty) {
+                await store.update(recallId, { importance: newImportance }, undefined);
+                await store.patchMetadata(recallId, { bad_recall_count: badCount }, undefined);
+              } else if (badCount >= 3) {
+                if ((meta.injected_count || 0) >= minRecallCountForPenalty) {
                   newImportance = Math.max(0.1, newImportance - penaltyOnMiss);
                 }
+                await store.update(recallId, { importance: newImportance }, undefined);
+                await store.patchMetadata(recallId, { bad_recall_count: badCount }, undefined);
               }
-
-              await store.update(
-                recallId,
-                { importance: newImportance },
-                undefined,
-              );
-              await store.patchMetadata(
-                recallId,
-                { bad_recall_count: badCount },
-                undefined,
-              );
             }
           }
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: recall usage scoring failed: ${String(err)}`);
         } finally {
-          // Bug 1 fix: delete pendingRecall immediately after scoring so that
-          // subsequent turns (greeting, short input) that skip auto-recall do not
-          // re-trigger feedback scoring on the same recallIds/responseText pair.
           pendingRecall.delete(sessionKey);
         }
       }
