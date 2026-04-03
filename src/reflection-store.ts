@@ -256,6 +256,15 @@ export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlice
   // resolvedAt === undefined means unresolved (default)
   const unresolvedItemRows = itemRows.filter(({ metadata }) => metadata.resolvedAt === undefined);
 
+  // If there were item rows but all are resolved, suppress to prevent legacy
+  // fallback from reviving them.  If there were NO item rows at all, allow
+  // legacy fallback to run (backward compatibility for stores that predate
+  // itemized reflection rows).
+  const hasItemRows = itemRows.length > 0;
+  if (hasItemRows && unresolvedItemRows.length === 0) {
+    return { invariants: [], derived: [] };
+  }
+
   const invariantCandidates = buildInvariantCandidates(unresolvedItemRows, legacyRows);
   const derivedCandidates = buildDerivedCandidates(unresolvedItemRows, legacyRows);
 

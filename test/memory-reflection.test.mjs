@@ -1162,6 +1162,77 @@ describe("memory reflection", () => {
       assert.equal(slices.invariants.length, 1);
       assert.ok(slices.invariants.includes("Always check for __pycache__ before pytest."));
     });
+
+    it("returns empty slices when all invariant items are resolved to prevent legacy fallback", () => {
+      const now = Date.UTC(2026, 2, 7);
+      const day = 24 * 60 * 60 * 1000;
+
+      // Only resolved items — no unresolved ones
+      const entries = [
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            usedFallback: false,
+            resolvedAt: now - 10 * 60 * 1000, // resolved
+            resolvedBy: "agent:main",
+            resolutionNote: "Problem solved",
+          },
+        }),
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            usedFallback: false,
+            resolvedAt: now - 5 * 60 * 1000, // resolved
+          },
+        }),
+      ];
+      entries[0].text = "Resolved: ignore prior benchmarks.";
+      entries[1].text = "Also resolved: ignore retrier.";
+
+      // Also add a legacy row with the same text so the legacy fallback path would
+      // revive these if it were triggered — this test ensures we short-circuit first.
+      const legacyEntries = [
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection",  // legacy type — no resolvedAt
+            agentId: "main",
+            storedAt: now - 1 * day,
+            invariants: ["Resolved: ignore prior benchmarks.", "Also resolved: ignore retrier."],
+            derived: [],
+          },
+        }),
+      ];
+
+      const allEntries = [...entries, ...legacyEntries];
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries: allEntries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      // All item rows are resolved → should return empty slices.
+      // Must NOT fall back to legacy rows (which would revive the resolved items).
+      assert.equal(slices.invariants.length, 0, "all resolved invariant items should be suppressed");
+      assert.equal(slices.derived.length, 0, "all resolved should yield no derived either");
+    });
   });
 
   describe("mapped reflection metadata and ranking", () => {
