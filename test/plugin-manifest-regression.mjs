@@ -161,7 +161,7 @@ try {
   plugin.register(api);
   assert.equal(services.length, 1, "plugin should register its background service");
   assert.equal(typeof api.hooks.agent_end, "function", "autoCapture should remain enabled by default");
-  assert.equal(typeof api.hooks["command:new"], "function", "selfImprovement command:new hook should be registered by default (#391)");
+  assert.equal(api.hooks["command:new"], undefined, "sessionMemory should stay disabled by default");
 
   // Verify tool registration and parameter naming (must fix)
   assert.ok(api.toolFactories.memory_compact, "memory_compact should be registered");
@@ -196,11 +196,11 @@ try {
     },
   });
   plugin.register(sessionDefaultApi);
-  // selfImprovement registers command:new by default (#391), independent of sessionMemory config
+  // selfImprovement registers command:new by default (#391), but we disabled it here
   assert.equal(
-    typeof sessionDefaultApi.hooks["command:new"],
-    "function",
-    "command:new hook should be registered (selfImprovement default-on since #391)",
+    sessionDefaultApi.hooks["command:new"],
+    undefined,
+    "command:new hook should NOT be registered when selfImprovement is disabled",
   );
 
   const sessionEnabledApi = createMockApi({
@@ -223,11 +223,11 @@ try {
     "function",
     "sessionMemory.enabled=true should register the async before_reset hook",
   );
-  // selfImprovement registers command:new by default (#391), independent of sessionMemory config
+  // selfImprovement registers command:new by default (#391), but we disabled it here
   assert.equal(
-    typeof sessionEnabledApi.hooks["command:new"],
-    "function",
-    "command:new hook should be registered (selfImprovement default-on since #391)",
+    sessionEnabledApi.hooks["command:new"],
+    undefined,
+    "command:new hook should NOT be registered when selfImprovement is disabled",
   );
 
   const longText = `${"Long embedding payload. ".repeat(420)}tail`;
