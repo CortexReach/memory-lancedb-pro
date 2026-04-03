@@ -226,6 +226,22 @@ interface PluginConfig {
     skipLowValue?: boolean;
     maxExtractionsPerHour?: number;
   };
+  feedback?: {
+    /** Boost importance when a recalled memory is used (default: 0.05) */
+    boostOnUse?: number;
+    /** Penalty when a recalled memory is not used after consecutive misses (default: 0.03) */
+    penaltyOnMiss?: number;
+    /** Extra boost when user explicitly confirms a recalled memory is correct (default: 0.15) */
+    boostOnConfirm?: number;
+    /** Extra penalty when user explicitly corrects a non-recalled memory (default: 0.10) */
+    penaltyOnError?: number;
+    /** Minimum recall (injection) count before penalty applies to this memory (default: 2) */
+    minRecallCountForPenalty?: number;
+    /** Keywords indicating user confirmation of a recalled memory */
+    confirmKeywords?: string[];
+    /** Keywords indicating user correction/error for a non-recalled memory */
+    errorKeywords?: string[];
+  };
 }
 
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
@@ -2977,6 +2993,20 @@ const memoryLanceDBProPlugin = {
         usedRecall = isRecallUsed(responseText, injectedIds);
       }
 
+      // Read feedback config values with defaults
+      const fb = config.feedback ?? {};
+      const boostOnUse = fb.boostOnUse ?? 0.05;
+      const penaltyOnMiss = fb.penaltyOnMiss ?? 0.03;
+      const boostOnConfirm = fb.boostOnConfirm ?? 0.15;
+      const penaltyOnError = fb.penaltyOnError ?? 0.10;
+      const minRecallCountForPenalty = fb.minRecallCountForPenalty ?? 2;
+      const confirmKeywords = fb.confirmKeywords ?? ["正確", "是", "對", "right", "yes", "沒錯", "對的"];
+      const errorKeywords = fb.errorKeywords ?? ["不", "錯", "不是", "wrong", "no", "not right"];
+
+      // Helper: check if text contains any of the keywords (case-insensitive)
+      const containsKeyword = (text: string, keywords: string[]): boolean =>
+        keywords.some((kw) => text.includes(kw));
+
       // Score the recall - update importance based on usage
       if (injectedIds.length > 0) {
         try {
@@ -2987,6 +3017,7 @@ const memoryLanceDBProPlugin = {
             const entry = await store.getById(recallId, undefined);
             if (!entry) continue;
             const meta = parseSmartMetadata(entry.metadata, entry);
+            const currentImportance = meta.importance ?? entry.importance ?? 0.5;
 
             if (usedRecall) {
               // Recall was used - increase importance (cap at 1.0)
@@ -2997,8 +3028,13 @@ const memoryLanceDBProPlugin = {
               // Bug 4 fix (this file): also fall back to entry.importance (row-level)
               // so old records that have no importance in metadata JSON still
               // get a correct boost instead of always landing at 0.5.
-              const currentImportance = meta.importance ?? entry.importance ?? 0.5;
-              const newImportance = Math.min(1.0, currentImportance + 0.05);
+              let newImportance = Math.min(1.0, currentImportance + boostOnUse);
+
+              // Phase 2 feature (merged into Phase 1): user explicit confirmation signal (+0.15)
+              if (containsKeyword(responseText, confirmKeywords)) {
+                newImportance = Math.min(1.0, newImportance + boostOnConfirm);
+              }
+
               await store.update(
                 recallId,
                 { importance: newImportance },
@@ -3013,11 +3049,24 @@ const memoryLanceDBProPlugin = {
             } else {
               // Recall was not used - increment bad_recall_count
               const badCount = (meta.bad_recall_count || 0) + 1;
-              let newImportance = meta.importance ?? entry.importance ?? 0.5;
-              // Apply penalty after threshold (3 consecutive unused)
-              if (badCount >= 3) {
-                newImportance = Math.max(0.1, newImportance - 0.03);
+              let newImportance = currentImportance;
+
+              // Phase 2 feature (merged into Phase 1): user explicit error signal (-0.10)
+              // Only apply when user explicitly corrects/negates
+              if (containsKeyword(responseText, errorKeywords)) {
+                // Only penalize if this memory has been recalled at least minRecallCountForPenalty times
+                // to avoid penalizing a memory that was just recalled once and didn't fit the context
+                if ((meta.injected_count || 0) >= minRecallCountForPenalty) {
+                  newImportance = Math.max(0.1, newImportance - penaltyOnError);
+                }
+              } else {
+                // Normal miss: apply penalty after threshold (3 consecutive unused)
+                // Also gated by minRecallCountForPenalty to avoid penalizing rarely-recalled memories
+                if (badCount >= 3 && (meta.injected_count || 0) >= minRecallCountForPenalty) {
+                  newImportance = Math.max(0.1, newImportance - penaltyOnMiss);
+                }
               }
+
               await store.update(
                 recallId,
                 { importance: newImportance },
