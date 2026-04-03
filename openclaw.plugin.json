@@ -137,6 +137,13 @@
         "default": 180,
         "description": "Maximum character budget per auto-injected memory summary."
       },
+      "autoRecallMaxQueryLength": {
+        "type": "integer",
+        "minimum": 100,
+        "maximum": 10000,
+        "default": 2000,
+        "description": "Maximum character length of the auto-recall query before truncation. Default: 2000."
+      },
       "maxRecallPerTurn": {
         "type": "integer",
         "minimum": 1,
@@ -1023,6 +1030,11 @@
     "autoRecallPerItemMaxChars": {
       "label": "Auto-Recall Per-Item Max Chars",
       "help": "Maximum characters per injected memory summary.",
+      "advanced": true
+    },
+    "autoRecallMaxQueryLength": {
+      "label": "Auto-Recall Max Query Length",
+      "help": "Maximum character length of the auto-recall query before truncation. Default: 2000.",
       "advanced": true
     },
     "recallMode": {
