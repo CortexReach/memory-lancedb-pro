@@ -493,236 +493,238 @@ export async function runImportMarkdown(
     minTextLength?: string;
     importance?: string;
   }
-): Promise<{ imported: number; skipped: number; foundFiles: number }> {
-const openclawHome = options.openclawHome
-        ? path.resolve(options.openclawHome)
-        : path.join(homedir(), ".openclaw");
+  ): Promise<{ imported: number; skipped: number; foundFiles: number }> {
+  const openclawHome = options.openclawHome
+    ? path.resolve(options.openclawHome)
+    : path.join(homedir(), ".openclaw");
 
-      const workspaceDir = path.join(openclawHome, "workspace");
-      let imported = 0;
-      let skipped = 0;
-      let foundFiles = 0;
+  const workspaceDir = path.join(openclawHome, "workspace");
+  let imported = 0;
+  let skipped = 0;
+  let foundFiles = 0;
 
-      if (!ctx.embedder) {
-        console.error(
-          "import-markdown requires an embedder. Use via plugin CLI or ensure embedder is configured.",
-        );
-        process.exit(1);
-      }
+  if (!ctx.embedder) {
+    // [FIXED P1] Throw instead of process.exit(1) so CLI handler can catch it
+    throw new Error(
+      "import-markdown requires an embedder. Use via plugin CLI or ensure embedder is configured.",
+    );
+  }
 
-      // Infer workspace scope from openclaw.json agents list
-      // (flat memory/ files have no per-file metadata, so we derive scope from config)
-      const fsPromises = await import("node:fs/promises");
-      let workspaceScope = ""; // empty = no scope override for nested workspaces
-      try {
-        const configPath = path.join(openclawHome, "openclaw.json");
-        const configContent = await fsPromises.readFile(configPath, "utf-8");
-        const config = JSON.parse(configContent);
-        const agentsList: Array<{ id?: string; workspace?: string }> = config?.agents?.list ?? [];
-        const matched = agentsList.find((a) => {
-          if (!a.workspace) return false;
-          return path.normalize(a.workspace) === workspaceDir;
-        });
-        if (matched?.id) {
-          workspaceScope = matched.id;
-        }
-      } catch { /* use default */ }
+  // Infer workspace scope from openclaw.json agents list
+  // (flat memory/ files have no per-file metadata, so we derive scope from config)
+  const fsPromises = await import("node:fs/promises");
+  let workspaceScope = ""; // empty = no scope override for nested workspaces
+  try {
+    const configPath = path.join(openclawHome, "openclaw.json");
+    const configContent = await fsPromises.readFile(configPath, "utf-8");
+    const config = JSON.parse(configContent);
+    const agentsList: Array<{ id?: string; workspace?: string }> = config?.agents?.list ?? [];
+    const matched = agentsList.find((a) => {
+      if (!a.workspace) return false;
+      return path.normalize(a.workspace) === workspaceDir;
+    });
+    if (matched?.id) {
+      workspaceScope = matched.id;
+    }
+  } catch { /* use default */ }
 
-      // Scan workspace directories
-      let workspaceEntries: Dirent[];
-      try {
-        workspaceEntries = await fsPromises.readdir(workspaceDir, { withFileTypes: true });
-      } catch {
-        console.error(`Failed to read workspace directory: ${workspaceDir}`);
-        process.exit(1);
-      }
+  // Scan workspace directories
+  let workspaceEntries: Dirent[];
+  try {
+    workspaceEntries = await fsPromises.readdir(workspaceDir, { withFileTypes: true });
+  } catch {
+    // [FIXED P1] Throw instead of process.exit(1) so CLI handler can catch it
+    throw new Error(`Failed to read workspace directory: ${workspaceDir}`);
+  }
 
-      // Collect all markdown files to scan
-      const mdFiles: Array<{ filePath: string; scope: string }> = [];
+  // Collect all markdown files to scan
+  const mdFiles: Array<{ filePath: string; scope: string }> = [];
 
-      for (const entry of workspaceEntries) {
-        if (!entry.isDirectory()) continue;
-        if (workspaceGlob && !entry.name.includes(workspaceGlob)) continue;
+  for (const entry of workspaceEntries) {
+    if (!entry.isDirectory()) continue;
+    if (workspaceGlob && !entry.name.includes(workspaceGlob)) continue;
 
-        const workspacePath = path.join(workspaceDir, entry.name);
+    const workspacePath = path.join(workspaceDir, entry.name);
 
-        // MEMORY.md
-        const memoryMd = path.join(workspacePath, "MEMORY.md");
-        try {
-          await fsPromises.stat(memoryMd);
-          mdFiles.push({ filePath: memoryMd, scope: entry.name });
-        } catch { /* not found */ }
+    // MEMORY.md
+    const memoryMd = path.join(workspacePath, "MEMORY.md");
+    try {
+      await fsPromises.stat(memoryMd);
+      mdFiles.push({ filePath: memoryMd, scope: entry.name });
+    } catch { /* not found */ }
 
-        // memory/ directory
-        const memoryDir = path.join(workspacePath, "memory");
-        try {
-          const stats = await fsPromises.stat(memoryDir);
-          if (stats.isDirectory()) {
-            const files = await fsPromises.readdir(memoryDir);
-            for (const f of files) {
-              if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
-                mdFiles.push({ filePath: path.join(memoryDir, f), scope: entry.name });
-              }
-            }
-          }
-        } catch { /* not found */ }
-      }
-
-      // Also scan nested agent workspaces under workspace/agents/<id>/.
-      // This handles the structure used by session-recovery and other OpenClaw
-      // components: workspace/agents/<id>/MEMORY.md and workspace/agents/<id>/memory/.
-      // We scan one additional level deeper than the top-level workspace scan.
-      async function scanAgentMd(
-        agentPath: string,
-        agentId: string,
-        mdFiles: Array<{ filePath: string; scope: string }>,
-        fsP: typeof import("node:fs/promises")
-      ): Promise<void> {
-        // workspace/agents/<id>/MEMORY.md
-        const agentMemoryMd = path.join(agentPath, "MEMORY.md");
-        try {
-          await fsP.stat(agentMemoryMd);
-          mdFiles.push({ filePath: agentMemoryMd, scope: agentId });
-        } catch { /* not found */ }
-
-        // workspace/agents/<id>/memory/ date files
-        const agentMemoryDir = path.join(agentPath, "memory");
-        try {
-          const stats = await fsP.stat(agentMemoryDir);
-          if (stats.isDirectory()) {
-            const files = await fsP.readdir(agentMemoryDir);
-            for (const f of files) {
-              if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
-                mdFiles.push({ filePath: path.join(agentMemoryDir, f), scope: agentId });
-              }
-            }
-          }
-        } catch { /* not found */ }
-      }
-
-      const agentsDir = path.join(workspaceDir, "agents");
-      try {
-        const agentEntries = await fsPromises.readdir(agentsDir, { withFileTypes: true });
-        if (workspaceGlob) {
-          // 有明確目標：只掃描符合的那一個 agent workspace
-          const matchedAgent = agentEntries.find(e => e.isDirectory() && e.name === workspaceGlob);
-          if (matchedAgent) {
-            const agentPath = path.join(agentsDir, matchedAgent.name);
-            await scanAgentMd(agentPath, matchedAgent.name, mdFiles, fsPromises);
-          }
-        } else {
-          // 無指定：掃描全部 agent workspaces
-          for (const agentEntry of agentEntries) {
-            if (!agentEntry.isDirectory()) continue;
-            const agentPath = path.join(agentsDir, agentEntry.name);
-            await scanAgentMd(agentPath, agentEntry.name, mdFiles, fsPromises);
+    // memory/ directory
+    const memoryDir = path.join(workspacePath, "memory");
+    try {
+      const stats = await fsPromises.stat(memoryDir);
+      if (stats.isDirectory()) {
+        const files = await fsPromises.readdir(memoryDir);
+        for (const f of files) {
+          if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
+            mdFiles.push({ filePath: path.join(memoryDir, f), scope: entry.name });
           }
         }
-      } catch { /* no agents/ directory */ }
+      }
+    } catch { /* not found */ }
+  }
 
-      // Also scan the flat `workspace/memory/` directory directly under workspace root
-      // (not inside any workspace subdirectory — supports James's actual structure).
-      // This scan runs regardless of whether nested workspace mdFiles were found,
-      // so flat memory is always reachable even when all nested workspaces are empty.
-      // Skip if a specific workspace was requested (workspaceGlob), to avoid importing
-      // root flat memory when the user meant to import only one workspace.
-      if (!workspaceGlob) {
-        const flatMemoryDir = path.join(workspaceDir, "memory");
+  // Also scan nested agent workspaces under workspace/agents/<id>/.
+  // This handles the structure used by session-recovery and other OpenClaw
+  // components: workspace/agents/<id>/MEMORY.md and workspace/agents/<id>/memory/.
+  // We scan one additional level deeper than the top-level workspace scan.
+  async function scanAgentMd(
+    agentPath: string,
+    agentId: string,
+    mdFiles: Array<{ filePath: string; scope: string }>,
+    fsP: typeof import("node:fs/promises")
+  ): Promise<void> {
+    // workspace/agents/<id>/MEMORY.md
+    const agentMemoryMd = path.join(agentPath, "MEMORY.md");
+    try {
+      await fsP.stat(agentMemoryMd);
+      mdFiles.push({ filePath: agentMemoryMd, scope: agentId });
+    } catch { /* not found */ }
+
+    // workspace/agents/<id>/memory/ date files
+    const agentMemoryDir = path.join(agentPath, "memory");
+    try {
+      const stats = await fsP.stat(agentMemoryDir);
+      if (stats.isDirectory()) {
+        const files = await fsP.readdir(agentMemoryDir);
+        for (const f of files) {
+          if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
+            mdFiles.push({ filePath: path.join(agentMemoryDir, f), scope: agentId });
+          }
+        }
+      }
+    } catch { /* not found */ }
+  }
+
+  const agentsDir = path.join(workspaceDir, "agents");
+  try {
+    const agentEntries = await fsPromises.readdir(agentsDir, { withFileTypes: true });
+    if (workspaceGlob) {
+      // 有明確目標：只掃描符合的那一個 agent workspace
+      const matchedAgent = agentEntries.find(e => e.isDirectory() && e.name === workspaceGlob);
+      if (matchedAgent) {
+        const agentPath = path.join(agentsDir, matchedAgent.name);
+        await scanAgentMd(agentPath, matchedAgent.name, mdFiles, fsPromises);
+      }
+    } else {
+      // 無指定：掃描全部 agent workspaces
+      for (const agentEntry of agentEntries) {
+        if (!agentEntry.isDirectory()) continue;
+        const agentPath = path.join(agentsDir, agentEntry.name);
+        await scanAgentMd(agentPath, agentEntry.name, mdFiles, fsPromises);
+      }
+    }
+  } catch { /* no agents/ directory */ }
+
+  // Also scan the flat `workspace/memory/` directory directly under workspace root
+  // (not inside any workspace subdirectory — supports James's actual structure).
+  // This scan runs regardless of whether nested workspace mdFiles were found,
+  // so flat memory is always reachable even when all nested workspaces are empty.
+  // Skip if a specific workspace was requested (workspaceGlob), to avoid importing
+  // root flat memory when the user meant to import only one workspace.
+  if (!workspaceGlob) {
+    const flatMemoryDir = path.join(workspaceDir, "memory");
+    try {
+      const stats = await fsPromises.stat(flatMemoryDir);
+      if (stats.isDirectory()) {
+        const files = await fsPromises.readdir(flatMemoryDir);
+        for (const f of files) {
+          if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
+            mdFiles.push({ filePath: path.join(flatMemoryDir, f), scope: workspaceScope || "global" });
+          }
+        }
+      }
+    } catch { /* not found */ }
+  }
+
+  if (mdFiles.length === 0) {
+    return { imported: 0, skipped: 0, foundFiles: 0 };
+  }
+
+  // NaN-safe parsing with bounds — invalid input falls back to defaults instead of
+  // silently passing NaN (e.g. "--min-text-length abc" would otherwise make every
+  // length check behave unexpectedly).
+  const minTextLength = clampInt(parseInt(options.minTextLength ?? "5", 10), 1, 10000);
+  const importanceDefault = Number.isFinite(parseFloat(options.importance ?? "0.7"))
+    ? Math.max(0, Math.min(1, parseFloat(options.importance ?? "0.7")))
+    : 0.7;
+  const dedupEnabled = !!options.dedup;
+
+  // Parse each file for memory entries (lines starting with "- ")
+  for (const { filePath, scope: discoveredScope } of mdFiles) {
+    foundFiles++;
+    let content = await fsPromises.readFile(filePath, "utf-8");
+    // Strip UTF-8 BOM (e.g. from Windows Notepad-saved files)
+    content = content.replace(/^\uFEFF/, "");
+    // Normalize line endings: handle both CRLF (\r\n) and LF (\n)
+    const lines = content.split(/\r?\n/);
+
+    for (const line of lines) {
+      // Skip non-memory lines
+      // Supports: "- text", "* text", "+ text" (standard Markdown bullet formats)
+      if (!/^[-*+]\s/.test(line)) continue;
+      const text = line.slice(2).trim();
+      if (text.length < minTextLength) { skipped++; continue; }
+
+      // Use --scope if provided, otherwise fall back to per-file discovered scope.
+      // This prevents cross-workspace leakage: without --scope, each workspace
+      // writes to its own scope instead of collapsing everything into "global".
+      const effectiveScope = options.scope || discoveredScope;
+
+      // ── Deduplication check (scope-aware exact match) ───────────────────
+      // Run even in dry-run so --dry-run --dedup reports accurate counts
+      if (dedupEnabled) {
         try {
-          const stats = await fsPromises.stat(flatMemoryDir);
-          if (stats.isDirectory()) {
-            const files = await fsPromises.readdir(flatMemoryDir);
-            for (const f of files) {
-              if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
-                mdFiles.push({ filePath: path.join(flatMemoryDir, f), scope: workspaceScope || "global" });
-              }
+          const existing = await ctx.store.bm25Search(text, 5, [effectiveScope]);
+          if (existing.length > 0 && existing[0].entry.text === text) {
+            skipped++;
+            if (!options.dryRun) {
+              console.log(`  [skip] already imported: ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`);
             }
-          }
-        } catch { /* not found */ }
-      }
-
-      if (mdFiles.length === 0) {
-        return { imported: 0, skipped: 0, foundFiles: 0 };
-      }
-
-      // NaN-safe parsing with bounds — invalid input falls back to defaults instead of
-      // silently passing NaN (e.g. "--min-text-length abc" would otherwise make every
-      // length check behave unexpectedly).
-      const minTextLength = clampInt(parseInt(options.minTextLength ?? "5", 10), 1, 10000);
-      const importanceDefault = Number.isFinite(parseFloat(options.importance ?? "0.7"))
-        ? Math.max(0, Math.min(1, parseFloat(options.importance ?? "0.7")))
-        : 0.7;
-      const dedupEnabled = !!options.dedup;
-
-      // Parse each file for memory entries (lines starting with "- ")
-      for (const { filePath, scope: discoveredScope } of mdFiles) {
-        foundFiles++;
-        let content = await fsPromises.readFile(filePath, "utf-8");
-        // Strip UTF-8 BOM (e.g. from Windows Notepad-saved files)
-        content = content.replace(/^\uFEFF/, "");
-        // Normalize line endings: handle both CRLF (\r\n) and LF (\n)
-        const lines = content.split(/\r?\n/);
-
-        for (const line of lines) {
-          // Skip non-memory lines
-          // Supports: "- text", "* text", "+ text" (standard Markdown bullet formats)
-          if (!/^[-*+]\s/.test(line)) continue;
-          const text = line.slice(2).trim();
-          if (text.length < minTextLength) { skipped++; continue; }
-
-          // Use --scope if provided, otherwise fall back to per-file discovered scope.
-          // This prevents cross-workspace leakage: without --scope, each workspace
-          // writes to its own scope instead of collapsing everything into "global".
-          const effectiveScope = options.scope || discoveredScope;
-
-          // ── Deduplication check (scope-aware exact match) ───────────────────
-          // Run even in dry-run so --dry-run --dedup reports accurate counts
-          if (dedupEnabled) {
-            try {
-              const existing = await ctx.store.bm25Search(text, 5, [effectiveScope]);
-              if (existing.length > 0 && existing[0].entry.text === text) {
-                skipped++;
-                if (!options.dryRun) {
-                  console.log(`  [skip] already imported: ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`);
-                }
-                continue;
-              }
-            } catch {
-              // bm25Search not available on this store implementation; proceed with import
-            }
-          }
-
-          if (options.dryRun) {
-            console.log(`  [dry-run] would import: ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
-            imported++;
             continue;
           }
-
-          try {
-            const vector = await ctx.embedder!.embedPassage(text);
-            await ctx.store.store({
-              text,
-              vector,
-              importance: importanceDefault,
-              category: "other",
-              scope: effectiveScope,
-              metadata: JSON.stringify({ importedFrom: filePath, sourceScope: discoveredScope }),
-            });
-            imported++;
-          } catch (err) {
-            console.warn(`  Failed to import: ${text.slice(0, 60)}... — ${err}`);
-            skipped++;
-          }
+        } catch (err) {
+          // [FIXED P2] Log warning so dedup failure is visible instead of silent
+          console.warn(`  [import-markdown] dedup check failed (${err}), proceeding with import: ${text.slice(0, 60)}...`);
         }
       }
 
       if (options.dryRun) {
-        console.log(`\nDRY RUN — found ${foundFiles} files, ${imported} entries would be imported, ${skipped} skipped${dedupEnabled ? " [dedup enabled]" : ""}`);
-      } else {
-        console.log(`\nImport complete: ${imported} imported, ${skipped} skipped (scanned ${foundFiles} files)${dedupEnabled ? " [dedup enabled]" : ""}`);
+        console.log(`  [dry-run] would import: ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
+        imported++;
+        continue;
       }
-      return { imported, skipped, foundFiles };
+
+      try {
+        const vector = await ctx.embedder!.embedPassage(text);
+        await ctx.store.store({
+          text,
+          vector,
+          importance: importanceDefault,
+          category: "other",
+          scope: effectiveScope,
+          metadata: JSON.stringify({ importedFrom: filePath, sourceScope: discoveredScope }),
+        });
+        imported++;
+      } catch (err) {
+        console.warn(`  Failed to import: ${text.slice(0, 60)}... — ${err}`);
+        skipped++;
+      }
     }
+  }
+
+  if (options.dryRun) {
+    console.log(`\nDRY RUN — found ${foundFiles} files, ${imported} entries would be imported, ${skipped} skipped${dedupEnabled ? " [dedup enabled]" : ""}`);
+  } else {
+    console.log(`\nImport complete: ${imported} imported, ${skipped} skipped (scanned ${foundFiles} files)${dedupEnabled ? " [dedup enabled]" : ""}`);
+  }
+  return { imported, skipped, foundFiles };
+    }
+
 
 export function registerMemoryCLI(program: Command, context: CLIContext): void {
   let lastSearchDiagnostics: ReturnType<MemoryRetriever["getLastDiagnostics"]> =
@@ -1432,17 +1434,16 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       "0.7",
     )
     .action(async (workspaceGlob, options) => {
-      const result = await runImportMarkdown(context, workspaceGlob, options);
-      if (result.foundFiles === 0) {
-        console.log("No Markdown memory files found.");
-        return;
-      }
-      const { imported, skipped, foundFiles } = result;
-      const dedupEnabled = !!options.dedup;
-      if (options.dryRun) {
-        console.log(`\nDRY RUN - found ${foundFiles} files, ${imported} entries would be imported, ${skipped} skipped${dedupEnabled ? " [dedup enabled]" : ""}`);
-      } else {
-        console.log(`\nImport complete: ${imported} imported, ${skipped} skipped (scanned ${foundFiles} files)${dedupEnabled ? " [dedup enabled]" : ""}`);
+      // [FIXED P1] Wrap with try/catch — runImportMarkdown now throws instead of process.exit(1)
+      try {
+        const result = await runImportMarkdown(context, workspaceGlob, options);
+        if (result.foundFiles === 0) {
+          console.log("No Markdown memory files found.");
+        }
+        // Summary is printed inside runImportMarkdown (removed duplicate output)
+      } catch (err) {
+        console.error(`import-markdown failed: ${err}`);
+        process.exit(1);
       }
     });
 
