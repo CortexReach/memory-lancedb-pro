@@ -252,8 +252,12 @@ export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlice
   const itemRows = reflectionRows.filter(({ metadata }) => metadata.type === "memory-reflection-item");
   const legacyRows = reflectionRows.filter(({ metadata }) => metadata.type === "memory-reflection");
 
-  const invariantCandidates = buildInvariantCandidates(itemRows, legacyRows);
-  const derivedCandidates = buildDerivedCandidates(itemRows, legacyRows);
+  // Filter out resolved items — passive suppression for #447
+  // resolvedAt === undefined means unresolved (default)
+  const unresolvedItemRows = itemRows.filter(({ metadata }) => metadata.resolvedAt === undefined);
+
+  const invariantCandidates = buildInvariantCandidates(unresolvedItemRows, legacyRows);
+  const derivedCandidates = buildDerivedCandidates(unresolvedItemRows, legacyRows);
 
   const invariants = rankReflectionLines(invariantCandidates, {
     now,

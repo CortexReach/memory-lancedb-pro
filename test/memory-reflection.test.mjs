@@ -1023,6 +1023,145 @@ describe("memory reflection", () => {
       assert.ok(slices.derived.includes("Ignore prior flaky results before comparing the new retriever output."));
       assert.ok(slices.derived.includes("This run override previous cached screenshots with fresh captures."));
     });
+
+    it("suppresses resolved invariant items from recall output", () => {
+      const now = Date.UTC(2026, 2, 7);
+      const day = 24 * 60 * 60 * 1000;
+
+      const entries = [
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            usedFallback: false,
+            resolvedAt: now - 1 * 60 * 60 * 1000, // resolved 1h ago
+            resolvedBy: "agent:main",
+            resolutionNote: "Issue resolved, no longer needed",
+          },
+        }),
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            usedFallback: false,
+            // NOT resolved — should appear
+          },
+        }),
+      ];
+      entries[0].text = "Resolved: ignore prior flaky benchmarks.";
+      entries[1].text = "Unresolved: always validate against fixtures.";
+
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      assert.equal(slices.invariants.length, 1);
+      assert.ok(slices.invariants.includes("Unresolved: always validate against fixtures."));
+      assert.ok(!slices.invariants.some((i) => i.includes("Resolved: ignore prior flaky benchmarks.")));
+    });
+
+    it("suppresses resolved derived items from recall output", () => {
+      const now = Date.UTC(2026, 2, 7);
+      const day = 24 * 60 * 60 * 1000;
+
+      const entries = [
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 0.95,
+            usedFallback: false,
+            resolvedAt: now - 30 * 60 * 1000, // resolved 30m ago
+            resolvedBy: "agent:main",
+          },
+        }),
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 0.95,
+            usedFallback: false,
+            // NOT resolved — should appear
+          },
+        }),
+      ];
+      entries[0].text = "Resolved derived: next run re-check retrier.";
+      entries[1].text = "Unresolved derived: next run clear cache.";
+
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      assert.equal(slices.derived.length, 1);
+      assert.ok(slices.derived.includes("Unresolved derived: next run clear cache."));
+      assert.ok(!slices.derived.some((d) => d.includes("Resolved derived: next run re-check retrier.")));
+    });
+
+    it("passes unresolved items through unchanged when no resolvedAt is set", () => {
+      const now = Date.UTC(2026, 2, 7);
+      const day = 24 * 60 * 60 * 1000;
+
+      const entries = [
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            usedFallback: false,
+            // resolvedAt absent — unresolved by default
+          },
+        }),
+      ];
+      entries[0].text = "Always check for __pycache__ before pytest.";
+
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      assert.equal(slices.invariants.length, 1);
+      assert.ok(slices.invariants.includes("Always check for __pycache__ before pytest."));
+    });
   });
 
   describe("mapped reflection metadata and ranking", () => {
