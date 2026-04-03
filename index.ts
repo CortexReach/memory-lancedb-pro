@@ -1985,7 +1985,45 @@ const memoryLanceDBProPlugin = {
         });
       }
       const { invariants, derived } = slices;
-      const next = { updatedAt: Date.now(), invariants, derived };
+
+      // === B-1: Scope-aware BM25 neighbor expansion for reflection derived slices ===
+      // Ref: Issue #445 / B1_Design_v1.md
+      // Defense D1: seen = new Set() — do NOT preload base items (PR #463 lesson)
+      // Defense: skip expansion if scopeFilter is undefined (global scope expansion is unsafe)
+      let finalDerived = derived;
+      if (scopeFilter !== undefined && derived.length > 0) {
+        const seen = new Set<string>();
+        const expandedDerived: string[] = [];
+
+        for (const derivedLine of derived) {
+          // Defense D2: scopeFilter must match the one used by store.list above
+          try {
+            const bm25Hits = await store.bm25Search(
+              derivedLine,
+              2, // topK=2
+              scopeFilter,
+              { excludeInactive: true },
+            );
+            for (const hit of bm25Hits) {
+              if (seen.has(hit.entry.id)) continue; // Defense: ID-based dedupe only
+              seen.add(hit.entry.id);
+              // Defense D4: truncate to first line, 120 chars max — avoid token bloat
+              const snippet = (hit.entry.text || "").split('\n')[0].trim().slice(0, 120);
+              expandedDerived.push(snippet);
+            }
+          } catch (_err) {
+            // Defense: bm25Search failure must not crash the reflection loading path.
+            // Log and continue without expansion.
+            api.logger.debug(`memory-lancedb-pro: B-1 bm25Search failed, skipping expansion: ${String(_err)}`);
+          }
+        }
+
+        // Defense D3: merge base + expanded, hard cap at 16 total
+        // Defense D6: expand, do NOT replace — base derived must be preserved
+        finalDerived = [...derived, ...expandedDerived].slice(0, 16);
+      }
+
+      const next = { updatedAt: Date.now(), invariants, derived: finalDerived };
       reflectionByAgentCache.set(cacheKey, next);
       return next;
     };
