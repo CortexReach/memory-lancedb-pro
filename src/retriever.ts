@@ -443,7 +443,7 @@ export class MemoryRetriever {
     // After retrieval, find vector neighbors of each result and merge.
     // Only for auto-recall to avoid adding latency to manual retrieval.
     if (source === "auto-recall" && this.config.enableNeighborEnrichment !== false) {
-      results = await this.enrichWithNeighbors(results, safeLimit);
+      results = await this.enrichWithNeighbors(results, safeLimit, category);
     }
 
     return results;
@@ -503,6 +503,7 @@ export class MemoryRetriever {
   private async enrichWithNeighbors(
     results: RetrievalResult[],
     limit: number,
+    category?: string,
   ): Promise<RetrievalResult[]> {
     const MAX_NEIGHBORS_PER_RESULT = 2;
     const NEIGHBOR_MIN_SCORE = 0.3;
@@ -520,12 +521,17 @@ export class MemoryRetriever {
           MAX_NEIGHBORS_PER_RESULT,
           NEIGHBOR_MIN_SCORE,
           [result.entry.scope],
+          { excludeInactive: true },
         );
 
         for (const nr of neighborResults) {
           if (neighbors.length >= limit) break;
           if (nr.entry.id === result.entry.id) continue;
           if (seenIds.has(nr.entry.id)) continue;
+          // Filter by category if specified
+          if (category && nr.entry.category !== category) continue;
+          // Filter out inactive neighbors (belt-and-suspenders after excludeInactive)
+          if (!isMemoryActiveAt(parseSmartMetadata(nr.entry.metadata, nr.entry))) continue;
 
           neighbors.push({
             ...nr,

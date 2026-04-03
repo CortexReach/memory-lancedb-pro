@@ -637,6 +637,136 @@ describe("PR #461 — Neighbor Enrichment (enrichWithNeighbors)", () => {
     });
   });
 
+  describe("category 過濾", () => {
+
+    // TC-17: neighbor 不同 category → 應被排除
+    it("neighbor category 不同 → 排除該 neighbor", async () => {
+      const entry1 = makeEntry("mem-1", "事實內文", "global", 0.5);
+      entry1.category = "fact";
+      const neighborFact = makeEntry("nb-fact", "事實鄰居", "global", 0.6);
+      neighborFact.category = "fact";
+      const neighborPref = makeEntry("nb-pref", "偏好鄰居", "global", 0.7);
+      neighborPref.category = "preference";
+
+      let vsCall = 0;
+      const retriever = new MemoryRetriever(
+        {
+          hasFtsSupport: false,
+          async vectorSearch() {
+            vsCall++;
+            if (vsCall === 1) return [makeResult(entry1, 0.6)];
+            // enrichment: 回傳 fact + preference 兩種 neighbor
+            return [makeResult(neighborFact, 0.55), makeResult(neighborPref, 0.65)];
+          },
+          async bm25Search() { return []; },
+          async hasId() { return false; },
+        },
+        {
+          async embedQuery() { return [0.1, 0.9]; },
+        },
+        { ...DEFAULT_RETRIEVAL_CONFIG, filterNoise: false, enableNeighborEnrichment: true },
+      );
+
+      // category = "fact"
+      const results = await retriever.retrieve({
+        query: "事實",
+        limit: 20,
+        source: "auto-recall",
+        category: "fact",
+      });
+
+      const factNeighbor = results.find(r => r.entry.id === "nb-fact");
+      const prefNeighbor = results.find(r => r.entry.id === "nb-pref");
+      assert.ok(factNeighbor, "fact neighbor 應存在");
+      assert.strictEqual(prefNeighbor, undefined, "preference neighbor 應被排除");
+    });
+
+    // TC-18: 無 category 限制 → 允許所有 category 的 neighbor
+    it("無 category 限制：所有 category 的 neighbor 都可進入", async () => {
+      const entry1 = makeEntry("mem-1", "內文", "global", 0.5);
+      entry1.category = "fact";
+      const neighborFact = makeEntry("nb-fact", "事實鄰居", "global", 0.6);
+      neighborFact.category = "fact";
+      const neighborPref = makeEntry("nb-pref", "偏好鄰居", "global", 0.7);
+      neighborPref.category = "preference";
+
+      let vsCall = 0;
+      const retriever = new MemoryRetriever(
+        {
+          hasFtsSupport: false,
+          async vectorSearch() {
+            vsCall++;
+            if (vsCall === 1) return [makeResult(entry1, 0.6)];
+            return [makeResult(neighborFact, 0.55), makeResult(neighborPref, 0.65)];
+          },
+          async bm25Search() { return []; },
+          async hasId() { return false; },
+        },
+        {
+          async embedQuery() { return [0.1, 0.9]; },
+        },
+        { ...DEFAULT_RETRIEVAL_CONFIG, filterNoise: false, enableNeighborEnrichment: true },
+      );
+
+      // 無 category
+      const results = await retriever.retrieve({
+        query: "內文",
+        limit: 20,
+        source: "auto-recall",
+      });
+
+      const factNeighbor = results.find(r => r.entry.id === "nb-fact");
+      const prefNeighbor = results.find(r => r.entry.id === "nb-pref");
+      assert.ok(factNeighbor, "fact neighbor 應存在");
+      assert.ok(prefNeighbor, "preference neighbor 也應存在（無 category 限制）");
+    });
+  });
+
+  describe("inactive 過濾", () => {
+
+    // TC-19: inactive neighbor → 應被排除
+    it("inactive neighbor → 排除該 neighbor（excludeInactive: true）", async () => {
+      const entry1 = makeEntry("mem-1", "內文一", "global", 0.5);
+      const activeNb = makeEntry("nb-active", "活躍鄰居", "global", 0.6);
+      // inactive neighbor：設置 valid_from（與 timestamp 同時賦值）並設置 past invalidated_at
+      // parseSmartMetadata: validFrom = entry.timestamp, invalidatedAt 需 >= validFrom 才保留
+      // → 設 entry.timestamp 為 2 天前，invalidated_at 為 1 天前 → 過去式 → isMemoryActiveAt=false
+      const inactiveNb = makeEntry("nb-inactive", "已停用鄰居", "global", 0.7);
+      const twoDaysAgo = Date.now() - 2 * 86400000;
+      inactiveNb.timestamp = twoDaysAgo;
+      inactiveNb.metadata = JSON.stringify({ valid_from: twoDaysAgo, invalidated_at: Date.now() - 86400000 });
+
+      let vsCall = 0;
+      const retriever = new MemoryRetriever(
+        {
+          hasFtsSupport: false,
+          async vectorSearch() {
+            vsCall++;
+            if (vsCall === 1) return [makeResult(entry1, 0.6)];
+            return [makeResult(activeNb, 0.55), makeResult(inactiveNb, 0.65)];
+          },
+          async bm25Search() { return []; },
+          async hasId() { return false; },
+        },
+        {
+          async embedQuery() { return [0.1, 0.9]; },
+        },
+        { ...DEFAULT_RETRIEVAL_CONFIG, filterNoise: false, enableNeighborEnrichment: true },
+      );
+
+      const results = await retriever.retrieve({
+        query: "內文",
+        limit: 20,
+        source: "auto-recall",
+      });
+
+      const activeResult = results.find(r => r.entry.id === "nb-active");
+      const inactiveResult = results.find(r => r.entry.id === "nb-inactive");
+      assert.ok(activeResult, "active neighbor 應存在");
+      assert.strictEqual(inactiveResult, undefined, "inactive neighbor 應被排除");
+    });
+  });
+
   describe("整合：完整 enrichment 流程", () => {
 
     // E2E-1: 3 個結果 → 每個找鄰居 → 合併並重新排序
