@@ -371,5 +371,14 @@ export function isRecallUsed(responseText: string, injectedIds: string[]): boole
     }
   }
 
+  // Bug fix (P1-1): also check if the response explicitly references any of the
+  // injected memory IDs. If the agent mentions the ID (e.g. "based on [abc-123]")
+  // that is a direct usage signal, not just a stock phrase.
+  for (const id of injectedIds) {
+    if (id && responseLower.includes(id.toLowerCase())) {
+      return true;
+    }
+  }
+
   return false;
 }
