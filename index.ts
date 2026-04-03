@@ -2183,6 +2183,8 @@ const memoryLanceDBProPlugin = {
       recallIds: string[];
       responseText: string;
       injectedAt: number;
+      /** Summary text lines actually injected into the prompt, used for usage detection. */
+      injectedSummaries: string[];
     };
     const pendingRecall = new Map<string, PendingRecallEntry>();
 
@@ -2722,10 +2724,15 @@ const memoryLanceDBProPlugin = {
           // agent_end will write responseText into this same pendingRecall
           // entry (only updating responseText, never clearing recallIds).
           const sessionKeyForRecall = ctx?.sessionKey || ctx?.sessionId || "default";
+          // Bug 1 fix: also store the injected summary lines so the feedback hook
+          // can detect usage even when the agent doesn't use stock phrases or IDs
+          // but directly incorporates the memory content into the response.
+          const injectedSummaries = selected.map((item) => item.line);
           pendingRecall.set(sessionKeyForRecall, {
             recallIds: selected.map((item) => item.id),
             responseText: "", // Will be populated by agent_end
             injectedAt: Date.now(),
+            injectedSummaries,
           });
 
           return {
@@ -3177,12 +3184,16 @@ const memoryLanceDBProPlugin = {
       // actual [category:scope] format used by auto-recall injection.
       const injectedIds = pending.recallIds ?? [];
 
+      // Bug 1 fix: also retrieve the injected summary lines so isRecallUsed can
+      // detect when the agent directly incorporates memory content into the response.
+      const injectedSummaries = pending.injectedSummaries ?? [];
+
       // Check if any recall was actually used by checking if the response contains reference to the injected content
       // This is a heuristic - we check if the response shows awareness of injected memories
       let usedRecall = false;
-      if (injectedIds.length > 0) {
+      if (injectedIds.length > 0 || injectedSummaries.length > 0) {
         // Use the real isRecallUsed function from reflection-slices
-        usedRecall = isRecallUsed(responseText, injectedIds);
+        usedRecall = isRecallUsed(responseText, injectedIds, injectedSummaries);
       }
 
       // Read feedback config values with defaults
@@ -3195,9 +3206,28 @@ const memoryLanceDBProPlugin = {
       const confirmKeywords = fb.confirmKeywords ?? ["正確", "是", "對", "right", "yes", "沒錯", "對的"];
       const errorKeywords = fb.errorKeywords ?? ["不", "錯", "不是", "wrong", "no", "not right"];
 
+      // Bug 2 fix: confirm/error keywords must be read from the NEXT turn's user
+      // prompt (event.prompt), not from the previous assistant response (responseText).
+      // event.prompt is an array of {role, content} message objects.
+      let userPromptText = "";
+      try {
+        const promptMessages = Array.isArray(event.prompt) ? event.prompt : [];
+        // Walk backwards to find the last user message
+        for (let i = promptMessages.length - 1; i >= 0; i--) {
+          const msg = promptMessages[i];
+          if (msg && msg.role === "user" && typeof msg.content === "string" && msg.content.trim().length > 0) {
+            userPromptText = msg.content.trim();
+            break;
+          }
+        }
+      } catch (_e) {
+        // If we can't read event.prompt, fall back to empty (keyword checks will be skipped)
+        userPromptText = "";
+      }
+
       // Helper: check if text contains any of the keywords (case-insensitive)
       const containsKeyword = (text: string, keywords: string[]): boolean =>
-        keywords.some((kw) => text.includes(kw));
+        keywords.some((kw) => text.toLowerCase().includes(kw.toLowerCase()));
 
       // Score the recall - update importance based on usage
       if (injectedIds.length > 0) {
@@ -3223,7 +3253,9 @@ const memoryLanceDBProPlugin = {
               let newImportance = Math.min(1.0, currentImportance + boostOnUse);
 
               // Phase 2 feature (merged into Phase 1): user explicit confirmation signal (+0.15)
-              if (containsKeyword(responseText, confirmKeywords)) {
+              // Bug 2 fix: check the next-turn user prompt for confirmation keywords,
+              // not the previous-turn assistant response.
+              if (containsKeyword(userPromptText, confirmKeywords)) {
                 newImportance = Math.min(1.0, newImportance + boostOnConfirm);
               }
 
@@ -3239,13 +3271,19 @@ const memoryLanceDBProPlugin = {
                 undefined,
               );
             } else {
-              // Recall was not used - increment bad_recall_count
-              const badCount = (meta.bad_recall_count || 0) + 1;
+              // Recall was not used.
+              // Bug 4 fix: do NOT add +1 here — bad_recall_count was already
+              // incremented by the auto-recall path when this memory was injected
+              // (staleInjected branch). Adding +1 again would double-count and
+              // cause the 3-consecutive-miss penalty to trigger after only 2 misses.
+              const badCount = meta.bad_recall_count || 0;
               let newImportance = currentImportance;
 
               // Phase 2 feature (merged into Phase 1): user explicit error signal (-0.10)
-              // Only apply when user explicitly corrects/negates
-              if (containsKeyword(responseText, errorKeywords)) {
+              // Only apply when user explicitly corrects/negates.
+              // Bug 2 fix: check the next-turn user prompt for error keywords,
+              // not the previous-turn assistant response.
+              if (containsKeyword(userPromptText, errorKeywords)) {
                 // Only penalize if this memory has been recalled at least minRecallCountForPenalty times
                 // to avoid penalizing a memory that was just recalled once and didn't fit the context
                 if ((meta.injected_count || 0) >= minRecallCountForPenalty) {
@@ -4466,15 +4504,12 @@ export function parsePluginConfig(value: unknown): PluginConfig {
                 : 30,
           }
         : { skipLowValue: false, maxExtractionsPerHour: 30 },
-    recallPrefix:
-      typeof cfg.recallPrefix === "object" && cfg.recallPrefix !== null
-        ? {
-            categoryField:
-              typeof (cfg.recallPrefix as Record<string, unknown>).categoryField === "string"
-                ? ((cfg.recallPrefix as Record<string, unknown>).categoryField as string)
-                : undefined,
-          }
-        : undefined,
+    // Bug 3 fix: parse and return the feedback config block so deployments
+    // that specify custom feedback values actually take effect instead of
+    // falling back to hardcoded defaults.
+    feedback: typeof cfg.feedback === "object" && cfg.feedback !== null
+      ? { ...(cfg.feedback as Record<string, unknown>) }
+      : {},
   };
 }
 
