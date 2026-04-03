@@ -4284,7 +4284,6 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       typeof cfg.retrieval === "object" && cfg.retrieval !== null
         ? (() => {
           const retrieval = { ...(cfg.retrieval as Record<string, unknown>) } as Record<string, unknown>;
-<<<<<<< HEAD
           // Bug 6 fix: only resolve env vars for rerank fields when reranking is
           // actually enabled AND the field contains a ${...} placeholder.
           // This prevents startup failures when reranking is disabled and rerankApiKey
@@ -4301,7 +4300,6 @@ export function parsePluginConfig(value: unknown): PluginConfig {
           }
           if (rerankEnabled && typeof retrieval.rerankProvider === "string" && retrieval.rerankProvider.includes("${")) {
             retrieval.rerankProvider = resolveEnvVars(retrieval.rerankProvider);
-          }
           }
           return retrieval as any;
         })()
