@@ -320,21 +320,28 @@ export function extractInjectableReflectionSliceItems(reflectionText: string): R
 /**
  * Check if a recall was actually used by the agent.
  * This function determines whether the agent's response shows awareness of the injected memories.
- * 
- * @param responseText - The agent's response text
- * @param injectedIds - Array of memory IDs that were injected
+ *
+ * @param responseText    - The agent's response text
+ * @param injectedIds     - Array of memory IDs that were injected
+ * @param injectedSummaries - Optional array of summary text lines that were injected;
+ *                            if the response contains any of these verbatim or partially,
+ *                            it is a strong usage signal even without explicit markers or IDs.
  * @returns true if the response shows evidence of using the recalled information
  */
-export function isRecallUsed(responseText: string, injectedIds: string[]): boolean {
+export function isRecallUsed(
+  responseText: string,
+  injectedIds: string[],
+  injectedSummaries?: string[],
+): boolean {
   if (!responseText || responseText.length <= 24) {
     return false;
   }
-  if (!injectedIds || injectedIds.length === 0) {
+  if ((!injectedIds || injectedIds.length === 0) && (!injectedSummaries || injectedSummaries.length === 0)) {
     return false;
   }
 
   const responseLower = responseText.toLowerCase();
-  
+
   // Check for explicit recall usage markers
   const usageMarkers = [
     "remember",
@@ -377,6 +384,29 @@ export function isRecallUsed(responseText: string, injectedIds: string[]): boole
   for (const id of injectedIds) {
     if (id && responseLower.includes(id.toLowerCase())) {
       return true;
+    }
+  }
+
+  // Bug 1 fix (isRecallUsed): when summaries are provided, check if the response
+  // contains any of the injected summary text verbatim or as a near-identical
+  // substring. This catches the case where the agent directly uses the memory
+  // content without any explicit marker phrase.
+  if (injectedSummaries && injectedSummaries.length > 0) {
+    const responseTrimmedLower = responseText.trim().toLowerCase();
+    for (const summary of injectedSummaries) {
+      if (summary && summary.trim().length > 0) {
+        const summaryLower = summary.trim().toLowerCase();
+        // Check for verbatim or near-verbatim presence (at least 10 chars to avoid
+        // false positives on very short fragments).
+        if (
+          summaryLower.length >= 10 &&
+          (responseTrimmedLower.includes(summaryLower) ||
+            // Also check the reverse (summary contains response snippet — agent echoed it)
+            summaryLower.includes(responseTrimmedLower.slice(0, Math.min(50, responseTrimmedLower.length))))
+        ) {
+          return true;
+        }
+      }
     }
   }
 
