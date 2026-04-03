@@ -572,37 +572,53 @@ const openclawHome = options.openclawHome
       // This handles the structure used by session-recovery and other OpenClaw
       // components: workspace/agents/<id>/MEMORY.md and workspace/agents/<id>/memory/.
       // We scan one additional level deeper than the top-level workspace scan.
-      if (!workspaceGlob) {
-        const agentsDir = path.join(workspaceDir, "agents");
+      async function scanAgentMd(
+        agentPath: string,
+        agentId: string,
+        mdFiles: Array<{ filePath: string; scope: string }>,
+        fsP: typeof import("node:fs/promises")
+      ): Promise<void> {
+        // workspace/agents/<id>/MEMORY.md
+        const agentMemoryMd = path.join(agentPath, "MEMORY.md");
         try {
-          const agentEntries = await fsPromises.readdir(agentsDir, { withFileTypes: true });
+          await fsP.stat(agentMemoryMd);
+          mdFiles.push({ filePath: agentMemoryMd, scope: agentId });
+        } catch { /* not found */ }
+
+        // workspace/agents/<id>/memory/ date files
+        const agentMemoryDir = path.join(agentPath, "memory");
+        try {
+          const stats = await fsP.stat(agentMemoryDir);
+          if (stats.isDirectory()) {
+            const files = await fsP.readdir(agentMemoryDir);
+            for (const f of files) {
+              if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
+                mdFiles.push({ filePath: path.join(agentMemoryDir, f), scope: agentId });
+              }
+            }
+          }
+        } catch { /* not found */ }
+      }
+
+      const agentsDir = path.join(workspaceDir, "agents");
+      try {
+        const agentEntries = await fsPromises.readdir(agentsDir, { withFileTypes: true });
+        if (workspaceGlob) {
+          // 有明確目標：只掃描符合的那一個 agent workspace
+          const matchedAgent = agentEntries.find(e => e.isDirectory() && e.name === workspaceGlob);
+          if (matchedAgent) {
+            const agentPath = path.join(agentsDir, matchedAgent.name);
+            await scanAgentMd(agentPath, matchedAgent.name, mdFiles, fsPromises);
+          }
+        } else {
+          // 無指定：掃描全部 agent workspaces
           for (const agentEntry of agentEntries) {
             if (!agentEntry.isDirectory()) continue;
             const agentPath = path.join(agentsDir, agentEntry.name);
-
-            // workspace/agents/<id>/MEMORY.md
-            const agentMemoryMd = path.join(agentPath, "MEMORY.md");
-            try {
-              await fsPromises.stat(agentMemoryMd);
-              mdFiles.push({ filePath: agentMemoryMd, scope: agentEntry.name });
-            } catch { /* not found */ }
-
-            // workspace/agents/<id>/memory/ date files
-            const agentMemoryDir = path.join(agentPath, "memory");
-            try {
-              const stats = await fsPromises.stat(agentMemoryDir);
-              if (stats.isDirectory()) {
-                const files = await fsPromises.readdir(agentMemoryDir);
-                for (const f of files) {
-                  if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
-                    mdFiles.push({ filePath: path.join(agentMemoryDir, f), scope: agentEntry.name });
-                  }
-                }
-              }
-            } catch { /* not found */ }
+            await scanAgentMd(agentPath, agentEntry.name, mdFiles, fsPromises);
           }
-        } catch { /* no agents/ directory */ }
-      }
+        }
+      } catch { /* no agents/ directory */ }
 
       // Also scan the flat `workspace/memory/` directory directly under workspace root
       // (not inside any workspace subdirectory — supports James's actual structure).
