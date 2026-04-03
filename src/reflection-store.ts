@@ -255,13 +255,50 @@ export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlice
   // Filter out resolved items — passive suppression for #447
   // resolvedAt === undefined means unresolved (default)
   const unresolvedItemRows = itemRows.filter(({ metadata }) => metadata.resolvedAt === undefined);
+  const resolvedItemRows = itemRows.filter(({ metadata }) => metadata.resolvedAt !== undefined);
 
-  // If there were item rows but all are resolved, suppress to prevent legacy
-  // fallback from reviving them.  If there were NO item rows at all, allow
-  // legacy fallback to run (backward compatibility for stores that predate
-  // itemized reflection rows).
   const hasItemRows = itemRows.length > 0;
-  if (hasItemRows && unresolvedItemRows.length === 0) {
+  const hasLegacyRows = legacyRows.length > 0;
+
+  // Collect normalized text of resolved items so we can detect whether legacy
+  // rows are pure duplicates of already-resolved content.
+  const resolvedInvariantTexts = new Set(
+    resolvedItemRows
+      .filter(({ metadata }) => metadata.itemKind === "invariant")
+      .flatMap(({ entry }) => sanitizeInjectableReflectionLines([entry.text]))
+      .map((line) => normalizeReflectionLineForAggregation(line))
+  );
+  const resolvedDerivedTexts = new Set(
+    resolvedItemRows
+      .filter(({ metadata }) => metadata.itemKind === "derived")
+      .flatMap(({ entry }) => sanitizeInjectableReflectionLines([entry.text]))
+      .map((line) => normalizeReflectionLineForAggregation(line))
+  );
+
+  // Check whether legacy rows add any content not already covered by resolved
+  // items.  If every line in every legacy row is a duplicate of a resolved
+  // item, the legacy fallback would revive just-resolved advice — suppress.
+  const legacyHasUniqueInvariant = legacyRows.some(({ metadata }) =>
+    toStringArray(metadata.invariants).some(
+      (line) => !resolvedInvariantTexts.has(normalizeReflectionLineForAggregation(line))
+    )
+  );
+  const legacyHasUniqueDerived = legacyRows.some(({ metadata }) =>
+    toStringArray(metadata.derived).some(
+      (line) => !resolvedDerivedTexts.has(normalizeReflectionLineForAggregation(line))
+    )
+  );
+
+  // Suppress when:
+  // 1) there were item rows, all are resolved, and there are no legacy rows, OR
+  // 2) there were item rows, all are resolved, legacy rows exist BUT all of their
+  //    content duplicates already-resolved items (prevents legacy fallback from
+  //    reviving just-resolved advice — the P1 bug fixed here).
+  const shouldSuppress =
+    hasItemRows &&
+    unresolvedItemRows.length === 0 &&
+    (!hasLegacyRows || (!legacyHasUniqueInvariant && !legacyHasUniqueDerived));
+  if (shouldSuppress) {
     return { invariants: [], derived: [] };
   }
 

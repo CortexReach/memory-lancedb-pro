@@ -1163,11 +1163,11 @@ describe("memory reflection", () => {
       assert.ok(slices.invariants.includes("Always check for __pycache__ before pytest."));
     });
 
-    it("returns empty slices when all invariant items are resolved to prevent legacy fallback", () => {
+    it("returns empty slices when ALL invariant items are resolved AND there are NO legacy rows", () => {
       const now = Date.UTC(2026, 2, 7);
       const day = 24 * 60 * 60 * 1000;
 
-      // Only resolved items — no unresolved ones
+      // Only resolved items — no unresolved ones, no legacy rows
       const entries = [
         makeEntry({
           timestamp: now - 1 * day,
@@ -1205,22 +1205,79 @@ describe("memory reflection", () => {
       entries[0].text = "Resolved: ignore prior benchmarks.";
       entries[1].text = "Also resolved: ignore retrier.";
 
-      // Also add a legacy row with the same text so the legacy fallback path would
-      // revive these if it were triggered — this test ensures we short-circuit first.
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      // All item rows are resolved AND there are no legacy rows → early return.
+      // Resolved items are suppressed; no legacy fallback to revive them.
+      assert.equal(slices.invariants.length, 0, "all resolved invariant items should be suppressed");
+      assert.equal(slices.derived.length, 0, "all resolved should yield no derived either");
+    });
+
+    it("suppresses legacy rows when all legacy content duplicates already-resolved items (P1 fix)", () => {
+      const now = Date.UTC(2026, 2, 7);
+      const day = 24 * 60 * 60 * 1000;
+
+      // All item rows are resolved — these are the "current" resolved truths.
+      const resolvedItemEntries = [
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            usedFallback: false,
+            resolvedAt: now - 30 * 60 * 1000, // resolved
+            resolvedBy: "agent:main",
+          },
+        }),
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 0.95,
+            usedFallback: false,
+            resolvedAt: now - 30 * 60 * 1000, // resolved
+            resolvedBy: "agent:main",
+          },
+        }),
+      ];
+      resolvedItemEntries[0].text = "Resolved: verify assumptions before file edits.";
+      resolvedItemEntries[1].text = "Resolved: next run re-check the migration path.";
+
+      // Legacy rows that contain EXACTLY the same text as the resolved items.
+      // In the default configuration (writeLegacyCombined !== false), these
+      // legacy duplicates are written alongside the item rows every time.
+      // The bug: without the fix, legacy fallback would revive these resolved items.
       const legacyEntries = [
         makeEntry({
           timestamp: now - 1 * day,
           metadata: {
-            type: "memory-reflection",  // legacy type — no resolvedAt
+            type: "memory-reflection",
             agentId: "main",
             storedAt: now - 1 * day,
-            invariants: ["Resolved: ignore prior benchmarks.", "Also resolved: ignore retrier."],
-            derived: [],
+            invariants: ["Resolved: verify assumptions before file edits."],
+            derived: ["Resolved: next run re-check the migration path."],
           },
         }),
       ];
 
-      const allEntries = [...entries, ...legacyEntries];
+      const allEntries = [...resolvedItemEntries, ...legacyEntries];
       const slices = loadAgentReflectionSlicesFromEntries({
         entries: allEntries,
         agentId: "main",
@@ -1228,10 +1285,65 @@ describe("memory reflection", () => {
         deriveMaxAgeMs: 7 * day,
       });
 
-      // All item rows are resolved → should return empty slices.
-      // Must NOT fall back to legacy rows (which would revive the resolved items).
-      assert.equal(slices.invariants.length, 0, "all resolved invariant items should be suppressed");
-      assert.equal(slices.derived.length, 0, "all resolved should yield no derived either");
+      // Both invariants and derived must be empty: legacy rows contain only
+      // duplicates of already-resolved items and must not revive them.
+      assert.equal(slices.invariants.length, 0,
+        "legacy invariant duplicate of resolved item must be suppressed");
+      assert.equal(slices.derived.length, 0,
+        "legacy derived duplicate of resolved item must be suppressed");
+    });
+
+    it("does NOT suppress legacy rows when resolved items exist alongside unrelated legacy rows", () => {
+      const now = Date.UTC(2026, 2, 7);
+      const day = 24 * 60 * 60 * 1000;
+
+      // All item rows are resolved (no unresolved ones)
+      const resolvedItemEntries = [
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            usedFallback: false,
+            resolvedAt: now - 10 * 60 * 1000, // resolved — would trigger early return
+            resolvedBy: "agent:main",
+          },
+        }),
+      ];
+      resolvedItemEntries[0].text = "Resolved: this invariant should not appear.";
+
+      // Unrelated legacy row — should NOT be suppressed by the early return
+      const legacyEntries = [
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection",  // legacy type
+            agentId: "main",
+            storedAt: now - 1 * day,
+            invariants: ["Legacy: always run linter before commit."],
+            derived: [],
+          },
+        }),
+      ];
+
+      const allEntries = [...resolvedItemEntries, ...legacyEntries];
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries: allEntries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      // Legacy row should be returned even though item rows are all resolved.
+      // The resolved item is suppressed; the unrelated legacy advice falls through.
+      assert.ok(slices.invariants.includes("Legacy: always run linter before commit."),
+        "legacy invariant should be returned when legacy rows are present alongside resolved items");
     });
   });
 
