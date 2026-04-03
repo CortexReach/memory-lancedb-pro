@@ -3169,6 +3169,9 @@ const memoryLanceDBProPlugin = {
       const responseText = pending.responseText;
       if (!responseText || responseText.length <= 24) {
         // Skip scoring for empty or very short responses
+        // Bug 5 fix: also clear pendingRecall so the next turn does not
+        // re-trigger feedback on stale recallIds / old responseText.
+        pendingRecall.delete(sessionKey);
         return;
       }
 
@@ -3203,7 +3206,11 @@ const memoryLanceDBProPlugin = {
               // importance column. patchMetadata only updates the metadata JSON
               // blob but NOT the entry.importance field, so importance changes
               // never affected ranking (applyImportanceWeight reads entry.importance).
-              const newImportance = Math.min(1.0, (meta.importance || 0.5) + 0.05);
+              // Bug 4 fix (this file): also fall back to entry.importance (row-level)
+              // so old records that have no importance in metadata JSON still
+              // get a correct boost instead of always landing at 0.5.
+              const currentImportance = meta.importance ?? entry.importance ?? 0.5;
+              const newImportance = Math.min(1.0, currentImportance + 0.05);
               await store.update(
                 recallId,
                 { importance: newImportance },
@@ -3218,7 +3225,7 @@ const memoryLanceDBProPlugin = {
             } else {
               // Recall was not used - increment bad_recall_count
               const badCount = (meta.bad_recall_count || 0) + 1;
-              let newImportance = meta.importance || 0.5;
+              let newImportance = meta.importance ?? entry.importance ?? 0.5;
               // Apply penalty after threshold (3 consecutive unused)
               if (badCount >= 3) {
                 newImportance = Math.max(0.1, newImportance - 0.03);
@@ -4277,6 +4284,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       typeof cfg.retrieval === "object" && cfg.retrieval !== null
         ? (() => {
           const retrieval = { ...(cfg.retrieval as Record<string, unknown>) } as Record<string, unknown>;
+<<<<<<< HEAD
           // Bug 6 fix: only resolve env vars for rerank fields when reranking is
           // actually enabled AND the field contains a ${...} placeholder.
           // This prevents startup failures when reranking is disabled and rerankApiKey
@@ -4293,6 +4301,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
           }
           if (rerankEnabled && typeof retrieval.rerankProvider === "string" && retrieval.rerankProvider.includes("${")) {
             retrieval.rerankProvider = resolveEnvVars(retrieval.rerankProvider);
+          }
           }
           return retrieval as any;
         })()
