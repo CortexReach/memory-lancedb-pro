@@ -682,7 +682,7 @@ export class MemoryRetriever {
       );
     } else {
       results = await this.hybridRetrieval(
-        query, safeLimit, scopeFilter, category, trace,
+        query, safeLimit, scopeFilter, category, trace, source,
       );
     }
 

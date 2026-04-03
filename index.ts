@@ -3000,7 +3000,7 @@ const memoryLanceDBProPlugin = {
               // Also update metadata JSON fields via patchMetadata (separate concern)
               await store.patchMetadata(
                 recallId,
-                { last_confirmed_use_at: Date.now() },
+                { last_confirmed_use_at: Date.now(), bad_recall_count: 0 },
                 undefined,
               );
             } else {
@@ -3025,6 +3025,11 @@ const memoryLanceDBProPlugin = {
           }
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: recall usage scoring failed: ${String(err)}`);
+        } finally {
+          // Bug 1 fix: delete pendingRecall immediately after scoring so that
+          // subsequent turns (greeting, short input) that skip auto-recall do not
+          // re-trigger feedback scoring on the same recallIds/responseText pair.
+          pendingRecall.delete(sessionKey);
         }
       }
     }, { priority: 5 });
