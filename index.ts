@@ -2668,6 +2668,14 @@ const memoryLanceDBProPlugin = {
           recallHistory.delete(sessionId);
           turnCounter.delete(sessionId);
           lastRawUserMessage.delete(sessionId);
+          // P3 fix: clean all pendingRecall entries for this session.
+          // pendingRecall keys use format: sessionKey (or sessionKey:agentId with composite key).
+          // We clean any key that starts with this sessionId.
+          for (const key of pendingRecall.keys()) {
+            if (key === sessionId || key.startsWith(`${sessionId}:`) || key.startsWith(`${ctx?.sessionKey ?? ""}:`)) {
+              pendingRecall.delete(key);
+            }
+          }
         }
         // Also clean by channelId/conversationId if present (shared cache key)
         const cacheKey = ctx?.channelId || ctx?.conversationId || "";
@@ -3097,8 +3105,8 @@ const memoryLanceDBProPlugin = {
       const boostOnConfirm = fb.boostOnConfirm ?? 0.15;
       const penaltyOnError = fb.penaltyOnError ?? 0.10;
       const minRecallCountForPenalty = fb.minRecallCountForPenalty ?? 2;
-      const confirmKeywords = fb.confirmKeywords ?? ["正確", "是", "對", "right", "yes", "沒錯", "對的"];
-      const errorKeywords = fb.errorKeywords ?? ["不", "錯", "不是", "wrong", "no", "not right"];
+      const confirmKeywords = fb.confirmKeywords ?? ["正確", "yes", "right", "沒錯", "確認", "correct", "ok"];
+      const errorKeywords = fb.errorKeywords ?? ["不是", "錯", "不對", "wrong", "no", "not right", "錯誤", "更正"];
 
       // event.prompt is a plain string in the current hook contract (confirmed by codebase usage).
       // We extract the user's last message from event.messages array instead.
