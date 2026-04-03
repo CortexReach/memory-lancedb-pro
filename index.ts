@@ -2508,6 +2508,18 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: injecting ${selected.length} memories into context for agent ${agentId}`,
           );
 
+          // Store recall IDs in pendingRecall so the feedback hook (which runs
+          // in the NEXT turn's before_prompt_build after agent_end) can read
+          // them directly instead of trying to parse prependContext.
+          // (agent_end runs after before_prompt_build, so pendingRecall for
+          // this session was already created with empty recallIds by agent_end
+          // of the PREVIOUS turn.)
+          const sessionKeyForRecall = ctx?.sessionKey || ctx?.sessionId || "default";
+          const existingPending = pendingRecall.get(sessionKeyForRecall);
+          if (existingPending) {
+            existingPending.recallIds = selected.map((item) => item.id);
+          }
+
           return {
             prependContext:
               `<relevant-memories>\n` +
@@ -2946,23 +2958,11 @@ const memoryLanceDBProPlugin = {
         return;
       }
 
-      // Extract injected IDs from prependContext if available
-      // The auto-recall injects memories with IDs in the injectedIds field
-      const injectedIds: string[] = [];
-      if (event.prependContext && typeof event.prependContext === "string") {
-        // Parse IDs from injected context - format is typically "- [category:scope] summary"
-        // We'll check if any recall IDs are present in the context
-        const match = event.prependContext.match(/\[([a-f0-9]{8,})\]/gi);
-        if (match) {
-          for (const m of match) {
-            const id = m.slice(1, -1);
-            if (id.length >= 8) injectedIds.push(id);
-          }
-        }
-      }
-
-      // Update pending recall entry with IDs
-      pending.recallIds = injectedIds;
+      // Read recall IDs directly from pendingRecall (populated by auto-recall's
+      // before_prompt_build hook from the PREVIOUS turn). This replaces the
+      // broken regex-based parsing of prependContext which never matched the
+      // actual [category:scope] format used by auto-recall injection.
+      const injectedIds = pending.recallIds ?? [];
 
       // Check if any recall was actually used by checking if the response contains reference to the injected content
       // This is a heuristic - we check if the response shows awareness of injected memories
