@@ -634,7 +634,7 @@ const openclawHome = options.openclawHome
             const files = await fsPromises.readdir(flatMemoryDir);
             for (const f of files) {
               if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
-                mdFiles.push({ filePath: path.join(flatMemoryDir, f), scope: workspaceScope || "shared" });
+                mdFiles.push({ filePath: path.join(flatMemoryDir, f), scope: workspaceScope || "global" });
               }
             }
           }
@@ -679,7 +679,7 @@ const openclawHome = options.openclawHome
           // Run even in dry-run so --dry-run --dedup reports accurate counts
           if (dedupEnabled) {
             try {
-              const existing = await ctx.store.bm25Search(text, 1, [effectiveScope]);
+              const existing = await ctx.store.bm25Search(text, 5, [effectiveScope]);
               if (existing.length > 0 && existing[0].entry.text === text) {
                 skipped++;
                 if (!options.dryRun) {
@@ -1412,7 +1412,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .command("import-markdown [workspace-glob]")
     .description("Import memories from Markdown files (MEMORY.md, memory/YYYY-MM-DD.md) into the plugin store")
     .option("--dry-run", "Show what would be imported without importing")
-    .option("--scope <scope>", "Import into specific scope (default: global)")
+    .option("--scope <scope>", "Import into specific scope (default: auto-discovered from workspace)")
     .option(
       "--openclaw-home <path>",
       "OpenClaw home directory (default: ~/.openclaw)",
@@ -1438,7 +1438,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         return;
       }
       const { imported, skipped, foundFiles } = result;
-      const dedupEnabled = !!options.dryRun;
+      const dedupEnabled = !!options.dedup;
       if (options.dryRun) {
         console.log(`\nDRY RUN - found ${foundFiles} files, ${imported} entries would be imported, ${skipped} skipped${dedupEnabled ? " [dedup enabled]" : ""}`);
       } else {
