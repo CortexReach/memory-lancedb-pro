@@ -2720,17 +2720,17 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: injecting ${selected.length} memories into context for agent ${agentId}`,
           );
 
-          // Store recall IDs in pendingRecall so the feedback hook (which runs
-          // in the NEXT turn's before_prompt_build after agent_end) can read
-          // them directly instead of trying to parse prependContext.
-          // (agent_end runs after before_prompt_build, so pendingRecall for
-          // this session was already created with empty recallIds by agent_end
-          // of the PREVIOUS turn.)
+          // Create or update pendingRecall for this turn so the feedback hook
+          // (which runs in the NEXT turn's before_prompt_build after agent_end)
+          // sees a matching pair: Turn N recallIds + Turn N responseText.
+          // agent_end will write responseText into this same pendingRecall
+          // entry (only updating responseText, never clearing recallIds).
           const sessionKeyForRecall = ctx?.sessionKey || ctx?.sessionId || "default";
-          const existingPending = pendingRecall.get(sessionKeyForRecall);
-          if (existingPending) {
-            existingPending.recallIds = selected.map((item) => item.id);
-          }
+          pendingRecall.set(sessionKeyForRecall, {
+            recallIds: selected.map((item) => item.id),
+            responseText: "", // Will be populated by agent_end
+            injectedAt: Date.now(),
+          });
 
           return {
             prependContext:
@@ -3129,8 +3129,12 @@ const memoryLanceDBProPlugin = {
       api.on("agent_end", agentEndAutoCaptureHook);
 
     // ========================================================================
-    // Proposal A Phase 1:agent_end hook - Store response text for usage tracking
+    // Proposal A Phase 1: agent_end hook - Store response text for usage tracking
     // ========================================================================
+    // NOTE: Only writes responseText to an EXISTING pendingRecall entry created
+    // by before_prompt_build (auto-recall). Does NOT create a new entry.
+    // This ensures recallIds (written by auto-recall in the same turn) and
+    // responseText (written here) remain paired for the feedback hook.
     api.on("agent_end", (event: any, ctx: any) => {
       const sessionKey = ctx?.sessionKey || ctx?.sessionId || "default";
       if (!sessionKey) return;
@@ -3145,13 +3149,11 @@ const memoryLanceDBProPlugin = {
         }
       }
 
-      // Store in pendingRecall if we have response text
-      if (lastMsgText && lastMsgText.trim().length > 0) {
-        pendingRecall.set(sessionKey, {
-          recallIds: [], // Will be populated by before_prompt_build
-          responseText: lastMsgText,
-          injectedAt: Date.now(),
-        });
+      // Only update an existing pendingRecall entry — do NOT create one.
+      // This preserves recallIds written by auto-recall earlier in this turn.
+      const existing = pendingRecall.get(sessionKey);
+      if (existing && lastMsgText && lastMsgText.trim().length > 0) {
+        existing.responseText = lastMsgText;
       }
     }, { priority: 20 });
 
@@ -3188,20 +3190,30 @@ const memoryLanceDBProPlugin = {
       if (injectedIds.length > 0) {
         try {
           for (const recallId of injectedIds) {
-            const meta = parseSmartMetadata(undefined, { id: recallId, metadata: "" });
-            // If we can't find the entry, skip
-            if (!meta) continue;
+            // Bug 2 fix: use store.getById to retrieve the real entry so we
+            // get the actual importance value, instead of calling
+            // parseSmartMetadata with empty placeholder metadata.
+            const entry = await store.getById(recallId, undefined);
+            if (!entry) continue;
+            const meta = parseSmartMetadata(entry.metadata, entry);
 
             if (usedRecall) {
               // Recall was used - increase importance (cap at 1.0)
+              // Bug 3 fix: use store.update to directly update the row-level
+              // importance column. patchMetadata only updates the metadata JSON
+              // blob but NOT the entry.importance field, so importance changes
+              // never affected ranking (applyImportanceWeight reads entry.importance).
               const newImportance = Math.min(1.0, (meta.importance || 0.5) + 0.05);
+              await store.update(
+                recallId,
+                { importance: newImportance },
+                undefined,
+              );
+              // Also update metadata JSON fields via patchMetadata (separate concern)
               await store.patchMetadata(
                 recallId,
-                {
-                  importance: newImportance,
-                  last_confirmed_use_at: Date.now(),
-                },
-                undefined
+                { last_confirmed_use_at: Date.now() },
+                undefined,
               );
             } else {
               // Recall was not used - increment bad_recall_count
@@ -3211,13 +3223,15 @@ const memoryLanceDBProPlugin = {
               if (badCount >= 3) {
                 newImportance = Math.max(0.1, newImportance - 0.03);
               }
+              await store.update(
+                recallId,
+                { importance: newImportance },
+                undefined,
+              );
               await store.patchMetadata(
                 recallId,
-                {
-                  importance: newImportance,
-                  bad_recall_count: badCount,
-                },
-                undefined
+                { bad_recall_count: badCount },
+                undefined,
               );
             }
           }
