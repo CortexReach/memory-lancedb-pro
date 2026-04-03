@@ -2632,11 +2632,11 @@ const memoryLanceDBProPlugin = {
     // Auto-capture: analyze and store important information after agent ends
     if (config.autoCapture !== false) {
       type AgentEndAutoCaptureHook = {
-        (event: any, ctx: any): void;
+        (event: any, ctx: any): Promise<void> | void;
         __lastRun?: Promise<void>;
       };
 
-      const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = (event, ctx) => {
+      const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = async (event, ctx) => {
         if (!event.success || !event.messages || event.messages.length === 0) {
           return;
         }
@@ -2968,7 +2968,19 @@ const memoryLanceDBProPlugin = {
         }
         })();
         agentEndAutoCaptureHook.__lastRun = backgroundRun;
-        void backgroundRun;
+        let safetyTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        backgroundRun,
+        new Promise<void>(resolve => {
+          safetyTimer = setTimeout(resolve, 15_000);
+        }),
+      ]);
+    } catch {
+      // swallow – best-effort capture must never break the host
+    } finally {
+      if (safetyTimer !== undefined) clearTimeout(safetyTimer);
+    }
       };
 
       api.on("agent_end", agentEndAutoCaptureHook);
