@@ -316,3 +316,35 @@ export function extractReflectionSliceItems(reflectionText: string): ReflectionS
 export function extractInjectableReflectionSliceItems(reflectionText: string): ReflectionSliceItem[] {
   return buildReflectionSliceItemsFromSlices(extractInjectableReflectionSlices(reflectionText));
 }
+
+/**
+ * 判斷回應是否實際使用了注入的記憶 ID 或摘要。
+ * - 回應長度 <= 24：不視為使用（太短）
+ * - injectedIds + injectedSummaries 都為空：不視為使用
+ * - 有 usage marker（如「教練我記得」）+ 對應 ID：視為使用
+ * - 有 usage marker + verbatim summary match（>=10 字元）：視為使用
+ */
+export function isRecallUsed(
+  response: string,
+  injectedIds: string[],
+  injectedSummaries: string[]
+): boolean {
+  if (response.length <= 24) return false;
+  if (injectedIds.length === 0 && injectedSummaries.length === 0) return false;
+
+  const hasUsageMarker = /教練|教練我|教練我記得|記得|memory|id[-:]/i.test(response);
+
+  if (injectedIds.length > 0) {
+    const hasMatchingId = injectedIds.some(id => response.includes(id));
+    if (hasMatchingId && hasUsageMarker) return true;
+  }
+
+  if (injectedSummaries.length > 0) {
+    const hasMatchingSummary = injectedSummaries.some(
+      s => s.length >= 10 && response.includes(s)
+    );
+    if (hasMatchingSummary) return true;
+  }
+
+  return false;
+}
