@@ -774,8 +774,10 @@ function buildAutoCaptureConversationKeyFromIngress(
 ): string | null {
   const channel = typeof channelId === "string" ? channelId.trim() : "";
   const conversation = typeof conversationId === "string" ? conversationId.trim() : "";
-  if (!channel || !conversation) return null;
-  return `${channel}:${conversation}`;
+  if (!channel) return null;
+  // DM: conversationId=undefined -> fallback to channelId (matches regex extract from sessionKey)
+  // Group: conversationId=exists -> returns channelId:conversationId (matches regex extract)
+  return conversation ? `${channel}:${conversation}` : channel;
 }
 
 /**
@@ -2059,8 +2061,9 @@ const memoryLanceDBProPlugin = {
       );
       const normalized = normalizeAutoCaptureText("user", event.content, shouldSkipReflectionMessage);
       if (conversationKey && normalized) {
+        const MAX_MESSAGE_LENGTH = 5000;
         const queue = autoCapturePendingIngressTexts.get(conversationKey) || [];
-        queue.push(normalized);
+        queue.push(normalized.slice(0, MAX_MESSAGE_LENGTH));
         autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
         pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
       }
@@ -2724,28 +2727,36 @@ const memoryLanceDBProPlugin = {
           const pendingIngressTexts = conversationKey
             ? [...(autoCapturePendingIngressTexts.get(conversationKey) || [])]
             : [];
-          if (conversationKey) {
-            autoCapturePendingIngressTexts.delete(conversationKey);
-          }
-
           const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
+          // [Fix #2] Cumulative counting: accumulate across events, not per-event overwrite
+          const currentCumulativeCount = previousSeenCount + eligibleTexts.length;
           let newTexts = eligibleTexts;
           if (pendingIngressTexts.length > 0) {
+            // [Fix #3] Use pendingIngressTexts as-is (REPLACE, not APPEND).
+            // REPLACE is correct because: (1) Fix #2 cumulative count ensures enough turns
+            // accumulate; (2) Fix #4 (delete) restores original behavior where pending is
+            // event-scoped; (3) APPEND causes deduplication issues when the same text
+            // appears in both pendingIngressTexts and eligibleTexts (after prefix stripping).
             newTexts = pendingIngressTexts;
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
           }
-          autoCaptureSeenTextCount.set(sessionKey, eligibleTexts.length);
+          autoCaptureSeenTextCount.set(sessionKey, currentCumulativeCount);
           pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
 
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
           let texts = newTexts;
+          // [Fix #5] isExplicitRememberCommand: guard against empty pendingIngressTexts
+          const lastPending = pendingIngressTexts.length > 0
+            ? pendingIngressTexts[pendingIngressTexts.length - 1]
+            : (eligibleTexts.length === 1 ? eligibleTexts[0] : null);
           if (
             texts.length === 1 &&
-            isExplicitRememberCommand(texts[0]) &&
+            lastPending !== null &&
+            isExplicitRememberCommand(lastPending) &&
             priorRecentTexts.length > 0
           ) {
-            texts = [...priorRecentTexts.slice(-1), ...texts];
+            texts = [...pendingIngressTexts, ...priorRecentTexts.slice(-1), ...eligibleTexts];
           }
           if (newTexts.length > 0) {
             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
@@ -2753,7 +2764,8 @@ const memoryLanceDBProPlugin = {
             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
-          const minMessages = config.extractMinMessages ?? 4;
+          // [Fix #6] Cap extractMinMessages to prevent misconfiguration
+          const minMessages = Math.min(config.extractMinMessages ?? 4, 100);
           if (skippedAutoCaptureTexts > 0) {
             api.logger.debug(
               `memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`,
@@ -2827,9 +2839,10 @@ const memoryLanceDBProPlugin = {
               );
               return;
             }
-            if (cleanTexts.length >= minMessages) {
+            // [Fix #3 updated] Use cumulative count (turn count) for smart extraction threshold
+            if (currentCumulativeCount >= minMessages) {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (${cleanTexts.length} clean texts >= ${minMessages})`,
+                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${currentCumulativeCount} >= minMessages=${minMessages})`,
               );
               const conversationText = cleanTexts.join("\n");
               const stats = await smartExtractor.extractAndPersist(
@@ -2856,7 +2869,7 @@ const memoryLanceDBProPlugin = {
               );
             } else {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (${cleanTexts.length} < ${minMessages})`,
+                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (cumulative=${currentCumulativeCount} < minMessages=${minMessages})`,
               );
             }
           }
