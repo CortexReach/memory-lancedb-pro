@@ -21,28 +21,28 @@ const { shouldCapture } = jiti("../index.ts");
 const { shouldSkipRetrieval } = jiti("../src/adaptive-retrieval.ts");
 
 // ==========================================================================
-// shouldCapture â German positive cases
+// shouldCapture — German positive cases
 // ==========================================================================
-describe("shouldCapture â German triggers", () => {
+describe("shouldCapture — German triggers", () => {
   // --- Memory / remember commands ---
   it("captures 'Merke dir: mein API-Key ist xyz'", () => {
     assert.equal(shouldCapture("Merke dir: mein API-Key ist xyz"), true);
   });
 
   it("captures 'Merk dir das bitte'", () => {
-    assert.equal(shouldCapture("Merk dir das bitte fÃ¼r spÃ¤ter"), true);
+    assert.equal(shouldCapture("Merk dir das bitte für später"), true);
   });
 
   it("captures 'Merk es dir: wir nutzen Postgres'", () => {
     assert.equal(shouldCapture("Merk es dir: wir nutzen Postgres"), true);
   });
 
-  it("captures 'Vergiss nicht: deployment immer Ã¼ber CI'", () => {
-    assert.equal(shouldCapture("Vergiss nicht: deployment immer Ã¼ber CI"), true);
+  it("captures 'Vergiss nicht: deployment immer über CI'", () => {
+    assert.equal(shouldCapture("Vergiss nicht: deployment immer über CI"), true);
   });
 
   it("captures 'Vergiss das nicht: Port 8080'", () => {
-    assert.equal(shouldCapture("Vergiss das nicht: Port 8080 fÃ¼r dev"), true);
+    assert.equal(shouldCapture("Vergiss das nicht: Port 8080 für dev"), true);
   });
 
   it("captures 'Nicht vergessen: Meeting um 14 Uhr'", () => {
@@ -58,8 +58,8 @@ describe("shouldCapture â German triggers", () => {
   });
 
   // --- Preference triggers ---
-  it("captures 'Ich bevorzuge TypeScript Ã¼ber JavaScript'", () => {
-    assert.equal(shouldCapture("Ich bevorzuge TypeScript Ã¼ber JavaScript"), true);
+  it("captures 'Ich bevorzuge TypeScript über JavaScript'", () => {
+    assert.equal(shouldCapture("Ich bevorzuge TypeScript über JavaScript"), true);
   });
 
   it("captures 'Ich mag keine Tabs, nur Spaces'", () => {
@@ -71,7 +71,7 @@ describe("shouldCapture â German triggers", () => {
   });
 
   it("captures 'Ich will Tests vor dem Merge'", () => {
-    assert.equal(shouldCapture("Ich will Tests vor dem Merge immer durchfÃ¼hren"), true);
+    assert.equal(shouldCapture("Ich will Tests vor dem Merge immer durchführen"), true);
   });
 
   it("captures 'Ich brauche eine Zusammenfassung'", () => {
@@ -87,8 +87,8 @@ describe("shouldCapture â German triggers", () => {
     assert.equal(shouldCapture("Wir nutzen ab jetzt pnpm statt npm"), true);
   });
 
-  it("captures 'Ab sofort deployen wir nur Ã¼ber main'", () => {
-    assert.equal(shouldCapture("Ab sofort deployen wir nur Ã¼ber main"), true);
+  it("captures 'Ab sofort deployen wir nur über main'", () => {
+    assert.equal(shouldCapture("Ab sofort deployen wir nur über main"), true);
   });
 
   it("captures 'In Zukunft verwenden wir ESLint flat config'", () => {
@@ -100,8 +100,8 @@ describe("shouldCapture â German triggers", () => {
     assert.equal(shouldCapture("Mein Name ist Max und ich bin Entwickler"), true);
   });
 
-  it("captures 'Mein Projekt heiÃt OpenClaw'", () => {
-    assert.equal(shouldCapture("Mein Projekt heiÃt OpenClaw"), true);
+  it("captures 'Mein Projekt heißt OpenClaw'", () => {
+    assert.equal(shouldCapture("Mein Projekt heißt OpenClaw"), true);
   });
 
   it("captures 'Ich wohne in Berlin'", () => {
@@ -114,7 +114,7 @@ describe("shouldCapture â German triggers", () => {
 
   // --- Scoped intent triggers for 'immer' ---
   it("captures 'immer wenn wir deployen' (intent: conditional)", () => {
-    assert.equal(shouldCapture("Immer wenn wir deployen, mÃ¼ssen wir Tests laufen lassen"), true);
+    assert.equal(shouldCapture("Immer wenn wir deployen, müssen wir Tests laufen lassen"), true);
   });
 
   it("captures 'immer daran denken' (intent: reminder)", () => {
@@ -135,9 +135,9 @@ describe("shouldCapture â German triggers", () => {
 });
 
 // ==========================================================================
-// shouldCapture â German negative / false-positive cases
+// shouldCapture — German negative / false-positive cases
 // ==========================================================================
-describe("shouldCapture â German false-positive prevention", () => {
+describe("shouldCapture — German false-positive prevention", () => {
   it("does NOT capture 'Zimmermann' (contains 'immer' substring)", () => {
     assert.equal(shouldCapture("Herr Zimmermann hat angerufen und eine Nachricht hinterlassen"), false);
   });
@@ -147,7 +147,7 @@ describe("shouldCapture â German false-positive prevention", () => {
   });
 
   it("does NOT capture 'Flimmern' (contains 'immer' substring)", () => {
-    assert.equal(shouldCapture("Das Flimmern auf dem Monitor ist stÃ¶rend und nervt mich"), false);
+    assert.equal(shouldCapture("Das Flimmern auf dem Monitor ist störend und nervt mich"), false);
   });
 
   it("does NOT capture 'Das ist immer so' (standalone 'immer' without intent context)", () => {
@@ -155,20 +155,20 @@ describe("shouldCapture â German false-positive prevention", () => {
   });
 
   it("does NOT capture 'Wichtigkeit' (contains 'wichtig' substring but word boundary fails)", () => {
-    assert.equal(shouldCapture("Die Wichtigkeit dieser Metrik wird Ã¼berschÃ¤tzt finde ich"), false);
+    assert.equal(shouldCapture("Die Wichtigkeit dieser Metrik wird überschätzt finde ich"), false);
   });
 
-  it("does NOT capture 'Er heiÃt Peter' (no 'mein' prefix)", () => {
-    assert.equal(shouldCapture("Er heiÃt Peter und kommt aus Hamburg in Norddeutschland"), false);
+  it("does NOT capture 'Er heißt Peter' (no 'mein' prefix)", () => {
+    assert.equal(shouldCapture("Er heißt Peter und kommt aus Hamburg in Norddeutschland"), false);
   });
 
-  it("does NOT capture 'Die Stadt heiÃt Berlin' (no 'mein' prefix)", () => {
-    assert.equal(shouldCapture("Die Stadt heiÃt Berlin und ist die Hauptstadt Deutschlands"), false);
+  it("does NOT capture 'Die Stadt heißt Berlin' (no 'mein' prefix)", () => {
+    assert.equal(shouldCapture("Die Stadt heißt Berlin und ist die Hauptstadt Deutschlands"), false);
   });
 
   it("does NOT capture 'Sie wohne dort seit Jahren' (no 'ich' prefix)", () => {
     // 'wohne' without 'ich' should not match
-    assert.equal(shouldCapture("Das GebÃ¤ude in dem sie wohne ist renoviert worden letztes Jahr"), false);
+    assert.equal(shouldCapture("Das Gebäude in dem sie wohne ist renoviert worden letztes Jahr"), false);
   });
 
   it("does NOT capture too-short German text", () => {
@@ -182,15 +182,15 @@ describe("shouldCapture â German false-positive prevention", () => {
 });
 
 // ==========================================================================
-// shouldSkipRetrieval â German force-retrieve patterns
+// shouldSkipRetrieval — German force-retrieve patterns
 // ==========================================================================
-describe("shouldSkipRetrieval â German retrieval triggers", () => {
+describe("shouldSkipRetrieval — German retrieval triggers", () => {
   it("forces retrieval for 'Erinnerst du dich an den Bug?'", () => {
     assert.equal(shouldSkipRetrieval("Erinnerst du dich an den Bug von gestern?"), false);
   });
 
-  it("forces retrieval for 'WeiÃt du noch welchen Port wir nutzen?'", () => {
-    assert.equal(shouldSkipRetrieval("WeiÃt du noch welchen Port wir nutzen?"), false);
+  it("forces retrieval for 'Weißt du noch welchen Port wir nutzen?'", () => {
+    assert.equal(shouldSkipRetrieval("Weißt du noch welchen Port wir nutzen?"), false);
   });
 
   it("forces retrieval for 'Was war mein API-Key?'", () => {
@@ -225,8 +225,8 @@ describe("shouldSkipRetrieval â German retrieval triggers", () => {
     assert.equal(shouldSkipRetrieval("Habe ich dir gesagt dass wir Postgres nutzen?"), false);
   });
 
-  it("forces retrieval for 'Habe ich erwÃ¤hnt dass Tests Pflicht sind?'", () => {
-    assert.equal(shouldSkipRetrieval("Habe ich erwÃ¤hnt dass Tests Pflicht sind?"), false);
+  it("forces retrieval for 'Habe ich erwähnt dass Tests Pflicht sind?'", () => {
+    assert.equal(shouldSkipRetrieval("Habe ich erwähnt dass Tests Pflicht sind?"), false);
   });
 
   it("forces retrieval for 'Merke dir: wir nutzen nur main' (also a capture trigger)", () => {
@@ -251,7 +251,7 @@ describe("shouldSkipRetrieval â German retrieval triggers", () => {
 // ==========================================================================
 // Explicit remember command consistency
 // ==========================================================================
-describe("shouldCapture â explicit remember command consistency", () => {
+describe("shouldCapture — explicit remember command consistency", () => {
   // All German remember variants should be captured by shouldCapture
   const explicitForms = [
     "Merk dir!",                     // short imperative
@@ -265,7 +265,7 @@ describe("shouldCapture â explicit remember command consistency", () => {
   // These are short (< 10 chars) so some won't fire shouldCapture due to length.
   // We test them padded to ensure the regex itself works.
   for (const form of explicitForms) {
-    const padded = form.length < 10 ? `${form} das ist relevant fÃ¼r spÃ¤ter` : form;
+    const padded = form.length < 10 ? `${form} das ist relevant für später` : form;
     it(`captures padded form: "${padded}"`, () => {
       assert.equal(shouldCapture(padded), true,
         `Expected shouldCapture to return true for: "${padded}"`);
