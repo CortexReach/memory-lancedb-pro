@@ -108,6 +108,8 @@ interface PluginConfig {
   autoRecallPerItemMaxChars?: number;
   /** Hard per-turn injection cap (safety valve). Overrides autoRecallMaxItems if lower. Default: 10. */
   maxRecallPerTurn?: number;
+  /** Agent/session exclusion list for auto-recall. Supports exact match, wildcard prefix (e.g. "pi-"), and "temp:*" for internal reflection sessions. */
+  autoRecallExcludeAgents?: string[];
   recallMode?: "full" | "summary" | "adaptive" | "off";
   /** Agent IDs excluded from auto-recall injection. Useful for background agents (e.g. memory-distiller, cron workers) whose output should not be contaminated by injected memory context. */
   autoRecallExcludeAgents?: string[];
@@ -314,6 +316,45 @@ function resolveSourceFromSessionKey(sessionKey: string | undefined): string {
   const source = match?.[1]?.trim();
   return source || "unknown";
 }
+/**
+ * Check if an agent ID or sessionKey matches any exclusion pattern.
+ * Supports:
+ * - Exact string match (e.g. "memory-distiller")
+ * - Wildcard suffix match (e.g. "pi-" matches "pi-agent", "pi-coder")
+ * - Special "temp:*" pattern matching internal reflection sessions
+ */
+function isAgentOrSessionExcluded(
+  agentId: string,
+  sessionKey: string | undefined,
+  patterns: string[],
+): boolean {
+  if (!Array.isArray(patterns) || patterns.length === 0) return false;
+
+  const cleanAgentId = agentId.trim();
+  const isInternal = typeof sessionKey === "string" &&
+    sessionKey.trim().startsWith("temp:memory-reflection");
+
+  for (const pattern of patterns) {
+    const p = typeof pattern === "string" ? pattern.trim() : "";
+    if (!p) continue;
+
+    if (p === "temp:*") {
+      if (isInternal) return true;
+      continue;
+    }
+
+    if (p.endsWith("-")) {
+      // Wildcard prefix match: "pi-" matches "pi-agent"
+      const prefix = p.slice(0, -1);
+      if (cleanAgentId.startsWith(prefix)) return true;
+    } else if (p === cleanAgentId) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 
 function summarizeAgentEndMessages(messages: unknown[]): string {
   const roleCounts = new Map<string, number>();
@@ -2308,15 +2349,15 @@ const memoryLanceDBProPlugin = {
       const AUTO_RECALL_TIMEOUT_MS = parsePositiveInt(config.autoRecallTimeoutMs) ?? 5_000; // configurable; default raised from 3s to 5s for remote embedding APIs behind proxies
       api.on("before_prompt_build", async (event: any, ctx: any) => {
         // Per-agent exclusion: skip auto-recall for agents in the exclusion list.
-        const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+        const sessionKey = (event as any).sessionKey as string | undefined;
+        const agentId = resolveHookAgentId(ctx?.agentId, sessionKey);
         if (
           Array.isArray(config.autoRecallExcludeAgents) &&
           config.autoRecallExcludeAgents.length > 0 &&
-          agentId !== undefined &&
-          config.autoRecallExcludeAgents.includes(agentId)
+          isAgentOrSessionExcluded(agentId, sessionKey, config.autoRecallExcludeAgents)
         ) {
           api.logger.debug?.(
-            `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}'`,
+            `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}' (sessionKey=${sessionKey ?? "(none)"})',
           );
           return;
         }
@@ -3030,6 +3071,13 @@ const memoryLanceDBProPlugin = {
               ? (event.context as Record<string, unknown>)
               : {};
             const commandSource = typeof contextForLog.commandSource === "string" ? contextForLog.commandSource : "";
+            // Skip self-improvement on internal reflection sessions (consistent with agent:bootstrap guard)
+            if (isInternalReflectionSessionKey(sessionKeyForLog)) {
+              api.logger.debug?.(
+                `self-improvement: command:${action} skipped (internal reflection session sessionKey=${sessionKeyForLog})`,
+              );
+              return;
+            }
             const contextKeys = Object.keys(contextForLog).slice(0, 8).join(",");
             api.logger.info(
               `self-improvement: command:${action} hook start; sessionKey=${sessionKeyForLog || "(none)"}; source=${commandSource || "(unknown)"}; hasMessages=${Array.isArray(event?.messages)}; contextKeys=${contextKeys || "(none)"}`
@@ -3166,6 +3214,21 @@ const memoryLanceDBProPlugin = {
       api.on("before_prompt_build", async (_event: any, ctx: any) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
+        if (
+          Array.isArray(config.autoRecallExcludeAgents) &&
+          config.autoRecallExcludeAgents.length > 0
+        ) {
+          const agentIdForExclude = resolveHookAgentId(
+            typeof ctx.agentId === "string" ? ctx.agentId : undefined,
+            sessionKey,
+          );
+          if (isAgentOrSessionExcluded(agentIdForExclude, sessionKey, config.autoRecallExcludeAgents)) {
+            api.logger.debug?.(
+              `memory-lancedb-pro: reflection inheritance skipped for excluded agent '${agentIdForExclude}'`,
+            );
+            return;
+          }
+        }
         if (reflectionInjectMode !== "inheritance-only" && reflectionInjectMode !== "inheritance+derived") return;
         try {
           pruneReflectionSessionState();
@@ -3193,6 +3256,21 @@ const memoryLanceDBProPlugin = {
       api.on("before_prompt_build", async (_event: any, ctx: any) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
+        if (
+          Array.isArray(config.autoRecallExcludeAgents) &&
+          config.autoRecallExcludeAgents.length > 0
+        ) {
+          const agentIdForExclude = resolveHookAgentId(
+            typeof ctx.agentId === "string" ? ctx.agentId : undefined,
+            sessionKey,
+          );
+          if (isAgentOrSessionExcluded(agentIdForExclude, sessionKey, config.autoRecallExcludeAgents)) {
+            api.logger.debug?.(
+              `memory-lancedb-pro: reflection derived+error injection skipped for excluded agent '${agentIdForExclude}'`,
+            );
+            return;
+          }
+        }
         const agentId = resolveHookAgentId(
           typeof ctx.agentId === "string" ? ctx.agentId : undefined,
           sessionKey,
@@ -3260,32 +3338,36 @@ const memoryLanceDBProPlugin = {
         if (!g[GLOBAL_REFLECTION_LOCK]) g[GLOBAL_REFLECTION_LOCK] = new Map<string, boolean>();
         return g[GLOBAL_REFLECTION_LOCK] as Map<string, boolean>;
       };
-
-      // Serial loop guard: track last reflection time per sessionKey to prevent
-      // gateway-level re-triggering (e.g. session_end → new session → command:new)
-      const REFLECTION_SERIAL_GUARD = Symbol.for("openclaw.memory-lancedb-pro.reflection-serial-guard");
-      const getSerialGuardMap = () => {
-        const g = globalThis as any;
-        if (!g[REFLECTION_SERIAL_GUARD]) g[REFLECTION_SERIAL_GUARD] = new Map<string, number>();
-        return g[REFLECTION_SERIAL_GUARD] as Map<string, number>;
+      const SERIAL_GUARD_COOLDOWN_MS = 120_000; // 2-minute cooldown between reflection triggers
+      const getSerialGuardMap = (): Map<string, number> => {
+        const g = globalThis as Record<string, unknown>;
+        if (!(g as Record<symbol, unknown>)[Symbol.for("openclaw.memory-lancedb-pro.serial-guard")]) {
+          (g as Record<symbol, unknown>)[Symbol.for("openclaw.memory-lancedb-pro.serial-guard")] = new Map<string, number>();
+        }
+        return (g as Record<symbol, unknown>)[Symbol.for("openclaw.memory-lancedb-pro.serial-guard")] as Map<string, number>;
       };
-      const SERIAL_GUARD_COOLDOWN_MS = 120_000; // 2 minutes cooldown per sessionKey
 
       const runMemoryReflection = async (event: any) => {
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
-        // Guard against re-entrant calls for the same session (e.g. file-write triggering another command:new)
-        // Uses global lock shared across all plugin instances to prevent loop amplification.
-        const globalLock = getGlobalReflectionLock();
-        if (sessionKey && globalLock.get(sessionKey)) {
-          api.logger.info(`memory-reflection: skipping re-entrant call for sessionKey=${sessionKey}; already running (global guard)`);
+        // Guard against internal reflection session
+        if (isInternalReflectionSessionKey(sessionKey)) {
+          api.logger.debug?.(
+            `memory-reflection: command hook skipped (internal sessionKey=${sessionKey})`,
+          );
           return;
         }
-        // Serial loop guard: skip if a reflection for this sessionKey completed recently
+        // Guard against re-entrant calls for the same session
+        const globalLock = getGlobalReflectionLock();
+        if (sessionKey && globalLock.get(sessionKey)) {
+          api.logger.info(`memory-reflection: command hook skipped (re-entrant, sessionKey=${sessionKey})`);
+          return;
+        }
+        // Serial loop guard: prevent rapid re-trigger within cooldown window
         if (sessionKey) {
           const serialGuard = getSerialGuardMap();
           const lastRun = serialGuard.get(sessionKey);
           if (lastRun && (Date.now() - lastRun) < SERIAL_GUARD_COOLDOWN_MS) {
-            api.logger.info(`memory-reflection: skipping serial re-trigger for sessionKey=${sessionKey}; last run ${(Date.now() - lastRun) / 1000}s ago (cooldown=${SERIAL_GUARD_COOLDOWN_MS / 1000}s)`);
+            api.logger.info(`memory-reflection: command hook skipped (cooldown ${((Date.now() - lastRun) / 1000).toFixed(0)}s, sessionKey=${sessionKey})`);
             return;
           }
         }
@@ -3298,7 +3380,7 @@ const memoryLanceDBProPlugin = {
           const cfg = context.cfg;
           const workspaceDir = resolveWorkspaceDirFromContext(context);
           if (!cfg) {
-            api.logger.warn(`memory-reflection: command:${action} missing cfg in hook context; skip reflection`);
+            api.logger.warn(`memory-reflection: command:${action} sessionKey=${sessionKey} missing cfg; skip reflection`);
             return;
           }
 
@@ -3343,7 +3425,7 @@ const memoryLanceDBProPlugin = {
               sourceAgentId,
             });
             api.logger.warn(
-              `memory-reflection: command:${action} missing session file after recovery for session ${currentSessionId}; dirs=${searchDirs.join(" | ") || "(none)"}`
+              `memory-reflection: command:${action} sessionKey=${sessionKey} sessionId=${currentSessionId} missing session file after recovery; dirs=${searchDirs.join(" | ") || "(none)"}`
             );
             return;
           }
@@ -3351,7 +3433,7 @@ const memoryLanceDBProPlugin = {
           const conversation = await readSessionConversationWithResetFallback(currentSessionFile, reflectionMessageCount);
           if (!conversation) {
             api.logger.warn(
-              `memory-reflection: command:${action} conversation empty/unusable for session ${currentSessionId}; file=${currentSessionFile}`
+              `memory-reflection: command:${action} sessionKey=${sessionKey} sessionId=${currentSessionId} conversation empty/unusable; file=${currentSessionFile}`
             );
             return;
           }
