@@ -77,6 +77,12 @@ async function runTest() {
   // Edge: neither → static (safe default)
   assert.equal(classifyTemporal("The sky is blue"), "static");
 
+  // Substring false-positive guard: "later" must NOT match "collateral"
+  assert.equal(classifyTemporal("collateral damage report"), "static");
+  assert.equal(classifyTemporal("bilateral trade agreement"), "static");
+  // But standalone "later" should still match
+  assert.equal(classifyTemporal("I will handle this later"), "dynamic");
+
   console.log("  ✅ temporal classification works for EN and ZH");
 
   // ===========================================================================

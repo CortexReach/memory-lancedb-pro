@@ -6,11 +6,14 @@
 
 export type TemporalType = "static" | "dynamic";
 
-// Dynamic keywords — time-sensitive indicators
-const DYNAMIC_KEYWORDS_EN = [
-  "today", "yesterday", "tomorrow", "recently", "currently",
-  "right now", "this week", "this month", "last week", "next week",
-  "this morning", "tonight", "later",
+// Dynamic keywords — time-sensitive indicators.
+// Uses word-boundary regexes for EN to avoid substring false positives
+// (e.g. "later" matching "collateral").
+const DYNAMIC_PATTERNS_EN: RegExp[] = [
+  /\btoday\b/i, /\byesterday\b/i, /\btomorrow\b/i, /\brecently\b/i,
+  /\bcurrently\b/i, /\bright now\b/i, /\bthis week\b/i, /\bthis month\b/i,
+  /\blast week\b/i, /\bnext week\b/i, /\bthis morning\b/i, /\btonight\b/i,
+  /\blater\b/i,
 ];
 
 const DYNAMIC_KEYWORDS_ZH = [
@@ -19,11 +22,11 @@ const DYNAMIC_KEYWORDS_ZH = [
   "今晚", "今早", "稍后", "待会",
 ];
 
-// Static keywords — permanent fact indicators
-const STATIC_KEYWORDS_EN = [
-  "favorite", "prefer", "always", "name is", "born",
-  "graduated", "live in", "work at", "job", "profession",
-  "hobby", "allergic",
+// Static keywords — permanent fact indicators.
+const STATIC_PATTERNS_EN: RegExp[] = [
+  /\bfavorite\b/i, /\bprefer\b/i, /\balways\b/i, /\bname is\b/i,
+  /\bborn\b/i, /\bgraduated\b/i, /\blive in\b/i, /\bwork at\b/i,
+  /\bjob\b/i, /\bprofession\b/i, /\bhobby\b/i, /\ballergic\b/i,
 ];
 
 const STATIC_KEYWORDS_ZH = [
@@ -36,14 +39,12 @@ const STATIC_KEYWORDS_ZH = [
  * Rule-based: keywords → classification. Default: "static" (safer default).
  */
 export function classifyTemporal(text: string): TemporalType {
-  const lower = text.toLowerCase();
-
   const hasDynamic =
-    DYNAMIC_KEYWORDS_EN.some((kw) => lower.includes(kw)) ||
+    DYNAMIC_PATTERNS_EN.some((re) => re.test(text)) ||
     DYNAMIC_KEYWORDS_ZH.some((kw) => text.includes(kw));
 
   const hasStatic =
-    STATIC_KEYWORDS_EN.some((kw) => lower.includes(kw)) ||
+    STATIC_PATTERNS_EN.some((re) => re.test(text)) ||
     STATIC_KEYWORDS_ZH.some((kw) => text.includes(kw));
 
   // If BOTH match → "dynamic" wins (time-sensitive info takes priority)
