@@ -3971,16 +3971,21 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       typeof cfg.retrieval === "object" && cfg.retrieval !== null
         ? (() => {
           const retrieval = { ...(cfg.retrieval as Record<string, unknown>) } as Record<string, unknown>;
-          if (typeof retrieval.rerankApiKey === "string") {
+          // Bug 6 fix: only resolve env vars for rerank fields when reranking is
+          // actually enabled AND the field contains a ${...} placeholder.
+          // This prevents startup failures when reranking is disabled and rerankApiKey
+          // is left as an unresolved placeholder.
+          const rerankEnabled = retrieval.rerank !== "none";
+          if (rerankEnabled && typeof retrieval.rerankApiKey === "string" && retrieval.rerankApiKey.includes("${")) {
             retrieval.rerankApiKey = resolveEnvVars(retrieval.rerankApiKey);
           }
-          if (typeof retrieval.rerankEndpoint === "string") {
+          if (rerankEnabled && typeof retrieval.rerankEndpoint === "string" && retrieval.rerankEndpoint.includes("${")) {
             retrieval.rerankEndpoint = resolveEnvVars(retrieval.rerankEndpoint);
           }
-          if (typeof retrieval.rerankModel === "string") {
+          if (rerankEnabled && typeof retrieval.rerankModel === "string" && retrieval.rerankModel.includes("${")) {
             retrieval.rerankModel = resolveEnvVars(retrieval.rerankModel);
           }
-          if (typeof retrieval.rerankProvider === "string") {
+          if (rerankEnabled && typeof retrieval.rerankProvider === "string" && retrieval.rerankProvider.includes("${")) {
             retrieval.rerankProvider = resolveEnvVars(retrieval.rerankProvider);
           }
           return retrieval as any;
