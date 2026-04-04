@@ -3184,13 +3184,13 @@ const memoryLanceDBProPlugin = {
                   newImportance = Math.max(0.1, newImportance - penaltyOnError);
                 }
                 await store.update(recallId, { importance: newImportance }, undefined);
-                await store.patchMetadata(recallId, { bad_recall_count: badCount }, undefined);
+                await store.patchMetadata(recallId, { bad_recall_count: badCount + 1 }, undefined);
               } else if (badCount >= 2) {
                 if ((meta.injected_count || 0) >= minRecallCountForPenalty) {
                   newImportance = Math.max(0.1, newImportance - penaltyOnMiss);
                 }
                 await store.update(recallId, { importance: newImportance }, undefined);
-                await store.patchMetadata(recallId, { bad_recall_count: badCount }, undefined);
+                await store.patchMetadata(recallId, { bad_recall_count: badCount + 1 }, undefined);
               }
             }
           }
