@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Fix: cumulative turn counting for auto-capture smart extraction (#417, PR #518)
+
+**Bug**: With `extractMinMessages: 2` + `smartExtraction: true`, single-turn DM conversations always fell through to regex fallback, writing dirty data (`l0_abstract == text`, no LLM distillation).
+
+**Root causes**:
+- `autoCaptureSeenTextCount` was overwritten per-event (always 1 for DM), never accumulating
+- `buildAutoCaptureConversationKeyFromIngress` returned `null` for DM (no `conversationId`), so `pendingIngressTexts` was never written
+
+**Changes**:
+- **Cumulative counting**: `autoCaptureSeenTextCount` now accumulates across events instead of overwriting per-event
+- **DM key fallback**: `buildAutoCaptureConversationKeyFromIngress` falls back to `channelId` for DM, fixing `pendingIngressTexts` writes
+- **Smart extraction threshold**: now uses cumulative turn count (`currentCumulativeCount`) instead of per-event message count
+- **`extractMinMessages` cap**: `Math.min(config.extractMinMessages ?? 4, 100)` prevents misconfiguration
+- **MAX_MESSAGE_LENGTH guard**: 5000 char limit in `pendingIngressTexts` prevents OOM
+
+**Note**: `extractMinMessages` semantics changed from "per-event message count" to "cumulative conversation turns". This is a bug fix since the old semantics were broken for DM; a changelog note is included for beta.11 users.
+
+---
+
 ## 1.1.0-beta.2 (Smart Memory Beta + Access Reinforcement)
 
 This is a **beta** release published under the npm dist-tag **`beta`** (it does not affect the stable `latest` channel).
