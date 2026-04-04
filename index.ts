@@ -3104,10 +3104,6 @@ const memoryLanceDBProPlugin = {
         usedRecall = isRecallUsed(responseText, injectedIds, injectedSummaries);
       }
 
-      // Read feedback config values with defaults
-      const fb = config.feedback ?? {};
-      const minRecallCountForPenalty = typeof fb.minRecallCountForPenalty === 'number' ? fb.minRecallCountForPenalty : 2;
-
       // event.prompt is a plain string in the current hook contract (confirmed by codebase usage).
       // We extract the user's last message from event.messages array instead.
       let userPromptText = "";
@@ -4377,12 +4373,55 @@ export function parsePluginConfig(value: unknown): PluginConfig {
                 : 30,
           }
         : { skipLowValue: false, maxExtractionsPerHour: 30 },
-    // Bug 3 fix: parse and return the feedback config block so deployments
-    // that specify custom feedback values actually take effect instead of
-    // falling back to hardcoded defaults.
-    feedback: typeof cfg.feedback === "object" && cfg.feedback !== null
-      ? { ...(cfg.feedback as Record<string, unknown>) }
-      : {},
+    // Proposal A Phase 3: Parse feedback config with proper field mapping and defaults
+    // Maps old field names (boostOnUse, penaltyOnMiss, etc.) to new names (importanceBoostOnUse, etc.)
+    // for backward compatibility with Phase 1 configurations.
+    feedback: (() => {
+      const raw = typeof cfg.feedback === "object" && cfg.feedback !== null
+        ? (cfg.feedback as Record<string, unknown>)
+        : null;
+      if (!raw) return {};
+      return {
+        importanceBoostOnUse:
+          typeof raw.importanceBoostOnUse === "number"
+            ? raw.importanceBoostOnUse
+            : typeof raw.boostOnUse === "number" // backward compat with Phase 1 name
+              ? raw.boostOnUse
+              : 0.05,
+        importanceBoostOnConfirm:
+          typeof raw.importanceBoostOnConfirm === "number"
+            ? raw.importanceBoostOnConfirm
+            : typeof raw.boostOnConfirm === "number" // backward compat with Phase 1 name
+              ? raw.boostOnConfirm
+              : 0.15,
+        importancePenaltyOnMiss:
+          typeof raw.importancePenaltyOnMiss === "number"
+            ? raw.importancePenaltyOnMiss
+            : typeof raw.penaltyOnMiss === "number" // backward compat with Phase 1 name
+              ? raw.penaltyOnMiss
+              : 0.03,
+        importancePenaltyOnError:
+          typeof raw.importancePenaltyOnError === "number"
+            ? raw.importancePenaltyOnError
+            : typeof raw.penaltyOnError === "number" // backward compat with Phase 1 name
+              ? raw.penaltyOnError
+              : 0.10,
+        minRecallCountForPenalty:
+          typeof raw.minRecallCountForPenalty === "number"
+            ? Math.max(1, Math.floor(raw.minRecallCountForPenalty))
+            : 2,
+        minRecallCountForBoost:
+          typeof raw.minRecallCountForBoost === "number"
+            ? Math.max(1, Math.floor(raw.minRecallCountForBoost))
+            : 1,
+        confirmKeywords: Array.isArray(raw.confirmKeywords)
+          ? raw.confirmKeywords.filter((k): k is string => typeof k === "string")
+          : ["是對的", "確認", "正確", "right"],
+        errorKeywords: Array.isArray(raw.errorKeywords)
+          ? raw.errorKeywords.filter((k): k is string => typeof k === "string")
+          : ["錯誤", "不對", "wrong", "not right"],
+      };
+    })(),
   };
 }
 
