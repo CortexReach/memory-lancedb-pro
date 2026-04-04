@@ -17,6 +17,8 @@ import type { TierManager } from "./tier-manager.js";
 import {
   getDecayableFromEntry,
   toLifecycleMemory,
+  isMemoryActiveAt,
+  parseSmartMetadata,
 } from "./smart-metadata.js";
 import { TraceCollector, type RetrievalTrace } from "./retrieval-trace.js";
 import { RetrievalStatsCollector } from "./retrieval-stats.js";
@@ -94,6 +96,10 @@ export interface RetrievalConfig {
    *  Queries containing these prefixes (e.g. "proj:AIF") will use BM25-only + mustContain
    *  to avoid semantic false positives from vector search. */
   tagPrefixes: string[];
+  /** Enable neighbor enrichment for auto-recall (default: true).
+   *  Proactively find vector neighbors of each retrieved memory and merge them in.
+   *  Only applies when source === "auto-recall". */
+  enableNeighborEnrichment?: boolean;
 }
 
 export interface RetrievalContext {
@@ -194,6 +200,7 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   reinforcementFactor: 0.5,
   maxHalfLifeMultiplier: 3,
   tagPrefixes: ["proj", "env", "team", "scope"],
+  enableNeighborEnrichment: true,
 };
 
 // ============================================================================
@@ -645,6 +652,11 @@ export class MemoryRetriever {
         this.accessTracker.recordAccess(results.map((r) => r.entry.id));
       }
 
+      // Proposal B Phase 2: Neighbor enrichment for auto-recall only (#445)
+      if (source === "auto-recall" && this.config.enableNeighborEnrichment !== false) {
+        results = await this.enrichWithNeighbors(results, safeLimit, category);
+      }
+
       return results;
     } catch (error) {
       diagnostics.finalResultCount = 0;
@@ -697,6 +709,85 @@ export class MemoryRetriever {
     }
 
     return { results, trace: finalTrace };
+  }
+
+  /**
+   * B-2: Neighbor enrichment — for each retrieved memory, find vector neighbors
+   * in the same scope and merge them into results.
+   *
+   * Anchor mode: original results are preserved in place. Neighbors only fill
+   * available slots (limit - results.length). No re-sorting by effectiveScore
+   * because hybrid scores and vector scores are not comparable.
+   *
+   * @param results - Original retrieved results
+   * @param limit - Maximum total results to return
+   * @param category - Optional category filter
+   */
+  private async enrichWithNeighbors(
+    results: RetrievalResult[],
+    limit: number,
+    category?: string,
+  ): Promise<RetrievalResult[]> {
+    const MAX_NEIGHBORS_TOTAL = limit;   // Hard cap: neighbors never exceed limit
+    const MAX_PER_RESULT = 2;            // Per-result cap
+    const NEIGHBOR_MIN_SCORE = 0.3;     // Minimum vector similarity threshold
+
+    const seenIds = new Set(results.map((r) => r.entry.id));
+    const neighbors: RetrievalResult[] = [];
+
+    for (const result of results) {
+      if (neighbors.length >= MAX_NEIGHBORS_TOTAL) break;
+
+      try {
+        const vector = await this.embedder.embedQuery(result.entry.text);
+        const hits = await this.store.vectorSearch(
+          vector,
+          MAX_PER_RESULT,
+          NEIGHBOR_MIN_SCORE,
+          [result.entry.scope],
+          { excludeInactive: true },
+        );
+
+        let neighborsAdded = 0;
+        for (const hit of hits) {
+          if (neighbors.length >= MAX_NEIGHBORS_TOTAL) break;
+          if (neighborsAdded >= MAX_PER_RESULT) break;
+
+          // Self-filter: skip if same entry
+          if (hit.entry.id === result.entry.id) continue;
+          // Dedupe: skip if already in results or neighbors
+          if (seenIds.has(hit.entry.id)) continue;
+          // Category filter: only include matching category
+          if (category && hit.entry.category !== category) continue;
+          // Belt-and-suspenders: ensure neighbor is active
+          if (!isMemoryActiveAt(parseSmartMetadata(hit.entry.metadata, hit.entry))) continue;
+          // Quality gate: respect minScore threshold
+          if (hit.score < this.config.minScore) continue;
+
+          neighbors.push({
+            ...hit,
+            sources: { vector: { score: hit.score, rank: 0 } },
+          });
+          seenIds.add(hit.entry.id);
+          neighborsAdded++;
+        }
+      } catch {
+        // Silently skip failed neighbor lookups — don't break the whole retrieval
+      }
+    }
+
+    // ── Anchor mode merge ──
+    // If original results already fill the limit, discard all neighbors.
+    // Otherwise, append neighbors to fill available slots.
+    if (results.length >= limit) {
+      return results.slice(0, limit);
+    }
+
+    const slotsAvailable = limit - results.length;
+    return [
+      ...results,
+      ...neighbors.slice(0, slotsAvailable),
+    ];
   }
 
   private extractTagTokens(query: string): string[] {
