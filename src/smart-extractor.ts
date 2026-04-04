@@ -72,10 +72,14 @@ import { batchDedup } from "./batch-dedup.js";
 export function stripEnvelopeMetadata(text: string): string {
   // 0. Strip runtime orchestration wrappers that should never become memories
   //    (sub-agent task scaffolding is execution metadata, not conversation content).
+  //    Strip the entire wrapper line (prefix + all inline content) so that subagent
+  //    instruction fragments like 'You are running as a subagent (depth 1/1).' are not
+  //    left behind when inline content does not match the old optional-group patterns.
   let cleaned = text.replace(
-    /^\[(?:Subagent Context|Subagent Task)\]\s*(?:You are running as a subagent.*?(?:$|(?<=\.)\s+)|Results auto-announce to your requester\.?\s*|do not busy-poll for status\.?\s*|Reply with a brief acknowledgment only\.?\s*|Do not use any memory tools\.?\s*)?/gim,
+    /^\[(?:Subagent Context|Subagent Task)\].*/gim,
     "",
   );
+  // Strip standalone boilerplate continuation lines that appear on their own.
   cleaned = cleaned.replace(
     /^(?:Results auto-announce to your requester\.?|do not busy-poll for status\.?|Do not use any memory tools\.?)\s*$/gim,
     "",
