@@ -96,6 +96,7 @@ function stripLeadingRuntimeWrappers(text: string): string {
   const lines = trimmed.split("\n");
   const cleanedLines: string[] = [];
   let strippingLeadIn = true;
+  let sawWrapperPrefix = false;
 
   for (const line of lines) {
     const current = line.trim();
@@ -109,8 +110,22 @@ function stripLeadingRuntimeWrappers(text: string): string {
       if (cleaned) {
         cleanedLines.push(cleaned);
         strippingLeadIn = false;
+        sawWrapperPrefix = true;
       }
       continue;
+    }
+
+    // Bug fix: also strip known boilerplate continuation lines (e.g.
+    // "Results auto-announce to your requester.", "Do not use any memory tools.")
+    // that appear right after the wrapper prefix. These lines do NOT match the
+    // wrapper prefix regex but are part of the wrapper boilerplate.
+    // Guard with sawWrapperPrefix so we don't skip boilerplate-like user content
+    // that appears BEFORE any wrapper prefix is seen.
+    if (strippingLeadIn && sawWrapperPrefix) {
+      AUTO_CAPTURE_RUNTIME_WRAPPER_BOILERPLATE_RE.lastIndex = 0;
+      if (AUTO_CAPTURE_RUNTIME_WRAPPER_BOILERPLATE_RE.test(current)) {
+        continue;
+      }
     }
 
     strippingLeadIn = false;
