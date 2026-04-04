@@ -203,6 +203,10 @@ interface PluginConfig {
     thinkLevel?: ReflectionThinkLevel;
     errorReminderMaxEntries?: number;
     dedupeErrorSignals?: boolean;
+    /** Cooldown in milliseconds between reflection triggers for the same session.
+     *  Default: 120000 (2 minutes). Set to 0 to disable the serial guard.
+     *  @example 60000 (1 min), 180000 (3 min) */
+    serialCooldownMs?: number;
   };
   mdMirror?: { enabled?: boolean; dir?: string };
   workspaceBoundary?: WorkspaceBoundaryConfig;
@@ -3360,13 +3364,22 @@ const memoryLanceDBProPlugin = {
           api.logger.info(`memory-reflection: command hook skipped (re-entrant, sessionKey=${sessionKey})`);
           return;
         }
+        // Parse context before guards so cfg is available
+        const context = (event.context || {}) as Record<string, unknown>;
+        const cfg = context.cfg as Record<string, unknown> | undefined;
+
         // Serial loop guard: prevent rapid re-trigger within cooldown window
         if (sessionKey) {
           const serialGuard = getSerialGuardMap();
           const lastRun = serialGuard.get(sessionKey);
-          if (lastRun && (Date.now() - lastRun) < SERIAL_GUARD_COOLDOWN_MS) {
-            api.logger.info(`memory-reflection: command hook skipped (cooldown ${((Date.now() - lastRun) / 1000).toFixed(0)}s, sessionKey=${sessionKey})`);
-            return;
+          if (lastRun) {
+            const cooldownMs = typeof (cfg?.memoryReflection as Record<string, unknown> | undefined)?.serialCooldownMs === "number"
+              ? (cfg!.memoryReflection as Record<string, unknown>).serialCooldownMs as number
+              : 120_000;
+            if ((Date.now() - lastRun) < cooldownMs) {
+              api.logger.info(`memory-reflection: command hook skipped (cooldown ${((Date.now() - lastRun) / 1000).toFixed(0)}s/${(cooldownMs / 1000).toFixed(0)}s, sessionKey=${sessionKey})`);
+              return;
+            }
           }
         }
         if (sessionKey) globalLock.set(sessionKey, true);
@@ -3374,8 +3387,6 @@ const memoryLanceDBProPlugin = {
         try {
           pruneReflectionSessionState();
           const action = String(event?.action || "unknown");
-          const context = (event.context || {}) as Record<string, unknown>;
-          const cfg = context.cfg;
           const workspaceDir = resolveWorkspaceDirFromContext(context);
           if (!cfg) {
             api.logger.warn(`memory-reflection: command:${action} sessionKey=${sessionKey} missing cfg; skip reflection`);
