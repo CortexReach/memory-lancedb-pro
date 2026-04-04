@@ -47,6 +47,7 @@ import {
   extractReflectionLearningGovernanceCandidates,
   extractInjectableReflectionMappedMemoryItems,
 } from "./src/reflection-slices.js";
+import { expandDerivedWithBm25 } from "./src/bm25-expansion.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
@@ -1985,7 +1986,8 @@ const memoryLanceDBProPlugin = {
         });
       }
       const { invariants, derived } = slices;
-      const next = { updatedAt: Date.now(), invariants, derived };
+      const expandedDerived = await expandDerivedWithBm25(derived, scopeFilter, store, api);
+      const next = { updatedAt: Date.now(), invariants, derived: expandedDerived };
       reflectionByAgentCache.set(cacheKey, next);
       return next;
     };
