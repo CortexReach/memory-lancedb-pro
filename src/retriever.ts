@@ -749,11 +749,7 @@ export class MemoryRetriever {
       );
 
       failureStage = "vector.postProcess";
-      // Bug 7 fix: when decayEngine is active, skip applyRecencyBoost here because
-      // decayEngine already handles temporal scoring; avoid double-boost.
-      const recencyBoosted = this.decayEngine
-        ? mapped
-        : this.applyRecencyBoost(mapped);
+      const recencyBoosted = this.applyRecencyBoost(mapped);
       if (diagnostics) diagnostics.stageCounts.afterRecency = recencyBoosted.length;
       const weighted = this.decayEngine
         ? recencyBoosted
