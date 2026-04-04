@@ -1137,7 +1137,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           }
 
           try {
-            const vector = await context.embedder!.embedQuery(text);
+            const vector = await context.embedder!.embedPassage(text);
             await context.store.store({
               text,
               vector,

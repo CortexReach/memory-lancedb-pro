@@ -1629,7 +1629,6 @@ const memoryLanceDBProPlugin = {
       api.logger.debug("memory-lancedb-pro: register() called again — skipping re-init (idempotent)");
       return;
     }
-    _initialized = true;
 
     // Parse and validate configuration
     const config = parsePluginConfig(api.pluginConfig);
@@ -3730,6 +3729,7 @@ const memoryLanceDBProPlugin = {
         // Run initial backup after a short delay, then schedule daily
         setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+        _initialized = true;
       },
       stop: async () => {
         if (backupTimer) {
