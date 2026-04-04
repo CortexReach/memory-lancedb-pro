@@ -3125,9 +3125,20 @@ const memoryLanceDBProPlugin = {
     // Proposal A Phase 1: session_end hook - Clean up pending recalls
     // ========================================================================
     api.on("session_end", (_event: any, ctx: any) => {
-      const sessionKey = ctx?.sessionKey || ctx?.sessionId || "default";
-      if (sessionKey) {
-        pendingRecall.delete(sessionKey);
+      // P1 fix: clean all pendingRecall entries for this session, including composite keys.
+      // When autoCapture is false, the auto-capture session_end (priority 10) is skipped,
+      // so this hook must handle composite keys (sessionKey:agentId) as well.
+      const sessionId = ctx?.sessionId || "";
+      const sessionKey = ctx?.sessionKey || "";
+      for (const key of pendingRecall.keys()) {
+        if (
+          key === sessionKey ||
+          key === sessionId ||
+          key.startsWith(`${sessionKey}:`) ||
+          key.startsWith(`${sessionId}:`)
+        ) {
+          pendingRecall.delete(key);
+        }
       }
     }, { priority: 20 });
 
