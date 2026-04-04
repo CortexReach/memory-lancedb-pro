@@ -1315,4 +1315,90 @@ assert.ok(
   ),
 );
 
+// ============================================================
+// Test: cumulative turn counting with extractMinMessages=2
+// Verifies issue #417 fix: 2 sequential agent_end events should
+// trigger smart extraction on turn 2 (cumulative count >= 2).
+// ============================================================
+
+async function runCumulativeTurnCountingScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-cumulative-turn-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  const embeddingServer = createEmbeddingServer();
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    const api = createMockApi(
+      dbPath,
+      `http://127.0.0.1:${embeddingPort}/v1`,
+      "http://127.0.0.1:9",
+      logs,
+      // extractMinMessages=2 (the key setting for this test)
+      { extractMinMessages: 2, smartExtraction: true, captureAssistant: false },
+    );
+    plugin.register(api);
+
+    const sessionKey = "agent:main:discord:dm:user123";
+    const channelId = "discord";
+    const conversationId = "dm:user123";
+
+    // Turn 1: message_received -> agent_end
+    await api.hooks.message_received(
+      { from: "user:user123", content: "我的名字是小明" },
+      { channelId, conversationId, accountId: "default" },
+    );
+    await runAgentEndHook(
+      api,
+      {
+        success: true,
+        messages: [{ role: "user", content: "我的名字是小明" }],
+      },
+      { agentId: "main", sessionKey },
+    );
+
+    // Turn 2: message_received -> agent_end (this should trigger smart extraction)
+    await api.hooks.message_received(
+      { from: "user:user123", content: "我喜歡游泳" },
+      { channelId, conversationId, accountId: "default" },
+    );
+    await runAgentEndHook(
+      api,
+      {
+        success: true,
+        messages: [{ role: "user", content: "我喜歡游泳" }],
+      },
+      { agentId: "main", sessionKey },
+    );
+
+    const smartExtractionTriggered = logs.some((entry) =>
+      entry[1].includes("running smart extraction") &&
+      entry[1].includes("cumulative=")
+    );
+    const smartExtractionSkipped = logs.some((entry) =>
+      entry[1].includes("skipped smart extraction") &&
+      entry[1].includes("cumulative=1")
+    );
+
+    return { logs, smartExtractionTriggered, smartExtractionSkipped };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const cumulativeResult = await runCumulativeTurnCountingScenario();
+// Turn 2 must trigger smart extraction (cumulative >= 2)
+assert.ok(cumulativeResult.smartExtractionTriggered,
+  "Smart extraction should trigger on turn 2 with cumulative count >= 2. Logs: " +
+  cumulativeResult.logs.map((e) => e[1]).join(" | "));
+// Turn 1 must have been skipped (cumulative=1 < 2)
+assert.ok(cumulativeResult.smartExtractionSkipped,
+  "Turn 1 should skip smart extraction (cumulative=1 < 2). Logs: " +
+  cumulativeResult.logs.map((e) => e[1]).join(" | "));
+
 console.log("OK: smart extractor branch regression test passed");
