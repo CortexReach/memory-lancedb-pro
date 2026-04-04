@@ -111,8 +111,6 @@ interface PluginConfig {
   /** Agent/session exclusion list for auto-recall. Supports exact match, wildcard prefix (e.g. "pi-"), and "temp:*" for internal reflection sessions. */
   autoRecallExcludeAgents?: string[];
   recallMode?: "full" | "summary" | "adaptive" | "off";
-  /** Agent IDs excluded from auto-recall injection. Useful for background agents (e.g. memory-distiller, cron workers) whose output should not be contaminated by injected memory context. */
-  autoRecallExcludeAgents?: string[];
   captureAssistant?: boolean;
   retrieval?: {
     mode?: "hybrid" | "vector";
