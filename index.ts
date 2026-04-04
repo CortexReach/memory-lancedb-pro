@@ -1973,7 +1973,7 @@ const memoryLanceDBProPlugin = {
       // Fall back to an uncategorized scan only when the category query produced no
       // agent-owned reflection slices, preserving backward compatibility with mixed-schema stores.
       let entries = await store.list(scopeFilter, "reflection", 240, 0);
-      let slices = loadAgentReflectionSlicesFromEntries({
+      let slices = await loadAgentReflectionSlicesFromEntries({
         entries,
         agentId,
         deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
@@ -1994,7 +1994,7 @@ const memoryLanceDBProPlugin = {
             return false;
           }
         });
-        slices = loadAgentReflectionSlicesFromEntries({
+        slices = await loadAgentReflectionSlicesFromEntries({
           entries,
           agentId,
           deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
@@ -4146,6 +4146,14 @@ export function parsePluginConfig(value: unknown): PluginConfig {
                 : 30,
           }
         : { skipLowValue: false, maxExtractionsPerHour: 30 },
+    bm25NeighborExpansion:
+      typeof cfg.bm25NeighborExpansion === "object" && cfg.bm25NeighborExpansion !== null
+        ? {
+          enabled: (cfg.bm25NeighborExpansion as Record<string, unknown>).enabled !== false,
+          maxCandidates: parsePositiveInt((cfg.bm25NeighborExpansion as Record<string, unknown>).maxCandidates) ?? 5,
+          maxNeighborsPerCandidate: parsePositiveInt((cfg.bm25NeighborExpansion as Record<string, unknown>).maxNeighborsPerCandidate) ?? 3,
+        }
+        : undefined,
   };
 }
 

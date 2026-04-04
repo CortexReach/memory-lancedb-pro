@@ -303,21 +303,19 @@ export function expandDerivedWithBm25BeforeRank(
   const maxCandidates = Math.max(1, Math.floor(config?.maxCandidates ?? 5));
   const maxNeighborsPerCandidate = Math.max(1, Math.floor(config?.maxNeighborsPerCandidate ?? 3));
 
-  // D2 guard: only run if scopeFilter is defined
-  if (scopeFilter === undefined) return Promise.resolve(derived);
-
   // Check if expansion is enabled (can be disabled via config)
+  // FIX: 移到 scopeFilter 之前，讓 caller 可透過 enabled: false 明確停用
   if (config?.enabled === false) return Promise.resolve(derived);
 
-  // BM25 neighbors use current time as fake timestamp, simulating "fresh knowledge"
-  const now = Date.now();
+  // D2 guard: only run if scopeFilter is defined
+  if (scopeFilter === undefined) return Promise.resolve(derived);
   // Default decay params for BM25 neighbors (conservative quality to avoid over-weighting)
   const NEIGHBOR_MIDPOINT_DAYS = REFLECTION_DERIVE_LOGISTIC_MIDPOINT_DAYS;
   const NEIGHBOR_K = REFLECTION_DERIVE_LOGISTIC_K;
   const NEIGHBOR_BASE_WEIGHT = REFLECTION_DERIVE_FALLBACK_BASE_WEIGHT;
 
   // Collect all BM25 search promises
-  const searchPromises: Array<{ queryText: string; normalizedKey: string }> = [];
+  const searchPromises: Array<{ queryText: string; normalizedKey: string; candidateTimestamp: number }> = [];
   for (let i = 0; i < Math.min(maxCandidates, derived.length); i++) {
     const candidate = derived[i];
     if (!candidate) continue;
@@ -327,6 +325,7 @@ export function expandDerivedWithBm25BeforeRank(
     searchPromises.push({
       queryText,
       normalizedKey: queryText.toLowerCase(),
+      candidateTimestamp: Number.isFinite(candidate.timestamp) ? candidate.timestamp : Date.now(),
     });
   }
 
@@ -350,6 +349,7 @@ export function expandDerivedWithBm25BeforeRank(
 
     for (const result of results) {
       let neighborCount = 0; // Per-candidate neighbor counter
+      const neighborTimestamp = result.candidateTimestamp;
 
       // Add current candidate to seen (skip self)
       seen.add(result.normalizedKey);
@@ -373,12 +373,14 @@ export function expandDerivedWithBm25BeforeRank(
 
         // Construct WeightedLineCandidate for this BM25 neighbor.
         // quality = 0.2 + 0.6 * bm25Score（乘法加成，高相關 → 高 quality → 高分）
+        // FIX: neighbor.timestamp = candidate.timestamp（而非 now），
+        // 避免 aggregation 時 neighbor 文字覆蓋 derived 文字
         const safeBmScore = Math.max(0, Math.min(1, hit.score));
         const quality = 0.2 + 0.6 * safeBmScore;
 
         allNeighbors.push({
           line: neighborText,
-          timestamp: now,
+          timestamp: neighborTimestamp,
           midpointDays: NEIGHBOR_MIDPOINT_DAYS,
           k: NEIGHBOR_K,
           baseWeight: NEIGHBOR_BASE_WEIGHT,
