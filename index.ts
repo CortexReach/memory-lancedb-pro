@@ -1345,7 +1345,7 @@ export function detectCategory(
     return "decision";
   }
   if (
-    /\+\d{10,}|@[\w.-]+\.\w+|is called|jmenuje se|我的\S+是|叫我|稱呼|称呼|heiße|heißt|mein name/i.test(
+    /\+\d{10,}|@[\w.-]+\.\w+|is called|jmenuje se|我的\S+是|叫我|稱呼|称呼|heiße|heißt|mein name/iu.test(
       lower,
     )
   ) {
