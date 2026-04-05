@@ -2746,18 +2746,10 @@ const memoryLanceDBProPlugin = {
 
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
           let texts = newTexts;
-          // [Fix #5] isExplicitRememberCommand: guard against empty pendingIngressTexts
-          const lastPending = pendingIngressTexts.length > 0
-            ? pendingIngressTexts[pendingIngressTexts.length - 1]
-            : (eligibleTexts.length === 1 ? eligibleTexts[0] : null);
-          if (
-            texts.length === 1 &&
-            lastPending !== null &&
-            isExplicitRememberCommand(lastPending) &&
-            priorRecentTexts.length > 0
-          ) {
-            texts = [...pendingIngressTexts, ...priorRecentTexts.slice(-1), ...eligibleTexts];
-          }
+          // [Fix #5 REMOVED] isExplicitRememberCommand guard: unreachable under REPLACE strategy.
+          // With REPLACE, texts = pendingIngressTexts (length typically > 1 in multi-turn),
+          // so texts.length === 1 guard can never trigger.
+          // This guard was designed for the old APPEND strategy and is obsolete.
           if (newTexts.length > 0) {
             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
