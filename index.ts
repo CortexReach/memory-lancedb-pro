@@ -113,6 +113,8 @@ interface PluginConfig {
   recallMode?: "full" | "summary" | "adaptive" | "off";
   /** Agent IDs excluded from auto-recall injection. Useful for background agents (e.g. memory-distiller, cron workers) whose output should not be contaminated by injected memory context. */
   autoRecallExcludeAgents?: string[];
+  /** Agent IDs included in auto-recall injection (whitelist mode). When set, ONLY these agents receive auto-recall. Cannot be used together with autoRecallExcludeAgents. */
+  autoRecallIncludeAgents?: string[];
   captureAssistant?: boolean;
   retrieval?: {
     mode?: "hybrid" | "vector";
@@ -2291,18 +2293,29 @@ const memoryLanceDBProPlugin = {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (sessionKey.includes(":subagent:")) return;
 
-        // Per-agent exclusion: skip auto-recall for agents in the exclusion list.
+        // Per-agent inclusion/exclusion: autoRecallIncludeAgents takes precedence over autoRecallExcludeAgents.
+        // - If autoRecallIncludeAgents is set: ONLY these agents receive auto-recall
+        // - Else if autoRecallExcludeAgents is set: all agents EXCEPT these receive auto-recall
+
         const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
-        if (
-          Array.isArray(config.autoRecallExcludeAgents) &&
-          config.autoRecallExcludeAgents.length > 0 &&
-          agentId !== undefined &&
-          config.autoRecallExcludeAgents.includes(agentId)
-        ) {
-          api.logger.debug?.(
-            `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}'`,
-          );
-          return;
+        if (agentId !== undefined) {
+          if (Array.isArray(config.autoRecallIncludeAgents) && config.autoRecallIncludeAgents.length > 0) {
+            if (!config.autoRecallIncludeAgents.includes(agentId)) {
+              api.logger.debug?.(
+                `memory-lancedb-pro: auto-recall skipped for agent '${agentId}' not in autoRecallIncludeAgents`,
+              );
+              return;
+            }
+          } else if (
+            Array.isArray(config.autoRecallExcludeAgents) &&
+            config.autoRecallExcludeAgents.length > 0 &&
+            config.autoRecallExcludeAgents.includes(agentId)
+          ) {
+            api.logger.debug?.(
+              `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}'`,
+            );
+            return;
+          }
         }
 
         // Manually increment turn counter for this session
@@ -3996,6 +4009,9 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     recallMode: (cfg.recallMode === "full" || cfg.recallMode === "summary" || cfg.recallMode === "adaptive" || cfg.recallMode === "off") ? cfg.recallMode : "full",
     autoRecallExcludeAgents: Array.isArray(cfg.autoRecallExcludeAgents)
       ? cfg.autoRecallExcludeAgents.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+      : undefined,
+    autoRecallIncludeAgents: Array.isArray(cfg.autoRecallIncludeAgents)
+      ? cfg.autoRecallIncludeAgents.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
       : undefined,
     captureAssistant: cfg.captureAssistant === true,
     retrieval:
