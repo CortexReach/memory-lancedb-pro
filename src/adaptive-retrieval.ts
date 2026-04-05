@@ -10,7 +10,7 @@ const SKIP_PATTERNS = [
   // Greetings & pleasantries
   /^(hi|hello|hey|good\s*(morning|afternoon|evening|night)|greetings|yo|sup|howdy|what'?s up)\b/i,
   // System/bot commands
-  /^\/[a-z][\w-]*\s*$/i,  // slash commands like /help, /recall
+  /^\/[a-z][\w-]*(\s|$)/i,  // slash commands like /help, /recall my name
   /^(run|build|test|ls|cd|git|npm|pip|docker|curl|cat|grep|find|make|sudo)\b/i,
   // Simple affirmations/negations
   /^(yes|no|yep|nope|ok|okay|sure|fine|thanks|thank you|thx|ty|got it|understood|cool|nice|great|good|perfect|awesome|👍|👎|✅|❌)\s*[.!]?$/i,
@@ -73,7 +73,7 @@ export function shouldSkipRetrieval(query: string, minLength?: number): boolean 
   // Force retrieve if query has memory-related intent (checked FIRST,
   // before length check, so short CJK queries like "你记得吗" aren't skipped)
   // 注意：slash 命令（如 /recall）优先走 SKIP 路径，不走 FORCE 路径
-  const isSlashCmd = /^\/[a-z][\w-]*\s*$/i.test(trimmed);
+  const isSlashCmd = /^\/[a-z][\w-]*(\s|$)/i.test(trimmed);
   if (!isSlashCmd && FORCE_RETRIEVE_PATTERNS.some(p => p.test(trimmed))) return false;
 
   // Too short to be meaningful

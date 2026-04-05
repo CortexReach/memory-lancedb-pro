@@ -50,6 +50,18 @@ describe("shouldSkipRetrieval", () => {
     it("does not skip API paths", () => {
       assert.equal(shouldSkipRetrieval("/api/v2/users"), false);
     });
+
+    it("skips slash commands with arguments", () => {
+      assert.equal(shouldSkipRetrieval("/recall my name"), true);
+    });
+
+    it("skips slash commands with content arguments", () => {
+      assert.equal(shouldSkipRetrieval("/remember user prefers dark mode"), true);
+    });
+
+    it("skips slash commands with lesson content", () => {
+      assert.equal(shouldSkipRetrieval("/lesson always use strict mode"), true);
+    });
   });
 
   // --- CJK short text threshold fix ---
