@@ -4139,7 +4139,7 @@ export function resetRegistration() {
   // Note: WeakSets cannot be cleared by design. In test scenarios where the
   // same process reloads the module, a fresh module state means a new WeakSet.
   // For hot-reload scenarios, the module is re-imported fresh.
-  _registeredApis.clear();
+  // (WeakSet.clear() does not exist, so we do nothing here.)
 }
 
 export default memoryLanceDBProPlugin;
