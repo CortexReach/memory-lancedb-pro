@@ -46,6 +46,8 @@ export interface SmartMemoryMetadata {
   last_accessed_at: number;
   valid_from: number;
   invalidated_at?: number;
+  memory_temporal_type?: "static" | "dynamic";
+  valid_until?: number;
   fact_key?: string;
   supersedes?: string;
   superseded_by?: string;
@@ -71,6 +73,7 @@ export interface LifecycleMemory {
   accessCount: number;
   createdAt: number;
   lastAccessedAt: number;
+  temporalType?: "static" | "dynamic";
 }
 
 function clamp01(value: unknown, fallback: number): number {
@@ -234,6 +237,18 @@ export function isMemoryActiveAt(
   return !metadata.invalidated_at || metadata.invalidated_at > at;
 }
 
+/**
+ * Check if a memory has passed its expiry date (valid_until).
+ * Separate from isMemoryActiveAt (which checks invalidated_at from superseding).
+ * Returns false if valid_until is not set (no expiry = permanent).
+ */
+export function isMemoryExpired(
+  metadata: Pick<SmartMemoryMetadata, "valid_until">,
+  at: number = Date.now(),
+): boolean {
+  return metadata.valid_until != null && metadata.valid_until <= at;
+}
+
 export function parseSmartMetadata(
   rawMetadata: string | undefined,
   entry: EntryLike = {},
@@ -290,6 +305,11 @@ export function parseSmartMetadata(
     valid_from: validFrom,
     invalidated_at:
       invalidatedAt && invalidatedAt >= validFrom ? invalidatedAt : undefined,
+    memory_temporal_type:
+      parsed.memory_temporal_type === "static" || parsed.memory_temporal_type === "dynamic"
+        ? parsed.memory_temporal_type
+        : undefined,
+    valid_until: normalizeOptionalTimestamp(parsed.valid_until),
     fact_key:
       normalizeOptionalString(parsed.fact_key) ??
       deriveFactKey(
@@ -356,6 +376,16 @@ export function buildSmartMetadata(
     valid_from: validFrom,
     invalidated_at:
       invalidatedAt && invalidatedAt >= validFrom ? invalidatedAt : undefined,
+    memory_temporal_type:
+      patch.memory_temporal_type === undefined
+        ? base.memory_temporal_type
+        : patch.memory_temporal_type === "static" || patch.memory_temporal_type === "dynamic"
+          ? patch.memory_temporal_type
+          : undefined,
+    valid_until:
+      patch.valid_until === undefined
+        ? base.valid_until
+        : normalizeOptionalTimestamp(patch.valid_until),
     fact_key:
       normalizeOptionalString(patch.fact_key) ??
       base.fact_key ??
@@ -465,6 +495,9 @@ export function toLifecycleMemory(
     accessCount: metadata.access_count,
     createdAt,
     lastAccessedAt: metadata.last_accessed_at || createdAt,
+    temporalType: metadata.memory_temporal_type === "dynamic" ? "dynamic"
+      : metadata.memory_temporal_type === "static" ? "static"
+      : undefined,
   };
 }
 
@@ -492,6 +525,9 @@ export function getDecayableFromEntry(
     accessCount: meta.access_count,
     createdAt,
     lastAccessedAt: meta.last_accessed_at || createdAt,
+    temporalType: meta.memory_temporal_type === "dynamic" ? "dynamic"
+      : meta.memory_temporal_type === "static" ? "static"
+      : undefined,
   };
 
   return { memory, meta };

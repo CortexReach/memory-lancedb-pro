@@ -20,6 +20,7 @@ import {
   parseSmartMetadata,
   stringifySmartMetadata,
 } from "./smart-metadata.js";
+import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
 import { TEMPORAL_VERSIONED_CATEGORIES } from "./memory-categories.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./self-improvement-files.js";
 import { getDisplayCategoryTag } from "./reflection-metadata.js";
@@ -769,6 +770,10 @@ export function registerMemoryStoreTool(
           const safeImportance = clamp01(importance, 0.7);
           const vector = await runtimeContext.embedder.embedPassage(text);
 
+          // Temporal awareness: classify and infer expiry
+          const temporalType = classifyTemporal(text);
+          const validUntil = inferExpiry(text);
+
           // Check for duplicates / supersede candidates using raw vector similarity
           // (bypasses importance/recency weighting).
           // Fail-open by design: dedup must never block a legitimate memory write.
@@ -933,6 +938,8 @@ export function registerMemoryStoreTool(
                   last_confirmed_use_at: Date.now(),
                   bad_recall_count: 0,
                   suppressed_until_turn: 0,
+                  memory_temporal_type: temporalType,
+                  valid_until: validUntil,
                 },
               ),
             ),
