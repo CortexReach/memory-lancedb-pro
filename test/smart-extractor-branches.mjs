@@ -65,7 +65,7 @@ function createEmbeddingServer() {
   });
 }
 
-function createMockApi(dbPath, embeddingBaseURL, llmBaseURL, logs) {
+function createMockApi(dbPath, embeddingBaseURL, llmBaseURL, logs, pluginConfigOverrides = {}) {
   return {
     pluginConfig: {
       dbPath,
@@ -73,6 +73,7 @@ function createMockApi(dbPath, embeddingBaseURL, llmBaseURL, logs) {
       autoRecall: false,
       smartExtraction: true,
       extractMinMessages: 2,
+      ...pluginConfigOverrides,
       embedding: {
         apiKey: "dummy",
         model: "qwen3-embedding-4b",
