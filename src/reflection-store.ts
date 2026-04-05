@@ -223,18 +223,185 @@ function resolveReflectionImportance(kind: ReflectionStoreKind): number {
   return 0.75;
 }
 
+/**
+ * BM25 neighbor expansion configuration (Option B for Issue #513).
+ * 在 rankReflectionLines() 之前，用候選文字當 BM25 query 找相關 memories 並 boost 分數，
+ * 讓 fresh session 也能受益於相關記憶。
+ */
+export interface Bm25NeighborExpansionConfig {
+  /** 是否啟用 BM25 expansion（預設 true） */
+  enabled?: boolean;
+  /** 對 top-N candidates 做 BM25 expansion（預設 5） */
+  maxCandidates?: number;
+  /** 每個 candidate 最多取幾個 BM25 neighbors（預設 3） */
+  maxNeighborsPerCandidate?: number;
+}
+
+/**
+ * BM25 search 函式簽名（來自 MemoryStore.bm25Search）。
+ * 用於在 expansion 時查詢相關 memories。
+ */
+export type Bm25SearchFn = (
+  query: string,
+  limit?: number,
+  scopeFilter?: string[],
+  options?: { excludeInactive?: boolean }
+) => Promise<MemorySearchResult[]>;
+
 export interface LoadReflectionSlicesParams {
   entries: MemoryEntry[];
   agentId: string;
   now?: number;
   deriveMaxAgeMs?: number;
   invariantMaxAgeMs?: number;
+  /** BM25 search 函式（來自 store.bm25Search），用於 derived expansion */
+  bm25Search?: Bm25SearchFn;
+  /** Scope filter 传递给 BM25 search */
+  scopeFilter?: string[];
+  /** BM25 neighbor expansion 設定（預設啟用） */
+  bm25NeighborExpansion?: Bm25NeighborExpansionConfig;
 }
 
-export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlicesParams): {
+/**
+ * Option B BM25 Neighbor Expansion（Issue #513）。
+ *
+ * 在 loadAgentReflectionSlicesFromEntries 的 rankReflectionLines() 之前，
+ * 對 top-N derived candidates 執行 BM25 expansion，
+ * 找相關 non-reflection memories 並乘法加成其分數，
+ * 解決 fresh session（無 prior reflection history）無法和相關記憶建立關聯的問題。
+ *
+ * 防禦機制（從 PR #503 保留）：
+ * - D1: seen = new Set() 空初始化（避免重複）
+ * - D2: scopeFilter !== undefined guard
+ * - D3: Cap at 16 total
+ * - D4: Truncate to first line, 120 chars
+ * - D6: Neighbors before base derived（prepend 而非 append）
+ *
+ * @param derived       derived candidates 文字陣列（來自 rankReflectionLines 前的候選）
+ * @param bm25Search    store.bm25Search 函式
+ * @param scopeFilter   scope 過濾陣列（用於 BM25 查詢）
+ * @param config        expansion 設定（maxCandidates, maxNeighborsPerCandidate）
+ * @returns 經 BM25 boost 的 expanded derived WeightedLineCandidate 陣列
+ */
+/**
+ * BM25 neighbor expansion helper (non-async, uses explicit Promise chain)。
+ * 使用 Promise chain 而非 async/await，以避免 jiti v2 TypeScript transpiler 的 parse error。
+ */
+export function expandDerivedWithBm25BeforeRank(
+  derived: WeightedLineCandidate[],
+  bm25Search: Bm25SearchFn | undefined,
+  scopeFilter: string[] | undefined,
+  config?: Bm25NeighborExpansionConfig
+): Promise<WeightedLineCandidate[]> {
+  // D1: early return if derived is empty
+  if (!derived || derived.length === 0) return Promise.resolve([]);
+
+  // Skip if bm25Search is not available (fresh session bypass - Phase 1)
+  if (!bm25Search) return Promise.resolve(derived);
+
+  // Apply defaults
+  const maxCandidates = Math.max(1, Math.floor(config?.maxCandidates ?? 5));
+  const maxNeighborsPerCandidate = Math.max(1, Math.floor(config?.maxNeighborsPerCandidate ?? 3));
+
+  // Check if expansion is enabled (can be disabled via config)
+  // FIX: 移到 scopeFilter 之前，讓 caller 可透過 enabled: false 明確停用
+  if (config?.enabled === false) return Promise.resolve(derived);
+
+  // D2 guard: only run if scopeFilter is defined
+  if (scopeFilter === undefined) return Promise.resolve(derived);
+  // Default decay params for BM25 neighbors (conservative quality to avoid over-weighting)
+  const NEIGHBOR_MIDPOINT_DAYS = REFLECTION_DERIVE_LOGISTIC_MIDPOINT_DAYS;
+  const NEIGHBOR_K = REFLECTION_DERIVE_LOGISTIC_K;
+  const NEIGHBOR_BASE_WEIGHT = REFLECTION_DERIVE_FALLBACK_BASE_WEIGHT;
+
+  // Collect all BM25 search promises
+  const searchPromises: Array<{ queryText: string; normalizedKey: string; candidateTimestamp: number }> = [];
+  for (let i = 0; i < Math.min(maxCandidates, derived.length); i++) {
+    const candidate = derived[i];
+    if (!candidate) continue;
+    // D4: Truncate to first line, 120 chars
+    const queryText = candidate.line.split("\n")[0].slice(0, 120).trim();
+    if (!queryText) continue;
+    searchPromises.push({
+      queryText,
+      normalizedKey: queryText.toLowerCase(),
+      candidateTimestamp: Number.isFinite(candidate.timestamp) ? candidate.timestamp : Date.now(),
+    });
+  }
+
+  // Execute all BM25 searches in parallel
+  const bm25Promises = searchPromises.map(
+    (sp) =>
+      bm25Search!(sp.queryText, maxNeighborsPerCandidate + 5, scopeFilter!, { excludeInactive: true })
+        .then((hits) => ({ hits, queryText: sp.queryText, normalizedKey: sp.normalizedKey }))
+        .catch((err) => {
+          // Fail-safe: BM25 errors should not block the reflection loading pipeline
+          console.warn(
+            `[bm25-neighbor-expansion] bm25Search failed for query "${sp.queryText.slice(0, 50)}": ${err instanceof Error ? err.message : String(err)}`
+          );
+          return { hits: [] as MemorySearchResult[], queryText: sp.queryText, normalizedKey: sp.normalizedKey };
+        })
+  );
+
+  return Promise.all(bm25Promises).then((results) => {
+    const seen = new Set<string>();
+    const allNeighbors: WeightedLineCandidate[] = [];
+
+    for (const result of results) {
+      let neighborCount = 0; // Per-candidate neighbor counter
+      const neighborTimestamp = result.candidateTimestamp;
+
+      // Add current candidate to seen (skip self)
+      seen.add(result.normalizedKey);
+
+      for (const hit of result.hits) {
+        if (allNeighbors.length >= 16) break; // D3: Cap at 16 total
+        if (neighborCount >= maxNeighborsPerCandidate) break; // Per-candidate limit
+
+        const hitText = hit.entry.text || "";
+        // D4: Truncate to first line, 120 chars
+        const neighborText = hitText.split("\n")[0].slice(0, 120).trim();
+        if (!neighborText) continue;
+
+        // Skip if category="reflection" (avoid self-matching to reflection rows)
+        if (hit.entry.category === "reflection") continue;
+
+        // Skip if already seen (deduplication)
+        const neighborKey = neighborText.toLowerCase();
+        if (seen.has(neighborKey)) continue;
+        seen.add(neighborKey);
+
+        // Construct WeightedLineCandidate for this BM25 neighbor.
+        // quality = 0.2 + 0.6 * bm25Score（乘法加成，高相關 → 高 quality → 高分）
+        // FIX: neighbor.timestamp = candidate.timestamp（而非 now），
+        // 避免 aggregation 時 neighbor 文字覆蓋 derived 文字
+        const safeBmScore = Math.max(0, Math.min(1, hit.score));
+        const quality = 0.2 + 0.6 * safeBmScore;
+
+        allNeighbors.push({
+          line: neighborText,
+          timestamp: neighborTimestamp,
+          midpointDays: NEIGHBOR_MIDPOINT_DAYS,
+          k: NEIGHBOR_K,
+          baseWeight: NEIGHBOR_BASE_WEIGHT,
+          quality,
+          usedFallback: false,
+        });
+
+        neighborCount++; // Increment per-candidate counter
+      }
+    }
+
+    // D6: Prepend neighbors before base derived (neighbors score higher when prepended)
+    // In rankReflectionLines aggregation, neighbors processed first win for matching keys
+    return [...allNeighbors, ...derived];
+  });
+}
+
+export async function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlicesParams): Promise<{
   invariants: string[];
   derived: string[];
-} {
+}> {
   const now = Number.isFinite(params.now) ? Number(params.now) : Date.now();
   const deriveMaxAgeMs = Number.isFinite(params.deriveMaxAgeMs)
     ? Math.max(0, Number(params.deriveMaxAgeMs))
@@ -261,7 +428,20 @@ export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlice
     limit: 8,
   });
 
-  const derived = rankReflectionLines(derivedCandidates, {
+  // Option B BM25 Neighbor Expansion (Issue #513):
+  // 對 top-N derived candidates 做 BM25 expansion，將找到的 neighbors（前綴加入）
+  // 與 base derived candidates 一起再做第二次 rankReflectionLines。
+  // neighbors 的 quality 由 BM25 score 決定（乘法加成），實現「高相關 → 高分」效果。
+  // 若 derivedCandidates 為空（fresh session），BM25 expansion 直接作用在空陣列上，
+  // neighbors 仍會被找出並出現在結果中（Phase 1 bypass）。
+  const expandedDerived = await expandDerivedWithBm25BeforeRank(
+    derivedCandidates,
+    params.bm25Search,
+    params.scopeFilter,
+    params.bm25NeighborExpansion
+  );
+
+  const derived = rankReflectionLines(expandedDerived, {
     now,
     maxAgeMs: deriveMaxAgeMs,
     limit: 10,

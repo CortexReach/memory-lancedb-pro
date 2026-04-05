@@ -42,6 +42,7 @@ import {
   storeReflectionToLanceDB,
   loadAgentReflectionSlicesFromEntries,
   DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+  type Bm25NeighborExpansionConfig,
 } from "./src/reflection-store.js";
 import {
   extractReflectionLearningGovernanceCandidates,
@@ -203,6 +204,15 @@ interface PluginConfig {
     thinkLevel?: ReflectionThinkLevel;
     errorReminderMaxEntries?: number;
     dedupeErrorSignals?: boolean;
+  };
+  /** BM25 neighbor expansion for derived reflection slices（Option B, Issue #513）。 */
+  bm25NeighborExpansion?: {
+    /** 是否啟用 BM25 expansion（預設 true） */
+    enabled?: boolean;
+    /** 對 top-N derived candidates 做 BM25 expansion（預設 5） */
+    maxCandidates?: number;
+    /** 每個 candidate 最多取幾個 BM25 neighbors（預設 3） */
+    maxNeighborsPerCandidate?: number;
   };
   mdMirror?: { enabled?: boolean; dir?: string };
   workspaceBoundary?: WorkspaceBoundaryConfig;
@@ -1963,10 +1973,16 @@ const memoryLanceDBProPlugin = {
       // Fall back to an uncategorized scan only when the category query produced no
       // agent-owned reflection slices, preserving backward compatibility with mixed-schema stores.
       let entries = await store.list(scopeFilter, "reflection", 240, 0);
-      let slices = loadAgentReflectionSlicesFromEntries({
+      let slices = await loadAgentReflectionSlicesFromEntries({
         entries,
         agentId,
         deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+        // Option B: BM25 neighbor expansion for derived reflection slices (Issue #513)
+        bm25Search: config.bm25NeighborExpansion?.enabled !== false
+          ? store.bm25Search.bind(store)
+          : undefined,
+        scopeFilter,
+        bm25NeighborExpansion: config.bm25NeighborExpansion,
       });
       if (slices.invariants.length === 0 && slices.derived.length === 0) {
         const legacyEntries = await store.list(scopeFilter, undefined, 240, 0);
@@ -1978,10 +1994,16 @@ const memoryLanceDBProPlugin = {
             return false;
           }
         });
-        slices = loadAgentReflectionSlicesFromEntries({
+        slices = await loadAgentReflectionSlicesFromEntries({
           entries,
           agentId,
           deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+          // Option B: BM25 neighbor expansion for derived reflection slices (Issue #513)
+          bm25Search: config.bm25NeighborExpansion?.enabled !== false
+            ? store.bm25Search.bind(store)
+            : undefined,
+          scopeFilter,
+          bm25NeighborExpansion: config.bm25NeighborExpansion,
         });
       }
       const { invariants, derived } = slices;
@@ -4124,6 +4146,14 @@ export function parsePluginConfig(value: unknown): PluginConfig {
                 : 30,
           }
         : { skipLowValue: false, maxExtractionsPerHour: 30 },
+    bm25NeighborExpansion:
+      typeof cfg.bm25NeighborExpansion === "object" && cfg.bm25NeighborExpansion !== null
+        ? {
+          enabled: (cfg.bm25NeighborExpansion as Record<string, unknown>).enabled !== false,
+          maxCandidates: parsePositiveInt((cfg.bm25NeighborExpansion as Record<string, unknown>).maxCandidates) ?? 5,
+          maxNeighborsPerCandidate: parsePositiveInt((cfg.bm25NeighborExpansion as Record<string, unknown>).maxNeighborsPerCandidate) ?? 3,
+        }
+        : undefined,
   };
 }
 
