@@ -38,7 +38,7 @@
     ]
   },
   "scripts": {
-    "test": "node scripts/verify-ci-test-manifest.mjs && node scripts/run-ci-tests.mjs --all",
+    "test": "node scripts/verify-ci-test-manifest.mjs && npm run test:cli-smoke && npm run test:core-regression && npm run test:storage-and-schema && npm run test:llm-clients-and-auth && npm run test:packaging-and-workflow",
     "test:cli-smoke": "node scripts/run-ci-tests.mjs --group cli-smoke",
     "test:core-regression": "node scripts/run-ci-tests.mjs --group core-regression",
     "test:storage-and-schema": "node scripts/run-ci-tests.mjs --group storage-and-schema",
