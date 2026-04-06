@@ -74,6 +74,8 @@ function createMockApi(dbPath, embeddingBaseURL, llmBaseURL, logs, pluginConfigO
       smartExtraction: true,
       extractMinMessages: 2,
       ...pluginConfigOverrides,
+      // Note: embedding always wins over pluginConfigOverrides — this is intentional
+      // so tests get deterministic mock embeddings regardless of overrides.
       embedding: {
         apiKey: "dummy",
         model: "qwen3-embedding-4b",

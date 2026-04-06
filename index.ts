@@ -2833,6 +2833,7 @@ const memoryLanceDBProPlugin = {
             // event-scoped; (3) APPEND causes deduplication issues when the same text
             // appears in both pendingIngressTexts and eligibleTexts (after prefix stripping).
             newTexts = pendingIngressTexts;
+            autoCapturePendingIngressTexts.delete(conversationKey); // [Fix #8] Clear consumed pending texts to prevent re-consumption
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
           }
@@ -2938,6 +2939,7 @@ const memoryLanceDBProPlugin = {
               );
               // Charge rate limiter only after successful extraction
               extractionRateLimiter.recordExtraction();
+              autoCaptureSeenTextCount.set(sessionKey, 0); // [Fix #8] Reset after extraction to avoid re-triggering on every subsequent agent_end
               if (stats.created > 0 || stats.merged > 0) {
                 api.logger.info(
                   `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
