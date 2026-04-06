@@ -29,6 +29,8 @@ Add four more parallel required jobs:
 
 This keeps GitHub Checks readable, avoids branch-protection breakage, and gives clear failure ownership. For example, a `strip-envelope-metadata` regression should fail `core-regression`, not `cli-smoke`.
 
+Target latency for `cli-smoke`: the job should consistently finish within roughly 5 to 10 minutes on pull requests. If it exceeds that budget after the split, the next pass should further reduce the group rather than silently accepting a slow "smoke" check.
+
 ## Script Grouping
 
 ### cli-smoke
@@ -37,7 +39,6 @@ Purpose: fast confidence that the CLI and its main end-to-end path still work.
 
 - `test/cli-smoke.mjs`
 - `test/functional-e2e.mjs`
-- Optional: `test/plugin-manifest-regression.mjs`
 
 `test/cli-oauth-login.test.mjs` is intentionally excluded from this group because it is better treated as auth integration coverage than as first-pass smoke.
 
@@ -105,6 +106,8 @@ First, add grouped scripts in `package.json`:
 
 Then rewrite `npm test` to call those grouped scripts sequentially. This preserves a single local full-suite command while making CI reuse the same stable entry points.
 
+The grouped scripts must be maintained from a single source of truth. The implementation should avoid hand-maintaining the same file list in multiple places without a consistency check. At minimum, add a lightweight verification step that asserts every test file in the current `npm test` baseline is assigned to exactly one group. No test should be silently dropped, and no test should run twice unless that duplication is intentional and documented.
+
 Second, update `.github/workflows/ci.yml` so each CI job runs:
 
 1. `actions/checkout`
@@ -122,15 +125,19 @@ Migration order:
 
 1. Add grouped `test:*` scripts.
 2. Keep `npm test` as the sequential full-suite baseline.
-3. Update the CI workflow to run grouped scripts in parallel jobs.
-4. Add the new jobs to branch protection while keeping `CI / cli-smoke`.
+3. Add a coverage check that validates the grouped scripts exactly partition the current baseline test set.
+4. Update the CI workflow to run grouped scripts in parallel jobs.
+5. Merge the workflow change so the new check names exist on the default branch.
+6. After the new checks are observable on the default branch, add them to branch protection while keeping `CI / cli-smoke`.
 
 Verification requirements:
 
 - Each `npm run test:*` command passes independently.
 - `npm test` still passes as the local full-suite baseline.
+- The grouped suite definition covers the baseline test set exactly once.
 - PR checks show `cli-smoke`, `core-regression`, `storage-and-schema`, `llm-clients-and-auth`, and `packaging-and-workflow`.
 - A failure in one subsystem is reported under the correct job name.
+- `cli-smoke` stays within the expected fast-path latency budget or is trimmed further.
 
 ## Follow-up Recommendations
 
