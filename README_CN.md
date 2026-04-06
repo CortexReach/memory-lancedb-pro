@@ -447,6 +447,7 @@ git clone https://github.com/CortexReach/memory-lancedb-pro-skill.git ~/.opencla
       "discord-bot": ["global", "agent:discord-bot"]
     }
   },
+  "sessionStrategy": "none",
   "sessionMemory": {
     "enabled": false,
     "messageCount": 15
