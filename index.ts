@@ -2933,18 +2933,27 @@ const memoryLanceDBProPlugin = {
                 `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${currentCumulativeCount} >= minMessages=${minMessages})`,
               );
               const conversationText = cleanTexts.join("\n");
-              const stats = await smartExtractor.extractAndPersist(
-                conversationText, sessionKey,
-                { scope: defaultScope, scopeFilter: accessibleScopes },
-              );
+              // [Fix #10] Wrap extraction in try-catch so a failing extraction does not crash the hook.
+              // Counter is NOT reset on failure — the same window will re-trigger on the next agent_end.
+              let stats;
+              try {
+                stats = await smartExtractor.extractAndPersist(
+                  conversationText, sessionKey,
+                  { scope: defaultScope, scopeFilter: accessibleScopes },
+                );
+              } catch (err) {
+                api.logger.error(
+                  `memory-lancedb-pro: smart extraction failed for agent ${agentId}: ${err instanceof Error ? err.message : String(err)}; skipping extraction this cycle`
+                );
+                return; // Do not fall through to regex fallback when smart extraction is configured
+              }
               extractionRateLimiter.recordExtraction();
               if (stats.created > 0 || stats.merged > 0) {
                 api.logger.info(
                   `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
                 );
                 // [Fix #9] Reset counter only on successful extraction.
-                // Prevents re-triggering on every subsequent agent_end after passing extractMinMessages threshold.
-                // Failed extractions do NOT reset, so the same message window will re-accumulate toward the next trigger.
+                // Counter is NOT reset on failure — the same window will re-accumulate toward the next trigger.
                 autoCaptureSeenTextCount.set(sessionKey, 0);
                 return; // Smart extraction handled everything
               }
