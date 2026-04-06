@@ -2833,7 +2833,9 @@ const memoryLanceDBProPlugin = {
             // event-scoped; (3) APPEND causes deduplication issues when the same text
             // appears in both pendingIngressTexts and eligibleTexts (after prefix stripping).
             newTexts = pendingIngressTexts;
-            autoCapturePendingIngressTexts.delete(conversationKey); // [Fix #8] Clear consumed pending texts to prevent re-consumption
+            if (conversationKey) {
+              autoCapturePendingIngressTexts.delete(conversationKey); // [Fix #8] Clear consumed pending texts to prevent re-consumption
+            }
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
           }
