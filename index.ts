@@ -2945,6 +2945,12 @@ const memoryLanceDBProPlugin = {
                 api.logger.error(
                   `memory-lancedb-pro: smart extraction failed for agent ${agentId}: ${err instanceof Error ? err.message : String(err)}; skipping extraction this cycle`
                 );
+                // [Fix #10 extended] Clear pending texts on failure so the next cycle
+                // does not re-process the same pending batch. Counter stays high (not reset)
+                // so the same window will re-accumulate toward the next trigger.
+                if (conversationKey) {
+                  autoCapturePendingIngressTexts.delete(conversationKey);
+                }
                 return; // Do not fall through to regex fallback when smart extraction is configured
               }
               extractionRateLimiter.recordExtraction();
