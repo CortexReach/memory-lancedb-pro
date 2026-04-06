@@ -2937,13 +2937,15 @@ const memoryLanceDBProPlugin = {
                 conversationText, sessionKey,
                 { scope: defaultScope, scopeFilter: accessibleScopes },
               );
-              // Charge rate limiter only after successful extraction
               extractionRateLimiter.recordExtraction();
-              autoCaptureSeenTextCount.set(sessionKey, 0); // [Fix #8] Reset after extraction to avoid re-triggering on every subsequent agent_end
               if (stats.created > 0 || stats.merged > 0) {
                 api.logger.info(
                   `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
                 );
+                // [Fix #9] Reset counter only on successful extraction.
+                // Prevents re-triggering on every subsequent agent_end after passing extractMinMessages threshold.
+                // Failed extractions do NOT reset, so the same message window will re-accumulate toward the next trigger.
+                autoCaptureSeenTextCount.set(sessionKey, 0);
                 return; // Smart extraction handled everything
               }
 
