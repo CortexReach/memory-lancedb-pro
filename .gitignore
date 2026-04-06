@@ -1,4 +1,5 @@
 node_modules/
+.worktrees/
 .venv-skill-tools
 .memory-lancedb-pro/
 .DS_Store
