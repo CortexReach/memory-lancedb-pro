@@ -56,6 +56,77 @@ function createMockApi(pluginConfig, options = {}) {
   };
 }
 
+async function withFakeTimers(run) {
+  const realSetTimeout = globalThis.setTimeout;
+  const realSetInterval = globalThis.setInterval;
+  const realClearTimeout = globalThis.clearTimeout;
+  const realClearInterval = globalThis.clearInterval;
+
+  let nextId = 1;
+  const timeouts = [];
+  const intervals = [];
+  const clearedTimeouts = [];
+  const clearedIntervals = [];
+  const unrefTimeouts = [];
+  const unrefIntervals = [];
+
+  globalThis.setTimeout = ((fn, delay, ...args) => {
+    const handle = {
+      id: nextId++,
+      kind: "timeout",
+      delay,
+      fn,
+      args,
+      unref() {
+        unrefTimeouts.push(this.id);
+        return this;
+      },
+    };
+    timeouts.push(handle);
+    return handle;
+  });
+
+  globalThis.setInterval = ((fn, delay, ...args) => {
+    const handle = {
+      id: nextId++,
+      kind: "interval",
+      delay,
+      fn,
+      args,
+      unref() {
+        unrefIntervals.push(this.id);
+        return this;
+      },
+    };
+    intervals.push(handle);
+    return handle;
+  });
+
+  globalThis.clearTimeout = ((handle) => {
+    clearedTimeouts.push(handle?.id ?? null);
+  });
+
+  globalThis.clearInterval = ((handle) => {
+    clearedIntervals.push(handle?.id ?? null);
+  });
+
+  try {
+    await run({
+      timeouts,
+      intervals,
+      clearedTimeouts,
+      clearedIntervals,
+      unrefTimeouts,
+      unrefIntervals,
+    });
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.setInterval = realSetInterval;
+    globalThis.clearTimeout = realClearTimeout;
+    globalThis.clearInterval = realClearInterval;
+  }
+}
+
 for (const key of [
   "smartExtraction",
   "extractMinMessages",
@@ -135,6 +206,97 @@ const services = [];
 const embeddingRequests = [];
 
 try {
+  await withFakeTimers(async ({
+    timeouts,
+    intervals,
+    clearedTimeouts,
+    clearedIntervals,
+    unrefTimeouts,
+    unrefIntervals,
+  }) => {
+    const timerServices = [];
+    const firstTimerApi = createMockApi(
+      {
+        dbPath: path.join(workDir, "db-backup-timers-1"),
+        autoCapture: false,
+        autoRecall: false,
+        embedding: {
+          provider: "openai-compatible",
+          apiKey: "dummy",
+          model: "text-embedding-3-small",
+          baseURL: "http://127.0.0.1:9/v1",
+          dimensions: 1536,
+        },
+      },
+      { services: timerServices },
+    );
+
+    plugin.register(firstTimerApi);
+    const firstBackupTimeout = timeouts.find((handle) => handle.delay === 60_000);
+    const firstBackupInterval = intervals.find((handle) => handle.delay === 24 * 60 * 60 * 1000);
+
+    assert.ok(firstBackupTimeout, "register() should arm the initial backup timeout");
+    assert.ok(firstBackupInterval, "register() should arm the recurring backup interval");
+    assert.ok(
+      unrefTimeouts.includes(firstBackupTimeout.id),
+      "initial backup timeout should be unref()'d so register-only tests can exit",
+    );
+    assert.ok(
+      unrefIntervals.includes(firstBackupInterval.id),
+      "backup interval should be unref()'d so register-only tests can exit",
+    );
+
+    await assert.doesNotReject(
+      timerServices[0].stop(),
+      "service stop should clear backup timers without throwing",
+    );
+    assert.ok(
+      clearedTimeouts.includes(firstBackupTimeout.id),
+      "stop() should clear the initial backup timeout",
+    );
+    assert.ok(
+      clearedIntervals.includes(firstBackupInterval.id),
+      "stop() should clear the recurring backup interval",
+    );
+
+    const secondTimerServices = [];
+    const secondTimerApi = createMockApi(
+      {
+        dbPath: path.join(workDir, "db-backup-timers-2"),
+        autoCapture: false,
+        autoRecall: false,
+        embedding: {
+          provider: "openai-compatible",
+          apiKey: "dummy",
+          model: "text-embedding-3-small",
+          baseURL: "http://127.0.0.1:9/v1",
+          dimensions: 1536,
+        },
+      },
+      { services: secondTimerServices },
+    );
+
+    plugin.register(secondTimerApi);
+    const backupTimeouts = timeouts.filter((handle) => handle.delay === 60_000);
+    const backupIntervals = intervals.filter((handle) => handle.delay === 24 * 60 * 60 * 1000);
+
+    assert.equal(backupTimeouts.length, 2, "re-register should create one fresh initial backup timeout");
+    assert.equal(backupIntervals.length, 2, "re-register should create one fresh recurring backup interval");
+
+    await assert.doesNotReject(
+      secondTimerServices[0].stop(),
+      "second service stop should also clear backup timers without throwing",
+    );
+    assert.ok(
+      clearedTimeouts.includes(backupTimeouts[1].id),
+      "second stop() should clear the re-armed initial backup timeout",
+    );
+    assert.ok(
+      clearedIntervals.includes(backupIntervals[1].id),
+      "second stop() should clear the re-armed recurring backup interval",
+    );
+  });
+
   const api = createMockApi(
     {
       dbPath: path.join(workDir, "db"),

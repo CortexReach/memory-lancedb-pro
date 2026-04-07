@@ -3605,6 +3605,7 @@ const memoryLanceDBProPlugin = {
     // Auto-Backup (daily JSONL export)
     // ========================================================================
 
+    let backupInitialTimeout: ReturnType<typeof setTimeout> | null = null;
     let backupTimer: ReturnType<typeof setInterval> | null = null;
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -3652,6 +3653,32 @@ const memoryLanceDBProPlugin = {
       } catch (err) {
         api.logger.warn(`memory-lancedb-pro: backup failed: ${String(err)}`);
       }
+    }
+
+    function clearBackupTimers() {
+      if (backupInitialTimeout) {
+        clearTimeout(backupInitialTimeout);
+        backupInitialTimeout = null;
+      }
+      if (backupTimer) {
+        clearInterval(backupTimer);
+        backupTimer = null;
+      }
+    }
+
+    function setupBackupTimers() {
+      if (backupInitialTimeout || backupTimer) return;
+
+      api.logger.info("memory-lancedb-pro: setting up auto-backup");
+
+      backupInitialTimeout = setTimeout(() => {
+        backupInitialTimeout = null;
+        void runBackup();
+      }, 60_000);
+      backupInitialTimeout.unref?.();
+
+      backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+      backupTimer.unref?.();
     }
 
     // ========================================================================
@@ -3750,23 +3777,13 @@ const memoryLanceDBProPlugin = {
         // even when plugin is registered after gateway startup.
       },
       stop: async () => {
-        if (backupTimer) {
-          clearInterval(backupTimer);
-          backupTimer = null;
-        }
+        clearBackupTimers();
         api.logger.info("memory-lancedb-pro: stopped");
       },
     });
 
-    // CRITICAL FIX: Set backup timer in register() instead of start().
-    // This ensures backups work even when plugin is registered after gateway startup
-    // (e.g., when plugin is loaded on-demand by agent session).
-    if (!backupTimer) {
-      api.logger.info("memory-lancedb-pro: setting up auto-backup");
-      // Run initial backup after a short delay, then schedule daily
-      setTimeout(() => void runBackup(), 60_000); // 1 min after register
-      backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
-    }
+    // Set backup timers in register() so late-loaded plugins still auto-backup.
+    setupBackupTimers();
   },
 };
 
