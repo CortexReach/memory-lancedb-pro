@@ -2824,7 +2824,10 @@ const memoryLanceDBProPlugin = {
             : [];
           const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
           // [Fix #2] Cumulative counting: accumulate across events, not per-event overwrite
-          const currentCumulativeCount = previousSeenCount + eligibleTexts.length;
+          // [Fix-Must2] Count only texts that are genuinely NEW to this event (newTexts),
+          // not the full eligibleTexts. This prevents double-counting when agent_end
+          // delivers full history: eligibleTexts = full history, but newTexts = only new ones.
+          // Computed AFTER newTexts is determined to avoid TDZ.
           let newTexts = eligibleTexts;
           if (pendingIngressTexts.length > 0) {
             // [Fix #3] Use pendingIngressTexts as-is (REPLACE, not APPEND).
@@ -2833,12 +2836,18 @@ const memoryLanceDBProPlugin = {
             // event-scoped; (3) APPEND causes deduplication issues when the same text
             // appears in both pendingIngressTexts and eligibleTexts (after prefix stripping).
             newTexts = pendingIngressTexts;
-            if (conversationKey) {
-              autoCapturePendingIngressTexts.delete(conversationKey); // [Fix #8] Clear consumed pending texts to prevent re-consumption
-            }
+            // [Fix #8] Clear consumed pending texts to prevent re-consumption
+            // [Fix-Must5] conversationKey MUST be valid here — if it's falsy, something is wrong upstream.
+            if (!conversationKey) throw new Error("autoCapturePendingIngressTexts consumed with falsy conversationKey");
+            autoCapturePendingIngressTexts.delete(conversationKey);
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
           }
+          // [Fix-Must2] Count only texts new to this event.
+          // newTexts.length >= previousSeenCount always (dedup ensures no text counted twice).
+          // The increment is therefore newTexts.length - previousSeenCount.
+          const newTextsCount = Math.max(0, newTexts.length - previousSeenCount);
+          const currentCumulativeCount = previousSeenCount + newTextsCount;
           autoCaptureSeenTextCount.set(sessionKey, currentCumulativeCount);
           pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
 
@@ -2956,13 +2965,14 @@ const memoryLanceDBProPlugin = {
                 return; // Do not fall through to regex fallback when smart extraction is configured
               }
               extractionRateLimiter.recordExtraction();
+              // [Fix-Must1] Always reset counter after any extraction attempt (not just on created/merged).
+              // This prevents the retry spiral when all candidates are deduplicated (created=0, merged=0):
+              // without reset, counter stays high -> next agent_end re-triggers -> same dedupe -> infinite loop.
+              autoCaptureSeenTextCount.set(sessionKey, 0);
               if (stats.created > 0 || stats.merged > 0) {
                 api.logger.info(
                   `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
                 );
-                // [Fix #9] Reset counter only on successful extraction.
-                // Counter is NOT reset on failure — the same window will re-accumulate toward the next trigger.
-                autoCaptureSeenTextCount.set(sessionKey, 0);
                 return; // Smart extraction handled everything
               }
 
