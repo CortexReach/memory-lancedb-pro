@@ -977,7 +977,8 @@ assert.ok(
 );
 assert.ok(
   rememberCommandContextLogs.some((entry) =>
-    entry[1].includes("auto-capture collected 2 text(s)")
+    // e5b5e5b: counter=(prev+eligible.length) -> Turn2 cumulative=3, but dedup leaves texts.length=1
+    entry[1].includes("auto-capture collected 1 text(s)")
   ),
 );
 
