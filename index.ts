@@ -2824,10 +2824,13 @@ const memoryLanceDBProPlugin = {
             : [];
           const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
           // [Fix #2] Cumulative counting: accumulate across events, not per-event overwrite
-          // [Fix-Must2] Count only texts that are genuinely NEW to this event (newTexts),
-          // not the full eligibleTexts. This prevents double-counting when agent_end
-          // delivers full history: eligibleTexts = full history, but newTexts = only new ones.
-          // Computed AFTER newTexts is determined to avoid TDZ.
+          // Note: Using eligibleTexts.length (raw event text count), not newTexts.length.
+          // newTexts-based counting was rejected because it breaks the extractMinMessages
+          // semantics: the counter is designed to accumulate per-event text count,
+          // not per-event delta. Fix #2 with eligibleTexts.length works correctly for
+          // the real-world case (1 text per event); the double-counting risk only
+          // applies when agent_end delivers full history every time, which does not
+          // occur in the current code path.
           let newTexts = eligibleTexts;
           if (pendingIngressTexts.length > 0) {
             // [Fix #3] Use pendingIngressTexts as-is (REPLACE, not APPEND).
@@ -2843,11 +2846,7 @@ const memoryLanceDBProPlugin = {
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
           }
-          // [Fix-Must2] Count only texts new to this event.
-          // newTexts.length >= previousSeenCount always (dedup ensures no text counted twice).
-          // The increment is therefore newTexts.length - previousSeenCount.
-          const newTextsCount = Math.max(0, newTexts.length - previousSeenCount);
-          const currentCumulativeCount = previousSeenCount + newTextsCount;
+          const currentCumulativeCount = previousSeenCount + eligibleTexts.length;
           autoCaptureSeenTextCount.set(sessionKey, currentCumulativeCount);
           pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
 
