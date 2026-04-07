@@ -2965,16 +2965,18 @@ const memoryLanceDBProPlugin = {
                 return; // Do not fall through to regex fallback when smart extraction is configured
               }
               extractionRateLimiter.recordExtraction();
-              // [Fix-Must1] Always reset counter after any extraction attempt (not just on created/merged).
-              // This prevents the retry spiral when all candidates are deduplicated (created=0, merged=0):
-              // without reset, counter stays high -> next agent_end re-triggers -> same dedupe -> infinite loop.
-              autoCaptureSeenTextCount.set(sessionKey, 0);
               if (stats.created > 0 || stats.merged > 0) {
                 api.logger.info(
                   `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
                 );
                 return; // Smart extraction handled everything
               }
+
+              // [Fix-Must1] Reset counter to previousSeenCount when all candidates are deduplicated
+              // (created=0, merged=0). Without this, counter stays high -> next agent_end
+              // re-triggers -> same dedupe -> retry spiral. Resetting to previousSeenCount ensures
+              // the next event starts fresh (counter = number of genuinely new texts seen so far).
+              autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
 
               if ((stats.boundarySkipped ?? 0) > 0) {
                 api.logger.info(
