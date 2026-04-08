@@ -165,8 +165,7 @@ let cleaned = text.replace(/^\[(?:Subagent Context|Subagent Task)\].*$/gm, "");
   cleaned = cleaned.replace(
     /^\[Queued messages while agent was busy\]\s*/gim,
     "",
-  ); (fix: extend envelope stripping to broader channel/system markers (Phase 2))
-
+  ); 
   // 1. Strip "System: [timestamp] Channel..." lines
   cleaned = cleaned.replace(
     /^System:\s*\[[\d\-: +GMT]+\]\s+\S+\[.*?\].*$/gm,
