@@ -16,6 +16,8 @@ import type { DecayEngine, DecayableMemory } from "./decay-engine.js";
 import type { TierManager } from "./tier-manager.js";
 import {
   getDecayableFromEntry,
+  isMemoryExpired,
+  parseSmartMetadata,
   toLifecycleMemory,
 } from "./smart-metadata.js";
 import { TraceCollector, type RetrievalTrace } from "./retrieval-trace.js";
@@ -718,11 +720,12 @@ export class MemoryRetriever {
   ): Promise<RetrievalResult[]> {
     let failureStage: RetrievalDiagnostics["failureStage"] = "vector.embedQuery";
     try {
+      const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
       const queryVector = await this.embedder.embedQuery(query);
       failureStage = "vector.vectorSearch";
       const results = await this.store.vectorSearch(
         queryVector,
-        limit,
+        candidatePoolSize,
         this.config.minScore,
         scopeFilter,
         { excludeInactive: true },
@@ -731,14 +734,21 @@ export class MemoryRetriever {
       const filtered = category
         ? results.filter((r) => r.entry.category === category)
         : results;
+
+      // Filter expired memories early — before scoring — so they don't
+      // occupy candidate slots that should go to live memories.
+      const unexpired = filtered.filter((r) => {
+        const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
+        return !isMemoryExpired(metadata);
+      });
       if (diagnostics) {
-        diagnostics.vectorResultCount = filtered.length;
-        diagnostics.fusedResultCount = filtered.length;
-        diagnostics.stageCounts.afterMinScore = filtered.length;
-        diagnostics.stageCounts.rerankInput = filtered.length;
+        diagnostics.vectorResultCount = unexpired.length;
+        diagnostics.fusedResultCount = unexpired.length;
+        diagnostics.stageCounts.afterMinScore = unexpired.length;
+        diagnostics.stageCounts.rerankInput = unexpired.length;
       }
 
-      const mapped = filtered.map(
+      const mapped = unexpired.map(
         (result, index) =>
           ({
             ...result,
@@ -807,7 +817,12 @@ export class MemoryRetriever {
       const textLower = r.entry.text.toLowerCase();
       return tagTokens.every((t) => textLower.includes(t.toLowerCase()));
     });
-    const mapped = mustContainFiltered.map(
+    // Filter expired memories early — before scoring
+    const unexpiredResults = mustContainFiltered.filter((r) => {
+      const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
+      return !isMemoryExpired(metadata);
+    });
+    const mapped = unexpiredResults.map(
       (result, index) =>
         ({
           ...result,
@@ -950,8 +965,14 @@ export class MemoryRetriever {
       if (diagnostics) diagnostics.fusedResultCount = fusedResults.length;
 
       trace?.startStage("min_score_filter", fusedResults.map((r) => r.entry.id));
-      const filtered = fusedResults.filter((r) => r.score >= this.config.minScore);
-      trace?.endStage(filtered.map((r) => r.entry.id), filtered.map((r) => r.score));
+      const scoreFiltered = fusedResults.filter((r) => r.score >= this.config.minScore);
+      trace?.endStage(scoreFiltered.map((r) => r.entry.id), scoreFiltered.map((r) => r.score));
+
+      // Filter expired memories early — before rerank/scoring
+      const filtered = scoreFiltered.filter((r) => {
+        const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
+        return !isMemoryExpired(metadata);
+      });
       if (diagnostics) diagnostics.stageCounts.afterMinScore = filtered.length;
 
       const rerankInput =
@@ -1436,8 +1457,13 @@ export class MemoryRetriever {
       const { accessCount, lastAccessedAt } = parseAccessMetadata(
         r.entry.metadata,
       );
+
+      // Dynamic memories decay 3x faster than static ones
+      const meta = parseSmartMetadata(r.entry.metadata, r.entry);
+      const baseHL = meta.memory_temporal_type === "dynamic" ? halfLife / 3 : halfLife;
+
       const effectiveHL = computeEffectiveHalfLife(
-        halfLife,
+        baseHL,
         accessCount,
         lastAccessedAt,
         this.config.reinforcementFactor,

@@ -62,6 +62,8 @@ Das ist der Unterschied, den ein **KI-Gedächtnisassistent** macht — er lernt 
 
 ## Schnellstart
 
+> **CPU-Anforderung:** Deine CPU muss **AVX/AVX2**-Befehle unterstützen (Intel Sandy Bridge 2011+ / AMD Bulldozer 2011+). Die native Vektor-Engine von LanceDB benötigt diese — auf nicht unterstützten CPUs stürzt das Plugin mit `SIGILL` (Illegal Instruction) ab. Prüfe mit: `grep -o 'avx[^ ]*' /proc/cpuinfo | head -1` (keine Ausgabe = nicht unterstützt). Siehe [#419](https://github.com/CortexReach/memory-lancedb-pro/issues/419).
+
 ### Option A: Ein-Klick-Installationsskript (empfohlen)
 
 Das community-gepflegte **[Setup-Skript](https://github.com/CortexReach/toolbox/tree/main/memory-lancedb-pro-setup)** erledigt Installation, Upgrade und Reparatur in einem Befehl:

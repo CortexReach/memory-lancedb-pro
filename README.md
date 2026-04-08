@@ -71,6 +71,8 @@ That's the difference an **AI Memory Assistant** makes — it learns your style,
 
 ## Quick Start
 
+> **CPU Requirement:** Your CPU must support **AVX/AVX2** instructions (Intel Sandy Bridge 2011+ / AMD Bulldozer 2011+). LanceDB's native vector engine requires these — on unsupported CPUs the plugin will crash with `SIGILL` (Illegal Instruction). Check with: `grep -o 'avx[^ ]*' /proc/cpuinfo | head -1` (no output = not supported). See [#419](https://github.com/CortexReach/memory-lancedb-pro/issues/419) for details.
+
 ### Option A: One-Click Install Script (Recommended)
 
 The community-maintained **[setup script](https://github.com/CortexReach/toolbox/tree/main/memory-lancedb-pro-setup)** handles install, upgrade, and repair in one command:

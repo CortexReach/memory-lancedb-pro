@@ -62,6 +62,8 @@ Essa é a diferença que um **Assistente de Memória IA** faz — aprende seu es
 
 ## Início rápido
 
+> **Requisito de CPU:** Sua CPU deve suportar instruções **AVX/AVX2** (Intel Sandy Bridge 2011+ / AMD Bulldozer 2011+). O motor vetorial nativo do LanceDB requer essas instruções — em CPUs não compatíveis o plugin falhará com `SIGILL` (Instrução ilegal). Verifique com: `grep -o 'avx[^ ]*' /proc/cpuinfo | head -1` (sem saída = não suportado). Veja [#419](https://github.com/CortexReach/memory-lancedb-pro/issues/419).
+
 ### Opção A: Script de instalação com um clique (recomendado)
 
 O **[script de instalação](https://github.com/CortexReach/toolbox/tree/main/memory-lancedb-pro-setup)** mantido pela comunidade gerencia instalação, atualização e reparo em um único comando:

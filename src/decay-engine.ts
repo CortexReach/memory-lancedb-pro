@@ -78,6 +78,8 @@ export interface DecayableMemory {
   accessCount: number;
   createdAt: number;
   lastAccessedAt: number;
+  /** Temporal classification: "dynamic" memories decay 3x faster. */
+  temporalType?: "static" | "dynamic";
 }
 
 export interface DecayEngine {
@@ -152,7 +154,9 @@ export function createDecayEngine(
     const lastActive =
       memory.accessCount > 0 ? memory.lastAccessedAt : memory.createdAt;
     const daysSince = Math.max(0, (now - lastActive) / MS_PER_DAY);
-    const effectiveHL = halfLife * Math.exp(mu * memory.importance);
+    // Dynamic memories decay 3x faster (1/3 half-life)
+    const baseHL = memory.temporalType === "dynamic" ? halfLife / 3 : halfLife;
+    const effectiveHL = baseHL * Math.exp(mu * memory.importance);
     const lambda = Math.LN2 / effectiveHL;
     const beta = getTierBeta(memory.tier);
     return Math.exp(-lambda * Math.pow(daysSince, beta));

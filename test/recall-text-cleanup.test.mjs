@@ -428,6 +428,7 @@ describe("recall text cleanup", () => {
     );
 
     assert.ok(output);
+    assert.match(output.prependContext, /<mode:full>/);
     assert.match(output.prependContext, /remember this/);
     assert.match(output.prependContext, /prefer concise diffs/);
     assert.doesNotMatch(output.prependContext, /vector\+BM25/);
@@ -448,6 +449,7 @@ describe("recall text cleanup", () => {
     const tool = createTool(registerMemoryRecallTool, makeRecallContext(makeManyResults(9)));
     const res = await tool.execute(null, { query: "many memories", limit: 10 });
     const lines = extractRenderedMemoryRecallLines(res.content[0].text);
+    assert.match(res.content[0].text, /<mode:summary>/);
 
     assert.equal(lines.length, 6, "summary mode should clamp limit to 6");
   });
@@ -460,6 +462,7 @@ describe("recall text cleanup", () => {
       includeFullText: true,
     });
     const lines = extractRenderedMemoryRecallLines(res.content[0].text);
+    assert.match(res.content[0].text, /<mode:full>/);
 
     assert.equal(lines.length, 7, "full text mode should honor larger limits");
     assert.doesNotMatch(lines[0], /…$/, "full text mode should not force preview truncation");
