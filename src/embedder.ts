@@ -9,6 +9,10 @@
  */
 
 import OpenAI from "openai";
+import {
+  buildDashScopeEmbeddingPayload,
+  fetchDashScopeEmbeddings,
+} from "./providers/dashscope-embedding.js";
 import { createHash } from "node:crypto";
 import { smartChunk } from "./chunker.js";
 
@@ -84,7 +88,7 @@ class EmbeddingCache {
 // ============================================================================
 
 export interface EmbeddingConfig {
-  provider: "openai-compatible" | "azure-openai";
+  provider: "openai-compatible" | "azure-openai" | "dashscope";
   apiVersion?: string;
   /** Single API key or array of keys for round-robin rotation with failover. */
   apiKey: string | string[];
@@ -103,6 +107,8 @@ export interface EmbeddingConfig {
   omitDimensions?: boolean;
   /** Enable automatic chunking for documents exceeding context limits (default: true) */
   chunking?: boolean;
+  /** DashScope multimodal embedding option. Default true keeps one output vector per single input call. */
+  enableFusion?: boolean;
 }
 
 type EmbeddingProviderProfile =
@@ -111,6 +117,7 @@ type EmbeddingProviderProfile =
   | "jina"
   | "voyage-compatible"
   | "nvidia"
+  | "dashscope"
   | "generic-openai-compatible";
 
 interface EmbeddingCapabilities {
@@ -141,6 +148,7 @@ const EMBEDDING_DIMENSIONS: Record<string, number> = {
   "gemini-embedding-001": 3072,
   "nomic-embed-text": 768,
   "mxbai-embed-large": 1024,
+  "qwen3-vl-embedding": 2560,
   "BAAI/bge-m3": 1024,
   "all-MiniLM-L6-v2": 384,
   "all-mpnet-base-v2": 512,
@@ -253,6 +261,7 @@ function detectEmbeddingProviderProfile(
   if (host.endsWith("api.jina.ai")) return "jina";
   if (host.endsWith("api.voyageai.com")) return "voyage-compatible";
   if (host.endsWith(".nvidia.com") || host === "nvidia.com") return "nvidia";
+  if (host.endsWith("dashscope.aliyuncs.com")) return "dashscope";
 
   // Model-prefix fallback — only when baseURL didn't match a known host
   if (/^jina-/i.test(model)) return "jina";
@@ -303,6 +312,13 @@ function getEmbeddingCapabilities(profile: EmbeddingProviderProfile): EmbeddingC
           "passage": "passage",
         },
         dimensionsField: "dimensions",
+      };
+    case "dashscope":
+      return {
+        encoding_format: false,
+        normalized: false,
+        taskField: null,
+        dimensionsField: "dimension",
       };
     case "generic-openai-compatible":
     default:
@@ -428,6 +444,7 @@ export class Embedder {
   private clients: OpenAI[];
   /** Round-robin index for client rotation. */
   private _clientIndex: number = 0;
+  private readonly _apiKeys: string[];
 
   public readonly dimensions: number;
   private readonly _cache: EmbeddingCache;
@@ -445,11 +462,13 @@ export class Embedder {
   private readonly _omitDimensions: boolean;
   /** Enable automatic chunking for long documents (default: true) */
   private readonly _autoChunk: boolean;
+  private readonly _enableFusion: boolean;
 
   constructor(config: EmbeddingConfig & { chunking?: boolean }) {
     // Normalize apiKey to array and resolve environment variables
     const apiKeys = Array.isArray(config.apiKey) ? config.apiKey : [config.apiKey];
     const resolvedKeys = apiKeys.map(k => resolveEnvVars(k));
+    this._apiKeys = resolvedKeys;
 
     this._model = config.model;
     this._baseURL = config.baseURL;
@@ -458,6 +477,7 @@ export class Embedder {
     this._normalized = config.normalized;
     this._requestDimensions = config.dimensions;
     this._omitDimensions = config.omitDimensions === true;
+    this._enableFusion = config.enableFusion !== false;
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
     const profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
@@ -593,6 +613,10 @@ export class Embedder {
    * through the SDK's HTTP client on Node.js.
    */
   private async embedWithRetry(payload: any, signal?: AbortSignal): Promise<any> {
+    if (this.isDashScopeProvider()) {
+      return this.embedWithDashScopeRetry(payload, signal);
+    }
+
     // Use native fetch for Ollama to ensure proper AbortController support
     if (this.isOllamaProvider()) {
       try {
@@ -711,10 +735,16 @@ export class Embedder {
   // EMBED_TIMEOUT_MS regardless of how many texts succeed. Individual text embedding
   // within the batch is protected by the SDK's own timeout handling.
   async embedBatchQuery(texts: string[], signal?: AbortSignal): Promise<number[][]> {
+    if (this.isDashScopeProvider()) {
+      return Promise.all(texts.map((text) => this.embedQuery(text, signal)));
+    }
     return this.embedMany(texts, this._taskQuery, signal);
   }
 
   async embedBatchPassage(texts: string[], signal?: AbortSignal): Promise<number[][]> {
+    if (this.isDashScopeProvider()) {
+      return Promise.all(texts.map((text) => this.embedPassage(text, signal)));
+    }
     return this.embedMany(texts, this._taskPassage, signal);
   }
 
@@ -733,7 +763,51 @@ export class Embedder {
     }
   }
 
+  private async embedWithDashScopeRetry(payload: any, signal?: AbortSignal): Promise<any> {
+    const maxAttempts = this._apiKeys.length;
+    let lastError: Error | undefined;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const apiKey = this._apiKeys[(this._clientIndex + attempt) % this._apiKeys.length];
+      try {
+        const data = await fetchDashScopeEmbeddings({
+          apiKey,
+          baseURL: this._baseURL,
+          payload,
+          signal,
+        });
+        this._clientIndex = (this._clientIndex + attempt + 1) % this._apiKeys.length;
+        return data;
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          throw error;
+        }
+        lastError = error instanceof Error ? error : new Error(String(error));
+        if (this.isRateLimitError(error) && attempt < maxAttempts - 1) {
+          continue;
+        }
+        break;
+      }
+    }
+
+    throw lastError || new Error("DashScope embedding failed");
+  }
+
+  private isDashScopeProvider(): boolean {
+    const profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
+    return profile === "dashscope";
+  }
+
   private buildPayload(input: string | string[], task?: string): any {
+    if (this.isDashScopeProvider()) {
+      return buildDashScopeEmbeddingPayload({
+        model: this.model,
+        input,
+        dimensions: this._requestDimensions,
+        enableFusion: this._enableFusion,
+      });
+    }
+
     const payload: any = {
       model: this.model,
       input,

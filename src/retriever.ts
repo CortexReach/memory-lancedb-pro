@@ -22,6 +22,7 @@ import {
 } from "./smart-metadata.js";
 import { TraceCollector, type RetrievalTrace } from "./retrieval-trace.js";
 import { RetrievalStatsCollector } from "./retrieval-stats.js";
+import { buildDashScopeRerankRequest } from "./providers/dashscope-rerank.js";
 
 // ============================================================================
 // Types & Configuration
@@ -366,20 +367,18 @@ function buildRerankRequest(
         },
       };
     case "dashscope":
-      // DashScope wraps query+documents under `input` and does not use top_n.
-      // Endpoint: https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
       return {
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiKey}`,
         },
-        body: {
+        body: buildDashScopeRerankRequest({
           model,
-          input: {
-            query,
-            documents: candidates,
-          },
-        },
+          query,
+          candidates,
+          topN,
+          returnDocuments: true,
+        }),
       };
     case "pinecone":
       return {

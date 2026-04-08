@@ -86,7 +86,7 @@ import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 
 interface PluginConfig {
   embedding: {
-    provider: "openai-compatible";
+    provider: "openai-compatible" | "azure-openai" | "dashscope";
     apiKey: string | string[];
     model?: string;
     baseURL?: string;
@@ -96,6 +96,7 @@ interface PluginConfig {
     taskPassage?: string;
     normalized?: boolean;
     chunking?: boolean;
+    enableFusion?: boolean;
   };
   dbPath?: string;
   autoCapture?: boolean;
@@ -1659,7 +1660,7 @@ const memoryLanceDBProPlugin = {
     // Initialize core components
     const store = new MemoryStore({ dbPath: resolvedDbPath, vectorDim });
     const embedder = createEmbedder({
-      provider: "openai-compatible",
+      provider: config.embedding.provider,
       apiKey: config.embedding.apiKey,
       model: config.embedding.model || "text-embedding-3-small",
       baseURL: config.embedding.baseURL,
@@ -1669,6 +1670,7 @@ const memoryLanceDBProPlugin = {
       taskPassage: config.embedding.taskPassage,
       normalized: config.embedding.normalized,
       chunking: config.embedding.chunking,
+      enableFusion: config.embedding.enableFusion,
     });
     // Initialize decay engine
     const decayEngine = createDecayEngine({
@@ -3832,7 +3834,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
 
   return {
     embedding: {
-      provider: "openai-compatible",
+      provider:
+        embedding.provider === "azure-openai" || embedding.provider === "dashscope"
+          ? embedding.provider
+          : "openai-compatible",
       apiKey,
       model:
         typeof embedding.model === "string"
@@ -3864,6 +3869,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       chunking:
         typeof embedding.chunking === "boolean"
           ? embedding.chunking
+          : undefined,
+      enableFusion:
+        typeof embedding.enableFusion === "boolean"
+          ? embedding.enableFusion
           : undefined,
     },
     dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
