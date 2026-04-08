@@ -42,7 +42,10 @@ function makeCountingEmbedder(options = {}) {
     async embedBatch(texts) {
       calls.embedBatch++;
       if (batchShouldFail) throw new Error("mock batch failure");
-      return Promise.all(texts.map((t) => embedder.embed(t)));
+      // Return vectors directly WITHOUT calling this.embed() to keep counters independent
+      return (texts || []).map((t) =>
+        Array(256).fill(0).map((_, i) => (t.length > 0 ? (t.charCodeAt(i % t.length) / 255) : 0)),
+      );
     },
     get calls() {
       return { ...calls };
@@ -147,21 +150,13 @@ describe("SmartExtractor batch embedding paths", () => {
   });
 
   // --------------------------------------------------------------------------
-  // Test 2: filterNoiseByEmbedding uses embedBatch
+  // Test 2: filterNoiseByEmbedding uses embedBatch (direct call)
   // --------------------------------------------------------------------------
   it("uses embedBatch in filterNoiseByEmbedding when noise bank is active", async () => {
     const { embedder, calls } = makeCountingEmbedder();
-    const llm = makeLlm([
-      {
-        category: "cases",
-        abstract: "这是一条测试记忆用于验证批量嵌入功能",
-        overview: "概览描述",
-        content: "详细的内容描述文本",
-      },
-    ]);
-    const store = makeStore();
+    const llm = makeLlm([]); // not used by filterNoiseByEmbedding
+    const store = makeStore(); // not used by filterNoiseByEmbedding
 
-    // Noise bank with isNoise that rejects everything (no noise)
     const noiseBank = {
       initialized: true,
       isNoise(_vec) { return false; },
@@ -170,13 +165,28 @@ describe("SmartExtractor batch embedding paths", () => {
 
     const extractor = makeExtractor(embedder, llm, store, { noiseBank });
 
-    await extractor.extractAndPersist("测试对话文本内容", "s1");
+    // Call filterNoiseByEmbedding DIRECTLY — this is the method under test.
+    // Mix of lengths: short (bypass), mid-length (needs embedding), long (bypass).
+    const inputTexts = [
+      "短",                                    // ≤8 → bypass
+      "这是一条中等长度的测试文本用于验证批量嵌入功能",  // 9-300 → needs embed
+      "这是一条另一条中等长度文本内容",            // 9-300 → needs embed
+      "x".repeat(350),                          // >300 → bypass
+    ];
 
-    // filterNoiseByEmbedding should have used embedBatch for mid-length texts
-    assert.ok(
-      calls.embedBatch >= 1,
-      `Expected embedBatch to be called by filterNoiseByEmbedding, total=${calls.embedBatch}`,
-    );
+    const result = await extractor.filterNoiseByEmbedding(inputTexts);
+
+    // All texts should pass through (isNoise returns false for everything)
+    assert.strictEqual(result.length, 4,
+      `Expected all 4 texts to pass through, got ${result.length}`);
+
+    // embedBatch should have been called exactly once for the 2 mid-length texts
+    assert.strictEqual(calls.embedBatch, 1,
+      `Expected 1 embedBatch call for filterNoiseByEmbedding, got ${calls.embedBatch}`);
+
+    // embed() should NOT have been called (batch path used instead)
+    assert.strictEqual(calls.embed, 0,
+      `Expected 0 embed calls (batch path), got ${calls.embed}`);
   });
 
   // --------------------------------------------------------------------------
@@ -249,21 +259,14 @@ describe("SmartExtractor batch embedding paths", () => {
   });
 
   // --------------------------------------------------------------------------
-  // Test 5: filterNoiseByEmbedding batch failure passes all texts through
+  // Test 5: filterNoiseByEmbedding batch failure passes all texts through (direct call)
   // --------------------------------------------------------------------------
   it("passes all texts through when filterNoiseByEmbedding batch fails", async () => {
     const { embedder } = makeCountingEmbedder({
       batchShouldFail: true,
     });
-    const llm = makeLlm([
-      {
-        category: "cases",
-        abstract: "噪声过滤回退测试用例文本内容",
-        overview: "",
-        content: "详细内容描述",
-      },
-    ]);
-    const store = makeStore();
+    const llm = makeLlm([]);   // not used
+    const store = makeStore();  // not used
 
     const noiseBank = {
       initialized: true,
@@ -273,14 +276,23 @@ describe("SmartExtractor batch embedding paths", () => {
 
     const extractor = makeExtractor(embedder, llm, store, { noiseBank });
 
-    // Should NOT throw — batch failure returns all texts unfiltered
-    const stats = await extractor.extractAndPersist("噪声过滤回退测试对话", "s1");
+    // Call filterNoiseByEmbedding DIRECTLY with mid-length texts that would
+    // normally be sent to embedBatch.
+    const inputTexts = [
+      "噪声过滤回退测试用例文本内容第一段",
+      "噪声过滤回退测试用例文本内容第二段",
+      "噪声过滤回退测试用例文本内容第三段",
+    ];
 
-    assert.ok(stats, "Extraction should complete despite noise filter batch failure");
+    // Should NOT throw — batch failure returns all texts unfiltered
+    const result = await extractor.filterNoiseByEmbedding(inputTexts);
+
+    assert.strictEqual(result.length, inputTexts.length,
+      `Expected all ${inputTexts.length} texts to pass through on batch failure, got ${result.length}`);
   });
 
   // --------------------------------------------------------------------------
-  // Test 6: Bypass texts (short/long) are not sent to embedBatch
+  // Test 6: Bypass texts (short/long) are not sent to embedBatch in noise filter (direct call)
   // --------------------------------------------------------------------------
   it("does not send bypass texts (short/long) to embedBatch in noise filter", async () => {
     let lastBatchInput = null;
@@ -291,15 +303,8 @@ describe("SmartExtractor batch embedding paths", () => {
         return texts.map(() => [0.1]);
       },
     };
-    const llm = makeLlm([
-      {
-        category: "cases",
-        abstract: "正常长度文本用于噪声过滤测试验证逻辑",
-        overview: "",
-        content: "详细内容",
-      },
-    ]);
-    const store = makeStore();
+    const llm = makeLlm([]);   // not used
+    const store = makeStore();  // not used
 
     const noiseBank = {
       initialized: true,
@@ -308,17 +313,39 @@ describe("SmartExtractor batch embedding paths", () => {
     };
 
     const extractor = makeExtractor(embedder, llm, store, { noiseBank });
-    await extractor.extractAndPersist("正常对话内容", "s1");
 
-    // If embedBatch was called, verify no extremely short or long texts were included
-    if (lastBatchInput !== null) {
-      for (const t of lastBatchInput) {
-        assert.ok(
-          t.length > 8 && t.length <= 300,
-          `Text sent to embedBatch should be in (8, 300] range, got length=${t.length}: "${t.slice(0, 40)}"`,
-        );
-      }
+    // Call filterNoiseByEmbedding DIRECTLY with a mix of lengths
+    const inputTexts = [
+      "短",                                    // ≤8 → bypass
+      "正常长度文本用于噪声过滤测试验证逻辑正确性",   // 9-300 → needs embed
+      "x".repeat(5),                            // ≤8 → bypass
+      "另一条正常长度文本内容用于测试",             // 9-300 → needs embed
+      "x".repeat(350),                          // >300 → bypass
+    ];
+
+    await extractor.filterNoiseByEmbedding(inputTexts);
+
+    // embedBatch should have been called with ONLY mid-length texts
+    assert.ok(lastBatchInput !== null,
+      "Expected embedBatch to be called for mid-length texts");
+
+    for (const t of lastBatchInput) {
+      assert.ok(
+        t.length > 8 && t.length <= 300,
+        `Text sent to embedBatch should be in (8, 300] range, got length=${t.length}: "${t.slice(0, 40)}"`,
+      );
     }
+
+    // Verify the specific texts that should have been batched
+    const batchedTexts = lastBatchInput.map((t) => t);
+    assert.ok(
+      batchedTexts.some((t) => t.includes("正常长度文本")),
+      "Expected mid-length text '正常长度文本...' in batch input",
+    );
+    assert.ok(
+      batchedTexts.some((t) => t.includes("另一条正常长度")),
+      "Expected mid-length text '另一条正常长度...' in batch input",
+    );
   });
 
   // --------------------------------------------------------------------------
