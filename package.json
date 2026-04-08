@@ -51,10 +51,10 @@
     "version": "node scripts/sync-plugin-version.mjs openclaw.plugin.json package.json && git add openclaw.plugin.json"
   },
   "optionalDependencies": {
-    "@lancedb/lancedb-darwin-x64": "^0.26.2",
     "@lancedb/lancedb-darwin-arm64": "^0.26.2",
-    "@lancedb/lancedb-linux-x64-gnu": "^0.26.2",
+    "@lancedb/lancedb-darwin-x64": "0.22.3",
     "@lancedb/lancedb-linux-arm64-gnu": "^0.26.2",
+    "@lancedb/lancedb-linux-x64-gnu": "^0.26.2",
     "@lancedb/lancedb-win32-x64-msvc": "^0.26.2"
   },
   "devDependencies": {

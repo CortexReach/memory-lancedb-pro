@@ -95,6 +95,8 @@ export interface EmbeddingConfig {
   model: string;
   baseURL?: string;
   dimensions?: number;
+  /** Per-request embedding timeout in milliseconds. Defaults to 10s, or 30s for DashScope. */
+  timeoutMs?: number;
 
   /** Optional task type for query embeddings (e.g. "retrieval.query") */
   taskQuery?: string;
@@ -246,7 +248,11 @@ function getProviderLabel(baseURL: string | undefined, model: string): string {
 function detectEmbeddingProviderProfile(
   baseURL: string | undefined,
   model: string,
+  providerHint?: EmbeddingConfig["provider"],
 ): EmbeddingProviderProfile {
+  if (providerHint === "dashscope") return "dashscope";
+  if (providerHint === "azure-openai") return "azure-openai";
+
   const base = baseURL || "";
   let host = "";
   try { host = new URL(base).hostname.toLowerCase(); } catch { /* invalid URL — skip host checks */ }
@@ -411,8 +417,9 @@ export function formatEmbeddingProviderError(
 /** Maximum recursion depth for embedSingle chunking retries. */
 const MAX_EMBED_DEPTH = 3;
 
-/** Global timeout for a single embedding operation (ms). */
-const EMBED_TIMEOUT_MS = 10_000;
+/** Global timeout fallback for a single embedding operation (ms). */
+const DEFAULT_EMBED_TIMEOUT_MS = 10_000;
+const DEFAULT_DASHSCOPE_EMBED_TIMEOUT_MS = 30_000;
 
 /**
  * Strictly decreasing character limit for forced truncation.
@@ -450,6 +457,7 @@ export class Embedder {
   private readonly _cache: EmbeddingCache;
 
   private readonly _model: string;
+  private readonly _provider: EmbeddingConfig["provider"];
   private readonly _baseURL?: string;
   private readonly _taskQuery?: string;
   private readonly _taskPassage?: string;
@@ -463,6 +471,7 @@ export class Embedder {
   /** Enable automatic chunking for long documents (default: true) */
   private readonly _autoChunk: boolean;
   private readonly _enableFusion: boolean;
+  private readonly _timeoutMs: number;
 
   constructor(config: EmbeddingConfig & { chunking?: boolean }) {
     // Normalize apiKey to array and resolve environment variables
@@ -470,6 +479,7 @@ export class Embedder {
     const resolvedKeys = apiKeys.map(k => resolveEnvVars(k));
     this._apiKeys = resolvedKeys;
 
+    this._provider = config.provider;
     this._model = config.model;
     this._baseURL = config.baseURL;
     this._taskQuery = config.taskQuery;
@@ -480,7 +490,13 @@ export class Embedder {
     this._enableFusion = config.enableFusion !== false;
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
-    const profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
+    const profile = detectEmbeddingProviderProfile(this._baseURL, this._model, this._provider);
+    this._timeoutMs =
+      typeof config.timeoutMs === "number" && Number.isFinite(config.timeoutMs) && config.timeoutMs > 0
+        ? Math.trunc(config.timeoutMs)
+        : profile === "dashscope"
+          ? DEFAULT_DASHSCOPE_EMBED_TIMEOUT_MS
+          : DEFAULT_EMBED_TIMEOUT_MS;
     this._capabilities = getEmbeddingCapabilities(profile);
 
     // Warn if configured fields will be silently ignored by this provider profile
@@ -675,7 +691,7 @@ export class Embedder {
   /** Wrap a single embedding operation with a global timeout via AbortSignal. */
   private withTimeout<T>(promiseFactory: (signal: AbortSignal) => Promise<T>, _label: string, externalSignal?: AbortSignal): Promise<T> {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), EMBED_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => controller.abort(), this._timeoutMs);
 
     // If caller passes an external signal, merge it with the internal timeout controller.
     // Either signal aborting will cancel the promise.
@@ -732,7 +748,7 @@ export class Embedder {
 
   // Note: embedBatchQuery/embedBatchPassage are NOT wrapped with withTimeout because
   // they handle multiple texts in a single API call. The timeout would fire after
-  // EMBED_TIMEOUT_MS regardless of how many texts succeed. Individual text embedding
+  // the per-request timeout regardless of how many texts succeed. Individual text embedding
   // within the batch is protected by the SDK's own timeout handling.
   async embedBatchQuery(texts: string[], signal?: AbortSignal): Promise<number[][]> {
     // P2 optimization: DashScope batch embedding goes through embedMany for a single
@@ -794,7 +810,7 @@ export class Embedder {
   }
 
   private isDashScopeProvider(): boolean {
-    const profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
+    const profile = detectEmbeddingProviderProfile(this._baseURL, this._model, this._provider);
     return profile === "dashscope";
   }
 

@@ -91,6 +91,7 @@ interface PluginConfig {
     model?: string;
     baseURL?: string;
     dimensions?: number;
+    timeoutMs?: number;
     omitDimensions?: boolean;
     taskQuery?: string;
     taskPassage?: string;
@@ -1665,6 +1666,7 @@ const memoryLanceDBProPlugin = {
       model: config.embedding.model || "text-embedding-3-small",
       baseURL: config.embedding.baseURL,
       dimensions: config.embedding.dimensions,
+      timeoutMs: config.embedding.timeoutMs,
       omitDimensions: config.embedding.omitDimensions,
       taskQuery: config.embedding.taskQuery,
       taskPassage: config.embedding.taskPassage,
@@ -2016,7 +2018,7 @@ const memoryLanceDBProPlugin = {
 
     // Dual-memory model warning: help users understand the two-layer architecture
     // Runs synchronously and logs warnings; does NOT block gateway startup.
-    api.logger.info(
+    logReg(
       `[memory-lancedb-pro] memory_recall queries the plugin store (LanceDB), not MEMORY.md.\n` +
       `  - Plugin memory (LanceDB) = primary recall source for semantic search\n` +
       `  - MEMORY.md / memory/YYYY-MM-DD.md = startup context / journal only\n` +
@@ -3660,9 +3662,14 @@ const memoryLanceDBProPlugin = {
     // Service Registration
     // ========================================================================
 
-    api.registerService({
-      id: "memory-lancedb-pro",
-      start: async () => {
+    if (isCliMode()) {
+      api.logger.debug(
+        "memory-lancedb-pro: skipping background service registration in CLI mode",
+      );
+    } else {
+      api.registerService({
+        id: "memory-lancedb-pro",
+        start: async () => {
         // IMPORTANT: Do not block gateway startup on external network calls.
         // If embedding/retrieval tests hang (bad network / slow provider), the gateway
         // may never bind its HTTP port, causing restart timeouts.
@@ -3751,15 +3758,16 @@ const memoryLanceDBProPlugin = {
         // Run initial backup after a short delay, then schedule daily
         setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
-      },
-      stop: async () => {
-        if (backupTimer) {
-          clearInterval(backupTimer);
-          backupTimer = null;
-        }
-        api.logger.info("memory-lancedb-pro: stopped");
-      },
-    });
+        },
+        stop: async () => {
+          if (backupTimer) {
+            clearInterval(backupTimer);
+            backupTimer = null;
+          }
+          api.logger.info("memory-lancedb-pro: stopped");
+        },
+      });
+    }
   },
 };
 

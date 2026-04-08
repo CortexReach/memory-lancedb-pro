@@ -74,8 +74,20 @@ export const loadLanceDB = async (): Promise<
   try {
     return await lancedbImportPromise;
   } catch (err) {
+    const message = String(err);
+    if (
+      process.platform === "darwin" &&
+      process.arch === "x64" &&
+      message.includes("@lancedb/lancedb-darwin-x64")
+    ) {
+      throw new Error(
+        "memory-lancedb-pro: failed to load LanceDB on macOS x64 because upstream LanceDB 0.26.x does not publish a matching darwin-x64 native package. " +
+        "Install the plugin's pinned fallback optional dependency (@lancedb/lancedb-darwin-x64@0.22.3) by re-running npm install in the plugin directory.",
+        { cause: err },
+      );
+    }
     throw new Error(
-      `memory-lancedb-pro: failed to load LanceDB. ${String(err)}`,
+      `memory-lancedb-pro: failed to load LanceDB. ${message}`,
       { cause: err },
     );
   }
