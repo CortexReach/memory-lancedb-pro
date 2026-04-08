@@ -309,7 +309,7 @@ export class SmartExtractor {
 
     if (candidates.length === 0) {
       this.log("memory-pro: smart-extractor: no memories extracted");
-      // LLM returned zero candidates — strongest noise signal — feedback to noise bank
+      // LLM returned zero candidates → strongest noise signal → feedback to noise bank
       this.learnAsNoise(conversationText);
       return stats;
     }
@@ -550,7 +550,7 @@ export class SmartExtractor {
   // --------------------------------------------------------------------------
 
   /**
-   * Process a single candidate memory: dedup — merge/create — store
+   * Process a single candidate memory: dedup → merge/create → store
    */
   private async processCandidate(
     candidate: CandidateMemory,
@@ -639,7 +639,7 @@ export class SmartExtractor {
           );
           stats.merged++;
         } else {
-          // Category doesn't support merge — create instead
+          // Category doesn't support merge → create instead
           await this.storeCandidate(candidate, vector, sessionKey, targetScope, admission?.audit);
           stats.created++;
         }
@@ -728,7 +728,7 @@ export class SmartExtractor {
   // --------------------------------------------------------------------------
 
   /**
-   * Two-stage dedup: vector similarity search — LLM decision.
+   * Two-stage dedup: vector similarity search → LLM decision.
    */
   private async deduplicate(
     candidate: CandidateMemory,
