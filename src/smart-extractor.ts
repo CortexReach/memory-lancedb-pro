@@ -439,8 +439,10 @@ export class SmartExtractor {
       }
     }
 
-    // Compact: remove undefined slots (filtered-out entries)
-    return result.filter(Boolean);
+    // Compact: remove undefined slots (filtered-out entries).
+    // Use explicit undefined check rather than filter(Boolean) to preserve
+    // empty strings that were legitimately in bypass slots.
+    return result.filter((x): x is string => x !== undefined);
   }
 
   /**
