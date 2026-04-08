@@ -2840,11 +2840,8 @@ const memoryLanceDBProPlugin = {
             // appears in both pendingIngressTexts and eligibleTexts (after prefix stripping).
             newTexts = pendingIngressTexts;
             // [Fix #8] Clear consumed pending texts to prevent re-consumption
-            // [Fix-Must5] conversationKey MUST be valid here — if it's falsy, something is wrong upstream.
-            if (!conversationKey) {
-              api.logger.error("memory-lancedb-pro: autoCapturePendingIngressTexts consumed with falsy conversationKey — skipping");
-              return;
-            }
+            // (conversationKey is guaranteed truthy here since pendingIngressTexts.length > 0
+            // and pendingIngressTexts is [] when conversationKey is falsy)
             autoCapturePendingIngressTexts.delete(conversationKey);
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
