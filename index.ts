@@ -21,9 +21,13 @@ const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 
 // Import core components
 import { MemoryStore, validateStoragePath } from "./src/store.js";
+import type { MemoryEntry } from "./src/store.js";
 import { createEmbedder, getVectorDimensions } from "./src/embedder.js";
+import type { Embedder } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
+import type { MemoryRetriever } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
+import type { ScopeManager } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
@@ -1483,6 +1487,14 @@ async function findPreviousSessionFile(
 
 type AgentWorkspaceMap = Record<string, string>;
 
+type MemoryRuntimeCapability = NonNullable<
+  Parameters<OpenClawPluginApi["registerMemoryCapability"]>[0]["runtime"]
+>;
+
+type MemoryRuntimeManager = NonNullable<
+  Awaited<ReturnType<MemoryRuntimeCapability["getMemorySearchManager"]>>["manager"]
+>;
+
 function resolveAgentWorkspaceMap(api: OpenClawPluginApi): AgentWorkspaceMap {
   const map: AgentWorkspaceMap = {};
 
@@ -1560,6 +1572,197 @@ function createMdMirrorWriter(
     } catch (err) {
       api.logger.warn(`mdMirror: write failed: ${String(err)}`);
     }
+  };
+}
+
+function clampMemoryRuntimeResultLimit(value: number | undefined): number {
+  if (!Number.isFinite(value)) return 10;
+  return Math.min(20, Math.max(1, Math.floor(value!)));
+}
+
+function buildRuntimeMemoryPath(entryId: string): string {
+  return `entries/${entryId}.md`;
+}
+
+function parseRuntimeMemoryEntryId(relPath: string): string | null {
+  const trimmed = relPath.trim();
+  if (!trimmed) return null;
+  const candidate = basename(trimmed, ".md").trim();
+  return candidate.length > 0 ? candidate : null;
+}
+
+function sliceTextByLineRange(
+  text: string,
+  from?: number,
+  lines?: number,
+): string {
+  const allLines = text.split("\n");
+  const start = Number.isFinite(from) && (from ?? 0) > 0
+    ? Math.floor(from!) - 1
+    : 0;
+  if (!Number.isFinite(lines) || (lines ?? 0) <= 0) {
+    return allLines.slice(start).join("\n");
+  }
+  return allLines.slice(start, start + Math.floor(lines!)).join("\n");
+}
+
+function buildMemoryReadText(entry: MemoryEntry): string {
+  return entry.text;
+}
+
+function createMemoryRuntimeManager(params: {
+  agentId: string;
+  store: MemoryStore;
+  embedder: Embedder;
+  retriever: MemoryRetriever;
+  scopeManager: ScopeManager;
+}): MemoryRuntimeManager {
+  const { agentId, store, embedder, retriever, scopeManager } = params;
+  const scopeFilter = scopeManager.getAccessibleScopes(agentId);
+  const retrievalConfig = retriever.getConfig();
+
+  let lastStats:
+    | {
+      totalCount: number;
+      scopeCounts: Record<string, number>;
+      categoryCounts: Record<string, number>;
+    }
+    | null = null;
+  let lastEmbeddingProbe: { ok: boolean; error?: string } = {
+    ok: false,
+    error: "probe not run yet",
+  };
+  let lastVectorAvailability: boolean | undefined;
+  let lastVectorError: string | undefined;
+
+  const refreshStats = async () => {
+    lastStats = await store.stats(scopeFilter);
+    return lastStats;
+  };
+
+  return {
+    async search(query, opts) {
+      const minScore = Number.isFinite(opts?.minScore) ? opts!.minScore! : 0;
+      const results = await retriever.retrieve({
+        query,
+        limit: clampMemoryRuntimeResultLimit(opts?.maxResults),
+        scopeFilter,
+        source: "manual",
+      });
+      await refreshStats().catch(() => { });
+
+      return results
+        .filter((result) => result.score >= minScore)
+        .map((result) => ({
+          path: buildRuntimeMemoryPath(result.entry.id),
+          startLine: 1,
+          endLine: Math.max(1, result.entry.text.split("\n").length),
+          score: result.score,
+          snippet: result.entry.text,
+          source: "memory" as const,
+          citation: `memory:${result.entry.id.slice(0, 8)}`,
+        }));
+    },
+
+    async readFile(readParams) {
+      const entryId = parseRuntimeMemoryEntryId(readParams.relPath);
+      if (!entryId) {
+        throw new Error(`Unsupported memory path: ${readParams.relPath}`);
+      }
+
+      const entry = await store.getById(entryId, scopeFilter);
+      if (!entry) {
+        throw new Error(`Memory entry not found: ${entryId}`);
+      }
+
+      const text = sliceTextByLineRange(
+        buildMemoryReadText(entry),
+        readParams.from,
+        readParams.lines,
+      );
+
+      return {
+        text,
+        path: readParams.relPath,
+      };
+    },
+
+    status() {
+      const totalCount = lastStats?.totalCount ?? 0;
+      const fts = store.getFtsStatus();
+      const cacheStats = embedder.cacheStats;
+
+      return {
+        backend: "builtin" as const,
+        provider: "openai-compatible",
+        requestedProvider: "openai-compatible",
+        model: embedder.model,
+        files: totalCount,
+        chunks: totalCount,
+        dirty: false,
+        dbPath: store.dbPath,
+        sources: ["memory" as const],
+        sourceCounts: [
+          {
+            source: "memory" as const,
+            files: totalCount,
+            chunks: totalCount,
+          },
+        ],
+        cache: {
+          enabled: true,
+          entries: cacheStats.size,
+        },
+        fts: {
+          enabled: true,
+          available: fts.available,
+          ...(fts.lastError ? { error: fts.lastError } : {}),
+        },
+        vector: {
+          enabled: true,
+          available: lastVectorAvailability,
+          dims: embedder.dimensions,
+          ...(lastVectorError ? { loadError: lastVectorError } : {}),
+        },
+        custom: {
+          plugin: "memory-lancedb-pro",
+          searchMode: retrievalConfig.mode,
+          scopeCount: scopeFilter.length,
+          accessibleScopes: scopeFilter,
+          categoryCounts: lastStats?.categoryCounts ?? {},
+        },
+      };
+    },
+
+    async probeEmbeddingAvailability() {
+      const result = await embedder.test();
+      lastEmbeddingProbe = {
+        ok: result.success,
+        ...(result.error ? { error: result.error } : {}),
+      };
+      return lastEmbeddingProbe;
+    },
+
+    async probeVectorAvailability() {
+      try {
+        const probeVector = Array.from({ length: embedder.dimensions }, () => 0);
+        await store.vectorSearch(probeVector, 1, 0, scopeFilter, {
+          excludeInactive: true,
+        });
+        await refreshStats();
+        lastVectorAvailability = true;
+        lastVectorError = undefined;
+        return true;
+      } catch (error) {
+        lastVectorAvailability = false;
+        lastVectorError = error instanceof Error ? error.message : String(error);
+        return false;
+      }
+    },
+
+    async close() {
+      return;
+    },
   };
 }
 
@@ -2014,44 +2217,39 @@ const memoryLanceDBProPlugin = {
 
     // Dual-memory model warning: help users understand the two-layer architecture
     // Runs synchronously and logs warnings; does NOT block gateway startup.
-    api.logger.info(
+    logReg(
       `[memory-lancedb-pro] memory_recall queries the plugin store (LanceDB), not MEMORY.md.\n` +
       `  - Plugin memory (LanceDB) = primary recall source for semantic search\n` +
       `  - MEMORY.md / memory/YYYY-MM-DD.md = startup context / journal only\n` +
       `  - Use memory_store or auto-capture for recallable memories.\n`
     );
 
-    // Health status for memory runtime stub (reflects actual plugin health)
-    // Updated by runStartupChecks after testing embedder and retriever
-    let embedHealth: { ok: boolean; error?: string } = { ok: false, error: "startup not complete" };
-    let retrievalHealth: boolean = false;
+    const memoryRuntime: MemoryRuntimeCapability = {
+      async getMemorySearchManager({ agentId }) {
+        return {
+          manager: createMemoryRuntimeManager({
+            agentId,
+            store,
+            embedder,
+            retriever,
+            scopeManager,
+          }),
+        };
+      },
+      resolveMemoryBackendConfig() {
+        return { backend: "builtin" };
+      },
+      async closeAllMemorySearchManagers() {
+        return;
+      },
+    };
 
-    // ========================================================================
-    // Stub Memory Runtime (satisfies openclaw doctor memory plugin check)
-    // memory-lancedb-pro uses a tool-based architecture, not the built-in memory-core
-    // runtime interface, so we register a minimal stub to satisfy the check.
-    // See: https://github.com/CortexReach/memory-lancedb-pro/issues/434
-    // ========================================================================
-    if (typeof api.registerMemoryRuntime === "function") {
-      api.registerMemoryRuntime({
-        async getMemorySearchManager(_params: any) {
-          return {
-            manager: {
-              status: () => ({
-                backend: "builtin" as const,
-                provider: "memory-lancedb-pro",
-                embeddingAvailable: embedHealth.ok,
-                retrievalAvailable: retrievalHealth,
-              }),
-              probeEmbeddingAvailability: async () => ({ ...embedHealth }),
-              probeVectorAvailability: async () => retrievalHealth,
-            },
-          };
-        },
-        resolveMemoryBackendConfig() {
-          return { backend: "builtin" as const };
-        },
+    if (typeof api.registerMemoryCapability === "function") {
+      api.registerMemoryCapability({
+        runtime: memoryRuntime,
       });
+    } else if (typeof api.registerMemoryRuntime === "function") {
+      api.registerMemoryRuntime(memoryRuntime);
     }
 
     api.on("message_received", (event: any, ctx: any) => {
@@ -3717,9 +3915,6 @@ const memoryLanceDBProPlugin = {
               );
             }
 
-            // Update stub health status so openclaw doctor reflects real state
-            embedHealth = { ok: !!embedTest.success, error: embedTest.error };
-            retrievalHealth = !!retrievalTest.success;
           } catch (error) {
             api.logger.warn(
               `memory-lancedb-pro: startup checks failed: ${String(error)}`,

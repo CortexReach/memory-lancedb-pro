@@ -176,6 +176,13 @@ async function main() {
     server = await startMockEmbeddingServer();
 
     const config = {
+      agents: {
+        defaults: {
+          memorySearch: {
+            enabled: true,
+          },
+        },
+      },
       plugins: {
         allow: ["memory-lancedb-pro"],
         load: {
@@ -270,6 +277,18 @@ async function main() {
 
     const statsBeforeDelete = parseJsonOutput(await runOpenClaw(profile, ["memory-pro", "stats", "--scope", "global", "--json"]));
     assert.equal(statsBeforeDelete.memory.totalCount, 2);
+
+    const statusOutput = parseJsonOutput(await runOpenClaw(profile, ["status", "--json", "--all"]));
+    assert.ok(statusOutput.memory);
+    assert.equal(statusOutput.memoryPlugin.slot, "memory-lancedb-pro");
+    assert.equal(statusOutput.memory.provider, "openai-compatible");
+    assert.equal(statusOutput.memory.model, "mock-embed-4d");
+    assert.equal(statusOutput.memory.files, 2);
+    assert.equal(statusOutput.memory.chunks, 2);
+    assert.equal(statusOutput.memory.vector.enabled, true);
+    assert.equal(statusOutput.memory.vector.available, true);
+    assert.equal(statusOutput.memory.fts.enabled, true);
+    assert.equal(statusOutput.memory.custom.plugin, "memory-lancedb-pro");
 
     const exportOutput = await runOpenClaw(profile, ["memory-pro", "export", "--scope", "global", "--output", exportFile]);
     assert.match(exportOutput, /Exported 2 memories/);
