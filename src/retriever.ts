@@ -22,7 +22,7 @@ import {
 } from "./smart-metadata.js";
 import { TraceCollector, type RetrievalTrace } from "./retrieval-trace.js";
 import { RetrievalStatsCollector } from "./retrieval-stats.js";
-import { buildDashScopeRerankRequest } from "./providers/dashscope-rerank.js";
+import { buildDashScopeRerankRequest, fetchDashScopeRerank } from "./providers/dashscope-rerank.js";
 
 // ============================================================================
 // Types & Configuration
@@ -1208,86 +1208,128 @@ export class MemoryRetriever {
           this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
         const documents = results.map((r) => r.entry.text);
 
-        // Build provider-specific request
-        const { headers, body } = buildRerankRequest(
-          provider,
-          this.config.rerankApiKey || "",
-          model,
-          query,
-          documents,
-          results.length,
-        );
-
-        // Timeout: configurable via rerankTimeoutMs (default: 5000ms)
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), this.config.rerankTimeoutMs ?? 5000);
-
-        let response: Response;
-        try {
-          response = await fetch(endpoint, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(body),
-            signal: controller.signal,
+        // P0 fix: dashscope rerank must use dedicated fetch + correct endpoint routing.
+        // Default model for dashscope is qwen3-vl-rerank (not jina-reranker-v3).
+        if (provider === "dashscope") {
+          const model = this.config.rerankModel || "qwen3-vl-rerank";
+          const body = buildDashScopeRerankRequest({
+            model,
+            query,
+            candidates: documents,
+            topN: results.length,
+            returnDocuments: true,
           });
-        } finally {
-          clearTimeout(timeout);
-        }
 
-        if (response.ok) {
-          const data: unknown = await response.json();
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), this.config.rerankTimeoutMs ?? 5000);
 
-          // Parse provider-specific response into unified format
-          const parsed = parseRerankResponse(provider, data);
+          let apiData: Awaited<ReturnType<typeof fetchDashScopeRerank>> | null = null;
+          let fetchError: Error | null = null;
+          try {
+            apiData = await fetchDashScopeRerank({
+              apiKey: this.config.rerankApiKey || "",
+              baseURL: this.config.rerankEndpoint,
+              payload: body,
+              signal: controller.signal,
+            });
+          } catch (err) {
+            fetchError = err instanceof Error ? err : new Error(String(err));
+          } finally {
+            clearTimeout(timeout);
+          }
 
-          if (!parsed) {
-            console.warn(
-              "Rerank API: invalid response shape, falling back to cosine",
-            );
-          } else {
-            // Build a Set of returned indices to identify unreturned candidates
+          if (fetchError) {
+            if (fetchError.name === "AbortError") {
+              console.warn(`DashScope rerank timed out (${this.config.rerankTimeoutMs ?? 5000}ms), falling back to cosine`);
+            } else {
+              console.warn("DashScope rerank API failed, falling back to cosine:", fetchError.message);
+            }
+          } else if (apiData?.results) {
+            const parsed = apiData.results.map((r) => ({ index: r.index, score: r.score }));
             const returnedIndices = new Set(parsed.map((r) => r.index));
-
             const reranked = parsed
               .filter((item) => item.index >= 0 && item.index < results.length)
               .map((item) => {
                 const original = results[item.index];
                 const floor = this.getRerankPreservationFloor(original, false);
-                // Blend: 60% cross-encoder score + 40% original fused score
-                const blendedScore = clamp01WithFloor(
-                  item.score * 0.6 + original.score * 0.4,
-                  floor,
-                );
+                const blendedScore = clamp01WithFloor(item.score * 0.6 + original.score * 0.4, floor);
                 return {
                   ...original,
                   score: blendedScore,
-                  sources: {
-                    ...original.sources,
-                    reranked: { score: item.score },
-                  },
+                  sources: { ...original.sources, reranked: { score: item.score } },
                 };
               });
-
-            // Keep unreturned candidates with their original scores (slightly penalized)
             const unreturned = results
               .filter((_, idx) => !returnedIndices.has(idx))
-              .map(r => ({
+              .map((r) => ({
                 ...r,
-                score: clamp01WithFloor(
-                  r.score * 0.8,
-                  this.getRerankPreservationFloor(r, true),
-                ),
+                score: clamp01WithFloor(r.score * 0.8, this.getRerankPreservationFloor(r, true)),
               }));
-
-            return [...reranked, ...unreturned].sort(
-              (a, b) => b.score - a.score,
-            );
+            return [...reranked, ...unreturned].sort((a, b) => b.score - a.score);
           }
+
+          // Fall through to cosine fallback below if DashScope returned no parseable results
         } else {
-          const errText = await response.text().catch(() => "");
-          console.warn(
-            `Rerank API returned ${response.status}: ${errText.slice(0, 200)}, falling back to cosine`,
+          // Non-dashscope providers: jina, siliconflow, voyage, pinecone, tei
+          const model = this.config.rerankModel || "jina-reranker-v3";
+          const endpoint = this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
+
+          const { headers, body } = buildRerankRequest(
+            provider,
+            this.config.rerankApiKey || "",
+            model,
+            query,
+            documents,
+            results.length,
           );
+
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), this.config.rerankTimeoutMs ?? 5000);
+
+          let response: Response;
+          try {
+            response = await fetch(endpoint, {
+              method: "POST",
+              headers,
+              body: JSON.stringify(body),
+              signal: controller.signal,
+            });
+          } finally {
+            clearTimeout(timeout);
+          }
+
+          if (response.ok) {
+            const data: unknown = await response.json();
+            const parsed = parseRerankResponse(provider, data);
+
+            if (!parsed) {
+              console.warn("Rerank API: invalid response shape, falling back to cosine");
+            } else {
+              const returnedIndices = new Set(parsed.map((r) => r.index));
+              const reranked = parsed
+                .filter((item) => item.index >= 0 && item.index < results.length)
+                .map((item) => {
+                  const original = results[item.index];
+                  const floor = this.getRerankPreservationFloor(original, false);
+                  const blendedScore = clamp01WithFloor(item.score * 0.6 + original.score * 0.4, floor);
+                  return {
+                    ...original,
+                    score: blendedScore,
+                    sources: { ...original.sources, reranked: { score: item.score } },
+                  };
+                });
+              const unreturned = results
+                .filter((_, idx) => !returnedIndices.has(idx))
+                .map((r) => ({
+                  ...r,
+                  score: clamp01WithFloor(r.score * 0.8, this.getRerankPreservationFloor(r, true)),
+                }));
+              return [...reranked, ...unreturned].sort((a, b) => b.score - a.score);
+            }
+          } else {
+            const errText = await response.text().catch(() => "");
+            console.warn(`Rerank API returned ${response.status}: ${errText.slice(0, 200)}, falling back to cosine`);
+          }
         }
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {

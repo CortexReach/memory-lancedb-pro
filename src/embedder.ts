@@ -992,8 +992,14 @@ export class Embedder {
       const results: number[][] = new Array(texts.length);
 
       // Fill in embeddings for valid texts
-      response.data.forEach((item, idx) => {
-        const originalIndex = validIndices[idx];
+      // P1 fix: use item.index from response (set by normalizeDashScopeEmbeddingResponse)
+      // rather than array position, which would misalign if the API returns results
+      // in a different order than the input texts were sent.
+      response.data.forEach((item) => {
+        const originalIndex =
+          typeof item.index === "number"
+            ? item.index
+            : validIndices[response.data.indexOf(item)];
         const embedding = item.embedding as number[];
 
         this.validateEmbedding(embedding);
