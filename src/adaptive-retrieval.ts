@@ -7,15 +7,22 @@
 
 // Queries that are clearly NOT memory-retrieval candidates
 const SKIP_PATTERNS = [
-  // Greetings & pleasantries
+  // Greetings & pleasantries (EN)
   /^(hi|hello|hey|good\s*(morning|afternoon|evening|night)|greetings|yo|sup|howdy|what'?s up)\b/i,
+  // Greetings & pleasantries (RU)
+  /^(привет|здравствуй|приветствую|здорово|салют)\b/i,
+  /^добр(ое|ый|ую|ое)\s*(утро|день|вечер|ночи|ночь)\b/i,
   // System/bot commands
   /^\//,  // slash commands
   /^(run|build|test|ls|cd|git|npm|pip|docker|curl|cat|grep|find|make|sudo)\b/i,
-  // Simple affirmations/negations
+  // Simple affirmations/negations (EN)
   /^(yes|no|yep|nope|ok|okay|sure|fine|thanks|thank you|thx|ty|got it|understood|cool|nice|great|good|perfect|awesome|👍|👎|✅|❌)\s*[.!]?$/i,
-  // Continuation prompts
+  // Simple affirmations/negations (RU)
+  /^(да|нет|ок|окей|хорошо|понял|понятно|поняла|ага|угу|ясно|верно|точно|спасибо|благодарю|мерси)\s*[.!]?$/i,
+  // Continuation prompts (EN + CJK)
   /^(go ahead|continue|proceed|do it|start|begin|next|实施|實施|开始|開始|继续|繼續|好的|可以|行)\s*[.!]?$/i,
+  // Continuation prompts (RU)
+  /^(продолжай|продолжить|дальше|погнали|начинай|начать|делай|давай)\s*[.!]?$/i,
   // Pure emoji
   /^[\p{Emoji}\s]+$/u,
   // Heartbeat/system (match anywhere, not just at start, to handle prefixed formats)
@@ -27,10 +34,23 @@ const SKIP_PATTERNS = [
 
 // Queries that SHOULD trigger retrieval even if short
 const FORCE_RETRIEVE_PATTERNS = [
+  // Memory-related keywords (EN)
   /\b(remember|recall|forgot|memory|memories)\b/i,
+  // Memory-related keywords (RU)
+  /\b(запомни|вспомни|забыл|запамятовал|память|помнишь|помню)\b/i,
+  // Temporal references (EN)
   /\b(last time|before|previously|earlier|yesterday|ago)\b/i,
+  // Temporal references (RU)
+  /\b(раньше|прежде|прошлый раз|до этого|недавно|давно|вчера|позавчера)\b/i,
+  // Personal data queries (EN)
   /\b(my (name|email|phone|address|birthday|preference))\b/i,
+  // Personal data queries (RU)
+  /\bмо(я|ё|й|и|е)\s*(имя|почта|телефон|адрес|день рождения|дата рождения|никнейм|логин)\b/i,
+  // "What did I say/tell" patterns (EN)
   /\b(what did (i|we)|did i (tell|say|mention))\b/i,
+  // "What did I say/tell" patterns (RU)
+  /\b(что я (говорил|сказал|писал|упоминал)|о ч(ё|е)м мы говорили|что мы обсуждали)\b/i,
+  // CJK patterns
   /(你记得|[你妳]記得|之前|上次|以前|还记得|還記得|提到过|提到過|说过|說過)/i,
 ];
 
@@ -87,9 +107,10 @@ export function shouldSkipRetrieval(query: string, minLength?: number): boolean 
   }
 
   // Skip very short non-question messages (likely commands or affirmations)
-  // CJK characters carry more meaning per character, so use a lower threshold
+  // CJK and Cyrillic characters carry more meaning per character, so use a lower threshold
   const hasCJK = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(trimmed);
-  const defaultMinLength = hasCJK ? 6 : 15;
+  const hasCyrillic = /[\u0400-\u04ff]/.test(trimmed);
+  const defaultMinLength = (hasCJK || hasCyrillic) ? 6 : 15;
   if (trimmed.length < defaultMinLength && !trimmed.includes('?') && !trimmed.includes('？')) return true;
 
   // Default: do retrieve

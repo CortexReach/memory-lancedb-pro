@@ -191,6 +191,7 @@ interface PluginConfig {
     thinkLevel?: ReflectionThinkLevel;
     errorReminderMaxEntries?: number;
     dedupeErrorSignals?: boolean;
+    modelOverride?: string;
   };
   mdMirror?: { enabled?: boolean; dir?: string };
   workspaceBoundary?: WorkspaceBoundaryConfig;
@@ -1093,6 +1094,7 @@ async function generateReflectionText(params: {
   thinkLevel: ReflectionThinkLevel;
   toolErrorSignals?: ReflectionErrorSignal[];
   logger?: { info?: (message: string) => void; warn?: (message: string) => void };
+  modelOverride?: string;
 }): Promise<{ text: string; usedFallback: boolean; promptHash: string; error?: string; runner: "embedded" | "cli" | "fallback" }> {
   const prompt = buildReflectionPrompt(
     params.conversation,
@@ -1120,7 +1122,7 @@ async function generateReflectionText(params: {
       onLog: onRetryLog,
       execute: async () => {
         const runEmbeddedPiAgent = await loadEmbeddedPiRunner();
-        const modelRef = resolveAgentPrimaryModelRef(params.cfg, params.agentId);
+        const modelRef = params.modelOverride || resolveAgentPrimaryModelRef(params.cfg, params.agentId);
         const { provider, model } = modelRef ? splitProviderModel(modelRef) : {};
         const embeddedTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
 
@@ -3190,6 +3192,7 @@ const memoryLanceDBProPlugin = {
             thinkLevel: reflectionThinkLevel,
             toolErrorSignals,
             logger: api.logger,
+            modelOverride: config.llm?.model || config.memoryReflection?.modelOverride,
           });
           api.logger.info(
             `memory-reflection: command:${action} reflection generation done for session ${currentSessionId}; runner=${reflectionGenerated.runner}; usedFallback=${reflectionGenerated.usedFallback ? "yes" : "no"}`

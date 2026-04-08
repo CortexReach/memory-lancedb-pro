@@ -60,8 +60,13 @@ const INTENT_RULES: IntentRule[] = [
   {
     label: "preference",
     patterns: [
+      // EN patterns
       /\b(prefer|preference|style|convention|like|dislike|favorite|habit)\b/i,
       /\b(how do (i|we) usually|what('s| is) (my|our) (style|convention|approach))\b/i,
+      // RU patterns
+      /\b(предпочитаю|предпочтени[ея]|люблю|нравится|привычка|стиль|обычн[оыа]|любимый|не люблю)\b/i,
+      /\b(как (я|мы) обычно|мой стиль|мой подход)\b/i,
+      // CJK patterns
       /(偏好|喜欢|习惯|风格|惯例|常用|不喜欢|不要用|别用)/,
     ],
     categories: ["preference", "decision"],
@@ -72,8 +77,13 @@ const INTENT_RULES: IntentRule[] = [
   {
     label: "decision",
     patterns: [
+      // EN patterns
       /\b(why did (we|i)|decision|decided|chose|rationale|trade-?off|reason for)\b/i,
       /\b(what was the (reason|rationale|decision))\b/i,
+      // RU patterns
+      /\b(почему (выбрал|решил|сделал)|решени[ея]|причина|зачем|обоснование)\b/i,
+      /\b(какое было решение|почему мы|компромисс)\b/i,
+      // CJK patterns
       /(为什么选|决定|选择了|取舍|权衡|原因是|当时决定)/,
     ],
     categories: ["decision", "fact"],
@@ -86,8 +96,13 @@ const INTENT_RULES: IntentRule[] = [
   {
     label: "entity",
     patterns: [
+      // EN patterns
       /\b(who is|who are|tell me about|info on|details about|contact info)\b/i,
       /\b(who('s| is) (the|our|my)|what team|which (person|team))\b/i,
+      // RU patterns
+      /\b(кто такой|кто такая|расскажи о|подробнее о|информация о|детали о)\b/i,
+      /\b(что за|какой командой|кто отвечает за)\b/i,
+      // CJK patterns
       /(谁是|告诉我关于|详情|联系方式|哪个团队)/,
     ],
     categories: ["entity", "fact"],
@@ -100,8 +115,13 @@ const INTENT_RULES: IntentRule[] = [
   {
     label: "event",
     patterns: [
+      // EN patterns
       /\b(when did|what happened|timeline|incident|outage|deploy|release|shipped)\b/i,
       /\b(last (week|month|time|sprint)|recently|yesterday|today)\b/i,
+      // RU patterns
+      /\b(когда было|когда произош(ло|ёл)|событие|инцидент|случилось|произошло)\b/i,
+      /\b(что произошло|хронология|таймлайн|деплой|релиз|выпуск)\b/i,
+      // CJK patterns
       /(什么时候|发生了什么|时间线|事件|上线|部署|发布|上次|最近)/,
     ],
     categories: ["entity", "decision"],
@@ -112,8 +132,13 @@ const INTENT_RULES: IntentRule[] = [
   {
     label: "fact",
     patterns: [
+      // EN patterns
       /\b(how (does|do|to)|what (does|do|is)|explain|documentation|spec)\b/i,
       /\b(config|configuration|setup|install|architecture|api|endpoint)\b/i,
+      // RU patterns
+      /\b(как сделать|как работает|что такое|объясни|документаци[яи]|инструкция)\b/i,
+      /\b(конфигураци[яи]|настройка|установка|архитектур[аы]|api|эндпоинт)\b/i,
+      // CJK patterns
       /(怎么|如何|是什么|解释|文档|规范|配置|安装|架构|接口)/,
     ],
     categories: ["fact", "entity"],
