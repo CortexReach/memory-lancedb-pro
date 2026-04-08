@@ -787,7 +787,7 @@ export function registerMemoryStoreTool(
 
 // Temporal awareness: classify and infer expiry
           const temporalType = classifyTemporal(text);
-          const validUntil = inferExpiry(text); (fix: extend envelope stripping to broader channel/system markers (Phase 2))
+          const validUntil = inferExpiry(text);
           // Check for duplicates / supersede candidates using raw vector similarity
           // (bypasses importance/recency weighting).
           // Fail-open by design: dedup must never block a legitimate memory write.
