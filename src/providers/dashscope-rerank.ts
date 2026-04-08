@@ -8,7 +8,7 @@ export interface DashScopeRerankRequestOptions {
 }
 
 const DEFAULT_DASHSCOPE_RERANK_ENDPOINT =
-  "https://dashscope.aliyuncs.com/api/v1/services/text/retrieval/vector-based/rerank";
+  "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank";
 
 export function buildDashScopeRerankRequest(
   options: DashScopeRerankRequestOptions,
@@ -39,7 +39,7 @@ export function buildDashScopeRerankRequest(
 export function resolveDashScopeRerankEndpoint(baseURL?: string): string {
   const raw = baseURL?.trim();
   if (!raw) return DEFAULT_DASHSCOPE_RERANK_ENDPOINT;
-  if (raw.includes("/services/text/retrieval")) return raw;
+  if (raw.includes("/services/rerank/") || raw.includes("/compatible-api/v1/reranks")) return raw;
   if (/dashscope\.aliyuncs\.com/i.test(raw)) return DEFAULT_DASHSCOPE_RERANK_ENDPOINT;
   return raw;
 }
