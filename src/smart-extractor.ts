@@ -127,8 +127,45 @@ function stripLeadingRuntimeWrappers(text: string): string {
  */
 export function stripEnvelopeMetadata(text: string): string {
   // 0. Strip runtime orchestration wrappers that should never become memories
-  //    (sub-agent task scaffolding is execution metadata, not conversation content).
-  let cleaned = stripLeadingRuntimeWrappers(text);
+let cleaned = text.replace(/^\[(?:Subagent Context|Subagent Task)\].*$/gm, "");
+  cleaned = cleaned.replace(
+    /^(?:Results auto-announce to your requester\.?|do not busy-poll for status\.?|Do not use any memory tools\.?)\s*$/gim,
+    "",
+  );
+
+  // 0b. Strip Discord/channel forwarded message envelope blocks
+  cleaned = cleaned.replace(
+    /^<<<EXTERNAL_UNTRUSTED_CONTENT\b.*$/gim,
+    "",
+  );
+  cleaned = cleaned.replace(
+    /^<<<END_EXTERNAL_UNTRUSTED_CONTENT\b.*$/gim,
+    "",
+  );
+
+  // 0c. Strip individual envelope metadata header lines (per-line, no blanket null return)
+  cleaned = cleaned.replace(
+    /^Sender\s*\(untrusted metadata\):\s*\n```json\n[\s\S]*?\n```\s*/gim,
+    "",
+  );
+  cleaned = cleaned.replace(
+    /^Conversation info\s*\(untrusted metadata\):\s*\n```json\n[\s\S]*?\n```\s*/gim,
+    "",
+  );
+  // Thread starter: consume header + content + trailing blank lines (not just the content line)
+  cleaned = cleaned.replace(
+    /^Thread starter\s*\(untrusted, for context\):\n([^\n]*\n[ \t]*)*\n+/gm,
+    "",
+  );
+  // Forwarded message context: same pattern — header + content + trailing blank lines
+  cleaned = cleaned.replace(
+    /^Forwarded message context\s*\(untrusted metadata\):\n([^\n]*\n[ \t]*)*\n+/gm,
+    "",
+  );
+  cleaned = cleaned.replace(
+    /^\[Queued messages while agent was busy\]\s*/gim,
+    "",
+  ); (fix: extend envelope stripping to broader channel/system markers (Phase 2))
 
   // 1. Strip "System: [timestamp] Channel..." lines
   cleaned = cleaned.replace(
@@ -272,7 +309,7 @@ export class SmartExtractor {
 
     if (candidates.length === 0) {
       this.log("memory-pro: smart-extractor: no memories extracted");
-      // LLM returned zero candidates → strongest noise signal → feedback to noise bank
+      // LLM returned zero candidates — strongest noise signal — feedback to noise bank
       this.learnAsNoise(conversationText);
       return stats;
     }
@@ -354,6 +391,7 @@ export class SmartExtractor {
    */
   async filterNoiseByEmbedding(texts: string[]): Promise<string[]> {
     const noiseBank = this.config.noiseBank;
+
     if (!noiseBank || !noiseBank.initialized) return texts;
 
     const result: string[] = [];
@@ -512,7 +550,7 @@ export class SmartExtractor {
   // --------------------------------------------------------------------------
 
   /**
-   * Process a single candidate memory: dedup → merge/create → store
+   * Process a single candidate memory: dedup — merge/create — store
    */
   private async processCandidate(
     candidate: CandidateMemory,
@@ -601,7 +639,7 @@ export class SmartExtractor {
           );
           stats.merged++;
         } else {
-          // Category doesn't support merge → create instead
+          // Category doesn't support merge — create instead
           await this.storeCandidate(candidate, vector, sessionKey, targetScope, admission?.audit);
           stats.created++;
         }
@@ -690,7 +728,7 @@ export class SmartExtractor {
   // --------------------------------------------------------------------------
 
   /**
-   * Two-stage dedup: vector similarity search → LLM decision.
+   * Two-stage dedup: vector similarity search — LLM decision.
    */
   private async deduplicate(
     candidate: CandidateMemory,
@@ -714,7 +752,7 @@ export class SmartExtractor {
 
     // Stage 1.5: Preference slot guard — same brand but different item
     // should always be stored as a new memory, not merged/skipped.
-    // Example: "喜欢麦当劳的板烧鸡腿堡" and "喜欢麦当劳的麦辣鸡翅" are
+    // Example: "喜欢麦当劳的板烧鸡腿堡" and "麦辣鸡腿堡" are
     // different preferences even though they share the same brand.
     if (candidate.category === "preferences") {
       const candidateSlot = inferAtomicBrandItemPreferenceSlot(candidate.content);
@@ -723,7 +761,7 @@ export class SmartExtractor {
           const existingSlot = inferAtomicBrandItemPreferenceSlot(r.entry.text);
           // If existing is not a brand-item preference, let LLM decide
           if (!existingSlot) return false;
-          // Same brand, different item → should not be deduped
+          // Same brand, different item — should not be deduped
           return existingSlot.brand === candidateSlot.brand && existingSlot.item !== candidateSlot.item;
         });
         if (allDifferentItem) {
