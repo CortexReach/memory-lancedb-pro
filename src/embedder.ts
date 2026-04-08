@@ -735,16 +735,16 @@ export class Embedder {
   // EMBED_TIMEOUT_MS regardless of how many texts succeed. Individual text embedding
   // within the batch is protected by the SDK's own timeout handling.
   async embedBatchQuery(texts: string[], signal?: AbortSignal): Promise<number[][]> {
-    if (this.isDashScopeProvider()) {
-      return Promise.all(texts.map((text) => this.embedQuery(text, signal)));
-    }
+    // P2 optimization: DashScope batch embedding goes through embedMany for a single
+    // API call instead of per-item Promise.all. embedMany already routes to
+    // embedWithDashScopeRetry which handles the DashScope protocol correctly.
     return this.embedMany(texts, this._taskQuery, signal);
   }
 
   async embedBatchPassage(texts: string[], signal?: AbortSignal): Promise<number[][]> {
-    if (this.isDashScopeProvider()) {
-      return Promise.all(texts.map((text) => this.embedPassage(text, signal)));
-    }
+    // P2 optimization: DashScope batch embedding goes through embedMany for a single
+    // API call instead of per-item Promise.all. embedMany already routes to
+    // embedWithDashScopeRetry which handles the DashScope protocol correctly.
     return this.embedMany(texts, this._taskPassage, signal);
   }
 
