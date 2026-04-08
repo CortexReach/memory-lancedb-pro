@@ -220,7 +220,8 @@ export class MemoryStore {
     return this.config.dbPath;
   }
 
-  private async ensureInitialized(): Promise<void> {
+  /** Ensure the store is fully initialized (FTS index created, table opened, etc.). Safe to call multiple times. */
+  public async ensureInitialized(): Promise<void> {
     if (this.table) {
       return;
     }

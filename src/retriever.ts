@@ -561,6 +561,9 @@ export class MemoryRetriever {
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
     const { query, limit, scopeFilter, category, source } = context;
     const safeLimit = clampInt(limit, 1, 20);
+    // Ensure store is fully initialized before routing decision (hybrid vs vector-only).
+    // Without this, hasFtsSupport may be false on first call if FTS index creation is still in flight.
+    await this.store.ensureInitialized();
     this.lastDiagnostics = null;
     const diagnostics: RetrievalDiagnostics = {
       source,
