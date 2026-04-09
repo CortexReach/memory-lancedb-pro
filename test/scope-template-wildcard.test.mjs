@@ -146,6 +146,37 @@ describe("resolveImplicitWriteScope", () => {
       { reason: "template_unresolved" },
     );
   });
+
+  it("falls back to the manager default without passing a bypass agent id", () => {
+    const calls = [];
+    const scopeManager = {
+      getDefaultScope(agentId) {
+        calls.push(agentId);
+        if (agentId === "system" || agentId === "undefined") {
+          throw new Error(`unexpected bypass lookup for ${agentId}`);
+        }
+        return "global";
+      },
+      isAccessible: () => true,
+      validateScope: () => true,
+    };
+
+    assert.deepStrictEqual(
+      resolveImplicitWriteScope({
+        scopeManager,
+        agentId: "system",
+      }),
+      { scope: "global" },
+    );
+    assert.deepStrictEqual(
+      resolveImplicitWriteScope({
+        scopeManager,
+        agentId: "undefined",
+      }),
+      { scope: "global" },
+    );
+    assert.deepStrictEqual(calls, [undefined, undefined]);
+  });
 });
 
 // ============================================================================

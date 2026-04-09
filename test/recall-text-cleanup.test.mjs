@@ -299,6 +299,7 @@ function makeRecallContext(results = makeResults()) {
       getAccessibleScopes: () => ["global"],
       isAccessible: () => true,
       getDefaultScope: () => "global",
+      validateScope: () => true,
     },
     embedder: { embedPassage: async () => [] },
     agentId: "main",
@@ -922,4 +923,3 @@ describe("recall text cleanup", () => {
     assert.match(res.content[0].text, /称呼偏好：宙斯/);
   });
 });
-

@@ -209,7 +209,8 @@ export function resolveImplicitWriteScope(
   const candidate =
     agentId && !isSystemBypassId(agentId)
       ? scopeManager.getDefaultScope(agentId)
-      : (defaultScope || scopeManager.getDefaultScope(agentId));
+      // Reserved bypass IDs must never be passed into getDefaultScope(agentId).
+      : (defaultScope || scopeManager.getDefaultScope());
 
   if (!candidate || !isConcreteWriteScope(candidate) || !scopeManager.validateScope(candidate)) {
     return {
