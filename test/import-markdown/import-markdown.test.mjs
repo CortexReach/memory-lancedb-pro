@@ -298,6 +298,124 @@ describe("import-markdown CLI", () => {
       assert.ok(skipped >= 0);
     });
   });
+
+  describe("flat root-memory scope inference", () => {
+    it("infers scope from openclaw.json agents list for flat workspace/memory/ files", async () => {
+      // Use isolated temp dir to avoid pollution from other tests' workspaces
+      const isolatedHome = join(tmpdir(), "import-markdown-flat-scope-test-" + Date.now());
+      await mkdir(isolatedHome, { recursive: true });
+
+      const openclawConfig = {
+        agents: {
+          list: [
+            { id: "agent-main", workspace: join(isolatedHome, "workspace", "agent-main") },
+          ],
+        },
+      };
+      await mkdir(join(isolatedHome, "workspace", "agent-main"), { recursive: true });
+      await writeFile(
+        join(isolatedHome, "openclaw.json"),
+        JSON.stringify(openclawConfig),
+        "utf-8",
+      );
+
+      await mkdir(join(isolatedHome, "workspace", "memory"), { recursive: true });
+      await writeFile(
+        join(isolatedHome, "workspace", "memory", "2026-04-10.md"),
+        "- Flat root memory entry\n",
+        "utf-8",
+      );
+
+      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const { imported } = await runImportMarkdown(ctx, {
+        openclawHome: isolatedHome,
+      });
+
+      assert.strictEqual(imported, 1, "should import the flat memory entry");
+      assert.strictEqual(
+        mockStore.storedRecords[0].scope,
+        "agent-main",
+        "flat root-memory should be scoped to the single configured agent",
+      );
+    });
+
+    it("falls back to global scope when no agent workspace matches", async () => {
+      const isolatedHome = join(tmpdir(), "import-markdown-flat-scope-test-" + Date.now());
+      await mkdir(isolatedHome, { recursive: true });
+
+      const openclawConfig = {
+        agents: {
+          list: [
+            { id: "some-agent", workspace: "/someother/path" },
+          ],
+        },
+      };
+      await writeFile(
+        join(isolatedHome, "openclaw.json"),
+        JSON.stringify(openclawConfig),
+        "utf-8",
+      );
+
+      await mkdir(join(isolatedHome, "workspace", "memory"), { recursive: true });
+      await writeFile(
+        join(isolatedHome, "workspace", "memory", "2026-04-10.md"),
+        "- Another flat entry\n",
+        "utf-8",
+      );
+
+      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const { imported } = await runImportMarkdown(ctx, {
+        openclawHome: isolatedHome,
+      });
+
+      assert.strictEqual(imported, 1);
+      assert.strictEqual(
+        mockStore.storedRecords[0].scope,
+        "global",
+        "should fall back to global when no agent workspace matches",
+      );
+    });
+
+    it("falls back to global scope when multiple agents exist (ambiguous)", async () => {
+      const isolatedHome = join(tmpdir(), "import-markdown-flat-scope-test-" + Date.now());
+      await mkdir(isolatedHome, { recursive: true });
+
+      const openclawConfig = {
+        agents: {
+          list: [
+            { id: "agent-a", workspace: join(isolatedHome, "workspace", "agent-a") },
+            { id: "agent-b", workspace: join(isolatedHome, "workspace", "agent-b") },
+          ],
+        },
+      };
+      await mkdir(join(isolatedHome, "workspace", "agent-a"), { recursive: true });
+      await mkdir(join(isolatedHome, "workspace", "agent-b"), { recursive: true });
+      await writeFile(
+        join(isolatedHome, "openclaw.json"),
+        JSON.stringify(openclawConfig),
+        "utf-8",
+      );
+
+      await mkdir(join(isolatedHome, "workspace", "memory"), { recursive: true });
+      await writeFile(
+        join(isolatedHome, "workspace", "memory", "2026-04-10.md"),
+        "- Multi-agent flat entry\n",
+        "utf-8",
+      );
+
+      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const { imported } = await runImportMarkdown(ctx, {
+        openclawHome: isolatedHome,
+      });
+
+      assert.strictEqual(imported, 1);
+      assert.strictEqual(
+        mockStore.storedRecords[0].scope,
+        "global",
+        "should fall back to global when multiple agents make it ambiguous",
+      );
+    });
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────────────── Test runner helper ──────────────────────────────────────────────────────────────────────────────

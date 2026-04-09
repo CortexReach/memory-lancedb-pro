@@ -512,21 +512,23 @@ export async function runImportMarkdown(
 
   // Infer workspace scope from openclaw.json agents list
   // (flat memory/ files have no per-file metadata, so we derive scope from config)
-  const fsPromises = await import("node:fs/promises");
   let workspaceScope = ""; // empty = no scope override for nested workspaces
   try {
     const configPath = path.join(openclawHome, "openclaw.json");
-    const configContent = await fsPromises.readFile(configPath, "utf-8");
-    const config = JSON.parse(configContent);
+    const configContent = await readFile(configPath, "utf8");
+    const config = JSON5.parse(configContent);
     const agentsList: Array<{ id?: string; workspace?: string }> = config?.agents?.list ?? [];
-    const matched = agentsList.find((a) => {
+    const matchedAgents = agentsList.filter((a) => {
       if (!a.workspace) return false;
-      return path.normalize(a.workspace) === workspaceDir;
+      const normalized = path.normalize(a.workspace);
+      return normalized.startsWith(workspaceDir + path.sep);
     });
-    if (matched?.id) {
-      workspaceScope = matched.id;
+    if (matchedAgents.length === 1 && matchedAgents[0]?.id) {
+      workspaceScope = matchedAgents[0].id;
     }
   } catch { /* use default */ }
+
+  const fsPromises = await import("node:fs/promises");
 
   // Scan workspace directories
   let workspaceEntries: Dirent[];
