@@ -431,6 +431,11 @@ function getExtensionApiImportSpecifiers(): string[] {
   specifiers.push(toImportSpecifier("/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js"));
   specifiers.push(toImportSpecifier("/opt/homebrew/lib/node_modules/openclaw/dist/extensionAPI.js"));
 
+  if (process.platform === "win32" && process.env.APPDATA) {
+    const windowsNpmPath = join(process.env.APPDATA, "npm", "node_modules", "openclaw", "dist", "extensionAPI.js");
+    specifiers.push(toImportSpecifier(windowsNpmPath));
+  }
+
   return [...new Set(specifiers.filter(Boolean))];
 }
 
