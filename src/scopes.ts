@@ -18,6 +18,17 @@ export interface ScopeConfig {
   agentAccess: Record<string, string[]>;
 }
 
+/**
+ * Context variables available for template resolution in scope strings.
+ * Populated from hook ctx at runtime (e.g. autoCapture / autoRecall).
+ */
+export interface ScopeContext {
+  agentId?: string;
+  accountId?: string;
+  channelId?: string;
+  conversationId?: string;
+}
+
 export interface ScopeManager {
   /**
    * Enumerate known scopes for the caller.
@@ -70,6 +81,76 @@ const SCOPE_PATTERNS = {
 
 const SYSTEM_BYPASS_IDS = new Set(["system", "undefined"]);
 const warnedLegacyFallbackBypassIds = new Set<string>();
+
+// ============================================================================
+// Template & Wildcard Utilities
+// ============================================================================
+
+const TEMPLATE_VAR_RE = /\$\{(\w+)\}/g;
+
+/** Returns true if the string contains `${...}` template variables. */
+export function hasTemplateVars(s: string): boolean {
+  return /\$\{\w+\}/.test(s);
+}
+
+/**
+ * Resolve template variables in a scope string.
+ * Unresolved variables (missing or empty in ctx) cause the function to return `undefined`,
+ * signalling that the caller should fall back to a safe default.
+ */
+export function resolveTemplateScope(template: string, ctx: ScopeContext | undefined): string | undefined {
+  if (!ctx) return undefined;
+  let failed = false;
+  const resolved = template.replace(TEMPLATE_VAR_RE, (_match, key: string) => {
+    const val = (ctx as Record<string, unknown>)[key];
+    if (typeof val === "string" && val.length > 0) return val;
+    failed = true;
+    return "";
+  });
+  return failed ? undefined : resolved;
+}
+
+/**
+ * Check if a concrete scope matches a wildcard pattern.
+ * Only trailing `*` is supported: `"user:*"` matches `"user:alice"`.
+ * Non-wildcard strings are compared with strict equality.
+ */
+export function matchesWildcardScope(pattern: string, scope: string): boolean {
+  if (!pattern.endsWith(":*")) return pattern === scope;
+  const prefix = pattern.slice(0, -1); // "user:*" → "user:"
+  return scope.startsWith(prefix) && scope.length > prefix.length;
+}
+
+/**
+ * Infer the wildcard pattern from a template default scope.
+ * e.g. `"user:${accountId}"` → `"user:*"`
+ *      `"bot-1:user:${accountId}"` → `"bot-1:user:*"`
+ *      `"agent:${agentId}:user:${accountId}"` → `undefined` (prefix contains only a top-level built-in namespace, too broad)
+ *      `"${agentId}:user:${accountId}"` → `undefined` (starts with variable)
+ *
+ * Only produces a wildcard when the template has a static prefix before the first variable,
+ * and the prefix is specific enough (not just a top-level built-in like "agent:").
+ */
+export function inferWildcardFromTemplate(template: string): string | undefined {
+  const idx = template.indexOf("${");
+  if (idx <= 0) return undefined; // no prefix or starts with variable
+  const prefix = template.slice(0, idx);
+  // Prefix must end with ":" to form a valid scope namespace
+  if (!prefix.endsWith(":")) return undefined;
+  // Reject if the prefix is just a top-level built-in namespace — the resulting wildcard
+  // (e.g. "agent:*") would be far too broad and break isolation between agents/users/projects.
+  const topLevelBuiltins = ["agent:", "user:", "custom:", "project:", "reflection:"];
+  if (topLevelBuiltins.includes(prefix)) {
+    // Exception: "user:${accountId}" → "user:*" is the primary use case and is safe
+    // because user scopes are per-user by definition. But "agent:${agentId}:..." → "agent:*"
+    // would grant access to ALL agent scopes.
+    // Allow only if the entire remainder after prefix is a single variable (no further segments).
+    const remainder = template.slice(idx);
+    const isSingleVar = /^\$\{\w+\}$/.test(remainder);
+    if (!isSingleVar) return undefined;
+  }
+  return prefix + "*";
+}
 
 export function isSystemBypassId(agentId?: string): boolean {
   return typeof agentId === "string" && SYSTEM_BYPASS_IDS.has(agentId);
@@ -151,8 +232,8 @@ export class MemoryScopeManager implements ScopeManager {
   }
 
   private validateConfiguration(): void {
-    // Validate default scope exists in definitions
-    if (!this.config.definitions[this.config.default]) {
+    // Validate default scope exists in definitions (skip validation for template defaults)
+    if (!hasTemplateVars(this.config.default) && !this.config.definitions[this.config.default]) {
       throw new Error(`Default scope '${this.config.default}' not found in definitions`);
     }
 
@@ -167,6 +248,8 @@ export class MemoryScopeManager implements ScopeManager {
         );
       }
       for (const scope of scopes) {
+        // Wildcard patterns (e.g. "user:*") are always valid
+        if (scope.endsWith(":*")) continue;
         if (!this.config.definitions[scope] && !this.isBuiltInScope(scope)) {
           console.warn(`Agent '${agentId}' has access to undefined scope '${scope}'`);
         }
@@ -175,6 +258,13 @@ export class MemoryScopeManager implements ScopeManager {
   }
 
   private isBuiltInScope(scope: string): boolean {
+    // Accept wildcard patterns like "user:*" as valid built-in scopes
+    if (scope.endsWith(":*")) {
+      const prefix = scope.slice(0, -2); // "user:*" → "user"
+      return ["agent", "custom", "project", "user", "reflection"].includes(prefix) ||
+        // Also accept compound prefixes like "bot-1:user" → startsWith check
+        this.isBuiltInScope(prefix.includes(":") ? prefix.slice(prefix.lastIndexOf(":") + 1) + ":x" : "");
+    }
     return (
       scope === "global" ||
       scope.startsWith("agent:") ||
@@ -187,12 +277,9 @@ export class MemoryScopeManager implements ScopeManager {
 
   getAccessibleScopes(agentId?: string): string[] {
     if (isSystemBypassId(agentId) || !agentId) {
-      // Keep enumeration semantics consistent for callers that inspect the list.
-      // This enumerates registered scopes, not every valid built-in pattern.
       return this.getAllScopes();
     }
 
-    // Explicit ACLs still inherit the agent's own reflection scope.
     const normalizedAgentId = agentId.trim();
     const explicitAccess = this.config.agentAccess[normalizedAgentId];
     if (explicitAccess) {
@@ -221,9 +308,6 @@ export class MemoryScopeManager implements ScopeManager {
    */
   getScopeFilter(agentId?: string): string[] | undefined {
     if (!agentId || isSystemBypassId(agentId)) {
-      // No agent specified or internal system tasks bypass store-level scope
-      // filtering entirely.  This aligns with isAccessible(scope, undefined)
-      // which also uses bypass semantics for missing agentId.
       return undefined;
     }
     return this.getAccessibleScopes(agentId);
@@ -231,6 +315,9 @@ export class MemoryScopeManager implements ScopeManager {
 
   getDefaultScope(agentId?: string): string {
     if (!agentId) {
+      // If default is a template, return "global" — callers without agentId
+      // should use resolveHookDefaultScope() in the hook layer instead.
+      if (hasTemplateVars(this.config.default)) return "global";
       return this.config.default;
     }
     if (isSystemBypassId(agentId)) {
@@ -243,9 +330,13 @@ export class MemoryScopeManager implements ScopeManager {
     const agentScope = SCOPE_PATTERNS.AGENT(agentId);
     const accessibleScopes = this.getAccessibleScopes(agentId);
 
-    if (accessibleScopes.includes(agentScope)) {
+    if (accessibleScopes.some(s => matchesWildcardScope(s, agentScope))) {
       return agentScope;
     }
+
+    // If config default is a template, don't return the raw template string —
+    // return agent scope as a safe fallback (hook layer handles template resolution).
+    if (hasTemplateVars(this.config.default)) return agentScope;
 
     return this.config.default;
   }
@@ -257,7 +348,8 @@ export class MemoryScopeManager implements ScopeManager {
     }
 
     const accessibleScopes = this.getAccessibleScopes(agentId);
-    return accessibleScopes.includes(scope);
+    // Exact match first, then wildcard match (e.g. "user:*" matches "user:alice")
+    return accessibleScopes.some(s => matchesWildcardScope(s, scope));
   }
 
   validateScope(scope: string): boolean {
@@ -266,6 +358,9 @@ export class MemoryScopeManager implements ScopeManager {
     }
 
     const trimmedScope = scope.trim();
+
+    // Wildcard patterns are valid scope specifiers
+    if (trimmedScope.endsWith(":*")) return true;
 
     // Check if scope is defined or is a built-in pattern
     return (
@@ -329,9 +424,9 @@ export class MemoryScopeManager implements ScopeManager {
     // Note: an agent's own reflection scope is still auto-granted by getAccessibleScopes().
     // This setter can add access, but it does not revoke `reflection:agent:${normalizedAgentId}`.
 
-    // Validate all scopes
+    // Validate all scopes (wildcards are always valid)
     for (const scope of scopes) {
-      if (!this.validateScope(scope)) {
+      if (!scope.endsWith(":*") && !this.validateScope(scope)) {
         throw new Error(`Invalid scope: ${scope}`);
       }
     }
@@ -361,8 +456,8 @@ export class MemoryScopeManager implements ScopeManager {
       return false;
     }
 
-    // Allow alphanumeric, hyphens, underscores, colons, and dots
-    const validFormat = /^[a-zA-Z0-9._:-]+$/.test(trimmed);
+    // Allow alphanumeric, hyphens, underscores, colons, dots, and wildcard asterisk
+    const validFormat = /^[a-zA-Z0-9._:*-]+$/.test(trimmed);
     return validFormat;
   }
 

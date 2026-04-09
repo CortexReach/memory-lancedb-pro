@@ -102,6 +102,39 @@ function isExplicitDenyAllScopeFilter(scopeFilter?: string[]): boolean {
   return Array.isArray(scopeFilter) && scopeFilter.length === 0;
 }
 
+/**
+ * Build a SQL condition for a single scope filter entry.
+ * Supports wildcard patterns: "user:*" → `scope LIKE 'user:%'`
+ * Plain scopes use exact match: "global" → `scope = 'global'`
+ */
+function scopeFilterToSqlCondition(scope: string): string {
+  if (scope.endsWith(":*")) {
+    const prefix = scope.slice(0, -1); // "user:*" → "user:"
+    // Escape LIKE meta-characters (_ and %) in the prefix to prevent unintended matching
+    const escapedPrefix = escapeSqlLiteral(prefix).replace(/%/g, "\\%").replace(/_/g, "\\_");
+    // Require at least one character after the prefix to match matchesWildcardScope() semantics
+    // (which rejects "user:" but accepts "user:alice")
+    return `(scope LIKE '${escapedPrefix}_%' ESCAPE '\\')`;
+  }
+  return `scope = '${escapeSqlLiteral(scope)}'`;
+}
+
+/**
+ * Check if a concrete scope matches any entry in a scope filter list.
+ * Supports wildcard patterns: "user:*" matches "user:alice".
+ */
+function scopeFilterIncludes(scopeFilter: string[], scope: string): boolean {
+  for (const pattern of scopeFilter) {
+    if (pattern.endsWith(":*")) {
+      const prefix = pattern.slice(0, -1); // "user:*" → "user:"
+      if (scope.startsWith(prefix) && scope.length > prefix.length) return true;
+    } else if (pattern === scope) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight: number }>): number {
   const normalizedQuery = normalizeSearchText(query);
   if (!normalizedQuery) return 0;
@@ -460,7 +493,7 @@ export class MemoryStore {
 
     const row = rows[0];
     const rowScope = (row.scope as string | undefined) ?? "global";
-    if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+    if (scopeFilter && scopeFilter.length > 0 && !scopeFilterIncludes(scopeFilter, rowScope)) {
       return null;
     }
 
@@ -493,7 +526,7 @@ export class MemoryStore {
     // Apply scope filter if provided
     if (scopeFilter && scopeFilter.length > 0) {
       const scopeConditions = scopeFilter
-        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .map((scope) => scopeFilterToSqlCondition(scope))
         .join(" OR ");
       query = query.where(`(${scopeConditions}) OR scope IS NULL`); // NULL for backward compatibility
     }
@@ -513,7 +546,7 @@ export class MemoryStore {
       if (
         scopeFilter &&
         scopeFilter.length > 0 &&
-        !scopeFilter.includes(rowScope)
+        !scopeFilterIncludes(scopeFilter, rowScope)
       ) {
         continue;
       }
@@ -568,7 +601,7 @@ export class MemoryStore {
       // Apply scope filter if provided
       if (scopeFilter && scopeFilter.length > 0) {
         const scopeConditions = scopeFilter
-          .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+          .map((scope) => scopeFilterToSqlCondition(scope))
           .join(" OR ");
         searchQuery = searchQuery.where(
           `(${scopeConditions}) OR scope IS NULL`,
@@ -585,7 +618,7 @@ export class MemoryStore {
         if (
           scopeFilter &&
           scopeFilter.length > 0 &&
-          !scopeFilter.includes(rowScope)
+          !scopeFilterIncludes(scopeFilter, rowScope)
         ) {
           continue;
         }
@@ -646,7 +679,7 @@ export class MemoryStore {
 
     if (scopeFilter && scopeFilter.length > 0) {
       const scopeConditions = scopeFilter
-        .map(scope => `scope = '${escapeSqlLiteral(scope)}'`)
+        .map(scope => scopeFilterToSqlCondition(scope))
         .join(" OR ");
       searchQuery = searchQuery.where(`(${scopeConditions}) OR scope IS NULL`);
     }
@@ -656,7 +689,7 @@ export class MemoryStore {
 
     for (const row of rows) {
       const rowScope = (row.scope as string | undefined) ?? "global";
-      if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+      if (scopeFilter && scopeFilter.length > 0 && !scopeFilterIncludes(scopeFilter, rowScope)) {
         continue;
       }
 
@@ -742,7 +775,7 @@ export class MemoryStore {
     if (
       scopeFilter &&
       scopeFilter.length > 0 &&
-      !scopeFilter.includes(rowScope)
+      !scopeFilterIncludes(scopeFilter, rowScope)
     ) {
       throw new Error(`Memory ${resolvedId} is outside accessible scopes`);
     }
@@ -770,7 +803,7 @@ export class MemoryStore {
 
     if (scopeFilter && scopeFilter.length > 0) {
       const scopeConditions = scopeFilter
-        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .map((scope) => scopeFilterToSqlCondition(scope))
         .join(" OR ");
       conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
     }
@@ -832,7 +865,7 @@ export class MemoryStore {
 
     if (scopeFilter && scopeFilter.length > 0) {
       const scopeConditions = scopeFilter
-        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .map((scope) => scopeFilterToSqlCondition(scope))
         .join(" OR ");
       query = query.where(`((${scopeConditions}) OR scope IS NULL)`);
     }
@@ -925,7 +958,7 @@ export class MemoryStore {
       if (
         scopeFilter &&
         scopeFilter.length > 0 &&
-        !scopeFilter.includes(rowScope)
+        !scopeFilterIncludes(scopeFilter, rowScope)
       ) {
         throw new Error(`Memory ${id} is outside accessible scopes`);
       }
@@ -1031,7 +1064,7 @@ export class MemoryStore {
 
     if (scopeFilter.length > 0) {
       const scopeConditions = scopeFilter
-        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .map((scope) => scopeFilterToSqlCondition(scope))
         .join(" OR ");
       conditions.push(`(${scopeConditions})`);
     }
@@ -1126,7 +1159,7 @@ export class MemoryStore {
 
     if (scopeFilter && scopeFilter.length > 0) {
       const scopeConditions = scopeFilter
-        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .map((scope) => scopeFilterToSqlCondition(scope))
         .join(" OR ");
       conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
     }

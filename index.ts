@@ -23,7 +23,7 @@ const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 import { MemoryStore, validateStoragePath } from "./src/store.js";
 import { createEmbedder, getVectorDimensions } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
-import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
+import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey, resolveTemplateScope, hasTemplateVars } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
@@ -302,6 +302,30 @@ function resolveHookAgentId(
   return (trimmedExplicit && trimmedExplicit.length > 0
     ? trimmedExplicit
     : parseAgentIdFromSessionKey(sessionKey)) || "main";
+}
+
+/**
+ * Hook-layer template resolution for scopes.default.
+ * The scope system stays static — template resolution happens here at runtime.
+ * Falls back to scopeManager.getDefaultScope(agentId) when not a template or unresolvable.
+ */
+function resolveHookDefaultScope(
+  config: PluginConfig,
+  scopeManager: { getDefaultScope(agentId?: string): string },
+  agentId: string,
+  ctx: any,
+): string {
+  const tpl = config.scopes?.default;
+  if (tpl && hasTemplateVars(tpl)) {
+    const resolved = resolveTemplateScope(tpl, {
+      agentId,
+      accountId: ctx?.accountId,
+      channelId: ctx?.channelId,
+      conversationId: ctx?.conversationId,
+    });
+    if (resolved) return resolved;
+  }
+  return scopeManager.getDefaultScope(agentId);
 }
 
 function resolveSourceFromSessionKey(sessionKey: string | undefined): string {
@@ -2586,7 +2610,7 @@ const memoryLanceDBProPlugin = {
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
           const defaultScope = isSystemBypassId(agentId)
             ? config.scopes?.default ?? "global"
-            : scopeManager.getDefaultScope(agentId);
+            : resolveHookDefaultScope(config, scopeManager, agentId, ctx);
           const sessionKey = ctx?.sessionKey || (event as any).sessionKey || "unknown";
 
           api.logger.debug(
@@ -2759,7 +2783,7 @@ const memoryLanceDBProPlugin = {
               const conversationText = cleanTexts.join("\n");
               const stats = await smartExtractor.extractAndPersist(
                 conversationText, sessionKey,
-                { scope: defaultScope, scopeFilter: accessibleScopes },
+                { scope: defaultScope, scopeFilter: [defaultScope] },
               );
               // Charge rate limiter only after successful extraction
               extractionRateLimiter.recordExtraction();
@@ -3527,7 +3551,7 @@ const memoryLanceDBProPlugin = {
           );
           const defaultScope = isSystemBypassId(agentId)
             ? config.scopes?.default ?? "global"
-            : scopeManager.getDefaultScope(agentId);
+            : resolveHookDefaultScope(config, scopeManager, agentId, ctx);
           const currentSessionId =
             typeof ctx.sessionId === "string" && ctx.sessionId.trim().length > 0
               ? ctx.sessionId

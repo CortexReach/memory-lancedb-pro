@@ -44,7 +44,7 @@
   },
   "devDependencies": {
     "commander": "^14.0.0",
-    "jiti": "^2.6.0",
+    "jiti": "^2.6.1",
     "typescript": "^5.9.3"
   }
 }
