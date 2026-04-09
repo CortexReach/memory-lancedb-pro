@@ -11,7 +11,7 @@ import { join } from "node:path";
 import type { MemoryRetriever, RetrievalResult } from "./retriever.js";
 import type { MemoryStore } from "./store.js";
 import { isNoise } from "./noise-filter.js";
-import { isSystemBypassId, resolveScopeFilter, parseAgentIdFromSessionKey, type MemoryScopeManager } from "./scopes.js";
+import { isSystemBypassId, resolveScopeFilter, parseAgentIdFromSessionKey, resolveImplicitWriteScope, type MemoryScopeManager, type ScopeContext } from "./scopes.js";
 import type { Embedder } from "./embedder.js";
 import {
   appendRelation,
@@ -60,6 +60,7 @@ interface ToolContext {
   scopeManager: MemoryScopeManager;
   embedder: Embedder;
   agentId?: string;
+  configuredDefaultScope?: string;
   workspaceDir?: string;
   mdMirror?: MdMirrorWriter | null;
   workspaceBoundary?: WorkspaceBoundaryConfig;
@@ -158,6 +159,19 @@ function resolveToolContext(
   return {
     ...base,
     agentId: resolveRuntimeAgentId(base.agentId, runtimeCtx),
+  };
+}
+
+function resolveRuntimeScopeContext(runtimeCtx: unknown, agentId: string | undefined): ScopeContext {
+  if (!runtimeCtx || typeof runtimeCtx !== "object") {
+    return { agentId };
+  }
+  const ctx = runtimeCtx as Record<string, unknown>;
+  return {
+    agentId,
+    accountId: typeof ctx.accountId === "string" ? ctx.accountId : undefined,
+    channelId: typeof ctx.channelId === "string" ? ctx.channelId : undefined,
+    conversationId: typeof ctx.conversationId === "string" ? ctx.conversationId : undefined,
   };
 }
 
@@ -713,7 +727,28 @@ export function registerMemoryStoreTool(
                 },
               };
             }
-            targetScope = runtimeContext.scopeManager.getDefaultScope(agentId);
+            const implicitScope = resolveImplicitWriteScope({
+              configuredDefaultScope: runtimeContext.configuredDefaultScope,
+              scopeManager: runtimeContext.scopeManager,
+              agentId,
+              context: resolveRuntimeScopeContext(toolCtx, agentId),
+            });
+            if (!implicitScope.ok || !implicitScope.scope) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: "Implicit default scope could not be resolved for memory_store writes. Provide an explicit scope.",
+                  },
+                ],
+                details: {
+                  error: "explicit_scope_required",
+                  reason: implicitScope.reason,
+                  agentId,
+                },
+              };
+            }
+            targetScope = implicitScope.scope;
           }
 
           // Validate scope access

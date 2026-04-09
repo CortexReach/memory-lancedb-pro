@@ -29,6 +29,14 @@ export interface ScopeContext {
   conversationId?: string;
 }
 
+export interface ImplicitWriteScopeResolution {
+  ok: boolean;
+  scope?: string;
+  source: "default" | "template";
+  reason?: "template_unresolved" | "scope_invalid" | "scope_inaccessible";
+  candidate?: string;
+}
+
 export interface ScopeManager {
   /**
    * Enumerate known scopes for the caller.
@@ -150,6 +158,94 @@ export function inferWildcardFromTemplate(template: string): string | undefined 
     if (!isSingleVar) return undefined;
   }
   return prefix + "*";
+}
+
+function isConcreteWriteScope(scope: string): boolean {
+  return !scope.endsWith(":*");
+}
+
+export function resolveImplicitWriteScope(
+  params: {
+    configuredDefaultScope?: string;
+    scopeManager: Pick<ScopeManager, "getDefaultScope" | "isAccessible" | "validateScope">;
+    agentId?: string;
+    context?: ScopeContext;
+  },
+): ImplicitWriteScopeResolution {
+  const {
+    configuredDefaultScope,
+    scopeManager,
+    agentId,
+    context,
+  } = params;
+  const defaultScope = configuredDefaultScope?.trim();
+
+  if (defaultScope && hasTemplateVars(defaultScope)) {
+    const resolved = resolveTemplateScope(defaultScope, context);
+    if (!resolved) {
+      return {
+        ok: false,
+        source: "template",
+        reason: "template_unresolved",
+      };
+    }
+    if (!isConcreteWriteScope(resolved) || !scopeManager.validateScope(resolved)) {
+      return {
+        ok: false,
+        source: "template",
+        reason: "scope_invalid",
+        candidate: resolved,
+      };
+    }
+    if (
+      agentId &&
+      !isSystemBypassId(agentId) &&
+      !scopeManager.isAccessible(resolved, agentId)
+    ) {
+      return {
+        ok: false,
+        source: "template",
+        reason: "scope_inaccessible",
+        candidate: resolved,
+      };
+    }
+    return {
+      ok: true,
+      scope: resolved,
+      source: "template",
+    };
+  }
+
+  const candidate =
+    agentId && !isSystemBypassId(agentId)
+      ? scopeManager.getDefaultScope(agentId)
+      : (defaultScope || scopeManager.getDefaultScope(agentId));
+
+  if (!candidate || !isConcreteWriteScope(candidate) || !scopeManager.validateScope(candidate)) {
+    return {
+      ok: false,
+      source: "default",
+      reason: "scope_invalid",
+      candidate,
+    };
+  }
+  if (
+    agentId &&
+    !isSystemBypassId(agentId) &&
+    !scopeManager.isAccessible(candidate, agentId)
+  ) {
+    return {
+      ok: false,
+      source: "default",
+      reason: "scope_inaccessible",
+      candidate,
+    };
+  }
+  return {
+    ok: true,
+    scope: candidate,
+    source: "default",
+  };
 }
 
 export function isSystemBypassId(agentId?: string): boolean {

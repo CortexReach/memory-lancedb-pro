@@ -23,7 +23,8 @@ const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 import { MemoryStore, validateStoragePath } from "./src/store.js";
 import { createEmbedder, getVectorDimensions } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
-import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey, resolveTemplateScope, hasTemplateVars } from "./src/scopes.js";
+import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey, resolveImplicitWriteScope, hasTemplateVars } from "./src/scopes.js";
+import type { ImplicitWriteScopeResolution } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
@@ -306,26 +307,42 @@ function resolveHookAgentId(
 
 /**
  * Hook-layer template resolution for scopes.default.
- * The scope system stays static — template resolution happens here at runtime.
- * Falls back to scopeManager.getDefaultScope(agentId) when not a template or unresolvable.
+ * Hook-initiated writes must resolve to a concrete readable scope or skip.
  */
 function resolveHookDefaultScope(
   config: PluginConfig,
-  scopeManager: { getDefaultScope(agentId?: string): string },
+  scopeManager: {
+    getDefaultScope(agentId?: string): string;
+    isAccessible(scope: string, agentId?: string): boolean;
+    validateScope(scope: string): boolean;
+  },
   agentId: string,
   ctx: any,
-): string {
-  const tpl = config.scopes?.default;
-  if (tpl && hasTemplateVars(tpl)) {
-    const resolved = resolveTemplateScope(tpl, {
+): ImplicitWriteScopeResolution {
+  return resolveImplicitWriteScope({
+    configuredDefaultScope: config.scopes?.default,
+    scopeManager,
+    agentId,
+    context: {
       agentId,
       accountId: ctx?.accountId,
       channelId: ctx?.channelId,
       conversationId: ctx?.conversationId,
-    });
-    if (resolved) return resolved;
+    },
+  });
+}
+
+function formatImplicitWriteScopeFailure(
+  resolution: ImplicitWriteScopeResolution,
+  configuredDefaultScope: string | undefined,
+): string {
+  if (resolution.reason === "template_unresolved") {
+    return `template default scope '${configuredDefaultScope ?? "(missing)"}' could not be resolved`;
   }
-  return scopeManager.getDefaultScope(agentId);
+  if (resolution.reason === "scope_inaccessible") {
+    return `implicit write scope '${resolution.candidate ?? "(missing)"}' is not accessible to the caller`;
+  }
+  return `implicit write scope '${resolution.candidate ?? "(missing)"}' is not a valid concrete write scope`;
 }
 
 function resolveSourceFromSessionKey(sessionKey: string | undefined): string {
@@ -1759,7 +1776,11 @@ const memoryLanceDBProPlugin = {
           user: "User",
           extractMinMessages: config.extractMinMessages ?? 4,
           extractMaxChars: config.extractMaxChars ?? 8000,
-          defaultScope: config.scopes?.default ?? "global",
+          // Template defaults must be resolved at the call site with runtime context.
+          defaultScope:
+            config.scopes?.default && !hasTemplateVars(config.scopes.default)
+              ? config.scopes.default
+              : undefined,
           workspaceBoundary: config.workspaceBoundary,
           admissionControl: config.admissionControl,
           onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
@@ -2067,6 +2088,7 @@ const memoryLanceDBProPlugin = {
         scopeManager,
         embedder,
         agentId: undefined, // Will be determined at runtime from context
+        configuredDefaultScope: config.scopes?.default,
         workspaceDir: getDefaultWorkspaceDir(),
         mdMirror,
         workspaceBoundary: config.workspaceBoundary,
@@ -2608,9 +2630,15 @@ const memoryLanceDBProPlugin = {
           // Determine agent ID and default scope
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
-          const defaultScope = isSystemBypassId(agentId)
-            ? config.scopes?.default ?? "global"
-            : resolveHookDefaultScope(config, scopeManager, agentId, ctx);
+          const defaultScopeResolution = resolveHookDefaultScope(config, scopeManager, agentId, ctx);
+          if (!defaultScopeResolution.ok || !defaultScopeResolution.scope) {
+            api.logger.warn(
+              `memory-lancedb-pro: auto-capture skipped for agent ${agentId}: ` +
+              formatImplicitWriteScopeFailure(defaultScopeResolution, config.scopes?.default),
+            );
+            return;
+          }
+          const defaultScope = defaultScopeResolution.scope;
           const sessionKey = ctx?.sessionKey || (event as any).sessionKey || "unknown";
 
           api.logger.debug(
@@ -3272,9 +3300,15 @@ const memoryLanceDBProPlugin = {
           const timeHms = timeIso.split(".")[0];
           const timeCompact = timeIso.replace(/[:.]/g, "");
           const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
-          const targetScope = isSystemBypassId(sourceAgentId)
-            ? config.scopes?.default ?? "global"
-            : scopeManager.getDefaultScope(sourceAgentId);
+          const targetScopeResolution = resolveHookDefaultScope(config, scopeManager, sourceAgentId, context);
+          if (!targetScopeResolution.ok || !targetScopeResolution.scope) {
+            api.logger.warn(
+              `memory-reflection: command:${action} skipped for agent ${sourceAgentId}: ` +
+              formatImplicitWriteScopeFailure(targetScopeResolution, config.scopes?.default),
+            );
+            return;
+          }
+          const targetScope = targetScopeResolution.scope;
           const toolErrorSignals = sessionKey
             ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
             : [];
@@ -3549,9 +3583,15 @@ const memoryLanceDBProPlugin = {
             typeof ctx.agentId === "string" ? ctx.agentId : undefined,
             sessionKey,
           );
-          const defaultScope = isSystemBypassId(agentId)
-            ? config.scopes?.default ?? "global"
-            : resolveHookDefaultScope(config, scopeManager, agentId, ctx);
+          const defaultScopeResolution = resolveHookDefaultScope(config, scopeManager, agentId, ctx);
+          if (!defaultScopeResolution.ok || !defaultScopeResolution.scope) {
+            api.logger.warn(
+              `session-memory: skipped before_reset write for agent ${agentId}: ` +
+              formatImplicitWriteScopeFailure(defaultScopeResolution, config.scopes?.default),
+            );
+            return;
+          }
+          const defaultScope = defaultScopeResolution.scope;
           const currentSessionId =
             typeof ctx.sessionId === "string" && ctx.sessionId.trim().length > 0
               ? ctx.sessionId
