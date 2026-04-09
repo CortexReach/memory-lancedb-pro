@@ -277,9 +277,12 @@ export class MemoryScopeManager implements ScopeManager {
 
   getAccessibleScopes(agentId?: string): string[] {
     if (isSystemBypassId(agentId) || !agentId) {
+      // Keep enumeration semantics consistent for callers that inspect the list.
+      // This enumerates registered scopes, not every valid built-in pattern.
       return this.getAllScopes();
     }
 
+    // Explicit ACLs still inherit the agent's own reflection scope.
     const normalizedAgentId = agentId.trim();
     const explicitAccess = this.config.agentAccess[normalizedAgentId];
     if (explicitAccess) {
@@ -308,6 +311,9 @@ export class MemoryScopeManager implements ScopeManager {
    */
   getScopeFilter(agentId?: string): string[] | undefined {
     if (!agentId || isSystemBypassId(agentId)) {
+      // No agent specified or internal system tasks bypass store-level scope
+      // filtering entirely.  This aligns with isAccessible(scope, undefined)
+      // which also uses bypass semantics for missing agentId.
       return undefined;
     }
     return this.getAccessibleScopes(agentId);
