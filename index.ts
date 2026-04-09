@@ -2977,11 +2977,18 @@ const memoryLanceDBProPlugin = {
               // the next event starts fresh (counter = number of genuinely new texts seen so far).
               autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
 
-              if ((stats.boundarySkipped ?? 0) > 0) {
+              // [Fix-Must1b] When all candidates are skipped AND no boundary texts remain,
+              // skip regex fallback entirely — there is nothing to capture.
+              if ((stats.boundarySkipped ?? 0) === 0) {
                 api.logger.info(
-                  `memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`,
+                  `memory-lancedb-pro: smart extraction produced no candidates and no boundary texts for agent ${agentId}; skipping regex fallback`,
                 );
+                return;
               }
+
+              api.logger.info(
+                `memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`,
+              );
 
               api.logger.info(
                 `memory-lancedb-pro: smart extraction produced no persisted memories for agent ${agentId} (created=${stats.created}, merged=${stats.merged}, skipped=${stats.skipped}); falling back to regex capture`,
