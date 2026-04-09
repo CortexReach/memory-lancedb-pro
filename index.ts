@@ -21,7 +21,10 @@ const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 
 // Import core components
 import { MemoryStore, validateStoragePath } from "./src/store.js";
-import { createEmbedder, getVectorDimensions } from "./src/embedder.js";
+import {
+  createEmbedder,
+  getEffectiveVectorDimensions,
+} from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
@@ -91,6 +94,7 @@ interface PluginConfig {
     model?: string;
     baseURL?: string;
     dimensions?: number;
+    requestDimensions?: number;
     omitDimensions?: boolean;
     taskQuery?: string;
     taskPassage?: string;
@@ -1730,9 +1734,10 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     );
   }
 
-  const vectorDim = getVectorDimensions(
+  const vectorDim = getEffectiveVectorDimensions(
     config.embedding.model || "text-embedding-3-small",
     config.embedding.dimensions,
+    config.embedding.requestDimensions,
   );
   const store = new MemoryStore({ dbPath: resolvedDbPath, vectorDim });
   const embedder = createEmbedder({
@@ -1741,6 +1746,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     model: config.embedding.model || "text-embedding-3-small",
     baseURL: config.embedding.baseURL,
     dimensions: config.embedding.dimensions,
+    requestDimensions: config.embedding.requestDimensions,
     omitDimensions: config.embedding.omitDimensions,
     taskQuery: config.embedding.taskQuery,
     taskPassage: config.embedding.taskPassage,
@@ -4033,6 +4039,8 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       // Accept number, numeric string, or env-var string (e.g. "${EMBED_DIM}").
       // Also accept legacy top-level `dimensions` for convenience.
       dimensions: parsePositiveInt(embedding.dimensions ?? cfg.dimensions),
+      // Intentionally no top-level fallback: requestDimensions is request-only.
+      requestDimensions: parsePositiveInt(embedding.requestDimensions),
       omitDimensions:
         typeof embedding.omitDimensions === "boolean"
           ? embedding.omitDimensions
