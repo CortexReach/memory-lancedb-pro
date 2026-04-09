@@ -1410,5 +1410,112 @@ assert.ok(cumulativeResult.smartExtractionTriggered,
 assert.ok(cumulativeResult.smartExtractionSkipped,
   "Turn 1 should skip smart extraction (cumulative=1 < 2). Logs: " +
   cumulativeResult.logs.map((e) => e[1]).join(" | "));
+// ============================================================
+// Test: DM fallback — Fix-Must1b regression
+// Scenario: DM conversation (no pending ingress texts).
+// Smart extraction runs, LLM returns empty.
+// Fix-Must1b: boundarySkipped=0 → early return → NO regex fallback.
+// ============================================================
+
+async function runDmFallbackMustfixScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-dm-fallback-mustfix-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  let llmCalls = 0;
+  const embeddingServer = createEmbeddingServer();
+
+  // LLM mock: ALWAYS returns empty memories.
+  // Simulates DM conversation where LLM finds no extractable content.
+  const llmServer = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404); res.end(); return;
+    }
+    llmCalls += 1;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl-test", object: "chat.completion",
+      created: Math.floor(Date.now() / 1000), model: "mock-memory-model",
+      choices: [{ index: 0, message: { role: "assistant",
+        content: JSON.stringify({ memories: [] }) }, finish_reason: "stop" }],
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const llmPort = llmServer.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    // extractMinMessages=1: first agent_end triggers smart extraction immediately.
+    // No message_received: pendingIngressTexts=[] (mimics DM with no conversationId).
+    const api = createMockApi(
+      dbPath, `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${llmPort}`, logs,
+      { extractMinMessages: 1, smartExtraction: true },
+    );
+    plugin.register(api);
+    const sessionKey = "agent:main:discord:dm:user456";
+
+    await runAgentEndHook(api, {
+      success: true,
+      // No conversationId: simulates DM without pending ingress texts.
+      // sessionKey extracts to "discord:dm:user456" (truthy), but since
+      // message_received was never called, pendingIngressTexts Map has no entry.
+      messages: [{ role: "user", content: "hi" }, { role: "user", content: "hello?" }],
+    }, { agentId: "main", sessionKey });
+
+    const freshStore = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const entries = await freshStore.list(["global", "agent:main"], undefined, 10, 0);
+    return { entries, llmCalls, logs };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const dmFallbackResult = await runDmFallbackMustfixScenario();
+
+// Assert 1: Smart extraction LLM was called exactly once
+assert.equal(dmFallbackResult.llmCalls, 1,
+  "Smart extraction should be called once. Logs: " +
+  dmFallbackResult.logs.map((e) => e[1]).join(" | "));
+
+// Assert 2: No memories stored (regex fallback did NOT capture garbage)
+assert.equal(dmFallbackResult.entries.length, 0,
+  "No memories should be stored. Entries: " +
+  JSON.stringify(dmFallbackResult.entries.map((e) => e.text)));
+
+// Assert 3 (Fix-Must1b core): Early return triggered — skip regex fallback
+assert.ok(
+  dmFallbackResult.logs.some((entry) =>
+    entry[1].includes("skipping regex fallback")),
+  "Fix-Must1b: should log 'skipping regex fallback'. Logs: " +
+  dmFallbackResult.logs.map((e) => e[1]).join(" | ")
+);
+
+// Assert 4: Regex fallback did NOT run
+assert.ok(
+  dmFallbackResult.logs.every((entry) =>
+    !entry[1].includes("running regex fallback")),
+  "Regex fallback should NOT run. Logs: " +
+  dmFallbackResult.logs.map((e) => e[1]).join(" | ")
+);
+
+// Assert 5: Smart extractor confirmed no memories extracted
+assert.ok(
+  dmFallbackResult.logs.some((entry) =>
+    entry[1].includes("no memories extracted")),
+  "Smart extractor should report no memories extracted. Logs: " +
+  dmFallbackResult.logs.map((e) => e[1]).join(" | ")
+);
+
+// ============================================================
+// End: Fix-Must1b regression test
+// ============================================================
+
+
 
 console.log("OK: smart extractor branch regression test passed");
