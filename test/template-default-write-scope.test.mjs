@@ -75,6 +75,19 @@ function createBasePluginConfig({ dbPath }) {
   };
 }
 
+function registerPluginForTest({ workDir, dbName, logs, overrides = {} }) {
+  const dbPath = path.join(workDir, dbName);
+  const api = createApiHarness({
+    pluginConfig: {
+      ...createBasePluginConfig({ dbPath }),
+      ...overrides,
+    },
+    logs,
+  });
+  memoryLanceDBProPlugin.register(api);
+  return { api, dbPath };
+}
+
 async function listEntries(dbPath) {
   const store = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
   return store.list(undefined, undefined, 20, 0);
@@ -111,17 +124,13 @@ describe("template default implicit write scope", () => {
   });
 
   it("skips before_reset writes when a template default scope cannot be resolved", async () => {
-    const dbPath = path.join(workDir, "db-before-reset");
     const logs = [];
-    const api = createApiHarness({
-      pluginConfig: {
-        ...createBasePluginConfig({ dbPath }),
-        sessionMemory: { enabled: true },
-      },
+    const { api, dbPath } = registerPluginForTest({
+      workDir,
+      dbName: "db-before-reset",
       logs,
+      overrides: { sessionMemory: { enabled: true } },
     });
-
-    memoryLanceDBProPlugin.register(api);
 
     await api.hooks.before_reset(
       {
@@ -149,17 +158,13 @@ describe("template default implicit write scope", () => {
   });
 
   it("resolves bypass auto-capture writes to a concrete template scope instead of the raw template string", async () => {
-    const dbPath = path.join(workDir, "db-agent-end");
     const logs = [];
-    const api = createApiHarness({
-      pluginConfig: {
-        ...createBasePluginConfig({ dbPath }),
-        autoCapture: true,
-      },
+    const { api, dbPath } = registerPluginForTest({
+      workDir,
+      dbName: "db-agent-end",
       logs,
+      overrides: { autoCapture: true },
     });
-
-    memoryLanceDBProPlugin.register(api);
 
     await runAgentEndHook(
       api,
@@ -189,14 +194,12 @@ describe("template default implicit write scope", () => {
   });
 
   it("memory_store resolves a template default scope from runtime tool context", async () => {
-    const dbPath = path.join(workDir, "db-tool-runtime");
     const logs = [];
-    const api = createApiHarness({
-      pluginConfig: createBasePluginConfig({ dbPath }),
+    const { api, dbPath } = registerPluginForTest({
+      workDir,
+      dbName: "db-tool-runtime",
       logs,
     });
-
-    memoryLanceDBProPlugin.register(api);
 
     const tool = api.toolFactories.memory_store({
       agentId: "main",
@@ -214,14 +217,12 @@ describe("template default implicit write scope", () => {
   });
 
   it("memory_store requires an explicit scope when a template default scope cannot be resolved", async () => {
-    const dbPath = path.join(workDir, "db-tool-unresolved");
     const logs = [];
-    const api = createApiHarness({
-      pluginConfig: createBasePluginConfig({ dbPath }),
+    const { api, dbPath } = registerPluginForTest({
+      workDir,
+      dbName: "db-tool-unresolved",
       logs,
     });
-
-    memoryLanceDBProPlugin.register(api);
 
     const tool = api.toolFactories.memory_store({
       agentId: "main",

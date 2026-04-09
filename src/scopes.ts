@@ -30,9 +30,7 @@ export interface ScopeContext {
 }
 
 export interface ImplicitWriteScopeResolution {
-  ok: boolean;
   scope?: string;
-  source: "default" | "template";
   reason?: "template_unresolved" | "scope_invalid" | "scope_inaccessible";
   candidate?: string;
 }
@@ -184,15 +182,11 @@ export function resolveImplicitWriteScope(
     const resolved = resolveTemplateScope(defaultScope, context);
     if (!resolved) {
       return {
-        ok: false,
-        source: "template",
         reason: "template_unresolved",
       };
     }
     if (!isConcreteWriteScope(resolved) || !scopeManager.validateScope(resolved)) {
       return {
-        ok: false,
-        source: "template",
         reason: "scope_invalid",
         candidate: resolved,
       };
@@ -203,16 +197,12 @@ export function resolveImplicitWriteScope(
       !scopeManager.isAccessible(resolved, agentId)
     ) {
       return {
-        ok: false,
-        source: "template",
         reason: "scope_inaccessible",
         candidate: resolved,
       };
     }
     return {
-      ok: true,
       scope: resolved,
-      source: "template",
     };
   }
 
@@ -223,8 +213,6 @@ export function resolveImplicitWriteScope(
 
   if (!candidate || !isConcreteWriteScope(candidate) || !scopeManager.validateScope(candidate)) {
     return {
-      ok: false,
-      source: "default",
       reason: "scope_invalid",
       candidate,
     };
@@ -235,16 +223,12 @@ export function resolveImplicitWriteScope(
     !scopeManager.isAccessible(candidate, agentId)
   ) {
     return {
-      ok: false,
-      source: "default",
       reason: "scope_inaccessible",
       candidate,
     };
   }
   return {
-    ok: true,
     scope: candidate,
-    source: "default",
   };
 }
 

@@ -733,7 +733,7 @@ export function registerMemoryStoreTool(
               agentId,
               context: resolveRuntimeScopeContext(toolCtx, agentId),
             });
-            if (!implicitScope.ok || !implicitScope.scope) {
+            if (!implicitScope.scope) {
               return {
                 content: [
                   {

@@ -7,6 +7,7 @@ const {
   MemoryScopeManager,
   hasTemplateVars,
   resolveTemplateScope,
+  resolveImplicitWriteScope,
   matchesWildcardScope,
   inferWildcardFromTemplate,
 } = jiti("../src/scopes.ts");
@@ -108,6 +109,42 @@ describe("inferWildcardFromTemplate", () => {
 
   it("allows agent:${agentId} as single-var template", () => {
     assert.strictEqual(inferWildcardFromTemplate("agent:${agentId}"), "agent:*");
+  });
+});
+
+describe("resolveImplicitWriteScope", () => {
+  it("returns the concrete resolved scope directly for template defaults", () => {
+    const manager = new MemoryScopeManager({
+      default: "user:${accountId}",
+      agentAccess: { main: ["global", "user:*"] },
+    });
+
+    assert.deepStrictEqual(
+      resolveImplicitWriteScope({
+        configuredDefaultScope: "user:${accountId}",
+        scopeManager: manager,
+        agentId: "main",
+        context: { agentId: "main", accountId: "alice" },
+      }),
+      { scope: "user:alice" },
+    );
+  });
+
+  it("returns only failure details when a template default cannot be resolved", () => {
+    const manager = new MemoryScopeManager({
+      default: "user:${accountId}",
+      agentAccess: { main: ["global", "user:*"] },
+    });
+
+    assert.deepStrictEqual(
+      resolveImplicitWriteScope({
+        configuredDefaultScope: "user:${accountId}",
+        scopeManager: manager,
+        agentId: "main",
+        context: { agentId: "main" },
+      }),
+      { reason: "template_unresolved" },
+    );
   });
 });
 

@@ -2631,7 +2631,7 @@ const memoryLanceDBProPlugin = {
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
           const defaultScopeResolution = resolveHookDefaultScope(config, scopeManager, agentId, ctx);
-          if (!defaultScopeResolution.ok || !defaultScopeResolution.scope) {
+          if (!defaultScopeResolution.scope) {
             api.logger.warn(
               `memory-lancedb-pro: auto-capture skipped for agent ${agentId}: ` +
               formatImplicitWriteScopeFailure(defaultScopeResolution, config.scopes?.default),
@@ -3301,7 +3301,7 @@ const memoryLanceDBProPlugin = {
           const timeCompact = timeIso.replace(/[:.]/g, "");
           const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
           const targetScopeResolution = resolveHookDefaultScope(config, scopeManager, sourceAgentId, context);
-          if (!targetScopeResolution.ok || !targetScopeResolution.scope) {
+          if (!targetScopeResolution.scope) {
             api.logger.warn(
               `memory-reflection: command:${action} skipped for agent ${sourceAgentId}: ` +
               formatImplicitWriteScopeFailure(targetScopeResolution, config.scopes?.default),
@@ -3584,7 +3584,7 @@ const memoryLanceDBProPlugin = {
             sessionKey,
           );
           const defaultScopeResolution = resolveHookDefaultScope(config, scopeManager, agentId, ctx);
-          if (!defaultScopeResolution.ok || !defaultScopeResolution.scope) {
+          if (!defaultScopeResolution.scope) {
             api.logger.warn(
               `session-memory: skipped before_reset write for agent ${agentId}: ` +
               formatImplicitWriteScopeFailure(defaultScopeResolution, config.scopes?.default),
