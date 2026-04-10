@@ -56,61 +56,6 @@ import { batchDedup } from "./batch-dedup.js";
 // Envelope Metadata Stripping
 // ============================================================================
 
-const RUNTIME_WRAPPER_LINE_RE = /^\[(?:Subagent Context|Subagent Task)\]\s*/i;
-const RUNTIME_WRAPPER_PREFIX_RE = /^\[(?:Subagent Context|Subagent Task)\]/i;
-const RUNTIME_WRAPPER_BOILERPLATE_RE =
-  /(?:You are running as a subagent\b.*?(?:$|(?<=\.)\s+)|Results auto-announce to your requester\.?\s*|do not busy-poll for status\.?\s*|Reply with a brief acknowledgment only\.?\s*|Do not use any memory tools\.?\s*)/gi;
-
-function stripRuntimeWrapperBoilerplate(text: string): string {
-  return text
-    .replace(RUNTIME_WRAPPER_BOILERPLATE_RE, "")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-}
-
-function stripLeadingRuntimeWrappers(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return trimmed;
-  }
-
-  const lines = trimmed.split("\n");
-  const cleanedLines: string[] = [];
-  let strippingLeadIn = true;
-
-  for (const line of lines) {
-    const current = line.trim();
-
-    if (strippingLeadIn && current === "") {
-      continue;
-    }
-
-    if (strippingLeadIn && RUNTIME_WRAPPER_PREFIX_RE.test(current)) {
-      const remainder = current.replace(RUNTIME_WRAPPER_LINE_RE, "").trim();
-      const cleaned = remainder ? stripRuntimeWrapperBoilerplate(remainder) : "";
-      if (cleaned) {
-        cleanedLines.push(cleaned);
-        strippingLeadIn = false;
-      }
-      continue;
-    }
-
-    if (
-      strippingLeadIn &&
-      /^(?:Results auto-announce to your requester\.?|do not busy-poll for status\.?|Reply with a brief acknowledgment only\.?|Do not use any memory tools\.?)$/i.test(
-        current,
-      )
-    ) {
-      continue;
-    }
-
-    strippingLeadIn = false;
-    cleanedLines.push(line);
-  }
-
-  return cleanedLines.join("\n").trim();
-}
-
 /**
  * Strip platform envelope metadata injected by OpenClaw channels before
  * the conversation text reaches the extraction LLM. These envelopes contain
@@ -124,45 +69,123 @@ function stripLeadingRuntimeWrappers(text: string): string {
  * - "Sender (untrusted metadata):" + JSON code blocks
  * - "Replied message (untrusted, for context):" + JSON code blocks
  * - Standalone JSON blocks containing message_id/sender_id fields
+ *
+ * Note: stripLeadingRuntimeWrappers and stripRuntimeWrapperBoilerplate from
+ * the old implementation are dead code after this refactor — they are not
+ * called anywhere in the pipeline. They have been removed.
  */
 export function stripEnvelopeMetadata(text: string): string {
-  // 0. PR #444: strip runtime orchestration wrappers (leading only, not global)
-  //    Preserves PR #444's stripLeadingRuntimeWrappers() — do NOT replace with global regex.
-  let cleaned = stripLeadingRuntimeWrappers(text);
+  // Matches wrapper lines: [Subagent Context] or [Subagent Task], possibly with
+  // inline content on the same line (e.g. "[Subagent Task] Reply with brief ack.").
+  // Also matches when the wrapper prefix is on its own line ("]\n" = no content after ]).
+  const WRAPPER_LINE_RE = /^\[(?:Subagent Context|Subagent Task)\](?:\s|$|\n)?/i;
+  const BOILERPLATE_RE = /^(?:Results auto-announce to your requester\.?|do not busy-poll for status\.?|Reply with a brief acknowledgment only\.?|Do not use any memory tools\.?)$/im;
+  // Non-anchored version for inline content: matches boilerplate phrases anywhere in a string.
+  // The subagent running phrase uses (?<=\.)\s+|$ alternation (same as old
+  // RUNTIME_WRAPPER_BOILERPLATE_RE) so that parenthetical depth like "(depth 1/1)."
+  // is included before the ending whitespace, correctly stripping the full phrase.
+  const INLINE_BOILERPLATE_RE =
+    /(?:You are running as a subagent\b.*?(?:(?<=\.)\s+|$)|Results auto-announce to your requester\.?|do not busy-poll for status\.?|Reply with a brief acknowledgment only\.?|Do not use any memory tools\.?)/gi;
+  // Anchor to start of line — prevents quoted/cited false-positives
+  const SUBAGENT_RUNNING_RE = /^You are running as a subagent\b/i;
 
-  // 0b. PR #481: strip Discord/channel forwarded message envelope blocks (per-line)
-  cleaned = cleaned.replace(
-    /^<<<EXTERNAL_UNTRUSTED_CONTENT\b.*$/gim,
-    "",
-  );
-  cleaned = cleaned.replace(
-    /^<<<END_EXTERNAL_UNTRUSTED_CONTENT\b.*$/gim,
-    "",
-  );
+  const originalLines = text.split("\n");
 
-  // 0c. Strip individual envelope metadata header lines (per-line, no blanket null return)
-  cleaned = cleaned.replace(
-    /^Sender\s*\(untrusted metadata\):\s*\n```json\n[\s\S]*?\n```\s*/gim,
-    "",
-  );
-  cleaned = cleaned.replace(
-    /^Conversation info\s*\(untrusted metadata\):\s*\n```json\n[\s\S]*?\n```\s*/gim,
-    "",
-  );
-  // Thread starter: consume header + content + trailing blank lines (not just the content line)
-  cleaned = cleaned.replace(
-    /^Thread starter\s*\(untrusted, for context\):\n([^\n]*\n[ \t]*)*\n+/gm,
-    "",
-  );
-  // Forwarded message context: same pattern — header + content + trailing blank lines
-  cleaned = cleaned.replace(
-    /^Forwarded message context\s*\(untrusted metadata\):\n([^\n]*\n[ \t]*)*\n+/gm,
-    "",
-  );
-  cleaned = cleaned.replace(
-    /^\[Queued messages while agent was busy\]\s*/gim,
-    "",
-  ); 
+  // Pre-scan: determine if there are leading wrappers.
+  // Needed to decide whether boilerplate in the leading zone should be stripped
+  // (boilerplate without a wrapper prefix is preserved — it may be legitimate user text).
+  //
+  // FIX (Must Fix 2): Only scan the ACTUAL leading zone — lines before the first
+  // real user content. Previously scanned ALL lines, causing false positives when
+  // a wrapper appeared in the trailing zone (e.g. user-pasted quoted text).
+  let foundLeadingWrapper = false;
+  for (let i = 0; i < originalLines.length; i++) {
+    const trimmed = originalLines[i].trim();
+    if (trimmed === "") continue; // blank lines are part of leading zone
+    if (WRAPPER_LINE_RE.test(trimmed)) { foundLeadingWrapper = true; continue; }
+    if (BOILERPLATE_RE.test(trimmed)) continue;
+    // First real user content — stop scanning, this is the leading zone boundary
+    break;
+  }
+
+  // Single-pass state machine: find leading zone end and build result simultaneously.
+  // Key: "You are running as a subagent..." on its own line AFTER a wrapper prefix
+  // is wrapper CONTENT (must be stripped), not user content.
+  let stillInLeadingZone = true;
+  let prevWasWrapper = false;
+  let encounteredWrapperYet = false; // FIX (MAJOR): per-line flag, not global
+  const result: string[] = [];
+
+  for (let i = 0; i < originalLines.length; i++) {
+    const rawLine = originalLines[i];
+    const trimmed = rawLine.trim();
+    const isWrapper = WRAPPER_LINE_RE.test(trimmed);
+    const isBoilerplate = BOILERPLATE_RE.test(trimmed);
+    const afterPrefix = trimmed.replace(WRAPPER_LINE_RE, "").trim();
+    const isBoilerplateAfterPrefix = BOILERPLATE_RE.test(afterPrefix);
+    const isSubagentContent = prevWasWrapper && SUBAGENT_RUNNING_RE.test(trimmed);
+
+    // Strip wrapper lines only when inside the leading zone (N2 fix)
+    if (stillInLeadingZone && isWrapper) {
+      prevWasWrapper = true;
+      encounteredWrapperYet = true;
+      // 1. Strip wrapper prefix
+      let remainder = afterPrefix;
+      // 2. Remove all boilerplate phrases from remainder (handles inline
+      //    wrapper+boilerplate like "[Subagent Context] ... Results auto-announce...").
+      //    Use INLINE_BOILERPLATE_RE (non-anchored, includes subagent phrase) so
+      //    boilerplate embedded anywhere in the inline content is also removed.
+      remainder = remainder.replace(INLINE_BOILERPLATE_RE, "").replace(/\s{2,}/g, " ").trim();
+      // 3. Keep remainder if non-empty (non-boilerplate inline content preserved);
+      //    strip the whole line if only boilerplate was present
+      result.push(remainder);
+      continue;
+    }
+
+    if (stillInLeadingZone) {
+      // Blank line — strip but do NOT exit the leading zone (Must Fix 1 fix)
+      if (trimmed === "") {
+        result.push("");
+        continue;
+      }
+
+      // Boilerplate check: use afterPrefix (wrapper-stripped content) so that
+      // inline wrapper+boilerplate like "[Subagent Task] Reply with brief ack."
+      // is correctly identified as boilerplate and removed.
+      const contentForBoilerplateCheck = isWrapper ? afterPrefix : trimmed;
+      const isBoilerplateInline = BOILERPLATE_RE.test(contentForBoilerplateCheck);
+
+      if (isBoilerplateInline) {
+        // Boilerplate in leading zone — strip only when a wrapper has ALREADY
+        // appeared on a PREVIOUS line. This correctly handles the case where
+        // boilerplate text appears BEFORE the first wrapper in the leading zone
+        // (e.g. legitimate user text matching a boilerplate phrase, followed
+        // later by a wrapper).
+        result.push(encounteredWrapperYet ? "" : rawLine);
+        continue;
+      }
+
+      if (isSubagentContent) {
+        // Multiline wrapper: "You are running as a subagent..." on its own line
+        // after a wrapper prefix — strip it; keep prevWasWrapper true
+        result.push(""); // strip
+        continue;
+      }
+
+      // Real user content — exit the leading zone permanently
+      stillInLeadingZone = false;
+      prevWasWrapper = false;
+      encounteredWrapperYet = false;
+      result.push(rawLine); // preserve
+      continue;
+    }
+
+    // After leaving leading zone — always preserve
+    result.push(rawLine);
+  }
+
+  let cleaned = result.join("\n");
+
   // 1. Strip "System: [timestamp] Channel..." lines
   cleaned = cleaned.replace(
     /^System:\s*\[[\d\-: +GMT]+\]\s+\S+\[.*?\].*$/gm,
@@ -387,7 +410,6 @@ export class SmartExtractor {
    */
   async filterNoiseByEmbedding(texts: string[]): Promise<string[]> {
     const noiseBank = this.config.noiseBank;
-
     if (!noiseBank || !noiseBank.initialized) return texts;
 
     const result: string[] = [];
