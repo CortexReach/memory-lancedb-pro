@@ -4,6 +4,7 @@
   "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, long-context chunking, and management CLI",
   "version": "1.1.0-beta.10",
   "kind": "memory",
+  "skills": ["./skills"],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -116,6 +117,13 @@
         "default": 8,
         "description": "Minimum number of turns before the same memory can be recalled again in the same session. Set to 0 to disable deduplication."
       },
+      "autoRecallTimeoutMs": {
+        "type": "integer",
+        "minimum": 500,
+        "maximum": 60000,
+        "default": 5000,
+        "description": "Timeout for the entire auto-recall pipeline (embedding + search + rerank) in milliseconds."
+      },
       "autoRecallMaxItems": {
         "type": "integer",
         "minimum": 1,
@@ -136,6 +144,20 @@
         "maximum": 1000,
         "default": 180,
         "description": "Maximum character budget per auto-injected memory summary."
+      },
+      "autoRecallMaxQueryLength": {
+        "type": "integer",
+        "minimum": 100,
+        "maximum": 10000,
+        "default": 2000,
+        "description": "Maximum character length of the auto-recall query before truncation. Default: 2000."
+      },
+      "maxRecallPerTurn": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50,
+        "default": 10,
+        "description": "Hard per-turn injection cap applied after dedup. Acts as a safety ceiling on top of autoRecallMaxItems to prevent context inflation. Default: 10."
       },
       "recallMode": {
         "type": "string",
@@ -311,6 +333,12 @@
             "type": "string",
             "default": "https://api.jina.ai/v1/rerank",
             "description": "Reranker API endpoint URL. Compatible with Jina-compatible endpoints and dedicated adapters such as TEI, SiliconFlow, Voyage, Pinecone, and DashScope."
+          },
+          "rerankTimeoutMs": {
+            "type": "integer",
+            "minimum": 500,
+            "default": 5000,
+            "description": "Rerank API timeout in milliseconds (default: 5000). Increase for local/CPU-based rerank servers."
           },
           "rerankProvider": {
             "type": "string",
@@ -827,10 +855,7 @@
           }
         }
       }
-    },
-    "required": [
-      "embedding"
-    ]
+    }
   },
   "uiHints": {
     "embedding.apiKey": {
@@ -1013,10 +1038,20 @@
       "help": "Maximum characters per injected memory summary.",
       "advanced": true
     },
+    "autoRecallMaxQueryLength": {
+      "label": "Auto-Recall Max Query Length",
+      "help": "Maximum character length of the auto-recall query before truncation. Default: 2000.",
+      "advanced": true
+    },
     "recallMode": {
       "label": "Recall Mode",
       "help": "Auto-recall depth: full (default), summary (L0 only), adaptive (intent-based category routing), off.",
       "advanced": false
+    },
+    "maxRecallPerTurn": {
+      "label": "Max Recall Per Turn",
+      "help": "Hard per-turn injection cap. Acts as a safety ceiling on top of Auto-Recall Max Items. Default: 10.",
+      "advanced": true
     },
     "captureAssistant": {
       "label": "Capture Assistant Messages",
@@ -1065,6 +1100,12 @@
       "label": "Reranker Endpoint",
       "placeholder": "https://api.jina.ai/v1/rerank",
       "help": "Custom reranker API endpoint URL",
+      "advanced": true
+    },
+    "retrieval.rerankTimeoutMs": {
+      "label": "Rerank Timeout (ms)",
+      "placeholder": "5000",
+      "help": "Rerank API timeout in milliseconds. Increase for local/CPU-based rerank servers.",
       "advanced": true
     },
     "retrieval.rerankProvider": {

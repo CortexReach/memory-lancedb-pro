@@ -15,10 +15,18 @@ const jiti = jitiFactory(import.meta.url, {
   },
 });
 
+// IMPORTANT: Get retriever/embedder module references BEFORE importing index.ts.
+// This is because index.ts captures the createRetriever/createEmbedder binding at
+// import time. We must reassign the module's exports before index.ts loads.
+const retrieverModuleForMock = jiti("../src/retriever.js");
+const embedderModuleForMock = jiti("../src/embedder.js");
+const origCreateRetriever = retrieverModuleForMock.createRetriever;
+const origCreateEmbedder = embedderModuleForMock.createEmbedder;
+
 const pluginModule = jiti("../index.ts");
 const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
 const { registerMemoryRecallTool, registerMemoryStoreTool } = jiti("../src/tools.ts");
-const { MemoryRetriever } = jiti("../src/retriever.ts");
+const { MemoryRetriever } = jiti("../src/retriever.js");
 const { buildSmartMetadata, stringifySmartMetadata } = jiti("../src/smart-metadata.ts");
 
 function makeApiCapture() {
@@ -325,6 +333,9 @@ describe("recall text cleanup", () => {
 
   afterEach(() => {
     MemoryRetriever.prototype.retrieve = originalRetrieve;
+    // Restore factory functions on the .js module (same cache as index.ts uses)
+    retrieverModuleForMock.createRetriever = origCreateRetriever;
+    embedderModuleForMock.createEmbedder = origCreateEmbedder;
     rmSync(workspaceDir, { recursive: true, force: true });
   });
 
@@ -361,7 +372,35 @@ describe("recall text cleanup", () => {
   });
 
   it("removes retrieval metadata from auto-recall injected text", async () => {
-    MemoryRetriever.prototype.retrieve = async () => makeResults();
+    // jiti caches ./src/retriever.js (used by index.ts) and ../src/retriever.ts
+    // (used by the test) as SEPARATE module instances.  Patching
+    // MemoryRetriever.prototype does NOT reach the instance the plugin creates
+    // via createRetriever.  Instead we intercept the factory.
+    const mockResults = makeResults();
+    const retrieverMod = jiti("../src/retriever.js");
+    retrieverMod.createRetriever = function mockCreateRetriever(store, embedder, config, options) {
+      return {
+        async retrieve(context = {}) {
+          return mockResults;
+        },
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+    const embedderMod = jiti("../src/embedder.js");
+    embedderMod.createEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() {
+          return new Float32Array(384).fill(0);
+        },
+        async embedPassage() {
+          return new Float32Array(384).fill(0);
+        },
+      };
+    };
 
     const harness = createPluginApiHarness({
       resolveRoot: workspaceDir,
@@ -389,6 +428,7 @@ describe("recall text cleanup", () => {
     );
 
     assert.ok(output);
+    assert.match(output.prependContext, /<mode:full>/);
     assert.match(output.prependContext, /remember this/);
     assert.match(output.prependContext, /prefer concise diffs/);
     assert.doesNotMatch(output.prependContext, /vector\+BM25/);
@@ -409,6 +449,7 @@ describe("recall text cleanup", () => {
     const tool = createTool(registerMemoryRecallTool, makeRecallContext(makeManyResults(9)));
     const res = await tool.execute(null, { query: "many memories", limit: 10 });
     const lines = extractRenderedMemoryRecallLines(res.content[0].text);
+    assert.match(res.content[0].text, /<mode:summary>/);
 
     assert.equal(lines.length, 6, "summary mode should clamp limit to 6");
   });
@@ -421,13 +462,160 @@ describe("recall text cleanup", () => {
       includeFullText: true,
     });
     const lines = extractRenderedMemoryRecallLines(res.content[0].text);
+    assert.match(res.content[0].text, /<mode:full>/);
 
     assert.equal(lines.length, 7, "full text mode should honor larger limits");
     assert.doesNotMatch(lines[0], /…$/, "full text mode should not force preview truncation");
   });
 
+  it("includeFullText=true renders L2 content in output, not L0 abstract", async () => {
+    const l0 = "short L0 abstract";
+    const l2 = "Full L2 narrative: the user resolved a concurrent-write conflict by adding proper-lockfile as a write guard around all LanceDB mutation calls. Prevention: always acquire the lock before any store.add / store.update call.";
+
+    const results = [
+      {
+        entry: {
+          id: "case-1",
+          text: l0,
+          category: "fact",
+          scope: "global",
+          importance: 0.85,
+          timestamp: Date.now(),
+          metadata: stringifySmartMetadata(
+            buildSmartMetadata(
+              { text: l0, category: "fact", importance: 0.85 },
+              {
+                l0_abstract: l0,
+                l1_overview: "## Conflict\n- LanceDB concurrent write resolved via proper-lockfile",
+                l2_content: l2,
+                memory_category: "cases",
+                fact_key: "cases:lancedb-write-conflict",
+              },
+            ),
+          ),
+        },
+        score: 0.95,
+        sources: { vector: { score: 0.95, rank: 1 } },
+      },
+    ];
+
+    // default (summary) mode should show L0
+    const toolSummary = createTool(registerMemoryRecallTool, makeRecallContext(results));
+    const resSummary = await toolSummary.execute(null, { query: "lancedb conflict" });
+    const summaryLines = extractRenderedMemoryRecallLines(resSummary.content[0].text);
+    assert.equal(summaryLines.length, 1);
+    assert.match(summaryLines[0], new RegExp(l0.slice(0, 20)));
+    assert.doesNotMatch(summaryLines[0], /Full L2 narrative/);
+
+    // includeFullText=true should show L2 in rendered output
+    const toolFull = createTool(registerMemoryRecallTool, makeRecallContext(results));
+    const resFull = await toolFull.execute(null, { query: "lancedb conflict", includeFullText: true });
+    const fullLines = extractRenderedMemoryRecallLines(resFull.content[0].text);
+    assert.equal(fullLines.length, 1);
+    assert.match(fullLines[0], /Full L2 narrative/, "rendered line should contain L2 content");
+    assert.doesNotMatch(fullLines[0], new RegExp(`^.*\\[case-1\\].*${l0.slice(0, 15)}`), "rendered line should not be the L0 abstract");
+
+    // details.memories[].fullText should carry L2
+    assert.equal(resFull.details.memories[0].fullText, l2, "details.memories[0].fullText should be L2 content");
+    // details.memories[].text still carries L0 for backwards compatibility
+    assert.equal(resFull.details.memories[0].text, l0, "details.memories[0].text should still be L0 for compatibility");
+  });
+
+  it("includeFullText=false does not expose fullText in details.memories", async () => {
+    const l0 = "short L0 abstract";
+    const l2 = "Full L2 narrative that should not appear when includeFullText is false.";
+
+    const results = [
+      {
+        entry: {
+          id: "case-2",
+          text: l0,
+          category: "fact",
+          scope: "global",
+          importance: 0.85,
+          timestamp: Date.now(),
+          metadata: stringifySmartMetadata(
+            buildSmartMetadata(
+              { text: l0, category: "fact", importance: 0.85 },
+              {
+                l0_abstract: l0,
+                l1_overview: "## Overview\n- some overview",
+                l2_content: l2,
+                memory_category: "cases",
+                fact_key: "cases:opt-in-check",
+              },
+            ),
+          ),
+        },
+        score: 0.9,
+        sources: { vector: { score: 0.9, rank: 1 } },
+      },
+    ];
+
+    const tool = createTool(registerMemoryRecallTool, makeRecallContext(results));
+    const res = await tool.execute(null, { query: "opt-in check" });
+
+    assert.equal(res.details.memories[0].fullText, undefined, "fullText should be absent when includeFullText=false");
+    assert.equal(res.details.memories[0].text, l0, "text should still carry L0");
+  });
+
+  it("includeFullText=true falls back to entry.text for legacy memories without smart metadata", async () => {
+    const legacyText = "legacy memory with no smart metadata at all";
+
+    const results = [
+      {
+        entry: {
+          id: "legacy-1",
+          text: legacyText,
+          category: "fact",
+          scope: "global",
+          importance: 0.6,
+          timestamp: Date.now(),
+          // no metadata field — simulates pre-smart-extraction records
+        },
+        score: 0.75,
+        sources: { vector: { score: 0.75, rank: 1 } },
+      },
+    ];
+
+    const tool = createTool(registerMemoryRecallTool, makeRecallContext(results));
+    const res = await tool.execute(null, { query: "legacy fallback", includeFullText: true });
+    const lines = extractRenderedMemoryRecallLines(res.content[0].text);
+
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /legacy memory with no smart metadata/, "should render entry.text as fallback for legacy memories");
+    assert.equal(res.details.memories[0].fullText, legacyText, "details.memories[0].fullText should fall back to entry.text");
+  });
+
+
   it("applies auto-recall item/char budgets before injecting context", async () => {
-    MemoryRetriever.prototype.retrieve = async () => makeManyResults(5);
+    // Intercept the factory functions instead of patching prototype (same jiti
+    // cache mismatch reason as the test above).
+    const mockResults = makeManyResults(5);
+    const retrieverMod = jiti("../src/retriever.js");
+    retrieverMod.createRetriever = function mockCreateRetriever(store, embedder, config, options) {
+      return {
+        async retrieve(context = {}) {
+          return mockResults;
+        },
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+    const embedderMod = jiti("../src/embedder.js");
+    embedderMod.createEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() {
+          return new Float32Array(384).fill(0);
+        },
+        async embedPassage() {
+          return new Float32Array(384).fill(0);
+        },
+      };
+    };
 
     const harness = createPluginApiHarness({
       resolveRoot: workspaceDir,
@@ -462,7 +650,33 @@ describe("recall text cleanup", () => {
   });
 
   it("auto-recall only injects confirmed non-archived memories", async () => {
-    MemoryRetriever.prototype.retrieve = async () => makeGovernanceFilteredResults();
+    // Intercept the factory functions instead of patching prototype (same jiti
+    // cache mismatch reason as the test above).
+    const mockResults = makeGovernanceFilteredResults();
+    const retrieverMod = jiti("../src/retriever.js");
+    retrieverMod.createRetriever = function mockCreateRetriever(store, embedder, config, options) {
+      return {
+        async retrieve(context = {}) {
+          return mockResults;
+        },
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+    const embedderMod = jiti("../src/embedder.js");
+    embedderMod.createEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() {
+          return new Float32Array(384).fill(0);
+        },
+        async embedPassage() {
+          return new Float32Array(384).fill(0);
+        },
+      };
+    };
 
     const harness = createPluginApiHarness({
       resolveRoot: workspaceDir,
@@ -551,7 +765,33 @@ describe("recall text cleanup", () => {
   });
 
   it("filters USER.md-exclusive facts from auto-recall injected text", async () => {
-    MemoryRetriever.prototype.retrieve = async () => makeUserMdExclusiveResults();
+    // Intercept the factory functions instead of patching prototype (same jiti
+    // cache mismatch reason as the test above).
+    const mockResults = makeUserMdExclusiveResults();
+    const retrieverMod = jiti("../src/retriever.js");
+    retrieverMod.createRetriever = function mockCreateRetriever(store, embedder, config, options) {
+      return {
+        async retrieve(context = {}) {
+          return mockResults;
+        },
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+    const embedderMod = jiti("../src/embedder.js");
+    embedderMod.createEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() {
+          return new Float32Array(384).fill(0);
+        },
+        async embedPassage() {
+          return new Float32Array(384).fill(0);
+        },
+      };
+    };
 
     const harness = createPluginApiHarness({
       resolveRoot: workspaceDir,
@@ -607,7 +847,33 @@ describe("recall text cleanup", () => {
   });
 
   it("filters legacy addressing memories from auto-recall injected text", async () => {
-    MemoryRetriever.prototype.retrieve = async () => makeLegacyAddressingResults();
+    // Intercept the factory functions instead of patching prototype (same jiti
+    // cache mismatch reason as the test above).
+    const mockResults = makeLegacyAddressingResults();
+    const retrieverMod = jiti("../src/retriever.js");
+    retrieverMod.createRetriever = function mockCreateRetriever(store, embedder, config, options) {
+      return {
+        async retrieve(context = {}) {
+          return mockResults;
+        },
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+    const embedderMod = jiti("../src/embedder.js");
+    embedderMod.createEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() {
+          return new Float32Array(384).fill(0);
+        },
+        async embedPassage() {
+          return new Float32Array(384).fill(0);
+        },
+      };
+    };
 
     const harness = createPluginApiHarness({
       resolveRoot: workspaceDir,
@@ -640,7 +906,7 @@ describe("recall text cleanup", () => {
 
     assert.ok(output);
     assert.match(output.prependContext, /remember this/);
-    assert.doesNotMatch(output.prependContext, /希望在主会话中被称呼为“宙斯”/);
+    assert.doesNotMatch(output.prependContext, /希望在主会话中被称呼为"宙斯"/);
   });
 
   it("respects filterRecall=false for memory_recall output", async () => {
@@ -659,3 +925,4 @@ describe("recall text cleanup", () => {
     assert.match(res.content[0].text, /称呼偏好：宙斯/);
   });
 });
+

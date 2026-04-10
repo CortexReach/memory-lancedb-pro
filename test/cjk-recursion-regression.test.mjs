@@ -236,6 +236,89 @@ async function testBatchEmbeddingStillWorks() {
   console.log("  PASSED\n");
 }
 
+async function testOllamaAbortWithNativeFetch() {
+  console.log("Test 8: Ollama native fetch respects external AbortSignal (PR354 fix regression)");
+
+  // Author's analysis: the previous test used withServer() on a random port but hardcoded
+  // http://127.0.0.1:11434/v1 for the Embedder — so the request always hit "connection refused"
+  // immediately and never touched the slow handler. This test fixes that by:
+  // 1. Binding the mock server directly to 127.0.0.1:11434 (so isOllamaProvider() is true)
+  // 2. Delaying the response by 5 seconds
+  // 3. Passing an external AbortSignal that fires after 2 seconds
+  // 4. Asserting total time ≈ 2s (proving abort interrupted the slow request)
+
+  const SLOW_DELAY_MS = 5_000;
+  const ABORT_AFTER_MS = 2_000;
+  const DIMS = 1024;
+
+  const server = http.createServer((req, res) => {
+    if (req.url === "/v1/embeddings" && req.method === "POST") {
+      const timer = setTimeout(() => {
+        if (res.writableEnded) return; // already aborted
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          data: [{ embedding: Array.from({ length: DIMS }, () => 0.1), index: 0 }]
+        }));
+      }, SLOW_DELAY_MS);
+      req.on("aborted", () => clearTimeout(timer));
+      return;
+    }
+    res.writeHead(404);
+    res.end("not found");
+  });
+
+  // Bind directly to 127.0.0.1:11434 so isOllamaProvider() returns true
+  await new Promise((resolve) => server.listen(11434, "127.0.0.1", resolve));
+
+  try {
+    const embedder = new Embedder({
+      provider: "openai-compatible",
+      apiKey: "test-key",
+      model: "mxbai-embed-large",
+      baseURL: "http://127.0.0.1:11434/v1",
+      dimensions: DIMS,
+    });
+
+    assert.equal(
+      embedder.isOllamaProvider ? embedder.isOllamaProvider() : false,
+      true,
+      "isOllamaProvider should return true for 127.0.0.1:11434"
+    );
+
+    const start = Date.now();
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), ABORT_AFTER_MS);
+
+    let errorCaught;
+    try {
+      // Pass external AbortSignal — should interrupt the 5-second slow response at ~2s
+      await embedder.embedPassage("abort test probe", controller.signal);
+    } catch (e) {
+      errorCaught = e;
+    }
+
+    clearTimeout(abortTimer);
+    const elapsed = Date.now() - start;
+
+    assert.ok(errorCaught, "embedPassage should throw (abort or timeout)");
+    const msg = errorCaught instanceof Error ? errorCaught.message : String(errorCaught);
+    assert.ok(
+      /timed out|abort|ollama|ECONNREFUSED/i.test(msg),
+      `Expected abort/timeout error, got: ${msg}`
+    );
+
+    // If abort works: elapsed ≈ 2000ms. If abort fails: elapsed ≈ 5000ms.
+    assert.ok(
+      elapsed < SLOW_DELAY_MS * 0.75,
+      `Expected abort ~${ABORT_AFTER_MS}ms, got ${elapsed}ms — abort did NOT interrupt slow request`
+    );
+
+    console.log(`  PASSED (aborted in ${elapsed}ms < ${SLOW_DELAY_MS}ms threshold)\n`);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
 async function run() {
   console.log("Running regression tests for PR #238...\n");
   await testSingleChunkFallbackTerminates();
@@ -245,6 +328,7 @@ async function run() {
   await testSmallContextChunking();
   await testTimeoutAbortPropagation();
   await testBatchEmbeddingStillWorks();
+  await testOllamaAbortWithNativeFetch();
   console.log("All regression tests passed!");
 }
 

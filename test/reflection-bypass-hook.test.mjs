@@ -22,6 +22,7 @@ const { storeReflectionToLanceDB } = jiti("../src/reflection-store.ts");
 
 const EMBEDDING_DIMENSIONS = 4;
 const FIXED_VECTOR = [0.5, 0.5, 0.5, 0.5];
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 function createPluginApiHarness({ pluginConfig, resolveRoot }) {
   const eventHandlers = new Map();
@@ -81,7 +82,7 @@ function makePluginConfig(workDir) {
   };
 }
 
-async function seedReflection(dbPath, agentId) {
+async function seedReflection(dbPath, agentId, runAt = Date.now() - 2 * DAY_MS) {
   const store = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
   await storeReflectionToLanceDB({
     reflectionText: [
@@ -96,7 +97,7 @@ async function seedReflection(dbPath, agentId) {
     command: "command:new",
     scope: "global",
     toolErrorSignals: [],
-    runAt: Date.UTC(2026, 2, 12, 15, 0, 0),
+    runAt,
     usedFallback: false,
     embedPassage: async () => FIXED_VECTOR,
     vectorSearch: async () => [],

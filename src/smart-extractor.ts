@@ -48,12 +48,68 @@ import {
   isUserMdExclusiveMemory,
   type WorkspaceBoundaryConfig,
 } from "./workspace-boundary.js";
+import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
 import { inferAtomicBrandItemPreferenceSlot } from "./preference-slots.js";
 import { batchDedup } from "./batch-dedup.js";
 
 // ============================================================================
 // Envelope Metadata Stripping
 // ============================================================================
+
+const RUNTIME_WRAPPER_LINE_RE = /^\[(?:Subagent Context|Subagent Task)\]\s*/i;
+const RUNTIME_WRAPPER_PREFIX_RE = /^\[(?:Subagent Context|Subagent Task)\]/i;
+const RUNTIME_WRAPPER_BOILERPLATE_RE =
+  /(?:You are running as a subagent\b.*?(?:$|(?<=\.)\s+)|Results auto-announce to your requester\.?\s*|do not busy-poll for status\.?\s*|Reply with a brief acknowledgment only\.?\s*|Do not use any memory tools\.?\s*)/gi;
+
+function stripRuntimeWrapperBoilerplate(text: string): string {
+  return text
+    .replace(RUNTIME_WRAPPER_BOILERPLATE_RE, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function stripLeadingRuntimeWrappers(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+
+  const lines = trimmed.split("\n");
+  const cleanedLines: string[] = [];
+  let strippingLeadIn = true;
+
+  for (const line of lines) {
+    const current = line.trim();
+
+    if (strippingLeadIn && current === "") {
+      continue;
+    }
+
+    if (strippingLeadIn && RUNTIME_WRAPPER_PREFIX_RE.test(current)) {
+      const remainder = current.replace(RUNTIME_WRAPPER_LINE_RE, "").trim();
+      const cleaned = remainder ? stripRuntimeWrapperBoilerplate(remainder) : "";
+      if (cleaned) {
+        cleanedLines.push(cleaned);
+        strippingLeadIn = false;
+      }
+      continue;
+    }
+
+    if (
+      strippingLeadIn &&
+      /^(?:Results auto-announce to your requester\.?|do not busy-poll for status\.?|Reply with a brief acknowledgment only\.?|Do not use any memory tools\.?)$/i.test(
+        current,
+      )
+    ) {
+      continue;
+    }
+
+    strippingLeadIn = false;
+    cleanedLines.push(line);
+  }
+
+  return cleanedLines.join("\n").trim();
+}
 
 /**
  * Strip platform envelope metadata injected by OpenClaw channels before
@@ -70,8 +126,12 @@ import { batchDedup } from "./batch-dedup.js";
  * - Standalone JSON blocks containing message_id/sender_id fields
  */
 export function stripEnvelopeMetadata(text: string): string {
+  // 0. Strip runtime orchestration wrappers that should never become memories
+  //    (sub-agent task scaffolding is execution metadata, not conversation content).
+  let cleaned = stripLeadingRuntimeWrappers(text);
+
   // 1. Strip "System: [timestamp] Channel..." lines
-  let cleaned = text.replace(
+  cleaned = cleaned.replace(
     /^System:\s*\[[\d\-: +GMT]+\]\s+\S+\[.*?\].*$/gm,
     "",
   );
@@ -401,6 +461,13 @@ export class SmartExtractor {
     let shortAbstractCount = 0;
     let noiseAbstractCount = 0;
     for (const raw of result.memories) {
+      if (!raw || typeof raw !== "object") {
+        invalidCategoryCount++;
+        this.debugLog(
+          `memory-lancedb-pro: smart-extractor: dropping null/invalid candidate entry`,
+        );
+        continue;
+      }
       const category = normalizeCategory(raw.category ?? "");
       if (!category) {
         invalidCategoryCount++;
@@ -956,6 +1023,7 @@ export class SmartExtractor {
     const factKey =
       existingMeta.fact_key ?? deriveFactKey(candidate.category, candidate.abstract);
     const storeCategory = this.mapToStoreCategory(candidate.category);
+    const supersedeClassifyText = candidate.content || candidate.abstract;
     const created = await this.store.store({
       text: candidate.abstract,
       vector,
@@ -978,7 +1046,7 @@ export class SmartExtractor {
             confidence: 0.7,
             source_session: sessionKey,
             source: "auto-capture",
-            state: "pending",
+            state: "confirmed", // #350: write confirmed to unblock auto-recall
             memory_layer: "working",
             injected_count: 0,
             bad_recall_count: 0,
@@ -990,6 +1058,8 @@ export class SmartExtractor {
               type: "supersedes",
               targetId: matchId,
             }),
+            memory_temporal_type: classifyTemporal(supersedeClassifyText),
+            valid_until: inferExpiry(supersedeClassifyText),
           },
         ),
       ),
@@ -1076,7 +1146,7 @@ export class SmartExtractor {
       last_accessed_at: Date.now(),
       source_session: sessionKey,
       source: "auto-capture" as const,
-      state: "pending" as const,
+      state: "confirmed" as const, // #350: write confirmed to unblock auto-recall
       memory_layer: "working" as const,
       injected_count: 0,
       bad_recall_count: 0,
@@ -1140,7 +1210,7 @@ export class SmartExtractor {
       last_accessed_at: Date.now(),
       source_session: sessionKey,
       source: "auto-capture" as const,
-      state: "pending" as const,
+      state: "confirmed" as const, // #350: write confirmed to unblock auto-recall
       memory_layer: "working" as const,
       injected_count: 0,
       bad_recall_count: 0,
@@ -1180,6 +1250,7 @@ export class SmartExtractor {
     // Map 6-category to existing store categories for backward compatibility
     const storeCategory = this.mapToStoreCategory(candidate.category);
 
+    const classifyText = candidate.content || candidate.abstract;
     const metadata = stringifySmartMetadata(
       buildSmartMetadata(
         {
@@ -1196,11 +1267,13 @@ export class SmartExtractor {
           confidence: 0.7,
           source_session: sessionKey,
           source: "auto-capture",
-          state: "pending",
+          state: "confirmed", // #350: write confirmed to unblock auto-recall
           memory_layer: "working",
           injected_count: 0,
           bad_recall_count: 0,
           suppressed_until_turn: 0,
+          memory_temporal_type: classifyTemporal(classifyText),
+          valid_until: inferExpiry(classifyText),
         },
       ),
     );

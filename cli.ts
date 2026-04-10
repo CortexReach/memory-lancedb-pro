@@ -409,6 +409,71 @@ function formatJson(obj: any): string {
   return JSON.stringify(obj, null, 2);
 }
 
+function formatRetrievalDiagnosticsLines(diagnostics: {
+  originalQuery: string;
+  bm25Query: string | null;
+  queryExpanded: boolean;
+  vectorResultCount: number;
+  bm25ResultCount: number;
+  fusedResultCount: number;
+  finalResultCount: number;
+  stageCounts: {
+    afterMinScore: number;
+    rerankInput: number;
+    afterRerank: number;
+    afterHardMinScore: number;
+    afterNoiseFilter: number;
+    afterDiversity: number;
+  };
+  dropSummary: Array<{ stage: string; dropped: number; before: number; after: number }>;
+  failureStage?: string;
+  errorMessage?: string;
+}): string[] {
+  const topDrops =
+    diagnostics.dropSummary.length > 0
+      ? diagnostics.dropSummary
+          .slice(0, 3)
+          .map(
+            (drop) => `${drop.stage} -${drop.dropped} (${drop.before}->${drop.after})`,
+          )
+          .join(", ")
+      : "none";
+
+  const lines = [
+    "Retrieval diagnostics:",
+    `  • Original query: ${diagnostics.originalQuery}`,
+    `  • BM25 query: ${diagnostics.bm25Query ?? "(disabled)"}`,
+    `  • Query expanded: ${diagnostics.queryExpanded ? "Yes" : "No"}`,
+    `  • Counts: vector=${diagnostics.vectorResultCount}, bm25=${diagnostics.bm25ResultCount}, fused=${diagnostics.fusedResultCount}, final=${diagnostics.finalResultCount}`,
+    `  • Stages: min=${diagnostics.stageCounts.afterMinScore}, rerankIn=${diagnostics.stageCounts.rerankInput}, rerank=${diagnostics.stageCounts.afterRerank}, hard=${diagnostics.stageCounts.afterHardMinScore}, noise=${diagnostics.stageCounts.afterNoiseFilter}, diversity=${diagnostics.stageCounts.afterDiversity}`,
+    `  • Drops: ${topDrops}`,
+  ];
+
+  if (diagnostics.failureStage) {
+    lines.push(`  • Failure stage: ${diagnostics.failureStage}`);
+  }
+  if (diagnostics.errorMessage) {
+    lines.push(`  • Error: ${diagnostics.errorMessage}`);
+  }
+
+  return lines;
+}
+
+function buildSearchErrorPayload(
+  error: unknown,
+  diagnostics: unknown,
+  includeDiagnostics: boolean,
+): Record<string, unknown> {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    error: {
+      code: "search_failed",
+      message,
+    },
+    ...(includeDiagnostics && diagnostics ? { diagnostics } : {}),
+  };
+}
+
 async function sleep(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -418,6 +483,18 @@ async function sleep(ms: number): Promise<void> {
 // ============================================================================
 
 export function registerMemoryCLI(program: Command, context: CLIContext): void {
+  let lastSearchDiagnostics: ReturnType<MemoryRetriever["getLastDiagnostics"]> =
+    null;
+
+  const captureSearchDiagnostics = (
+    retriever: Pick<MemoryRetriever, "getLastDiagnostics">,
+  ) => {
+    lastSearchDiagnostics =
+      typeof retriever.getLastDiagnostics === "function"
+        ? retriever.getLastDiagnostics()
+        : null;
+  };
+
   const getSearchRetriever = (): MemoryRetriever => {
     if (!context.embedder) {
       return context.retriever;
@@ -431,26 +508,49 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     scopeFilter?: string[],
     category?: string,
   ) => {
-    let results = await getSearchRetriever().retrieve({
-      query,
-      limit,
-      scopeFilter,
-      category,
-      source: "cli",
-    });
-
-    if (results.length === 0 && context.embedder) {
-      await sleep(75);
-      results = await getSearchRetriever().retrieve({
+    lastSearchDiagnostics = null;
+    const retriever = getSearchRetriever();
+    let results;
+    try {
+      results = await retriever.retrieve({
         query,
         limit,
         scopeFilter,
         category,
         source: "cli",
       });
+      captureSearchDiagnostics(retriever);
+    } catch (error) {
+      captureSearchDiagnostics(retriever);
+      throw error;
     }
 
-    return results;
+    if (results.length === 0 && context.embedder) {
+      await sleep(75);
+      const retryRetriever = getSearchRetriever();
+      try {
+        results = await retryRetriever.retrieve({
+          query,
+          limit,
+          scopeFilter,
+          category,
+          source: "cli",
+        });
+        captureSearchDiagnostics(retryRetriever);
+      } catch (error) {
+        captureSearchDiagnostics(retryRetriever);
+        throw error;
+      }
+      return {
+        results,
+        diagnostics: lastSearchDiagnostics,
+      };
+    }
+
+    return {
+      results,
+      diagnostics: lastSearchDiagnostics,
+    };
   };
 
   const memory = program
@@ -697,6 +797,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .option("--scope <scope>", "Search within specific scope")
     .option("--category <category>", "Filter by category")
     .option("--limit <n>", "Maximum number of results", "10")
+    .option("--debug", "Show retrieval diagnostics")
     .option("--json", "Output as JSON")
     .action(async (query, options) => {
       try {
@@ -707,11 +808,24 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           scopeFilter = [options.scope];
         }
 
-        const results = await runSearch(query, limit, scopeFilter, options.category);
+        const { results, diagnostics } = await runSearch(
+          query,
+          limit,
+          scopeFilter,
+          options.category,
+        );
 
         if (options.json) {
-          console.log(formatJson(results));
+          console.log(
+            formatJson(options.debug ? { diagnostics, results } : results),
+          );
         } else {
+          if (options.debug && diagnostics) {
+            for (const line of formatRetrievalDiagnosticsLines(diagnostics)) {
+              console.log(line);
+            }
+            console.log();
+          }
           if (results.length === 0) {
             console.log("No relevant memories found.");
           } else {
@@ -730,6 +844,18 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           }
         }
       } catch (error) {
+        const diagnostics = options.debug ? lastSearchDiagnostics : null;
+        if (options.json) {
+          console.log(
+            formatJson(buildSearchErrorPayload(error, diagnostics, options.debug)),
+          );
+          process.exit(1);
+        }
+        if (diagnostics) {
+          for (const line of formatRetrievalDiagnosticsLines(diagnostics)) {
+            console.error(line);
+          }
+        }
         console.error("Search failed:", error);
         process.exit(1);
       }

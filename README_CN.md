@@ -62,6 +62,8 @@
 
 ## 快速开始
 
+> **CPU 要求：** 你的 CPU 必须支持 **AVX/AVX2** 指令集（Intel Sandy Bridge 2011 年后 / AMD Bulldozer 2011 年后）。LanceDB 的原生向量引擎依赖这些指令——不支持的 CPU 会导致插件崩溃（`SIGILL` 非法指令错误）。检查方法：`grep -o 'avx[^ ]*' /proc/cpuinfo | head -1`（无输出 = 不支持）。详见 [#419](https://github.com/CortexReach/memory-lancedb-pro/issues/419)。
+
 ### 方式 A：一键安装脚本（推荐）
 
 社区维护的 **[安装脚本](https://github.com/CortexReach/toolbox/tree/main/memory-lancedb-pro-setup)** 一条命令搞定安装、升级和修复：

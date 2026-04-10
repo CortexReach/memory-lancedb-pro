@@ -179,3 +179,34 @@ test("parsePluginConfig rejects empty array apiKey", () => {
     /apiKey/,
   );
 });
+
+test("parsePluginConfig resolves env vars in retrieval rerank config", () => {
+  process.env.__TEST_RERANK_KEY = "rerank-key-from-env";
+  process.env.__TEST_RERANK_ENDPOINT = "https://api.jina.ai/v1/rerank";
+  process.env.__TEST_RERANK_MODEL = "jina-reranker-v2-base-multilingual";
+  process.env.__TEST_RERANK_PROVIDER = "jina";
+  try {
+    const config = parsePluginConfig({
+      embedding: {
+        apiKey: "embed-key",
+        model: "text-embedding-3-small",
+      },
+      retrieval: {
+        rerank: "cross-encoder",
+        rerankApiKey: "${__TEST_RERANK_KEY}",
+        rerankEndpoint: "${__TEST_RERANK_ENDPOINT}",
+        rerankModel: "${__TEST_RERANK_MODEL}",
+        rerankProvider: "${__TEST_RERANK_PROVIDER}",
+      },
+    });
+    assert.equal(config.retrieval.rerankApiKey, "rerank-key-from-env");
+    assert.equal(config.retrieval.rerankEndpoint, "https://api.jina.ai/v1/rerank");
+    assert.equal(config.retrieval.rerankModel, "jina-reranker-v2-base-multilingual");
+    assert.equal(config.retrieval.rerankProvider, "jina");
+  } finally {
+    delete process.env.__TEST_RERANK_KEY;
+    delete process.env.__TEST_RERANK_ENDPOINT;
+    delete process.env.__TEST_RERANK_MODEL;
+    delete process.env.__TEST_RERANK_PROVIDER;
+  }
+});

@@ -32,6 +32,7 @@ ${conversationText}
 - Temporary information: One-time questions or conversations
 - Vague information: "User has questions about a feature" (no specific details)
 - Tool output, error logs, or boilerplate
+- Runtime scaffolding or orchestration wrappers such as "[Subagent Context]", "[Subagent Task]", bootstrap wrappers, task envelopes, or agent instructions — these are execution metadata, NEVER store them as memories
 - Recall queries / meta-questions: "Do you remember X?", "你还记得X吗?", "你知道我喜欢什么吗" — these are retrieval requests, NOT new information to store
 - Degraded or incomplete references: If the user mentions something vaguely ("that thing I said"), do NOT invent details or create a hollow memory
 

@@ -23,6 +23,8 @@ export interface LlmClientConfig {
   oauthProvider?: string;
   timeoutMs?: number;
   log?: (msg: string) => void;
+  /** Warn-level logger for user-visible failures (timeouts, retries, network errors). */
+  warnLog?: (msg: string) => void;
 }
 
 export interface LlmClient {
@@ -172,7 +174,7 @@ function createTimeoutSignal(timeoutMs?: number): { signal: AbortSignal; dispose
   };
 }
 
-function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
+function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void, warnLog?: (msg: string) => void): LlmClient {
   if (!config.apiKey) {
     throw new Error("LLM api-key mode requires llm.apiKey or embedding.apiKey");
   }
@@ -249,7 +251,7 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void)
       } catch (err) {
         lastError =
           `memory-lancedb-pro: llm-client [${label}] request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
-        log(lastError);
+        (warnLog ?? log)(lastError);
         return null;
       }
     },
@@ -259,7 +261,7 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void)
   };
 }
 
-function createOauthClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
+function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, warnLog?: (msg: string) => void): LlmClient {
   if (!config.oauthPath) {
     throw new Error("LLM oauth mode requires llm.oauthPath");
   }
@@ -400,7 +402,7 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void):
       } catch (err) {
         lastError =
           `memory-lancedb-pro: llm-client [${label}] OAuth request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
-        log(lastError);
+        (warnLog ?? log)(lastError);
         return null;
       }
     },
@@ -412,10 +414,11 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void):
 
 export function createLlmClient(config: LlmClientConfig): LlmClient {
   const log = config.log ?? (() => {});
+  const warnLog = config.warnLog;
   if (config.auth === "oauth") {
-    return createOauthClient(config, log);
+    return createOauthClient(config, log, warnLog);
   }
-  return createApiKeyClient(config, log);
+  return createApiKeyClient(config, log, warnLog);
 }
 
 export { extractJsonFromResponse, repairCommonJson };
