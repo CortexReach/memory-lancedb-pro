@@ -126,14 +126,11 @@ function stripLeadingRuntimeWrappers(text: string): string {
  * - Standalone JSON blocks containing message_id/sender_id fields
  */
 export function stripEnvelopeMetadata(text: string): string {
-  // 0. Strip runtime orchestration wrappers that should never become memories
-let cleaned = text.replace(/^\[(?:Subagent Context|Subagent Task)\].*$/gm, "");
-  cleaned = cleaned.replace(
-    /^(?:Results auto-announce to your requester\.?|do not busy-poll for status\.?|Do not use any memory tools\.?)\s*$/gim,
-    "",
-  );
+  // 0. PR #444: strip runtime orchestration wrappers (leading only, not global)
+  //    Preserves PR #444's stripLeadingRuntimeWrappers() — do NOT replace with global regex.
+  let cleaned = stripLeadingRuntimeWrappers(text);
 
-  // 0b. Strip Discord/channel forwarded message envelope blocks
+  // 0b. PR #481: strip Discord/channel forwarded message envelope blocks (per-line)
   cleaned = cleaned.replace(
     /^<<<EXTERNAL_UNTRUSTED_CONTENT\b.*$/gim,
     "",

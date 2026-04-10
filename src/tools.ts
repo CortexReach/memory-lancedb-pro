@@ -783,11 +783,11 @@ export function registerMemoryStoreTool(
           }
 
           const safeImportance = clamp01(importance, 0.7);
-          const vector = await runtimeContext.embedder.embedPassage(text);
+          const vector = await runtimeContext.embedder.embedPassage(stripped);
 
-// Temporal awareness: classify and infer expiry
-          const temporalType = classifyTemporal(text);
-          const validUntil = inferExpiry(text);
+          // Temporal awareness: classify and infer expiry
+          const temporalType = classifyTemporal(stripped);
+          const validUntil = inferExpiry(stripped);
           // Check for duplicates / supersede candidates using raw vector similarity
           // (bypasses importance/recency weighting).
           // Fail-open by design: dedup must never block a legitimate memory write.

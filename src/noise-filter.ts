@@ -63,7 +63,7 @@ export const ENVELOPE_NOISE_PATTERNS: RegExp[] = [
   /^Thread starter\s*\(untrusted, for context\):/im,
   /^Forwarded message context\s*\(untrusted metadata\):/im,
   /^\[Queued messages while agent was busy\]/im,
-  /^System:\s*\[/im,
+  /^System:\s*\[[\d\-: +GMT]+\]/im,  // precise: must match timestamp format
 ];
 
 export interface NoiseFilterOptions {
