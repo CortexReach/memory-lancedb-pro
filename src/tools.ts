@@ -175,9 +175,15 @@ async function retrieveWithRetry(
     scopeFilter?: string[];
     category?: string;
   },
+  countStore?: () => Promise<number>,
 ): Promise<RetrievalResult[]> {
   let results = await retriever.retrieve(params);
   if (results.length === 0) {
+    // Skip retry if store is empty — nothing to catch up via write-ahead lag.
+    if (countStore) {
+      const total = await countStore();
+      if (total === 0) return results;
+    }
     await sleep(75);
     results = await retriever.retrieve(params);
   }
@@ -210,7 +216,7 @@ async function resolveMemoryId(
     query: trimmed,
     limit: 5,
     scopeFilter,
-  });
+  }, () => context.store.count());
   if (results.length === 0) {
     return {
       ok: false,
@@ -575,7 +581,7 @@ export function registerMemoryRecallTool(
             scopeFilter,
             category,
             source: "manual",
-          }), runtimeContext.workspaceBoundary);
+          }, () => runtimeContext.store.count()), runtimeContext.workspaceBoundary);
 
           if (results.length === 0) {
             return {
@@ -1079,7 +1085,7 @@ export function registerMemoryForgetTool(
               query,
               limit: 5,
               scopeFilter,
-            });
+            }, () => context.store.count());
 
             if (results.length === 0) {
               return {
@@ -1221,7 +1227,7 @@ export function registerMemoryUpdateTool(
               query: memoryId,
               limit: 3,
               scopeFilter,
-            });
+            }, () => context.store.count());
             if (results.length === 0) {
               return {
                 content: [
@@ -2142,7 +2148,7 @@ export function registerMemoryExplainRankTool(
             limit: safeLimit,
             scopeFilter,
             source: "manual",
-          });
+          }, () => runtimeContext.store.count());
           if (results.length === 0) {
             return {
               content: [{ type: "text", text: "No relevant memories found." }],
