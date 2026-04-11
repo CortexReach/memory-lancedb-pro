@@ -24,19 +24,6 @@
   },
   "author": "win4r",
   "license": "MIT",
-  "dependencies": {
-    "@lancedb/lancedb": "^0.26.2",
-    "@sinclair/typebox": "0.34.48",
-    "apache-arrow": "18.1.0",
-    "json5": "^2.2.3",
-    "openai": "^6.21.0",
-    "proper-lockfile": "^4.1.2"
-  },
-  "openclaw": {
-    "extensions": [
-      "./index.ts"
-    ]
-  },
   "scripts": {
     "test": "node scripts/verify-ci-test-manifest.mjs && npm run test:cli-smoke && npm run test:core-regression && npm run test:storage-and-schema && npm run test:llm-clients-and-auth && npm run test:packaging-and-workflow",
     "test:cli-smoke": "node scripts/run-ci-tests.mjs --group cli-smoke",
@@ -49,6 +36,19 @@
     "bench:longmemeval": "jiti benchmark/run.ts --benchmark longmemeval",
     "test:openclaw-host": "node test/openclaw-host-functional.mjs",
     "version": "node scripts/sync-plugin-version.mjs openclaw.plugin.json package.json && git add openclaw.plugin.json"
+  },
+  "dependencies": {
+    "@lancedb/lancedb": "^0.26.2",
+    "@sinclair/typebox": "0.34.48",
+    "apache-arrow": "18.1.0",
+    "json5": "^2.2.3",
+    "openai": "^6.21.0",
+    "proper-lockfile": "^4.1.2"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "optionalDependencies": {
     "@lancedb/lancedb-darwin-x64": "^0.26.2",

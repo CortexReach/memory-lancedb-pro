@@ -478,6 +478,7 @@ Query → BM25 FTS ─────┘
       "discord-bot": ["global", "agent:discord-bot"]
     }
   },
+  "sessionStrategy": "none",
   "sessionMemory": {
     "enabled": false,
     "messageCount": 15

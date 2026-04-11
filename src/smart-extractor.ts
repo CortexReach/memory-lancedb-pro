@@ -126,10 +126,43 @@ function stripLeadingRuntimeWrappers(text: string): string {
  * - Standalone JSON blocks containing message_id/sender_id fields
  */
 export function stripEnvelopeMetadata(text: string): string {
-  // 0. Strip runtime orchestration wrappers that should never become memories
-  //    (sub-agent task scaffolding is execution metadata, not conversation content).
+  // 0. PR #444: strip runtime orchestration wrappers (leading only, not global)
+  //    Preserves PR #444's stripLeadingRuntimeWrappers() — do NOT replace with global regex.
   let cleaned = stripLeadingRuntimeWrappers(text);
 
+  // 0b. PR #481: strip Discord/channel forwarded message envelope blocks (per-line)
+  cleaned = cleaned.replace(
+    /^<<<EXTERNAL_UNTRUSTED_CONTENT\b.*$/gim,
+    "",
+  );
+  cleaned = cleaned.replace(
+    /^<<<END_EXTERNAL_UNTRUSTED_CONTENT\b.*$/gim,
+    "",
+  );
+
+  // 0c. Strip individual envelope metadata header lines (per-line, no blanket null return)
+  cleaned = cleaned.replace(
+    /^Sender\s*\(untrusted metadata\):\s*\n```json\n[\s\S]*?\n```\s*/gim,
+    "",
+  );
+  cleaned = cleaned.replace(
+    /^Conversation info\s*\(untrusted metadata\):\s*\n```json\n[\s\S]*?\n```\s*/gim,
+    "",
+  );
+  // Thread starter: consume header + content + trailing blank lines (not just the content line)
+  cleaned = cleaned.replace(
+    /^Thread starter\s*\(untrusted, for context\):\n([^\n]*\n[ \t]*)*\n+/gm,
+    "",
+  );
+  // Forwarded message context: same pattern — header + content + trailing blank lines
+  cleaned = cleaned.replace(
+    /^Forwarded message context\s*\(untrusted metadata\):\n([^\n]*\n[ \t]*)*\n+/gm,
+    "",
+  );
+  cleaned = cleaned.replace(
+    /^\[Queued messages while agent was busy\]\s*/gim,
+    "",
+  ); 
   // 1. Strip "System: [timestamp] Channel..." lines
   cleaned = cleaned.replace(
     /^System:\s*\[[\d\-: +GMT]+\]\s+\S+\[.*?\].*$/gm,
@@ -354,6 +387,7 @@ export class SmartExtractor {
    */
   async filterNoiseByEmbedding(texts: string[]): Promise<string[]> {
     const noiseBank = this.config.noiseBank;
+
     if (!noiseBank || !noiseBank.initialized) return texts;
 
     const result: string[] = [];

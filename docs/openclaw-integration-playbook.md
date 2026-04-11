@@ -44,8 +44,10 @@ Use this when you also want `/new` to write a searchable session summary into La
 
 In this mode:
 
-- enable plugin `sessionMemory.enabled`
+- set plugin `sessionStrategy: "memoryReflection"` for LLM-powered reflection (structured extraction, dedup, lifecycle scoring)
 - decide whether OpenClaw built-in `session-memory` should also remain enabled
+
+> **Note:** The legacy `sessionMemory.enabled = true` maps to `systemSessionMemory` (simple session summary stored directly in LanceDB), not `memoryReflection`. If you need the full reflection pipeline, use `sessionStrategy` explicitly.
 
 If both are enabled, `/new` can produce two outputs:
 
@@ -58,28 +60,46 @@ That is valid, but it is a double-write design. If you do not want duplicated se
 
 For most users, use one of these patterns.
 
-### Option 1: Built-in only
+### Option 1: Disabled (no plugin session hooks)
 
-Choose this when you mainly want transcript persistence and workspace summaries.
+Choose this when you mainly want transcript persistence and workspace summaries without plugin involvement.
 
-- plugin `sessionMemory.enabled = false`
+- plugin `sessionStrategy: "none"` (or omit `sessionStrategy` entirely)
 - OpenClaw built-in `hooks.internal.entries.session-memory.enabled = true`
 
-### Option 2: Plugin only
+### Option 2: Plugin only (LLM reflection)
 
-Choose this when you want session summaries to participate in LanceDB retrieval, dedupe, and lifecycle scoring.
+Choose this when you want session summaries to participate in LanceDB retrieval with LLM-powered structured extraction, dedup, and lifecycle scoring.
 
-- plugin `sessionMemory.enabled = true`
+- plugin `sessionStrategy: "memoryReflection"`
 - OpenClaw built-in `hooks.internal.entries.session-memory.enabled = false`
 
-### Option 3: Dual write
+### Option 3: Plugin only (simple summary)
+
+Choose this when you want session summaries stored in LanceDB but do not need the full LLM reflection pipeline.
+
+- plugin `sessionStrategy: "systemSessionMemory"`
+- OpenClaw built-in `hooks.internal.entries.session-memory.enabled = false`
+
+This writes a plain session summary directly into LanceDB as `fact` / `peripheral` tier entries, without LLM-driven dedup or lifecycle scoring.
+
+### Option 4: Dual write
 
 Choose this only if you explicitly want both:
 
-- workspace markdown/session artifacts
-- LanceDB-searchable session memories
+- workspace markdown/session artifacts (via built-in session-memory)
+- LanceDB-searchable session memories (via plugin `sessionStrategy`)
 
 If you use dual write, document it for your team. Otherwise it will look like duplicate behavior during debugging.
+
+### Strategy comparison
+
+| Configuration | Strategy | Behavior |
+|---|---|---|
+| `sessionStrategy: "memoryReflection"` | memoryReflection | LLM-powered reflection: structured extraction, dedup, lifecycle scoring |
+| `sessionStrategy: "systemSessionMemory"` | systemSessionMemory | Simple session summary stored directly in LanceDB as fact/peripheral |
+| `sessionMemory: { enabled: true }` | systemSessionMemory | Legacy shorthand, same as `systemSessionMemory` above |
+| `sessionStrategy: "none"` or omitted | none | Plugin session hooks disabled |
 
 ## 3. Baseline Verification Checklist
 
@@ -292,7 +312,7 @@ Check in this order:
 
 Check:
 
-- plugin session memory is enabled
+- plugin `sessionStrategy` is set to `"memoryReflection"` or `"systemSessionMemory"` (not `"none"`)
 - plugin hook is actually registered and named
 - gateway has been restarted after the hook/config change
 - built-in hook state matches your intended design

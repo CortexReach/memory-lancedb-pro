@@ -2305,10 +2305,15 @@ const memoryLanceDBProPlugin = {
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
 
+          // Use cached raw user message for the recall query to avoid channel
+          // metadata noise (e.g. Slack's Conversation info JSON with message_id,
+          // sender_id, conversation_label) that pollutes the embedding vector and
+          // causes irrelevant memories to rank higher.  Fall back to event.prompt
+          // for non-channel triggers or when no cached message is available.
           // FR-04: Truncate long prompts (e.g. file attachments) before embedding.
           // Auto-recall only needs the user's intent, not full attachment text.
           const MAX_RECALL_QUERY_LENGTH = config.autoRecallMaxQueryLength ?? 2_000;
-          let recallQuery = event.prompt;
+          let recallQuery = lastRawUserMessage.get(cacheKey) || event.prompt;
           if (recallQuery.length > MAX_RECALL_QUERY_LENGTH) {
             const originalLength = recallQuery.length;
             recallQuery = recallQuery.slice(0, MAX_RECALL_QUERY_LENGTH);

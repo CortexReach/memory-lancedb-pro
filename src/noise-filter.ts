@@ -50,6 +50,22 @@ const DIAGNOSTIC_ARTIFACT_PATTERNS = [
   /\bno explicit solution\b/i,
 ];
 
+/**
+ * Envelope noise patterns — Discord/channel metadata headers and blocks
+ * that have zero informational value for memory extraction.
+ * Used as a fast pre-filter before embedding-based noise checks.
+ */
+export const ENVELOPE_NOISE_PATTERNS: RegExp[] = [
+  /^<<<EXTERNAL_UNTRUSTED_CONTENT\b/im,
+  /^<<<END_EXTERNAL_UNTRUSTED_CONTENT\b/im,
+  /^Sender\s*\(untrusted metadata\):/im,
+  /^Conversation info\s*\(untrusted metadata\):/im,
+  /^Thread starter\s*\(untrusted, for context\):/im,
+  /^Forwarded message context\s*\(untrusted metadata\):/im,
+  /^\[Queued messages while agent was busy\]/im,
+  /^System:\s*\[[\d\-: +GMT]+\]/im,  // precise: must match timestamp format
+];
+
 export interface NoiseFilterOptions {
   /** Filter agent denial responses (default: true) */
   filterDenials?: boolean;
