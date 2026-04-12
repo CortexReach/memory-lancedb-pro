@@ -3102,6 +3102,13 @@ const memoryLanceDBProPlugin = {
             api.logger.info(
               `memory-lancedb-pro: auto-captured ${stored} memories for agent ${agentId} in scope ${defaultScope}`,
             );
+            // Note: counter is intentionally NOT reset here. If we reset after regex fallback,
+            // the next turn starts fresh (counter = 1) and requires another full cycle to re-trigger.
+            // This means: Turn 1 stores via regex → counter=0 → Turn 2 counter=1 (<min) → skipped.
+            // This is intentional — regex fallback is a last-resort fallback, not a primary path.
+            // The primary reset mechanisms are:
+            //   1. F1: success block of smart extraction (set(0) on created/merged > 0)
+            //   2. Fix-Must1: all-dedup failure path (set(previousSeenCount) prevents retry spiral)
           }
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: capture failed: ${String(err)}`);
