@@ -447,6 +447,8 @@ function toImportSpecifier(value: string): string {
   if (!trimmed) return "";
   if (trimmed.startsWith("file://")) return trimmed;
   if (trimmed.startsWith("/")) return pathToFileURL(trimmed).href;
+  // Handle Windows absolute paths (e.g. C:\Users\... or D:/Program Files/...)
+  if (/^[a-zA-Z]:[/\\]/.test(trimmed)) return pathToFileURL(trimmed).href;
   return trimmed;
 }
 function getExtensionApiImportSpecifiers(): string[] {
@@ -465,6 +467,11 @@ function getExtensionApiImportSpecifiers(): string[] {
   specifiers.push(toImportSpecifier("/usr/lib/node_modules/openclaw/dist/extensionAPI.js"));
   specifiers.push(toImportSpecifier("/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js"));
   specifiers.push(toImportSpecifier("/opt/homebrew/lib/node_modules/openclaw/dist/extensionAPI.js"));
+
+  if (process.platform === "win32" && process.env.APPDATA) {
+    const windowsNpmPath = join(process.env.APPDATA, "npm", "node_modules", "openclaw", "dist", "extensionAPI.js");
+    specifiers.push(toImportSpecifier(windowsNpmPath));
+  }
 
   return [...new Set(specifiers.filter(Boolean))];
 }
