@@ -2963,11 +2963,12 @@ const memoryLanceDBProPlugin = {
                 }
                 return; // Do not fall through to regex fallback when smart extraction is configured
               }
-              extractionRateLimiter.recordExtraction();
               if (stats.created > 0 || stats.merged > 0) {
+                extractionRateLimiter.recordExtraction();
                 api.logger.info(
                   `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
                 );
+                autoCaptureSeenTextCount.set(sessionKey, 0);
                 return; // Smart extraction handled everything
               }
 
