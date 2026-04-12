@@ -853,6 +853,135 @@
             "description": "Maximum number of auto-capture extractions allowed per hour"
           }
         }
+      },
+      "dreaming": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Dreaming: periodic memory consolidation and promotion from short-term to long-term storage. Bridges LanceDB Pro's tier-manager, decay-engine, and smart-extraction into OpenClaw's dreaming lifecycle.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable dreaming memory consolidation cycles"
+          },
+          "cron": {
+            "type": "string",
+            "default": "",
+            "description": "Custom cron expression for dreaming schedule. Leave empty for managed scheduling."
+          },
+          "timezone": {
+            "type": "string",
+            "default": "UTC",
+            "description": "Timezone for cron scheduling (IANA format)"
+          },
+          "storageMode": {
+            "type": "string",
+            "enum": ["inline", "separate", "both"],
+            "default": "inline",
+            "description": "How dream insights are stored: inline (metadata), separate (dedicated collection), or both"
+          },
+          "separateReports": {
+            "type": "boolean",
+            "default": false,
+            "description": "Generate separate dream reports per phase"
+          },
+          "verboseLogging": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable verbose logging for dreaming cycles"
+          },
+          "phases": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Dreaming phase configuration",
+            "properties": {
+              "light": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Light phase: collect candidate memories for consolidation",
+                "properties": {
+                  "lookbackDays": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 365,
+                    "default": 7,
+                    "description": "How many days of recent memories to scan"
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 500,
+                    "default": 50,
+                    "description": "Maximum candidate memories per light phase"
+                  }
+                }
+              },
+              "deep": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Deep phase: evaluate and score memories for promotion using tier-manager and decay-engine",
+                "properties": {
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 20,
+                    "description": "Maximum memories to process per deep phase"
+                  },
+                  "minScore": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "default": 0.5,
+                    "description": "Minimum composite score for promotion consideration"
+                  },
+                  "minRecallCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "default": 2,
+                    "description": "Minimum recall count for promotion"
+                  },
+                  "recencyHalfLifeDays": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 365,
+                    "default": 14,
+                    "description": "Recency weighting half-life for scoring"
+                  }
+                }
+              },
+              "rem": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "REM phase: theme reflection and pattern detection across promoted memories",
+                "properties": {
+                  "lookbackDays": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 365,
+                    "default": 30,
+                    "description": "Lookback window for pattern analysis"
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 10,
+                    "description": "Maximum patterns to detect per REM phase"
+                  },
+                  "minPatternStrength": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "default": 0.6,
+                    "description": "Minimum strength for detected patterns"
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     }
   },
@@ -1375,6 +1504,55 @@
     "extractionThrottle.maxExtractionsPerHour": {
       "label": "Max Extractions Per Hour",
       "help": "Rate limit for auto-capture extractions. Prevents excessive LLM calls during rapid-fire sessions.",
+      "advanced": true
+    },
+    "dreaming.enabled": {
+      "label": "Enable Dreaming",
+      "help": "Enable periodic memory consolidation and promotion cycles using tier-manager and decay-engine"
+    },
+    "dreaming.cron": {
+      "label": "Dreaming Cron",
+      "help": "Custom cron expression for dreaming schedule. Leave empty for managed scheduling.",
+      "advanced": true
+    },
+    "dreaming.timezone": {
+      "label": "Dreaming Timezone",
+      "help": "IANA timezone for cron scheduling",
+      "advanced": true
+    },
+    "dreaming.storageMode": {
+      "label": "Dream Storage Mode",
+      "help": "inline (metadata), separate (dedicated collection), or both",
+      "advanced": true
+    },
+    "dreaming.verboseLogging": {
+      "label": "Verbose Dreaming",
+      "help": "Enable verbose logging for dreaming cycles",
+      "advanced": true
+    },
+    "dreaming.phases.light.lookbackDays": {
+      "label": "Light Phase Lookback",
+      "help": "Days of recent memories to scan in light phase",
+      "advanced": true
+    },
+    "dreaming.phases.light.limit": {
+      "label": "Light Phase Limit",
+      "help": "Max candidate memories per light phase",
+      "advanced": true
+    },
+    "dreaming.phases.deep.minScore": {
+      "label": "Deep Phase Min Score",
+      "help": "Minimum composite score for promotion consideration",
+      "advanced": true
+    },
+    "dreaming.phases.deep.minRecallCount": {
+      "label": "Deep Phase Min Recalls",
+      "help": "Minimum recall count for promotion",
+      "advanced": true
+    },
+    "dreaming.phases.rem.minPatternStrength": {
+      "label": "REM Min Pattern Strength",
+      "help": "Minimum strength for detected patterns",
       "advanced": true
     }
   }

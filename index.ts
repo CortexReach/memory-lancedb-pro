@@ -58,6 +58,7 @@ import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extract
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
 import { NoisePrototypeBank } from "./src/noise-prototypes.js";
 import { createLlmClient } from "./src/llm-client.js";
+import { createDreamingEngine, type DreamingEngine, type DreamingConfig } from "./src/dreaming-engine.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
 import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
@@ -225,6 +226,7 @@ interface PluginConfig {
     skipLowValue?: boolean;
     maxExtractionsPerHour?: number;
   };
+  dreaming?: DreamingConfig;
 }
 
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
@@ -254,7 +256,9 @@ function resolveEnvVars(value: string): string {
   return value.replace(/\$\{([^}]+)\}/g, (_, envVar) => {
     const envValue = process.env[envVar];
     if (!envValue) {
-      throw new Error(`Environment variable ${envVar} is not set`);
+      // Return empty string instead of throwing — the feature using this value
+      // will simply be unavailable (e.g., reranking disabled).
+      return '';
     }
     return envValue;
   });
@@ -3606,6 +3610,7 @@ const memoryLanceDBProPlugin = {
     // ========================================================================
 
     let backupTimer: ReturnType<typeof setInterval> | null = null;
+    let dreamingTimer: ReturnType<typeof setInterval> | null = null;
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
     async function runBackup() {
@@ -3749,11 +3754,69 @@ const memoryLanceDBProPlugin = {
         // Run initial backup after a short delay, then schedule daily
         setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+
+        // ========================================================================
+        // Dreaming Engine
+        // ========================================================================
+        let dreamingEngine: DreamingEngine | null = null;
+        dreamingTimer = null;
+
+        const dreamingConfig = config.dreaming as DreamingConfig | undefined;
+        if (dreamingConfig?.enabled) {
+          try {
+            dreamingEngine = createDreamingEngine({
+              store,
+              decayEngine,
+              tierManager,
+              config: dreamingConfig,
+              log: (msg: string) => api.logger.info(msg),
+              debugLog: (msg: string) => api.logger.debug(msg),
+            });
+
+            // Run first dreaming cycle after 5 minutes, then every 6 hours
+            const DREAMING_INTERVAL_MS = 6 * 60 * 60 * 1000;
+            setTimeout(async () => {
+              try {
+                const report = await dreamingEngine!.run();
+                api.logger.info(
+                  `memory-lancedb-pro: dreaming cycle complete — ` +
+                  `light: ${report.phases.light.scanned} scanned, ${report.phases.light.transitions.length} transitions; ` +
+                  `deep: ${report.phases.deep.promoted}/${report.phases.deep.candidates} promoted; ` +
+                  `rem: ${report.phases.rem.patterns.length} patterns, ${report.phases.rem.reflectionsCreated} reflections`,
+                );
+              } catch (err) {
+                api.logger.warn(`memory-lancedb-pro: dreaming cycle failed: ${String(err)}`);
+              }
+            }, 5 * 60 * 1000);
+
+            dreamingTimer = setInterval(async () => {
+              try {
+                const report = await dreamingEngine!.run();
+                api.logger.info(
+                  `memory-lancedb-pro: dreaming cycle complete — ` +
+                  `light: ${report.phases.light.scanned} scanned, ${report.phases.light.transitions.length} transitions; ` +
+                  `deep: ${report.phases.deep.promoted}/${report.phases.deep.candidates} promoted; ` +
+                  `rem: ${report.phases.rem.patterns.length} patterns, ${report.phases.rem.reflectionsCreated} reflections`,
+                );
+              } catch (err) {
+                api.logger.warn(`memory-lancedb-pro: dreaming cycle failed: ${String(err)}`);
+              }
+            }, DREAMING_INTERVAL_MS);
+
+            api.logger.info("memory-lancedb-pro: dreaming engine initialized (interval: 6h)");
+          } catch (err) {
+            api.logger.warn(`memory-lancedb-pro: dreaming init failed: ${String(err)}`);
+          }
+        }
       },
       stop: async () => {
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
+        }
+        if (dreamingTimer) {
+          clearInterval(dreamingTimer);
+          dreamingTimer = null;
         }
         api.logger.info("memory-lancedb-pro: stopped");
       },
@@ -4040,6 +4103,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
                 : 30,
           }
         : { skipLowValue: false, maxExtractionsPerHour: 30 },
+    dreaming: cfg.dreaming as DreamingConfig | undefined,
   };
 }
 
