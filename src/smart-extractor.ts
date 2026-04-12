@@ -303,25 +303,51 @@ export class SmartExtractor {
       );
     }
 
-    // Step 2: Process each surviving candidate through dedup pipeline
-    // Pre-compute vectors for non-profile candidates in a single batch API call
-    // to reduce embedding round-trips from N to 1.
-    const precomputedVectors = new Map<number, number[]>();
-    const nonProfileEntries: { index: number; text: string }[] = [];
+    // Step 2: Process each surviving candidate through dedup pipeline.
+    //
+    // Optimization: filter boundary-excluded candidates BEFORE batch embedding
+    // to avoid wasting embed API calls on candidates that will be skipped.
+    // See MR1 from code review.
+    const processableCandidates: { index: number; candidate: CandidateMemory }[] = [];
     for (let i = 0; i < survivingCandidates.length; i++) {
       const c = survivingCandidates[i];
-      if (!ALWAYS_MERGE_CATEGORIES.has(c.category)) {
-        nonProfileEntries.push({ index: i, text: `${c.abstract} ${c.content}` });
+      if (
+        isUserMdExclusiveMemory(
+          {
+            memoryCategory: c.category,
+            abstract: c.abstract,
+            content: c.content,
+          },
+          this.config.workspaceBoundary,
+        )
+      ) {
+        stats.skipped += 1;
+        stats.boundarySkipped = (stats.boundarySkipped ?? 0) + 1;
+        this.log(
+          `memory-pro: smart-extractor: skipped USER.md-exclusive [${c.category}] ${c.abstract.slice(0, 60)}`,
+        );
+        continue;
+      }
+      processableCandidates.push({ index: i, candidate: c });
+    }
+
+    // Pre-compute vectors for processable non-profile candidates in a single batch API call
+    // to reduce embedding round-trips from N to 1.
+    const precomputedVectors = new Map<number, number[]>();
+    const nonProfileToEmbed: { index: number; text: string }[] = [];
+    for (const { index, candidate } of processableCandidates) {
+      if (!ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
+        nonProfileToEmbed.push({ index, text: `${candidate.abstract} ${candidate.content}` });
       }
     }
-    if (nonProfileEntries.length > 0) {
+    if (nonProfileToEmbed.length > 0) {
       try {
-        const batchTexts = nonProfileEntries.map((e) => e.text);
+        const batchTexts = nonProfileToEmbed.map((e) => e.text);
         const batchVectors = await this.embedder.embedBatch(batchTexts);
-        for (let j = 0; j < nonProfileEntries.length; j++) {
+        for (let j = 0; j < nonProfileToEmbed.length; j++) {
           const vec = batchVectors[j];
           if (vec && vec.length > 0) {
-            precomputedVectors.set(nonProfileEntries[j].index, vec);
+            precomputedVectors.set(nonProfileToEmbed[j].index, vec);
           }
         }
       } catch (err) {
@@ -331,26 +357,7 @@ export class SmartExtractor {
       }
     }
 
-    for (let idx = 0; idx < survivingCandidates.length; idx++) {
-      const candidate = survivingCandidates[idx];
-      if (
-        isUserMdExclusiveMemory(
-          {
-            memoryCategory: candidate.category,
-            abstract: candidate.abstract,
-            content: candidate.content,
-          },
-          this.config.workspaceBoundary,
-        )
-      ) {
-        stats.skipped += 1;
-        stats.boundarySkipped = (stats.boundarySkipped ?? 0) + 1;
-        this.log(
-          `memory-pro: smart-extractor: skipped USER.md-exclusive [${candidate.category}] ${candidate.abstract.slice(0, 60)}`,
-        );
-        continue;
-      }
-
+    for (const { index, candidate } of processableCandidates) {
       try {
         await this.processCandidate(
           candidate,
@@ -359,7 +366,7 @@ export class SmartExtractor {
           stats,
           targetScope,
           scopeFilter,
-          precomputedVectors.get(idx),
+          precomputedVectors.get(index),
         );
       } catch (err) {
         this.log(
