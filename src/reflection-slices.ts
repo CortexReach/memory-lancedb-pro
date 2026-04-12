@@ -386,53 +386,24 @@ export function isRecallUsed(
     }
   }
 
-  // P0-3 fix: summary path AND gate — when summaries are provided,
-  // both the verbatim check AND a usage marker must be present.
-  // This matches the AND logic of the ID path (hasSpecificRecall + usageMarker).
+  // P1 fix: Summary path — detect when injected summary content appears in the response.
+  // No AND gate here: summary text IS the injected memory, so any verbatim/near-verbatim
+  // overlap is a strong usage signal. The 10-char minimum prevents false positives on
+  // common short words. Guards at function entry already ensure injectedSummaries is non-empty.
   if (injectedSummaries && injectedSummaries.length > 0) {
     const responseTrimmedLower = responseText.trim().toLowerCase();
-    const usageMarkers = [
-      "remember",
-      "之前",
-      "记得",
-      "according to",
-      "based on what",
-      "as you mentioned",
-      "如前所述",
-      "如您所說",
-      "如您所说的",
-      "我記得",
-      "我记得",
-      "之前你說",
-      "之前你说",
-      "之前提到",
-      "之前提到的",
-      "根据之前",
-      "依据之前",
-      "按照之前",
-      "照您之前",
-      "照你说的",
-      "from previous",
-      "earlier you",
-      "in the memory",
-      "the memory mentioned",
-      "the memories show",
-    ];
-    const hasUsageMarker = usageMarkers.some((m) => responseLower.includes(m.toLowerCase()));
-    if (hasUsageMarker || hasSpecificRecall) {
-      for (const summary of injectedSummaries) {
-        if (summary && summary.trim().length > 0) {
-          const summaryLower = summary.trim().toLowerCase();
-          // Check for verbatim or near-verbatim presence (at least 10 chars to avoid
-          // false positives on very short fragments).
-          if (
-            summaryLower.length >= 10 &&
-            (responseTrimmedLower.includes(summaryLower) ||
-              // Also check the reverse (summary contains response snippet — agent echoed it)
-              summaryLower.includes(responseTrimmedLower.slice(0, Math.min(50, responseTrimmedLower.length))))
-          ) {
-            return true;
-          }
+    for (const summary of injectedSummaries) {
+      if (summary && summary.trim().length > 0) {
+        const summaryLower = summary.trim().toLowerCase();
+        // Check for verbatim or near-verbatim presence (at least 10 chars to avoid
+        // false positives on very short fragments).
+        if (
+          summaryLower.length >= 10 &&
+          (responseTrimmedLower.includes(summaryLower) ||
+            // Also check the reverse (summary contains response snippet — agent echoed it)
+            summaryLower.includes(responseTrimmedLower.slice(0, Math.min(50, responseTrimmedLower.length))))
+        ) {
+          return true;
         }
       }
     }
