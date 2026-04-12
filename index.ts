@@ -2034,7 +2034,20 @@ const memoryLanceDBProPlugin = {
       /** Summary text lines actually injected into the prompt, used for usage detection. */
       injectedSummaries: string[];
     };
+    // P0-1 fix: pendingRecall TTL-based cleanup to prevent unbounded memory growth.
+    // Entries older than 10 minutes are cleaned up on each set() call.
+    const PENDING_RECALL_MAX_AGE_MS = 10 * 60 * 1000; // 10 minutes
+    function cleanupPendingRecall(): void {
+      const now = Date.now();
+      for (const [key, entry] of pendingRecall.entries()) {
+        if (now - entry.injectedAt > PENDING_RECALL_MAX_AGE_MS) {
+          pendingRecall.delete(key);
+        }
+      }
+    }
     const pendingRecall = new Map<string, PendingRecallEntry>();
+    // Clean up on module load (handles re-registration edge cases)
+    cleanupPendingRecall();
 
     const logReg = isCliMode() ? api.logger.debug : api.logger.info;
     logReg(
@@ -2537,6 +2550,8 @@ const memoryLanceDBProPlugin = {
           // can detect usage even when the agent doesn't use stock phrases or IDs
           // but directly incorporates the memory content into the response.
           const injectedSummaries = selected.map((item) => item.line);
+          // P0-1 fix: run TTL cleanup before each set to prevent unbounded growth
+          cleanupPendingRecall();
           pendingRecall.set(sessionKeyForRecall, {
             recallIds: selected.map((item) => item.id),
             responseText: "", // Will be populated by agent_end
@@ -3096,6 +3111,11 @@ const memoryLanceDBProPlugin = {
                 undefined,
               );
             } else {
+              // P0-2 fix: bad_recall_count read-modify-write.
+              // KNOWN LIMITATION: This is not atomic. Concurrent before_prompt_build
+              // invocations for the same recallId may overwrite each other's increments.
+              // Full atomic fix requires store-layer compare-and-swap support (out of
+              // Phase 1 scope). The increment is best-effort and may undercount.
               const badCount = meta.bad_recall_count || 0;
               let newImportance = currentImportance;
               if (containsKeyword(userPromptText, errorKeywords)) {
