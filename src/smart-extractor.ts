@@ -80,12 +80,16 @@ export function stripEnvelopeMetadata(text: string): string {
   // Also matches when the wrapper prefix is on its own line ("]\n" = no content after ]).
   const WRAPPER_LINE_RE = /^\[(?:Subagent Context|Subagent Task)\](?:\s|$|\n)?/i;
   const BOILERPLATE_RE = /^(?:Results auto-announce to your requester\.?|do not busy-poll for status\.?|Reply with a brief acknowledgment only\.?|Do not use any memory tools\.?)$/im;
-  // Non-anchored version for inline content: matches boilerplate phrases anywhere in a string.
+  // Anchored inline variant: only strip boilerplate when it starts the wrapper
+  // remainder. This avoids erasing legitimate inline payload that merely quotes
+  // a boilerplate phrase later in the sentence.
+  // Repeat the anchored segment so composite wrappers like "You are running...
+  // Results auto-announce..." are fully removed before preserving any payload.
   // The subagent running phrase uses (?<=\.)\s+|$ alternation (same as old
   // RUNTIME_WRAPPER_BOILERPLATE_RE) so that parenthetical depth like "(depth 1/1)."
   // is included before the ending whitespace, correctly stripping the full phrase.
   const INLINE_BOILERPLATE_RE =
-    /(?:You are running as a subagent\b.*?(?:(?<=\.)\s+|$)|Results auto-announce to your requester\.?|do not busy-poll for status\.?|Reply with a brief acknowledgment only\.?|Do not use any memory tools\.?)/gi;
+    /^(?:(?:You are running as a subagent\b.*?(?:(?<=\.)\s+|$)|Results auto-announce to your requester\.?\s*|do not busy-poll for status\.?\s*|Reply with a brief acknowledgment only\.?\s*|Do not use any memory tools\.?\s*))+/i;
   // Anchor to start of line — prevents quoted/cited false-positives
   const SUBAGENT_RUNNING_RE = /^You are running as a subagent\b/i;
 
@@ -133,8 +137,8 @@ export function stripEnvelopeMetadata(text: string): string {
       let remainder = afterPrefix;
       // 2. Remove all boilerplate phrases from remainder (handles inline
       //    wrapper+boilerplate like "[Subagent Context] ... Results auto-announce...").
-      //    Use INLINE_BOILERPLATE_RE (non-anchored, includes subagent phrase) so
-      //    boilerplate embedded anywhere in the inline content is also removed.
+      //    Use INLINE_BOILERPLATE_RE (anchored, includes subagent phrase) so only
+      //    leading wrapper boilerplate is removed while quoted user payload remains.
       remainder = remainder.replace(INLINE_BOILERPLATE_RE, "").replace(/\s{2,}/g, " ").trim();
       // 3. Keep remainder if non-empty (non-boilerplate inline content preserved);
       //    strip the whole line if only boilerplate was present
@@ -202,7 +206,7 @@ export function stripEnvelopeMetadata(text: string): string {
   // 3. Strip any remaining JSON blocks that look like envelope metadata
   //    (contain message_id and sender_id fields)
   cleaned = cleaned.replace(
-    /```json\s*\{[^}]*"message_id"\s*:[^}]*"sender_id"\s*:[^}]*\}\s*```/g,
+    /```json\s*(?=\{[\s\S]*?"message_id"\s*:)(?=\{[\s\S]*?"sender_id"\s*:)\{[\s\S]*?\}\s*```/g,
     "",
   );
 

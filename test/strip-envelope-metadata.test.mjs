@@ -213,6 +213,15 @@ describe("stripEnvelopeMetadata", () => {
     assert.doesNotMatch(result, /Subagent Context/);
   });
 
+  it("preserves inline wrapper payload that only mentions boilerplate later in the sentence", () => {
+    const input = [
+      "[Subagent Context] User quoted the phrase Reply with a brief acknowledgment only. for documentation.",
+    ].join("\n");
+
+    const result = stripEnvelopeMetadata(input);
+    assert.equal(result, "User quoted the phrase Reply with a brief acknowledgment only. for documentation.");
+  });
+
   // FIX 2 regression: wrapper inline boilerplate should still be stripped
   it("strips boilerplate-only inline content after wrapper prefix", () => {
     const input = [
@@ -221,6 +230,24 @@ describe("stripEnvelopeMetadata", () => {
 
     const result = stripEnvelopeMetadata(input);
     assert.equal(result, "");
+  });
+
+  it("strips leading inline boilerplate but preserves payload that follows it", () => {
+    const input = [
+      "[Subagent Task] Reply with a brief acknowledgment only. Then summarize the failing test.",
+    ].join("\n");
+
+    const result = stripEnvelopeMetadata(input);
+    assert.equal(result, "Then summarize the failing test.");
+  });
+
+  it("strips multiple leading boilerplate phrases before preserving inline payload", () => {
+    const input = [
+      "[Subagent Task] Reply with a brief acknowledgment only. Do not use any memory tools. Actual user content starts here.",
+    ].join("\n");
+
+    const result = stripEnvelopeMetadata(input);
+    assert.equal(result, "Actual user content starts here.");
   });
 
   it("handles Telegram-style envelope headers", () => {
@@ -247,6 +274,22 @@ describe("stripEnvelopeMetadata", () => {
     assert.match(result, /Some text before/);
     assert.match(result, /Some text after/);
     assert.doesNotMatch(result, /message_id/);
+  });
+
+  it("strips standalone JSON blocks when sender_id appears before message_id", () => {
+    const input = [
+      "Some text before",
+      "```json",
+      '{"sender_id": "ou_yyy", "message_id": "om_xxx", "timestamp": "2026-03-18"}',
+      "```",
+      "Some text after",
+    ].join("\n");
+
+    const result = stripEnvelopeMetadata(input);
+    assert.match(result, /Some text before/);
+    assert.match(result, /Some text after/);
+    assert.doesNotMatch(result, /message_id/);
+    assert.doesNotMatch(result, /sender_id/);
   });
 
   it("collapses excessive blank lines after stripping", () => {
