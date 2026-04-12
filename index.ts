@@ -3003,6 +3003,8 @@ const memoryLanceDBProPlugin = {
       // Use same key format as auto-recall hook (sessionKey:agentId) so we read the right entry.
       const agentIdForKey = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
       const sessionKey = `${ctx?.sessionKey || ctx?.sessionId || "default"}:${agentIdForKey ?? ""}`;
+      // P2 fix: also cleanup on read path to handle idle sessions that never trigger set()
+      cleanupPendingRecall();
       const pending = pendingRecall.get(sessionKey);
       if (!pending) return;
 
@@ -3041,8 +3043,8 @@ const memoryLanceDBProPlugin = {
       const boostOnConfirm = fb.boostOnConfirm ?? 0.15;
       const penaltyOnError = fb.penaltyOnError ?? 0.10;
       const minRecallCountForPenalty = fb.minRecallCountForPenalty ?? 2;
-      const confirmKeywords = fb.confirmKeywords ?? ["正確", "yes", "right", "沒錯", "確認", "correct", "ok"];
-      const errorKeywords = fb.errorKeywords ?? ["不是", "錯", "不對", "wrong", "no", "not right", "錯誤", "更正"];
+      const confirmKeywords = fb.confirmKeywords ?? ["correct", "right", "yes", "confirmed", "exactly", "對", "沒錯", "正確", "確認", "好的"];
+      const errorKeywords = fb.errorKeywords ?? ["wrong", "incorrect", "not right", "that's wrong", "error", "mistake", "fix it", "change that", "改成", "改為", "不是這樣", "不對", "錯了"];
 
       // event.prompt is a plain string in the current hook contract (confirmed by codebase usage).
       // We extract the user's last message from event.messages array instead.
@@ -3125,7 +3127,7 @@ const memoryLanceDBProPlugin = {
                   newImportance = Math.max(0.1, newImportance - penaltyOnError);
                 }
                 await store.update(recallId, { importance: newImportance }, undefined);
-                await store.patchMetadata(recallId, { bad_recall_count: badCount + 1, last_confirmed_use_at: Date.now() }, undefined);
+                await store.patchMetadata(recallId, { bad_recall_count: badCount + 1 }, undefined);
               } else if (badCount >= 1) {
                 // P1 fix: check >= 1 to match injection path's staleInjected increment.
                 // After injection increments (staleInjected), badCount will be 1, so we apply
