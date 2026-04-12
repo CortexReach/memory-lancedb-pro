@@ -1,5 +1,11 @@
 /**
  * LanceDB Storage Layer with Multi-Scope Support
+ * 
+ * Features:
+ * - Multi-scope isolation (agent/user/global/session)
+ * - Frozen snapshot pattern for stable system prompt injection
+ * - Cross-process file locking for concurrent safety
+ * - Atomic writes via temp-file + rename
  */
 
 import type * as LanceDB from "@lancedb/lancedb";
