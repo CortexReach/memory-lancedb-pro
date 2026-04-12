@@ -3305,25 +3305,29 @@ const memoryLanceDBProPlugin = {
                 undefined,
               );
             } else {
-              // P0-2 fix: bad_recall_count read-modify-write.
-              // KNOWN LIMITATION: This is not atomic. Concurrent before_prompt_build
-              // invocations for the same recallId may overwrite each other's increments.
-              // Full atomic fix requires store-layer compare-and-swap support (out of
-              // Phase 1 scope). The increment is best-effort and may undercount.
+              // P1 fix: align scoring penalty threshold with injection increment.
+              // The injection path increments on staleInjected (previous turn not confirmed).
+              // To avoid double-counting: scoring only increments for explicit errors,
+              // and checks >= 1 to sync with injection's first increment.
               const badCount = meta.bad_recall_count || 0;
               let newImportance = currentImportance;
               if (containsKeyword(userPromptText, errorKeywords)) {
+                // Only increment for explicit user error/correction
                 if ((meta.injected_count || 0) >= minRecallCountForPenalty) {
                   newImportance = Math.max(0.1, newImportance - penaltyOnError);
                 }
                 await store.update(recallId, { importance: newImportance }, undefined);
-                await store.patchMetadata(recallId, { bad_recall_count: badCount + 1 }, undefined);
-              } else if (badCount >= 2) {
+                await store.patchMetadata(recallId, { bad_recall_count: badCount + 1, last_confirmed_use_at: Date.now() }, undefined);
+              } else if (badCount >= 1) {
+                // P1 fix: check >= 1 to match injection path's staleInjected increment.
+                // After injection increments (staleInjected), badCount will be 1, so we apply
+                // penalty on the second miss rather than waiting for the third.
                 if ((meta.injected_count || 0) >= minRecallCountForPenalty) {
                   newImportance = Math.max(0.1, newImportance - penaltyOnMiss);
                 }
                 await store.update(recallId, { importance: newImportance }, undefined);
-                await store.patchMetadata(recallId, { bad_recall_count: badCount + 1 }, undefined);
+                // Don't increment here - injection path already increments via staleInjected.
+                // This prevents double-counting while still applying penalty.
               }
             }
           }
