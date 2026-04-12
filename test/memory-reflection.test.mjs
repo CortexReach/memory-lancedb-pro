@@ -1293,6 +1293,130 @@ describe("memory reflection", () => {
         "legacy derived duplicate of resolved item must be suppressed");
     });
 
+    // ---- P2 cross-section suppression fix tests ----
+
+    it("invariants resolved + derived has unique legacy: only derived passes", () => {
+      // Bug scenario: Invariants all resolved, but derived has unique legacy content.
+      // shouldSuppress=false (because derived has unique content).
+      // buildInvariantCandidates must NOT revive resolved invariants via legacy fallback.
+      const now = Date.UTC(2026, 3, 15);
+      const day = 24 * 60 * 60 * 1000;
+
+      // All invariant items are resolved
+      const resolvedInvariantEntry = makeEntry({
+        timestamp: now - 1 * day,
+        metadata: {
+          type: "memory-reflection-item",
+          itemKind: "invariant",
+          agentId: "main",
+          storedAt: now - 1 * day,
+          decayMidpointDays: 45,
+          decayK: 0.22,
+          baseWeight: 1.1,
+          quality: 1,
+          usedFallback: false,
+          resolvedAt: now - 10 * 60 * 1000,
+          resolvedBy: "agent:main",
+        },
+      });
+      resolvedInvariantEntry.text = "Resolved invariant that must stay suppressed.";
+
+      // No unresolved derived items at all
+      const itemRows = [resolvedInvariantEntry];
+
+      // Legacy row: invariant duplicate of resolved + unique derived content
+      const legacyEntries = [
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            invariants: ["Resolved invariant that must stay suppressed."],
+            derived: ["Unique derived that should survive legacy fallback."],
+          },
+        }),
+      ];
+
+      const allEntries = [...itemRows, ...legacyEntries];
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries: allEntries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      // Invariants must be empty: the only invariant is a resolved duplicate
+      assert.equal(slices.invariants.length, 0,
+        "resolved invariant must not be revived via legacy fallback");
+      // Derived must contain the unique legacy derived content
+      assert(slices.derived.length > 0,
+        "unique legacy derived should survive");
+      assert(slices.derived.some((l) => l.includes("Unique derived")),
+        "unique legacy derived text must appear in derived slice");
+    });
+
+    it("derived resolved + invariants has unique legacy: only invariants passes", () => {
+      // Symmetric case: Derived all resolved, but invariants have unique legacy content.
+      // shouldSuppress=false (because invariants has unique content).
+      // buildDerivedCandidates must NOT revive resolved derived via legacy fallback.
+      const now = Date.UTC(2026, 3, 15);
+      const day = 24 * 60 * 60 * 1000;
+
+      // All derived items are resolved
+      const resolvedDerivedEntry = makeEntry({
+        timestamp: now - 1 * day,
+        metadata: {
+          type: "memory-reflection-item",
+          itemKind: "derived",
+          agentId: "main",
+          storedAt: now - 1 * day,
+          decayMidpointDays: 7,
+          decayK: 0.65,
+          baseWeight: 1,
+          quality: 0.95,
+          usedFallback: false,
+          resolvedAt: now - 10 * 60 * 1000,
+          resolvedBy: "agent:main",
+        },
+      });
+      resolvedDerivedEntry.text = "Resolved derived that must stay suppressed.";
+
+      // No unresolved invariant items at all
+      const itemRows = [resolvedDerivedEntry];
+
+      // Legacy row: derived duplicate of resolved + unique invariant content
+      const legacyEntries = [
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection",
+            agentId: "main",
+            storedAt: now - 1 * day,
+            invariants: ["Unique invariant that should survive legacy fallback."],
+            derived: ["Resolved derived that must stay suppressed."],
+          },
+        }),
+      ];
+
+      const allEntries = [...itemRows, ...legacyEntries];
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries: allEntries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      // Invariants must contain the unique legacy invariant content
+      assert(slices.invariants.length > 0,
+        "unique legacy invariant should survive");
+      assert(slices.invariants.some((l) => l.includes("Unique invariant")),
+        "unique legacy invariant text must appear in invariants slice");
+      // Derived must be empty: the only derived is a resolved duplicate
+      assert.equal(slices.derived.length, 0,
+        "resolved derived must not be revived via legacy fallback");
+    });
+
     it("does NOT suppress legacy rows when resolved items exist alongside unrelated legacy rows", () => {
       const now = Date.UTC(2026, 2, 7);
       const day = 24 * 60 * 60 * 1000;

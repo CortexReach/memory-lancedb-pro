@@ -302,8 +302,22 @@ export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlice
     return { invariants: [], derived: [] };
   }
 
-  const invariantCandidates = buildInvariantCandidates(unresolvedItemRows, legacyRows);
-  const derivedCandidates = buildDerivedCandidates(unresolvedItemRows, legacyRows);
+  // [FIX P2] Per-section legacy filtering: only pass legacy rows that have unique
+  // content for this specific section. Prevents resolved items in section A from being
+  // revived when section B has unique legacy content (cross-section legacy fallback bug).
+  const invariantLegacyRows = legacyRows.filter(({ metadata }) =>
+    toStringArray(metadata.invariants).some(
+      (line) => !resolvedInvariantTexts.has(normalizeReflectionLineForAggregation(line))
+    )
+  );
+  const derivedLegacyRows = legacyRows.filter(({ metadata }) =>
+    toStringArray(metadata.derived).some(
+      (line) => !resolvedDerivedTexts.has(normalizeReflectionLineForAggregation(line))
+    )
+  );
+
+  const invariantCandidates = buildInvariantCandidates(unresolvedItemRows, invariantLegacyRows);
+  const derivedCandidates = buildDerivedCandidates(unresolvedItemRows, derivedLegacyRows);
 
   const invariants = rankReflectionLines(invariantCandidates, {
     now,
