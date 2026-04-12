@@ -2704,7 +2704,9 @@ const memoryLanceDBProPlugin = {
               const nextBadRecallCount = staleInjected
                 ? meta.bad_recall_count + 1
                 : meta.bad_recall_count;
-              const shouldSuppress = nextBadRecallCount >= 3 && minRepeated > 0;
+              // P2 fix: suppress threshold aligned with scoring path (>= 2). After 2 bad recalls,
+              // both the scoring penalty and suppression kick in simultaneously.
+              const shouldSuppress = nextBadRecallCount >= 2 && minRepeated > 0;
               await store.patchMetadata(
                 item.id,
                 {
