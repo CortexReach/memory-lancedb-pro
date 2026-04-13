@@ -175,6 +175,18 @@ describe("shouldCapture — German false-positive prevention", () => {
     assert.equal(shouldCapture("Das Gebäude in dem sie wohne ist renoviert worden letztes Jahr"), false);
   });
 
+  it("does NOT capture 'Ich arbeite gerade an PR 489' (transient work status, not personal info)", () => {
+    assert.equal(shouldCapture("Ich arbeite gerade an PR 489"), false);
+  });
+
+  it("does NOT capture 'Ich arbeite noch am Fix für den Test' (transient work status)", () => {
+    assert.equal(shouldCapture("Ich arbeite noch am Fix für den Test"), false);
+  });
+
+  it("does NOT capture 'Ich arbeite heute von zuhause' (transient status)", () => {
+    assert.equal(shouldCapture("Ich arbeite heute von zuhause aus"), false);
+  });
+
   it("does NOT capture too-short German text", () => {
     assert.equal(shouldCapture("Wichtig"), false);  // < 10 chars
   });

@@ -1274,7 +1274,7 @@ const MEMORY_TRIGGERS = [
   /merk(?:e?\s+dir|\s+es\s+dir)|erinner(?:e)?\s+dich|vergiss\s+(?:das\s+)?nicht|nicht\s+vergessen/i,
   /ich bevorzuge|ich mag\b|ich hasse|ich will\b|ich brauche/i,
   /wir haben entschieden|wir nutzen|ab jetzt|ab sofort|in zukunft/i,
-  /mein\s+\w+\s+(?:ist|heißt)|ich\s+(?:wohne|arbeite)\b/i,
+  /mein\s+\w+\s+(?:ist|heißt)|ich\s+wohne\b|ich\s+arbeite\s+bei\b/i,
   /\b(immer\s+(?:wenn|daran|denken|merken|beachten)|niemals|wichtig)\b/i,
 ];
 
