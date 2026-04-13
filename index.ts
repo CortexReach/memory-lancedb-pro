@@ -345,6 +345,33 @@ function resolveHookAgentId(
     : parseAgentIdFromSessionKey(sessionKey)) || "main";
 }
 
+// Detect when agentId came from a chat_id / user: source (e.g. "657229412030480397").
+// These are numeric Discord/Telegram IDs mistakenly used as agent IDs and cause
+// auto-recall to timeout. We skip them rather than block all pure-numeric IDs
+// to avoid false positives for intentionally numeric agent names.
+function isChatIdBasedAgentId(agentId: string): boolean {
+  return /^\d+$/.test(agentId); // pure digits = almost certainly a chat_id, not a real agent
+}
+
+/**
+ * Returns true when agentId is invalid — either empty/undefined, detected as a
+ * numeric chat_id, or not present in the openclaw.json declared agents list.
+ * Pass `declaredAgents` (from config.declaredAgents) for authoritative validation.
+ */
+function isInvalidAgentIdFormat(
+  agentId: string | undefined,
+  declaredAgents?: Set<string>,
+): boolean {
+  if (!agentId) return true;
+  // Pure numeric IDs are almost always chat_id extractions, not real agent IDs.
+  if (isChatIdBasedAgentId(agentId)) return true;
+  // If we have a declared agents list, treat unknown IDs as invalid.
+  if (declaredAgents && declaredAgents.size > 0 && !declaredAgents.has(agentId)) {
+    return true;
+  }
+  return false;
+}
+
 function resolveSourceFromSessionKey(sessionKey: string | undefined): string {
   const trimmed = sessionKey?.trim() ?? "";
   const match = /^agent:[^:]+:([^:]+)/.exec(trimmed);
@@ -2414,7 +2441,6 @@ const memoryLanceDBProPlugin = {
 
       const AUTO_RECALL_TIMEOUT_MS = parsePositiveInt(config.autoRecallTimeoutMs) ?? 5_000; // configurable; default raised from 3s to 5s for remote embedding APIs behind proxies
       api.on("before_prompt_build", async (event: any, ctx: any) => {
-<<<<<<< HEAD
         // Skip auto-recall for sub-agent sessions — their context comes from the parent.
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (sessionKey.includes(":subagent:")) return;
@@ -2424,6 +2450,12 @@ const memoryLanceDBProPlugin = {
         // - Else if autoRecallExcludeAgents is set: all agents EXCEPT these receive auto-recall
 
         const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+        if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+          api.logger.debug?.(
+            `memory-lancedb-pro: auto-recall skipped \u2014 invalid agentId format '${agentId}'`,
+          );
+          return;
+        }
         if (Array.isArray(config.autoRecallIncludeAgents) && config.autoRecallIncludeAgents.length > 0) {
           if (!config.autoRecallIncludeAgents.includes(agentId)) {
             api.logger.debug?.(
@@ -2469,6 +2501,10 @@ const memoryLanceDBProPlugin = {
         const recallWork = async (): Promise<{ prependContext: string } | undefined> => {
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+            api.logger.debug?.(`memory-lancedb-pro: auto-recall skip \u2014 invalid agentId '${agentId}'`);
+            return undefined;
+          }
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
 
           // Use cached raw user message for the recall query to avoid channel
@@ -2812,6 +2848,10 @@ const memoryLanceDBProPlugin = {
 
           // Determine agent ID and default scope
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+            api.logger.debug(`memory-lancedb-pro: auto-capture skip \u2014 invalid agentId '${agentId}'`);
+            return;
+          }
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
           const defaultScope = isSystemBypassId(agentId)
             ? config.scopes?.default ?? "global"
@@ -3330,6 +3370,10 @@ const memoryLanceDBProPlugin = {
             typeof ctx.agentId === "string" ? ctx.agentId : undefined,
             sessionKey,
           );
+          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+            api.logger.debug?.(`memory-lancedb-pro: reflection inheritance skip \u2014 invalid agentId '${agentId}'`);
+            return;
+          }
           const scopes = resolveScopeFilter(scopeManager, agentId);
           const slices = await loadAgentReflectionSlices(agentId, scopes);
           if (slices.invariants.length === 0) return;
@@ -3356,6 +3400,10 @@ const memoryLanceDBProPlugin = {
           typeof ctx.agentId === "string" ? ctx.agentId : undefined,
           sessionKey,
         );
+        if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+          api.logger.debug?.(`memory-lancedb-pro: reflection derived+error skip \u2014 invalid agentId '${agentId}'`);
+          return;
+        }
         pruneReflectionSessionState();
 
         const blocks: string[] = [];
@@ -3833,6 +3881,10 @@ const memoryLanceDBProPlugin = {
             typeof ctx.agentId === "string" ? ctx.agentId : undefined,
             sessionKey,
           );
+          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+            api.logger.debug?.(`session-memory [before_reset]: skip \u2014 invalid agentId '${agentId}'`);
+            return;
+          }
           const defaultScope = isSystemBypassId(agentId)
             ? config.scopes?.default ?? "global"
             : scopeManager.getDefaultScope(agentId);
@@ -4161,6 +4213,23 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         .filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
         .map((id) => id.trim())
       : undefined,
+    // Build declaredAgents Set from openclaw.json agents.list for fast validation.
+    declaredAgents: (() => {
+      const s = new Set<string>();
+      const agentsList = (cfg as Record<string, unknown>).agents as Record<string, unknown> | undefined;
+      if (agentsList) {
+        const list = agentsList.list as unknown;
+        if (Array.isArray(list)) {
+          for (const entry of list) {
+            if (entry && typeof entry === "object") {
+              const id = (entry as Record<string, unknown>).id;
+              if (typeof id === "string" && id.trim().length > 0) s.add(id.trim());
+            }
+          }
+        }
+      }
+      return s;
+    })(),
     captureAssistant: cfg.captureAssistant === true,
     retrieval:
       typeof cfg.retrieval === "object" && cfg.retrieval !== null
