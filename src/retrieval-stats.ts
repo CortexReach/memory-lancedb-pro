@@ -82,7 +82,8 @@ export class RetrievalStatsCollector {
    * Compute aggregate statistics from all recorded queries.
    */
   getStats(): AggregateStats {
-    const n = this._records.length;
+    const records = this._getRecords();
+    const n = records.length;
     if (n === 0) {
       return {
         totalQueries: 0,
@@ -106,7 +107,7 @@ export class RetrievalStatsCollector {
     const queriesBySource: Record<string, number> = {};
     const dropsByStage: Record<string, number> = {};
 
-    for (const { trace, source } of this._getRecords()) {
+    for (const { trace, source } of records) {
       totalLatency += trace.totalMs;
       totalResults += trace.finalCount;
       latencies.push(trace.totalMs);

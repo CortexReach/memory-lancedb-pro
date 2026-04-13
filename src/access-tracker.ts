@@ -294,11 +294,15 @@ export class AccessTracker {
     this.clearTimer();
     if (this.pending.size > 0) {
       this.logger.warn(
-        `access-tracker: destroying with ${this.pending.size} pending writes — attempting final flush`,
+        `access-tracker: destroying with ${this.pending.size} pending writes — attempting final flush (3s timeout)`,
       );
-      // Fire-and-forget final flush. Uses finally() to guarantee we always
-      // clear pending/_retryCount even if flush throws or never resolves.
-      void this.doFlush().finally(() => {
+      // Fire-and-forget final flush with a hard 3s timeout. Uses Promise.race
+      // to guarantee we always clear pending/_retryCount even if flush hangs.
+      const flushWithTimeout = Promise.race([
+        this.doFlush(),
+        new Promise<void>((resolve) => setTimeout(resolve, 3_000)),
+      ]);
+      void flushWithTimeout.finally(() => {
         this.pending.clear();
         this._retryCount.clear();
       });
