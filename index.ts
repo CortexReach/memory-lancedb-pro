@@ -1357,7 +1357,7 @@ export function detectCategory(
 
 function sanitizeForContext(text: string): string {
   return text
-    .replace(/[\r\n]+/g, " ")
+    .replace(/[\r\n]+/g, "\\n")
     .replace(/<\/?[a-zA-Z][^>]*>/g, "")
     .replace(/</g, "\uFF1C")
     .replace(/>/g, "\uFF1E")
@@ -2399,7 +2399,7 @@ const memoryLanceDBProPlugin = {
             const summary = sanitizeForContext(contentText).slice(0, effectivePerItemMaxChars);
             return {
               id: r.entry.id,
-              prefix: `${tierPrefix}[${displayCategory}:${r.entry.scope}]`,
+              prefix: (() => { const f = metaObj.folder ? `[${metaObj.folder}]` : ""; const s = metaObj.source ? `(${metaObj.source})` : ""; const d = r.entry.timestamp ? new Date(r.entry.timestamp).toISOString().slice(0, 10) : ""; return `${f} ${d} ${s}`.trim(); })(),
               summary,
               chars: summary.length,
               meta: metaObj,
