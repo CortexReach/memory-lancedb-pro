@@ -3295,42 +3295,32 @@ const memoryLanceDBProPlugin = {
             const meta = parseSmartMetadata(entry.metadata, entry);
             const currentImportance = meta.importance ?? entry.importance ?? 0.5;
 
-            if (usedRecall) {
+            // P1 fix (Codex): check errorKeywords BEFORE usedRecall.
+            // If user explicitly corrects, that overrides the heuristic usage detection.
+            // Also set last_confirmed_use_at here to prevent injection path's staleInjected
+            // from double-counting in the same turn.
+            const hasError = containsKeyword(userPromptText, errorKeywords);
+            if (hasError) {
+              if ((meta.injected_count || 0) >= minRecallCountForPenalty) {
+                await store.update(recallId, { importance: Math.max(0.1, currentImportance - penaltyOnError) }, undefined);
+              }
+              await store.patchMetadata(recallId, { bad_recall_count: (meta.bad_recall_count || 0) + 1, last_confirmed_use_at: Date.now() }, undefined);
+            } else if (usedRecall) {
+              // Pure positive use: boost importance
               let newImportance = Math.min(1.0, currentImportance + boostOnUse);
               if (containsKeyword(userPromptText, confirmKeywords)) {
                 newImportance = Math.min(1.0, newImportance + boostOnConfirm);
               }
               await store.update(recallId, { importance: newImportance }, undefined);
-              await store.patchMetadata(
-                recallId,
-                { last_confirmed_use_at: Date.now(), bad_recall_count: 0 },
-                undefined,
-              );
+              await store.patchMetadata(recallId, { last_confirmed_use_at: Date.now(), bad_recall_count: 0 }, undefined);
             } else {
               // P1 fix: align scoring penalty threshold with injection increment.
-              // The injection path increments on staleInjected (previous turn not confirmed).
-              // To avoid double-counting: scoring only increments for explicit errors,
-              // and checks >= 1 to sync with injection's first increment.
+              // Silent miss: apply penalty if badCount >= 1 (injection path handles increment).
               const badCount = meta.bad_recall_count || 0;
-              let newImportance = currentImportance;
-              if (containsKeyword(userPromptText, errorKeywords)) {
-                // Only increment for explicit user error/correction
-                if ((meta.injected_count || 0) >= minRecallCountForPenalty) {
-                  newImportance = Math.max(0.1, newImportance - penaltyOnError);
-                }
-                await store.update(recallId, { importance: newImportance }, undefined);
-                await store.patchMetadata(recallId, { bad_recall_count: badCount + 1 }, undefined);
-              } else if (badCount >= 1) {
-                // P1 fix: check >= 1 to match injection path's staleInjected increment.
-                // After injection increments (staleInjected), badCount will be 1, so we apply
-                // penalty on the second miss rather than waiting for the third.
-                if ((meta.injected_count || 0) >= minRecallCountForPenalty) {
-                  newImportance = Math.max(0.1, newImportance - penaltyOnMiss);
-                }
-                await store.update(recallId, { importance: newImportance }, undefined);
-                // Don't increment here - injection path already increments via staleInjected.
-                // This prevents double-counting while still applying penalty.
+              if (badCount >= 1 && (meta.injected_count || 0) >= minRecallCountForPenalty) {
+                await store.update(recallId, { importance: Math.max(0.1, currentImportance - penaltyOnMiss) }, undefined);
               }
+              // No increment here - injection path already increments via staleInjected.
             }
           }
         } catch (err) {
