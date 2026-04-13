@@ -32,6 +32,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/smart-metadata-v2.mjs" },
   { group: "storage-and-schema", runner: "node", file: "test/vector-search-cosine.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/context-support-e2e.mjs" },
+  { group: "core-regression", runner: "node", file: "test/agentid-validation.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/temporal-facts.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/memory-update-supersede.test.mjs" },
   { group: "llm-clients-and-auth", runner: "node", file: "test/memory-upgrader-diagnostics.test.mjs" },
