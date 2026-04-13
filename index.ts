@@ -3229,11 +3229,13 @@ const memoryLanceDBProPlugin = {
       }
 
       // Read feedback config values with defaults
+      // P2 fix: coerce to Number to handle env-driven string config values.
+      // Without coercion, string values would cause string concatenation in Math.min/max.
       const fb = config.feedback ?? {};
-      const boostOnUse = fb.boostOnUse ?? 0.05;
-      const penaltyOnMiss = fb.penaltyOnMiss ?? 0.03;
-      const boostOnConfirm = fb.boostOnConfirm ?? 0.15;
-      const penaltyOnError = fb.penaltyOnError ?? 0.10;
+      const boostOnUse = Number(fb.boostOnUse ?? 0) || 0.05;
+      const penaltyOnMiss = Number(fb.penaltyOnMiss ?? 0) || 0.03;
+      const boostOnConfirm = Number(fb.boostOnConfirm ?? 0) || 0.15;
+      const penaltyOnError = Number(fb.penaltyOnError ?? 0) || 0.10;
       const minRecallCountForPenalty = fb.minRecallCountForPenalty ?? 2;
       const confirmKeywords = fb.confirmKeywords ?? ["correct", "right", "yes", "confirmed", "exactly", "對", "沒錯", "正確", "確認", "好的"];
       const errorKeywords = fb.errorKeywords ?? ["wrong", "incorrect", "not right", "that's wrong", "error", "mistake", "fix it", "change that", "改成", "改為", "不是這樣", "不對", "錯了"];
@@ -3330,6 +3332,7 @@ const memoryLanceDBProPlugin = {
         }
       }
     }, { priority: 5 });
+    }
 
     // ========================================================================
     // Proposal A Phase 1: session_end hook - Clean up pending recalls
