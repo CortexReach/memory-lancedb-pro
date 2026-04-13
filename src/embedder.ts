@@ -33,6 +33,16 @@ class EmbeddingCache {
     this.ttlMs = ttlMinutes * 60_000;
   }
 
+  /** Remove all expired entries. Called on every set() when cache is near capacity. */
+  private _evictExpired(): void {
+    const now = Date.now();
+    for (const [k, entry] of this.cache) {
+      if (now - entry.createdAt > this.ttlMs) {
+        this.cache.delete(k);
+      }
+    }
+  }
+
   private key(text: string, task?: string): string {
     const hash = createHash("sha256").update(`${task || ""}:${text}`).digest("hex").slice(0, 24);
     return hash;
@@ -59,10 +69,15 @@ class EmbeddingCache {
 
   set(text: string, task: string | undefined, vector: number[]): void {
     const k = this.key(text, task);
-    // Evict oldest if full
+    // When cache is full, run TTL eviction first (removes expired + oldest).
+    // This prevents unbounded growth from stale entries while keeping writes O(1).
     if (this.cache.size >= this.maxSize) {
-      const firstKey = this.cache.keys().next().value;
-      if (firstKey !== undefined) this.cache.delete(firstKey);
+      this._evictExpired();
+      // If eviction didn't free enough slots, evict the single oldest LRU entry.
+      if (this.cache.size >= this.maxSize) {
+        const firstKey = this.cache.keys().next().value;
+        if (firstKey !== undefined) this.cache.delete(firstKey);
+      }
     }
     this.cache.set(k, { vector, createdAt: Date.now() });
   }

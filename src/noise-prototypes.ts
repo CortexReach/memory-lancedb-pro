@@ -40,7 +40,7 @@ const BUILTIN_NOISE_TEXTS: readonly string[] = [
 
 const DEFAULT_THRESHOLD = 0.82;
 const MAX_LEARNED_PROTOTYPES = 200;
-const DEDUP_THRESHOLD = 0.95;
+const DEDUP_THRESHOLD = 0.90; // lowered from 0.95: reduces noise bank bloat (0.82-0.90 range is where near-duplicate noise accumulates)
 
 // ============================================================================
 // NoisePrototypeBank
