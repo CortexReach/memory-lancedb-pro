@@ -2743,7 +2743,8 @@ const memoryLanceDBProPlugin = {
           // Bug 1 fix: also store the injected summary lines so the feedback hook
           // can detect usage even when the agent doesn't use stock phrases or IDs
           // but directly incorporates the memory content into the response.
-          const injectedSummaries = selected.map((item) => item.line);
+          // P1 fix: store summary content only (without prefix) for accurate matching.
+          const injectedSummaries = selected.map((item) => item.summary);
           // P0-1 fix: run TTL cleanup before each set to prevent unbounded growth
           cleanupPendingRecall();
           pendingRecall.set(sessionKeyForRecall, {
@@ -2798,9 +2799,10 @@ const memoryLanceDBProPlugin = {
           lastRawUserMessage.delete(sessionId);
           // P3 fix: clean all pendingRecall entries for this session.
           // pendingRecall keys use format: sessionKey (or sessionKey:agentId with composite key).
-          // We clean any key that starts with this sessionId.
+          // P1 fix: use sessionId only when sessionKey is absent to avoid clearing unrelated sessions.
+          const sessionKeyToClean = ctx?.sessionKey ?? sessionId;
           for (const key of pendingRecall.keys()) {
-            if (key === sessionId || key.startsWith(`${sessionId}:`) || key.startsWith(`${ctx?.sessionKey ?? ""}:`)) {
+            if (key === sessionId || key.startsWith(`${sessionId}:`) || (sessionKeyToClean && key.startsWith(`${sessionKeyToClean}:`))) {
               pendingRecall.delete(key);
             }
           }
@@ -3229,13 +3231,13 @@ const memoryLanceDBProPlugin = {
       }
 
       // Read feedback config values with defaults
-      // P2 fix: coerce to Number to handle env-driven string config values.
-      // Without coercion, string values would cause string concatenation in Math.min/max.
+      // P2 fix: coerce to Number and use ?? to preserve explicit zero values.
+      // P2 fix: use nullish coalescing to allow 0 as a valid config value.
       const fb = config.feedback ?? {};
-      const boostOnUse = Number(fb.boostOnUse ?? 0) || 0.05;
-      const penaltyOnMiss = Number(fb.penaltyOnMiss ?? 0) || 0.03;
-      const boostOnConfirm = Number(fb.boostOnConfirm ?? 0) || 0.15;
-      const penaltyOnError = Number(fb.penaltyOnError ?? 0) || 0.10;
+      const boostOnUse = Number(fb.boostOnUse ?? 0) ?? 0.05;
+      const penaltyOnMiss = Number(fb.penaltyOnMiss ?? 0) ?? 0.03;
+      const boostOnConfirm = Number(fb.boostOnConfirm ?? 0) ?? 0.15;
+      const penaltyOnError = Number(fb.penaltyOnError ?? 0) ?? 0.10;
       const minRecallCountForPenalty = fb.minRecallCountForPenalty ?? 2;
       const confirmKeywords = fb.confirmKeywords ?? ["correct", "right", "yes", "confirmed", "exactly", "對", "沒錯", "正確", "確認", "好的"];
       const errorKeywords = fb.errorKeywords ?? ["wrong", "incorrect", "not right", "that's wrong", "error", "mistake", "fix it", "change that", "改成", "改為", "不是這樣", "不對", "錯了"];
