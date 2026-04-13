@@ -1911,9 +1911,8 @@ function isAgentOrSessionExcluded(
     }
 
     if (p.endsWith("-")) {
-      // Wildcard prefix match: "pi-" matches "pi-agent"
-      const prefix = p.slice(0, -1);
-      if (cleanAgentId.startsWith(prefix)) return true;
+      // Wildcard prefix match: "pi-" matches "pi-agent" but NOT "pilot" or "ping"
+      if (cleanAgentId.startsWith(p)) return true;
     } else if (p === cleanAgentId) {
       return true;
     }
@@ -2393,6 +2392,7 @@ const memoryLanceDBProPlugin = {
 
       const AUTO_RECALL_TIMEOUT_MS = parsePositiveInt(config.autoRecallTimeoutMs) ?? 5_000; // configurable; default raised from 3s to 5s for remote embedding APIs behind proxies
       api.on("before_prompt_build", async (event: any, ctx: any) => {
+<<<<<<< HEAD
         // Skip auto-recall for sub-agent sessions — their context comes from the parent.
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (sessionKey.includes(":subagent:")) return;
@@ -2410,10 +2410,10 @@ const memoryLanceDBProPlugin = {
             return;
           }
         } else if (
+          agentId !== undefined &&
           Array.isArray(config.autoRecallExcludeAgents) &&
           config.autoRecallExcludeAgents.length > 0 &&
           isAgentOrSessionExcluded(agentId, sessionKey, config.autoRecallExcludeAgents)
-        ) {
         ) {
           api.logger.debug?.(
             `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}' (sessionKey=${sessionKey ?? "(none)"})`,
