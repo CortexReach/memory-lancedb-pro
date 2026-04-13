@@ -1645,9 +1645,8 @@ function isAgentOrSessionExcluded(
     }
 
     if (p.endsWith("-")) {
-      // Wildcard prefix match: "pi-" matches "pi-agent"
-      const prefix = p.slice(0, -1);
-      if (cleanAgentId.startsWith(prefix)) return true;
+      // Wildcard prefix match: "pi-" matches "pi-agent" but NOT "pilot" or "ping"
+      if (cleanAgentId.startsWith(p)) return true;
     } else if (p === cleanAgentId) {
       return true;
     }
@@ -2261,6 +2260,7 @@ const memoryLanceDBProPlugin = {
         const sessionKey = (event as any).sessionKey as string | undefined;
         const agentId = resolveHookAgentId(ctx?.agentId, sessionKey);
         if (
+          agentId !== undefined &&
           Array.isArray(config.autoRecallExcludeAgents) &&
           config.autoRecallExcludeAgents.length > 0 &&
           isAgentOrSessionExcluded(agentId, sessionKey, config.autoRecallExcludeAgents)
