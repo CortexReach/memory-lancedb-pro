@@ -205,6 +205,10 @@ interface PluginConfig {
     thinkLevel?: ReflectionThinkLevel;
     errorReminderMaxEntries?: number;
     dedupeErrorSignals?: boolean;
+    /** Cooldown in ms between reflection triggers for the same session. Default: 120000 (2 min). Set to 0 to disable. */
+    serialCooldownMs?: number;
+    /** Agent/session patterns excluded from reflection injection. Supports exact match, wildcard prefix (e.g. "pi-"), and "temp:*". */
+    excludeAgents?: string[];
   };
   mdMirror?: { enabled?: boolean; dir?: string };
   workspaceBoundary?: WorkspaceBoundaryConfig;
@@ -1620,6 +1624,38 @@ const pluginVersion = getPluginVersion();
 // hook/tool registration for the new API instance" regression that rwmjhb identified.
 const _registeredApis = new WeakSet<OpenClawPluginApi>();
 
+function isAgentOrSessionExcluded(
+  agentId: string,
+  sessionKey: string | undefined,
+  patterns: string[],
+): boolean {
+  if (!Array.isArray(patterns) || patterns.length === 0) return false;
+
+  const cleanAgentId = agentId.trim();
+  const isInternal = typeof sessionKey === "string" &&
+    sessionKey.trim().startsWith("temp:memory-reflection");
+
+  for (const pattern of patterns) {
+    const p = typeof pattern === "string" ? pattern.trim() : "";
+    if (!p) continue;
+
+    if (p === "temp:*") {
+      if (isInternal) return true;
+      continue;
+    }
+
+    if (p.endsWith("-")) {
+      // Wildcard prefix match: "pi-" matches "pi-agent"
+      const prefix = p.slice(0, -1);
+      if (cleanAgentId.startsWith(prefix)) return true;
+    } else if (p === cleanAgentId) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 const memoryLanceDBProPlugin = {
   id: "memory-lancedb-pro",
   name: "Memory (LanceDB Pro)",
@@ -2222,15 +2258,15 @@ const memoryLanceDBProPlugin = {
       const AUTO_RECALL_TIMEOUT_MS = parsePositiveInt(config.autoRecallTimeoutMs) ?? 5_000; // configurable; default raised from 3s to 5s for remote embedding APIs behind proxies
       api.on("before_prompt_build", async (event: any, ctx: any) => {
         // Per-agent exclusion: skip auto-recall for agents in the exclusion list.
-        const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+        const sessionKey = (event as any).sessionKey as string | undefined;
+        const agentId = resolveHookAgentId(ctx?.agentId, sessionKey);
         if (
           Array.isArray(config.autoRecallExcludeAgents) &&
           config.autoRecallExcludeAgents.length > 0 &&
-          agentId !== undefined &&
-          config.autoRecallExcludeAgents.includes(agentId)
+          isAgentOrSessionExcluded(agentId, sessionKey, config.autoRecallExcludeAgents)
         ) {
           api.logger.debug?.(
-            `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}'`,
+            `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}' (sessionKey=${sessionKey ?? "(none)"})`,
           );
           return;
         }
@@ -3199,13 +3235,21 @@ const memoryLanceDBProPlugin = {
           api.logger.info(`memory-reflection: skipping re-entrant call for sessionKey=${sessionKey}; already running (global guard)`);
           return;
         }
+        // Parse context before guards so cfg is available for serialCooldownMs
+        const context = (event.context || {}) as Record<string, unknown>;
+        const cfg = context.cfg;
         // Serial loop guard: skip if a reflection for this sessionKey completed recently
         if (sessionKey) {
           const serialGuard = getSerialGuardMap();
           const lastRun = serialGuard.get(sessionKey);
-          if (lastRun && (Date.now() - lastRun) < SERIAL_GUARD_COOLDOWN_MS) {
-            api.logger.info(`memory-reflection: skipping serial re-trigger for sessionKey=${sessionKey}; last run ${(Date.now() - lastRun) / 1000}s ago (cooldown=${SERIAL_GUARD_COOLDOWN_MS / 1000}s)`);
-            return;
+          if (lastRun) {
+            const cooldownMs = typeof (cfg?.memoryReflection as Record<string, unknown> | undefined)?.serialCooldownMs === "number"
+              ? (cfg!.memoryReflection as Record<string, unknown>).serialCooldownMs as number
+              : 120_000;
+            if ((Date.now() - lastRun) < cooldownMs) {
+              api.logger.info(`memory-reflection: command hook skipped (cooldown ${((Date.now() - lastRun) / 1000).toFixed(0)}s/${(cooldownMs / 1000).toFixed(0)}s, sessionKey=${sessionKey})`);
+              return;
+            }
           }
         }
         if (sessionKey) globalLock.set(sessionKey, true);
@@ -3213,8 +3257,6 @@ const memoryLanceDBProPlugin = {
         try {
           pruneReflectionSessionState();
           const action = String(event?.action || "unknown");
-          const context = (event.context || {}) as Record<string, unknown>;
-          const cfg = context.cfg;
           const workspaceDir = resolveWorkspaceDirFromContext(context);
           if (!cfg) {
             api.logger.warn(`memory-reflection: command:${action} missing cfg in hook context; skip reflection`);
@@ -3225,6 +3267,17 @@ const memoryLanceDBProPlugin = {
           const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
           let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
           const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
+          // Exclude agents/sessions listed in memoryReflection.excludeAgents (supports wildcards)
+          const excludePatterns = (cfg as Record<string, unknown> | undefined)?.memoryReflection
+            ? ((cfg as Record<string, unknown>).memoryReflection as Record<string, unknown>)?.excludeAgents as string[] | undefined
+            : undefined;
+          if (excludePatterns && isAgentOrSessionExcluded(sourceAgentId, sessionKey, excludePatterns)) {
+            api.logger.debug?.(
+              `memory-reflection: command hook skipped (excluded agent=${sourceAgentId}, sessionKey=${sessionKey ?? "(none)"})`,
+            );
+            return;
+          }
+
           const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
           api.logger.info(
             `memory-reflection: command:${action} hook start; sessionKey=${sessionKey || "(none)"}; source=${commandSource || "(unknown)"}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`
