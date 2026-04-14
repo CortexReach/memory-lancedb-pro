@@ -298,13 +298,16 @@ export class AccessTracker {
       );
       // Fire-and-forget final flush with a hard 3s timeout. Uses Promise.race
       // to guarantee we always clear pending/_retryCount even if flush hangs.
+      // Route through flush() to avoid concurrent write-backs with any in-flight flush.
       const flushWithTimeout = Promise.race([
-        this.doFlush(),
+        this.flush(),
         new Promise<void>((resolve) => setTimeout(resolve, 3_000)),
       ]);
       void flushWithTimeout.finally(() => {
         this.pending.clear();
         this._retryCount.clear();
+      }).catch(() => {
+        // Suppress unhandled rejection during shutdown.
       });
     } else {
       this.pending.clear();
