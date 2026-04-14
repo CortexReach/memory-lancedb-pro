@@ -1650,12 +1650,11 @@ function _dedupHookEvent(handlerName: string, event: any): boolean {
   if (_hookEventDedup.has(key)) return true; // duplicate — skip
   _hookEventDedup.add(key);
   if (_hookEventDedup.size > 200) {
-    // Prune oldest 100 entries to keep Set bounded
-    const iter = _hookEventDedup.values();
-    for (let i = 0; i < 100; i++) {
-      const v = iter.next();
-      if (!v.done) _hookEventDedup.delete(v.value);
-    }
+    // Keep newest 100: convert to array (preserves insertion order), slice last 100, clear, re-add
+    const arr = Array.from(_hookEventDedup);
+    const newest100 = arr.slice(-100);
+    _hookEventDedup.clear();
+    for (const k of newest100) _hookEventDedup.add(k);
   }
   return false; // first occurrence — proceed
 }
