@@ -198,7 +198,9 @@ export class MemoryStore {
   private table: LanceDB.Table | null = null;
   private initPromise: Promise<void> | null = null;
   private ftsIndexCreated = false;
-  private updateQueue: Promise<void> = Promise.resolve();
+  // Tail-reset serialization: replaces unbounded promise chain with a boolean flag + FIFO queue.
+  private _updating = false;
+  private _waitQueue: Array<() => void> = [];
 
   constructor(private readonly config: StoreConfig) { }
 
@@ -999,18 +1001,21 @@ export class MemoryStore {
   }
 
   private async runSerializedUpdate<T>(action: () => Promise<T>): Promise<T> {
-    const previous = this.updateQueue;
-    let release: (() => void) | undefined;
-    const lock = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.updateQueue = previous.then(() => lock);
-
-    await previous;
-    try {
-      return await action();
-    } finally {
-      release?.();
+    // Tail-reset: no infinite promise chain. Uses a boolean flag + FIFO queue.
+    if (!this._updating) {
+      this._updating = true;
+      try {
+        return await action();
+      } finally {
+        this._updating = false;
+        const next = this._waitQueue.shift();
+        if (next) next();
+      }
+    } else {
+      // Already busy — enqueue and wait for the current owner to signal done.
+      return new Promise<void>((resolve) => {
+        this._waitQueue.push(resolve);
+      }).then(() => this.runSerializedUpdate(action)) as Promise<T>;
     }
   }
 
