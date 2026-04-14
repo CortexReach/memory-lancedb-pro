@@ -11,6 +11,9 @@ import {
   mkdirSync,
   realpathSync,
   lstatSync,
+  rmSync,
+  statSync,
+  unlinkSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
@@ -154,7 +157,7 @@ export function validateStoragePath(dbPath: string): string {
     ) {
       throw err;
     } else {
-      // Other lstat failures — continue with original path
+      // Other lstat failures ??continue with original path
     }
   }
 
@@ -207,12 +210,28 @@ export class MemoryStore {
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
+
+    // Ensure lock file exists before locking (proper-lockfile requires it)
     if (!existsSync(lockPath)) {
       try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
       try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
     }
+
+    // Proactive cleanup of stale lock artifacts (fixes stale-lock ECOMPROMISED)
+    if (existsSync(lockPath)) {
+      try {
+        const stat = statSync(lockPath);
+        const ageMs = Date.now() - stat.mtimeMs;
+        const staleThresholdMs = 5 * 60 * 1000;
+        if (ageMs > staleThresholdMs) {
+          try { unlinkSync(lockPath); } catch {}
+          console.warn(`[memory-lancedb-pro] cleared stale lock: ${lockPath} ageMs=${ageMs}`);
+        }
+      } catch {}
+    }
+
     const release = await lockfile.lock(lockPath, {
-      retries: { retries: 5, factor: 2, minTimeout: 100, maxTimeout: 2000 },
+      retries: { retries: 10, factor: 2, minTimeout: 200, maxTimeout: 5000 },
       stale: 10000,
     });
     try { return await fn(); } finally { await release(); }
@@ -278,24 +297,24 @@ export class MemoryStore {
 
         if (missingColumns.length > 0) {
           console.warn(
-            `memory-lancedb-pro: migrating legacy table — adding columns: ${missingColumns.map((c) => c.name).join(", ")}`,
+            `memory-lancedb-pro: migrating legacy table ??adding columns: ${missingColumns.map((c) => c.name).join(", ")}`,
           );
           await table.addColumns(missingColumns);
           console.log(
-            `memory-lancedb-pro: migration complete — ${missingColumns.length} column(s) added`,
+            `memory-lancedb-pro: migration complete ??${missingColumns.length} column(s) added`,
           );
         }
       } catch (err) {
         const msg = String(err);
         if (msg.includes("already exists")) {
-          // Concurrent initialization race — another process already added the columns
+          // Concurrent initialization race ??another process already added the columns
           console.log("memory-lancedb-pro: migration columns already exist (concurrent init)");
         } else {
           console.warn("memory-lancedb-pro: could not check/migrate table schema:", err);
         }
       }
     } catch (_openErr) {
-      // Table doesn't exist yet — create it
+      // Table doesn't exist yet ??create it
       const schemaEntry: MemoryEntry = {
         id: "__schema__",
         text: "",
@@ -314,7 +333,7 @@ export class MemoryStore {
         await table.delete('id = "__schema__"');
       } catch (createErr) {
         // Race: another caller (or eventual consistency) created the table
-        // between our failed openTable and this createTable — just open it.
+        // between our failed openTable and this createTable ??just open it.
         if (String(createErr).includes("already exists")) {
           table = await db.openTable(TABLE_NAME);
         } else {
@@ -882,7 +901,7 @@ export class MemoryStore {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
-    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+    return this.runWithFileLock(async () => {
       // Support both full UUID and short prefix (8+ hex chars), same as delete()
       const uuidRegex =
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -997,7 +1016,7 @@ export class MemoryStore {
       }
 
       return updated;
-    }));
+    });
   }
 
   private async runSerializedUpdate<T>(action: () => Promise<T>): Promise<T> {
