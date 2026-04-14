@@ -1620,6 +1620,46 @@ const pluginVersion = getPluginVersion();
 // hook/tool registration for the new API instance" regression that rwmjhb identified.
 const _registeredApis = new WeakSet<OpenClawPluginApi>();
 
+// ============================================================================
+// Hook Event Deduplication (Phase 1)
+// ============================================================================
+//
+// OpenClaw calls register() once per scope init (5× at startup, 4× per inbound
+// message that triggers a scope cache-miss). Each call pushes handlers into the
+// global registerInternalHook Map. Without guarding, handlers accumulate
+// unboundedly — observed: 200+ duplicate handlers after hours of uptime.
+//
+// We cannot guard at registration time because clearInternalHooks() is called
+// between the first and subsequent register() calls. Guard at handler invocation
+// instead, keyed on (handlerName, sessionKey, timestamp).
+//
+
+/** Dedup guard: Set of already-processed hook event keys. */
+const _hookEventDedup = new Set<string>();
+
+/**
+ * Returns true if this event was already processed (skip), false if first
+ * occurrence (proceed). Automatically prunes Set when size > 200.
+ */
+function _dedupHookEvent(handlerName: string, event: any): boolean {
+  const sk = typeof event?.sessionKey === "string" ? event.sessionKey : "?";
+  const ts = event?.timestamp instanceof Date
+    ? event.timestamp.getTime()
+    : (typeof event?.timestamp === "number" ? event.timestamp : Date.now());
+  const key = `${handlerName}:${sk}:${ts}`;
+  if (_hookEventDedup.has(key)) return true; // duplicate — skip
+  _hookEventDedup.add(key);
+  if (_hookEventDedup.size > 200) {
+    // Prune oldest 100 entries to keep Set bounded
+    const iter = _hookEventDedup.values();
+    for (let i = 0; i < 100; i++) {
+      const v = iter.next();
+      if (!v.done) _hookEventDedup.delete(v.value);
+    }
+  }
+  return false; // first occurrence — proceed
+}
+
 const memoryLanceDBProPlugin = {
   id: "memory-lancedb-pro",
   name: "Memory (LanceDB Pro)",
@@ -2899,6 +2939,7 @@ const memoryLanceDBProPlugin = {
 
     if (config.selfImprovement?.enabled !== false) {
       api.registerHook("agent:bootstrap", async (event) => {
+        if (_dedupHookEvent("bootstrap", event)) return;
         try {
           const context = (event.context || {}) as Record<string, unknown>;
           const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
@@ -2942,6 +2983,7 @@ const memoryLanceDBProPlugin = {
 
       if (config.selfImprovement?.beforeResetNote !== false) {
         const appendSelfImprovementNote = async (event: any) => {
+          if (_dedupHookEvent("selfImprovement", event)) return;
           try {
             const action = String(event?.action || "unknown");
             const sessionKeyForLog = typeof event?.sessionKey === "string" ? event.sessionKey : "";
@@ -3191,6 +3233,7 @@ const memoryLanceDBProPlugin = {
       const SERIAL_GUARD_COOLDOWN_MS = 120_000; // 2 minutes cooldown per sessionKey
 
       const runMemoryReflection = async (event: any) => {
+        if (_dedupHookEvent("reflection", event)) return;
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
         // Guard against re-entrant calls for the same session (e.g. file-write triggering another command:new)
         // Uses global lock shared across all plugin instances to prevent loop amplification.
