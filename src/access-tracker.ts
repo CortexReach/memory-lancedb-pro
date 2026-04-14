@@ -213,6 +213,9 @@ export function computeEffectiveHalfLife(
  */
 export class AccessTracker {
   private readonly pending: Map<string, number> = new Map();
+  // Tracks retry count per ID so that delta is never amplified across failures.
+  private readonly _retryCount = new Map<string, number>();
+  private readonly _maxRetries = 5;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private flushPromise: Promise<void> | null = null;
   private readonly debounceMs: number;
@@ -291,10 +294,22 @@ export class AccessTracker {
     this.clearTimer();
     if (this.pending.size > 0) {
       this.logger.warn(
-        `access-tracker: destroying with ${this.pending.size} pending writes`,
+        `access-tracker: destroying with ${this.pending.size} pending writes — attempting final flush (3s timeout)`,
       );
+      // Fire-and-forget final flush with a hard 3s timeout. Uses Promise.race
+      // to guarantee we always clear pending/_retryCount even if flush hangs.
+      const flushWithTimeout = Promise.race([
+        this.doFlush(),
+        new Promise<void>((resolve) => setTimeout(resolve, 3_000)),
+      ]);
+      void flushWithTimeout.finally(() => {
+        this.pending.clear();
+        this._retryCount.clear();
+      });
+    } else {
+      this.pending.clear();
+      this._retryCount.clear();
     }
-    this.pending.clear();
   }
 
   // --------------------------------------------------------------------------
@@ -308,18 +323,33 @@ export class AccessTracker {
     for (const [id, delta] of batch) {
       try {
         const current = await this.store.getById(id);
-        if (!current) continue;
+        if (!current) {
+          // ID not found — memory was deleted or outside current scope.
+          // Do NOT retry or warn; just drop silently and clear any retry counter.
+          this._retryCount.delete(id);
+          continue;
+        }
 
         const updatedMeta = buildUpdatedMetadata(current.metadata, delta);
         await this.store.update(id, { metadata: updatedMeta });
+        this._retryCount.delete(id); // success — clear retry counter
       } catch (err) {
-        // Requeue failed delta for retry on next flush
-        const existing = this.pending.get(id) ?? 0;
-        this.pending.set(id, existing + delta);
-        this.logger.warn(
-          `access-tracker: write-back failed for ${id.slice(0, 8)}:`,
-          err,
-        );
+        const retryCount = (this._retryCount.get(id) ?? 0) + 1;
+        if (retryCount > this._maxRetries) {
+          // Exceeded max retries — drop and log error.
+          this._retryCount.delete(id);
+          this.logger.error(
+            `access-tracker: dropping ${id.slice(0, 8)} after ${retryCount} failed retries`,
+          );
+        } else {
+          this._retryCount.set(id, retryCount);
+          // Requeue with the original delta only (NOT accumulated) for next flush.
+          this.pending.set(id, delta);
+          this.logger.warn(
+            `access-tracker: write-back failed for ${id.slice(0, 8)} (attempt ${retryCount}/${this._maxRetries}):`,
+            err,
+          );
+        }
       }
     }
   }

@@ -42,11 +42,15 @@ interface QueryRecord {
 }
 
 export class RetrievalStatsCollector {
-  private _records: QueryRecord[] = [];
+  // Ring buffer: O(1) write, avoids O(n) Array.shift() GC pressure.
+  private _records: (QueryRecord | undefined)[] = [];
+  private _head = 0;    // next write position
+  private _count = 0;  // number of valid records
   private readonly _maxRecords: number;
 
   constructor(maxRecords = 1000) {
     this._maxRecords = maxRecords;
+    this._records = new Array(maxRecords);
   }
 
   /**
@@ -55,18 +59,31 @@ export class RetrievalStatsCollector {
    * @param source - Query source identifier (e.g. "manual", "auto-recall")
    */
   recordQuery(trace: RetrievalTrace, source: string): void {
-    this._records.push({ trace, source });
-    // Evict oldest if over capacity
-    if (this._records.length > this._maxRecords) {
-      this._records.shift();
+    this._records[this._head] = { trace, source };
+    this._head = (this._head + 1) % this._maxRecords;
+    if (this._count < this._maxRecords) {
+      this._count++;
     }
+  }
+
+  /** Return records in insertion order (oldest → newest). Used by getStats(). */
+  private _getRecords(): QueryRecord[] {
+    if (this._count === 0) return [];
+    const result: QueryRecord[] = [];
+    const start = this._count < this._maxRecords ? 0 : this._head;
+    for (let i = 0; i < this._count; i++) {
+      const rec = this._records[(start + i) % this._maxRecords];
+      if (rec !== undefined) result.push(rec);
+    }
+    return result;
   }
 
   /**
    * Compute aggregate statistics from all recorded queries.
    */
   getStats(): AggregateStats {
-    const n = this._records.length;
+    const records = this._getRecords();
+    const n = records.length;
     if (n === 0) {
       return {
         totalQueries: 0,
@@ -90,7 +107,7 @@ export class RetrievalStatsCollector {
     const queriesBySource: Record<string, number> = {};
     const dropsByStage: Record<string, number> = {};
 
-    for (const { trace, source } of this._records) {
+    for (const { trace, source } of records) {
       totalLatency += trace.totalMs;
       totalResults += trace.finalCount;
       latencies.push(trace.totalMs);
@@ -142,11 +159,13 @@ export class RetrievalStatsCollector {
    * Reset all collected statistics.
    */
   reset(): void {
-    this._records = [];
+    this._records = new Array(this._maxRecords);
+    this._head = 0;
+    this._count = 0;
   }
 
   /** Number of recorded queries. */
   get count(): number {
-    return this._records.length;
+    return this._count;
   }
 }
