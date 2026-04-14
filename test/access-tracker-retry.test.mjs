@@ -6,7 +6,8 @@
  * 2. Drops writes after maxRetries exceeded
  * 3. Handles new writes during retry correctly
  * 
- * Uses jiti to load TypeScript directly (same as cli-smoke.mjs)
+ * Precise delta verification: verifies final stored accessCount matches expected value.
+ * Formula: buildUpdatedMetadata adds delta to prev.accessCount (line 132 in access-tracker.ts)
  * 
  * Run: node test/access-tracker-retry.test.mjs
  */
@@ -14,7 +15,7 @@
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
-const { AccessTracker } = jiti("../src/access-tracker.ts");
+const { AccessTracker, parseAccessMetadata } = jiti("../src/access-tracker.ts");
 
 class MockStore {
   constructor(failUntil = 2) {
@@ -56,15 +57,13 @@ async function testRetryCountDoesNotAmplify() {
     logger: { warn: () => {} }
   });
   
-  // Record 3 accesses - this sets delta to 3
+  // Record 3 accesses - delta = 3
   tracker.recordAccess(["mem1", "mem1", "mem1"]);
   
-  // Get initial delta (should be 3)
   let pending = tracker.getPendingUpdates();
   let initialDelta = pending.get("mem1") ?? 0;
   console.log("Initial delta: " + initialDelta);
   
-  // First flush - will fail and retry
   await tracker.flush();
   await sleep(100);
   
@@ -72,7 +71,6 @@ async function testRetryCountDoesNotAmplify() {
   let deltaAfterFlush1 = pending.get("mem1") ?? 0;
   console.log("Delta after 1st flush failure: " + deltaAfterFlush1);
   
-  // Second flush - will fail and retry again
   await tracker.flush();
   await sleep(100);
   
@@ -80,13 +78,7 @@ async function testRetryCountDoesNotAmplify() {
   let deltaAfterFlush2 = pending.get("mem1") ?? 0;
   console.log("Delta after 2nd flush failure: " + deltaAfterFlush2);
   
-  // The fix uses separate _retryCount map, so pending delta should NOT accumulate
-  // It should stay at most 3 (original) - not grow to 6, 9, etc.
-  // With the fix, delta could be:
-  // - Still 3 (retry didn't add more)
-  // - Or 0 (if retry was treated as new operation)
-  // But it should NOT be 6, 9, etc.
-  
+  // Key assertion: delta should NOT grow beyond initial
   if (deltaAfterFlush2 > initialDelta) {
     console.error("FAIL: delta grew from " + initialDelta + " to " + deltaAfterFlush2 + " - delta amplified!");
     process.exit(1);
@@ -97,48 +89,65 @@ async function testRetryCountDoesNotAmplify() {
   return true;
 }
 
-async function testRetryWithNewWrites() {
-  console.log("Testing new writes during retry...");
+async function testRetryWithNewWrites_PreciseCount() {
+  console.log("Testing new writes during retry with PRECISE metadata count...");
   
-  const mockStore = new MockStore(2); // Fail twice, then succeed
+  // MockStore that fails twice then succeeds
+  const mockStore = new MockStore(2);
   const tracker = new AccessTracker({
     store: mockStore,
     logger: { warn: () => {}, error: () => {} }
   });
   
-  // Record initial access
+  // Pre-seed the memory so getById returns data (not null)
+  // This is required: access-tracker drops writes when memory doesn't exist yet
+  mockStore.data.set("memA", { metadata: JSON.stringify({ accessCount: 0, lastAccessedAt: 0 }) });
+  
+  // Step 1: Record 1 access
   tracker.recordAccess(["memA"]);
   
-  // First flush - fails, enters retry
+  // Step 2: First flush fails (failUntil=2, first failure)
   await tracker.flush();
   await sleep(50);
   
-  // While in retry state, record more accesses
-  tracker.recordAccess(["memA", "memA"]); // +2 more
-  
-  let pending = tracker.getPendingUpdates();
-  let deltaBeforeRetryResolves = pending.get("memA") ?? 0;
-  console.log("Delta during retry (before retry resolves): " + deltaBeforeRetryResolves);
-  
-  // Second flush - should fail again
+  // Step 3: Second flush fails (second failure)
   await tracker.flush();
   await sleep(50);
   
-  // Third flush - finally succeeds
+  // Step 4: While in retry state, record 2 more accesses
+  tracker.recordAccess(["memA", "memA"]);
+  
+  // Step 5: Third flush succeeds (failUntil exhausted)
+  await tracker.flush();
+  await sleep(50);
+  
+  // Step 6: Fourth flush (no new writes, verify stable)
   await tracker.flush();
   
-  pending = tracker.getPendingUpdates();
-  let deltaAfterSuccess = pending.get("memA") ?? 0;
-  console.log("Delta after successful flush: " + deltaAfterSuccess);
-  
-  // The key behavior: new writes during retry should be preserved
-  // They should NOT be lost due to retry logic
-  if (deltaAfterSuccess < 0) {
-    console.error("FAIL: new writes lost during retry");
+  // Key verification: Check final stored metadata accessCount
+  // Formula: newCount = prev.accessCount + accessDelta (access-tracker.ts:132)
+  // Initial: accessCount = 0
+  // Step 1: delta=1, accessCount = 0 + 1 = 1
+  // Step 4: delta=2, accessCount = 1 + 2 = 3
+  const stored = mockStore.data.get("memA");
+  if (!stored) {
+    console.error("FAIL: no data stored for memA");
     process.exit(1);
   }
   
-  console.log("PASS  new writes during retry preserved");
+  const metadata = typeof stored.metadata === "string" ? JSON.parse(stored.metadata) : stored.metadata;
+  const parsed = parseAccessMetadata(JSON.stringify(metadata));
+  const finalCount = parsed.accessCount;
+  
+  console.log("Final stored accessCount: " + finalCount);
+  
+  // Expected: 1 + 2 = 3
+  if (finalCount !== 3) {
+    console.error("FAIL: expected accessCount=3, got " + finalCount);
+    process.exit(1);
+  }
+  
+  console.log("PASS  precise metadata count verified: accessCount=3");
   tracker.destroy();
   return true;
 }
@@ -178,12 +187,12 @@ async function main() {
   
   try {
     await testRetryCountDoesNotAmplify();
-    await testRetryWithNewWrites();
+    await testRetryWithNewWrites_PreciseCount();
     await testMaxRetriesDrops();
     
     console.log("\n=== ALL TESTS PASSED ===");
     console.log("retry delta not amplify: OK");
-    console.log("new writes during retry: OK");
+    console.log("precise metadata count: OK");
     console.log("max retries drops: OK");
     process.exit(0);
   } catch (err) {
