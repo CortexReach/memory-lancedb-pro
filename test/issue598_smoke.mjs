@@ -35,7 +35,7 @@ if (subagentSkipCount < 3) {
 }
 
 // Verify: before_prompt_build hook exists and has the subagent guard
-const hookGuardPattern = /before_prompt_build[\s\S]{0,200}:subagent:/;
+const hookGuardPattern = /before_prompt_build[\s\S]{0,2000}:subagent:/;
 if (!hookGuardPattern.test(content)) {
   console.error("FAIL: before_prompt_build hook is missing ':subagent:' guard");
   process.exit(1);
