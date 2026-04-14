@@ -559,10 +559,20 @@ export class Embedder {
     if (!this._baseURL) {
       throw new Error("embedWithNativeFetch requires a baseURL");
     }
-    // Ollama's embeddings endpoint is at /v1/embeddings (OpenAI-compatible)
-    const endpoint = this._baseURL.replace(/\/$/, "") + "/embeddings";
+
+    // Fix for Ollama 0.20.5+: /v1/embeddings returns empty arrays for both `input` and `prompt`.
+    // Only /api/embeddings + `prompt` parameter works correctly.
+    // See: https://github.com/CortexReach/memory-lancedb-pro/issues/620
+    const base = this._baseURL.replace(/\/$/, "").replace(/\/v1$/, "");
+    const endpoint = base + "/api/embeddings";
 
     const apiKey = this.clients[0]?.apiKey ?? "ollama";
+
+    // Ollama's /api/embeddings requires "prompt" field, not "input"
+    const ollamaPayload = {
+      model: payload.model,
+      prompt: payload.input,
+    };
 
     const response = await fetch(endpoint, {
       method: "POST",
@@ -570,7 +580,7 @@ export class Embedder {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(ollamaPayload),
       signal: signal,
     });
 
@@ -580,7 +590,10 @@ export class Embedder {
     }
 
     const data = await response.json();
-    return data; // OpenAI-compatible shape: { data: [{ embedding: number[] }] }
+
+    // Ollama /api/embeddings returns { embedding: number[] },
+    // convert to OpenAI-compatible shape { data: [{ embedding: number[] }] }
+    return { data: [{ embedding: data.embedding }] };
   }
 
   /**
