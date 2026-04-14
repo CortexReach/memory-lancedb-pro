@@ -11,6 +11,9 @@ import {
   mkdirSync,
   realpathSync,
   lstatSync,
+  rmSync,
+  statSync,
+  unlinkSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
@@ -198,22 +201,53 @@ export class MemoryStore {
   private table: LanceDB.Table | null = null;
   private initPromise: Promise<void> | null = null;
   private ftsIndexCreated = false;
-  private updateQueue: Promise<void> = Promise.resolve();
+  private updateQueue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly config: StoreConfig) { }
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
-    const lockfile = await loadLockfile();
-    const lockPath = join(this.config.dbPath, ".memory-write.lock");
-    if (!existsSync(lockPath)) {
-      try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
-      try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
-    }
-    const release = await lockfile.lock(lockPath, {
-      retries: { retries: 5, factor: 2, minTimeout: 100, maxTimeout: 2000 },
-      stale: 10000,
+    const queued = this.updateQueue.catch(() => {}).then(async () => {
+      const lockfile = await loadLockfile();
+
+      try { mkdirSync(this.config.dbPath, { recursive: true }); } catch {}
+
+      const lockPath = join(this.config.dbPath, ".memory-write.lock");
+      const staleThresholdMs = 5 * 60 * 1000;
+
+      // Proactive cleanup of stale lock artifacts (legacy fallback)
+      if (existsSync(lockPath)) {
+        try {
+          const stat = statSync(lockPath);
+          const ageMs = Date.now() - stat.mtimeMs;
+
+          if (ageMs > staleThresholdMs) {
+            if (stat.isDirectory()) {
+              rmSync(lockPath, { recursive: true, force: true });
+            } else {
+              unlinkSync(lockPath);
+            }
+            console.warn(`[memory-lancedb-pro] cleared stale lock artifact: ${lockPath} ageMs=${ageMs}`);
+          }
+        } catch (err) {
+          console.warn(`[memory-lancedb-pro] failed to inspect/clear stale lock artifact: ${lockPath} err=${String(err)}`);
+        }
+      }
+
+      const release = await lockfile.lock(this.config.dbPath, {
+        lockfilePath: lockPath,
+        retries: { retries: 10, factor: 2, minTimeout: 200, maxTimeout: 5000 },
+        stale: 10000,
+      });
+
+      try {
+        return await fn();
+      } finally {
+        await release();
+      }
     });
-    try { return await fn(); } finally { await release(); }
+
+    this.updateQueue = queued.catch(() => {});
+    return queued;
   }
 
   get dbPath(): string {
@@ -880,7 +914,7 @@ export class MemoryStore {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
-    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+    return this.runWithFileLock(async () => {
       // Support both full UUID and short prefix (8+ hex chars), same as delete()
       const uuidRegex =
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -995,7 +1029,7 @@ export class MemoryStore {
       }
 
       return updated;
-    }));
+    });
   }
 
   private async runSerializedUpdate<T>(action: () => Promise<T>): Promise<T> {
