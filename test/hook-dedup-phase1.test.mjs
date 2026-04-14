@@ -187,6 +187,45 @@ describe('Phase 1: Handler guard placement', () => {
     assert.ok(dedupState._hookEventDedup.has('reflection:agent:main:test:1000'));
   });
 
+  // --- selfImprovement mock: messages array check before dedup ---
+  function mockSelfImprovement(event, dedupState) {
+    if (!Array.isArray(event?.messages)) return 'SKIP_no_messages';
+    if (dedupState._dedupHookEvent('selfImprovement', event)) return 'SKIP_dedup';
+    return 'PROCEED';
+  }
+
+  it('selfImprovement: missing messages skipped — does NOT pollute dedup', () => {
+    const dedupState = createDedupState();
+    // messages is undefined
+    const r1 = mockSelfImprovement({ sessionKey: 'agent:main:test', timestamp: 1000 }, dedupState);
+    assert.strictEqual(r1, 'SKIP_no_messages');
+    assert.strictEqual(dedupState._hookEventDedup.size, 0, 'Missing messages must not pollute dedup');
+  });
+
+  it('selfImprovement: non-array messages skipped — does NOT pollute dedup', () => {
+    const dedupState = createDedupState();
+    // messages is a string (not an array)
+    const r1 = mockSelfImprovement({ sessionKey: 'agent:main:test', timestamp: 1000, messages: 'not an array' }, dedupState);
+    assert.strictEqual(r1, 'SKIP_no_messages');
+    assert.strictEqual(dedupState._hookEventDedup.size, 0, 'Non-array messages must not pollute dedup');
+  });
+
+  it('selfImprovement: valid messages proceeds', () => {
+    const dedupState = createDedupState();
+    const event = { sessionKey: 'agent:main:test', timestamp: 1000, messages: ['hello'] };
+    const r = mockSelfImprovement(event, dedupState);
+    assert.strictEqual(r, 'PROCEED');
+    assert.ok(dedupState._hookEventDedup.has('selfImprovement:agent:main:test:1000'));
+  });
+
+  it('selfImprovement: missing(skipped) then valid same ts — valid proceeds', () => {
+    const dedupState = createDedupState();
+    mockSelfImprovement({ sessionKey: 'agent:main:test', timestamp: 1000 }, dedupState);
+    // Missing was skipped before dedup, valid key is not duplicate of missing
+    const r = mockSelfImprovement({ sessionKey: 'agent:main:test', timestamp: 1000, messages: ['hi'] }, dedupState);
+    assert.strictEqual(r, 'PROCEED', 'Missing was skipped, valid key is not duplicate');
+  });
+
   it('reflection: empty(skipped) then valid same ts — valid proceeds', () => {
     const dedupState = createDedupState();
     mockReflection({ sessionKey: '', timestamp: 1000 }, dedupState);
