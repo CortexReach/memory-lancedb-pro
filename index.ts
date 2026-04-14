@@ -2222,7 +2222,7 @@ const memoryLanceDBProPlugin = {
       const AUTO_RECALL_TIMEOUT_MS = parsePositiveInt(config.autoRecallTimeoutMs) ?? 5_000; // configurable; default raised from 3s to 5s for remote embedding APIs behind proxies
       api.on("before_prompt_build", async (event: any, ctx: any) => {
         // Skip auto-recall for sub-agent sessions — their context comes from the parent.
-        const sessionKey = typeof ctx?.sessionKey === "string" ? ctx.sessionKey : "";
+        const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (sessionKey.includes(":subagent:")) return;
 
         // Per-agent exclusion: skip auto-recall for agents in the exclusion list.
