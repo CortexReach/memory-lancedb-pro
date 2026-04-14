@@ -927,7 +927,7 @@ describe("recall text cleanup", () => {
 
   // --- PR #602: recall prefix format tests ---
 
-  function makeAutoRecallHarness(workspaceDir, mockResults) {
+  function makeAutoRecallHarness(workspaceDir, mockResults, extraConfig = {}) {
     const retrieverMod = jiti("../src/retriever.js");
     retrieverMod.createRetriever = function mockCreateRetriever() {
       return {
@@ -954,6 +954,7 @@ describe("recall text cleanup", () => {
         autoRecall: true,
         autoRecallMinLength: 1,
         selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+        ...extraConfig,
       },
     });
     memoryLanceDBProPlugin.register(harness.api);
@@ -961,7 +962,7 @@ describe("recall text cleanup", () => {
     return autoRecallHook;
   }
 
-  it("uses folder name as display category when category is 'other' (Apple Notes import)", async () => {
+  it("uses configured categoryField as display category when field is present in metadata", async () => {
     const ts = new Date("2024-05-30T00:00:00.000Z").getTime();
     const hook = makeAutoRecallHarness(workspaceDir, [
       {
@@ -972,13 +973,12 @@ describe("recall text cleanup", () => {
           scope: "global",
           importance: 0.8,
           timestamp: ts,
-          // "manual" is a recognized MemorySource; "apple_notes" would be normalized to "legacy"
           metadata: JSON.stringify({ folder: "Goals", source: "manual" }),
         },
         score: 0.9,
         sources: { vector: { score: 0.9, rank: 1 } },
       },
-    ]);
+    ], { recallPrefix: { categoryField: "folder" } });
 
     const output = await hook(
       { prompt: "What are my goals?" },
@@ -986,7 +986,7 @@ describe("recall text cleanup", () => {
     );
 
     assert.ok(output, "expected recall output");
-    // Folder name replaces "other" in the category position of the prefix
+    // metadata.folder replaces the built-in category in the prefix
     assert.match(output.prependContext, /\[Goals:/);
     assert.doesNotMatch(output.prependContext, /\[other:/);
     // Date is appended from timestamp
@@ -995,7 +995,7 @@ describe("recall text cleanup", () => {
     assert.match(output.prependContext, /\(manual\)/);
   });
 
-  it("does not apply folder override for entries without category 'other'", async () => {
+  it("falls back to built-in category when categoryField is configured but absent from metadata", async () => {
     const hook = makeAutoRecallHarness(workspaceDir, [
       {
         entry: {
@@ -1009,20 +1009,47 @@ describe("recall text cleanup", () => {
         score: 0.85,
         sources: { vector: { score: 0.85, rank: 1 } },
       },
-    ]);
+    ], { recallPrefix: { categoryField: "folder" } });
 
     const output = await hook(
       { prompt: "What are my preferences?" },
-      { sessionId: "no-metadata-test", sessionKey: "agent:main:session:no-metadata-test", agentId: "main" },
+      { sessionId: "no-folder-test", sessionKey: "agent:main:session:no-folder-test", agentId: "main" },
     );
 
     assert.ok(output, "expected recall output");
-    // Content is present
     assert.match(output.prependContext, /prefer short commit messages/);
-    // Category-based prefix is present (parseSmartMetadata maps "preference" → "preferences")
+    // Falls back to built-in category (parseSmartMetadata maps "preference" → "preferences")
     assert.match(output.prependContext, /\[preferences:global\]/);
-    // No folder override was applied (no folder in metadata, not "other" category)
     assert.doesNotMatch(output.prependContext, /\[Goals:/);
+  });
+
+  it("uses built-in category unchanged when recallPrefix.categoryField is not configured", async () => {
+    const hook = makeAutoRecallHarness(workspaceDir, [
+      {
+        entry: {
+          id: "default-1",
+          text: "prefer short commit messages",
+          category: "preference",
+          scope: "global",
+          importance: 0.7,
+          timestamp: Date.now(),
+          metadata: JSON.stringify({ folder: "Preferences", source: "manual" }),
+        },
+        score: 0.85,
+        sources: { vector: { score: 0.85, rank: 1 } },
+      },
+    ]); // no recallPrefix config
+
+    const output = await hook(
+      { prompt: "What are my preferences?" },
+      { sessionId: "default-prefix-test", sessionKey: "agent:main:session:default-prefix-test", agentId: "main" },
+    );
+
+    assert.ok(output, "expected recall output");
+    assert.match(output.prependContext, /prefer short commit messages/);
+    // No categoryField configured — folder is ignored, built-in category used
+    assert.match(output.prependContext, /\[preferences:global\]/);
+    assert.doesNotMatch(output.prependContext, /\[Preferences:/);
   });
 
   it("includes tier prefix in recall line when tier metadata is present", async () => {

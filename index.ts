@@ -225,6 +225,26 @@ interface PluginConfig {
     skipLowValue?: boolean;
     maxExtractionsPerHour?: number;
   };
+  recallPrefix?: {
+    /**
+     * Metadata field to use as the category label in auto-recall prefix lines.
+     * When set, the value of `metadata[categoryField]` replaces the built-in
+     * category in the `[category:scope]` prefix — if the field is present on
+     * the entry. Falls back to the built-in category when the field is absent.
+     *
+     * Useful for import-based workflows where entries carry a meaningful
+     * grouping label in a custom metadata field (e.g. "folder" for Apple Notes
+     * imports, "notebook" for Notion, "collection" for Obsidian).
+     *
+     * Default: unset — built-in category is used for all entries.
+     *
+     * @example
+     * recallPrefix: { categoryField: "folder" }
+     * // Entry with metadata.folder = "Goals" → prefix: [W][Goals:global]
+     * // Entry without metadata.folder       → prefix: [W][preference:global]
+     */
+    categoryField?: string;
+  };
 }
 
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
@@ -2400,15 +2420,26 @@ const memoryLanceDBProPlugin = {
             return {
               id: r.entry.id,
               prefix: (() => {
-                // When the raw stored category is "other" and a folder name is available
-                // (e.g. Apple Notes import), use the folder name as the display category
-                // so the prefix is meaningful instead of showing "[other:...]".
-                // We check r.entry.category (not displayCategory) because parseSmartMetadata
-                // always enriches "other" to a semantic category via reverseMapLegacyCategory.
-                const effectiveCategory =
-                  r.entry.category === "other" && metaObj.folder
-                    ? metaObj.folder
-                    : displayCategory;
+                // If recallPrefix.categoryField is configured, read that field directly
+                // from the raw metadata JSON and use it as the category label when present.
+                // Falls back to displayCategory when the field is absent or unset.
+                // Reading from raw JSON (not metaObj) avoids relying on parseSmartMetadata
+                // passing through unknown fields.
+                const categoryFieldName = config.recallPrefix?.categoryField;
+                let effectiveCategory = displayCategory;
+                if (categoryFieldName) {
+                  try {
+                    const rawMeta: Record<string, unknown> = r.entry.metadata
+                      ? (JSON.parse(r.entry.metadata) as Record<string, unknown>)
+                      : {};
+                    const fieldValue = rawMeta[categoryFieldName];
+                    if (typeof fieldValue === "string" && fieldValue) {
+                      effectiveCategory = fieldValue;
+                    }
+                  } catch {
+                    // malformed metadata — keep displayCategory
+                  }
+                }
                 const base = `${tierPrefix}[${effectiveCategory}:${r.entry.scope}]`;
                 const parts: string[] = [base];
                 if (r.entry.timestamp)
@@ -4061,6 +4092,15 @@ export function parsePluginConfig(value: unknown): PluginConfig {
                 : 30,
           }
         : { skipLowValue: false, maxExtractionsPerHour: 30 },
+    recallPrefix:
+      typeof cfg.recallPrefix === "object" && cfg.recallPrefix !== null
+        ? {
+            categoryField:
+              typeof (cfg.recallPrefix as Record<string, unknown>).categoryField === "string"
+                ? ((cfg.recallPrefix as Record<string, unknown>).categoryField as string)
+                : undefined,
+          }
+        : undefined,
   };
 }
 
