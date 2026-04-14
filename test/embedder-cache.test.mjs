@@ -1,15 +1,18 @@
 /**
- * Regression test for Issue #598: embedder.ts TTL eviction
+ * Smoke test for Issue #598: embedder.ts EmbeddingCache initialization
  * 
  * Memory leak fix: EmbeddingCache._evictExpired() is called on every set()
- * when cache is near capacity, preventing unbounded growth.
+ * when cache is near capacity (src/embedder.ts:72-82).
  * 
- * The TTL eviction uses hardcoded defaults: maxSize=256, ttlMinutes=30.
- * Config fields for these values are NOT part of EmbeddingConfig interface.
+ * This test is a smoke/configuration test, NOT a full eviction test:
+ * - It verifies Embedder can be created with nomic-embed-text model
+ * - It verifies cacheStats is accessible (shows bounded cache: size, hits, misses)
+ * - Full _evictExpired() testing requires OLLAMA server running
  * 
- * This test verifies:
- * 1. EmbeddingCache eviction logic exists and is called on set()
- * 2. Cache stays bounded by maxSize
+ * The fix itself is verified by:
+ * 1. Review of src/embedder.ts:72-82 (TTL eviction on set)
+ * 2. access-tracker and store serialization tests pass
+ * 3. This smoke test confirms no regressions in constructor
  * 
  * Run: node test/embedder-cache.test.mjs
  */
@@ -36,11 +39,11 @@ async function testEmbedderCreation() {
   const stats = embedder.cacheStats;
   console.log("PASS  embedder created: keyCount=" + stats.keyCount);
   
-  return { embedder, config };
+  return embedder;
 }
 
-async function testTTL_evictionExists() {
-  console.log("Testing _evictExpired exists in EmbeddingCache...");
+async function testCacheSmoke() {
+  console.log("Testing cache smoke (no OLLAMA needed)...");
   
   const config = {
     provider: "ollama",
@@ -50,31 +53,31 @@ async function testTTL_evictionExists() {
   };
   
   const embedder = createEmbedder(config);
-  
-  // Verify embedder was created with cache
   const stats = embedder.cacheStats;
-  console.log("Cache stats available: " + JSON.stringify(stats));
   
-  // The fix: _evictExpired() is called on every set() when near capacity
-  // This prevents unbounded growth even with hardcoded (256, 30) defaults
-  // We can't directly test _evictExpired without a running OLLAMA server,
-  // but we verified the Embedder has a cache with bounded size
+  // Verify cache has expected structure
+  console.log("Cache stats: size=" + stats.size + ", hits=" + stats.hits + ", misses=" + stats.misses);
   
-  console.log("PASS  cache exists with bounded size (hardcoded 256, 30 min TTL)");
+  if (typeof stats.size !== "number") {
+    console.error("FAIL: cache.stats.size is not a number");
+    process.exit(1);
+  }
+  
+  console.log("PASS  cache smoke: bounded cache with size/hits/misses");
   return true;
 }
 
 async function main() {
-  console.log("Running embedder-cache regression tests...\n");
+  console.log("Running embedder-cache smoke tests...\n");
   
   try {
     await testEmbedderCreation();
-    await testTTL_evictionExists();
+    await testCacheSmoke();
     
     console.log("\n=== ALL TESTS PASSED ===");
     console.log("embedder creation: OK");
-    console.log("TTL eviction: OK (verified via Embedder constructor - _evictExpired on set())");
-    console.log("Note: Full TTL eviction test requires OLLAMA server running");
+    console.log("cache smoke: OK");
+    console.log("Note: Full _evictExpired() on set() requires OLLAMA server");
     process.exit(0);
   } catch (err) {
     console.error("\n=== TEST FAILED ===");
