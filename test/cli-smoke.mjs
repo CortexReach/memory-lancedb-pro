@@ -300,7 +300,6 @@ async function runCliSmoke() {
     },
     store: {
       async patchMetadata() {},
-      async count() { return 1; },
     },
     scopeManager: {
       getAccessibleScopes() {
