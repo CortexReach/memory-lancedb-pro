@@ -2939,19 +2939,16 @@ const memoryLanceDBProPlugin = {
 
     if (config.selfImprovement?.enabled !== false) {
       api.registerHook("agent:bootstrap", async (event) => {
+        const context = (event.context || {}) as Record<string, unknown>;
+        const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
+
+        // Validation BEFORE dedup — invalid sessions must NOT pollute the dedup set
+        if (isInternalReflectionSessionKey(sessionKey)) { return; }
+        if (config.selfImprovement?.skipSubagentBootstrap !== false && sessionKey.includes(":subagent:")) { return; }
+
         if (_dedupHookEvent("bootstrap", event)) return;
         try {
-          const context = (event.context || {}) as Record<string, unknown>;
-          const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
           const workspaceDir = resolveWorkspaceDirFromContext(context);
-
-          if (isInternalReflectionSessionKey(sessionKey)) {
-            return;
-          }
-
-          if (config.selfImprovement?.skipSubagentBootstrap !== false && sessionKey.includes(":subagent:")) {
-            return;
-          }
 
           if (config.selfImprovement?.ensureLearningFiles !== false) {
             await ensureSelfImprovementLearningFiles(workspaceDir);
@@ -2983,7 +2980,14 @@ const memoryLanceDBProPlugin = {
 
       if (config.selfImprovement?.beforeResetNote !== false) {
         const appendSelfImprovementNote = async (event: any) => {
+          // Basic validation BEFORE dedup — skip events that will legitimately return anyway
+          if (!Array.isArray(event.messages)) {
+            api.logger.warn(`self-improvement: command:${String(event?.action || "unknown")} missing event.messages array; skip note inject`);
+            return;
+          }
+
           if (_dedupHookEvent("selfImprovement", event)) return;
+
           try {
             const action = String(event?.action || "unknown");
             const sessionKeyForLog = typeof event?.sessionKey === "string" ? event.sessionKey : "";
@@ -2995,11 +2999,6 @@ const memoryLanceDBProPlugin = {
             api.logger.info(
               `self-improvement: command:${action} hook start; sessionKey=${sessionKeyForLog || "(none)"}; source=${commandSource || "(unknown)"}; hasMessages=${Array.isArray(event?.messages)}; contextKeys=${contextKeys || "(none)"}`
             );
-
-            if (!Array.isArray(event.messages)) {
-              api.logger.warn(`self-improvement: command:${action} missing event.messages array; skip note inject`);
-              return;
-            }
 
             // Skip self-improvement note on Discord channel (non-thread) resets
             // to avoid contributing to the post-reset startup race on Discord channels.
@@ -3233,8 +3232,15 @@ const memoryLanceDBProPlugin = {
       const SERIAL_GUARD_COOLDOWN_MS = 120_000; // 2 minutes cooldown per sessionKey
 
       const runMemoryReflection = async (event: any) => {
-        if (_dedupHookEvent("reflection", event)) return;
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
+
+        // Validate sessionKey BEFORE dedup — invalid/empty keys must NOT pollute the dedup set
+        if (!sessionKey) {
+          // skip events without a valid sessionKey — they are not meaningful for reflection
+          return;
+        }
+
+        if (_dedupHookEvent("reflection", event)) return;
         // Guard against re-entrant calls for the same session (e.g. file-write triggering another command:new)
         // Uses global lock shared across all plugin instances to prevent loop amplification.
         const globalLock = getGlobalReflectionLock();
