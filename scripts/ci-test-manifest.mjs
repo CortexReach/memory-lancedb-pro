@@ -41,6 +41,10 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/preference-slots.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/is-latest-auto-supersede.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/temporal-awareness.test.mjs", args: ["--test"] },
+  // Issue #598 regression tests
+  { group: "core-regression", runner: "node", file: "test/store-serialization.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/access-tracker-retry.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/embedder-cache.test.mjs" },
 ];
 
 export function getEntriesForGroup(group) {
