@@ -338,7 +338,7 @@ export class AccessTracker {
         if (retryCount > this._maxRetries) {
           // Exceeded max retries — drop and log error.
           this._retryCount.delete(id);
-          this.logger.error(
+          this.logger.error?.(
             `access-tracker: dropping ${id.slice(0, 8)} after ${retryCount} failed retries`,
           );
         } else {
