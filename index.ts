@@ -2399,7 +2399,23 @@ const memoryLanceDBProPlugin = {
             const summary = sanitizeForContext(contentText).slice(0, effectivePerItemMaxChars);
             return {
               id: r.entry.id,
-              prefix: (() => { const f = metaObj.folder ? `[${metaObj.folder}]` : ""; const s = metaObj.source ? `(${metaObj.source})` : ""; const d = r.entry.timestamp ? new Date(r.entry.timestamp).toISOString().slice(0, 10) : ""; return `${f} ${d} ${s}`.trim(); })(),
+              prefix: (() => {
+                // When the raw stored category is "other" and a folder name is available
+                // (e.g. Apple Notes import), use the folder name as the display category
+                // so the prefix is meaningful instead of showing "[other:...]".
+                // We check r.entry.category (not displayCategory) because parseSmartMetadata
+                // always enriches "other" to a semantic category via reverseMapLegacyCategory.
+                const effectiveCategory =
+                  r.entry.category === "other" && metaObj.folder
+                    ? metaObj.folder
+                    : displayCategory;
+                const base = `${tierPrefix}[${effectiveCategory}:${r.entry.scope}]`;
+                const parts: string[] = [base];
+                if (r.entry.timestamp)
+                  parts.push(new Date(r.entry.timestamp).toISOString().slice(0, 10));
+                if (metaObj.source) parts.push(`(${metaObj.source})`);
+                return parts.join(" ");
+              })(),
               summary,
               chars: summary.length,
               meta: metaObj,

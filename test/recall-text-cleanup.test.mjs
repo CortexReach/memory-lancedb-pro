@@ -924,5 +924,149 @@ describe("recall text cleanup", () => {
     assert.equal(res.details.memories.length, 3);
     assert.match(res.content[0].text, /称呼偏好：宙斯/);
   });
+
+  // --- PR #602: recall prefix format tests ---
+
+  function makeAutoRecallHarness(workspaceDir, mockResults) {
+    const retrieverMod = jiti("../src/retriever.js");
+    retrieverMod.createRetriever = function mockCreateRetriever() {
+      return {
+        async retrieve() { return mockResults; },
+        getConfig() { return { mode: "hybrid" }; },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+    const embedderMod = jiti("../src/embedder.js");
+    embedderMod.createEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() { return new Float32Array(384).fill(0); },
+        async embedPassage() { return new Float32Array(384).fill(0); },
+      };
+    };
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: true,
+        autoRecallMinLength: 1,
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    const [{ handler: autoRecallHook }] = harness.eventHandlers.get("before_prompt_build") || [];
+    return autoRecallHook;
+  }
+
+  it("uses folder name as display category when category is 'other' (Apple Notes import)", async () => {
+    const ts = new Date("2024-05-30T00:00:00.000Z").getTime();
+    const hook = makeAutoRecallHarness(workspaceDir, [
+      {
+        entry: {
+          id: "apple-1",
+          text: "reach revenue goal of $1M ARR by end of 2025",
+          category: "other",
+          scope: "global",
+          importance: 0.8,
+          timestamp: ts,
+          // "manual" is a recognized MemorySource; "apple_notes" would be normalized to "legacy"
+          metadata: JSON.stringify({ folder: "Goals", source: "manual" }),
+        },
+        score: 0.9,
+        sources: { vector: { score: 0.9, rank: 1 } },
+      },
+    ]);
+
+    const output = await hook(
+      { prompt: "What are my goals?" },
+      { sessionId: "apple-prefix-test", sessionKey: "agent:main:session:apple-prefix-test", agentId: "main" },
+    );
+
+    assert.ok(output, "expected recall output");
+    // Folder name replaces "other" in the category position of the prefix
+    assert.match(output.prependContext, /\[Goals:/);
+    assert.doesNotMatch(output.prependContext, /\[other:/);
+    // Date is appended from timestamp
+    assert.match(output.prependContext, /2024-05-30/);
+    // Source suffix is present
+    assert.match(output.prependContext, /\(manual\)/);
+  });
+
+  it("does not apply folder override for entries without category 'other'", async () => {
+    const hook = makeAutoRecallHarness(workspaceDir, [
+      {
+        entry: {
+          id: "plain-1",
+          text: "prefer short commit messages",
+          category: "preference",
+          scope: "global",
+          importance: 0.7,
+          timestamp: Date.now(),
+        },
+        score: 0.85,
+        sources: { vector: { score: 0.85, rank: 1 } },
+      },
+    ]);
+
+    const output = await hook(
+      { prompt: "What are my preferences?" },
+      { sessionId: "no-metadata-test", sessionKey: "agent:main:session:no-metadata-test", agentId: "main" },
+    );
+
+    assert.ok(output, "expected recall output");
+    // Content is present
+    assert.match(output.prependContext, /prefer short commit messages/);
+    // Category-based prefix is present (parseSmartMetadata maps "preference" → "preferences")
+    assert.match(output.prependContext, /\[preferences:global\]/);
+    // No folder override was applied (no folder in metadata, not "other" category)
+    assert.doesNotMatch(output.prependContext, /\[Goals:/);
+  });
+
+  it("includes tier prefix in recall line when tier metadata is present", async () => {
+    const hook = makeAutoRecallHarness(workspaceDir, [
+      {
+        entry: {
+          id: "tiered-1",
+          text: "always use absolute imports",
+          category: "fact",
+          scope: "global",
+          importance: 0.9,
+          timestamp: Date.now(),
+          metadata: JSON.stringify({ tier: "l1" }),
+        },
+        score: 0.88,
+        sources: { vector: { score: 0.88, rank: 1 } },
+      },
+      {
+        entry: {
+          id: "tiered-2",
+          text: "prefer TypeScript strict mode",
+          category: "preference",
+          scope: "global",
+          importance: 0.85,
+          timestamp: Date.now(),
+          metadata: JSON.stringify({ tier: "l2" }),
+        },
+        score: 0.82,
+        sources: { vector: { score: 0.82, rank: 2 } },
+      },
+    ]);
+
+    const output = await hook(
+      { prompt: "What are my coding preferences?" },
+      { sessionId: "tier-prefix-test", sessionKey: "agent:main:session:tier-prefix-test", agentId: "main" },
+    );
+
+    assert.ok(output, "expected recall output");
+    // Both entries should have a tier prefix (first char of tier, uppercased, in brackets)
+    const lines = output.prependContext.split("\n").filter((l) => l.startsWith("- ["));
+    assert.ok(lines.length >= 2, "expected at least 2 recall lines");
+    for (const line of lines) {
+      assert.match(line, /^- \[[A-Z]\]\[/, "recall line should start with tier prefix [X][");
+    }
+  });
 });
 
