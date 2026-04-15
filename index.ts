@@ -780,6 +780,9 @@ function shouldSkipReflectionMessage(role: string, text: string): boolean {
 }
 
 const AUTO_CAPTURE_MAP_MAX_ENTRIES = 2000;
+// Maximum number of recent texts kept in the pending-ingress and recent-texts windows.
+// Must stay in sync with the threshold cap AUTO_CAPTURE_PENDING_WINDOW.
+const AUTO_CAPTURE_PENDING_WINDOW = 6;
 const AUTO_CAPTURE_EXPLICIT_REMEMBER_RE =
   /^(?:请|請)?(?:记住|記住|记一下|記一下|别忘了|別忘了)[。.!?？!]*$/u;
 
@@ -2202,7 +2205,7 @@ const memoryLanceDBProPlugin = {
         const MAX_MESSAGE_LENGTH = 5000;
         const queue = autoCapturePendingIngressTexts.get(conversationKey) || [];
         queue.push(normalized.slice(0, MAX_MESSAGE_LENGTH));
-        autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
+        autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-AUTO_CAPTURE_PENDING_WINDOW));
         pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
       }
       api.logger.debug(
@@ -2846,7 +2849,7 @@ const memoryLanceDBProPlugin = {
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
           }
-          const currentCumulativeCount = previousSeenCount + eligibleTexts.length;
+          const currentCumulativeCount = previousSeenCount + newTexts.length;
           autoCaptureSeenTextCount.set(sessionKey, currentCumulativeCount);
           pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
 
@@ -2857,13 +2860,13 @@ const memoryLanceDBProPlugin = {
           // so texts.length === 1 guard can never trigger.
           // This guard was designed for the old APPEND strategy and is obsolete.
           if (newTexts.length > 0) {
-            const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
+            const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-AUTO_CAPTURE_PENDING_WINDOW);
             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
           // [Fix #6] Cap extractMinMessages to prevent misconfiguration
-          const minMessages = Math.min(config.extractMinMessages ?? 4, 100);
+          const minMessages = Math.min(config.extractMinMessages ?? 4, AUTO_CAPTURE_PENDING_WINDOW);
           if (skippedAutoCaptureTexts > 0) {
             api.logger.debug(
               `memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`,
