@@ -1,28 +1,31 @@
 /**
  * Test: toImportSpecifier and Windows path fallback
- * PR #576 - Windows APPDATA path fallback for extensionAPI.js
+ * PR #593 - Windows path support for extensionAPI.js
  *
- * Tests the behavior of `toImportSpecifier` and `getExtensionApiImportSpecifiers`
- * using local implementations that mirror the PR #576 code exactly.
- * Functions are NOT exported from index.ts, so we copy the logic to test it.
+ * Tests the behavior of `toImportSpecifier` and `getExtensionApiImportSpecifiers`.
+ * toImportSpecifier is imported from index.ts; getExtensionApiImportSpecifiers
+ * is a local copy that mirrors the PR #593 implementation (internal, not exported).
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import jitiFactory from "jiti";
 
-// Copy of the PR #576 toImportSpecifier implementation (index.ts:414-423)
-function toImportSpecifier(value) {
-  const trimmed = value.trim();
-  if (!trimmed) return "";
-  if (trimmed.startsWith("file://")) return trimmed;
-  if (trimmed.startsWith("/")) return pathToFileURL(trimmed).href;
-  // Handle Windows absolute paths (e.g. C:\Users\... or D:/Program Files/...)
-  if (/^[a-zA-Z]:[/\\]/.test(trimmed)) return pathToFileURL(trimmed).href;
-  return trimmed;
-}
+const testDir = path.dirname(fileURLToPath(import.meta.url));
+const pluginSdkStubPath = path.resolve(testDir, "helpers", "openclaw-plugin-sdk-stub.mjs");
+const jitiLib = jitiFactory(import.meta.url, {
+  interopDefault: true,
+  alias: {
+    "openclaw/plugin-sdk": pluginSdkStubPath,
+  },
+});
 
-// Copy of the PR #576 getExtensionApiImportSpecifiers implementation (index.ts:425-444)
+// Import the actual toImportSpecifier from index.ts via jiti (exported for testing) — PR #593
+const { toImportSpecifier } = jitiLib("../index.ts");
+
+// Copy of the PR #593 getExtensionApiImportSpecifiers implementation (index.ts)
 // Note: intentionally does NOT include the requireFromHere.resolve() call (dead code)
 function getExtensionApiImportSpecifiers() {
   const envPath = process.env.OPENCLAW_EXTENSION_API_PATH?.trim();
@@ -79,38 +82,41 @@ describe("toImportSpecifier", () => {
     assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
   });
 
-  // --- Windows paths (PR #576 new fix) ---
-  it("converts Windows drive-letter backslash path to file:// URL", () => {
-    const result = toImportSpecifier("C:\\Users\\admin\\AppData\\Roaming\\npm\\node_modules\\openclaw\\dist\\extensionAPI.js");
-    assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
-    assert.ok(result.includes("C:/"), `Expected C:/ prefix, got: ${result}`);
-  });
+  // --- Windows paths (PR #593) ---
+  // --- Windows paths (PR #593) - skip on non-Windows ---
+  if (process.platform === "win32") {
+    it("converts Windows drive-letter backslash path to file:// URL", () => {
+      const result = toImportSpecifier("C:\\Users\\admin\\AppData\\Roaming\\npm\\node_modules\\openclaw\\dist\\extensionAPI.js");
+      assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
+      assert.ok(result.includes("C:/"), `Expected C:/ prefix, got: ${result}`);
+    });
 
-  it("converts Windows drive-letter forward-slash path to file:// URL", () => {
-    const result = toImportSpecifier("D:/Program Files/openclaw/dist/extensionAPI.js");
-    assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
-    assert.ok(result.includes("D:/"), `Expected D:/ prefix, got: ${result}`);
-  });
+    it("converts Windows drive-letter forward-slash path to file:// URL", () => {
+      const result = toImportSpecifier("D:/Program Files/openclaw/dist/extensionAPI.js");
+      assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
+      assert.ok(result.includes("D:/"), `Expected D:/ prefix, got: ${result}`);
+    });
 
-  it("converts Windows path with spaces to file:// URL", () => {
-    const result = toImportSpecifier("E:\\code\\my project\\file.js");
-    assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
-  });
+    it("converts Windows path with spaces to file:// URL", () => {
+      const result = toImportSpecifier("E:\\code\\my project\\file.js");
+      assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
+    });
 
-  it("rejects Windows drive letter without separator (C: -> unchanged)", () => {
-    const result = toImportSpecifier("C:");
-    assert.equal(result, "C:");
-  });
+    it("rejects Windows drive letter without separator (C: -> unchanged)", () => {
+      const result = toImportSpecifier("C:");
+      assert.equal(result, "C:");
+    });
 
-  it("rejects DOS 8.3 short path (C:path\\to\\file.js -> unchanged)", () => {
-    const result = toImportSpecifier("C:path\\to\\file.js");
-    assert.equal(result, "C:path\\to\\file.js");
-  });
+    it("rejects DOS 8.3 short path (C:path\\to\\file.js -> unchanged)", () => {
+      const result = toImportSpecifier("C:path\\to\\file.js");
+      assert.equal(result, "C:path\\to\\file.js");
+    });
 
-  it("rejects single-backslash UNC-like path (\\server\\share -> unchanged)", () => {
-    const result = toImportSpecifier("\\server\\share\\file.js");
-    assert.equal(result, "\\server\\share\\file.js");
-  });
+    it("rejects single-backslash UNC-like path (\\server\\share -> unchanged)", () => {
+      const result = toImportSpecifier("\\server\\share\\file.js");
+      assert.equal(result, "\\server\\share\\file.js");
+    });
+  }
 
   // --- Pass-through cases ---
   it("passes through file:// POSIX URL unchanged", () => {
@@ -143,20 +149,22 @@ describe("toImportSpecifier", () => {
     assert.equal(result, "");
   });
 
-  it("handles path with trailing slash", () => {
-    const result = toImportSpecifier("C:\\Users\\admin\\");
-    assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
-  });
+  if (process.platform === "win32") {
+    it("handles path with trailing slash", () => {
+      const result = toImportSpecifier("C:\\Users\\admin\\");
+      assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
+    });
 
-  it("handles lowercase drive letter", () => {
-    const result = toImportSpecifier("c:\\users\\test\\file.js");
-    assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
-  });
+    it("handles lowercase drive letter", () => {
+      const result = toImportSpecifier("c:\\users\\test\\file.js");
+      assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
+    });
 
-  it("handles uppercase drive letter", () => {
-    const result = toImportSpecifier("E:\\Users\\Admin\\Desktop\\file.js");
-    assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
-  });
+    it("handles uppercase drive letter", () => {
+      const result = toImportSpecifier("E:\\Users\\Admin\\Desktop\\file.js");
+      assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
+    });
+  }
 });
 
 // ============================================================================
@@ -239,22 +247,24 @@ describe("getExtensionApiImportSpecifiers", () => {
 });
 
 // ============================================================================
-// Integration: pathToFileURL Windows path conversion
+// Integration: pathToFileURL Windows path conversion (Windows-only)
 // ============================================================================
 
-describe("pathToFileURL Windows path conversion", () => {
-  it("produces valid file:// URL from Windows backslash path", async () => {
-    const { pathToFileURL } = await import("node:url");
-    const input = "C:\\Users\\admin\\AppData\\Roaming\\npm\\node_modules\\openclaw\\dist\\extensionAPI.js";
-    const result = pathToFileURL(input).href;
-    assert.equal(result, "file:///C:/Users/admin/AppData/Roaming/npm/node_modules/openclaw/dist/extensionAPI.js");
-  });
+if (process.platform === "win32") {
+  describe("pathToFileURL Windows path conversion", () => {
+    it("produces valid file:// URL from Windows backslash path", async () => {
+      const { pathToFileURL } = await import("node:url");
+      const input = "C:\\Users\\admin\\AppData\\Roaming\\npm\\node_modules\\openclaw\\dist\\extensionAPI.js";
+      const result = pathToFileURL(input).href;
+      assert.equal(result, "file:///C:/Users/admin/AppData/Roaming/npm/node_modules/openclaw/dist/extensionAPI.js");
+    });
 
-  it("produces valid file:// URL from Windows forward-slash path", async () => {
-    const { pathToFileURL } = await import("node:url");
-    const input = "D:/Program Files/openclaw/dist/extensionAPI.js";
-    const result = pathToFileURL(input).href;
-    assert.ok(result.startsWith("file://"));
-    assert.ok(result.includes("D:/"));
+    it("produces valid file:// URL from Windows forward-slash path", async () => {
+      const { pathToFileURL } = await import("node:url");
+      const input = "D:/Program Files/openclaw/dist/extensionAPI.js";
+      const result = pathToFileURL(input).href;
+      assert.ok(result.startsWith("file://"));
+      assert.ok(result.includes("D:/"));
+    });
   });
-});
+}

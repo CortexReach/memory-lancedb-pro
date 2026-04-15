@@ -442,13 +442,13 @@ type EmbeddedPiRunner = (params: Record<string, unknown>) => Promise<unknown>;
 const requireFromHere = createRequire(import.meta.url);
 let embeddedPiRunnerPromise: Promise<EmbeddedPiRunner> | null = null;
 
-function toImportSpecifier(value: string): string {
+export function toImportSpecifier(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return "";
   if (trimmed.startsWith("file://")) return trimmed;
   if (trimmed.startsWith("/")) return pathToFileURL(trimmed).href;
-  // Handle Windows absolute paths (e.g. C:\Users\... or D:/Program Files/...)
-  if (/^[a-zA-Z]:[/\\]/.test(trimmed)) return pathToFileURL(trimmed).href;
+  // Handle Windows absolute paths (e.g. C:\Users\... or D:/Program Files/...) — PR #593
+  if (process.platform === 'win32' && /^[a-zA-Z]:[/\\]/.test(trimmed)) return pathToFileURL(trimmed).href;
   return trimmed;
 }
 function getExtensionApiImportSpecifiers(): string[] {
