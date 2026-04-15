@@ -79,6 +79,9 @@ import {
   type AdmissionRejectionAuditEntry,
 } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
+import { createEntityGraph, type EntityGraph } from "./src/entity-graph.js";
+import { createConfidenceTracker, type ConfidenceTracker } from "./src/confidence-tracker.js";
+import { createProactiveInjector, type ProactiveInjector } from "./src/proactive-injector.js";
 
 // ============================================================================
 // Configuration & Types
@@ -183,6 +186,7 @@ interface PluginConfig {
     default?: string;
     definitions?: Record<string, { description: string }>;
     agentAccess?: Record<string, string[]>;
+    shared?: { enabled?: boolean; autoPromote?: boolean };
   };
   enableManagementTools?: boolean;
   sessionStrategy?: SessionStrategy;
@@ -224,6 +228,13 @@ interface PluginConfig {
   extractionThrottle?: {
     skipLowValue?: boolean;
     maxExtractionsPerHour?: number;
+  };
+  entityGraph?: { enabled?: boolean };
+  proactive?: {
+    enabled?: boolean;
+    staleMemoryDays?: number;
+    entityPrefetch?: boolean;
+    patternTriggers?: Record<string, string>;
   };
 }
 
@@ -1690,6 +1701,14 @@ const memoryLanceDBProPlugin = {
     );
     const scopeManager = createScopeManager(config.scopes);
 
+    // Configure shared scope based on config (default: enabled)
+    const sharedEnabled = config.scopes?.shared?.enabled !== false;
+    if (sharedEnabled && !scopeManager.getScopeDefinition("shared")) {
+      scopeManager.addScopeDefinition("shared", {
+        description: "Cross-agent shared knowledge — read by all agents, written only by explicit writes or dreaming engine",
+      });
+    }
+
     // ClawTeam integration: extend accessible scopes via env var
     const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
     if (clawteamScopes.length > 0) {
@@ -2086,6 +2105,22 @@ const memoryLanceDBProPlugin = {
     });
 
     // ========================================================================
+    // Initialize Priority 3 Enhancements
+    // ========================================================================
+
+    const entityGraph = createEntityGraph({ enabled: config.entityGraph?.enabled ?? false });
+    const confidenceTracker = createConfidenceTracker({ enabled: true });
+    const proactiveInjector = createProactiveInjector(
+      { retriever, entityGraph, scopeManager },
+      {
+        enabled: config.proactive?.enabled ?? false,
+        staleMemoryDays: config.proactive?.staleMemoryDays ?? 7,
+        entityPrefetch: config.proactive?.entityPrefetch ?? true,
+        patternTriggers: config.proactive?.patternTriggers ?? {},
+      },
+    );
+
+    // ========================================================================
     // Markdown Mirror
     // ========================================================================
 
@@ -2106,6 +2141,8 @@ const memoryLanceDBProPlugin = {
         workspaceDir: getDefaultWorkspaceDir(),
         mdMirror,
         workspaceBoundary: config.workspaceBoundary,
+        entityGraph,
+        confidenceTracker,
       },
       {
         enableManagementTools: config.enableManagementTools,
@@ -2485,6 +2522,11 @@ const memoryLanceDBProPlugin = {
             }),
           );
 
+          // Track confidence for auto-recalled memories
+          for (const item of selected) {
+            confidenceTracker.recordRecall(item.id);
+          }
+
           const memoryContext = selected.map((item) => item.line).join("\n");
 
           const injectedIds = selected.map((item) => item.id).join(",") || "(none)";
@@ -2755,6 +2797,10 @@ const memoryLanceDBProPlugin = {
                 conversationText, sessionKey,
                 { scope: defaultScope, scopeFilter: accessibleScopes },
               );
+              // Extract entities from conversation text into the entity graph
+              if (config.entityGraph?.enabled) {
+                entityGraph.addEntitiesAndRelationships(conversationText);
+              }
               // Charge rate limiter only after successful extraction
               extractionRateLimiter.recordExtraction();
               if (stats.created > 0 || stats.merged > 0) {

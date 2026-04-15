@@ -853,6 +853,94 @@
             "description": "Maximum number of auto-capture extractions allowed per hour"
           }
         }
+      },
+      "scopes": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "default": {
+            "type": "string",
+            "default": "global"
+          },
+          "definitions": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "description": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "agentAccess": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "shared": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true,
+                "description": "Enable cross-agent shared memory scope (read by all agents)"
+              },
+              "autoPromote": {
+                "type": "boolean",
+                "default": false,
+                "description": "Auto-promote memories accessed by 3+ agents to shared scope during dream cycle"
+              }
+            }
+          }
+        }
+      },
+      "entityGraph": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable entity relationship extraction and graph"
+          }
+        }
+      },
+      "proactive": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Proactive memory injection alongside auto-recall",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable proactive memory injection"
+          },
+          "staleMemoryDays": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 365,
+            "default": 7,
+            "description": "Days before a memory is considered stale for proactive injection"
+          },
+          "entityPrefetch": {
+            "type": "boolean",
+            "default": true,
+            "description": "Pre-fetch related memories when user mentions a known entity"
+          },
+          "patternTriggers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Map of regex patterns to search queries for proactive injection"
+          }
+        }
       }
     }
   },

@@ -2190,9 +2190,190 @@ export function registerMemoryExplainRankTool(
 // Tool Registration Helper
 // ============================================================================
 
-export function registerAllMemoryTools(
+// ============================================================================
+// Entity Graph Tool
+// ============================================================================
+
+export function registerMemoryEntitiesTool(
+  api: OpenClawPluginApi,
+  context: ToolContext & { entityGraph?: { extractEntities(text: string): Array<{ name: string; category: string; normalized: string }>; getRelated(entity: string, depth?: number): Array<{ subject: string; predicate: string; object: string; confidence: number; lastSeen: number }>; getEntityProfile(name: string): { name: string; category: string; factCount: number; relationships: unknown[]; firstSeen: number; lastSeen: number }; getAllEntities(): Array<{ name: string; category: string; normalized: string }> }; },
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return {
+        name: "memory_entities",
+        label: "Memory Entities",
+        description: "Query the entity graph for relationships and profiles about known entities (people, projects, tools, locations).",
+        parameters: Type.Object({
+          entity: Type.String({ description: "Entity name to look up" }),
+          action: Type.Optional(stringEnum(["profile", "related"] as const)),
+          depth: Type.Optional(Type.Number({ description: "Relationship traversal depth (default: 1)" })),
+        }),
+        async execute(_toolCallId, params) {
+          const { entity, action = "profile", depth = 1 } = params as { entity: string; action?: "profile" | "related"; depth?: number };
+
+          if (!context.entityGraph) {
+            return { content: [{ type: "text", text: "Entity graph is not enabled." }], details: { error: "disabled" } };
+          }
+
+          if (action === "related") {
+            const rels = context.entityGraph.getRelated(entity, depth);
+            if (rels.length === 0) {
+              return { content: [{ type: "text", text: `No relationships found for "${entity}".` }], details: { count: 0 } };
+            }
+            const text = rels.map(r => `- ${r.subject} ${r.predicate} ${r.object} (confidence: ${r.confidence.toFixed(2)})`).join("\n");
+            return { content: [{ type: "text", text: `Relationships for "${entity}":\n${text}` }], details: { count: rels.length, relationships: rels } };
+          }
+
+          const profile = context.entityGraph.getEntityProfile(entity);
+          const relLines = profile.relationships.slice(0, 10).map((r: any) => `- ${r.subject} ${r.predicate} ${r.object}`).join("\n");
+          const text = [
+            `Entity: ${profile.name}`,
+            `Category: ${profile.category}`,
+            `Known facts: ${profile.factCount}`,
+            `First seen: ${profile.firstSeen ? new Date(profile.firstSeen).toISOString().split("T")[0] : "unknown"}`,
+            `Last seen: ${profile.lastSeen ? new Date(profile.lastSeen).toISOString().split("T")[0] : "unknown"}`,
+            profile.relationships.length > 0 ? `Relationships:\n${relLines}` : "No relationships yet.",
+          ].join("\n");
+          return { content: [{ type: "text", text }], details: { profile } };
+        },
+      };
+    },
+    { name: "memory_entities" },
+  );
+}
+
+// ============================================================================
+// Confidence Boost Tool
+// ============================================================================
+
+export function registerMemoryBoostTool(
+  api: OpenClawPluginApi,
+  context: ToolContext & { confidenceTracker?: { recordUseful(memoryId: string): void; getConfidence(memoryId: string): number } },
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return {
+        name: "memory_boost",
+        label: "Memory Boost",
+        description: "Manually boost a memory's confidence score, signaling it was useful in a response.",
+        parameters: Type.Object({
+          memoryId: Type.Optional(Type.String({ description: "Memory ID to boost (UUID or prefix)" })),
+          query: Type.Optional(Type.String({ description: "Search query to find memory when memoryId is omitted" })),
+        }),
+        async execute(_toolCallId, params) {
+          const { memoryId, query } = params as { memoryId?: string; query?: string };
+          if (!memoryId && !query) {
+            return { content: [{ type: "text", text: "Provide memoryId or query." }], details: { error: "missing_param" } };
+          }
+
+          if (!context.confidenceTracker) {
+            return { content: [{ type: "text", text: "Confidence tracking is not enabled." }], details: { error: "disabled" } };
+          }
+
+          const agentId = runtimeContext.agentId;
+          const scopeFilter = resolveScopeFilter(runtimeContext.scopeManager, agentId);
+          const resolved = await resolveMemoryId(runtimeContext, memoryId ?? query ?? "", scopeFilter);
+          if (!resolved.ok) {
+            return { content: [{ type: "text", text: resolved.message }], details: resolved.details ?? { error: "resolve_failed" } };
+          }
+
+          context.confidenceTracker.recordUseful(resolved.id);
+          const confidence = context.confidenceTracker.getConfidence(resolved.id);
+          return {
+            content: [{ type: "text", text: `Boosted memory ${resolved.id.slice(0, 8)}... confidence: ${confidence.toFixed(3)}` }],
+            details: { action: "boosted", id: resolved.id, confidence },
+          };
+        },
+      };
+    },
+    { name: "memory_boost" },
+  );
+}
+
+// ============================================================================
+// Shared Memory Write Tool
+// ============================================================================
+
+export function registerMemorySharedTool(
   api: OpenClawPluginApi,
   context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return {
+        name: "memory_shared",
+        label: "Memory Shared",
+        description: "Explicitly write a memory to the shared scope, making it accessible to all agents.",
+        parameters: Type.Object({
+          text: Type.String({ description: "Information to store in shared scope" }),
+          importance: Type.Optional(Type.Number({ description: "Importance score 0-1 (default: 0.7)" })),
+          category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
+        }),
+        async execute(_toolCallId, params) {
+          const { text, importance = 0.7, category = "fact" } = params as { text: string; importance?: number; category?: string };
+          const agentId = runtimeContext.agentId;
+
+          // Validate shared scope is accessible
+          if (!runtimeContext.scopeManager.isAccessible("shared", agentId)) {
+            return { content: [{ type: "text", text: "Shared scope is not enabled or not accessible." }], details: { error: "scope_access_denied", requestedScope: "shared" } };
+          }
+
+          // Noise check
+          if (isNoise(text)) {
+            return { content: [{ type: "text", text: "Skipped: text detected as noise." }], details: { action: "noise_filtered" } };
+          }
+
+          const stripped = stripEnvelopeMetadata(text);
+          if (!stripped.trim()) {
+            return { content: [{ type: "text", text: "Skipped: no extractable content." }], details: { action: "envelope_metadata_rejected" } };
+          }
+
+          const safeImportance = clamp01(importance, 0.7);
+          const vector = await runtimeContext.embedder.embedPassage(stripped);
+
+          const entry = await runtimeContext.store.store({
+            text: stripped,
+            vector,
+            importance: safeImportance,
+            category: category as any,
+            scope: "shared",
+            metadata: stringifySmartMetadata(
+              buildSmartMetadata(
+                { text: stripped, category: category as any, importance: safeImportance },
+                { l0_abstract: stripped, l1_overview: `- ${stripped}`, l2_content: stripped, source: "manual_shared", state: "confirmed", memory_layer: "durable", last_confirmed_use_at: Date.now(), bad_recall_count: 0, suppressed_until_turn: 0 },
+              ),
+            ),
+          });
+
+          if (context.mdMirror) {
+            await context.mdMirror({ text: stripped, category: category as string, scope: "shared", timestamp: entry.timestamp }, { source: "memory_shared", agentId });
+          }
+
+          return {
+            content: [{ type: "text", text: `Stored to shared scope: "${stripped.slice(0, 100)}${stripped.length > 100 ? "..." : ""}" (${entry.id.slice(0, 8)})` }],
+            details: { action: "created", id: entry.id, scope: "shared", category },
+          };
+        },
+      };
+    },
+    { name: "memory_shared" },
+  );
+}
+
+// ============================================================================
+// Tool Registration Helper
+// ============================================================================
+
+export function registerAllMemoryTools(
+  api: OpenClawPluginApi,
+  context: ToolContext & {
+    entityGraph?: { extractEntities(text: string): Array<{ name: string; category: string; normalized: string }>; getRelated(entity: string, depth?: number): Array<{ subject: string; predicate: string; object: string; confidence: number; lastSeen: number }>; getEntityProfile(name: string): { name: string; category: string; factCount: number; relationships: unknown[]; firstSeen: number; lastSeen: number }; getAllEntities(): Array<{ name: string; category: string; normalized: string }> };
+    confidenceTracker?: { recordUseful(memoryId: string): void; getConfidence(memoryId: string): number };
+  },
   options: {
     enableManagementTools?: boolean;
     enableSelfImprovementTools?: boolean;
@@ -2203,6 +2384,13 @@ export function registerAllMemoryTools(
   registerMemoryStoreTool(api, context);
   registerMemoryForgetTool(api, context);
   registerMemoryUpdateTool(api, context);
+
+  // Entity graph tool (always registered; returns "disabled" if not configured)
+  registerMemoryEntitiesTool(api, context);
+  // Confidence boost tool (always registered; returns "disabled" if not configured)
+  registerMemoryBoostTool(api, context);
+  // Shared memory write tool
+  registerMemorySharedTool(api, context);
 
   // Management tools (optional)
   if (options.enableManagementTools) {
