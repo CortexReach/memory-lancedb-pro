@@ -245,6 +245,11 @@ function getDefaultWorkspaceDir(): string {
   return join(home, ".openclaw", "workspace");
 }
 
+function getDefaultMdMirrorDir(): string {
+  const home = homedir();
+  return join(home, ".openclaw", "memory", "md-mirror");
+}
+
 function resolveWorkspaceDirFromContext(context: Record<string, unknown> | undefined): string {
   const runtimePath = typeof context?.workspaceDir === "string" ? context.workspaceDir.trim() : "";
   return runtimePath || getDefaultWorkspaceDir();
@@ -1526,7 +1531,9 @@ function createMdMirrorWriter(
 ): MdMirrorWriter | null {
   if (config.mdMirror?.enabled !== true) return null;
 
-  const fallbackDir = api.resolvePath(config.mdMirror.dir || "memory-md");
+  const fallbackDir = config.mdMirror.dir
+    ? api.resolvePath(config.mdMirror.dir)
+    : getDefaultMdMirrorDir();
   const workspaceMap = resolveAgentWorkspaceMap(api);
 
   if (Object.keys(workspaceMap).length > 0) {
@@ -4053,6 +4060,8 @@ export function parsePluginConfig(value: unknown): PluginConfig {
  * to unload/reload the plugin without restarting the process.
  * @public
  */
+export { getDefaultMdMirrorDir };
+
 export function resetRegistration() {
   // Note: WeakSets cannot be cleared by design. In test scenarios where the
   // same process reloads the module, a fresh module state means a new WeakSet.
