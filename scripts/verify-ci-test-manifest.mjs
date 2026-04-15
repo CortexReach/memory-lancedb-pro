@@ -52,6 +52,8 @@ const EXPECTED_BASELINE = [
   { group: "core-regression", runner: "node", file: "test/embedder-cache.test.mjs" },
   // Issue #629 batch embedding fix
   { group: "llm-clients-and-auth", runner: "node", file: "test/embedder-ollama-batch-routing.test.mjs" },
+  // Issue #492 agentId validation tests
+  { group: "core-regression", runner: "node", file: "test/agentid-validation.test.mjs", args: ["--test"] },
 ];
 
 function fail(message) {
