@@ -449,6 +449,7 @@ const DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS = true;
 const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
+const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
 const REFLECTION_FALLBACK_MARKER = "(fallback) Reflection generation failed; storing minimal pointer only.";
 const DIAG_BUILD_TAG = "memory-lancedb-pro-diag-20260308-0058";
 
@@ -3454,7 +3455,7 @@ const memoryLanceDBProPlugin = {
         if (!g[REFLECTION_SERIAL_GUARD]) g[REFLECTION_SERIAL_GUARD] = new Map<string, number>();
         return g[REFLECTION_SERIAL_GUARD] as Map<string, number>;
       };
-      const SERIAL_GUARD_COOLDOWN_MS = 120_000; // 2 minutes cooldown per sessionKey
+      // SERIAL_GUARD_COOLDOWN_MS moved to DEFAULT_SERIAL_GUARD_COOLDOWN_MS
 
       const runMemoryReflection = async (event: any) => {
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
@@ -3481,9 +3482,7 @@ const memoryLanceDBProPlugin = {
           const serialGuard = getSerialGuardMap();
           const lastRun = serialGuard.get(sessionKey);
           if (lastRun) {
-            const cooldownMs = typeof (cfg?.memoryReflection as Record<string, unknown> | undefined)?.serialCooldownMs === "number"
-              ? (cfg!.memoryReflection as Record<string, unknown>).serialCooldownMs as number
-              : 120_000;
+            const cooldownMs = config.memoryReflection?.serialCooldownMs ?? DEFAULT_SERIAL_GUARD_COOLDOWN_MS;
             if ((Date.now() - lastRun) < cooldownMs) {
               api.logger.info(`memory-reflection: command hook skipped (cooldown ${((Date.now() - lastRun) / 1000).toFixed(0)}s/${(cooldownMs / 1000).toFixed(0)}s, sessionKey=${sessionKey})`);
               return;
@@ -3506,9 +3505,7 @@ const memoryLanceDBProPlugin = {
           let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
           const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
           // Exclude agents/sessions listed in memoryReflection.excludeAgents (supports wildcards)
-          const excludePatterns = (cfg as Record<string, unknown> | undefined)?.memoryReflection
-            ? ((cfg as Record<string, unknown>).memoryReflection as Record<string, unknown>)?.excludeAgents as string[] | undefined
-            : undefined;
+          const excludePatterns = config.memoryReflection?.excludeAgents;
           if (excludePatterns && isAgentOrSessionExcluded(sourceAgentId, sessionKey, excludePatterns)) {
             api.logger.debug?.(
               `memory-reflection: command hook skipped (excluded agent=${sourceAgentId}, sessionKey=${sessionKey ?? "(none)"})`,
@@ -4273,6 +4270,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         })(),
         errorReminderMaxEntries: parsePositiveInt(memoryReflectionRaw.errorReminderMaxEntries) ?? DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES,
         dedupeErrorSignals: memoryReflectionRaw.dedupeErrorSignals !== false,
+        serialCooldownMs: parsePositiveInt(memoryReflectionRaw.serialCooldownMs) ?? DEFAULT_SERIAL_GUARD_COOLDOWN_MS,
+        excludeAgents: Array.isArray(memoryReflectionRaw.excludeAgents)
+          ? memoryReflectionRaw.excludeAgents.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+          : undefined,
       }
       : {
         enabled: sessionStrategy === "memoryReflection",
@@ -4286,6 +4287,8 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         thinkLevel: DEFAULT_REFLECTION_THINK_LEVEL,
         errorReminderMaxEntries: DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES,
         dedupeErrorSignals: DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS,
+        serialCooldownMs: DEFAULT_SERIAL_GUARD_COOLDOWN_MS,
+        excludeAgents: undefined,
       },
     sessionMemory:
       typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
