@@ -1944,6 +1944,216 @@ const memoryLanceDBProPlugin = {
     // register() call (e.g. message_received queued earlier) can still log.
     _autoCaptureDebugLog = (msg: string) => void api.logger.debug(msg);
 
+    async function sleep(ms: number): Promise<void> {
+      await new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function retrieveWithRetry(params: {
+      query: string;
+      limit: number;
+      scopeFilter?: string[];
+      category?: string;
+    }) {
+      let results = await retriever.retrieve(params);
+      if (results.length === 0) {
+        await sleep(75);
+        results = await retriever.retrieve(params);
+      }
+      return results;
+    }
+
+    async function runRecallLifecycle(
+      results: Array<{ entry: { id: string; text: string; category: "preference" | "fact" | "decision" | "entity" | "other"; scope: string; importance: number; timestamp: number; metadata?: string } }>,
+      scopeFilter?: string[],
+    ): Promise<Map<string, string>> {
+      const now = Date.now();
+      type LifecycleEntry = {
+        id: string;
+        text: string;
+        category: "preference" | "fact" | "decision" | "entity" | "other";
+        scope: string;
+        importance: number;
+        timestamp: number;
+        metadata?: string;
+      };
+      const lifecycleEntries = new Map<string, LifecycleEntry>();
+      const tierOverrides = new Map<string, string>();
+
+      await Promise.allSettled(
+        results.map(async (result) => {
+          const metadata = parseSmartMetadata(result.entry.metadata, result.entry);
+          const updated = await store.patchMetadata(
+            result.entry.id,
+            {
+              access_count: metadata.access_count + 1,
+              last_accessed_at: now,
+            },
+            scopeFilter,
+          );
+          lifecycleEntries.set(result.entry.id, updated ?? result.entry);
+        }),
+      );
+
+      try {
+        if (scopeFilter !== undefined) {
+          const recentEntries = await store.list(scopeFilter, undefined, 100, 0);
+          for (const entry of recentEntries) {
+            if (!lifecycleEntries.has(entry.id)) {
+              lifecycleEntries.set(entry.id, entry);
+            }
+          }
+        } else {
+          api.logger.debug(`memory-lancedb-pro: skipping tier maintenance preload for bypass scope filter`);
+        }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: tier maintenance preload failed: ${String(err)}`);
+      }
+
+      const candidates = Array.from(lifecycleEntries.values())
+        .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+        .filter((entry) => parseSmartMetadata(entry.metadata, entry).type !== "session-summary");
+
+      if (candidates.length === 0) {
+        return tierOverrides;
+      }
+
+      try {
+        const memories = candidates.map((entry) => toLifecycleMemory(entry.id, entry));
+        const decayScores = decayEngine.scoreAll(memories, now);
+        const transitions = tierManager.evaluateAll(memories, decayScores, now);
+
+        await Promise.allSettled(
+          transitions.map(async (transition) => {
+            await store.patchMetadata(
+              transition.memoryId,
+              {
+                tier: transition.toTier,
+                tier_updated_at: now,
+              },
+              scopeFilter,
+            );
+            tierOverrides.set(transition.memoryId, transition.toTier);
+          }),
+        );
+
+        if (transitions.length > 0) {
+          api.logger.info(
+            `memory-lancedb-pro: tier maintenance applied ${transitions.length} transition(s)`,
+          );
+        }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: tier maintenance failed: ${String(err)}`);
+      }
+
+      return tierOverrides;
+    }
+
+    const pruneOldestByUpdatedAt = <T extends { updatedAt: number }>(map: Map<string, T>, maxSize: number) => {
+      if (map.size <= maxSize) return;
+      const sorted = [...map.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+      const removeCount = map.size - maxSize;
+      for (let i = 0; i < removeCount; i++) {
+        const key = sorted[i]?.[0];
+        if (key) map.delete(key);
+      }
+    };
+
+    const pruneReflectionSessionState = (now = Date.now()) => {
+      for (const [key, state] of reflectionErrorStateBySession.entries()) {
+        if (now - state.updatedAt > DEFAULT_REFLECTION_SESSION_TTL_MS) {
+          reflectionErrorStateBySession.delete(key);
+        }
+      }
+      for (const [key, state] of reflectionDerivedBySession.entries()) {
+        if (now - state.updatedAt > DEFAULT_REFLECTION_SESSION_TTL_MS) {
+          reflectionDerivedBySession.delete(key);
+        }
+      }
+      pruneOldestByUpdatedAt(reflectionErrorStateBySession, DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS);
+      pruneOldestByUpdatedAt(reflectionDerivedBySession, DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS);
+    };
+
+    const getReflectionErrorState = (sessionKey: string): ReflectionErrorState => {
+      const key = sessionKey.trim();
+      const current = reflectionErrorStateBySession.get(key);
+      if (current) {
+        current.updatedAt = Date.now();
+        return current;
+      }
+      const created: ReflectionErrorState = { entries: [], lastInjectedCount: 0, signatureSet: new Set<string>(), updatedAt: Date.now() };
+      reflectionErrorStateBySession.set(key, created);
+      return created;
+    };
+
+    const addReflectionErrorSignal = (sessionKey: string, signal: ReflectionErrorSignal, dedupeEnabled: boolean) => {
+      if (!sessionKey.trim()) return;
+      pruneReflectionSessionState();
+      const state = getReflectionErrorState(sessionKey);
+      if (dedupeEnabled && state.signatureSet.has(signal.signatureHash)) return;
+      state.entries.push(signal);
+      state.signatureSet.add(signal.signatureHash);
+      state.updatedAt = Date.now();
+      if (state.entries.length > 30) {
+        const removed = state.entries.length - 30;
+        state.entries.splice(0, removed);
+        state.lastInjectedCount = Math.max(0, state.lastInjectedCount - removed);
+        state.signatureSet = new Set(state.entries.map((e) => e.signatureHash));
+      }
+    };
+
+    const getPendingReflectionErrorSignalsForPrompt = (sessionKey: string, maxEntries: number): ReflectionErrorSignal[] => {
+      pruneReflectionSessionState();
+      const state = reflectionErrorStateBySession.get(sessionKey.trim());
+      if (!state) return [];
+      state.updatedAt = Date.now();
+      state.lastInjectedCount = Math.min(state.lastInjectedCount, state.entries.length);
+      const pending = state.entries.slice(state.lastInjectedCount);
+      if (pending.length === 0) return [];
+      const clipped = pending.slice(-maxEntries);
+      state.lastInjectedCount = state.entries.length;
+      return clipped;
+    };
+
+    const loadAgentReflectionSlices = async (agentId: string, scopeFilter?: string[]) => {
+      const scopeKey = Array.isArray(scopeFilter)
+        ? `scopes:${[...scopeFilter].sort().join(",")}`
+        : "<NO_SCOPE_FILTER>";
+      const cacheKey = `${agentId}::${scopeKey}`;
+      const cached = reflectionByAgentCache.get(cacheKey);
+      if (cached && Date.now() - cached.updatedAt < 15_000) return cached;
+
+      // Prefer reflection-category rows to avoid full-table reads on bypass callers.
+      // Fall back to an uncategorized scan only when the category query produced no
+      // agent-owned reflection slices, preserving backward compatibility with mixed-schema stores.
+      let entries = await store.list(scopeFilter, "reflection", 240, 0);
+      let slices = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId,
+        deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+      });
+      if (slices.invariants.length === 0 && slices.derived.length === 0) {
+        const legacyEntries = await store.list(scopeFilter, undefined, 240, 0);
+        entries = legacyEntries.filter((entry) => {
+          try {
+            const metadata = parseReflectionMetadata(entry.metadata);
+            return isReflectionMetadataType(metadata.type) && isOwnedByAgent(metadata, agentId);
+          } catch {
+            return false;
+          }
+        });
+        slices = loadAgentReflectionSlicesFromEntries({
+          entries,
+          agentId,
+          deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+        });
+      }
+      const { invariants, derived } = slices;
+      const next = { updatedAt: Date.now(), invariants, derived };
+      reflectionByAgentCache.set(cacheKey, next);
+      return next;
+    };
+
+    // Session-based recall history to prevent redundant injections
     let embedHealth: { ok: boolean; error?: string } = { ok: false, error: "startup not complete" };
     let retrievalHealth: boolean = false;
 
@@ -2010,7 +2220,6 @@ const memoryLanceDBProPlugin = {
     // Markdown Mirror
     // ========================================================================
 
-    const mdMirror = createMdMirrorWriter(api, config);
 
     // ========================================================================
     // Register Tools
