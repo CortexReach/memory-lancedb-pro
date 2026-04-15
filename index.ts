@@ -1531,9 +1531,9 @@ function createMdMirrorWriter(
 ): MdMirrorWriter | null {
   if (config.mdMirror?.enabled !== true) return null;
 
-  const fallbackDir = config.mdMirror.dir
-    ? api.resolvePath(config.mdMirror.dir)
-    : getDefaultMdMirrorDir();
+  const fallbackDir = api.resolvePath(
+    config.mdMirror.dir ?? getDefaultMdMirrorDir(),
+  );
   const workspaceMap = resolveAgentWorkspaceMap(api);
 
   if (Object.keys(workspaceMap).length > 0) {
@@ -4055,13 +4055,13 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   };
 }
 
+export { getDefaultMdMirrorDir };
+
 /**
  * Resets the registration state — primarily intended for use in tests that need
  * to unload/reload the plugin without restarting the process.
  * @public
  */
-export { getDefaultMdMirrorDir };
-
 export function resetRegistration() {
   // Note: WeakSets cannot be cleared by design. In test scenarios where the
   // same process reloads the module, a fresh module state means a new WeakSet.
