@@ -1410,6 +1410,155 @@ assert.ok(cumulativeResult.smartExtractionTriggered,
 assert.ok(cumulativeResult.smartExtractionSkipped,
   "Turn 1 should skip smart extraction (cumulative=1 < 2). Logs: " +
   cumulativeResult.logs.map((e) => e[1]).join(" | "));
+
+// ===============================================================
+// Test: F5 — Counter reset after successful extraction
+// Scenario: Verifies Fix #9 (counter resets to 0 after success).
+// Turn 1: cumulative=1, skip
+// Turn 2: cumulative=2, trigger extraction, LLM returns SUCCESS with memories
+//   -> counter resets to 0 (Fix #9)
+// Turn 3: cumulative restarts from 0, +1 new text = 1 < minMessages=2, skip
+// Key assertions:
+//   - LLM called exactly once (turn 2 only)
+//   - Turn 3 observes reset counter and does NOT re-trigger extraction
+// ===============================================================
+
+async function runCounterResetSuccessScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-counter-reset-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  let llmCalls = 0;
+  const embeddingServer = createEmbeddingServer();
+
+  // LLM mock: returns SUCCESS with one memory on first call.
+  // Second call (if any) = regression — proves counter did NOT reset.
+  const llmServer = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404); res.end(); return;
+    }
+    llmCalls += 1;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl-test", object: "chat.completion",
+      created: Math.floor(Date.now() / 1000), model: "mock-memory-model",
+      choices: [{
+        index: 0, message: { role: "assistant",
+          content: JSON.stringify({
+            memories: [{
+              text: "使用者喜歡把重要修復寫成 regression test",
+              category: "fact", importance: 0.82,
+              confidence: 0.9, rationale: "明確陳述偏好",
+            }],
+          }),
+        },
+        finish_reason: "stop",
+      }],
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const llmPort = llmServer.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    const api = createMockApi(
+      dbPath, `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${llmPort}`, logs,
+      // extractMinMessages=2: turns 1+2 cumulative=2 triggers extraction
+      { extractMinMessages: 2, smartExtraction: true, captureAssistant: false },
+    );
+    plugin.register(api);
+
+    const sessionKey = "agent:main:discord:dm:user789";
+    const channelId = "discord";
+    const conversationId = "dm:user789";
+
+    // Turn 1: cumulative=1, should skip
+    await api.hooks.message_received(
+      { from: "user:user789", content: "第一輪訊息" },
+      { channelId, conversationId, accountId: "default" },
+    );
+    await runAgentEndHook(
+      api,
+      { success: true, messages: [{ role: "user", content: "第一輪訊息" }] },
+      { agentId: "main", sessionKey },
+    );
+
+    // Turn 2: cumulative=2, should trigger extraction AND succeed
+    // -> Fix #9: counter resets to 0 after success
+    await api.hooks.message_received(
+      { from: "user:user789", content: "第二輪訊息" },
+      { channelId, conversationId, accountId: "default" },
+    );
+    await runAgentEndHook(
+      api,
+      { success: true, messages: [{ role: "user", content: "第二輪訊息" }] },
+      { agentId: "main", sessionKey },
+    );
+
+    // Turn 3: if counter reset worked, cumulative restarts from 0 -> +1 = 1 < 2
+    // -> should NOT re-trigger smart extraction
+    await api.hooks.message_received(
+      { from: "user:user789", content: "第三輪訊息" },
+      { channelId, conversationId, accountId: "default" },
+    );
+    await runAgentEndHook(
+      api,
+      { success: true, messages: [{ role: "user", content: "第三輪訊息" }] },
+      { agentId: "main", sessionKey },
+    );
+
+    // Collect log entries for assertion
+    const triggerLogs = logs.filter((entry) =>
+      entry[1].includes("running smart extraction"),
+    );
+    const resetSkipLogs = logs.filter((entry) =>
+      entry[1].includes("skipped smart extraction") &&
+      entry[1].includes("cumulative=1"),
+    );
+    const successLogs = logs.filter((entry) =>
+      entry[1].includes("smart-extracted") &&
+      entry[1].includes("created, 0 merged"),
+    );
+
+    return { llmCalls, triggerLogs, resetSkipLogs, successLogs, logs };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const counterResetResult = await runCounterResetSuccessScenario();
+
+// Assert 1: LLM called exactly once (turn 2 success, turn 3 did NOT re-trigger)
+assert.equal(counterResetResult.llmCalls, 1,
+  `LLM should be called exactly once (turn 2). Got ${counterResetResult.llmCalls} calls. Logs: ` +
+  counterResetResult.logs.map((e) => e[1]).join(" | "));
+
+// Assert 2: Turn 2 triggered smart extraction (cumulative=2 >= minMessages=2)
+assert.equal(counterResetResult.triggerLogs.length, 1,
+  "Smart extraction should trigger exactly once on turn 2. Logs: " +
+  counterResetResult.logs.map((e) => e[1]).join(" | "));
+
+// Assert 3: Turn 2 persisted at least one extracted memory
+assert.ok(counterResetResult.successLogs.length > 0,
+  "Turn 2 should log success with extracted memories. Logs: " +
+  counterResetResult.logs.map((e) => e[1]).join(" | "));
+
+// Assert 4 (Fix #9 core): Turn 3 observes reset counter (cumulative=1 < 2) and skips
+assert.ok(counterResetResult.resetSkipLogs.length > 0,
+  "Turn 3 should skip smart extraction due to reset counter (cumulative=1 < minMessages=2). " +
+  "This proves Fix #9 (counter reset after success) is working. Logs: " +
+  counterResetResult.logs.map((e) => e[1]).join(" | "));
+
+// ============================================================
+// End: F5 counter reset success test
+// ============================================================
+
 // ============================================================
 // Test: DM fallback — Fix-Must1b regression
 // Scenario: DM conversation (no pending ingress texts).
