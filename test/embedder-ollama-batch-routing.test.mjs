@@ -8,8 +8,6 @@ const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { Embedder } = jiti("../src/embedder.ts");
 
 const DIMS = 1024;
-const OLLAMA_PORT = 11434;
-const OLLAMA_BASE = `http://127.0.0.1:${OLLAMA_PORT}/v1`;
 
 /**
  * Test: Ollama embedWithNativeFetch routes single vs batch requests correctly.
@@ -27,6 +25,9 @@ const OLLAMA_BASE = `http://127.0.0.1:${OLLAMA_PORT}/v1`;
  * 3. Batch responses with wrong count are rejected
  * 4. Batch responses with empty embeddings are rejected
  * 5. Single-element batch still routes to /v1/embeddings
+ *
+ * NOTE: Uses port 0 to let OS assign an available port, avoiding EADDRINUSE
+ * when developers have Ollama running locally on port 11434.
  */
 
 function readJson(req) {
@@ -57,6 +58,24 @@ function dims() {
   return Array.from({ length: DIMS }, () => Math.random() * 0.1);
 }
 
+/**
+ * Helper to start a mock server and get its actual port.
+ * Uses port 0 to let OS assign an available port.
+ */
+async function startMockServer(server) {
+  return new Promise((resolve, reject) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (addr && typeof addr === "object") {
+        resolve(addr.port);
+      } else {
+        reject(new Error("Failed to get server port"));
+      }
+    });
+    server.on("error", reject);
+  });
+}
+
 test("single requests use /api/embeddings with prompt field", async () => {
   let capturedBody = null;
 
@@ -66,14 +85,15 @@ test("single requests use /api/embeddings with prompt field", async () => {
     res.end(JSON.stringify({ embedding: dims() }));
   });
 
-  await new Promise((resolve) => server.listen(OLLAMA_PORT, "127.0.0.1", resolve));
+  const port = await startMockServer(server);
+  const baseURL = `http://127.0.0.1:${port}/v1`;
 
   try {
     const embedder = new Embedder({
       provider: "openai-compatible",
       apiKey: "test-key",
       model: "mxbai-embed-large",
-      baseURL: OLLAMA_BASE,
+      baseURL,
       dimensions: DIMS,
     });
 
@@ -101,14 +121,15 @@ test("batch requests use /v1/embeddings with input array", async () => {
     res.end(JSON.stringify({ data: embeddings }));
   });
 
-  await new Promise((resolve) => server.listen(OLLAMA_PORT, "127.0.0.1", resolve));
+  const port = await startMockServer(server);
+  const baseURL = `http://127.0.0.1:${port}/v1`;
 
   try {
     const embedder = new Embedder({
       provider: "openai-compatible",
       apiKey: "test-key",
       model: "mxbai-embed-large",
-      baseURL: OLLAMA_BASE,
+      baseURL,
       dimensions: DIMS,
     });
 
@@ -142,14 +163,15 @@ test("batch rejects response with wrong number of embeddings", async () => {
     res.end(JSON.stringify({ data: embeddings }));
   });
 
-  await new Promise((resolve) => server.listen(OLLAMA_PORT, "127.0.0.1", resolve));
+  const port = await startMockServer(server);
+  const baseURL = `http://127.0.0.1:${port}/v1`;
 
   try {
     const embedder = new Embedder({
       provider: "openai-compatible",
       apiKey: "test-key",
       model: "mxbai-embed-large",
-      baseURL: OLLAMA_BASE,
+      baseURL,
       dimensions: DIMS,
     });
 
@@ -186,14 +208,15 @@ test("batch rejects response with empty embedding array", async () => {
     res.end(JSON.stringify({ data: embeddings }));
   });
 
-  await new Promise((resolve) => server.listen(OLLAMA_PORT, "127.0.0.1", resolve));
+  const port = await startMockServer(server);
+  const baseURL = `http://127.0.0.1:${port}/v1`;
 
   try {
     const embedder = new Embedder({
       provider: "openai-compatible",
       apiKey: "test-key",
       model: "mxbai-embed-large",
-      baseURL: OLLAMA_BASE,
+      baseURL,
       dimensions: DIMS,
     });
 
@@ -222,14 +245,15 @@ test("single-element batch still routes to /v1/embeddings", async () => {
     res.end(JSON.stringify({ data: [{ embedding: dims(), index: 0 }] }));
   });
 
-  await new Promise((resolve) => server.listen(OLLAMA_PORT, "127.0.0.1", resolve));
+  const port = await startMockServer(server);
+  const baseURL = `http://127.0.0.1:${port}/v1`;
 
   try {
     const embedder = new Embedder({
       provider: "openai-compatible",
       apiKey: "test-key",
       model: "mxbai-embed-large",
-      baseURL: OLLAMA_BASE,
+      baseURL,
       dimensions: DIMS,
     });
 
