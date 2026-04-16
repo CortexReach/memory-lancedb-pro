@@ -11,6 +11,12 @@
  *   2. Reverse-map 5-category → 6-category
  *   3. Generate L0/L1/L2 via LLM (or fallback to simple rules)
  *   4. Write enriched metadata back via store.update()
+ *
+ * Two-Phase Processing (Issue #632 fix):
+ *   Phase 1: LLM enrichment (no lock, can run concurrently)
+ *   Phase 2: DB writes (single lock per batch)
+ *
+ * This reduces lock contention from N locks (one per entry) to 1 lock per batch.
  */
 
 import type { MemoryStore, MemoryEntry } from "./store.js";
@@ -60,6 +66,14 @@ interface EnrichedMetadata {
   last_accessed_at: number;
   upgraded_from: string; // original 5-category
   upgraded_at: number;   // timestamp of upgrade
+}
+
+/** Phase 1 result: enriched entry ready for DB write */
+interface EnrichedEntry {
+  entry: MemoryEntry;
+  newCategory: MemoryCategory;
+  enriched: Pick<EnrichedMetadata, "l0_abstract" | "l1_overview" | "l2_content">;
+  error?: string;  // If enrichment failed, record error but don't throw
 }
 
 // ============================================================================
@@ -154,7 +168,7 @@ function simpleEnrich(
 }
 
 // ============================================================================
-// Memory Upgrader
+// Memory Upgrader (Two-Phase)
 // ============================================================================
 
 export class MemoryUpgrader {
@@ -205,9 +219,134 @@ export class MemoryUpgrader {
     return { total: allMemories.length, legacy, byCategory };
   }
 
+  // =========================================================================
+  // Phase 1: LLM Enrichment (no lock, can run concurrently)
+  // =========================================================================
+
   /**
-   * Main upgrade entry point.
-   * Scans all memories, filters legacy ones, and enriches them.
+   * Phase 1: Enrich a single entry (no lock needed).
+   * This is a pure function with no side effects.
+   */
+  private async prepareEntry(
+    entry: MemoryEntry,
+    noLlm: boolean,
+  ): Promise<EnrichedEntry> {
+    // Step 1: Reverse-map category
+    let newCategory = reverseMapCategory(entry.category, entry.text);
+
+    // Step 2: Generate L0/L1/L2
+    let enriched: Pick<EnrichedMetadata, "l0_abstract" | "l1_overview" | "l2_content">;
+
+    if (!noLlm && this.llm) {
+      try {
+        const prompt = buildUpgradePrompt(entry.text, newCategory);
+        const llmResult = await this.llm.completeJson<{
+          l0_abstract: string;
+          l1_overview: string;
+          l2_content: string;
+          resolved_category?: string;
+        }>(prompt);
+
+        if (!llmResult) {
+          throw new Error(this.llm.getLastError() || "LLM returned null");
+        }
+
+        enriched = {
+          l0_abstract: llmResult.l0_abstract || simpleEnrich(entry.text, newCategory).l0_abstract,
+          l1_overview: llmResult.l1_overview || simpleEnrich(entry.text, newCategory).l1_overview,
+          l2_content: llmResult.l2_content || entry.text,
+        };
+
+        // LLM may have resolved the ambiguous fact→profile/cases
+        if (llmResult.resolved_category) {
+          const validCategories = new Set([
+            "profile", "preferences", "entities", "events", "cases", "patterns",
+          ]);
+          if (validCategories.has(llmResult.resolved_category)) {
+            newCategory = llmResult.resolved_category as MemoryCategory;
+          }
+        }
+      } catch (err) {
+        this.log(
+          `memory-upgrader: LLM enrichment failed for ${entry.id}, falling back to simple — ${String(err)}`,
+        );
+        enriched = simpleEnrich(entry.text, newCategory);
+      }
+    } else {
+      enriched = simpleEnrich(entry.text, newCategory);
+    }
+
+    return {
+      entry,
+      newCategory,
+      enriched,
+    };
+  }
+
+  // =========================================================================
+  // Phase 2: DB Write (single lock per batch)
+  // =========================================================================
+
+  /**
+   * Phase 2: Write all enriched entries to DB under a single lock.
+   */
+  private async writeEnrichedBatch(
+    batch: EnrichedEntry[],
+  ): Promise<{ success: number; errors: string[] }> {
+    let success = 0;
+    const errors: string[] = [];
+
+    await this.store.runWithFileLock(async () => {
+      for (const { entry, newCategory, enriched } of batch) {
+        try {
+          // Step 3: Build enriched metadata
+          const existingMeta = entry.metadata ? (() => {
+            try { return JSON.parse(entry.metadata!); } catch { return {}; }
+          })() : {};
+
+          const newMetadata: EnrichedMetadata = {
+            ...buildSmartMetadata(
+              { ...entry, metadata: JSON.stringify(existingMeta) },
+              {
+                l0_abstract: enriched.l0_abstract,
+                l1_overview: enriched.l1_overview,
+                l2_content: enriched.l2_content,
+                memory_category: newCategory,
+                tier: "working" as MemoryTier,
+                access_count: 0,
+                confidence: 0.7,
+              },
+            ),
+            upgraded_from: entry.category,
+            upgraded_at: Date.now(),
+          };
+
+          // Step 4: Update the memory entry
+          await this.store.update(entry.id, {
+            text: enriched.l0_abstract,
+            metadata: stringifySmartMetadata(newMetadata),
+          });
+          success++;
+        } catch (err) {
+          const errMsg = `Failed to update ${entry.id}: ${String(err)}`;
+          errors.push(errMsg);
+          this.log(`memory-upgrader: ERROR — ${errMsg}`);
+        }
+      }
+    });
+
+    return { success, errors };
+  }
+
+  // =========================================================================
+  // Main Upgrade (Two-Phase Processing)
+  // =========================================================================
+
+  /**
+   * Main upgrade entry point with two-phase processing.
+   * 
+   * Phase 1: LLM enrichment (no lock)
+   * Phase 2: DB writes (single lock per batch)
    */
   async upgrade(options: UpgradeOptions = {}): Promise<UpgradeResult> {
     const batchSize = options.batchSize ?? this.options.batchSize ?? 10;
@@ -268,15 +407,29 @@ export class MemoryUpgrader {
         `memory-upgrader: processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(toProcess.length / batchSize)} (${batch.length} memories)`,
       );
 
+      // =====================================================================
+      // Phase 1: LLM enrichment (no lock, can be concurrent)
+      // =====================================================================
+      const enrichedBatch: EnrichedEntry[] = [];
+
       for (const entry of batch) {
         try {
-          await this.upgradeEntry(entry, noLlm);
-          result.upgraded++;
+          const enriched = await this.prepareEntry(entry, noLlm);
+          enrichedBatch.push(enriched);
         } catch (err) {
-          const errMsg = `Failed to upgrade ${entry.id}: ${String(err)}`;
+          const errMsg = `Failed to enrich ${entry.id}: ${String(err)}`;
           result.errors.push(errMsg);
           this.log(`memory-upgrader: ERROR — ${errMsg}`);
         }
+      }
+
+      // =====================================================================
+      // Phase 2: DB writes under single lock
+      // =====================================================================
+      if (enrichedBatch.length > 0) {
+        const writeResult = await this.writeEnrichedBatch(enrichedBatch);
+        result.upgraded += writeResult.success;
+        result.errors.push(...writeResult.errors);
       }
 
       // Progress report
@@ -289,89 +442,6 @@ export class MemoryUpgrader {
       `memory-upgrader: upgrade complete — ${result.upgraded} upgraded, ${result.skipped} already new, ${result.errors.length} errors`,
     );
     return result;
-  }
-
-  /**
-   * Upgrade a single legacy memory entry.
-   */
-  private async upgradeEntry(
-    entry: MemoryEntry,
-    noLlm: boolean,
-  ): Promise<void> {
-    // Step 1: Reverse-map category
-    let newCategory = reverseMapCategory(entry.category, entry.text);
-
-    // Step 2: Generate L0/L1/L2
-    let enriched: Pick<EnrichedMetadata, "l0_abstract" | "l1_overview" | "l2_content">;
-
-    if (!noLlm && this.llm) {
-      try {
-        const prompt = buildUpgradePrompt(entry.text, newCategory);
-        const llmResult = await this.llm.completeJson<{
-          l0_abstract: string;
-          l1_overview: string;
-          l2_content: string;
-          resolved_category?: string;
-        }>(prompt);
-
-        if (!llmResult) {
-          const detail = this.llm.getLastError();
-          throw new Error(detail || "LLM returned null");
-        }
-
-        enriched = {
-          l0_abstract: llmResult.l0_abstract || simpleEnrich(entry.text, newCategory).l0_abstract,
-          l1_overview: llmResult.l1_overview || simpleEnrich(entry.text, newCategory).l1_overview,
-          l2_content: llmResult.l2_content || entry.text,
-        };
-
-        // LLM may have resolved the ambiguous fact→profile/cases
-        if (llmResult.resolved_category) {
-          const validCategories = new Set([
-            "profile", "preferences", "entities", "events", "cases", "patterns",
-          ]);
-          if (validCategories.has(llmResult.resolved_category)) {
-            newCategory = llmResult.resolved_category as MemoryCategory;
-          }
-        }
-      } catch (err) {
-        this.log(
-          `memory-upgrader: LLM enrichment failed for ${entry.id}, falling back to simple — ${String(err)}`,
-        );
-        enriched = simpleEnrich(entry.text, newCategory);
-      }
-    } else {
-      enriched = simpleEnrich(entry.text, newCategory);
-    }
-
-    // Step 3: Build enriched metadata
-    const existingMeta = entry.metadata ? (() => {
-      try { return JSON.parse(entry.metadata!); } catch { return {}; }
-    })() : {};
-
-    const newMetadata: EnrichedMetadata = {
-      ...buildSmartMetadata(
-        { ...entry, metadata: JSON.stringify(existingMeta) },
-        {
-          l0_abstract: enriched.l0_abstract,
-          l1_overview: enriched.l1_overview,
-          l2_content: enriched.l2_content,
-          memory_category: newCategory,
-          tier: "working" as MemoryTier,
-          access_count: 0,
-          confidence: 0.7,
-        },
-      ),
-      upgraded_from: entry.category,
-      upgraded_at: Date.now(),
-    };
-
-    // Step 4: Update the memory entry
-    await this.store.update(entry.id, {
-      // Update text to L0 abstract for better search indexing
-      text: enriched.l0_abstract,
-      metadata: stringifySmartMetadata(newMetadata),
-    });
   }
 }
 
