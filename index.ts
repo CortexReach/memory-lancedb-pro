@@ -1686,6 +1686,40 @@ function _dedupHookEvent(handlerName: string, event: any): boolean {
   return false; // first occurrence — proceed
 }
 
+// ============================================================================
+// Phase 2 — Singleton State Management (PR #598)
+// ============================================================================
+
+interface PluginSingletonState {
+  config: ReturnType<typeof parsePluginConfig>;
+  resolvedDbPath: string;
+  store: MemoryStore;
+  embedder: ReturnType<typeof createEmbedder>;
+  decayEngine: ReturnType<typeof createDecayEngine>;
+  tierManager: ReturnType<typeof createTierManager>;
+  retriever: ReturnType<typeof createRetriever>;
+  scopeManager: ReturnType<typeof createScopeManager>;
+  migrator: ReturnType<typeof createMigrator>;
+  smartExtractor: SmartExtractor | null;
+  extractionRateLimiter: ReturnType<typeof createExtractionRateLimiter>;
+  // Session Maps — persist across scope refreshes instead of being recreated
+  reflectionErrorStateBySession: Map<string, ReflectionErrorState>;
+  reflectionDerivedBySession: Map<string, { updatedAt: number; derived: string[] }>;
+  reflectionByAgentCache: Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>;
+  recallHistory: Map<string, Map<string, number>>;
+  turnCounter: Map<string, number>;
+  autoCaptureSeenTextCount: Map<string, number>;
+  autoCapturePendingIngressTexts: Map<string, string[]>;
+  autoCaptureRecentTexts: Map<string, string[]>;
+}
+
+let _singletonState: PluginSingletonState | null = null;
+
+function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
+  // Resources will be migrated here in next commit
+  return null!;
+}
+
 const memoryLanceDBProPlugin = {
   id: "memory-lancedb-pro",
   name: "Memory (LanceDB Pro)",
