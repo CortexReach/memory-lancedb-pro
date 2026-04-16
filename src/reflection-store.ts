@@ -276,13 +276,14 @@ export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlice
   );
 
   // Check whether legacy rows add any content not already covered by resolved items.
+  // F4 fix: apply same normalization pipeline to both sides
   const legacyHasUniqueInvariant = legacyRows.some(({ metadata }) =>
-    toStringArray(metadata.invariants).some(
+    sanitizeInjectableReflectionLines(toStringArray(metadata.invariants)).some(
       (line) => !resolvedInvariantTexts.has(normalizeReflectionLineForAggregation(line))
     )
   );
   const legacyHasUniqueDerived = legacyRows.some(({ metadata }) =>
-    toStringArray(metadata.derived).some(
+    sanitizeInjectableReflectionLines(toStringArray(metadata.derived)).some(
       (line) => !resolvedDerivedTexts.has(normalizeReflectionLineForAggregation(line))
     )
   );
@@ -303,16 +304,19 @@ export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlice
   // [P2] Per-section legacy filtering: only pass legacy rows that have unique
   // content for this specific section. Prevents resolved items in section A from being
   // revived when section B has unique legacy content (cross-section legacy fallback bug).
-  const invariantLegacyRows = legacyRows.filter(({ metadata }) =>
-    toStringArray(metadata.invariants).some(
-      (line) => !resolvedInvariantTexts.has(normalizeReflectionLineForAggregation(line))
-    )
-  );
-  const derivedLegacyRows = legacyRows.filter(({ metadata }) =>
-    toStringArray(metadata.derived).some(
-      (line) => !resolvedDerivedTexts.has(normalizeReflectionLineForAggregation(line))
-    )
-  );
+  // MR1 fix: exclude rows where ALL lines are resolved, not just some.
+  const invariantLegacyRows = legacyRows.filter(({ metadata }) => {
+    const lines = sanitizeInjectableReflectionLines(toStringArray(metadata.invariants));
+    if (lines.length === 0) return false;
+    // Keep row only if at least one line is NOT resolved
+    return lines.some((line) => !resolvedInvariantTexts.has(normalizeReflectionLineForAggregation(line)));
+  });
+  const derivedLegacyRows = legacyRows.filter(({ metadata }) => {
+    const lines = sanitizeInjectableReflectionLines(toStringArray(metadata.derived));
+    if (lines.length === 0) return false;
+    // Keep row only if at least one line is NOT resolved
+    return lines.some((line) => !resolvedDerivedTexts.has(normalizeReflectionLineForAggregation(line)));
+  });
 
   const invariantCandidates = buildInvariantCandidates(unresolvedItemRows, invariantLegacyRows);
   const derivedCandidates = buildDerivedCandidates(unresolvedItemRows, derivedLegacyRows);
