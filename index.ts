@@ -1909,6 +1909,7 @@ const memoryLanceDBProPlugin = {
       embedder,
       retriever,
       scopeManager,
+      migrator,
       smartExtractor,
       decayEngine,
       tierManager,
