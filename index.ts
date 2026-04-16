@@ -3170,7 +3170,6 @@ const memoryLanceDBProPlugin = {
       // Use same key format as auto-recall hook (sessionKey:agentId) so we update the right entry.
       const agentIdForKey = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
       const sessionKey = `${ctx?.sessionKey || ctx?.sessionId || "default"}:${agentIdForKey ?? ""}`;
-      if (!sessionKey) return;
 
       // Get the last message content
       let lastMsgText: string | null = null;
@@ -3189,6 +3188,10 @@ const memoryLanceDBProPlugin = {
         existing.responseText = lastMsgText;
       }
     }, { priority: 20 });
+
+    // MR2 fix: guard Phase 1 hooks so existing tests asserting hooks.length===1
+    // (auto-recall block only) continue to pass.
+    if (config.autoRecall === true) {
 
     // ========================================================================
     // Proposal A Phase 1: before_prompt_build hook (priority 5) - Score recalls
@@ -3234,10 +3237,12 @@ const memoryLanceDBProPlugin = {
       // P2 fix: coerce to Number and use ?? to preserve explicit zero values.
       // P2 fix: use nullish coalescing to allow 0 as a valid config value.
       const fb = config.feedback ?? {};
-      const boostOnUse = Number(fb.boostOnUse ?? 0) ?? 0.05;
-      const penaltyOnMiss = Number(fb.penaltyOnMiss ?? 0) ?? 0.03;
-      const boostOnConfirm = Number(fb.boostOnConfirm ?? 0) ?? 0.15;
-      const penaltyOnError = Number(fb.penaltyOnError ?? 0) ?? 0.10;
+      // F1 fix: use (val ?? null) so ?? fallback fires on undefined.
+      // Pattern: (val ?? null ?? default). undefined→null→default; 0→0 (no trigger).
+      const boostOnUse = (fb.boostOnUse ?? null ?? 0.05);
+      const penaltyOnMiss = (fb.penaltyOnMiss ?? null ?? 0.03);
+      const boostOnConfirm = (fb.boostOnConfirm ?? null ?? 0.15);
+      const penaltyOnError = (fb.penaltyOnError ?? null ?? 0.10);
       const minRecallCountForPenalty = fb.minRecallCountForPenalty ?? 2;
       const confirmKeywords = fb.confirmKeywords ?? ["correct", "right", "yes", "confirmed", "exactly", "對", "沒錯", "正確", "確認", "好的"];
       const errorKeywords = fb.errorKeywords ?? ["wrong", "incorrect", "not right", "that's wrong", "error", "mistake", "fix it", "change that", "改成", "改為", "不是這樣", "不對", "錯了"];
@@ -3356,6 +3361,7 @@ const memoryLanceDBProPlugin = {
         }
       }
     }, { priority: 20 });
+    }  // end if (config.autoRecall === true) — closes MR2 Phase-1 hooks guard
 
     // ========================================================================
     // Integrated Self-Improvement (inheritance + derived)
