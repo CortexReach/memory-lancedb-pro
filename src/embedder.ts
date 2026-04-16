@@ -33,6 +33,16 @@ class EmbeddingCache {
     this.ttlMs = ttlMinutes * 60_000;
   }
 
+  /** Remove all expired entries. Called on every set() when cache is near capacity. */
+  private _evictExpired(): void {
+    const now = Date.now();
+    for (const [k, entry] of this.cache) {
+      if (now - entry.createdAt > this.ttlMs) {
+        this.cache.delete(k);
+      }
+    }
+  }
+
   private key(text: string, task?: string): string {
     const hash = createHash("sha256").update(`${task || ""}:${text}`).digest("hex").slice(0, 24);
     return hash;
@@ -59,10 +69,15 @@ class EmbeddingCache {
 
   set(text: string, task: string | undefined, vector: number[]): void {
     const k = this.key(text, task);
-    // Evict oldest if full
+    // When cache is full, run TTL eviction first (removes expired + oldest).
+    // This prevents unbounded growth from stale entries while keeping writes O(1).
     if (this.cache.size >= this.maxSize) {
-      const firstKey = this.cache.keys().next().value;
-      if (firstKey !== undefined) this.cache.delete(firstKey);
+      this._evictExpired();
+      // If eviction didn't free enough slots, evict the single oldest LRU entry.
+      if (this.cache.size >= this.maxSize) {
+        const firstKey = this.cache.keys().next().value;
+        if (firstKey !== undefined) this.cache.delete(firstKey);
+      }
     }
     this.cache.set(k, { vector, createdAt: Date.now() });
   }
@@ -559,10 +574,20 @@ export class Embedder {
     if (!this._baseURL) {
       throw new Error("embedWithNativeFetch requires a baseURL");
     }
-    // Ollama's embeddings endpoint is at /v1/embeddings (OpenAI-compatible)
-    const endpoint = this._baseURL.replace(/\/$/, "") + "/embeddings";
+
+    // Fix for Ollama 0.20.5+: /v1/embeddings returns empty arrays for both `input` and `prompt`.
+    // Only /api/embeddings + `prompt` parameter works correctly.
+    // See: https://github.com/CortexReach/memory-lancedb-pro/issues/620
+    const base = this._baseURL.replace(/\/$/, "").replace(/\/v1$/, "");
+    const endpoint = base + "/api/embeddings";
 
     const apiKey = this.clients[0]?.apiKey ?? "ollama";
+
+    // Ollama's /api/embeddings requires "prompt" field, not "input"
+    const ollamaPayload = {
+      model: payload.model,
+      prompt: payload.input,
+    };
 
     const response = await fetch(endpoint, {
       method: "POST",
@@ -570,7 +595,7 @@ export class Embedder {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(ollamaPayload),
       signal: signal,
     });
 
@@ -580,7 +605,10 @@ export class Embedder {
     }
 
     const data = await response.json();
-    return data; // OpenAI-compatible shape: { data: [{ embedding: number[] }] }
+
+    // Ollama /api/embeddings returns { embedding: number[] },
+    // convert to OpenAI-compatible shape { data: [{ embedding: number[] }] }
+    return { data: [{ embedding: data.embedding }] };
   }
 
   /**

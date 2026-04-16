@@ -23,6 +23,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/retriever-rerank-regression.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-memory-lifecycle.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-branches.mjs" },
+  { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-embed.test.mjs" },
   { group: "packaging-and-workflow", runner: "node", file: "test/plugin-manifest-regression.mjs" },
   { group: "core-regression", runner: "node", file: "test/session-summary-before-reset.test.mjs", args: ["--test"] },
   { group: "packaging-and-workflow", runner: "node", file: "test/sync-plugin-version.test.mjs", args: ["--test"] },
@@ -40,7 +41,12 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/cross-process-lock.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/preference-slots.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/is-latest-auto-supersede.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/hook-dedup-phase1.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/temporal-awareness.test.mjs", args: ["--test"] },
+  // Issue #598 regression tests
+  { group: "core-regression", runner: "node", file: "test/store-serialization.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/access-tracker-retry.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/embedder-cache.test.mjs" },
 ];
 
 export function getEntriesForGroup(group) {

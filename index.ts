@@ -226,21 +226,6 @@ interface PluginConfig {
     skipLowValue?: boolean;
     maxExtractionsPerHour?: number;
   };
-  feedback?: {
-    /** Boost importance when a recalled memory is used (default: 0.05) */
-    boostOnUse?: number;
-    /** Penalty when a recalled memory is not used after consecutive misses (default: 0.03) */
-    penaltyOnMiss?: number;
-    /** Extra boost when user explicitly confirms a recalled memory is correct (default: 0.15) */
-    boostOnConfirm?: number;
-    /** Extra penalty when user explicitly corrects a non-recalled memory (default: 0.10) */
-    penaltyOnError?: number;
-    /** Minimum recall (injection) count before penalty applies to this memory (default: 2) */
-    minRecallCountForPenalty?: number;
-    /** Keywords indicating user confirmation of a recalled memory */
-    confirmKeywords?: string[];
-    /** Keywords indicating user correction/error for a non-recalled memory */
-    errorKeywords?: string[];
   };
 }
 
@@ -260,6 +245,11 @@ function getDefaultDbPath(): string {
 function getDefaultWorkspaceDir(): string {
   const home = homedir();
   return join(home, ".openclaw", "workspace");
+}
+
+function getDefaultMdMirrorDir(): string {
+  const home = homedir();
+  return join(home, ".openclaw", "memory", "md-mirror");
 }
 
 function resolveWorkspaceDirFromContext(context: Record<string, unknown> | undefined): string {
@@ -1374,7 +1364,7 @@ export function detectCategory(
 
 function sanitizeForContext(text: string): string {
   return text
-    .replace(/[\r\n]+/g, " ")
+    .replace(/[\r\n]+/g, "\\n")
     .replace(/<\/?[a-zA-Z][^>]*>/g, "")
     .replace(/</g, "\uFF1C")
     .replace(/>/g, "\uFF1E")
@@ -1543,7 +1533,9 @@ function createMdMirrorWriter(
 ): MdMirrorWriter | null {
   if (config.mdMirror?.enabled !== true) return null;
 
-  const fallbackDir = api.resolvePath(config.mdMirror.dir || "memory-md");
+  const fallbackDir = api.resolvePath(
+    config.mdMirror.dir ?? getDefaultMdMirrorDir(),
+  );
   const workspaceMap = resolveAgentWorkspaceMap(api);
 
   if (Object.keys(workspaceMap).length > 0) {
@@ -1636,6 +1628,45 @@ const pluginVersion = getPluginVersion();
 // Using WeakSet instead of a module-level boolean avoids the "second register() call skips
 // hook/tool registration for the new API instance" regression that rwmjhb identified.
 const _registeredApis = new WeakSet<OpenClawPluginApi>();
+
+// ============================================================================
+// Hook Event Deduplication (Phase 1)
+// ============================================================================
+//
+// OpenClaw calls register() once per scope init (5× at startup, 4× per inbound
+// message that triggers a scope cache-miss). Each call pushes handlers into the
+// global registerInternalHook Map. Without guarding, handlers accumulate
+// unboundedly — observed: 200+ duplicate handlers after hours of uptime.
+//
+// We cannot guard at registration time because clearInternalHooks() is called
+// between the first and subsequent register() calls. Guard at handler invocation
+// instead, keyed on (handlerName, sessionKey, timestamp).
+//
+
+/** Dedup guard: Set of already-processed hook event keys. */
+const _hookEventDedup = new Set<string>();
+
+/**
+ * Returns true if this event was already processed (skip), false if first
+ * occurrence (proceed). Automatically prunes Set when size > 200.
+ */
+function _dedupHookEvent(handlerName: string, event: any): boolean {
+  const sk = typeof event?.sessionKey === "string" ? event.sessionKey : "?";
+  const ts = event?.timestamp instanceof Date
+    ? event.timestamp.getTime()
+    : (typeof event?.timestamp === "number" ? event.timestamp : Date.now());
+  const key = `${handlerName}:${sk}:${ts}`;
+  if (_hookEventDedup.has(key)) return true; // duplicate — skip
+  _hookEventDedup.add(key);
+  if (_hookEventDedup.size > 200) {
+    // Keep newest 100: convert to array (preserves insertion order), slice last 100, clear, re-add
+    const arr = Array.from(_hookEventDedup);
+    const newest100 = arr.slice(-100);
+    _hookEventDedup.clear();
+    for (const k of newest100) _hookEventDedup.add(k);
+  }
+  return false; // first occurrence — proceed
+}
 
 const memoryLanceDBProPlugin = {
   id: "memory-lancedb-pro",
@@ -2264,6 +2295,10 @@ const memoryLanceDBProPlugin = {
 
       const AUTO_RECALL_TIMEOUT_MS = parsePositiveInt(config.autoRecallTimeoutMs) ?? 5_000; // configurable; default raised from 3s to 5s for remote embedding APIs behind proxies
       api.on("before_prompt_build", async (event: any, ctx: any) => {
+        // Skip auto-recall for sub-agent sessions — their context comes from the parent.
+        const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
+        if (sessionKey.includes(":subagent:")) return;
+
         // Per-agent exclusion: skip auto-recall for agents in the exclusion list.
         const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
         if (
@@ -2442,7 +2477,34 @@ const memoryLanceDBProPlugin = {
             const summary = sanitizeForContext(contentText).slice(0, effectivePerItemMaxChars);
             return {
               id: r.entry.id,
-              prefix: `${tierPrefix}[${displayCategory}:${r.entry.scope}]`,
+              prefix: (() => {
+                // If recallPrefix.categoryField is configured, read that field directly
+                // from the raw metadata JSON and use it as the category label when present.
+                // Falls back to displayCategory when the field is absent or unset.
+                // Reading from raw JSON (not metaObj) avoids relying on parseSmartMetadata
+                // passing through unknown fields.
+                const categoryFieldName = config.recallPrefix?.categoryField;
+                let effectiveCategory = displayCategory;
+                if (categoryFieldName) {
+                  try {
+                    const rawMeta: Record<string, unknown> = r.entry.metadata
+                      ? (JSON.parse(r.entry.metadata) as Record<string, unknown>)
+                      : {};
+                    const fieldValue = rawMeta[categoryFieldName];
+                    if (typeof fieldValue === "string" && fieldValue) {
+                      effectiveCategory = fieldValue;
+                    }
+                  } catch {
+                    // malformed metadata — keep displayCategory
+                  }
+                }
+                const base = `${tierPrefix}[${effectiveCategory}:${r.entry.scope}]`;
+                const parts: string[] = [base];
+                if (r.entry.timestamp)
+                  parts.push(new Date(r.entry.timestamp).toISOString().slice(0, 10));
+                if (metaObj.source) parts.push(`(${metaObj.source})`);
+                return parts.join(" ");
+              })(),
               summary,
               chars: summary.length,
               meta: metaObj,
@@ -3177,18 +3239,16 @@ const memoryLanceDBProPlugin = {
 
     if (config.selfImprovement?.enabled !== false) {
       api.registerHook("agent:bootstrap", async (event) => {
+        const context = (event.context || {}) as Record<string, unknown>;
+        const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
+
+        // Validation BEFORE dedup — invalid sessions must NOT pollute the dedup set
+        if (isInternalReflectionSessionKey(sessionKey)) { return; }
+        if (config.selfImprovement?.skipSubagentBootstrap !== false && sessionKey.includes(":subagent:")) { return; }
+
+        if (_dedupHookEvent("bootstrap", event)) return;
         try {
-          const context = (event.context || {}) as Record<string, unknown>;
-          const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
           const workspaceDir = resolveWorkspaceDirFromContext(context);
-
-          if (isInternalReflectionSessionKey(sessionKey)) {
-            return;
-          }
-
-          if (config.selfImprovement?.skipSubagentBootstrap !== false && sessionKey.includes(":subagent:")) {
-            return;
-          }
 
           if (config.selfImprovement?.ensureLearningFiles !== false) {
             await ensureSelfImprovementLearningFiles(workspaceDir);
@@ -3220,6 +3280,14 @@ const memoryLanceDBProPlugin = {
 
       if (config.selfImprovement?.beforeResetNote !== false) {
         const appendSelfImprovementNote = async (event: any) => {
+          // Basic validation BEFORE dedup — skip events that will legitimately return anyway
+          if (!Array.isArray(event.messages)) {
+            api.logger.warn(`self-improvement: command:${String(event?.action || "unknown")} missing event.messages array; skip note inject`);
+            return;
+          }
+
+          if (_dedupHookEvent("selfImprovement", event)) return;
+
           try {
             const action = String(event?.action || "unknown");
             const sessionKeyForLog = typeof event?.sessionKey === "string" ? event.sessionKey : "";
@@ -3231,11 +3299,6 @@ const memoryLanceDBProPlugin = {
             api.logger.info(
               `self-improvement: command:${action} hook start; sessionKey=${sessionKeyForLog || "(none)"}; source=${commandSource || "(unknown)"}; hasMessages=${Array.isArray(event?.messages)}; contextKeys=${contextKeys || "(none)"}`
             );
-
-            if (!Array.isArray(event.messages)) {
-              api.logger.warn(`self-improvement: command:${action} missing event.messages array; skip note inject`);
-              return;
-            }
 
             // Skip self-improvement note on Discord channel (non-thread) resets
             // to avoid contributing to the post-reset startup race on Discord channels.
@@ -3362,6 +3425,8 @@ const memoryLanceDBProPlugin = {
 
       api.on("before_prompt_build", async (_event: any, ctx: any) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
+        // Skip reflection injection for sub-agent sessions.
+        if (sessionKey.includes(":subagent:")) return;
         if (isInternalReflectionSessionKey(sessionKey)) return;
         if (reflectionInjectMode !== "inheritance-only" && reflectionInjectMode !== "inheritance+derived") return;
         try {
@@ -3389,6 +3454,8 @@ const memoryLanceDBProPlugin = {
 
       api.on("before_prompt_build", async (_event: any, ctx: any) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
+        // Skip reflection injection for sub-agent sessions.
+        if (sessionKey.includes(":subagent:")) return;
         if (isInternalReflectionSessionKey(sessionKey)) return;
         const agentId = resolveHookAgentId(
           typeof ctx.agentId === "string" ? ctx.agentId : undefined,
@@ -3470,6 +3537,14 @@ const memoryLanceDBProPlugin = {
 
       const runMemoryReflection = async (event: any) => {
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
+
+        // Validate sessionKey BEFORE dedup — invalid/empty keys must NOT pollute the dedup set
+        if (!sessionKey) {
+          // skip events without a valid sessionKey — they are not meaningful for reflection
+          return;
+        }
+
+        if (_dedupHookEvent("reflection", event)) return;
         // Guard against re-entrant calls for the same session (e.g. file-write triggering another command:new)
         // Uses global lock shared across all plugin instances to prevent loop amplification.
         const globalLock = getGlobalReflectionLock();
@@ -4323,14 +4398,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
                 : 30,
           }
         : { skipLowValue: false, maxExtractionsPerHour: 30 },
-    // Bug 3 fix: parse and return the feedback config block so deployments
-    // that specify custom feedback values actually take effect instead of
-    // falling back to hardcoded defaults.
-    feedback: typeof cfg.feedback === "object" && cfg.feedback !== null
-      ? { ...(cfg.feedback as Record<string, unknown>) }
-      : {},
   };
 }
+
+export { getDefaultMdMirrorDir };
 
 /**
  * Resets the registration state — primarily intended for use in tests that need

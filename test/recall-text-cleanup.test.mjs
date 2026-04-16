@@ -924,5 +924,176 @@ describe("recall text cleanup", () => {
     assert.equal(res.details.memories.length, 3);
     assert.match(res.content[0].text, /称呼偏好：宙斯/);
   });
+
+  // --- PR #602: recall prefix format tests ---
+
+  function makeAutoRecallHarness(workspaceDir, mockResults, extraConfig = {}) {
+    const retrieverMod = jiti("../src/retriever.js");
+    retrieverMod.createRetriever = function mockCreateRetriever() {
+      return {
+        async retrieve() { return mockResults; },
+        getConfig() { return { mode: "hybrid" }; },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+    const embedderMod = jiti("../src/embedder.js");
+    embedderMod.createEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() { return new Float32Array(384).fill(0); },
+        async embedPassage() { return new Float32Array(384).fill(0); },
+      };
+    };
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: true,
+        autoRecallMinLength: 1,
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+        ...extraConfig,
+      },
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    const [{ handler: autoRecallHook }] = harness.eventHandlers.get("before_prompt_build") || [];
+    return autoRecallHook;
+  }
+
+  it("uses configured categoryField as display category when field is present in metadata", async () => {
+    const ts = new Date("2024-05-30T00:00:00.000Z").getTime();
+    const hook = makeAutoRecallHarness(workspaceDir, [
+      {
+        entry: {
+          id: "apple-1",
+          text: "reach revenue goal of $1M ARR by end of 2025",
+          category: "other",
+          scope: "global",
+          importance: 0.8,
+          timestamp: ts,
+          metadata: JSON.stringify({ folder: "Goals", source: "manual" }),
+        },
+        score: 0.9,
+        sources: { vector: { score: 0.9, rank: 1 } },
+      },
+    ], { recallPrefix: { categoryField: "folder" } });
+
+    const output = await hook(
+      { prompt: "What are my goals?" },
+      { sessionId: "apple-prefix-test", sessionKey: "agent:main:session:apple-prefix-test", agentId: "main" },
+    );
+
+    assert.ok(output, "expected recall output");
+    // metadata.folder replaces the built-in category in the prefix
+    assert.match(output.prependContext, /\[Goals:/);
+    assert.doesNotMatch(output.prependContext, /\[other:/);
+    // Date is appended from timestamp
+    assert.match(output.prependContext, /2024-05-30/);
+    // Source suffix is present
+    assert.match(output.prependContext, /\(manual\)/);
+  });
+
+  it("falls back to built-in category when categoryField is configured but absent from metadata", async () => {
+    const hook = makeAutoRecallHarness(workspaceDir, [
+      {
+        entry: {
+          id: "plain-1",
+          text: "prefer short commit messages",
+          category: "preference",
+          scope: "global",
+          importance: 0.7,
+          timestamp: Date.now(),
+        },
+        score: 0.85,
+        sources: { vector: { score: 0.85, rank: 1 } },
+      },
+    ], { recallPrefix: { categoryField: "folder" } });
+
+    const output = await hook(
+      { prompt: "What are my preferences?" },
+      { sessionId: "no-folder-test", sessionKey: "agent:main:session:no-folder-test", agentId: "main" },
+    );
+
+    assert.ok(output, "expected recall output");
+    assert.match(output.prependContext, /prefer short commit messages/);
+    // Falls back to built-in category (parseSmartMetadata maps "preference" → "preferences")
+    assert.match(output.prependContext, /\[preferences:global\]/);
+    assert.doesNotMatch(output.prependContext, /\[Goals:/);
+  });
+
+  it("uses built-in category unchanged when recallPrefix.categoryField is not configured", async () => {
+    const hook = makeAutoRecallHarness(workspaceDir, [
+      {
+        entry: {
+          id: "default-1",
+          text: "prefer short commit messages",
+          category: "preference",
+          scope: "global",
+          importance: 0.7,
+          timestamp: Date.now(),
+          metadata: JSON.stringify({ folder: "Preferences", source: "manual" }),
+        },
+        score: 0.85,
+        sources: { vector: { score: 0.85, rank: 1 } },
+      },
+    ]); // no recallPrefix config
+
+    const output = await hook(
+      { prompt: "What are my preferences?" },
+      { sessionId: "default-prefix-test", sessionKey: "agent:main:session:default-prefix-test", agentId: "main" },
+    );
+
+    assert.ok(output, "expected recall output");
+    assert.match(output.prependContext, /prefer short commit messages/);
+    // No categoryField configured — folder is ignored, built-in category used
+    assert.match(output.prependContext, /\[preferences:global\]/);
+    assert.doesNotMatch(output.prependContext, /\[Preferences:/);
+  });
+
+  it("includes tier prefix in recall line when tier metadata is present", async () => {
+    const hook = makeAutoRecallHarness(workspaceDir, [
+      {
+        entry: {
+          id: "tiered-1",
+          text: "always use absolute imports",
+          category: "fact",
+          scope: "global",
+          importance: 0.9,
+          timestamp: Date.now(),
+          metadata: JSON.stringify({ tier: "l1" }),
+        },
+        score: 0.88,
+        sources: { vector: { score: 0.88, rank: 1 } },
+      },
+      {
+        entry: {
+          id: "tiered-2",
+          text: "prefer TypeScript strict mode",
+          category: "preference",
+          scope: "global",
+          importance: 0.85,
+          timestamp: Date.now(),
+          metadata: JSON.stringify({ tier: "l2" }),
+        },
+        score: 0.82,
+        sources: { vector: { score: 0.82, rank: 2 } },
+      },
+    ]);
+
+    const output = await hook(
+      { prompt: "What are my coding preferences?" },
+      { sessionId: "tier-prefix-test", sessionKey: "agent:main:session:tier-prefix-test", agentId: "main" },
+    );
+
+    assert.ok(output, "expected recall output");
+    // Both entries should have a tier prefix (first char of tier, uppercased, in brackets)
+    const lines = output.prependContext.split("\n").filter((l) => l.startsWith("- ["));
+    assert.ok(lines.length >= 2, "expected at least 2 recall lines");
+    for (const line of lines) {
+      assert.match(line, /^- \[[A-Z]\]\[/, "recall line should start with tier prefix [X][");
+    }
+  });
 });
 

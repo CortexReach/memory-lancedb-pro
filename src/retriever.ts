@@ -759,9 +759,6 @@ export class MemoryRetriever {
       );
 
       failureStage = "vector.postProcess";
-      // Bug 7 fix: when decayEngine is active, skip applyRecencyBoost here
-      // because applyDecayBoost already incorporates recency into its composite
-      // score. Calling both double-counts recency for vector-only results.
       const recencyBoosted = this.decayEngine
         ? mapped
         : this.applyRecencyBoost(mapped);
