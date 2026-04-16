@@ -252,8 +252,59 @@ export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlice
   const itemRows = reflectionRows.filter(({ metadata }) => metadata.type === "memory-reflection-item");
   const legacyRows = reflectionRows.filter(({ metadata }) => metadata.type === "memory-reflection");
 
-  const invariantCandidates = buildInvariantCandidates(itemRows, legacyRows);
-  const derivedCandidates = buildDerivedCandidates(itemRows, legacyRows);
+  // [P1] Filter out resolved items — passive suppression for #447
+  const unresolvedItemRows = itemRows.filter(({ metadata }) => metadata.resolvedAt === undefined);
+  const resolvedItemRows = itemRows.filter(({ metadata }) => metadata.resolvedAt !== undefined);
+
+  const hasItemRows = itemRows.length > 0;
+  const hasLegacyRows = legacyRows.length > 0;
+
+  // Collect normalized text of resolved items for deduplication
+  const resolvedInvariantTexts = new Set(
+    resolvedItemRows
+      .filter(({ metadata }) => metadata.itemKind === "invariant")
+      .flatMap(({ entry }) => sanitizeInjectableReflectionLines([entry.text]))
+      .map((line) => normalizeReflectionLineForAggregation(line))
+  );
+  const resolvedDerivedTexts = new Set(
+    resolvedItemRows
+      .filter(({ metadata }) => metadata.itemKind === "derived")
+      .flatMap(({ entry }) => sanitizeInjectableReflectionLines([entry.text]))
+      .map((line) => normalizeReflectionLineForAggregation(line))
+  );
+
+  // Check whether legacy rows add unique content
+  const legacyHasUniqueInvariant = legacyRows.some(({ metadata }) =>
+    sanitizeInjectableReflectionLines(toStringArray(metadata.invariants)).some(
+      (line) => !resolvedInvariantTexts.has(normalizeReflectionLineForAggregation(line))
+    )
+  );
+  const legacyHasUniqueDerived = legacyRows.some(({ metadata }) =>
+    sanitizeInjectableReflectionLines(toStringArray(metadata.derived)).some(
+      (line) => !resolvedDerivedTexts.has(normalizeReflectionLineForAggregation(line))
+    )
+  );
+
+  // Suppress when all items resolved and no unique legacy content
+  const shouldSuppress = hasItemRows && unresolvedItemRows.length === 0 && (!hasLegacyRows || (!legacyHasUniqueInvariant && !legacyHasUniqueDerived));
+  if (shouldSuppress) {
+    return { invariants: [], derived: [] };
+  }
+
+  // [P2] Per-section legacy filtering — MR1 fix + F4 fix
+  const invariantLegacyRows = legacyRows.filter(({ metadata }) => {
+    const lines = sanitizeInjectableReflectionLines(toStringArray(metadata.invariants));
+    if (lines.length === 0) return false;
+    return lines.some((line) => !resolvedInvariantTexts.has(normalizeReflectionLineForAggregation(line)));
+  });
+  const derivedLegacyRows = legacyRows.filter(({ metadata }) => {
+    const lines = sanitizeInjectableReflectionLines(toStringArray(metadata.derived));
+    if (lines.length === 0) return false;
+    return lines.some((line) => !resolvedDerivedTexts.has(normalizeReflectionLineForAggregation(line)));
+  });
+
+  const invariantCandidates = buildInvariantCandidates(unresolvedItemRows, invariantLegacyRows);
+  const derivedCandidates = buildDerivedCandidates(unresolvedItemRows, derivedLegacyRows);
 
   const invariants = rankReflectionLines(invariantCandidates, {
     now,
