@@ -400,8 +400,12 @@ export function isRecallUsed(
         if (
           summaryLower.length >= 10 &&
           (responseTrimmedLower.includes(summaryLower) ||
-            // Also check the reverse (summary contains response snippet — agent echoed it)
-            summaryLower.includes(responseTrimmedLower.slice(0, Math.min(50, responseTrimmedLower.length))))
+            // Also check the reverse (summary contains response snippet — agent echoed it).
+            // F3 fix: require >= 10 chars to avoid false positives on short acknowledgments.
+            (() => {
+              const snippet = responseTrimmedLower.slice(0, Math.min(50, responseTrimmedLower.length));
+              return snippet.length >= 10 && summaryLower.includes(snippet);
+            })())
         ) {
           return true;
         }

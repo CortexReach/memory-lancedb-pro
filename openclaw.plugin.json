@@ -4,7 +4,9 @@
   "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, long-context chunking, and management CLI",
   "version": "1.1.0-beta.10",
   "kind": "memory",
-  "skills": ["./skills"],
+  "skills": [
+    "./skills"
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -161,7 +163,12 @@
       },
       "recallMode": {
         "type": "string",
-        "enum": ["full", "summary", "adaptive", "off"],
+        "enum": [
+          "full",
+          "summary",
+          "adaptive",
+          "off"
+        ],
         "default": "full",
         "description": "Auto-recall depth mode. 'full': inject with configured per-item budget. 'summary': L0 abstracts only (compact). 'adaptive': analyze query intent to auto-select category and depth. 'off': disable auto-recall injection."
       },
@@ -260,23 +267,78 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "utility": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
-              "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
-              "novelty": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
-              "recency": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
-              "typePrior": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.6 }
+              "utility": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.1
+              },
+              "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.1
+              },
+              "novelty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.1
+              },
+              "recency": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.1
+              },
+              "typePrior": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.6
+              }
             }
           },
           "typePriors": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "profile": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.95 },
-              "preferences": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.9 },
-              "entities": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.75 },
-              "events": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.45 },
-              "cases": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.8 },
-              "patterns": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.85 }
+              "profile": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.95
+              },
+              "preferences": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.9
+              },
+              "entities": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.75
+              },
+              "events": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.45
+              },
+              "cases": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.8
+              },
+              "patterns": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.85
+              }
             }
           }
         }
@@ -851,6 +913,88 @@
             "maximum": 200,
             "default": 30,
             "description": "Maximum number of auto-capture extractions allowed per hour"
+          }
+        }
+      },
+      "feedback": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Recall-feedback loop: adjusts memory importance based on usage signals.",
+        "properties": {
+          "boostOnUse": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.05,
+            "description": "Boost when a recalled memory is confirmed as used (default: 0.05)"
+          },
+          "penaltyOnMiss": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.03,
+            "description": "Penalty on silent miss after consecutive injections (default: 0.03)"
+          },
+          "boostOnConfirm": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.15,
+            "description": "Extra boost when user explicitly confirms a recalled memory (default: 0.15)"
+          },
+          "penaltyOnError": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.1,
+            "description": "Penalty when user explicitly corrects a non-recalled memory (default: 0.10)"
+          },
+          "minRecallCountForPenalty": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 2,
+            "description": "Minimum injection count before penalty applies (default: 2)"
+          },
+          "confirmKeywords": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "correct",
+              "right",
+              "yes",
+              "confirmed",
+              "exactly",
+              "對",
+              "沒錯",
+              "正確",
+              "確認",
+              "好的"
+            ],
+            "description": "Keywords indicating user confirmed a recalled memory"
+          },
+          "errorKeywords": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "wrong",
+              "incorrect",
+              "not right",
+              "that's wrong",
+              "error",
+              "mistake",
+              "fix it",
+              "change that",
+              "改成",
+              "改為",
+              "不是這樣",
+              "不對",
+              "錯了"
+            ],
+            "description": "Keywords indicating user explicitly corrected a non-recalled memory"
           }
         }
       }
