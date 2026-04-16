@@ -2027,9 +2027,6 @@ const memoryLanceDBProPlugin = {
 
       return tierOverrides;
     }
-    const reflectionErrorStateBySession = new Map<string, ReflectionErrorState>();
-    const reflectionDerivedBySession = new Map<string, { updatedAt: number; derived: string[] }>();
-    const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
 
     const pruneOldestByUpdatedAt = <T extends { updatedAt: number }>(map: Map<string, T>, maxSize: number) => {
       if (map.size <= maxSize) return;
@@ -2135,20 +2132,6 @@ const memoryLanceDBProPlugin = {
       reflectionByAgentCache.set(cacheKey, next);
       return next;
     };
-
-    // Session-based recall history to prevent redundant injections
-    // Map<sessionId, Map<memoryId, turnIndex>>
-    const recallHistory = new Map<string, Map<string, number>>();
-
-    // Map<sessionId, turnCounter> - manual turn tracking per session
-    const turnCounter = new Map<string, number>();
-
-    // Track how many normalized user texts have already been seen per session snapshot.
-    // All three Maps are pruned to AUTO_CAPTURE_MAP_MAX_ENTRIES to prevent unbounded
-    // growth in long-running processes with many distinct sessions.
-    const autoCaptureSeenTextCount = new Map<string, number>();
-    const autoCapturePendingIngressTexts = new Map<string, string[]>();
-    const autoCaptureRecentTexts = new Map<string, string[]>();
 
     const logReg = isCliMode() ? api.logger.debug : api.logger.info;
     logReg(
