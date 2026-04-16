@@ -170,6 +170,30 @@ function simpleEnrich(
 // ============================================================================
 // Memory Upgrader (Two-Phase)
 // ============================================================================
+//
+// REFACTORING NOTE (Issue #632):
+// ---------------------------
+// The old implementation had each entry call store.update() individually, causing:
+//   - N lock acquisitions for N entries = high contention
+//   - Plugin waits seconds while LLM runs between lock acquisitions
+//
+// The new two-phase approach separates:
+//   - Phase 1: LLM enrichment (no lock, runs quickly)
+//   - Phase 2: DB writes (single lock per batch)
+//
+// OLD FLOW (removed):
+//   for (const entry of batch) {
+//     await this.upgradeEntry(entry); // LLM + store.update() inside lock
+//   }
+//
+// NEW FLOW:
+//   Phase 1: await this.prepareEntry() for all entries (no lock)
+//   Phase 2: await this.writeEnrichedBatch() (single lock for all writes)
+//
+// The logic inside prepareEntry() is IDENTICAL to what upgradeEntry() did -
+// only the timing/ordering has changed to reduce lock contention.
+//
+// ============================================================================
 
 export class MemoryUpgrader {
   private log: (msg: string) => void;
@@ -225,7 +249,15 @@ export class MemoryUpgrader {
 
   /**
    * Phase 1: Enrich a single entry (no lock needed).
-   * This is a pure function with no side effects.
+   * 
+   * This method contains the SAME logic that was previously inside upgradeEntry():
+   *   - Reverse-map category
+   *   - Generate L0/L1/L2 via LLM (or simple fallback)
+   * 
+   * The difference is that now this runs WITHOUT acquiring a lock,
+   * allowing all entries in a batch to be enriched concurrently.
+   * 
+   * @returns EnrichedEntry containing all data needed for DB write (Phase 2)
    */
   private async prepareEntry(
     entry: MemoryEntry,
@@ -289,6 +321,12 @@ export class MemoryUpgrader {
 
   /**
    * Phase 2: Write all enriched entries to DB under a single lock.
+   * 
+   * This method groups all DB writes into ONE lock acquisition,
+   * reducing lock contention from N locks (one per entry) to 1 lock per batch.
+   * 
+   * The actual update logic (buildSmartMetadata, stringifySmartMetadata, store.update)
+   * is the SAME as it was in the old upgradeEntry() - only the timing changed.
    */
   private async writeEnrichedBatch(
     batch: EnrichedEntry[],
@@ -345,8 +383,22 @@ export class MemoryUpgrader {
   /**
    * Main upgrade entry point with two-phase processing.
    * 
-   * Phase 1: LLM enrichment (no lock)
-   * Phase 2: DB writes (single lock per batch)
+   * ISSUE #632 FIX:
+   * Before this fix, each entry was processed sequentially with its own lock:
+   *   for (entry in batch) { upgradeEntry(entry); } // N locks
+   * 
+   * Now we use two-phase processing:
+   *   Phase 1: Enrich all entries (no lock) -> collect results
+   *   Phase 2: Write all results (one lock) -> done
+   * 
+   * This reduces lock acquisitions from N (one per entry) to 1 (per batch).
+   * 
+   * EXAMPLE: 10 entries with batchSize=10
+   *   Before: 10 lock acquisitions (one per entry)
+   *   After:  1 lock acquisition (all writes grouped)
+   * 
+   * The LLM enrichment still runs for each entry, but WITHOUT holding a lock,
+   * so the plugin can acquire the lock between entries if needed.
    */
   async upgrade(options: UpgradeOptions = {}): Promise<UpgradeResult> {
     const batchSize = options.batchSize ?? this.options.batchSize ?? 10;
@@ -410,6 +462,11 @@ export class MemoryUpgrader {
       // =====================================================================
       // Phase 1: LLM enrichment (no lock, can be concurrent)
       // =====================================================================
+      // NOTE: This loop runs WITHOUT holding a lock.
+      // Each entry's LLM enrichment happens in sequence here, but the plugin
+      // can acquire the lock between entries if needed.
+      // Previously, store.update() was called inside upgradeEntry() which held
+      // the lock during LLM processing - causing the contention issue.
       const enrichedBatch: EnrichedEntry[] = [];
 
       for (const entry of batch) {
@@ -426,6 +483,9 @@ export class MemoryUpgrader {
       // =====================================================================
       // Phase 2: DB writes under single lock
       // =====================================================================
+      // Previously, each entry's store.update() acquired its own lock.
+      // Now we group all writes into ONE lock acquisition per batch.
+      // This is the KEY FIX for Issue #632: from N locks to 1 lock per batch.
       if (enrichedBatch.length > 0) {
         const writeResult = await this.writeEnrichedBatch(enrichedBatch);
         result.upgraded += writeResult.success;
