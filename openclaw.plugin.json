@@ -4,9 +4,6 @@
   "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, long-context chunking, and management CLI",
   "version": "1.1.0-beta.10",
   "kind": "memory",
-  "skills": [
-    "./skills"
-  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -163,30 +160,9 @@
       },
       "recallMode": {
         "type": "string",
-        "enum": [
-          "full",
-          "summary",
-          "adaptive",
-          "off"
-        ],
+        "enum": ["full", "summary", "adaptive", "off"],
         "default": "full",
         "description": "Auto-recall depth mode. 'full': inject with configured per-item budget. 'summary': L0 abstracts only (compact). 'adaptive': analyze query intent to auto-select category and depth. 'off': disable auto-recall injection."
-      },
-      "autoRecallExcludeAgents": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        },
-        "default": [],
-        "description": "Agent IDs excluded from auto-recall injection. When set, these agents will NOT receive auto-recalled memories. Useful for background agents (e.g. cron workers) whose output should not be contaminated by injected context. Cannot be used with autoRecallIncludeAgents."
-      },
-      "autoRecallIncludeAgents": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        },
-        "default": [],
-        "description": "Agent IDs included in auto-recall injection (whitelist mode). When set, ONLY these agents will receive auto-recall. Cannot be used with autoRecallExcludeAgents. Overrides autoRecallExcludeAgents if both are set."
       },
       "captureAssistant": {
         "type": "boolean"
@@ -283,78 +259,23 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "utility": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-                "default": 0.1
-              },
-              "confidence": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-                "default": 0.1
-              },
-              "novelty": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-                "default": 0.1
-              },
-              "recency": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-                "default": 0.1
-              },
-              "typePrior": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-                "default": 0.6
-              }
+              "utility": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
+              "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
+              "novelty": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
+              "recency": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
+              "typePrior": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.6 }
             }
           },
           "typePriors": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "profile": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-                "default": 0.95
-              },
-              "preferences": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-                "default": 0.9
-              },
-              "entities": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-                "default": 0.75
-              },
-              "events": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-                "default": 0.45
-              },
-              "cases": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-                "default": 0.8
-              },
-              "patterns": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-                "default": 0.85
-              }
+              "profile": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.95 },
+              "preferences": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.9 },
+              "entities": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.75 },
+              "events": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.45 },
+              "cases": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.8 },
+              "patterns": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.85 }
             }
           }
         }
@@ -932,7 +853,10 @@
           }
         }
       }
-    }
+    },
+    "required": [
+      "embedding"
+    ]
   },
   "uiHints": {
     "embedding.apiKey": {
@@ -1222,7 +1146,7 @@
     },
     "decay.intrinsicWeight": {
       "label": "Decay Intrinsic Weight",
-      "help": "Weight of importance \u00d7 confidence in lifecycle score.",
+      "help": "Weight of importance × confidence in lifecycle score.",
       "advanced": true
     },
     "decay.betaCore": {
@@ -1429,7 +1353,7 @@
     },
     "memoryCompaction.similarityThreshold": {
       "label": "Similarity Threshold",
-      "help": "How similar two memories must be to merge (0\u20131). 0.88 is a good starting point; raise to 0.92+ for conservative merges.",
+      "help": "How similar two memories must be to merge (0–1). 0.88 is a good starting point; raise to 0.92+ for conservative merges.",
       "advanced": true
     },
     "memoryCompaction.cooldownHours": {
@@ -1449,11 +1373,6 @@
     "extractionThrottle.skipLowValue": {
       "label": "Skip Low-Value Conversations",
       "help": "Skip auto-capture for conversations estimated to have low memory value (< 0.2)"
-    },
-    "extractionThrottle.maxExtractionsPerHour": {
-      "label": "Max Extractions Per Hour",
-      "help": "Rate limit for auto-capture extractions. Prevents excessive LLM calls during rapid-fire sessions.",
-      "advanced": true
     },
     "autoRecallExcludeAgents": {
       "label": "Auto-Recall Excluded Agents",
