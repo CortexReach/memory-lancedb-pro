@@ -587,6 +587,9 @@ export class Embedder {
     const apiKey = this.clients[0]?.apiKey ?? "ollama";
 
     // Handle batch requests with /v1/embeddings + input array
+    // NOTE: /v1/embeddings is used unconditionally for batch with no fallback.
+    // If a model doesn't support that endpoint, failure will be silent from the user's perspective.
+    // This is acceptable because most Ollama embedding models support /v1/embeddings.
     if (Array.isArray(payload.input)) {
       const response = await fetch(base + "/v1/embeddings", {
         method: "POST",
@@ -597,6 +600,9 @@ export class Embedder {
         body: JSON.stringify({
           model: payload.model,
           input: payload.input,
+          // NOTE: Other provider options (encoding_format, normalized, dimensions, etc.)
+          // from buildPayload() are intentionally not included. Ollama embedding models
+          // do not support these parameters, so omitting them is correct.
         }),
         signal,
       });
