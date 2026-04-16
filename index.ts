@@ -451,7 +451,7 @@ export function toImportSpecifier(value: string): string {
   if (process.platform === 'win32' && /^[a-zA-Z]:[/\\]/.test(trimmed)) return pathToFileURL(trimmed).href;
   return trimmed;
 }
-function getExtensionApiImportSpecifiers(): string[] {
+export function getExtensionApiImportSpecifiers(): string[] {
   const envPath = process.env.OPENCLAW_EXTENSION_API_PATH?.trim();
   const specifiers: string[] = [];
 

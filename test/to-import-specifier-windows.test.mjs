@@ -3,12 +3,10 @@
  * PR #593 - Windows path support for extensionAPI.js
  *
  * Tests the behavior of `toImportSpecifier` and `getExtensionApiImportSpecifiers`.
- * toImportSpecifier is imported from index.ts; getExtensionApiImportSpecifiers
- * is a local copy that mirrors the PR #593 implementation (internal, not exported).
+ * Both functions are imported from index.ts (exported for testing) — PR #593.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { join } from "node:path";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import jitiFactory from "jiti";
@@ -22,29 +20,8 @@ const jitiLib = jitiFactory(import.meta.url, {
   },
 });
 
-// Import the actual toImportSpecifier from index.ts via jiti (exported for testing) — PR #593
-const { toImportSpecifier } = jitiLib("../index.ts");
-
-// Copy of the PR #593 getExtensionApiImportSpecifiers implementation (index.ts)
-// Note: intentionally does NOT include the requireFromHere.resolve() call (dead code)
-function getExtensionApiImportSpecifiers() {
-  const envPath = process.env.OPENCLAW_EXTENSION_API_PATH?.trim();
-  const specifiers = [];
-
-  if (envPath) specifiers.push(toImportSpecifier(envPath));
-  specifiers.push("openclaw/dist/extensionAPI.js");
-
-  specifiers.push(toImportSpecifier("/usr/lib/node_modules/openclaw/dist/extensionAPI.js"));
-  specifiers.push(toImportSpecifier("/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js"));
-  specifiers.push(toImportSpecifier("/opt/homebrew/lib/node_modules/openclaw/dist/extensionAPI.js"));
-
-  if (process.platform === "win32" && process.env.APPDATA) {
-    const windowsNpmPath = join(process.env.APPDATA, "npm", "node_modules", "openclaw", "dist", "extensionAPI.js");
-    specifiers.push(toImportSpecifier(windowsNpmPath));
-  }
-
-  return [...new Set(specifiers.filter(Boolean))];
-}
+// Import actual implementations from index.ts via jiti (both exported for testing) — PR #593
+const { toImportSpecifier, getExtensionApiImportSpecifiers } = jitiLib("../index.ts");
 
 // Env helper: set key to value, run fn, restore original
 function withEnv(key, value, fn) {
