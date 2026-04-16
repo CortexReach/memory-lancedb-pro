@@ -104,8 +104,8 @@ function createMockStoreWithLockTracking() {
 // Test Cases
 // ============================================================================
 
-async function testCurrentBehavior_LockPerEntry() {
-  console.log("\n=== Test 1: 驗證目前的實作（每個 entry 都拿一次 lock）===");
+async function testNewBehavior_LockPerBatch() {
+  console.log("\n=== Test 1: 驗證新的實作（每個 batch 只拿一次 lock）===");
   
   const store = createMockStoreWithLockTracking();
   const entries = [
@@ -128,24 +128,19 @@ async function testCurrentBehavior_LockPerEntry() {
 
   const upgrader = createMemoryUpgrader(store, llm);
   
-  // 修改 store 的 update 方法，讓它通過 runWithFileLock
-  const originalUpdate = store.update.bind(store);
-  store.update = async (id, patch) => {
-    return store.runWithFileLock(async () => {
-      return originalUpdate(id, patch);
-    });
-  };
+  // NOTE: 我們不再 mock update 來呼叫 runWithFileLock
+  // 新的實作會在 writeEnrichedBatch 中統一呼叫一次 runWithFileLock
 
   await upgrader.upgrade({ batchSize: 3, noLlm: false });
 
   console.log(`  Lock 取得次數: ${store.state.lockCount}`);
   console.log(`  Update 次數: ${store.state.updates.length}`);
   
-  // 驗證：每個 entry 都拿一次 lock = 3 次
-  assert.equal(store.state.lockCount, 3, "目前實作：應該每個 entry 都拿一次 lock");
+  // 驗證：每個 batch 只拿一次 lock = 1 次（而不是 3 次）
+  assert.equal(store.state.lockCount, 1, "新的兩階段實作：應該每個 batch 只拿一次 lock");
   assert.equal(store.state.updates.length, 3, "應該有 3 次 update");
   
-  console.log("  ✅ Test 1 通過：確認目前的實作每個 entry 都拿一次 lock");
+  console.log("  ✅ Test 1 通過：確認新的實作每個 batch 只拿一次 lock (Issue #632 fix)");
 }
 
 async function testTwoPhaseApproach_LockOnce() {
@@ -431,7 +426,7 @@ async function main() {
   console.log("===========================================");
 
   try {
-    await testCurrentBehavior_LockPerEntry();
+    await testNewBehavior_LockPerBatch();
     await testTwoPhaseApproach_LockOnce();
     await testConcurrentWrites_NoDataLoss();
     await testTwoPhaseVsCurrent_Performance();
