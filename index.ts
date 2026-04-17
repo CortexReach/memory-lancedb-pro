@@ -2298,24 +2298,22 @@ const memoryLanceDBProPlugin = {
         // - Else if autoRecallExcludeAgents is set: all agents EXCEPT these receive auto-recall
 
         const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
-        if (agentId !== undefined) {
-          if (Array.isArray(config.autoRecallIncludeAgents) && config.autoRecallIncludeAgents.length > 0) {
-            if (!config.autoRecallIncludeAgents.includes(agentId)) {
-              api.logger.debug?.(
-                `memory-lancedb-pro: auto-recall skipped for agent '${agentId}' not in autoRecallIncludeAgents`,
-              );
-              return;
-            }
-          } else if (
-            Array.isArray(config.autoRecallExcludeAgents) &&
-            config.autoRecallExcludeAgents.length > 0 &&
-            config.autoRecallExcludeAgents.includes(agentId)
-          ) {
+        if (Array.isArray(config.autoRecallIncludeAgents) && config.autoRecallIncludeAgents.length > 0) {
+          if (!config.autoRecallIncludeAgents.includes(agentId)) {
             api.logger.debug?.(
-              `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}'`,
+              `memory-lancedb-pro: auto-recall skipped for agent '${agentId}' not in autoRecallIncludeAgents`,
             );
             return;
           }
+        } else if (
+          Array.isArray(config.autoRecallExcludeAgents) &&
+          config.autoRecallExcludeAgents.length > 0 &&
+          config.autoRecallExcludeAgents.includes(agentId)
+        ) {
+          api.logger.debug?.(
+            `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}'`,
+          );
+          return;
         }
 
         // Manually increment turn counter for this session

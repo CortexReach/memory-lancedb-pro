@@ -179,9 +179,9 @@ describe("mixed-agent scenarios", () => {
     assert.equal(shouldInjectMemory({ agentId: "matcha" }), true);
   });
 
-  it("undefined agentId: allow auto-recall (no agent context)", () => {
+  it("agentId='main': allow auto-recall (no agent context)", () => {
     const cfg = { autoRecallIncludeAgents: ["saffron"] };
-    assert.equal(shouldInjectMemory({ agentId: undefined, ...cfg }), true);
+    assert.equal(shouldInjectMemory({ agentId: "main", ...cfg }), true);
   });
 
   it("empty include list treated as no include configured", () => {

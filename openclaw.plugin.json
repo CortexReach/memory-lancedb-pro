@@ -1384,12 +1384,12 @@
     },
     "autoRecallExcludeAgents": {
       "label": "Auto-Recall Excluded Agents",
-      "help": "Agent IDs excluded from auto-recall injection. Cannot be used with autoRecallIncludeAgents.",
+      "help": "Agent IDs excluded from auto-recall injection. If autoRecallIncludeAgents is set, it takes precedence (whitelist wins).",
       "advanced": true
     },
     "autoRecallIncludeAgents": {
       "label": "Auto-Recall Included Agents",
-      "help": "Whitelist mode: only these agents receive auto-recall. Overrides autoRecallExcludeAgents.",
+      "help": "Whitelist mode: only these agents receive auto-recall. Takes precedence over autoRecallExcludeAgents if both are set.",
       "advanced": true
     }
   }
