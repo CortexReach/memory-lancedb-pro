@@ -9,7 +9,7 @@ const pluginSdkStubPath = path.resolve(testDir, "helpers", "openclaw-plugin-sdk-
 const jiti = jitiFactory(import.meta.url, {
   interopDefault: true,
   alias: {
-    "openclaw/plugin-sdk": pluginSdkStubPath,
+    "openclaw/plugin-sdk/core": pluginSdkStubPath,
   },
 });
 const { parsePluginConfig } = jiti("../index.ts");

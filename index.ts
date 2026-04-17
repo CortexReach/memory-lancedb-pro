@@ -3,7 +3,7 @@
  * Enhanced LanceDB-backed long-term memory with hybrid retrieval and multi-scope isolation
  */
 
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { readFile, readdir, writeFile, mkdir, appendFile, unlink, stat } from "node:fs/promises";

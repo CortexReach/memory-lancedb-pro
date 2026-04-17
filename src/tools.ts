@@ -4,8 +4,8 @@
  */
 
 import { Type } from "@sinclair/typebox";
-import { stringEnum } from "openclaw/plugin-sdk";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { stringEnum } from "openclaw/plugin-sdk/core";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";

@@ -12,7 +12,7 @@ const extensionApiStubPath = path.resolve(testDir, "helpers", "openclaw-extensio
 const jiti = jitiFactory(import.meta.url, {
   interopDefault: true,
   alias: {
-    "openclaw/plugin-sdk": pluginSdkStubPath,
+    "openclaw/plugin-sdk/core": pluginSdkStubPath,
   },
 });
 
