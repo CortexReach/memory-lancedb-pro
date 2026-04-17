@@ -103,7 +103,7 @@ Each memory contains three levels:
 \`\`\`json
 {
   "category": "cases",
-  "abstract": "LanceDB BigInt error -> Use Number() coercion before arithmetic",
+  "abstract": "LanceDB BigInt numeric handling issue",
   "overview": "## Problem\\nLanceDB 0.26+ returns BigInt for numeric columns\\n\\n## Solution\\nCoerce values with Number(...) before arithmetic",
   "content": "When LanceDB returns BigInt values, wrap them with Number() before doing arithmetic operations."
 }
