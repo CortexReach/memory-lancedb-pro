@@ -29,6 +29,13 @@ export type MemoryCategoryIntent =
 
 export type RecallDepth = "l0" | "l1" | "full";
 
+/**
+ * Knowledge vs Experience routing (arxiv:2602.05665 §V-E).
+ * Set from per-intent-rule hints; consumed by applyMemoryTypeBoost to
+ * promote the matching side of the split.
+ */
+export type MemoryTypeIntent = "knowledge" | "experience";
+
 export interface IntentSignal {
   /** Categories to prioritize (ordered by relevance). */
   categories: MemoryCategoryIntent[];
@@ -38,6 +45,8 @@ export interface IntentSignal {
   confidence: "high" | "medium" | "low";
   /** Short label for logging. */
   label: string;
+  /** Preferred memory type (knowledge vs experience), if the query leans one way. */
+  memoryType?: MemoryTypeIntent;
 }
 
 // ============================================================================
@@ -49,6 +58,7 @@ interface IntentRule {
   patterns: RegExp[];
   categories: MemoryCategoryIntent[];
   depth: RecallDepth;
+  memoryType?: MemoryTypeIntent;
 }
 
 /**
@@ -66,6 +76,22 @@ const INTENT_RULES: IntentRule[] = [
     ],
     categories: ["preference", "decision"],
     depth: "l0",
+    memoryType: "knowledge",
+  },
+
+  // --- Experience / Trajectory queries (K-E decoupling, §V-E) ---
+  // Kept above "decision" so queries like "last time we decided" route to
+  // experience rather than generic decision-rationale.
+  {
+    label: "experience",
+    patterns: [
+      /\b(last time|remember when|recall when|when we (tried|did|built|shipped|deployed))\b/i,
+      /\b(previously|earlier (we|i)|we used to|ran into|encountered)\b/i,
+      /(上次|上回|之前|以前|记得|还记得|那次|那会|先前)/,
+    ],
+    categories: ["decision", "fact"],
+    depth: "full",
+    memoryType: "experience",
   },
 
   // --- Decision / Rationale queries ---
@@ -78,6 +104,7 @@ const INTENT_RULES: IntentRule[] = [
     ],
     categories: ["decision", "fact"],
     depth: "l1",
+    memoryType: "experience",
   },
 
   // --- Entity / People / Project queries ---
@@ -92,6 +119,7 @@ const INTENT_RULES: IntentRule[] = [
     ],
     categories: ["entity", "fact"],
     depth: "l1",
+    memoryType: "knowledge",
   },
 
   // --- Event / Timeline queries ---
@@ -102,10 +130,11 @@ const INTENT_RULES: IntentRule[] = [
     patterns: [
       /\b(when did|what happened|timeline|incident|outage|deploy|release|shipped)\b/i,
       /\b(last (week|month|time|sprint)|recently|yesterday|today)\b/i,
-      /(什么时候|发生了什么|时间线|事件|上线|部署|发布|上次|最近)/,
+      /(什么时候|发生了什么|时间线|事件|上线|部署|发布|最近)/,
     ],
     categories: ["entity", "decision"],
     depth: "full",
+    memoryType: "experience",
   },
 
   // --- Fact / Knowledge queries ---
@@ -114,10 +143,11 @@ const INTENT_RULES: IntentRule[] = [
     patterns: [
       /\b(how (does|do|to)|what (does|do|is)|explain|documentation|spec)\b/i,
       /\b(config|configuration|setup|install|architecture|api|endpoint)\b/i,
-      /(怎么|如何|是什么|解释|文档|规范|配置|安装|架构|接口)/,
+      /(怎么|如何|是什么|解释|文档|规范|配置|安装|架构|接口|原理|规则)/,
     ],
     categories: ["fact", "entity"],
     depth: "l1",
+    memoryType: "knowledge",
   },
 ];
 
@@ -150,6 +180,7 @@ export function analyzeIntent(query: string): IntentSignal {
         depth: rule.depth,
         confidence: "high",
         label: rule.label,
+        memoryType: rule.memoryType,
       };
     }
   }
@@ -187,6 +218,38 @@ export function applyCategoryBoost<
 
   const boosted = results.map((r) => {
     if (prioritySet.has(r.entry.category)) {
+      return { ...r, score: Math.min(1, r.score * boostFactor) };
+    }
+    return r;
+  });
+
+  return boosted.sort((a, b) => b.score - a.score);
+}
+
+/**
+ * Boost results whose stored memory_type matches the intent's memoryType.
+ *
+ * Implements the retrieval half of knowledge-experience decoupling
+ * (arxiv:2602.05665 §V-E). Call AFTER applyCategoryBoost so both signals
+ * compound on the same result set.
+ *
+ * `getMemoryType` reads the stored type from entry metadata — accepting a
+ * callback keeps this module free of JSON-parsing and smart-metadata imports.
+ */
+export function applyMemoryTypeBoost<
+  T extends { entry: { metadata?: string }; score: number },
+>(
+  results: T[],
+  intent: IntentSignal,
+  getMemoryType: (entry: T["entry"]) => "knowledge" | "experience" | undefined,
+  boostFactor = 1.15,
+): T[] {
+  if (!intent.memoryType || intent.confidence === "low") return results;
+
+  const want = intent.memoryType;
+  const boosted = results.map((r) => {
+    const type = getMemoryType(r.entry);
+    if (type === want) {
       return { ...r, score: Math.min(1, r.score * boostFactor) };
     }
     return r;

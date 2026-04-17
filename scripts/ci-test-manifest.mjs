@@ -47,6 +47,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/store-serialization.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/access-tracker-retry.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/embedder-cache.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/knowledge-experience-decoupling.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

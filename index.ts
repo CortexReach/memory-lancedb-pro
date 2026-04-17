@@ -78,7 +78,7 @@ import {
   type AdmissionControlConfig,
   type AdmissionRejectionAuditEntry,
 } from "./src/admission-control.js";
-import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
+import { analyzeIntent, applyCategoryBoost, applyMemoryTypeBoost } from "./src/intent-analyzer.js";
 
 // ============================================================================
 // Configuration & Types
@@ -156,6 +156,8 @@ interface PluginConfig {
     coreDecayFloor?: number;
     workingDecayFloor?: number;
     peripheralDecayFloor?: number;
+    knowledgeHalfLifeMultiplier?: number;
+    experienceHalfLifeMultiplier?: number;
   };
   tier?: {
     coreAccessThreshold?: number;
@@ -2377,8 +2379,16 @@ const memoryLanceDBProPlugin = {
             return;
           }
 
-          // Apply intent-based category boost for adaptive mode
-          const rankedResults = intent ? applyCategoryBoost(results, intent) : results;
+          // Apply intent-based category boost for adaptive mode, then the
+          // knowledge/experience type boost (arxiv:2602.05665 §V-E).
+          const categoryBoosted = intent ? applyCategoryBoost(results, intent) : results;
+          const rankedResults = intent
+            ? applyMemoryTypeBoost(
+                categoryBoosted,
+                intent,
+                (entry) => parseSmartMetadata(entry.metadata, entry).memory_type,
+              )
+            : categoryBoosted;
 
           // Filter out redundant memories based on session history
           const minRepeated = config.autoRecallMinRepeated ?? 8;

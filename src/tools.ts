@@ -21,6 +21,7 @@ import {
   parseSmartMetadata,
   stringifySmartMetadata,
 } from "./smart-metadata.js";
+import type { MemoryType } from "./memory-categories.js";
 import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
 import { TEMPORAL_VERSIONED_CATEGORIES } from "./memory-categories.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./self-improvement-files.js";
@@ -506,7 +507,7 @@ export function registerMemoryRecallTool(
       name: "memory_recall",
       label: "Memory Recall",
       description:
-        "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
+        "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics. Pass type=\"knowledge\" for static/reference facts (profile, preferences, entities, patterns) or type=\"experience\" for past interactions and outcomes (events, cases).",
       parameters: Type.Object({
         query: Type.String({
           description: "Search query for finding relevant memories",
@@ -532,6 +533,9 @@ export function registerMemoryRecallTool(
           }),
         ),
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
+        type: Type.Optional(
+          stringEnum(["knowledge", "experience", "both"] as const),
+        ),
       }),
       async execute(_toolCallId, params) {
         const {
@@ -541,6 +545,7 @@ export function registerMemoryRecallTool(
           maxCharsPerItem = 180,
           scope,
           category,
+          type,
         } = params as {
           query: string;
           limit?: number;
@@ -548,6 +553,7 @@ export function registerMemoryRecallTool(
           maxCharsPerItem?: number;
           scope?: string;
           category?: string;
+          type?: "knowledge" | "experience" | "both";
         };
 
         try {
@@ -575,7 +581,7 @@ export function registerMemoryRecallTool(
             }
           }
 
-          const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry(runtimeContext.retriever, {
+          const rawResults = filterUserMdExclusiveRecallResults(await retrieveWithRetry(runtimeContext.retriever, {
             query,
             limit: safeLimit,
             scopeFilter,
@@ -583,10 +589,19 @@ export function registerMemoryRecallTool(
             source: "manual",
           }, () => runtimeContext.store.count()), runtimeContext.workspaceBoundary);
 
+          const typeFilter: MemoryType | undefined =
+            type === "knowledge" || type === "experience" ? type : undefined;
+          const results = typeFilter
+            ? rawResults.filter(
+                (r) =>
+                  parseSmartMetadata(r.entry.metadata, r.entry).memory_type === typeFilter,
+              )
+            : rawResults;
+
           if (results.length === 0) {
             return {
               content: [{ type: "text", text: "No relevant memories found." }],
-              details: { count: 0, query, scopes: scopeFilter },
+              details: { count: 0, query, scopes: scopeFilter, type: typeFilter ?? "both" },
             };
           }
 
@@ -646,6 +661,7 @@ export function registerMemoryRecallTool(
               scopes: scopeFilter,
               retrievalMode: runtimeContext.retriever.getConfig().mode,
               recallMode: includeFullText ? "full" : "summary",
+              type: typeFilter ?? "both",
             },
           };
         } catch (error) {
