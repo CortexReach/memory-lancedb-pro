@@ -953,9 +953,16 @@ export class MemoryRetriever {
         bm25Results = bm25Result_.value;
       }
 
-      if (vectorResults.length === 0 && bm25Results.length === 0) {
+      // Check if BOTH backends failed (rejected), not just empty results
+      // Empty result sets are valid; only throw when both promises reject
+      const bothFailed =
+        vectorResult_.status === "rejected" && bm25Result_.status === "rejected";
+
+      if (bothFailed) {
+        const vectorError = vectorResult_.reason?.message || "unknown";
+        const bm25Error = bm25Result_.reason?.message || "unknown";
         throw attachFailureStage(
-          new Error("both vector and BM25 search failed"),
+          new Error(`both vector and BM25 search failed: ${vectorError}, ${bm25Error}`),
           "hybrid.parallelSearch",
         );
       }
