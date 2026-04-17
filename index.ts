@@ -1984,6 +1984,167 @@ const memoryLanceDBProPlugin = {
     );
 
     // ========================================================================
+    // Active Memory Runtime Registration
+    // ========================================================================
+
+    const activeMemoryPathPrefix = "memory-lancedb-pro/entries/";
+    const activeMemoryWorkspaceDir = getDefaultWorkspaceDir();
+
+    const formatActiveMemoryPath = (id: string) => `${activeMemoryPathPrefix}${id}.md`;
+
+    const parseActiveMemoryPath = (relPath: string): string | null => {
+      const normalized = relPath.trim().replace(/^\/+/, "");
+      if (!normalized.startsWith(activeMemoryPathPrefix) || !normalized.endsWith(".md")) {
+        return null;
+      }
+      const id = normalized.slice(activeMemoryPathPrefix.length, -3).trim();
+      return id || null;
+    };
+
+    const formatMemoryDocument = (entry: { id: string; text: string; category: string; scope: string; importance: number; timestamp: number }) => {
+      const updatedAt = new Date(entry.timestamp || Date.now()).toISOString();
+      return [
+        `# Memory ${entry.id}`,
+        ``,
+        `- category: ${entry.category}`,
+        `- scope: ${entry.scope}`,
+        `- importance: ${entry.importance}`,
+        `- updatedAt: ${updatedAt}`,
+        ``,
+        entry.text,
+      ].join("\n");
+    };
+
+    const readMemoryDocumentWindow = (content: string, from?: number, lines?: number) => {
+      const allLines = content.split(/\r?\n/);
+      const safeFrom = Math.max(1, Math.floor(from ?? 1));
+      const safeLines = Math.max(1, Math.floor(lines ?? 200));
+      const start = safeFrom - 1;
+      const slice = allLines.slice(start, start + safeLines);
+      const nextFrom = start + slice.length < allLines.length ? start + slice.length + 1 : undefined;
+      return {
+        text: slice.join("\n"),
+        from: safeFrom,
+        lines: slice.length,
+        truncated: nextFrom !== undefined,
+        nextFrom,
+      };
+    };
+
+    api.registerMemoryCapability({
+      runtime: {
+        async getMemorySearchManager({ agentId }) {
+          try {
+            const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
+            const stats = await store.stats(accessibleScopes);
+            const embeddingProbe = await embedder.test();
+            const cacheStats = embedder.cacheStats;
+            const providerStatus = {
+              backend: "builtin" as const,
+              provider: "memory-lancedb-pro",
+              model: config.embedding.model || "text-embedding-3-small",
+              files: stats.totalCount,
+              chunks: stats.totalCount,
+              workspaceDir: activeMemoryWorkspaceDir,
+              dbPath: resolvedDbPath,
+              sources: ["memory"] as const,
+              sourceCounts: [{ source: "memory" as const, files: stats.totalCount, chunks: stats.totalCount }],
+              cache: {
+                enabled: true,
+                entries: cacheStats.size,
+              },
+              vector: {
+                enabled: true,
+                available: embeddingProbe.success,
+                dims: vectorDim,
+              },
+              custom: {
+                plugin: "memory-lancedb-pro",
+                scopes: accessibleScopes,
+                scopeCounts: stats.scopeCounts,
+                categoryCounts: stats.categoryCounts,
+              },
+            };
+
+            return {
+              manager: {
+                async search(query, opts) {
+                  const scopeFilter = accessibleScopes;
+                  const results = await retriever.retrieve({
+                    query,
+                    limit: Math.max(1, Math.min(opts?.maxResults ?? 10, 50)),
+                    scopeFilter,
+                    source: "manual",
+                  });
+                  return results
+                    .filter((result) => (opts?.minScore == null ? true : result.score >= opts.minScore))
+                    .map((result) => {
+                      const path = formatActiveMemoryPath(result.entry.id);
+                      const lineCount = Math.max(1, result.entry.text.split(/\r?\n/).length);
+                      return {
+                        path,
+                        startLine: 1,
+                        endLine: lineCount,
+                        score: result.score,
+                        snippet: result.entry.text.slice(0, 280),
+                        source: "memory" as const,
+                        citation: `memory:${path}`,
+                      };
+                    });
+                },
+                async readFile(params) {
+                  const id = parseActiveMemoryPath(params.relPath);
+                  if (!id) {
+                    throw new Error(`Unsupported memory document path: ${params.relPath}`);
+                  }
+                  const entry = await store.getById(id, accessibleScopes);
+                  if (!entry) {
+                    throw new Error(`Memory document not found: ${params.relPath}`);
+                  }
+                  const content = formatMemoryDocument(entry);
+                  return {
+                    path: formatActiveMemoryPath(entry.id),
+                    ...readMemoryDocumentWindow(content, params.from, params.lines),
+                  };
+                },
+                status() {
+                  return providerStatus;
+                },
+                async probeEmbeddingAvailability() {
+                  const probe = await embedder.test();
+                  return {
+                    ok: probe.success,
+                    error: probe.error,
+                  };
+                },
+                async probeVectorAvailability() {
+                  const probe = await embedder.test();
+                  return probe.success;
+                },
+                async sync() {
+                  return;
+                },
+                async close() {
+                  return;
+                },
+              },
+            };
+          } catch (err) {
+            return {
+              manager: null,
+              error: err instanceof Error ? err.message : String(err),
+            };
+          }
+        },
+        resolveMemoryBackendConfig() {
+          return { backend: "builtin" as const };
+        },
+      },
+    });
+
+    api.logger.info("memory-lancedb-pro: active memory runtime registered");
+
+    // ========================================================================
     // Lifecycle Hooks
     // ========================================================================
 

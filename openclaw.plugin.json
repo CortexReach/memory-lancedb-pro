@@ -453,6 +453,11 @@
             "description": "Fallback directory for Markdown mirror files when agent workspace is unknown"
           }
         }
+      },
+      "dreaming": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "Pass-through config for OpenClaw's dreaming sidecar when memory-lancedb-pro owns the memory slot."
       }
     },
     "required": [

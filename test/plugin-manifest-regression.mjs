@@ -30,6 +30,8 @@ function createMockApi(pluginConfig, options = {}) {
     pluginConfig,
     hooks: {},
     toolFactories: {},
+    memoryCapability: null,
+    memoryRuntime: null,
     logger: {
       info() {},
       warn() {},
@@ -47,6 +49,12 @@ function createMockApi(pluginConfig, options = {}) {
     registerService(service) {
       options.services?.push(service);
     },
+    registerMemoryCapability(capability) {
+      this.memoryCapability = capability;
+    },
+    registerMemoryRuntime(runtime) {
+      this.memoryRuntime = runtime;
+    },
     on(name, handler) {
       this.hooks[name] = handler;
     },
@@ -56,7 +64,7 @@ function createMockApi(pluginConfig, options = {}) {
   };
 }
 
-for (const key of ["smartExtraction", "extractMinMessages", "extractMaxChars"]) {
+for (const key of ["smartExtraction", "extractMinMessages", "extractMaxChars", "dreaming"]) {
   assert.ok(
     Object.prototype.hasOwnProperty.call(manifest.configSchema.properties, key),
     `configSchema should declare ${key}`,
@@ -116,6 +124,8 @@ try {
   assert.equal(services.length, 1, "plugin should register its background service");
   assert.equal(typeof api.hooks.agent_end, "function", "autoCapture should remain enabled by default");
   assert.equal(api.hooks["command:new"], undefined, "sessionMemory should stay disabled by default");
+  assert.equal(typeof api.memoryCapability?.runtime?.getMemorySearchManager, "function", "plugin should register active memory capability runtime");
+  assert.equal(typeof api.memoryCapability?.runtime?.resolveMemoryBackendConfig, "function", "plugin should expose backend config resolver for the active memory runtime");
   await assert.doesNotReject(
     services[0].stop(),
     "service stop should not throw when no access tracker is configured",
