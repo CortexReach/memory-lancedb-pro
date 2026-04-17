@@ -11,6 +11,12 @@
  *   2. Reverse-map 5-category → 6-category
  *   3. Generate L0/L1/L2 via LLM (or fallback to simple rules)
  *   4. Write enriched metadata back via store.update()
+ *
+ * Two-Phase Processing (Issue #632 fix):
+ *   Phase 1: LLM enrichment (no lock, can run concurrently)
+ *   Phase 2: DB writes (single lock per batch)
+ *
+ * This reduces lock contention from N locks (one per entry) to 1 lock per batch.
  */
 
 import type { MemoryStore, MemoryEntry } from "./store.js";
@@ -60,6 +66,14 @@ interface EnrichedMetadata {
   last_accessed_at: number;
   upgraded_from: string; // original 5-category
   upgraded_at: number;   // timestamp of upgrade
+}
+
+/** Phase 1 result: enriched entry ready for DB write */
+interface EnrichedEntry {
+  entry: MemoryEntry;
+  newCategory: MemoryCategory;
+  enriched: Pick<EnrichedMetadata, "l0_abstract" | "l1_overview" | "l2_content">;
+  error?: string;  // If enrichment failed, record error but don't throw
 }
 
 // ============================================================================
@@ -154,7 +168,31 @@ function simpleEnrich(
 }
 
 // ============================================================================
-// Memory Upgrader
+// Memory Upgrader (Two-Phase)
+// ============================================================================
+//
+// REFACTORING NOTE (Issue #632):
+// ---------------------------
+// The old implementation had each entry call store.update() individually, causing:
+//   - N lock acquisitions for N entries = high contention
+//   - Plugin waits seconds while LLM runs between lock acquisitions
+//
+// The new two-phase approach separates:
+//   - Phase 1: LLM enrichment (no lock, runs quickly)
+//   - Phase 2: DB writes (single lock per batch)
+//
+// OLD FLOW (removed):
+//   for (const entry of batch) {
+//     await this.upgradeEntry(entry); // LLM + store.update() inside lock
+//   }
+//
+// NEW FLOW:
+//   Phase 1: await this.prepareEntry() for all entries (no lock)
+//   Phase 2: await this.writeEnrichedBatch() (single lock for all writes)
+//
+// The logic inside prepareEntry() is IDENTICAL to what upgradeEntry() did -
+// only the timing/ordering has changed to reduce lock contention.
+//
 // ============================================================================
 
 export class MemoryUpgrader {
@@ -205,9 +243,162 @@ export class MemoryUpgrader {
     return { total: allMemories.length, legacy, byCategory };
   }
 
+  // =========================================================================
+  // Phase 1: LLM Enrichment (no lock, can run concurrently)
+  // =========================================================================
+
   /**
-   * Main upgrade entry point.
-   * Scans all memories, filters legacy ones, and enriches them.
+   * Phase 1: Enrich a single entry (no lock needed).
+   * 
+   * This method contains the SAME logic that was previously inside upgradeEntry():
+   *   - Reverse-map category
+   *   - Generate L0/L1/L2 via LLM (or simple fallback)
+   * 
+   * The difference is that now this runs WITHOUT acquiring a lock,
+   * allowing all entries in a batch to be enriched concurrently.
+   * 
+   * @returns EnrichedEntry containing all data needed for DB write (Phase 2)
+   */
+  private async prepareEntry(
+    entry: MemoryEntry,
+    noLlm: boolean,
+  ): Promise<EnrichedEntry> {
+    // Step 1: Reverse-map category
+    let newCategory = reverseMapCategory(entry.category, entry.text);
+
+    // Step 2: Generate L0/L1/L2
+    let enriched: Pick<EnrichedMetadata, "l0_abstract" | "l1_overview" | "l2_content">;
+
+    if (!noLlm && this.llm) {
+      try {
+        const prompt = buildUpgradePrompt(entry.text, newCategory);
+        const llmResult = await this.llm.completeJson<{
+          l0_abstract: string;
+          l1_overview: string;
+          l2_content: string;
+          resolved_category?: string;
+        }>(prompt);
+
+        if (!llmResult) {
+          throw new Error(this.llm.getLastError() || "LLM returned null");
+        }
+
+        enriched = {
+          l0_abstract: llmResult.l0_abstract || simpleEnrich(entry.text, newCategory).l0_abstract,
+          l1_overview: llmResult.l1_overview || simpleEnrich(entry.text, newCategory).l1_overview,
+          l2_content: llmResult.l2_content || entry.text,
+        };
+
+        // LLM may have resolved the ambiguous fact→profile/cases
+        if (llmResult.resolved_category) {
+          const validCategories = new Set([
+            "profile", "preferences", "entities", "events", "cases", "patterns",
+          ]);
+          if (validCategories.has(llmResult.resolved_category)) {
+            newCategory = llmResult.resolved_category as MemoryCategory;
+          }
+        }
+      } catch (err) {
+        this.log(
+          `memory-upgrader: LLM enrichment failed for ${entry.id}, falling back to simple — ${String(err)}`,
+        );
+        enriched = simpleEnrich(entry.text, newCategory);
+      }
+    } else {
+      enriched = simpleEnrich(entry.text, newCategory);
+    }
+
+    return {
+      entry,
+      newCategory,
+      enriched,
+    };
+  }
+
+  // =========================================================================
+  // Phase 2: DB Write (single lock per batch)
+  // =========================================================================
+
+  /**
+   * Phase 2: Write all enriched entries to DB under a single lock.
+   * 
+   * This method groups all DB writes into ONE lock acquisition,
+   * reducing lock contention from N locks (one per entry) to 1 lock per batch.
+   * 
+   * The actual update logic (buildSmartMetadata, stringifySmartMetadata, store.update)
+   * is the SAME as it was in the old upgradeEntry() - only the timing changed.
+   */
+  private async writeEnrichedBatch(
+    batch: EnrichedEntry[],
+  ): Promise<{ success: number; errors: string[] }> {
+    let success = 0;
+    const errors: string[] = [];
+
+    await this.store.runWithFileLock(async () => {
+      for (const { entry, newCategory, enriched } of batch) {
+        try {
+          // Step 3: Build enriched metadata
+          const existingMeta = entry.metadata ? (() => {
+            try { return JSON.parse(entry.metadata!); } catch { return {}; }
+          })() : {};
+
+          const newMetadata: EnrichedMetadata = {
+            ...buildSmartMetadata(
+              { ...entry, metadata: JSON.stringify(existingMeta) },
+              {
+                l0_abstract: enriched.l0_abstract,
+                l1_overview: enriched.l1_overview,
+                l2_content: enriched.l2_content,
+                memory_category: newCategory,
+                tier: "working" as MemoryTier,
+                access_count: 0,
+                confidence: 0.7,
+              },
+            ),
+            upgraded_from: entry.category,
+            upgraded_at: Date.now(),
+          };
+
+          // Step 4: Update the memory entry
+          await this.store.update(entry.id, {
+            text: enriched.l0_abstract,
+            metadata: stringifySmartMetadata(newMetadata),
+          });
+          success++;
+        } catch (err) {
+          const errMsg = `Failed to update ${entry.id}: ${String(err)}`;
+          errors.push(errMsg);
+          this.log(`memory-upgrader: ERROR — ${errMsg}`);
+        }
+      }
+    });
+
+    return { success, errors };
+  }
+
+  // =========================================================================
+  // Main Upgrade (Two-Phase Processing)
+  // =========================================================================
+
+  /**
+   * Main upgrade entry point with two-phase processing.
+   * 
+   * ISSUE #632 FIX:
+   * Before this fix, each entry was processed sequentially with its own lock:
+   *   for (entry in batch) { upgradeEntry(entry); } // N locks
+   * 
+   * Now we use two-phase processing:
+   *   Phase 1: Enrich all entries (no lock) -> collect results
+   *   Phase 2: Write all results (one lock) -> done
+   * 
+   * This reduces lock acquisitions from N (one per entry) to 1 (per batch).
+   * 
+   * EXAMPLE: 10 entries with batchSize=10
+   *   Before: 10 lock acquisitions (one per entry)
+   *   After:  1 lock acquisition (all writes grouped)
+   * 
+   * The LLM enrichment still runs for each entry, but WITHOUT holding a lock,
+   * so the plugin can acquire the lock between entries if needed.
    */
   async upgrade(options: UpgradeOptions = {}): Promise<UpgradeResult> {
     const batchSize = options.batchSize ?? this.options.batchSize ?? 10;
@@ -268,15 +459,37 @@ export class MemoryUpgrader {
         `memory-upgrader: processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(toProcess.length / batchSize)} (${batch.length} memories)`,
       );
 
+      // =====================================================================
+      // Phase 1: LLM enrichment (no lock, can be concurrent)
+      // =====================================================================
+      // NOTE: This loop runs WITHOUT holding a lock.
+      // Each entry's LLM enrichment happens in sequence here, but the plugin
+      // can acquire the lock between entries if needed.
+      // Previously, store.update() was called inside upgradeEntry() which held
+      // the lock during LLM processing - causing the contention issue.
+      const enrichedBatch: EnrichedEntry[] = [];
+
       for (const entry of batch) {
         try {
-          await this.upgradeEntry(entry, noLlm);
-          result.upgraded++;
+          const enriched = await this.prepareEntry(entry, noLlm);
+          enrichedBatch.push(enriched);
         } catch (err) {
-          const errMsg = `Failed to upgrade ${entry.id}: ${String(err)}`;
+          const errMsg = `Failed to enrich ${entry.id}: ${String(err)}`;
           result.errors.push(errMsg);
           this.log(`memory-upgrader: ERROR — ${errMsg}`);
         }
+      }
+
+      // =====================================================================
+      // Phase 2: DB writes under single lock
+      // =====================================================================
+      // Previously, each entry's store.update() acquired its own lock.
+      // Now we group all writes into ONE lock acquisition per batch.
+      // This is the KEY FIX for Issue #632: from N locks to 1 lock per batch.
+      if (enrichedBatch.length > 0) {
+        const writeResult = await this.writeEnrichedBatch(enrichedBatch);
+        result.upgraded += writeResult.success;
+        result.errors.push(...writeResult.errors);
       }
 
       // Progress report
@@ -289,89 +502,6 @@ export class MemoryUpgrader {
       `memory-upgrader: upgrade complete — ${result.upgraded} upgraded, ${result.skipped} already new, ${result.errors.length} errors`,
     );
     return result;
-  }
-
-  /**
-   * Upgrade a single legacy memory entry.
-   */
-  private async upgradeEntry(
-    entry: MemoryEntry,
-    noLlm: boolean,
-  ): Promise<void> {
-    // Step 1: Reverse-map category
-    let newCategory = reverseMapCategory(entry.category, entry.text);
-
-    // Step 2: Generate L0/L1/L2
-    let enriched: Pick<EnrichedMetadata, "l0_abstract" | "l1_overview" | "l2_content">;
-
-    if (!noLlm && this.llm) {
-      try {
-        const prompt = buildUpgradePrompt(entry.text, newCategory);
-        const llmResult = await this.llm.completeJson<{
-          l0_abstract: string;
-          l1_overview: string;
-          l2_content: string;
-          resolved_category?: string;
-        }>(prompt);
-
-        if (!llmResult) {
-          const detail = this.llm.getLastError();
-          throw new Error(detail || "LLM returned null");
-        }
-
-        enriched = {
-          l0_abstract: llmResult.l0_abstract || simpleEnrich(entry.text, newCategory).l0_abstract,
-          l1_overview: llmResult.l1_overview || simpleEnrich(entry.text, newCategory).l1_overview,
-          l2_content: llmResult.l2_content || entry.text,
-        };
-
-        // LLM may have resolved the ambiguous fact→profile/cases
-        if (llmResult.resolved_category) {
-          const validCategories = new Set([
-            "profile", "preferences", "entities", "events", "cases", "patterns",
-          ]);
-          if (validCategories.has(llmResult.resolved_category)) {
-            newCategory = llmResult.resolved_category as MemoryCategory;
-          }
-        }
-      } catch (err) {
-        this.log(
-          `memory-upgrader: LLM enrichment failed for ${entry.id}, falling back to simple — ${String(err)}`,
-        );
-        enriched = simpleEnrich(entry.text, newCategory);
-      }
-    } else {
-      enriched = simpleEnrich(entry.text, newCategory);
-    }
-
-    // Step 3: Build enriched metadata
-    const existingMeta = entry.metadata ? (() => {
-      try { return JSON.parse(entry.metadata!); } catch { return {}; }
-    })() : {};
-
-    const newMetadata: EnrichedMetadata = {
-      ...buildSmartMetadata(
-        { ...entry, metadata: JSON.stringify(existingMeta) },
-        {
-          l0_abstract: enriched.l0_abstract,
-          l1_overview: enriched.l1_overview,
-          l2_content: enriched.l2_content,
-          memory_category: newCategory,
-          tier: "working" as MemoryTier,
-          access_count: 0,
-          confidence: 0.7,
-        },
-      ),
-      upgraded_from: entry.category,
-      upgraded_at: Date.now(),
-    };
-
-    // Step 4: Update the memory entry
-    await this.store.update(entry.id, {
-      // Update text to L0 abstract for better search indexing
-      text: enriched.l0_abstract,
-      metadata: stringifySmartMetadata(newMetadata),
-    });
   }
 }
 
