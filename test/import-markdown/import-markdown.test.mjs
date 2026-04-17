@@ -1,4 +1,4 @@
-/**
+﻿/**
  * import-markdown.test.mjs
  * Integration tests for the import-markdown CLI command.
  * Tests: BOM handling, CRLF normalization, bullet formats, dedup logic,
@@ -414,6 +414,38 @@ describe("import-markdown CLI", () => {
         "global",
         "should fall back to global when multiple agents make it ambiguous",
       );
+    });
+  });
+  describe("skip non-file .md entries", () => {
+    it("skips a directory named YYYY-MM-DD.md without aborting import", async () => {
+      const wsDir = await setupWorkspace("nonfile-test");
+      // Create memory/ subdirectory first
+      await mkdir(join(wsDir, "memory"), { recursive: true });
+      // Create a real .md file
+      await writeFile(
+        join(wsDir, "memory", "2026-04-11.md"),
+        "- Real file entry\n",
+        "utf-8",
+      );
+      // Create a directory that looks like a .md file (the bug scenario)
+      const fakeDir = join(wsDir, "memory", "2026-04-12.md");
+      await mkdir(fakeDir, { recursive: true });
+
+      const ctx = { embedder: mockEmbedder, store: mockStore };
+      let threw = false;
+      try {
+        const { imported, skipped } = await runImportMarkdown(ctx, {
+          openclawHome: testWorkspaceDir,
+          workspaceGlob: "nonfile-test",
+        });
+        // Should have imported the real file (1 entry from "- Real file entry")
+        assert.strictEqual(imported, 1, "should import the real .md file");
+        assert.strictEqual(skipped, 1, "should skip exactly 1 (.md directory entry)");
+      } catch (err) {
+        threw = true;
+        throw new Error(`Import aborted on .md directory: ${err}`);
+      }
+      assert.ok(!threw, "import should not abort when encountering .md directory");
     });
   });
 });

@@ -658,8 +658,31 @@ export async function runImportMarkdown(
 
   // Parse each file for memory entries (lines starting with "- ")
   for (const { filePath, scope: discoveredScope } of mdFiles) {
-    foundFiles++;
-    let content = await fsPromises.readFile(filePath, "utf-8");
+    let content: string;
+    try {
+      const stats = await fsPromises.stat(filePath);
+      if (!stats.isFile()) {
+        // Skip non-file entries (e.g. a directory named "YYYY-MM-DD.md")
+        console.warn(`  [skip] not a file: ${filePath}`);
+        skipped++;
+        continue;
+      }
+      foundFiles++; // count only actual files, not directories
+      content = await fsPromises.readFile(filePath, "utf-8");
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code === "EISDIR") {
+        // .md directory — already handled above by isFile() check, but catch
+        // this explicitly so genuine I/O errors (permissions, corruption)
+        // are not silently swallowed
+        console.warn(`  [skip] not a file: ${filePath}`);
+        skipped++;
+      } else {
+        throw err; // re-throw genuine I/O errors
+      }
+      continue;
+    }
+    // (fix(import-markdown): CI測試登記 + .md目錄skip保護)
     // Strip UTF-8 BOM (e.g. from Windows Notepad-saved files)
     content = content.replace(/^\uFEFF/, "");
     // Normalize line endings: handle both CRLF (\r\n) and LF (\n)
