@@ -8,7 +8,7 @@
  * - Intrinsic: importance × confidence
  */
 
-import type { MemoryTier } from "./memory-categories.js";
+import type { MemoryTier, MemoryType } from "./memory-categories.js";
 
 // ============================================================================
 // Types
@@ -43,6 +43,14 @@ export interface DecayConfig {
   workingDecayFloor: number;
   /** Decay floor for Peripheral memories (default: 0.5) */
   peripheralDecayFloor: number;
+  /**
+   * Knowledge/experience half-life multipliers (arxiv:2602.05665 §V-E).
+   * Knowledge is static reference data — decays slower (3x).
+   * Experience is trajectory data — decays faster (0.7x), letting old logs fade.
+   * Set both to 1.0 to disable K/E decoupling.
+   */
+  knowledgeHalfLifeMultiplier: number;
+  experienceHalfLifeMultiplier: number;
 }
 
 export const DEFAULT_DECAY_CONFIG: DecayConfig = {
@@ -59,6 +67,8 @@ export const DEFAULT_DECAY_CONFIG: DecayConfig = {
   coreDecayFloor: 0.9,
   workingDecayFloor: 0.7,
   peripheralDecayFloor: 0.5,
+  knowledgeHalfLifeMultiplier: 3.0,
+  experienceHalfLifeMultiplier: 0.7,
 };
 
 export interface DecayScore {
@@ -80,6 +90,8 @@ export interface DecayableMemory {
   lastAccessedAt: number;
   /** Temporal classification: "dynamic" memories decay 3x faster. */
   temporalType?: "static" | "dynamic";
+  /** Knowledge-vs-experience classification; applies a half-life multiplier when set. */
+  memoryType?: MemoryType;
 }
 
 export interface DecayEngine {
@@ -120,6 +132,8 @@ export function createDecayEngine(
     coreDecayFloor,
     workingDecayFloor,
     peripheralDecayFloor,
+    knowledgeHalfLifeMultiplier,
+    experienceHalfLifeMultiplier,
   } = config;
 
   function getTierBeta(tier: MemoryTier): number {
@@ -155,7 +169,14 @@ export function createDecayEngine(
       memory.accessCount > 0 ? memory.lastAccessedAt : memory.createdAt;
     const daysSince = Math.max(0, (now - lastActive) / MS_PER_DAY);
     // Dynamic memories decay 3x faster (1/3 half-life)
-    const baseHL = memory.temporalType === "dynamic" ? halfLife / 3 : halfLife;
+    const temporalHL = memory.temporalType === "dynamic" ? halfLife / 3 : halfLife;
+    const typeMultiplier =
+      memory.memoryType === "knowledge"
+        ? knowledgeHalfLifeMultiplier
+        : memory.memoryType === "experience"
+          ? experienceHalfLifeMultiplier
+          : 1.0;
+    const baseHL = temporalHL * typeMultiplier;
     const effectiveHL = baseHL * Math.exp(mu * memory.importance);
     const lambda = Math.LN2 / effectiveHL;
     const beta = getTierBeta(memory.tier);

@@ -41,6 +41,51 @@ export const APPEND_ONLY_CATEGORIES = new Set<MemoryCategory>([
 /** Memory tier levels for lifecycle management. */
 export type MemoryTier = "core" | "working" | "peripheral";
 
+/**
+ * Knowledge vs Experience decoupling (see arxiv:2602.05665 §III-C, §V-E).
+ *
+ * - knowledge: passive, static, verifiable reference (profile / preferences / entities / patterns)
+ * - experience: trajectory log of interactions and outcomes (events / cases)
+ */
+export type MemoryType = "knowledge" | "experience";
+
+const KNOWLEDGE_CATEGORIES = new Set<MemoryCategory>([
+  "profile",
+  "preferences",
+  "entities",
+  "patterns",
+]);
+
+const EXPERIENCE_CATEGORIES = new Set<MemoryCategory>([
+  "events",
+  "cases",
+]);
+
+const KNOWLEDGE_LEGACY = new Set(["preference", "fact", "entity"]);
+const EXPERIENCE_LEGACY = new Set(["decision", "reflection"]);
+
+/**
+ * Classify a memory as knowledge or experience.
+ * Prefers the 6-category `memory_category`; falls back to the legacy top-level category.
+ * Defaults to "knowledge" when neither is informative (conservative for decay: knowledge decays slower).
+ */
+export function classifyMemoryType(
+  memoryCategory: MemoryCategory | string | undefined,
+  legacyCategory?: string,
+): MemoryType {
+  if (typeof memoryCategory === "string") {
+    const mc = memoryCategory as MemoryCategory;
+    if (KNOWLEDGE_CATEGORIES.has(mc)) return "knowledge";
+    if (EXPERIENCE_CATEGORIES.has(mc)) return "experience";
+  }
+  if (legacyCategory) {
+    const lc = legacyCategory.toLowerCase();
+    if (KNOWLEDGE_LEGACY.has(lc)) return "knowledge";
+    if (EXPERIENCE_LEGACY.has(lc)) return "experience";
+  }
+  return "knowledge";
+}
+
 /** A candidate memory extracted from conversation by LLM. */
 export type CandidateMemory = {
   category: MemoryCategory;

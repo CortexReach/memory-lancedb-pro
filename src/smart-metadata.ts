@@ -1,7 +1,9 @@
 import {
   TEMPORAL_VERSIONED_CATEGORIES,
+  classifyMemoryType,
   type MemoryCategory,
   type MemoryTier,
+  type MemoryType,
 } from "./memory-categories.js";
 import type { DecayableMemory } from "./decay-engine.js";
 
@@ -40,6 +42,7 @@ export interface SmartMemoryMetadata {
   l1_overview: string;
   l2_content: string;
   memory_category: MemoryCategory;
+  memory_type: MemoryType;
   tier: MemoryTier;
   access_count: number;
   confidence: number;
@@ -74,6 +77,11 @@ export interface LifecycleMemory {
   createdAt: number;
   lastAccessedAt: number;
   temporalType?: "static" | "dynamic";
+  memoryType?: MemoryType;
+}
+
+function normalizeMemoryType(value: unknown): MemoryType | undefined {
+  return value === "knowledge" || value === "experience" ? value : undefined;
 }
 
 function clamp01(value: unknown, fallback: number): number {
@@ -289,15 +297,21 @@ export function parseSmartMetadata(
   const memoryLayer = normalizeLayer(
     parsed.memory_layer ?? deriveDefaultLayer(source, memoryCategory, state),
   );
+  const resolvedMemoryCategory: MemoryCategory =
+    typeof parsed.memory_category === "string"
+      ? (parsed.memory_category as MemoryCategory)
+      : memoryCategory;
+  const resolvedMemoryType: MemoryType =
+    normalizeMemoryType(parsed.memory_type) ??
+    classifyMemoryType(resolvedMemoryCategory, entry.category);
+
   const normalized: SmartMemoryMetadata = {
     ...parsed,
     l0_abstract: l0,
     l1_overview: normalizeText(parsed.l1_overview, defaultOverview(l0)),
     l2_content: l2,
-    memory_category:
-      typeof parsed.memory_category === "string"
-        ? (parsed.memory_category as MemoryCategory)
-        : memoryCategory,
+    memory_category: resolvedMemoryCategory,
+    memory_type: resolvedMemoryType,
     tier: normalizeTier(parsed.tier),
     access_count: clampCount(parsed.access_count, 0),
     confidence: clamp01(parsed.confidence, 0.7),
@@ -346,6 +360,11 @@ export function buildSmartMetadata(
     typeof patch.memory_category === "string"
       ? patch.memory_category
       : base.memory_category;
+  const nextMemoryType: MemoryType =
+    normalizeMemoryType(patch.memory_type) ??
+    (typeof patch.memory_category === "string"
+      ? classifyMemoryType(nextCategory, entry.category)
+      : base.memory_type);
   const nextSource =
     patch.source !== undefined ? normalizeSource(patch.source) : base.source;
   const nextState =
@@ -366,6 +385,7 @@ export function buildSmartMetadata(
     l1_overview: normalizeText(patch.l1_overview, base.l1_overview),
     l2_content: normalizeText(patch.l2_content, base.l2_content),
     memory_category: nextCategory,
+    memory_type: nextMemoryType,
     tier: normalizeTier(patch.tier ?? base.tier),
     access_count: clampCount(patch.access_count, base.access_count),
     confidence: clamp01(patch.confidence, base.confidence),
@@ -498,6 +518,7 @@ export function toLifecycleMemory(
     temporalType: metadata.memory_temporal_type === "dynamic" ? "dynamic"
       : metadata.memory_temporal_type === "static" ? "static"
       : undefined,
+    memoryType: metadata.memory_type,
   };
 }
 
@@ -528,6 +549,7 @@ export function getDecayableFromEntry(
     temporalType: meta.memory_temporal_type === "dynamic" ? "dynamic"
       : meta.memory_temporal_type === "static" ? "static"
       : undefined,
+    memoryType: meta.memory_type,
   };
 
   return { memory, meta };

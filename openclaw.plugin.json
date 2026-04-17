@@ -496,6 +496,20 @@
             "minimum": 0,
             "maximum": 1,
             "default": 0.5
+          },
+          "knowledgeHalfLifeMultiplier": {
+            "type": "number",
+            "minimum": 0.1,
+            "maximum": 10,
+            "default": 3.0,
+            "description": "Half-life multiplier for knowledge-type memories (profile / preferences / entities / patterns). >1 makes knowledge decay slower. Set both multipliers to 1.0 to disable K/E decoupling (arxiv:2602.05665 §V-E)."
+          },
+          "experienceHalfLifeMultiplier": {
+            "type": "number",
+            "minimum": 0.1,
+            "maximum": 10,
+            "default": 0.7,
+            "description": "Half-life multiplier for experience-type memories (events / cases). <1 makes trajectory logs decay faster. Set both multipliers to 1.0 to disable K/E decoupling."
           }
         }
       },
@@ -1160,6 +1174,16 @@
     "decay.betaPeripheral": {
       "label": "Peripheral Beta",
       "help": "Weibull beta for peripheral memories.",
+      "advanced": true
+    },
+    "decay.knowledgeHalfLifeMultiplier": {
+      "label": "Knowledge Half-Life Multiplier",
+      "help": "Multiplier applied to the half-life of knowledge-type memories (profile, preferences, entities, patterns). >1 makes them decay slower. Set to 1.0 to disable K/E decoupling.",
+      "advanced": true
+    },
+    "decay.experienceHalfLifeMultiplier": {
+      "label": "Experience Half-Life Multiplier",
+      "help": "Multiplier applied to the half-life of experience-type memories (events, cases). <1 makes trajectory logs fade faster.",
       "advanced": true
     },
     "tier.coreAccessThreshold": {
