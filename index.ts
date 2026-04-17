@@ -449,6 +449,15 @@ export function toImportSpecifier(value: string): string {
   if (trimmed.startsWith("/")) return pathToFileURL(trimmed).href;
   // Handle Windows absolute paths (e.g. C:\Users\... or D:/Program Files/...) — PR #593
   if (process.platform === 'win32' && /^[a-zA-Z]:[/\\]/.test(trimmed)) return pathToFileURL(trimmed).href;
+  // Handle UNC paths (\\server\share or \\?\UNC\\server\share) — PR #593
+  if (process.platform === 'win32' && /^\\\\[^\\]+\\[^\\]+/.test(trimmed)) {
+    // UNC: \\server\share -> \\?\UNC\\server\share -> file://server/share
+    // If already has \\?\UNC\\ prefix, pass directly (don't replace)
+    if (trimmed.startsWith('\\\\?\\UNC\\')) return pathToFileURL(trimmed).href;
+    // Standard UNC: \\server\share -> \\?\UNC\\server\share
+    const normalized = '\\\\?\\UNC\\' + trimmed.slice(2);
+    return pathToFileURL(normalized).href;
+  }
   return trimmed;
 }
 export function getExtensionApiImportSpecifiers(): string[] {

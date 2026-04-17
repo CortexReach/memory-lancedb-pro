@@ -60,7 +60,6 @@ describe("toImportSpecifier", () => {
   });
 
   // --- Windows paths (PR #593) ---
-  // --- Windows paths (PR #593) - skip on non-Windows ---
   if (process.platform === "win32") {
     it("converts Windows drive-letter backslash path to file:// URL", () => {
       const result = toImportSpecifier("C:\\Users\\admin\\AppData\\Roaming\\npm\\node_modules\\openclaw\\dist\\extensionAPI.js");
@@ -89,9 +88,38 @@ describe("toImportSpecifier", () => {
       assert.equal(result, "C:path\\to\\file.js");
     });
 
-    it("rejects single-backslash UNC-like path (\\server\\share -> unchanged)", () => {
-      const result = toImportSpecifier("\\server\\share\\file.js");
-      assert.equal(result, "\\server\\share\\file.js");
+    // --- UNC paths (PR #593) ---
+    it("converts UNC path (\\\\server\\share) to file:// URL", () => {
+      const result = toImportSpecifier("\\\\server\\share\\path\\to\\file.js");
+      assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
+    });
+
+    it("converts UNC path with deep nested path to file:// URL", () => {
+      const result = toImportSpecifier("\\\\fileserver\\company-share\\openclaw\\dist\\extensionAPI.js");
+      assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
+      assert.ok(result.includes("fileserver"), `Expected fileserver in URL, got: ${result}`);
+      assert.ok(result.includes("company-share"), `Expected company-share in URL, got: ${result}`);
+    });
+
+    it("converts long-server-name UNC path to file:// URL", () => {
+      const result = toImportSpecifier("\\\\my-long-server-name\\shared-folder\\file.js");
+      assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
+    });
+
+    it("converts single-level UNC root to file:// URL", () => {
+      const result = toImportSpecifier("\\\\server\\share");
+      assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
+    });
+
+    it("passes through already-normalized \\\\?\\UNC\\\\ prefix unchanged", () => {
+      // \\\\?\\UNC\\server\\share should also be converted
+      const result = toImportSpecifier("\\\\?\\UNC\\server\\share\\file.js");
+      assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
+    });
+
+    it("UNC path with spaces in share name converts correctly", () => {
+      const result = toImportSpecifier("\\\\server\\my shared folder\\path\\file.js");
+      assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
     });
   }
 
@@ -172,6 +200,14 @@ describe("getExtensionApiImportSpecifiers", () => {
     });
   });
 
+  it("converts OPENCLAW_EXTENSION_API_PATH UNC path to file:// URL", () => {
+    withEnv("OPENCLAW_EXTENSION_API_PATH", "\\\\server\\share\\openclaw\\dist\\extensionAPI.js", () => {
+      const specifiers = getExtensionApiImportSpecifiers();
+      const uncSpec = specifiers.find(s => s.startsWith("file://") && s.includes("server") && s.includes("share"));
+      assert.ok(uncSpec, `Expected UNC path as file:// URL: ${JSON.stringify(specifiers)}`);
+    });
+  });
+
   it("includes POSIX fallback paths on all platforms", () => {
     const specifiers = getExtensionApiImportSpecifiers();
     assert.ok(specifiers.some(s => s.includes("/usr/lib")), `Expected /usr/lib path, got: ${JSON.stringify(specifiers)}`);
@@ -242,6 +278,15 @@ if (process.platform === "win32") {
       const result = pathToFileURL(input).href;
       assert.ok(result.startsWith("file://"));
       assert.ok(result.includes("D:/"));
+    });
+
+    it("produces valid file:// URL from UNC path", async () => {
+      const { pathToFileURL } = await import("node:url");
+      // UNC: \\\\server\\share\\path -> \\\\?\\UNC\\server\\share\\path -> file://server/share/path
+      const uncPath = "\\\\?\\UNC\\\\server\\\\share\\\\path\\\\file.js";
+      const result = pathToFileURL(uncPath).href;
+      assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
+      assert.ok(result.includes("server"), `Expected server in URL, got: ${result}`);
     });
   });
 }
