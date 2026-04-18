@@ -369,11 +369,13 @@ async function testNoOverwriteBetweenPluginAndUpgrader() {
   // 檢查最終狀態
   const final = store.state.data.get("entry-1");
   console.log(`  最終 text: ${final.text.substring(0, 30)}...`);
+  console.log(`  最終 metadata: ${final.metadata?.substring(0, 30)}...`);
   console.log(`  最終 injected_count: ${final.injected_count}`);
   console.log(`  總更新次數: ${allUpdates.length}`);
   
-  // 驗證：text 被更新（upgrader），injected_count 也被保留（plugin）
-  assert.ok(final.text !== "Original text", "Upgrader 應該更新 text");
+  // 驗證：text 保留原樣，metadata 被更新（包含 l0_abstract），injected_count 保留（plugin）
+  assert.equal(final.text, "Original text that needs upgrading", "Upgrader 不應覆蓋 text，保留 original");
+  assert.ok(final.metadata.includes("l0_abstract"), "Upgrader 應該更新 metadata");
   assert.equal(final.injected_count, 5, "Plugin 寫入的 injected_count 應該保留");
   
   // 顯示更新的欄位
@@ -382,7 +384,7 @@ async function testNoOverwriteBetweenPluginAndUpgrader() {
   console.log(`  Text 更新次數: ${textUpdates.length}`);
   console.log(`  injected_count 更新次數: ${countUpdates.length}`);
   
-  console.log("  ✅ Test 5 通過：Plugin 和 Upgrader 更新不同欄位，互不覆蓋");
+  console.log("  ✅ Test 5 通過：Plugin 和 Upgrader 更新不同欄位，互不覆蓋（text 保留，metadata 更新）");
 }
 
 // ============================================================================

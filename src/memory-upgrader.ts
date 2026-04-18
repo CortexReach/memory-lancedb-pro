@@ -381,8 +381,9 @@ export class MemoryUpgrader {
         };
 
         // Step 4: Update the memory entry (store.update() handles its own lock)
+        // [FIX] 不再覆蓋 text，保留 original 內容，避免部分寫入後 crash 無法恢復
+        // metadata 內含 l0_abstract，recall 時會使用
         await this.store.update(entry.id, {
-          text: enriched.l0_abstract,
           metadata: stringifySmartMetadata(newMetadata),
         });
         success++;
