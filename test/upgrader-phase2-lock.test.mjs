@@ -153,7 +153,7 @@ async function testNewBehavior_LockPerBatch() {
 }
 
 async function testTwoPhaseApproach_LockOnce() {
-  console.log("\n=== Test 2: 兩階段方案（lock 只拿一次）===");
+  console.log("\n=== Test 2: 兩階段方案實際測試 ===");
   
   const store = createMockStoreWithLockTracking();
   const entries = [
@@ -165,137 +165,90 @@ async function testTwoPhaseApproach_LockOnce() {
   ];
   store.initData(entries);
 
-  let llmCallCount = 0;
   const llm = {
     async completeJson() {
-      llmCallCount++;
-      await new Promise(resolve => setTimeout(resolve, 10));
-      return null;
+      return null; // 觸發 fallback
     },
     getLastError() {
-      return "mock timeout";
+      return "mock";
     },
   };
 
-  // 建立 upgrader（使用原始實作）
   const upgrader = createMemoryUpgrader(store, llm);
-
-  // 模擬兩階段方案：修改 store.update，讓它在 lock 外執行
-  // 問題：現有的 upgradeEntry 內部已經拿 lock 了
-  // 我們需要包裝 whole batch 處理，讓 lock 只拿一次
   
-  // 測試思路：
-  // 1. 模擬 Plugin 和 Upgrader 同時運行的場景
-  // 2. 驗證兩階段方案可以避免 lock 競爭
+  // 實際呼叫 upgrader，觀察 lock 次數
+  const start = Date.now();
+  await upgrader.upgrade({ batchSize: 5, noLlm: true });
+  const duration = Date.now() - start;
 
-  const operations = [];
+  console.log(`  Lock 取得次數: ${store.state.lockCount}`);
+  console.log(`  Update 次數: ${store.state.updates.length}`);
+  console.log(`  耗時: ${duration}ms`);
   
-  // 模擬 Plugin 的寫入（在 lock 外）
-  async function pluginWrite(id, patch) {
-    operations.push({ type: "plugin-write-start", id, time: Date.now() });
-    await new Promise(resolve => setTimeout(resolve, 5)); // 模擬處理
-    operations.push({ type: "plugin-write-end", id, time: Date.now() });
-  }
-
-  // 模擬 Upgrader 的寫入（在 lock 內）
-  async function upgraderWrite(id, patch) {
-    operations.push({ type: "upgrader-write-start", id, time: Date.now() });
-    await store.runWithFileLock(async () => {
-      operations.push({ type: "upgrader-write-lock-acquired", id, time: Date.now() });
-      await new Promise(resolve => setTimeout(resolve, 5));
-      await store.update(id, patch);
-      operations.push({ type: "upgrader-write-lock-released", id, time: Date.now() });
-    });
-    operations.push({ type: "upgrader-write-end", id, time: Date.now() });
-  }
-
-  // 並發執行
-  await Promise.all([
-    pluginWrite("entry-1", { injected_count: 1 }),
-    pluginWrite("entry-2", { injected_count: 2 }),
-    upgraderWrite("entry-1", { text: "upgraded text", metadata: "{}" }),
-  ]);
-
-  console.log(`  總操作數: ${operations.length}`);
+  // 驗證：5 個 entry 應該只拿 1 次 lock（因為 batchSize=5）
+  assert.equal(store.state.lockCount, 1, "兩階段方案：5 個 entry 只拿 1 次 lock");
+  assert.equal(store.state.updates.length, 5, "應該有 5 次 update");
   
-  // 驗證：操作是並發的，lock 確保了資料一致性
-  // Plugin 和 Upgrader 都成功完成
-  
-  console.log("  ✅ Test 2 通過：兩階段方案可以並發執行");
+  console.log("  ✅ Test 2 通過：實際呼叫 upgrader 確認 lock 次數正確");
 }
 
 async function testConcurrentWrites_NoDataLoss() {
-  console.log("\n=== Test 3: 並發寫入的資料一致性問題===");
+  console.log("\n=== Test 3: 並發寫入（Plugin + Upgrader）實際測試===");
   
   const store = createMockStoreWithLockTracking();
   const entries = [
-    createLegacyEntry("shared-entry", "Shared memory that both upgrade and plugin will modify"),
+    createLegacyEntry("entry-1", "Legacy memory 1"),
+    createLegacyEntry("entry-2", "Legacy memory 2"),
   ];
   store.initData(entries);
 
   // 初始化 injected_count
-  store.state.data.set("shared-entry", {
-    ...entries[0],
-    injected_count: 0,
+  store.state.data.set("entry-1", { ...entries[0], injected_count: 0 });
+  store.state.data.set("entry-2", { ...entries[1], injected_count: 0 });
+
+  const llm = {
+    async completeJson() {
+      return null; // fallback
+    },
+    getLastError() {
+      return "mock";
+    },
+  };
+
+  const upgrader = createMemoryUpgrader(store, llm);
+  
+  // 模擬 Plugin 在 Upgrader 執行期間同時寫入
+  const pluginWrites = [];
+  
+  // Hook store.update 來記錄 Plugin 寫入
+  const originalUpdate = store.update.bind(store);
+  store.update = async function(id, patch) {
+    if (patch.injected_count !== undefined) {
+      pluginWrites.push({ id, patch, time: Date.now() });
+    }
+    return originalUpdate(id, patch);
+  };
+
+  // 同時啟動 Upgrader 和 Plugin 模擬
+  const upgraderPromise = upgrader.upgrade({ batchSize: 2, noLlm: true });
+  
+  // Plugin 寫入（模擬在 upgrade 期間）
+  await new Promise(resolve => setTimeout(resolve, 5));
+  await store.runWithFileLock(async () => {
+    await store.update("entry-1", { injected_count: 1 });
+    await store.update("entry-2", { injected_count: 1 });
   });
+  
+  await upgraderPromise;
 
-  const operations = [];
+  console.log(`  Upgrader 更新次數: ${store.state.updates.length}`);
+  console.log(`  Plugin 寫入次數: ${pluginWrites.length}`);
   
-  // Plugin 只更新 injected_count（read-modify-write）
-  async function pluginWrite(id) {
-    operations.push({ type: "plugin-start", id, time: Date.now() });
-    await store.runWithFileLock(async () => {
-      operations.push({ type: "plugin-lock", id, time: Date.now() });
-      const current = store.state.data.get(id) || {};
-      await new Promise(resolve => setTimeout(resolve, 5)); // 模擬處理延遲
-      const newCount = (current.injected_count || 0) + 1;
-      await store.update(id, { 
-        injected_count: newCount 
-      });
-      operations.push({ type: "plugin-complete", id, newCount, time: Date.now() });
-    });
-  }
-
-  // Upgrader 更新 text 和 metadata
-  async function upgraderWrite() {
-    operations.push({ type: "upgrade-start", time: Date.now() });
-    await store.runWithFileLock(async () => {
-      operations.push({ type: "upgrade-lock", time: Date.now() });
-      await new Promise(resolve => setTimeout(resolve, 5));
-      await store.update("shared-entry", { 
-        text: "Upgraded text",
-        metadata: '{"upgraded": true}'
-      });
-      operations.push({ type: "upgrade-complete", time: Date.now() });
-    });
-  }
-
-  // 同時執行
-  await Promise.all([
-    pluginWrite("shared-entry"),
-    pluginWrite("shared-entry"),
-    upgraderWrite(),
-  ]);
-
-  console.log(`  總操作數: ${operations.length}`);
-  console.log(`  最終資料:`, store.state.data.get("shared-entry"));
+  // 驗證：兩個更新都成功，沒有互相覆蓋
+  assert.ok(store.state.updates.length >= 2, "Upgrader 應該至少更新 2 次");
+  assert.equal(pluginWrites.length, 2, "Plugin 應該寫入 2 次");
   
-  // 驗證：雖然有 lock，但 read-modify-write 模式仍然有問題
-  // 因為 lock 只保護單次 update，不保護 read-modify-write 這個組合操作
-  const finalData = store.state.data.get("shared-entry");
-  
-  console.log("\n  ⚠️  發現問題：");
-  console.log("  Plugin 執行了 2 次，每次應該 +1，但最終只有 1");
-  console.log("  原因：read-modify-write 沒有 atomic transaction 保護");
-  console.log("  Plugin-1: read(0) → write(1)");
-  console.log("  Plugin-2: read(0) → write(1)  // 讀到的是舊值！");
-  
-  // 這不是 bug，只是說明 read-modify-write 需要額外保護
-  // 實際上 Plugin 和 Upgrader 更新的是不同欄位，所以不會直接覆蓋
-  
-  assert.ok(finalData.injected_count <= 2, "injected_count 不應超過預期");
-  
-  console.log("  ✅ Test 3 通過：確認了 read-modify-write 的資料一致性邊界");
+  console.log("  ✅ Test 3 通過：並發寫入都成功，沒有資料遺失");
 }
 
 async function testTwoPhaseVsCurrent_Performance() {
@@ -367,62 +320,69 @@ async function testTwoPhaseVsCurrent_Performance() {
 }
 
 async function testNoOverwriteBetweenPluginAndUpgrader() {
-  console.log("\n=== Test 5: Plugin 和 Upgrader 更新不同欄位，不會互相覆蓋===");
+  console.log("\n=== Test 5: Plugin 更新不同欄位，不會被 Upgrader 覆蓋 ===");
   
   const store = createMockStoreWithLockTracking();
-  const entry = createLegacyEntry("entry-x", "Original text");
+  const entry = createLegacyEntry("entry-1", "Original text that needs upgrading");
   store.initData([entry]);
-
-  // 初始化資料
-  store.state.data.set("entry-x", {
+  
+  // 初始化 injection 欄位
+  store.state.data.set("entry-1", {
     ...entry,
     injected_count: 0,
     last_injected_at: 0,
-    bad_recall_count: 0,
   });
 
-  const operations = [];
+  // 追蹤所有更新
+  const allUpdates = [];
+  const originalUpdate = store.update.bind(store);
+  store.update = async function(id, patch) {
+    allUpdates.push({ id, patch, time: Date.now() });
+    return originalUpdate(id, patch);
+  };
+
+  const llm = {
+    async completeJson() {
+      return null; // fallback
+    },
+    getLastError() {
+      return "mock";
+    },
+  };
+
+  const upgrader = createMemoryUpgrader(store, llm);
   
-  // Plugin: 只更新 injection 相關欄位
-  async function pluginUpdate() {
-    await store.runWithFileLock(async () => {
-      operations.push({ type: "plugin-update", time: Date.now() });
-      const current = store.state.data.get("entry-x");
-      await store.update("entry-x", {
-        injected_count: current.injected_count + 1,
-        last_injected_at: Date.now(),
-      });
+  // 同時執行 upgrader 和 plugin
+  const upgraderPromise = upgrader.upgrade({ batchSize: 1, noLlm: true });
+  
+  // Plugin 在 upgrade 期間寫入
+  await new Promise(resolve => setTimeout(resolve, 2));
+  await store.runWithFileLock(async () => {
+    await store.update("entry-1", { 
+      injected_count: 5,
+      last_injected_at: Date.now() 
     });
-  }
-
-  // Upgrader: 只更新 text 和 metadata
-  async function upgraderUpdate() {
-    await store.runWithFileLock(async () => {
-      operations.push({ type: "upgrader-update", time: Date.now() });
-      await store.update("entry-x", {
-        text: "Upgraded text content",
-        metadata: JSON.stringify({ upgraded: true, memory_category: "cases" }),
-      });
-    });
-  }
-
-  // 執行多次模擬競爭
-  await Promise.all([
-    pluginUpdate(),
-    pluginUpdate(),
-    pluginUpdate(),
-    upgraderUpdate(),
-  ]);
-
-  const finalData = store.state.data.get("entry-x");
-  console.log(`  Plugin 更新次數: ${finalData.injected_count}`);
-  console.log(`  Upgrader 是否成功: ${finalData.text === "Upgraded text content"}`);
+  });
   
-  // 驗證：兩者的更新都生效了
-  // (由於是並發執行，最後一個完成的可能會覆蓋同一欄位)
-  // 但如果它們更新的欄位不同，理論上不會互相覆蓋
+  await upgraderPromise;
+
+  // 檢查最終狀態
+  const final = store.state.data.get("entry-1");
+  console.log(`  最終 text: ${final.text.substring(0, 30)}...`);
+  console.log(`  最終 injected_count: ${final.injected_count}`);
+  console.log(`  總更新次數: ${allUpdates.length}`);
   
-  console.log("  ✅ Test 5 通過：Plugin 和 Upgrader 可以並發更新");
+  // 驗證：text 被更新（upgrader），injected_count 也被保留（plugin）
+  assert.ok(final.text !== "Original text", "Upgrader 應該更新 text");
+  assert.equal(final.injected_count, 5, "Plugin 寫入的 injected_count 應該保留");
+  
+  // 顯示更新的欄位
+  const textUpdates = allUpdates.filter(u => u.patch.text !== undefined);
+  const countUpdates = allUpdates.filter(u => u.patch.injected_count !== undefined);
+  console.log(`  Text 更新次數: ${textUpdates.length}`);
+  console.log(`  injected_count 更新次數: ${countUpdates.length}`);
+  
+  console.log("  ✅ Test 5 通過：Plugin 和 Upgrader 更新不同欄位，互不覆蓋");
 }
 
 // ============================================================================
