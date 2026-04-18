@@ -69,6 +69,10 @@ class EmbeddingCache {
 
   set(text: string, task: string | undefined, vector: number[]): void {
     const k = this.key(text, task);
+    // If key already exists, delete to update insertion order for correct LRU semantics
+    if (this.cache.has(k)) {
+      this.cache.delete(k);
+    }
     // When cache is full, run TTL eviction first (removes expired + oldest).
     // This prevents unbounded growth from stale entries while keeping writes O(1).
     if (this.cache.size >= this.maxSize) {
