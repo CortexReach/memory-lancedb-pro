@@ -303,6 +303,13 @@ export class MemoryUpgrader {
           `memory-upgrader: LLM enrichment failed for ${entry.id}, falling back to simple — ${String(err)}`,
         );
         enriched = simpleEnrich(entry.text, newCategory);
+        // [FIX F3] 設置 error 欄位以追踪 fallback
+        return {
+          entry,
+          newCategory,
+          enriched,
+          error: `LLM failed: ${String(err).slice(0, 100)}`,
+        };
       }
     } else {
       enriched = simpleEnrich(entry.text, newCategory);
@@ -338,7 +345,11 @@ export class MemoryUpgrader {
     // 這裡再包一層會造成 deadlock（proper-lockfile 不支援遞迴 lock）。
     // [FIX MR2] 每個 entry 在寫入前重新讀取一次，確保拿到 plugin 在
     // enrichment window 期間寫入的最新資料，避免覆蓋 injected_count 等欄位。
-    for (const { entry, newCategory, enriched } of batch) {
+    // [FIX F5] 每 N 個 entry 寫入後讓出 lock，避免 plugin 長期飢餓
+    const YIELD_EVERY = 5;
+    
+    for (let i = 0; i < batch.length; i++) {
+      const { entry, newCategory, enriched } = batch[i];
       try {
         // Re-read latest state before writing (MR2 fix)
         const latest = await this.store.getById(entry.id);
@@ -375,6 +386,11 @@ export class MemoryUpgrader {
           metadata: stringifySmartMetadata(newMetadata),
         });
         success++;
+        
+        // [FIX F5] 每 N 個 entry 寫入後短暫讓出，讓 plugin 有機會取得 lock
+        if ((i + 1) % YIELD_EVERY === 0) {
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
       } catch (err) {
         const errMsg = `Failed to update ${entry.id}: ${String(err)}`;
         errors.push(errMsg);

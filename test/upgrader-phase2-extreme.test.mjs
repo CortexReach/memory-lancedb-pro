@@ -13,11 +13,20 @@ import Module from "node:module";
 
 import jitiFactory from "jiti";
 
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// [FIX F1] 使用動態路徑取代硬編碼的 /opt/homebrew/，支援 Linux/macOS/Windows
+const nodeModulesPaths = [
+  path.resolve(process.execPath, "../../lib/node_modules"),
+  path.resolve(process.execPath, "../../openclaw/node_modules"),
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../node_modules"),
+].filter(Boolean);
+
 process.env.NODE_PATH = [
   process.env.NODE_PATH,
-  "/opt/homebrew/lib/node_modules/openclaw/node_modules",
-  "/opt/homebrew/lib/node_modules",
-].filter(Boolean).join(":");
+  ...nodeModulesPaths,
+].join(":");
 Module._initPaths();
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
