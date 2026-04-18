@@ -113,6 +113,8 @@ interface PluginConfig {
   recallMode?: "full" | "summary" | "adaptive" | "off";
   /** Agent IDs excluded from auto-recall injection. Useful for background agents (e.g. memory-distiller, cron workers) whose output should not be contaminated by injected memory context. */
   autoRecallExcludeAgents?: string[];
+  /** Agent IDs included in auto-recall injection (whitelist mode). When set, ONLY these agents receive auto-recall. Unresolved agent context falls back to 'main'. If both include and exclude are set, include wins. */
+  autoRecallIncludeAgents?: string[];
   captureAssistant?: boolean;
   retrieval?: {
     mode?: "hybrid" | "vector";
@@ -1686,6 +1688,198 @@ function _dedupHookEvent(handlerName: string, event: any): boolean {
   return false; // first occurrence — proceed
 }
 
+// ============================================================================
+// Phase 2 — Singleton State Management (PR #598)
+// ============================================================================
+
+interface PluginSingletonState {
+  config: ReturnType<typeof parsePluginConfig>;
+  resolvedDbPath: string;
+  store: MemoryStore;
+  embedder: ReturnType<typeof createEmbedder>;
+  decayEngine: ReturnType<typeof createDecayEngine>;
+  tierManager: ReturnType<typeof createTierManager>;
+  retriever: ReturnType<typeof createRetriever>;
+  scopeManager: ReturnType<typeof createScopeManager>;
+  migrator: ReturnType<typeof createMigrator>;
+  smartExtractor: SmartExtractor | null;
+  extractionRateLimiter: ReturnType<typeof createExtractionRateLimiter>;
+  // Session Maps — persist across scope refreshes instead of being recreated
+  reflectionErrorStateBySession: Map<string, ReflectionErrorState>;
+  reflectionDerivedBySession: Map<string, { updatedAt: number; derived: string[] }>;
+  reflectionByAgentCache: Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>;
+  recallHistory: Map<string, Map<string, number>>;
+  turnCounter: Map<string, number>;
+  autoCaptureSeenTextCount: Map<string, number>;
+  autoCapturePendingIngressTexts: Map<string, string[]>;
+  autoCaptureRecentTexts: Map<string, string[]>;
+}
+
+let _singletonState: PluginSingletonState | null = null;
+
+function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
+  const config = parsePluginConfig(api.pluginConfig);
+  const resolvedDbPath = api.resolvePath(config.dbPath || getDefaultDbPath());
+
+  try {
+    validateStoragePath(resolvedDbPath);
+  } catch (err) {
+    api.logger.warn(
+      `memory-lancedb-pro: storage path issue — ${String(err)}\n` +
+      `  The plugin will still attempt to start, but writes may fail.`,
+    );
+  }
+
+  const vectorDim = getVectorDimensions(
+    config.embedding.model || "text-embedding-3-small",
+    config.embedding.dimensions,
+  );
+  const store = new MemoryStore({ dbPath: resolvedDbPath, vectorDim });
+  const embedder = createEmbedder({
+    provider: "openai-compatible",
+    apiKey: config.embedding.apiKey,
+    model: config.embedding.model || "text-embedding-3-small",
+    baseURL: config.embedding.baseURL,
+    dimensions: config.embedding.dimensions,
+    omitDimensions: config.embedding.omitDimensions,
+    taskQuery: config.embedding.taskQuery,
+    taskPassage: config.embedding.taskPassage,
+    normalized: config.embedding.normalized,
+    chunking: config.embedding.chunking,
+  });
+  const decayEngine = createDecayEngine({
+    ...DEFAULT_DECAY_CONFIG,
+    ...(config.decay || {}),
+  });
+  const tierManager = createTierManager({
+    ...DEFAULT_TIER_CONFIG,
+    ...(config.tier || {}),
+  });
+  const retriever = createRetriever(
+    store,
+    embedder,
+    { ...DEFAULT_RETRIEVAL_CONFIG, ...config.retrieval },
+    { decayEngine },
+  );
+  const scopeManager = createScopeManager(config.scopes);
+
+  const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
+  if (clawteamScopes.length > 0) {
+    applyClawteamScopes(scopeManager, clawteamScopes);
+    api.logger.info(`memory-lancedb-pro: CLAWTEAM_MEMORY_SCOPE added scopes: ${clawteamScopes.join(", ")}`);
+  }
+
+  const migrator = createMigrator(store);
+
+  let smartExtractor: SmartExtractor | null = null;
+  if (config.smartExtraction !== false) {
+    try {
+      const llmAuth = config.llm?.auth || "api-key";
+      const llmApiKey = llmAuth === "oauth"
+        ? undefined
+        : config.llm?.apiKey
+          ? resolveEnvVars(config.llm.apiKey)
+          : resolveFirstApiKey(config.embedding.apiKey);
+      const llmBaseURL = llmAuth === "oauth"
+        ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
+        : config.llm?.baseURL
+          ? resolveEnvVars(config.llm.baseURL)
+          : config.embedding.baseURL;
+      const llmModel = config.llm?.model || "openai/gpt-oss-120b";
+      const llmOauthPath = llmAuth === "oauth"
+        ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
+        : undefined;
+      const llmOauthProvider = llmAuth === "oauth" ? config.llm?.oauthProvider : undefined;
+      const llmTimeoutMs = resolveLlmTimeoutMs(config);
+
+      const llmClient = createLlmClient({
+        auth: llmAuth,
+        apiKey: llmApiKey,
+        model: llmModel,
+        baseURL: llmBaseURL,
+        oauthProvider: llmOauthProvider,
+        oauthPath: llmOauthPath,
+        timeoutMs: llmTimeoutMs,
+        log: (msg: string) => api.logger.debug(msg),
+        warnLog: (msg: string) => api.logger.warn(msg),
+      });
+
+      const noiseBank = new NoisePrototypeBank((msg: string) => api.logger.debug(msg));
+      noiseBank.init(embedder).catch((err) =>
+        api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
+      );
+
+      const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
+
+      smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+        user: "User",
+        extractMinMessages: config.extractMinMessages ?? 4,
+        extractMaxChars: config.extractMaxChars ?? 8000,
+        defaultScope: config.scopes?.default ?? "global",
+        workspaceBoundary: config.workspaceBoundary,
+        admissionControl: config.admissionControl,
+        onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
+        log: (msg: string) => api.logger.info(msg),
+        debugLog: (msg: string) => api.logger.debug(msg),
+        noiseBank,
+      });
+
+      (isCliMode() ? api.logger.debug : api.logger.info)(
+        "memory-lancedb-pro: smart extraction enabled (LLM model: "
+        + llmModel
+        + ", timeoutMs: "
+        + llmTimeoutMs
+        + ", noise bank: ON)",
+      );
+    } catch (err) {
+      api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+    }
+  }
+
+  const extractionRateLimiter = createExtractionRateLimiter({
+    maxExtractionsPerHour: config.extractionThrottle?.maxExtractionsPerHour,
+  });
+
+  // Session Maps — MUST be in singleton state so they persist across scope refreshes
+  const reflectionErrorStateBySession = new Map<string, ReflectionErrorState>();
+  const reflectionDerivedBySession = new Map<string, { updatedAt: number; derived: string[] }>();
+  const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
+  const recallHistory = new Map<string, Map<string, number>>();
+  const turnCounter = new Map<string, number>();
+  const autoCaptureSeenTextCount = new Map<string, number>();
+  const autoCapturePendingIngressTexts = new Map<string, string[]>();
+  const autoCaptureRecentTexts = new Map<string, string[]>();
+
+  const logReg = isCliMode() ? api.logger.debug : api.logger.info;
+  logReg(
+    `memory-lancedb-pro@${pluginVersion}: plugin registered [singleton init] `
+    + `(db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`,
+  );
+  logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
+
+  return {
+    config,
+    resolvedDbPath,
+    store,
+    embedder,
+    decayEngine,
+    tierManager,
+    retriever,
+    scopeManager,
+    migrator,
+    smartExtractor,
+    extractionRateLimiter,
+    reflectionErrorStateBySession,
+    reflectionDerivedBySession,
+    reflectionByAgentCache,
+    recallHistory,
+    turnCounter,
+    autoCaptureSeenTextCount,
+    autoCapturePendingIngressTexts,
+    autoCaptureRecentTexts,
+  };
+}
+
 const memoryLanceDBProPlugin = {
   id: "memory-lancedb-pro",
   name: "Memory (LanceDB Pro)",
@@ -1702,149 +1896,36 @@ const memoryLanceDBProPlugin = {
     _registeredApis.add(api);
 
     // Parse and validate configuration
-    const config = parsePluginConfig(api.pluginConfig);
-
-    const resolvedDbPath = api.resolvePath(config.dbPath || getDefaultDbPath());
-
-    // Pre-flight: validate storage path (symlink resolution, mkdir, write check).
-    // Runs synchronously and logs warnings; does NOT block gateway startup.
-    try {
-      validateStoragePath(resolvedDbPath);
-    } catch (err) {
-      api.logger.warn(
-        `memory-lancedb-pro: storage path issue — ${String(err)}\n` +
-        `  The plugin will still attempt to start, but writes may fail.`,
-      );
-    }
-
-    const vectorDim = getVectorDimensions(
-      config.embedding.model || "text-embedding-3-small",
-      config.embedding.dimensions,
-    );
-
-    // Initialize core components
-    const store = new MemoryStore({ dbPath: resolvedDbPath, vectorDim });
-    const embedder = createEmbedder({
-      provider: "openai-compatible",
-      apiKey: config.embedding.apiKey,
-      model: config.embedding.model || "text-embedding-3-small",
-      baseURL: config.embedding.baseURL,
-      dimensions: config.embedding.dimensions,
-      omitDimensions: config.embedding.omitDimensions,
-      taskQuery: config.embedding.taskQuery,
-      taskPassage: config.embedding.taskPassage,
-      normalized: config.embedding.normalized,
-      chunking: config.embedding.chunking,
-    });
-    // Initialize decay engine
-    const decayEngine = createDecayEngine({
-      ...DEFAULT_DECAY_CONFIG,
-      ...(config.decay || {}),
-    });
-    const tierManager = createTierManager({
-      ...DEFAULT_TIER_CONFIG,
-      ...(config.tier || {}),
-    });
-    const retriever = createRetriever(
+    // ========================================================================
+    // Phase 2 — Singleton state: initialize heavy resources exactly once.
+    // First register() call runs _initPluginState(); subsequent calls reuse
+    // the same singleton via destructuring. This prevents:
+    //   - Memory heap growth from repeated resource creation (~9 calls/process)
+    //   - Accumulated session Maps being lost on re-registration
+    // ========================================================================
+    if (!_singletonState) { _singletonState = _initPluginState(api); }
+    const {
+      config,
+      resolvedDbPath,
       store,
       embedder,
-      {
-        ...DEFAULT_RETRIEVAL_CONFIG,
-        ...config.retrieval,
-      },
-      { decayEngine },
-    );
-    const scopeManager = createScopeManager(config.scopes);
+      retriever,
+      scopeManager,
+      migrator,
+      smartExtractor,
+      decayEngine,
+      tierManager,
+      extractionRateLimiter,
+      reflectionErrorStateBySession,
+      reflectionDerivedBySession,
+      reflectionByAgentCache,
+      recallHistory,
+      turnCounter,
+      autoCaptureSeenTextCount,
+      autoCapturePendingIngressTexts,
+      autoCaptureRecentTexts,
+    } = _singletonState;
 
-    // ClawTeam integration: extend accessible scopes via env var
-    const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
-    if (clawteamScopes.length > 0) {
-      applyClawteamScopes(scopeManager, clawteamScopes);
-      api.logger.info(`memory-lancedb-pro: CLAWTEAM_MEMORY_SCOPE added scopes: ${clawteamScopes.join(", ")}`);
-    }
-
-    const migrator = createMigrator(store);
-
-    // Initialize smart extraction
-    let smartExtractor: SmartExtractor | null = null;
-    if (config.smartExtraction !== false) {
-      try {
-        const llmAuth = config.llm?.auth || "api-key";
-        const llmApiKey = llmAuth === "oauth"
-          ? undefined
-          : config.llm?.apiKey
-            ? resolveEnvVars(config.llm.apiKey)
-            : resolveFirstApiKey(config.embedding.apiKey);
-        const llmBaseURL = llmAuth === "oauth"
-          ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
-          : config.llm?.baseURL
-            ? resolveEnvVars(config.llm.baseURL)
-            : config.embedding.baseURL;
-        const llmModel = config.llm?.model || "openai/gpt-oss-120b";
-        const llmOauthPath = llmAuth === "oauth"
-          ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
-          : undefined;
-        const llmOauthProvider = llmAuth === "oauth"
-          ? config.llm?.oauthProvider
-          : undefined;
-        const llmTimeoutMs = resolveLlmTimeoutMs(config);
-
-        const llmClient = createLlmClient({
-          auth: llmAuth,
-          apiKey: llmApiKey,
-          model: llmModel,
-          baseURL: llmBaseURL,
-          oauthProvider: llmOauthProvider,
-          oauthPath: llmOauthPath,
-          timeoutMs: llmTimeoutMs,
-          log: (msg: string) => api.logger.debug(msg),
-          warnLog: (msg: string) => api.logger.warn(msg),
-        });
-
-        // Initialize embedding-based noise prototype bank (async, non-blocking)
-        const noiseBank = new NoisePrototypeBank(
-          (msg: string) => api.logger.debug(msg),
-        );
-        noiseBank.init(embedder).catch((err) =>
-          api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
-        );
-
-        const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(
-          config,
-          resolvedDbPath,
-          api,
-        );
-
-        smartExtractor = new SmartExtractor(store, embedder, llmClient, {
-          user: "User",
-          extractMinMessages: config.extractMinMessages ?? 4,
-          extractMaxChars: config.extractMaxChars ?? 8000,
-          defaultScope: config.scopes?.default ?? "global",
-          workspaceBoundary: config.workspaceBoundary,
-          admissionControl: config.admissionControl,
-          onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
-          log: (msg: string) => api.logger.info(msg),
-          debugLog: (msg: string) => api.logger.debug(msg),
-          noiseBank,
-        });
-
-        (isCliMode() ? api.logger.debug : api.logger.info)(
-          "memory-lancedb-pro: smart extraction enabled (LLM model: "
-          + llmModel
-          + ", timeoutMs: "
-          + llmTimeoutMs
-          + ", noise bank: ON)",
-        );
-      } catch (err) {
-        api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
-      }
-    }
-
-    // Extraction rate limiter (Feature 7: Adaptive Extraction Throttling)
-    // NOTE: This rate limiter is global — shared across all agents in multi-agent setups.
-    const extractionRateLimiter = createExtractionRateLimiter({
-      maxExtractionsPerHour: config.extractionThrottle?.maxExtractionsPerHour,
-    });
 
     async function sleep(ms: number): Promise<void> {
       await new Promise(resolve => setTimeout(resolve, ms));
@@ -1949,9 +2030,6 @@ const memoryLanceDBProPlugin = {
 
       return tierOverrides;
     }
-    const reflectionErrorStateBySession = new Map<string, ReflectionErrorState>();
-    const reflectionDerivedBySession = new Map<string, { updatedAt: number; derived: string[] }>();
-    const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
 
     const pruneOldestByUpdatedAt = <T extends { updatedAt: number }>(map: Map<string, T>, maxSize: number) => {
       if (map.size <= maxSize) return;
@@ -2057,20 +2135,6 @@ const memoryLanceDBProPlugin = {
       reflectionByAgentCache.set(cacheKey, next);
       return next;
     };
-
-    // Session-based recall history to prevent redundant injections
-    // Map<sessionId, Map<memoryId, turnIndex>>
-    const recallHistory = new Map<string, Map<string, number>>();
-
-    // Map<sessionId, turnCounter> - manual turn tracking per session
-    const turnCounter = new Map<string, number>();
-
-    // Track how many normalized user texts have already been seen per session snapshot.
-    // All three Maps are pruned to AUTO_CAPTURE_MAP_MAX_ENTRIES to prevent unbounded
-    // growth in long-running processes with many distinct sessions.
-    const autoCaptureSeenTextCount = new Map<string, number>();
-    const autoCapturePendingIngressTexts = new Map<string, string[]>();
-    const autoCaptureRecentTexts = new Map<string, string[]>();
 
     const logReg = isCliMode() ? api.logger.debug : api.logger.info;
     logReg(
@@ -2291,12 +2355,21 @@ const memoryLanceDBProPlugin = {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (sessionKey.includes(":subagent:")) return;
 
-        // Per-agent exclusion: skip auto-recall for agents in the exclusion list.
+        // Per-agent inclusion/exclusion: autoRecallIncludeAgents takes precedence over autoRecallExcludeAgents.
+        // - If autoRecallIncludeAgents is set: ONLY these agents receive auto-recall
+        // - Else if autoRecallExcludeAgents is set: all agents EXCEPT these receive auto-recall
+
         const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
-        if (
+        if (Array.isArray(config.autoRecallIncludeAgents) && config.autoRecallIncludeAgents.length > 0) {
+          if (!config.autoRecallIncludeAgents.includes(agentId)) {
+            api.logger.debug?.(
+              `memory-lancedb-pro: auto-recall skipped for agent '${agentId}' not in autoRecallIncludeAgents`,
+            );
+            return;
+          }
+        } else if (
           Array.isArray(config.autoRecallExcludeAgents) &&
           config.autoRecallExcludeAgents.length > 0 &&
-          agentId !== undefined &&
           config.autoRecallExcludeAgents.includes(agentId)
         ) {
           api.logger.debug?.(
@@ -3995,7 +4068,14 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     maxRecallPerTurn: parsePositiveInt(cfg.maxRecallPerTurn) ?? 10,
     recallMode: (cfg.recallMode === "full" || cfg.recallMode === "summary" || cfg.recallMode === "adaptive" || cfg.recallMode === "off") ? cfg.recallMode : "full",
     autoRecallExcludeAgents: Array.isArray(cfg.autoRecallExcludeAgents)
-      ? cfg.autoRecallExcludeAgents.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+      ? cfg.autoRecallExcludeAgents
+        .filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+        .map((id) => id.trim())
+      : undefined,
+    autoRecallIncludeAgents: Array.isArray(cfg.autoRecallIncludeAgents)
+      ? cfg.autoRecallIncludeAgents
+        .filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+        .map((id) => id.trim())
       : undefined,
     captureAssistant: cfg.captureAssistant === true,
     retrieval:

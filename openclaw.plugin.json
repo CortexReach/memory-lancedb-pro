@@ -4,7 +4,9 @@
   "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, long-context chunking, and management CLI",
   "version": "1.1.0-beta.10",
   "kind": "memory",
-  "skills": ["./skills"],
+  "skills": [
+    "./skills"
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -164,6 +166,18 @@
         "enum": ["full", "summary", "adaptive", "off"],
         "default": "full",
         "description": "Auto-recall depth mode. 'full': inject with configured per-item budget. 'summary': L0 abstracts only (compact). 'adaptive': analyze query intent to auto-select category and depth. 'off': disable auto-recall injection."
+      },
+      "autoRecallExcludeAgents": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": [],
+        "description": "Blacklist mode for auto-recall injection. Agents in this list are skipped. Agent resolution falls back to 'main' when no explicit agentId is available. If autoRecallIncludeAgents is also set, include wins."
+      },
+      "autoRecallIncludeAgents": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": [],
+        "description": "Whitelist mode for auto-recall injection. Only agents in this list receive auto-recall. Agent resolution falls back to 'main' when no explicit agentId is available. If both include and exclude are set, autoRecallIncludeAgents takes precedence (whitelist wins)."
       },
       "captureAssistant": {
         "type": "boolean"
@@ -854,7 +868,10 @@
           }
         }
       }
-    }
+    },
+    "required": [
+      "embedding"
+    ]
   },
   "uiHints": {
     "embedding.apiKey": {
@@ -1375,6 +1392,16 @@
     "extractionThrottle.maxExtractionsPerHour": {
       "label": "Max Extractions Per Hour",
       "help": "Rate limit for auto-capture extractions. Prevents excessive LLM calls during rapid-fire sessions.",
+      "advanced": true
+    },
+    "autoRecallExcludeAgents": {
+      "label": "Auto-Recall Excluded Agents",
+      "help": "Blacklist mode. Agents here are skipped for auto-recall. If agentId is unavailable it falls back to 'main'. If autoRecallIncludeAgents is set, include wins.",
+      "advanced": true
+    },
+    "autoRecallIncludeAgents": {
+      "label": "Auto-Recall Included Agents",
+      "help": "Whitelist mode. Only these agents receive auto-recall. If agentId is unavailable it falls back to 'main'. Includes take precedence over excludes.",
       "advanced": true
     }
   }

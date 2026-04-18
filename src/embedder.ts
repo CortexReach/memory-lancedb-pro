@@ -569,39 +569,89 @@ export class Embedder {
    * Call embeddings.create using native fetch (bypasses OpenAI SDK).
    * Used exclusively for Ollama endpoints where AbortController must work
    * correctly to avoid long-lived stalled sockets.
+   *
+   * For Ollama 0.20.5+: /v1/embeddings may return empty arrays for some models,
+   * so we use /api/embeddings with "prompt" field for single requests (PR #621).
+   * For batch requests, we use /v1/embeddings with "input" array as it's more
+   * efficient and confirmed working in local testing.
+   *
+   * See: https://github.com/CortexReach/memory-lancedb-pro/issues/620
+   * Fix: https://github.com/CortexReach/memory-lancedb-pro/issues/629
    */
   private async embedWithNativeFetch(payload: any, signal?: AbortSignal): Promise<any> {
     if (!this._baseURL) {
       throw new Error("embedWithNativeFetch requires a baseURL");
     }
 
-    // Fix for Ollama 0.20.5+: /v1/embeddings returns empty arrays for both `input` and `prompt`.
-    // Only /api/embeddings + `prompt` parameter works correctly.
-    // See: https://github.com/CortexReach/memory-lancedb-pro/issues/620
     const base = this._baseURL.replace(/\/$/, "").replace(/\/v1$/, "");
-    const endpoint = base + "/api/embeddings";
-
     const apiKey = this.clients[0]?.apiKey ?? "ollama";
 
-    // Ollama's /api/embeddings requires "prompt" field, not "input"
-    const ollamaPayload = {
-      model: payload.model,
-      prompt: payload.input,
-    };
+    // Handle batch requests with /v1/embeddings + input array
+    // NOTE: /v1/embeddings is used unconditionally for batch with no fallback.
+    // If a model doesn't support that endpoint, failure will be silent from the user's perspective.
+    // This is acceptable because most Ollama embedding models support /v1/embeddings.
+    if (Array.isArray(payload.input)) {
+      const response = await fetch(base + "/v1/embeddings", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: payload.model,
+          input: payload.input,
+          // NOTE: Other provider options (encoding_format, normalized, dimensions, etc.)
+          // from buildPayload() are intentionally not included. Ollama embedding models
+          // do not support these parameters, so omitting them is correct.
+        }),
+        signal,
+      });
 
-    const response = await fetch(endpoint, {
+      if (!response.ok) {
+        const body = await response.text().catch(() => "");
+        throw new Error(
+          `Ollama batch embedding failed: ${response.status} ${response.statusText} ??${body.slice(0, 200)}`
+        );
+      }
+
+      const data = await response.json();
+
+      // Validate response count and non-empty embeddings
+      if (
+        !Array.isArray(data?.data) ||
+        data.data.length !== payload.input.length ||
+        data.data.some((item: any) => {
+          const embedding = item?.embedding;
+          return !Array.isArray(embedding) || embedding.length === 0;
+        })
+      ) {
+        throw new Error(
+          `Ollama batch embedding returned invalid response for ${payload.input.length} inputs`
+        );
+      }
+
+      return data;
+    }
+
+    // Single request: use /api/embeddings + prompt (PR #621 fix)
+    const response = await fetch(base + "/api/embeddings", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(ollamaPayload),
-      signal: signal,
+      body: JSON.stringify({
+        model: payload.model,
+        prompt: payload.input,
+      }),
+      signal,
     });
 
     if (!response.ok) {
       const body = await response.text().catch(() => "");
-      throw new Error(`Ollama embedding failed: ${response.status} ${response.statusText} ??${body.slice(0, 200)}`);
+      throw new Error(
+        `Ollama embedding failed: ${response.status} ${response.statusText} ??${body.slice(0, 200)}`
+      );
     }
 
     const data = await response.json();

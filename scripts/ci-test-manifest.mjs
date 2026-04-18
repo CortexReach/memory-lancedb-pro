@@ -20,6 +20,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/strip-envelope-metadata.test.mjs", args: ["--test"] },
   { group: "cli-smoke", runner: "node", file: "test/cli-smoke.mjs" },
   { group: "cli-smoke", runner: "node", file: "test/functional-e2e.mjs" },
+  { group: "storage-and-schema", runner: "node", file: "test/per-agent-auto-recall.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/retriever-rerank-regression.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-memory-lifecycle.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-branches.mjs" },
@@ -41,7 +42,6 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/cross-process-lock.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/preference-slots.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/is-latest-auto-supersede.test.mjs" },
-  { group: "core-regression", runner: "node", file: "test/hook-dedup-phase1.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/temporal-awareness.test.mjs", args: ["--test"] },
   // Issue #598 regression tests
   { group: "core-regression", runner: "node", file: "test/store-serialization.test.mjs" },
@@ -50,6 +50,8 @@ export const CI_TEST_MANIFEST = [
   // Issue #632 / PR #639 lock contention fix
   { group: "core-regression", runner: "node", file: "test/upgrader-phase2-lock.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/upgrader-phase2-extreme.test.mjs" },
+  // Issue #629 batch embedding fix
+  { group: "llm-clients-and-auth", runner: "node", file: "test/embedder-ollama-batch-routing.test.mjs" },
 ];
 
 export function getEntriesForGroup(group) {

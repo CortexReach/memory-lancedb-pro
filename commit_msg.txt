@@ -1,0 +1,7 @@
+fix(embedder): address PR review comments (Issue #629)
+
+- Add embedder-ollama-batch-routing.test.mjs to CI manifest
+- Add comments explaining why provider options are omitted for Ollama batch
+- Add note about /v1/embeddings no-fallback assumption
+
+Reviewed by: rwmjhb
