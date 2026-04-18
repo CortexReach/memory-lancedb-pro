@@ -113,7 +113,7 @@ interface PluginConfig {
   recallMode?: "full" | "summary" | "adaptive" | "off";
   /** Agent IDs excluded from auto-recall injection. Useful for background agents (e.g. memory-distiller, cron workers) whose output should not be contaminated by injected memory context. */
   autoRecallExcludeAgents?: string[];
-  /** Agent IDs included in auto-recall injection (whitelist mode). When set, ONLY these agents receive auto-recall. Cannot be used together with autoRecallExcludeAgents. */
+  /** Agent IDs included in auto-recall injection (whitelist mode). When set, ONLY these agents receive auto-recall. Unresolved agent context falls back to 'main'. If both include and exclude are set, include wins. */
   autoRecallIncludeAgents?: string[];
   captureAssistant?: boolean;
   retrieval?: {
@@ -4006,10 +4006,14 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     maxRecallPerTurn: parsePositiveInt(cfg.maxRecallPerTurn) ?? 10,
     recallMode: (cfg.recallMode === "full" || cfg.recallMode === "summary" || cfg.recallMode === "adaptive" || cfg.recallMode === "off") ? cfg.recallMode : "full",
     autoRecallExcludeAgents: Array.isArray(cfg.autoRecallExcludeAgents)
-      ? cfg.autoRecallExcludeAgents.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+      ? cfg.autoRecallExcludeAgents
+        .filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+        .map((id) => id.trim())
       : undefined,
     autoRecallIncludeAgents: Array.isArray(cfg.autoRecallIncludeAgents)
-      ? cfg.autoRecallIncludeAgents.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+      ? cfg.autoRecallIncludeAgents
+        .filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+        .map((id) => id.trim())
       : undefined,
     captureAssistant: cfg.captureAssistant === true,
     retrieval:

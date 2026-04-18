@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import jitiFactory from "jiti";
 
@@ -12,7 +14,49 @@ const jiti = jitiFactory(import.meta.url, {
     "openclaw/plugin-sdk": pluginSdkStubPath,
   },
 });
-const { parsePluginConfig } = jiti("../index.ts");
+const pluginModule = jiti("../index.ts");
+const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
+const { parsePluginConfig } = pluginModule;
+const retrieverModuleForMock = jiti("../src/retriever.js");
+const embedderModuleForMock = jiti("../src/embedder.js");
+const origCreateRetriever = retrieverModuleForMock.createRetriever;
+const origCreateEmbedder = embedderModuleForMock.createEmbedder;
+
+
+function createPluginApiHarness({ pluginConfig, resolveRoot, debugLogs = [] }) {
+  const eventHandlers = new Map();
+
+  const api = {
+    pluginConfig,
+    resolvePath(target) {
+      if (typeof target !== "string") return target;
+      if (path.isAbsolute(target)) return target;
+      return path.join(resolveRoot, target);
+    },
+    logger: {
+      info() {},
+      warn() {},
+      debug(message) {
+        debugLogs.push(String(message));
+      },
+    },
+    registerTool() {},
+    registerCli() {},
+    registerService() {},
+    on(eventName, handler, meta) {
+      const list = eventHandlers.get(eventName) || [];
+      list.push({ handler, meta });
+      eventHandlers.set(eventName, list);
+    },
+    registerHook(eventName, handler, opts) {
+      const list = eventHandlers.get(eventName) || [];
+      list.push({ handler, meta: opts });
+      eventHandlers.set(eventName, list);
+    },
+  };
+
+  return { api, eventHandlers };
+}
 
 function baseConfig() {
   return {
@@ -50,6 +94,22 @@ describe("autoRecallExcludeAgents", () => {
       autoRecallExcludeAgents: ["saffron", "   ", "\t", "maple"],
     });
     assert.deepEqual(parsed.autoRecallExcludeAgents, ["saffron", "maple"]);
+  });
+
+  it("trims agent IDs during parsing", () => {
+    const parsed = parsePluginConfig({
+      ...baseConfig(),
+      autoRecallExcludeAgents: [" saffron ", "\tmaple\n"],
+    });
+    assert.deepEqual(parsed.autoRecallExcludeAgents, ["saffron", "maple"]);
+  });
+
+  it("trims agent IDs during parsing", () => {
+    const parsed = parsePluginConfig({
+      ...baseConfig(),
+      autoRecallIncludeAgents: [" saffron ", "\tmaple\n"],
+    });
+    assert.deepEqual(parsed.autoRecallIncludeAgents, ["saffron", "maple"]);
   });
 
   it("returns empty array for empty array input (not undefined)", () => {
@@ -179,9 +239,9 @@ describe("mixed-agent scenarios", () => {
     assert.equal(shouldInjectMemory({ agentId: "matcha" }), true);
   });
 
-  it("agentId='main': allow auto-recall (no agent context)", () => {
+  it("agentId='main': whitelist does not match unless main is included", () => {
     const cfg = { autoRecallIncludeAgents: ["saffron"] };
-    assert.equal(shouldInjectMemory({ agentId: "main", ...cfg }), true);
+    assert.equal(shouldInjectMemory({ agentId: "main", ...cfg }), false);
   });
 
   it("empty include list treated as no include configured", () => {
@@ -189,5 +249,74 @@ describe("mixed-agent scenarios", () => {
     // Empty include array = not configured, fall through to exclude
     assert.equal(shouldInjectMemory({ agentId: "saffron", ...cfg }), false);
     assert.equal(shouldInjectMemory({ agentId: "maple", ...cfg }), true);
+  });
+});
+
+
+describe("real before_prompt_build hook", () => {
+  it("skips auto-recall for fallback 'main' when whitelist excludes it", async () => {
+    const workspaceDir = mkdtempSync(path.join(tmpdir(), "per-agent-auto-recall-"));
+    const debugLogs = [];
+
+    retrieverModuleForMock.createRetriever = function mockCreateRetriever() {
+      return {
+        async retrieve() {
+          throw new Error("retrieve should not run when whitelist blocks agent");
+        },
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+
+    embedderModuleForMock.createEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() {
+          return new Float32Array(384).fill(0);
+        },
+        async embedPassage() {
+          return new Float32Array(384).fill(0);
+        },
+      };
+    };
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      debugLogs,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: true,
+        autoRecallMinLength: 1,
+        autoRecallIncludeAgents: ["saffron"],
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+
+    try {
+      memoryLanceDBProPlugin.register(harness.api);
+      const hooks = harness.eventHandlers.get("before_prompt_build") || [];
+      assert.equal(hooks.length, 1, "expected one before_prompt_build hook");
+      const [{ handler: autoRecallHook }] = hooks;
+
+      const output = await autoRecallHook(
+        { prompt: "Please recall my preferences.", sessionKey: "agent:main:session:test-main" },
+        { sessionId: "test-main", sessionKey: "agent:main:session:test-main" },
+      );
+
+      assert.equal(output, undefined);
+      assert.ok(
+        debugLogs.some((line) => line.includes("auto-recall skipped for agent 'main' not in autoRecallIncludeAgents")),
+        "expected whitelist skip debug log for fallback 'main'",
+      );
+    } finally {
+      retrieverModuleForMock.createRetriever = origCreateRetriever;
+      embedderModuleForMock.createEmbedder = origCreateEmbedder;
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
   });
 });
