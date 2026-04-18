@@ -1,4 +1,4 @@
-import { describe, it, beforeEach, afterEach } from "node:test";
+import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -105,47 +105,50 @@ async function seedReflection(dbPath, agentId, runAt = Date.now() - 2 * DAY_MS) 
   });
 }
 
-async function invokeReflectionHooks({ workDir, agentId, explicitAgentId = agentId }) {
-  const pluginConfig = makePluginConfig(workDir);
-  await seedReflection(pluginConfig.dbPath, agentId);
-
-  const harness = createPluginApiHarness({
-    resolveRoot: workDir,
-    pluginConfig,
-  });
-
-  memoryLanceDBProPlugin.register(harness.api);
-
-  const promptHooks = harness.eventHandlers.get("before_prompt_build") || [];
-
-  assert.equal(promptHooks.length, 2, "expected exactly two before_prompt_build hooks (invariants + derived)");
-
-  // Sort by priority: lower priority value runs first (invariants=12, derived=15)
-  const sorted = [...promptHooks].sort((a, b) => (a.meta?.priority ?? 99) - (b.meta?.priority ?? 99));
-  const ctx = { sessionKey: `agent:${agentId}:test`, agentId: explicitAgentId };
-  const startResult = await sorted[0].handler({}, ctx);   // invariants (priority 12)
-  const promptResult = await sorted[1].handler({}, ctx);   // derived (priority 15)
-
-  return { harness, startResult, promptResult };
-}
-
 describe("reflection hooks tolerate bypass scope filters", () => {
+  // Share a single workDir across all tests to avoid plugin singleton
+  // re-registration issues: _singletonState is initialized once on the
+  // first register() call and subsequent calls with different dbPath
+  // are silently ignored, leaving hooks pointing at a stale/deleted DB.
   let workDir;
+  let harness;
 
-  beforeEach(() => {
+  before(async () => {
     workDir = mkdtempSync(path.join(tmpdir(), "reflection-bypass-hook-"));
+    const pluginConfig = makePluginConfig(workDir);
+
+    // Seed reflection data for all agents used by tests
+    for (const agentId of ["system", "undefined", "main"]) {
+      await seedReflection(pluginConfig.dbPath, agentId);
+    }
+
+    // Register plugin exactly once
+    harness = createPluginApiHarness({
+      resolveRoot: workDir,
+      pluginConfig,
+    });
+    memoryLanceDBProPlugin.register(harness.api);
   });
 
-  afterEach(() => {
+  after(() => {
     rmSync(workDir, { recursive: true, force: true });
   });
 
+  async function invokeHooks(agentId, explicitAgentId = agentId) {
+    const promptHooks = harness.eventHandlers.get("before_prompt_build") || [];
+    assert.equal(promptHooks.length, 2, "expected exactly two before_prompt_build hooks (invariants + derived)");
+
+    const sorted = [...promptHooks].sort((a, b) => (a.meta?.priority ?? 99) - (b.meta?.priority ?? 99));
+    const ctx = { sessionKey: `agent:${agentId}:test`, agentId: explicitAgentId };
+    const startResult = await sorted[0].handler({}, ctx);
+    const promptResult = await sorted[1].handler({}, ctx);
+
+    return { startResult, promptResult };
+  }
+
   ["system", "undefined"].forEach((reservedAgentId) => {
     it(`injects inherited and derived reflection context for bypass agentId=${reservedAgentId}`, async () => {
-      const { harness, startResult, promptResult } = await invokeReflectionHooks({
-        workDir,
-        agentId: reservedAgentId,
-      });
+      const { startResult, promptResult } = await invokeHooks(reservedAgentId);
 
       assert.match(startResult?.prependContext || "", /<inherited-rules>/);
       assert.match(startResult?.prependContext || "", new RegExp(`Always verify reflection hook coverage for ${reservedAgentId}\\.`));
@@ -160,10 +163,7 @@ describe("reflection hooks tolerate bypass scope filters", () => {
   });
 
   it("injects reflection context for a normal non-bypass agent id", async () => {
-    const { harness, startResult, promptResult } = await invokeReflectionHooks({
-      workDir,
-      agentId: "main",
-    });
+    const { startResult, promptResult } = await invokeHooks("main");
 
     assert.match(startResult?.prependContext || "", /<inherited-rules>/);
     assert.match(startResult?.prependContext || "", /Always verify reflection hook coverage for main\./);
@@ -177,11 +177,7 @@ describe("reflection hooks tolerate bypass scope filters", () => {
   });
 
   it("resolves reflection agent id from sessionKey when ctx.agentId is missing", async () => {
-    const { harness, startResult, promptResult } = await invokeReflectionHooks({
-      workDir,
-      agentId: "main",
-      explicitAgentId: undefined,
-    });
+    const { startResult, promptResult } = await invokeHooks("main", undefined);
 
     assert.match(startResult?.prependContext || "", /Always verify reflection hook coverage for main\./);
     assert.match(promptResult?.prependContext || "", /Next run exercise the reflection injection path for main\./);
