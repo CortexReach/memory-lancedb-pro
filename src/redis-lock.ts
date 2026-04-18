@@ -71,11 +71,13 @@ export class RedisLockManager {
     try {
       await this.redis.ping();
       redisAvailable = true;
-    } catch {
+    } catch (err) {
       // Redis 不可用，使用 file lock fallback
-      console.warn('[RedisLock] Redis unavailable, using file lock fallback');
+      console.warn(`[RedisLock] ⚠️ Redis unavailable (${err}), falling back to file lock`);
       return this.createFileLock(key, ttl);
     }
+
+    // 如果 Redis 可用但沒有進一步使用，這裡可以加強確認
 
     let attempts = 0;
     while (true) {
@@ -161,9 +163,9 @@ export class RedisLockManager {
       lockfile.lockSync(lockPath, {
         stale: lockTTL,
       });
-      console.log(`[RedisLock] Acquired file lock for ${key}`);
+      console.log(`[RedisLock] ✅ File lock acquired: key=${key}, path=${lockPath}`);
     } catch (err) {
-      console.warn(`[RedisLock] Failed to acquire file lock: ${err}`);
+      console.warn(`[RedisLock] ❌ Failed to acquire file lock: key=${key}, err=${err}`);
     }
 
     // 回傳 release function
@@ -171,11 +173,11 @@ export class RedisLockManager {
       try {
         const lockfile = require('proper-lockfile');
         await lockfile.unlock(lockPath);
-        console.log(`[RedisLock] Released file lock for ${key}`);
+        console.log(`[RedisLock] ✅ File lock released: key=${key}`);
       } catch (err) {
         // 忽略 ENOENT（檔案不存在）
         if (!err.message.includes('ENOENT')) {
-          console.warn(`[RedisLock] Failed to release file lock: ${err}`);
+          console.warn(`[RedisLock] ❌ Failed to release file lock: key=${key}, err=${err}`);
         }
       }
     };
