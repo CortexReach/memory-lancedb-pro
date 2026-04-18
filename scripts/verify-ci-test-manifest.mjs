@@ -48,6 +48,9 @@ const EXPECTED_BASELINE = [
   { group: "core-regression", runner: "node", file: "test/store-serialization.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/access-tracker-retry.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/embedder-cache.test.mjs" },
+  // Issue #632 / PR #639 lock contention fix
+  { group: "core-regression", runner: "node", file: "test/upgrader-phase2-lock.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/upgrader-phase2-extreme.test.mjs" },
 ];
 
 function fail(message) {
