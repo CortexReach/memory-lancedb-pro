@@ -334,44 +334,53 @@ export class MemoryUpgrader {
     let success = 0;
     const errors: string[] = [];
 
-    await this.store.runWithFileLock(async () => {
-      for (const { entry, newCategory, enriched } of batch) {
-        try {
-          // Step 3: Build enriched metadata
-          const existingMeta = entry.metadata ? (() => {
-            try { return JSON.parse(entry.metadata!); } catch { return {}; }
-          })() : {};
-
-          const newMetadata: EnrichedMetadata = {
-            ...buildSmartMetadata(
-              { ...entry, metadata: JSON.stringify(existingMeta) },
-              {
-                l0_abstract: enriched.l0_abstract,
-                l1_overview: enriched.l1_overview,
-                l2_content: enriched.l2_content,
-                memory_category: newCategory,
-                tier: "working" as MemoryTier,
-                access_count: 0,
-                confidence: 0.7,
-              },
-            ),
-            upgraded_from: entry.category,
-            upgraded_at: Date.now(),
-          };
-
-          // Step 4: Update the memory entry
-          await this.store.update(entry.id, {
-            text: enriched.l0_abstract,
-            metadata: stringifySmartMetadata(newMetadata),
-          });
-          success++;
-        } catch (err) {
-          const errMsg = `Failed to update ${entry.id}: ${String(err)}`;
-          errors.push(errMsg);
-          this.log(`memory-upgrader: ERROR — ${errMsg}`);
+    // [FIX F2] 移除巢狀 lock：store.update() 內部已有 runWithFileLock，
+    // 這裡再包一層會造成 deadlock（proper-lockfile 不支援遞迴 lock）。
+    // [FIX MR2] 每個 entry 在寫入前重新讀取一次，確保拿到 plugin 在
+    // enrichment window 期間寫入的最新資料，避免覆蓋 injected_count 等欄位。
+    for (const { entry, newCategory, enriched } of batch) {
+      try {
+        // Re-read latest state before writing (MR2 fix)
+        const latest = await this.store.getById(entry.id);
+        if (!latest) {
+          errors.push(`Entry ${entry.id} not found during write phase`);
+          continue;
         }
+
+        // Step 3: Build enriched metadata using latest entry state
+        const existingMeta = latest.metadata ? (() => {
+          try { return JSON.parse(latest.metadata); } catch { return {}; }
+        })() : {};
+
+        const newMetadata: EnrichedMetadata = {
+          ...buildSmartMetadata(
+            { ...latest, metadata: JSON.stringify(existingMeta) },
+            {
+              l0_abstract: enriched.l0_abstract,
+              l1_overview: enriched.l1_overview,
+              l2_content: enriched.l2_content,
+              memory_category: newCategory,
+              tier: "working" as MemoryTier,
+              access_count: 0,
+              confidence: 0.7,
+            },
+          ),
+          upgraded_from: entry.category,
+          upgraded_at: Date.now(),
+        };
+
+        // Step 4: Update the memory entry (store.update() handles its own lock)
+        await this.store.update(entry.id, {
+          text: enriched.l0_abstract,
+          metadata: stringifySmartMetadata(newMetadata),
+        });
+        success++;
+      } catch (err) {
+        const errMsg = `Failed to update ${entry.id}: ${String(err)}`;
+        errors.push(errMsg);
+        this.log(`memory-upgrader: ERROR — ${errMsg}`);
       }
-    });
+    }
 
     return { success, errors };
   }
