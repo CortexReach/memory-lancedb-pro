@@ -6,6 +6,9 @@
  */
 
 import Redis from 'ioredis';
+import path from 'node:path';
+import fs from 'node:fs';
+import proper-lockfile from 'proper-lockfile';
 
 // 生成唯一 token
 function generateToken(): string {
@@ -60,13 +63,9 @@ export class RedisLockManager {
       await this.redis.ping();
       redisAvailable = true;
     } catch {
-      // Redis 不可用，優雅降級 - 回傳 no-op lock
-      console.warn('[RedisLock] Redis unavailable, using no-op lock (allow concurrent)');
-      return async () => {}; // No-op release
-    }
-
-    if (!redisAvailable) {
-      return async () => {};
+      // Redis 不可用，使用 file lock fallback
+      console.warn('[RedisLock] Redis unavailable, using file lock fallback');
+      return this.createFileLock(key, ttl);
     }
 
     let attempts = 0;
@@ -130,6 +129,45 @@ export class RedisLockManager {
 
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * 建立 file lock（Redis 不可用時的 fallback）
+   */
+  private createFileLock(key: string, ttl?: number): () => Promise<void> {
+    const lockPath = path.join('/tmp', `.memory-lock-${key}.lock`);
+    const lockTTL = (ttl || this.defaultTTL) / 1000; // proper-lockfile 用秒
+
+    // 確保目錄存在
+    const dir = path.dirname(lockPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    // 同步取得 file lock
+    try {
+      proper_lockfile.lockSync(lockPath, {
+        retries: {
+          retries: 10,
+          minTimeout: 1000,
+          maxTimeout: 30000,
+        },
+        stale: lockTTL,
+      });
+      console.log(`[RedisLock] Acquired file lock for ${key}`);
+    } catch (err) {
+      console.warn(`[RedisLock] Failed to acquire file lock: ${err}`);
+    }
+
+    // 回傳 release function
+    return async () => {
+      try {
+        await proper_lockfile.unlock(lockPath);
+        console.log(`[RedisLock] Released file lock for ${key}`);
+      } catch (err) {
+        console.warn(`[RedisLock] Failed to release file lock: ${err}`);
+      }
+    };
   }
 }
 
