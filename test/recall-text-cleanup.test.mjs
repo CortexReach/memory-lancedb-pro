@@ -25,6 +25,7 @@ const origCreateEmbedder = embedderModuleForMock.createEmbedder;
 
 const pluginModule = jiti("../index.ts");
 const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
+const { resetRegistration } = pluginModule;
 const { registerMemoryRecallTool, registerMemoryStoreTool } = jiti("../src/tools.ts");
 const { MemoryRetriever } = jiti("../src/retriever.js");
 const { buildSmartMetadata, stringifySmartMetadata } = jiti("../src/smart-metadata.ts");
@@ -336,6 +337,9 @@ describe("recall text cleanup", () => {
     // Restore factory functions on the .js module (same cache as index.ts uses)
     retrieverModuleForMock.createRetriever = origCreateRetriever;
     embedderModuleForMock.createEmbedder = origCreateEmbedder;
+    // Reset singleton state so subsequent tests that call register() get a fresh
+    // config and retriever instead of reusing the stale first-registration state.
+    resetRegistration();
     rmSync(workspaceDir, { recursive: true, force: true });
   });
 

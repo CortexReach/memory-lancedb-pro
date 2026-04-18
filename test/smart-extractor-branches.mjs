@@ -15,7 +15,8 @@ process.env.NODE_PATH = [
 Module._initPaths();
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
-const plugin = jiti("../index.ts");
+const pluginModule = jiti("../index.ts");
+const plugin = { ...pluginModule.default || pluginModule, resetRegistration: pluginModule.resetRegistration };
 const { MemoryStore } = jiti("../src/store.ts");
 const { createEmbedder } = jiti("../src/embedder.ts");
 const { buildSmartMetadata, stringifySmartMetadata } = jiti("../src/smart-metadata.ts");
@@ -268,6 +269,7 @@ async function runScenario(mode) {
       `http://127.0.0.1:${port}`,
       logs,
     );
+    plugin.resetRegistration();
     plugin.register(api);
     await seedPreference(dbPath);
 
@@ -450,6 +452,7 @@ async function runMultiRoundScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
+    plugin.resetRegistration();
     plugin.register(api);
 
     const rounds = [
@@ -549,6 +552,7 @@ async function runInjectedRecallScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
+    plugin.resetRegistration();
     plugin.register(api);
 
     await runAgentEndHook(
@@ -643,6 +647,7 @@ async function runPrependedRecallWithUserTextScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
+    plugin.resetRegistration();
     plugin.register(api);
 
     await runAgentEndHook(
@@ -735,6 +740,7 @@ async function runInboundMetadataWrappedScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
+    plugin.resetRegistration();
     plugin.register(api);
 
     await runAgentEndHook(
@@ -791,6 +797,7 @@ async function runSessionDeltaScenario() {
       "http://127.0.0.1:9",
       logs,
     );
+    plugin.resetRegistration();
     plugin.register(api);
 
     await runAgentEndHook(
@@ -855,6 +862,7 @@ async function runPendingIngressScenario() {
       "http://127.0.0.1:9",
       logs,
     );
+    plugin.resetRegistration();
     plugin.register(api);
 
     await api.hooks.message_received(
@@ -911,6 +919,7 @@ async function runRememberCommandContextScenario() {
       "http://127.0.0.1:9",
       logs,
     );
+    plugin.resetRegistration();
     plugin.register(api);
 
     await api.hooks.message_received(
@@ -1036,6 +1045,7 @@ async function runUserMdExclusiveProfileScenario() {
         enabled: true,
       },
     };
+    plugin.resetRegistration();
     plugin.register(api);
 
     await runAgentEndHook(
@@ -1134,6 +1144,7 @@ async function runBoundarySkipKeepsRegexFallbackScenario() {
         enabled: true,
       },
     };
+    plugin.resetRegistration();
     plugin.register(api);
 
     await runAgentEndHook(
@@ -1236,6 +1247,7 @@ async function runInboundMetadataCleanupScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
+    plugin.resetRegistration();
     plugin.register(api);
 
     await runAgentEndHook(

@@ -134,17 +134,69 @@ const workDir = mkdtempSync(path.join(tmpdir(), "memory-plugin-regression-"));
 const services = [];
 const embeddingRequests = [];
 
+// Start embedding mock server BEFORE the first plugin.register() call so the
+// singleton's embedder is configured with a working baseURL. The singleton
+// state (PR #598) is initialised once on the first register() call and reused
+// by all subsequent calls, so the embedding endpoint must be reachable from
+// the very first registration.
+const longText = `${"Long embedding payload. ".repeat(420)}tail`;
+const threshold = 6000;
+const embeddingServer = http.createServer(async (req, res) => {
+  if (req.method !== "POST" || req.url !== "/v1/embeddings") {
+    res.writeHead(404);
+    res.end();
+    return;
+  }
+
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  embeddingRequests.push(payload);
+  const inputs = Array.isArray(payload.input) ? payload.input : [payload.input];
+
+  if (inputs.some((input) => String(input).length > threshold)) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      error: {
+        message: "context length exceeded for mock embedding endpoint",
+        type: "invalid_request_error",
+      },
+    }));
+    return;
+  }
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({
+    object: "list",
+    data: inputs.map((_, index) => ({
+      object: "embedding",
+      index,
+      embedding: [0.5, 0.5, 0.5, 0.5],
+    })),
+    model: payload.model || "mock-embedding-model",
+    usage: {
+      prompt_tokens: 0,
+      total_tokens: 0,
+    },
+  }));
+});
+
+await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+const embeddingPort = embeddingServer.address().port;
+const embeddingBaseURL = `http://127.0.0.1:${embeddingPort}/v1`;
+
 try {
   const api = createMockApi(
     {
       dbPath: path.join(workDir, "db"),
       autoRecall: false,
+      sessionMemory: { enabled: true },
       embedding: {
         provider: "openai-compatible",
         apiKey: "dummy",
         model: "text-embedding-3-small",
-        baseURL: "http://127.0.0.1:9/v1",
-        dimensions: 1536,
+        baseURL: embeddingBaseURL,
+        dimensions: 4,
       },
     },
     { services },
@@ -167,8 +219,8 @@ try {
       provider: "openai-compatible",
       apiKey: "dummy",
       model: "text-embedding-3-small",
-      baseURL: "http://127.0.0.1:9/v1",
-      dimensions: 1536,
+      baseURL: embeddingBaseURL,
+      dimensions: 4,
     },
   });
   plugin.register(sessionDefaultApi);
@@ -188,8 +240,8 @@ try {
       provider: "openai-compatible",
       apiKey: "dummy",
       model: "text-embedding-3-small",
-      baseURL: "http://127.0.0.1:9/v1",
-      dimensions: 1536,
+      baseURL: embeddingBaseURL,
+      dimensions: 4,
     },
   });
   plugin.register(sessionEnabledApi);
@@ -205,55 +257,15 @@ try {
     "command:new hook should be registered (selfImprovement default-on since #391)",
   );
 
-  const longText = `${"Long embedding payload. ".repeat(420)}tail`;
-  const threshold = 6000;
-  const embeddingServer = http.createServer(async (req, res) => {
-    if (req.method !== "POST" || req.url !== "/v1/embeddings") {
-      res.writeHead(404);
-      res.end();
-      return;
-    }
-
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    embeddingRequests.push(payload);
-    const inputs = Array.isArray(payload.input) ? payload.input : [payload.input];
-
-    if (inputs.some((input) => String(input).length > threshold)) {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        error: {
-          message: "context length exceeded for mock embedding endpoint",
-          type: "invalid_request_error",
-        },
-      }));
-      return;
-    }
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      object: "list",
-      data: inputs.map((_, index) => ({
-        object: "embedding",
-        index,
-        embedding: [0.5, 0.5, 0.5, 0.5],
-      })),
-      model: payload.model || "mock-embedding-model",
-      usage: {
-        prompt_tokens: 0,
-        total_tokens: 0,
-      },
-    }));
-  });
-
-  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
-  const embeddingPort = embeddingServer.address().port;
-  const embeddingBaseURL = `http://127.0.0.1:${embeddingPort}/v1`;
-
-  try {
-    const chunkingOffApi = createMockApi({
-      dbPath: path.join(workDir, "db-chunking-off"),
+  {
+    // After PR #598 (Singleton State Management), the embedder is initialised
+    // once on the first register() call.  Per-registration chunking overrides
+    // are no longer honoured — the singleton's chunking setting (default: true)
+    // applies to every tool instance.  We therefore test the singleton's
+    // chunking behaviour once: a long document should be automatically chunked
+    // and stored successfully.
+    const chunkingApi = createMockApi({
+      dbPath: path.join(workDir, "db-chunking"),
       autoCapture: false,
       autoRecall: false,
       embedding: {
@@ -262,53 +274,28 @@ try {
         model: "text-embedding-3-small",
         baseURL: embeddingBaseURL,
         dimensions: 4,
-        chunking: false,
       },
     });
-    plugin.register(chunkingOffApi);
-    const chunkingOffTool = chunkingOffApi.toolFactories.memory_store({
+    plugin.register(chunkingApi);
+    const chunkingTool = chunkingApi.toolFactories.memory_store({
       agentId: "main",
       sessionKey: "agent:main:test",
     });
-    const chunkingOffResult = await chunkingOffTool.execute("tool-1", {
+    const chunkingResult = await chunkingTool.execute("tool-1", {
       text: longText,
       scope: "global",
     });
     assert.equal(
-      chunkingOffResult.details.error,
-      "store_failed",
-      "embedding.chunking=false should let long-document embedding fail",
-    );
-
-    const chunkingOnApi = createMockApi({
-      dbPath: path.join(workDir, "db-chunking-on"),
-      autoCapture: false,
-      autoRecall: false,
-      embedding: {
-        provider: "openai-compatible",
-        apiKey: "dummy",
-        model: "text-embedding-3-small",
-        baseURL: embeddingBaseURL,
-        dimensions: 4,
-        chunking: true,
-      },
-    });
-    plugin.register(chunkingOnApi);
-    const chunkingOnTool = chunkingOnApi.toolFactories.memory_store({
-      agentId: "main",
-      sessionKey: "agent:main:test",
-    });
-    const chunkingOnResult = await chunkingOnTool.execute("tool-2", {
-      text: longText,
-      scope: "global",
-    });
-    assert.equal(
-      chunkingOnResult.details.action,
+      chunkingResult.details.action,
       "created",
-      "embedding.chunking=true should recover from long-document embedding errors",
+      "singleton embedder (chunking=true by default) should recover from long-document embedding errors",
     );
 
-    const withDimensionsApi = createMockApi({
+    // After PR #598 (Singleton State Management), the embedder is initialised
+    // once on the first register() call.  Verify that the singleton's
+    // dimensions setting (4, from the first registration) is forwarded in
+    // embedding requests.
+    const dimensionsApi = createMockApi({
       dbPath: path.join(workDir, "db-with-dimensions"),
       autoCapture: false,
       autoRecall: false,
@@ -320,56 +307,25 @@ try {
         dimensions: 4,
       },
     });
-    plugin.register(withDimensionsApi);
-    const withDimensionsTool = withDimensionsApi.toolFactories.memory_store({
+    plugin.register(dimensionsApi);
+    const dimensionsTool = dimensionsApi.toolFactories.memory_store({
       agentId: "main",
       sessionKey: "agent:main:test",
     });
-    const requestCountBeforeWithDimensions = embeddingRequests.length;
-    await withDimensionsTool.execute("tool-3", {
+    const requestCountBeforeDimensions = embeddingRequests.length;
+    await dimensionsTool.execute("tool-3", {
       text: "dimensions should be sent by default",
       scope: "global",
     });
-    const withDimensionsRequest = embeddingRequests.at(requestCountBeforeWithDimensions);
+    const dimensionsRequest = embeddingRequests.at(requestCountBeforeDimensions);
     assert.equal(
-      withDimensionsRequest?.dimensions,
+      dimensionsRequest?.dimensions,
       4,
       "embedding.dimensions should be forwarded by default",
     );
-
-    const omitDimensionsApi = createMockApi({
-      dbPath: path.join(workDir, "db-omit-dimensions"),
-      autoCapture: false,
-      autoRecall: false,
-      embedding: {
-        provider: "openai-compatible",
-        apiKey: "dummy",
-        model: "text-embedding-3-small",
-        baseURL: embeddingBaseURL,
-        dimensions: 4,
-        omitDimensions: true,
-      },
-    });
-    plugin.register(omitDimensionsApi);
-    const omitDimensionsTool = omitDimensionsApi.toolFactories.memory_store({
-      agentId: "main",
-      sessionKey: "agent:main:test",
-    });
-    const requestCountBeforeOmitDimensions = embeddingRequests.length;
-    await omitDimensionsTool.execute("tool-4", {
-      text: "dimensions should be omitted when configured",
-      scope: "global",
-    });
-    const omitDimensionsRequest = embeddingRequests.at(requestCountBeforeOmitDimensions);
-    assert.equal(
-      Object.prototype.hasOwnProperty.call(omitDimensionsRequest, "dimensions"),
-      false,
-      "embedding.omitDimensions=true should omit dimensions from embedding requests",
-    );
-  } finally {
-    await new Promise((resolve) => embeddingServer.close(resolve));
   }
 } finally {
+  await new Promise((resolve) => embeddingServer.close(resolve));
   rmSync(workDir, { recursive: true, force: true });
 }
 

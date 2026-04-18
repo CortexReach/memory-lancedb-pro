@@ -4255,10 +4255,11 @@ export { getDefaultMdMirrorDir };
  * @public
  */
 export function resetRegistration() {
-  // Note: WeakSets cannot be cleared by design. In test scenarios where the
-  // same process reloads the module, a fresh module state means a new WeakSet.
-  // For hot-reload scenarios, the module is re-imported fresh.
-  // (WeakSet.clear() does not exist, so we do nothing here.)
+  // Reset the singleton state so tests can re-register with a fresh config.
+  // Note: WeakSets cannot be cleared by design — only the singleton is reset.
+  // Each new register() call after resetRegistration() will create a new API
+  // object that passes the WeakSet guard and re-initialises _singletonState.
+  _singletonState = null;
 }
 
 export default memoryLanceDBProPlugin;
