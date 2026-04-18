@@ -40,6 +40,11 @@ export interface RetrievalConfig {
   recencyHalfLifeDays: number;
   /** Max recency boost factor (default: 0.10) */
   recencyWeight: number;
+  /** Minutes window for fresh memory boost. Memories stored within this window
+   *  get an additional score bonus (default: 30). Set to 0 to disable. */
+  freshMemoryBoostMinutes?: number;
+  /** Base score boost for fresh memories (default: 0.15) */
+  freshMemoryBoostWeight?: number;
   /** Filter noise from results (default: true) */
   filterNoise: boolean;
   /** Reranker API key (enables cross-encoder reranking) */
@@ -1363,6 +1368,25 @@ export class MemoryRetriever {
         score: clamp01(r.score + boost, r.score),
       };
     });
+
+    // 新鲜记忆加分：窗口内存储的记忆获得额外分数，
+    // 确保纠正信息能排在高频旧记忆之前。
+    const freshWindowMinutes = this.config.freshMemoryBoostMinutes ?? 30;
+    const freshWeight = this.config.freshMemoryBoostWeight ?? 0.15;
+    if (freshWindowMinutes > 0) {
+      const freshWindowMs = freshWindowMinutes * 60_000;
+      for (const r of boosted) {
+        const ts = r.entry.timestamp && r.entry.timestamp > 0 ? r.entry.timestamp : now;
+        const ageMs = now - ts;
+        if (ageMs < freshWindowMs) {
+          let bonus = freshWeight;
+          if (r.entry.category === "reflection" || r.entry.category === "preference") {
+            bonus += 0.05;
+          }
+          r.score = clamp01(r.score + bonus, r.score);
+        }
+      }
+    }
 
     return boosted.sort((a, b) => b.score - a.score);
   }
