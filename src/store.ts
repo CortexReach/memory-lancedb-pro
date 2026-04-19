@@ -420,6 +420,39 @@ export class MemoryStore {
   }
 
   /**
+   * Bulk store multiple memory entries (single lock acquisition)
+   * 
+   * Reduces lock contention by acquiring lock once for multiple entries.
+   * Use this when auto-capture produces multiple memories.
+   */
+  async bulkStore(
+    entries: Omit<MemoryEntry, "id" | "timestamp">[],
+  ): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+    
+    const fullEntries: MemoryEntry[] = entries.map((entry) => ({
+      ...entry,
+      id: randomUUID(),
+      timestamp: Date.now(),
+      metadata: entry.metadata || "{}",
+    }));
+    
+    // Single lock acquisition for all entries
+    return this.runWithFileLock(async () => {
+      try {
+        await this.table!.add(fullEntries);
+      } catch (err: any) {
+        const code = err.code || "";
+        const message = err.message || String(err);
+        throw new Error(
+          `Failed to bulk store ${fullEntries.length} memories: ${code} ${message}`,
+        );
+      }
+      return fullEntries;
+    });
+  }
+
+  /**
    * Import a pre-built entry while preserving its id/timestamp.
    * Used for re-embedding / migration / A/B testing across embedding models.
    * Intentionally separate from `store()` to keep normal writes simple.
