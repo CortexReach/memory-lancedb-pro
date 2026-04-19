@@ -430,7 +430,17 @@ export class MemoryStore {
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
     
-    const fullEntries: MemoryEntry[] = entries.map((entry) => ({
+    // Filter out invalid entries (undefined, null, missing text/vector)
+    const validEntries = entries.filter(
+      (entry) => entry && entry.text && entry.text.length > 0 && entry.vector && entry.vector.length > 0
+    );
+    
+    // Early return for empty array (skip lock acquisition)
+    if (validEntries.length === 0) {
+      return [];
+    }
+    
+    const fullEntries: MemoryEntry[] = validEntries.map((entry) => ({
       ...entry,
       id: randomUUID(),
       timestamp: Date.now(),
