@@ -17,6 +17,7 @@ Module._initPaths();
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const plugin = jiti("../index.ts");
+const resetRegistration = plugin.resetRegistration ?? (() => {});
 
 const manifest = JSON.parse(
   readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
@@ -158,6 +159,7 @@ try {
     },
     { services },
   );
+  resetRegistration();
   plugin.register(api);
   assert.equal(services.length, 1, "plugin should register its background service");
   assert.equal(typeof api.hooks.agent_end, "function", "autoCapture should remain enabled by default");
@@ -180,6 +182,7 @@ try {
       dimensions: 1536,
     },
   });
+  resetRegistration();
   plugin.register(sessionDefaultApi);
   // selfImprovement registers command:new by default (#391), independent of sessionMemory config
   assert.equal(
@@ -201,6 +204,7 @@ try {
       dimensions: 1536,
     },
   });
+  resetRegistration();
   plugin.register(sessionEnabledApi);
   assert.equal(
     typeof sessionEnabledApi.hooks.before_reset,
@@ -274,6 +278,7 @@ try {
         chunking: false,
       },
     });
+    resetRegistration();
     plugin.register(chunkingOffApi);
     const chunkingOffTool = chunkingOffApi.toolFactories.memory_store({
       agentId: "main",
@@ -302,6 +307,7 @@ try {
         chunking: true,
       },
     });
+    resetRegistration();
     plugin.register(chunkingOnApi);
     const chunkingOnTool = chunkingOnApi.toolFactories.memory_store({
       agentId: "main",
@@ -329,6 +335,7 @@ try {
         dimensions: 4,
       },
     });
+    resetRegistration();
     plugin.register(withDimensionsApi);
     const withDimensionsTool = withDimensionsApi.toolFactories.memory_store({
       agentId: "main",
@@ -358,6 +365,7 @@ try {
         requestDimensions: 4,
       },
     });
+    resetRegistration();
     plugin.register(withRequestDimensionsApi);
     const withRequestDimensionsTool = withRequestDimensionsApi.toolFactories.memory_store({
       agentId: "main",
@@ -393,6 +401,7 @@ try {
         omitDimensions: true,
       },
     });
+    resetRegistration();
     plugin.register(omitDimensionsApi);
     const omitDimensionsTool = omitDimensionsApi.toolFactories.memory_store({
       agentId: "main",

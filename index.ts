@@ -1651,7 +1651,7 @@ const pluginVersion = getPluginVersion();
 // WeakSet keyed by API instance — each distinct API object tracks its own initialized state.
 // Using WeakSet instead of a module-level boolean avoids the "second register() call skips
 // hook/tool registration for the new API instance" regression that rwmjhb identified.
-const _registeredApis = new WeakSet<OpenClawPluginApi>();
+let _registeredApis = new WeakSet<OpenClawPluginApi>();
 
 // ============================================================================
 // Hook Event Deduplication (Phase 1)
@@ -4263,10 +4263,9 @@ export { getDefaultMdMirrorDir };
  * @public
  */
 export function resetRegistration() {
-  // Note: WeakSets cannot be cleared by design. In test scenarios where the
-  // same process reloads the module, a fresh module state means a new WeakSet.
-  // For hot-reload scenarios, the module is re-imported fresh.
-  // (WeakSet.clear() does not exist, so we do nothing here.)
+  _registeredApis = new WeakSet<OpenClawPluginApi>();
+  _singletonState = null;
+  _hookEventDedup.clear();
 }
 
 export default memoryLanceDBProPlugin;
