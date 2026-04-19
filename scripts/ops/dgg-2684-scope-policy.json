@@ -1,0 +1,88 @@
+{
+  "version": "dgg-2684",
+  "description": "Selected scope/retrieval policy for AC-3 (exp_scope_hybrid) and runtime profile sync",
+  "retrieval": {
+    "vectorWeight": 0.55,
+    "bm25Weight": 0.45,
+    "recencyHalfLifeDays": 10,
+    "recencyWeight": 0.18,
+    "hardMinScore": 0.32
+  },
+  "agentAccess": {
+    "main": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "dggd:decisions",
+      "dggd:ops",
+      "role:exec",
+      "role:pm",
+      "role:dev",
+      "agent:main"
+    ],
+    "tamer": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "dggd:decisions",
+      "dggd:ops",
+      "agent:tamer"
+    ],
+    "kuromi": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "dggd:decisions",
+      "dggd:ops",
+      "role:exec",
+      "role:pm",
+      "role:dev",
+      "agent:kuromi"
+    ],
+    "hellokitty-exec": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "dggd:decisions",
+      "dggd:ops",
+      "role:exec",
+      "agent:hellokitty-exec"
+    ],
+    "mymelody-pm": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "dggd:decisions",
+      "dggd:ops",
+      "role:pm",
+      "agent:mymelody-pm"
+    ],
+    "badtz-dev": [
+      "dggd",
+      "dggd:projects",
+      "dggd:ops",
+      "role:dev",
+      "agent:badtz-dev"
+    ],
+    "cinna-mlds": [
+      "dggd",
+      "dggd:projects",
+      "dggd:ops",
+      "role:dev",
+      "agent:cinna-mlds"
+    ],
+    "albot": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "dggd:decisions",
+      "agent:albot"
+    ],
+    "koolmi": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "agent:koolmi"
+    ]
+  }
+}

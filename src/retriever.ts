@@ -178,24 +178,24 @@ export interface RetrievalDiagnostics {
 
 export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   mode: "hybrid",
-  vectorWeight: 0.7,
-  bm25Weight: 0.3,
+  vectorWeight: 0.55,
+  bm25Weight: 0.45,
   queryExpansion: true,
   minScore: 0.3,
   rerank: "cross-encoder",
   candidatePoolSize: 20,
-  recencyHalfLifeDays: 14,
-  recencyWeight: 0.1,
+  recencyHalfLifeDays: 10,
+  recencyWeight: 0.18,
   filterNoise: true,
   rerankModel: "jina-reranker-v3",
   rerankEndpoint: "https://api.jina.ai/v1/rerank",
   rerankTimeoutMs: 5000,
   lengthNormAnchor: 500,
-  hardMinScore: 0.35,
+  hardMinScore: 0.32,
   timeDecayHalfLifeDays: 60,
   reinforcementFactor: 0.5,
   maxHalfLifeMultiplier: 3,
-  tagPrefixes: ["proj", "env", "team", "scope"],
+  tagPrefixes: ["scope", "dggd", "role", "agent", "proj", "project", "env", "team", "user"],
 };
 
 // ============================================================================
@@ -215,6 +215,16 @@ function clamp01(value: number, fallback: number): number {
 function clamp01WithFloor(value: number, floor: number): number {
   const safeFloor = clamp01(floor, 0);
   return Math.max(safeFloor, clamp01(value, safeFloor));
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+interface ParsedTagToken {
+  raw: string;
+  prefix: string;
+  value: string;
 }
 
 type TaggedRetrievalError = Error & {
@@ -701,13 +711,73 @@ export class MemoryRetriever {
     return { results, trace: finalTrace };
   }
 
-  private extractTagTokens(query: string): string[] {
+  private extractTagTokens(query: string): ParsedTagToken[] {
     if (!this.config.tagPrefixes?.length) return [];
-    
-    const pattern = this.config.tagPrefixes.join("|");
-    const regex = new RegExp(`(?:${pattern}):[\\w-]+`, "gi");
-    const matches = query.match(regex);
-    return matches || [];
+
+    const prefixes = this.config.tagPrefixes
+      .map((p) => p.trim().toLowerCase())
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length);
+    if (prefixes.length === 0) return [];
+
+    const pattern = prefixes.map(escapeRegex).join("|");
+    const regex = new RegExp(`\\b(${pattern}):([\\w:-]+)\\b`, "gi");
+    const tokens: ParsedTagToken[] = [];
+
+    for (const match of query.matchAll(regex)) {
+      const raw = match[0];
+      const prefix = (match[1] || "").toLowerCase();
+      const value = (match[2] || "").toLowerCase();
+      if (!raw || !prefix || !value) continue;
+      tokens.push({ raw, prefix, value });
+    }
+
+    return tokens;
+  }
+
+  private stripTagTokens(query: string, tagTokens: ParsedTagToken[]): string {
+    if (tagTokens.length === 0) return query.trim();
+
+    let stripped = query;
+    for (const token of tagTokens) {
+      stripped = stripped.replace(token.raw, " ");
+    }
+    return stripped.replace(/\s+/g, " ").trim();
+  }
+
+  private matchesTagToken(entry: MemoryEntry, token: ParsedTagToken): boolean {
+    const textLower = entry.text.toLowerCase();
+    const rawLower = token.raw.toLowerCase();
+    if (textLower.includes(rawLower)) return true;
+
+    const scope = (entry.scope || "").toLowerCase();
+    if (!scope) return false;
+
+    const startsWithScope = (candidate: string): boolean =>
+      scope === candidate || scope.startsWith(`${candidate}:`);
+
+    switch (token.prefix) {
+      case "scope": {
+        const literal = token.value;
+        const colonNormalized = token.value.replace(/-/g, ":");
+        return startsWithScope(literal) || startsWithScope(colonNormalized);
+      }
+      case "dggd":
+      case "role":
+      case "agent":
+      case "user":
+        return startsWithScope(`${token.prefix}:${token.value}`);
+      case "project":
+      case "proj":
+        return startsWithScope(`project:${token.value}`);
+      case "team":
+        return (
+          startsWithScope(`team:${token.value}`) ||
+          startsWithScope(`dggd:${token.value}`)
+        );
+      default:
+        return false;
+    }
   }
 
   private async vectorOnlyRetrieval(
@@ -798,7 +868,7 @@ export class MemoryRetriever {
 
   private async bm25OnlyRetrieval(
     query: string,
-    tagTokens: string[],
+    tagTokens: ParsedTagToken[],
     limit: number,
     scopeFilter?: string[],
     category?: string,
@@ -806,10 +876,11 @@ export class MemoryRetriever {
     diagnostics?: RetrievalDiagnostics,
   ): Promise<RetrievalResult[]> {
     const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
+    const bm25Query = this.stripTagTokens(query, tagTokens) || query;
 
     trace?.startStage("bm25_search", []);
     const bm25Results = await this.store.bm25Search(
-      query,
+      bm25Query,
       candidatePoolSize,
       scopeFilter,
       { excludeInactive: true },
@@ -818,8 +889,7 @@ export class MemoryRetriever {
       ? bm25Results.filter((r) => r.entry.category === category)
       : bm25Results;
     const mustContainFiltered = categoryFiltered.filter((r) => {
-      const textLower = r.entry.text.toLowerCase();
-      return tagTokens.every((t) => textLower.includes(t.toLowerCase()));
+      return tagTokens.every((token) => this.matchesTagToken(r.entry, token));
     });
     // Filter expired memories early — before scoring
     const unexpiredResults = mustContainFiltered.filter((r) => {
@@ -835,7 +905,7 @@ export class MemoryRetriever {
     );
     trace?.endStage(mapped.map((r) => r.entry.id), mapped.map((r) => r.score));
     if (diagnostics) {
-      diagnostics.bm25Query = query;
+      diagnostics.bm25Query = bm25Query;
       diagnostics.bm25ResultCount = mapped.length;
       diagnostics.fusedResultCount = mapped.length;
       diagnostics.stageCounts.afterMinScore = mapped.length;

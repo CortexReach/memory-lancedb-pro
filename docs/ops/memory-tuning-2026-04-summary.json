@@ -1,0 +1,32 @@
+[
+  {
+    "variant": "baseline",
+    "weightedPrecisionAt5": 0.52,
+    "relevantRate": 0.32,
+    "partialRate": 0.4,
+    "irrelevantRate": 0.28,
+    "scopeLeakageRate": 0.56,
+    "totalRows": 50,
+    "elapsedSec": 285
+  },
+  {
+    "variant": "exp_recent",
+    "weightedPrecisionAt5": 0.54,
+    "relevantRate": 0.32,
+    "partialRate": 0.44,
+    "irrelevantRate": 0.24,
+    "scopeLeakageRate": 0.52,
+    "totalRows": 50,
+    "elapsedSec": 218.2
+  },
+  {
+    "variant": "exp_scope_hybrid",
+    "weightedPrecisionAt5": 0.63,
+    "relevantRate": 0.5,
+    "partialRate": 0.26,
+    "irrelevantRate": 0.24,
+    "scopeLeakageRate": 0.34,
+    "totalRows": 50,
+    "elapsedSec": 310.7
+  }
+]
