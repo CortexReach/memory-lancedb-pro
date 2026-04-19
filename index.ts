@@ -2049,10 +2049,12 @@ const memoryLanceDBProPlugin = {
       limit: number;
       scopeFilter?: string[];
       category?: string;
+      signal?: AbortSignal;
     }) {
       let results = await retriever.retrieve(params);
       if (results.length === 0) {
         await sleep(75);
+        if (params.signal?.aborted) return results;
         results = await retriever.retrieve(params);
       }
       return results;
@@ -2530,7 +2532,13 @@ const memoryLanceDBProPlugin = {
         // (embedding → rerank → lifecycle), which can silently drop messages on
         // channels like Telegram when subsequent requests hit lock timeouts.
         // See: https://github.com/CortexReach/memory-lancedb-pro/issues/253
-        const recallWork = async (): Promise<{ prependContext: string } | undefined> => {
+        //
+        // The timeout also aborts the in-flight embedding HTTP call via the
+        // abortController below, so the underlying work doesn't continue to hold
+        // resources (lancedb connection, per-agent memory-runtime mutex) past
+        // the timeout boundary.
+        const abortController = new AbortController();
+        const recallWork = async (signal: AbortSignal): Promise<{ prependContext: string } | undefined> => {
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
@@ -2577,6 +2585,7 @@ const memoryLanceDBProPlugin = {
             limit: retrieveLimit,
             scopeFilter: accessibleScopes,
             source: "auto-recall",
+            signal,
           }), config.workspaceBoundary);
 
           if (results.length === 0) {
@@ -2817,9 +2826,12 @@ const memoryLanceDBProPlugin = {
         let timeoutId: ReturnType<typeof setTimeout> | undefined;
         try {
           const result = await Promise.race([
-            recallWork().then((r) => { clearTimeout(timeoutId); return r; }),
+            recallWork(abortController.signal).then((r) => { clearTimeout(timeoutId); return r; }),
             new Promise<undefined>((resolve) => {
               timeoutId = setTimeout(() => {
+                // Cancel in-flight embedding/retrieval HTTP calls so they don't
+                // keep holding resources after we've given up on the result.
+                abortController.abort(new Error("auto-recall timeout"));
                 api.logger.warn(
                   `memory-lancedb-pro: auto-recall timed out after ${AUTO_RECALL_TIMEOUT_MS}ms; skipping memory injection to avoid stalling agent startup`,
                 );
@@ -2830,7 +2842,14 @@ const memoryLanceDBProPlugin = {
           return result;
         } catch (err) {
           clearTimeout(timeoutId);
-          api.logger.warn(`memory-lancedb-pro: recall failed: ${String(err)}`);
+          // Downgrade AbortError to debug — the timeout path already emitted
+          // a warn log, and the race has already resolved undefined.
+          const isAbort = err instanceof Error && (err.name === "AbortError" || /abort/i.test(err.message));
+          if (isAbort) {
+            api.logger.debug?.(`memory-lancedb-pro: recall aborted: ${String(err)}`);
+          } else {
+            api.logger.warn(`memory-lancedb-pro: recall failed: ${String(err)}`);
+          }
         }
       }, { priority: 10 });
 
