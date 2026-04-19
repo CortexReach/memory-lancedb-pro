@@ -53,11 +53,10 @@ export interface MetadataPatch {
 let lancedbImportPromise: Promise<typeof import("@lancedb/lancedb")> | null =
   null;
 
-// =========================================================================
-// Cross-Process File Lock (proper-lockfile)
-// =========================================================================
+// =========================================================================// Cross-Process Lock (Redis + proper-lockfile fallback)// =========================================================================
 
 let lockfileModule: any = null;
+let redisLockManager: any = null;
 
 async function loadLockfile(): Promise<any> {
   if (!lockfileModule) {
@@ -66,6 +65,20 @@ async function loadLockfile(): Promise<any> {
   return lockfileModule;
 }
 
+// Initialize Redis lock manager (lazy)
+async function getRedisLockManager(): Promise<any> {
+  if (!redisLockManager) {
+    try {
+      const { createRedisLockManager } = await import("./redis-lock.js");
+      redisLockManager = await createRedisLockManager();
+      console.log("[memory-lancedb-pro] Redis lock manager initialized");
+    } catch (err) {
+      console.warn("[memory-lancedb-pro] Redis lock unavailable, using file lock fallback:", err);
+      redisLockManager = null;
+    }
+  }
+  return redisLockManager;
+}
 /** For unit testing: override the lockfile module with a mock. */
 export function __setLockfileModuleForTests(module: any): void {
   lockfileModule = module;
@@ -210,6 +223,23 @@ export class MemoryStore {
   constructor(private readonly config: StoreConfig) { }
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
+    // ===== Try Redis lock first =====
+    const redisManager = await getRedisLockManager();
+    if (redisManager) {
+      try {
+        const release = await redisManager.acquire("memory-write", 60000);
+        try {
+          return await fn();
+        } finally {
+          await release();
+        }
+      } catch (err) {
+        console.warn("[memory-lancedb-pro] Redis lock failed, falling back to file lock:", err);
+        // Fall through to file lock
+      }
+    }
+
+    // ===== File lock fallback =====
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
     if (!existsSync(lockPath)) {
@@ -566,12 +596,6 @@ export class MemoryStore {
       .limit(1)
       .toArray();
     return res.length > 0;
-  }
-
-  /** Lightweight total row count via LanceDB countRows(). */
-  async count(): Promise<number> {
-    await this.ensureInitialized();
-    return await this.table!.countRows();
   }
 
   async getById(id: string, scopeFilter?: string[]): Promise<MemoryEntry | null> {
