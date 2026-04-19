@@ -2866,7 +2866,7 @@ const memoryLanceDBProPlugin = {
           }
 
           // [Fix #6] Cap extractMinMessages to prevent misconfiguration
-          const minMessages = Math.min(config.extractMinMessages ?? 4, AUTO_CAPTURE_PENDING_WINDOW);
+          const minMessages = config.extractMinMessages ?? 4;
           if (skippedAutoCaptureTexts > 0) {
             api.logger.debug(
               `memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`,

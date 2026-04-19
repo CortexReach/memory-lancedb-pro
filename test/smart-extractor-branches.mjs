@@ -1445,9 +1445,10 @@ async function runCounterResetSuccessScenario() {
         index: 0, message: { role: "assistant",
           content: JSON.stringify({
             memories: [{
-              text: "使用者喜歡把重要修復寫成 regression test",
-              category: "fact", importance: 0.82,
-              confidence: 0.9, rationale: "明確陳述偏好",
+              category: "cases",
+              abstract: "使用者偏好將重要修復寫成 regression test",
+              overview: "使用者喜歡把重要修復寫成 regression test",
+              content: "使用者喜歡把重要修復寫成 regression test，以確保未來不會再犯同樣的錯誤。"
             }],
           }),
         },
