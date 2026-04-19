@@ -51,15 +51,15 @@
     ]
   },
   "optionalDependencies": {
-    "@lancedb/lancedb-darwin-x64": "^0.26.2",
     "@lancedb/lancedb-darwin-arm64": "^0.26.2",
-    "@lancedb/lancedb-linux-x64-gnu": "^0.26.2",
+    "@lancedb/lancedb-darwin-x64": "^0.26.2",
     "@lancedb/lancedb-linux-arm64-gnu": "^0.26.2",
+    "@lancedb/lancedb-linux-x64-gnu": "^0.26.2",
     "@lancedb/lancedb-win32-x64-msvc": "^0.26.2"
   },
   "devDependencies": {
     "commander": "^14.0.0",
-    "jiti": "^2.6.0",
+    "jiti": "^2.6.1",
     "typescript": "^5.9.3"
   }
 }
