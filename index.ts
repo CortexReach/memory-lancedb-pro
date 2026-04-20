@@ -26,6 +26,7 @@ import {
   getEffectiveVectorDimensions,
 } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
+import { AccessTracker } from "./src/access-tracker.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
@@ -1883,6 +1884,14 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     { ...DEFAULT_RETRIEVAL_CONFIG, ...config.retrieval },
     { decayEngine },
   );
+
+  // Wire access tracker so recall operations update access_count on memories
+  const accessTracker = new AccessTracker({
+    store,
+    logger: { warn: (...args: unknown[]) => api.logger.warn(...args), info: (...args: unknown[]) => api.logger.info(...args) },
+    debounceMs: 5000,
+  });
+  retriever.setAccessTracker(accessTracker);
   const scopeManager = createScopeManager(config.scopes);
 
   const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
