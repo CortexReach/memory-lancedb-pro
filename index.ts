@@ -271,6 +271,11 @@ function getDefaultDbPath(): string {
 
 function getDefaultWorkspaceDir(): string {
   const home = homedir();
+  // Try workspace-main first (standard OpenClaw layout), fallback to workspace
+  const mainDir = join(home, ".openclaw", "workspace-main");
+  try {
+    if (statSync(mainDir).isDirectory()) return mainDir;
+  } catch {}
   return join(home, ".openclaw", "workspace");
 }
 
