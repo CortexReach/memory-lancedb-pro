@@ -103,6 +103,8 @@ const DREAMING_SOURCE_TAG = "dreaming-engine";
 interface DreamingEngineParams {
   store: MemoryStore;
   embedder: { embed(text: string): Promise<number[]> };
+  /** Fallback vector dimension when embedding fails */
+  fallbackDimensions: number;
   decayEngine: { scoreAll(memories: DecayableMemory[], now: number): DecayScore[] };
   tierManager: { evaluateAll(memories: TierableMemory[], decayScores: DecayScore[], now: number): TierTransition[] };
   config: DreamingConfig;
@@ -113,12 +115,20 @@ interface DreamingEngineParams {
 
 export function createDreamingEngine(params: DreamingEngineParams): DreamingEngine {
   const { store, embedder, decayEngine, tierManager, config, log, debugLog } = params;
+  const fallbackVector = () => new Array(params.fallbackDimensions).fill(0);
 
   const verbose = config.verboseLogging;
   const dbg = verbose ? debugLog : () => {};
+  const runningScopes = new Set<string>(); // Prevent overlapping cycles per scope
 
   return {
     async run(scope: string): Promise<DreamingReport> {
+      if (runningScopes.has(scope)) {
+        log(`Skipping ${scope} — previous cycle still running`);
+        return { timestamp: Date.now(), scope, phases: { light: { scanned: 0, transitions: [] }, deep: { candidates: 0, promoted: 0 }, rem: { patterns: [], reflectionsCreated: 0 } } };
+      }
+      runningScopes.add(scope);
+      try {
       const now = Date.now();
       log(`💤 Dreaming cycle started (scope: ${scope})`);
 
@@ -156,6 +166,9 @@ export function createDreamingEngine(params: DreamingEngineParams): DreamingEngi
 
       log("☀️ Dreaming cycle complete");
       return report;
+      } finally {
+        runningScopes.delete(scope);
+      }
     },
   };
 
@@ -278,10 +291,11 @@ export function createDreamingEngine(params: DreamingEngineParams): DreamingEngi
       if (composite >= minScore && accessCount >= minRecallCount) {
         // Boost importance by 20% (capped at 1.0)
         const newImportance = Math.min(1.0, entry.importance * 1.2);
+        // Update top-level importance column + metadata tier
+        await store.update(entry.id, { importance: newImportance });
         await store.patchMetadata(entry.id, {
           tier: "core",
           tier_updated_at: now,
-          importance: newImportance,
         });
         dbg(`  ⬆ Deep sleep promoted: ${entry.id} (score=${composite.toFixed(3)}, accesses=${accessCount})`);
         promoted++;
@@ -371,7 +385,7 @@ export function createDreamingEngine(params: DreamingEngineParams): DreamingEngi
         vector = await embedder.embed(reflectionText);
       } catch {
         dbg("REM: embedding failed, falling back to zero vector");
-        vector = new Array(1024).fill(0);
+        vector = fallbackVector();
       }
 
       // MR1: Store reflection in the same scope as source memories

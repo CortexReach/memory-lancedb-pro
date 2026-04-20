@@ -73,6 +73,10 @@ function createMockStore(entries: MemoryEntry[]): MemoryStore {
     patchMetadata: async (id, patch) => {
       patched.set(id, patch);
     },
+    update: async (id, updates) => {
+      patched.set(id, { ...patched.get(id), ...updates });
+      return null;
+    },
   } as unknown as MemoryStore;
 }
 
@@ -153,6 +157,7 @@ async function testScopeIsolation() {
   const engine = createDreamingEngine({
     store,
     embedder: createMockEmbedder(),
+    fallbackDimensions: 1024,
     decayEngine: createMockDecayEngine(),
     tierManager: createMockTierManager(),
     config: mergeDreamingConfig({ enabled: true, phases: { light: { lookbackDays: 7, limit: 100 } } }),
@@ -192,6 +197,7 @@ async function testReflectionLoopPrevention() {
   const engine = createDreamingEngine({
     store,
     embedder: createMockEmbedder(),
+    fallbackDimensions: 1024,
     decayEngine: createMockDecayEngine(),
     tierManager: createMockTierManager(),
     config: mergeDreamingConfig({ enabled: true }),
@@ -234,6 +240,7 @@ async function testREMEmbedding() {
   const engine = createDreamingEngine({
     store,
     embedder,
+    fallbackDimensions: 1024,
     decayEngine: createMockDecayEngine(),
     tierManager: createMockTierManager(),
     config: mergeDreamingConfig({ enabled: true, verboseLogging: true }),
@@ -264,6 +271,7 @@ async function testLightSleep() {
   const engine = createDreamingEngine({
     store,
     embedder: createMockEmbedder(),
+    fallbackDimensions: 1024,
     decayEngine: createMockDecayEngine(),
     tierManager: createMockTierManager(transitions),
     config: mergeDreamingConfig({ enabled: true }),
@@ -291,6 +299,7 @@ async function testDeepSleep() {
   const engine = createDreamingEngine({
     store,
     embedder: createMockEmbedder(),
+    fallbackDimensions: 1024,
     decayEngine,
     tierManager: createMockTierManager(),
     config: mergeDreamingConfig({ enabled: true, phases: { deep: { minScore: 0.6, minRecallCount: 1 } } }),
@@ -323,6 +332,7 @@ async function testREMPatternDetection() {
   const engine = createDreamingEngine({
     store,
     embedder: createMockEmbedder(),
+    fallbackDimensions: 1024,
     decayEngine: createMockDecayEngine(),
     tierManager: createMockTierManager(),
     config: mergeDreamingConfig({ enabled: true }),
@@ -349,6 +359,7 @@ async function testErrorResilience() {
   const engine = createDreamingEngine({
     store,
     embedder: createMockEmbedder(),
+    fallbackDimensions: 1024,
     decayEngine: failingDecayEngine,
     tierManager: createMockTierManager(),
     config: mergeDreamingConfig({ enabled: true }),
