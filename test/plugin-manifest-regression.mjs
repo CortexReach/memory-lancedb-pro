@@ -17,6 +17,7 @@ Module._initPaths();
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const plugin = jiti("../index.ts");
+const resetRegistration = plugin.resetRegistration ?? (() => {});
 
 const manifest = JSON.parse(
   readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
@@ -110,6 +111,15 @@ assert.equal(
   "embedding.omitDimensions should be declared in the plugin schema",
 );
 assert.equal(
+  manifest.configSchema.properties.embedding.properties.requestDimensions?.type,
+  "integer",
+  "embedding.requestDimensions should be declared in the plugin schema",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.uiHints, "embedding.requestDimensions"),
+  "uiHints should expose embedding.requestDimensions",
+);
+assert.equal(
   manifest.configSchema.properties.sessionMemory.properties.enabled.default,
   false,
   "sessionMemory.enabled schema default should match runtime default",
@@ -149,6 +159,7 @@ try {
     },
     { services },
   );
+  resetRegistration();
   plugin.register(api);
   assert.equal(services.length, 1, "plugin should register its background service");
   assert.equal(typeof api.hooks.agent_end, "function", "autoCapture should remain enabled by default");
@@ -171,6 +182,7 @@ try {
       dimensions: 1536,
     },
   });
+  resetRegistration();
   plugin.register(sessionDefaultApi);
   // selfImprovement registers command:new by default (#391), independent of sessionMemory config
   assert.equal(
@@ -192,6 +204,7 @@ try {
       dimensions: 1536,
     },
   });
+  resetRegistration();
   plugin.register(sessionEnabledApi);
   assert.equal(
     typeof sessionEnabledApi.hooks.before_reset,
@@ -265,6 +278,7 @@ try {
         chunking: false,
       },
     });
+    resetRegistration();
     plugin.register(chunkingOffApi);
     const chunkingOffTool = chunkingOffApi.toolFactories.memory_store({
       agentId: "main",
@@ -293,6 +307,7 @@ try {
         chunking: true,
       },
     });
+    resetRegistration();
     plugin.register(chunkingOnApi);
     const chunkingOnTool = chunkingOnApi.toolFactories.memory_store({
       agentId: "main",
@@ -320,6 +335,7 @@ try {
         dimensions: 4,
       },
     });
+    resetRegistration();
     plugin.register(withDimensionsApi);
     const withDimensionsTool = withDimensionsApi.toolFactories.memory_store({
       agentId: "main",
@@ -327,14 +343,49 @@ try {
     });
     const requestCountBeforeWithDimensions = embeddingRequests.length;
     await withDimensionsTool.execute("tool-3", {
-      text: "dimensions should be sent by default",
+      text: "dimensions should stay internal by default",
       scope: "global",
     });
     const withDimensionsRequest = embeddingRequests.at(requestCountBeforeWithDimensions);
     assert.equal(
-      withDimensionsRequest?.dimensions,
+      Object.prototype.hasOwnProperty.call(withDimensionsRequest ?? {}, "dimensions"),
+      false,
+      "embedding.dimensions should be used for local schema sizing, not forwarded by default",
+    );
+
+    const withRequestDimensionsApi = createMockApi({
+      dbPath: path.join(workDir, "db-with-request-dimensions"),
+      autoCapture: false,
+      autoRecall: false,
+      embedding: {
+        provider: "openai-compatible",
+        apiKey: "dummy",
+        model: "text-embedding-3-small",
+        baseURL: embeddingBaseURL,
+        requestDimensions: 4,
+      },
+    });
+    resetRegistration();
+    plugin.register(withRequestDimensionsApi);
+    const withRequestDimensionsTool = withRequestDimensionsApi.toolFactories.memory_store({
+      agentId: "main",
+      sessionKey: "agent:main:test",
+    });
+    const requestCountBeforeRequestDimensions = embeddingRequests.length;
+    const withRequestDimensionsResult = await withRequestDimensionsTool.execute("tool-3b", {
+      text: "requestDimensions should drive both request payload and local schema size",
+      scope: "global",
+    });
+    assert.equal(
+      withRequestDimensionsResult.details.action,
+      "created",
+      "requestDimensions-only config should still create memories end-to-end",
+    );
+    const withRequestDimensionsRequest = embeddingRequests.at(requestCountBeforeRequestDimensions);
+    assert.equal(
+      withRequestDimensionsRequest?.dimensions,
       4,
-      "embedding.dimensions should be forwarded by default",
+      "embedding.requestDimensions should be forwarded to embedding requests",
     );
 
     const omitDimensionsApi = createMockApi({
@@ -346,10 +397,11 @@ try {
         apiKey: "dummy",
         model: "text-embedding-3-small",
         baseURL: embeddingBaseURL,
-        dimensions: 4,
+        requestDimensions: 4,
         omitDimensions: true,
       },
     });
+    resetRegistration();
     plugin.register(omitDimensionsApi);
     const omitDimensionsTool = omitDimensionsApi.toolFactories.memory_store({
       agentId: "main",
@@ -364,7 +416,7 @@ try {
     assert.equal(
       Object.prototype.hasOwnProperty.call(omitDimensionsRequest, "dimensions"),
       false,
-      "embedding.omitDimensions=true should omit dimensions from embedding requests",
+      "embedding.omitDimensions=true should omit dimensions from embedding requests even when requestDimensions is set",
     );
   } finally {
     await new Promise((resolve) => embeddingServer.close(resolve));

@@ -16,6 +16,7 @@ Module._initPaths();
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const plugin = jiti("../index.ts");
+const resetRegistration = plugin.resetRegistration ?? (() => {});
 const { MemoryStore } = jiti("../src/store.ts");
 const { createEmbedder } = jiti("../src/embedder.ts");
 const { buildSmartMetadata, stringifySmartMetadata } = jiti("../src/smart-metadata.ts");
@@ -151,6 +152,11 @@ async function runAgentEndHook(api, event, ctx) {
   }
 }
 
+function registerFreshPlugin(api) {
+  resetRegistration();
+  plugin.register(api);
+}
+
 async function seedPreference(dbPath) {
   const store = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
   const embedder = createEmbedder({
@@ -268,7 +274,7 @@ async function runScenario(mode) {
       `http://127.0.0.1:${port}`,
       logs,
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
     await seedPreference(dbPath);
 
     await runAgentEndHook(
@@ -450,7 +456,7 @@ async function runMultiRoundScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     const rounds = [
       ["最近我在调整饮品偏好。", "我喜欢乌龙茶。", "这条偏好以后都有效。", "请记住。"],
@@ -549,7 +555,7 @@ async function runInjectedRecallScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     await runAgentEndHook(
       api,
@@ -643,7 +649,7 @@ async function runPrependedRecallWithUserTextScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     await runAgentEndHook(
       api,
@@ -735,7 +741,7 @@ async function runInboundMetadataWrappedScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     await runAgentEndHook(
       api,
@@ -791,7 +797,7 @@ async function runSessionDeltaScenario() {
       "http://127.0.0.1:9",
       logs,
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     await runAgentEndHook(
       api,
@@ -855,7 +861,7 @@ async function runPendingIngressScenario() {
       "http://127.0.0.1:9",
       logs,
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     await api.hooks.message_received(
       { from: "discord:channel:1", content: "@jige_claw_bot 我的饮品偏好是乌龙茶" },
@@ -911,7 +917,7 @@ async function runRememberCommandContextScenario() {
       "http://127.0.0.1:9",
       logs,
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     await api.hooks.message_received(
       { from: "discord:channel:1", content: "@jige_claw_bot 我的饮品偏好是乌龙茶" },
@@ -1036,7 +1042,7 @@ async function runUserMdExclusiveProfileScenario() {
         enabled: true,
       },
     };
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     await runAgentEndHook(
       api,
@@ -1134,7 +1140,7 @@ async function runBoundarySkipKeepsRegexFallbackScenario() {
         enabled: true,
       },
     };
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     await runAgentEndHook(
       api,
@@ -1236,7 +1242,7 @@ async function runInboundMetadataCleanupScenario() {
       `http://127.0.0.1:${port}`,
       logs,
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     await runAgentEndHook(
       api,

@@ -920,24 +920,56 @@ export class MemoryRetriever {
 
       trace?.startStage("parallel_search", []);
       failureStage = "hybrid.parallelSearch";
-      const [vectorResults, bm25Results] = await Promise.all([
+      const settledResults = await Promise.allSettled([
         this.runVectorSearch(
           queryVector,
           candidatePoolSize,
           scopeFilter,
           category,
-        ).catch((error) => {
-          throw attachFailureStage(error, "hybrid.vectorSearch");
-        }),
+        ),
         this.runBM25Search(
           bm25Query,
           candidatePoolSize,
           scopeFilter,
           category,
-        ).catch((error) => {
-          throw attachFailureStage(error, "hybrid.bm25Search");
-        }),
+        ),
       ]);
+
+      const vectorResult_ = settledResults[0];
+      const bm25Result_ = settledResults[1];
+
+      let vectorResults: RetrievalResult[];
+      let bm25Results: RetrievalResult[];
+
+      if (vectorResult_.status === "rejected") {
+        const error = attachFailureStage(vectorResult_.reason, "hybrid.vectorSearch");
+        console.warn(`[Retriever] vector search failed: ${error.message}`);
+        vectorResults = [];
+      } else {
+        vectorResults = vectorResult_.value;
+      }
+
+      if (bm25Result_.status === "rejected") {
+        const error = attachFailureStage(bm25Result_.reason, "hybrid.bm25Search");
+        console.warn(`[Retriever] bm25 search failed: ${error.message}`);
+        bm25Results = [];
+      } else {
+        bm25Results = bm25Result_.value;
+      }
+
+      // Check if BOTH backends failed (rejected), not just empty results
+      // Empty result sets are valid; only throw when both promises reject
+      const bothFailed =
+        vectorResult_.status === "rejected" && bm25Result_.status === "rejected";
+
+      if (bothFailed) {
+        const vectorError = vectorResult_.reason?.message || "unknown";
+        const bm25Error = bm25Result_.reason?.message || "unknown";
+        throw attachFailureStage(
+          new Error(`both vector and BM25 search failed: ${vectorError}, ${bm25Error}`),
+          "hybrid.parallelSearch",
+        );
+      }
       if (diagnostics) {
         diagnostics.vectorResultCount = vectorResults.length;
         diagnostics.bm25ResultCount = bm25Results.length;

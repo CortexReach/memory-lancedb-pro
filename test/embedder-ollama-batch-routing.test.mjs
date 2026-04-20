@@ -41,11 +41,13 @@ function readJson(req) {
 
 function makeOllamaMock(handler) {
   return http.createServer((req, res) => {
-    if (req.method === "POST" && req.url === "/api/embeddings") {
+    const requestPath = (req.url || "").replace(/^\/ollama\b/, "");
+
+    if (req.method === "POST" && requestPath === "/api/embeddings") {
       handler(req, res, "api");
       return;
     }
-    if (req.method === "POST" && req.url === "/v1/embeddings") {
+    if (req.method === "POST" && requestPath === "/v1/embeddings") {
       handler(req, res, "v1");
       return;
     }
@@ -76,6 +78,12 @@ async function startMockServer(server) {
   });
 }
 
+function makeOllamaBaseURL(port) {
+  // Use a path marker instead of the default Ollama port so the test still
+  // exercises isOllamaProvider() without colliding with a real local server.
+  return `http://127.0.0.1:${port}/ollama/v1`;
+}
+
 test("single requests use /api/embeddings with prompt field", async () => {
   let capturedBody = null;
 
@@ -86,7 +94,7 @@ test("single requests use /api/embeddings with prompt field", async () => {
   });
 
   const port = await startMockServer(server);
-  const baseURL = `http://127.0.0.1:${port}/v1`;
+  const baseURL = makeOllamaBaseURL(port);
 
   try {
     const embedder = new Embedder({
@@ -97,6 +105,7 @@ test("single requests use /api/embeddings with prompt field", async () => {
       dimensions: DIMS,
     });
 
+    assert.equal(embedder.isOllamaProvider(), true, "expected /ollama baseURL to use native fetch");
     const result = await embedder.embedPassage("hello world");
 
     assert.equal(capturedBody?.model, "mxbai-embed-large");
@@ -122,7 +131,7 @@ test("batch requests use /v1/embeddings with input array", async () => {
   });
 
   const port = await startMockServer(server);
-  const baseURL = `http://127.0.0.1:${port}/v1`;
+  const baseURL = makeOllamaBaseURL(port);
 
   try {
     const embedder = new Embedder({
@@ -164,7 +173,7 @@ test("batch rejects response with wrong number of embeddings", async () => {
   });
 
   const port = await startMockServer(server);
-  const baseURL = `http://127.0.0.1:${port}/v1`;
+  const baseURL = makeOllamaBaseURL(port);
 
   try {
     const embedder = new Embedder({
@@ -209,7 +218,7 @@ test("batch rejects response with empty embedding array", async () => {
   });
 
   const port = await startMockServer(server);
-  const baseURL = `http://127.0.0.1:${port}/v1`;
+  const baseURL = makeOllamaBaseURL(port);
 
   try {
     const embedder = new Embedder({
@@ -246,7 +255,7 @@ test("single-element batch still routes to /v1/embeddings", async () => {
   });
 
   const port = await startMockServer(server);
-  const baseURL = `http://127.0.0.1:${port}/v1`;
+  const baseURL = makeOllamaBaseURL(port);
 
   try {
     const embedder = new Embedder({

@@ -21,6 +21,7 @@ const EXPECTED_BASELINE = [
   { group: "core-regression", runner: "node", file: "test/strip-envelope-metadata.test.mjs", args: ["--test"] },
   { group: "cli-smoke", runner: "node", file: "test/cli-smoke.mjs" },
   { group: "cli-smoke", runner: "node", file: "test/functional-e2e.mjs" },
+  { group: "storage-and-schema", runner: "node", file: "test/per-agent-auto-recall.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/retriever-rerank-regression.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-memory-lifecycle.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-branches.mjs" },
@@ -47,6 +48,8 @@ const EXPECTED_BASELINE = [
   { group: "core-regression", runner: "node", file: "test/store-serialization.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/access-tracker-retry.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/embedder-cache.test.mjs" },
+  // Issue #629 batch embedding fix
+  { group: "llm-clients-and-auth", runner: "node", file: "test/embedder-ollama-batch-routing.test.mjs" },
 ];
 
 function fail(message) {

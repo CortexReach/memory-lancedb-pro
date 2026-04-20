@@ -255,7 +255,7 @@ describe("retriever BM25 query expansion gating", () => {
   });
 
   it("distinguishes vector-search failures inside the hybrid parallel stage", async () => {
-    const { retriever } = createRetrieverHarness(
+    const { retriever, bm25Queries } = createRetrieverHarness(
       {},
       {
         async vectorSearch() {
@@ -264,51 +264,70 @@ describe("retriever BM25 query expansion gating", () => {
       },
     );
 
-    await assert.rejects(
-      retriever.retrieve({
-        query: "普通查询",
-        limit: 1,
-        source: "manual",
-      }),
-      /simulated vector search failure/,
-    );
+    // With graceful degradation, BM25 results should be returned even though vector failed
+    const results = await retriever.retrieve({
+      query: "普通查询",
+      limit: 1,
+      source: "manual",
+    });
 
+    // Results from BM25 should be returned
+    assert.ok(results.length > 0);
+    assert.ok(bm25Queries.length > 0);
+
+    // Overall retrieval did not fail (graceful degradation)
     assert.equal(
       retriever.getLastDiagnostics()?.failureStage,
-      "hybrid.vectorSearch",
+      undefined,
     );
+    // Vector result count should be 0 (failed)
     assert.equal(
-      retriever.getLastDiagnostics()?.errorMessage,
-      "simulated vector search failure",
+      retriever.getLastDiagnostics()?.vectorResultCount,
+      0,
+    );
+    // BM25 result count should be > 0 (succeeded)
+    assert.ok(
+      (retriever.getLastDiagnostics()?.bm25ResultCount ?? 0) > 0,
     );
   });
 
   it("distinguishes bm25-search failures inside the hybrid parallel stage", async () => {
-    const { retriever } = createRetrieverHarness(
+    const { retriever, bm25Queries } = createRetrieverHarness(
       {},
       {
-        async bm25Search() {
+        async bm25Search(query) {
+          bm25Queries.push(query);
           throw new Error("simulated bm25 search failure");
         },
       },
     );
 
-    await assert.rejects(
-      retriever.retrieve({
-        query: "普通查询",
-        limit: 1,
-        source: "manual",
-      }),
-      /simulated bm25 search failure/,
-    );
+    // With graceful degradation, vector results should be returned even though BM25 failed
+    const results = await retriever.retrieve({
+      query: "普通查询",
+      limit: 1,
+      source: "manual",
+    });
 
+    // Results from vector should be returned (empty by default in harness)
+    assert.equal(results.length, 0);
+    // BM25 was attempted (even though it failed)
+    assert.equal(bm25Queries.length, 1);
+
+    // Overall retrieval did not fail (graceful degradation)
     assert.equal(
       retriever.getLastDiagnostics()?.failureStage,
-      "hybrid.bm25Search",
+      undefined,
     );
+    // Vector result count should be 0 (empty by default in harness)
     assert.equal(
-      retriever.getLastDiagnostics()?.errorMessage,
-      "simulated bm25 search failure",
+      retriever.getLastDiagnostics()?.vectorResultCount,
+      0,
+    );
+    // BM25 result count should be 0 (failed)
+    assert.equal(
+      retriever.getLastDiagnostics()?.bm25ResultCount,
+      0,
     );
   });
 });
