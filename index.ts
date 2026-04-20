@@ -275,7 +275,7 @@ function getDefaultWorkspaceDir(): string {
   // Try workspace-main first (standard OpenClaw layout), fallback to workspace
   const mainDir = join(home, ".openclaw", "workspace-main");
   try {
-    if (statSync(mainDir).isDirectory()) return mainDir;
+    if (readFileSync(join(mainDir, "AGENTS.md"))) return mainDir;
   } catch {}
   return join(home, ".openclaw", "workspace");
 }
@@ -3817,6 +3817,7 @@ const memoryLanceDBProPlugin = {
     // ========================================================================
 
     let backupTimer: ReturnType<typeof setInterval> | null = null;
+    let dreamingTimer: ReturnType<typeof setInterval> | null = null;
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
     async function runBackup() {
@@ -3968,8 +3969,6 @@ const memoryLanceDBProPlugin = {
         const dreamingUserConfig = (api.pluginConfig as Record<string, unknown>)?.dreaming as Record<string, unknown> | undefined;
         const dreamingCfg = mergeDreamingConfig(dreamingUserConfig);
 
-        let dreamingTimer: ReturnType<typeof setInterval> | null = null;
-
         if (dreamingCfg.enabled) {
           const { createDreamingEngine: createDreaming } = await import("./src/dreaming-engine.js");
 
@@ -3985,18 +3984,15 @@ const memoryLanceDBProPlugin = {
             log: dreamingLog,
             debugLog: dreamingDebug,
             workspaceDir: getDefaultWorkspaceDir(),
+            fallbackDimensions: config.embedding?.dimensions ?? 1024,
           });
 
           // Simple cron scheduler: checks every 60s, matches minute+hour fields
-          function parseCron(expr: string): { minute: number[]; hour: number[] } {
+          function parseCron(expr: string) {
             const parts = expr.trim().split(/\s+/);
-            if (parts.length < 2) return { minute: [0], hour: [3] };
-            const parseField = (field: string, min: number, max: number): number[] => {
-              if (field === "*") {
-                const r: number[] = [];
-                for (let i = min; i <= max; i++) r.push(i);
-                return r;
-              }
+            if (parts.length < 2) return { minute: [0], hour: [3], dayOfMonth: undefined, month: undefined, dayOfWeek: undefined };
+            const parseField = (field: string, min: number, max: number): number[] | undefined => {
+              if (!field || field === "*") return undefined; // wildcard = match all
               return field.split(",").flatMap((p) => {
                 const stepMatch = p.match(/^(\*|\d+)\/(\d+)$/);
                 if (stepMatch) {
@@ -4010,59 +4006,72 @@ const memoryLanceDBProPlugin = {
                 return Number.isFinite(n) ? [n] : [];
               });
             };
-            return { minute: parseField(parts[0], 0, 59), hour: parseField(parts[1], 0, 23) };
+            return {
+              minute: parseField(parts[0], 0, 59),
+              hour: parseField(parts[1], 0, 23),
+              dayOfMonth: parts.length > 2 ? parseField(parts[2], 1, 31) : undefined,
+              month: parts.length > 3 ? parseField(parts[3], 1, 12) : undefined,
+              dayOfWeek: parts.length > 4 ? parseField(parts[4], 0, 6) : undefined,
+            };
           }
 
           const parsedCron = parseCron(dreamingCfg.cron);
 
           dreamingTimer = setInterval(async () => {
             const now = new Date();
-            if (!parsedCron.minute.includes(now.getMinutes()) || !parsedCron.hour.includes(now.getHours())) return;
+            if (parsedCron.minute && !parsedCron.minute.includes(now.getMinutes())) return;
+            if (parsedCron.hour && !parsedCron.hour.includes(now.getHours())) return;
+            if (parsedCron.dayOfMonth && !parsedCron.dayOfMonth.includes(now.getDate())) return;
+            if (parsedCron.month && !parsedCron.month.includes(now.getMonth() + 1)) return;
+            if (parsedCron.dayOfWeek && !parsedCron.dayOfWeek.includes(now.getDay())) return;
 
             // Run dreaming for each scope that has memories (MR1: scope isolation)
             // Include both defined scopes and dynamic agent scopes discovered from the store
             const definedScopes = scopeManager.getAllScopes();
             const scopes = new Set(definedScopes);
             try {
-              // Discover agent scopes from existing memories
               const allMemories = await store.list(undefined, undefined, 500, 0);
               for (const m of allMemories) {
                 if (m.scope) scopes.add(m.scope);
               }
             } catch {}
-            // Always include global
             scopes.add("global");
+
+            // Run scopes sequentially to avoid write races on DREAMS.md
+            const dreamLines: string[] = [];
             for (const scope of scopes) {
-              dreamingEngine.run(scope).then((report) => {
+              try {
+                const report = await dreamingEngine.run(scope);
                 dreamingLog(
                   `cycle complete [${report.scope}] — ` +
                   `light:${report.phases.light.scanned}/${report.phases.light.transitions.length} transitions, ` +
                   `deep:${report.phases.deep.candidates}/${report.phases.deep.promoted} promoted, ` +
                   `rem:${report.phases.rem.patterns.length} patterns/${report.phases.rem.reflectionsCreated} reflections`,
                 );
-
-                // Write DREAMS.md
-                const workspaceDir = getDefaultWorkspaceDir();
-                const dreamsPath = join(workspaceDir, "DREAMS.md");
-                const dateStr = new Date().toISOString().replace("T", " ").slice(0, 19);
-                const lines = [
-                  `## Dream Cycle — ${dateStr} [${report.scope}]`, ``,
+                dreamLines.push(
+                  `## Dream Cycle — ${new Date().toISOString().replace("T", " ").slice(0, 19)} [${report.scope}]`, ``,
                   `**Light Sleep:** ${report.phases.light.scanned} scanned, ${report.phases.light.transitions.length} transitions`,
                   `**Deep Sleep:** ${report.phases.deep.candidates} candidates, ${report.phases.deep.promoted} promoted`,
                   `**REM:** ${report.phases.rem.patterns.length} patterns, ${report.phases.rem.reflectionsCreated} reflections`, ``,
-                ];
+                );
                 if (report.phases.rem.patterns.length > 0) {
-                  lines.push(`### Patterns`);
-                  for (const p of report.phases.rem.patterns) lines.push(`- ${p}`);
-                  lines.push("");
+                  dreamLines.push(`### Patterns`);
+                  for (const p of report.phases.rem.patterns) dreamLines.push(`- ${p}`);
+                  dreamLines.push("");
                 }
-                readFile(dreamsPath, "utf-8").then(
-                  (existing) => writeFile(dreamsPath, lines.join("\n") + "\n" + existing, "utf-8"),
-                  () => writeFile(dreamsPath, lines.join("\n") + "\n", "utf-8"),
-                ).catch(() => {});
-              }).catch((err) => {
-                dreamingLog(`cycle error: ${String(err)}`);
-              });
+              } catch (err) {
+                dreamingLog(`cycle error [${scope}]: ${String(err)}`);
+              }
+            }
+
+            // Write DREAMS.md once after all scopes complete
+            if (dreamLines.length > 0) {
+              const workspaceDir = getDefaultWorkspaceDir();
+              const dreamsPath = join(workspaceDir, "DREAMS.md");
+              try {
+                const existing = await readFile(dreamsPath, "utf-8").catch(() => "");
+                await writeFile(dreamsPath, dreamLines.join("\n") + "\n" + existing, "utf-8");
+              } catch {}
             }
           }, 60_000);
 
