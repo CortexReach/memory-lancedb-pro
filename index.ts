@@ -2842,11 +2842,12 @@ const memoryLanceDBProPlugin = {
           return result;
         } catch (err) {
           clearTimeout(timeoutId);
-          // Downgrade AbortError to debug — the timeout path already emitted
-          // a warn log, and the race has already resolved undefined.
-          const isAbort = err instanceof Error && (err.name === "AbortError" || /abort/i.test(err.message));
-          if (isAbort) {
-            api.logger.debug?.(`memory-lancedb-pro: recall aborted: ${String(err)}`);
+          // Downgrade to debug only when OUR controller aborted (i.e. the
+          // timeout callback fired). Aborts originating elsewhere — e.g. the
+          // embedder's own internal timeout — keep warn visibility so real
+          // failures aren't silenced.
+          if (abortController.signal.aborted) {
+            api.logger.debug?.(`memory-lancedb-pro: recall aborted by timeout: ${String(err)}`);
           } else {
             api.logger.warn(`memory-lancedb-pro: recall failed: ${String(err)}`);
           }

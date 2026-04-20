@@ -106,8 +106,9 @@ export interface RetrievalContext {
   /** Retrieval source: "manual" for user-triggered, "auto-recall" for system-initiated, "cli" for CLI commands. */
   source?: "manual" | "auto-recall" | "cli";
   /** Optional AbortSignal. When aborted, in-flight embedding calls cancel and
-   *  the method rejects with AbortError instead of holding the caller's session
-   *  lock while the underlying HTTP request runs to completion. */
+   *  the method rejects due to abort (often with AbortError or the signal's
+   *  abort reason) instead of holding the caller's session lock while the
+   *  underlying HTTP request runs to completion. */
   signal?: AbortSignal;
 }
 
