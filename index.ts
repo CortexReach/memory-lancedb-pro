@@ -4414,12 +4414,23 @@ const memoryLanceDBProPlugin = {
 
           const parsedCron = parseCron(dreamingCfg.cron);
 
-          dreamingTimer = setInterval(() => {
+          dreamingTimer = setInterval(async () => {
             const now = new Date();
             if (!parsedCron.minute.includes(now.getMinutes()) || !parsedCron.hour.includes(now.getHours())) return;
 
-            // Run dreaming for each accessible scope (MR1: scope isolation)
-            const scopes = scopeManager.getAllScopes();
+            // Run dreaming for each scope that has memories (MR1: scope isolation)
+            // Include both defined scopes and dynamic agent scopes discovered from the store
+            const definedScopes = scopeManager.getAllScopes();
+            const scopes = new Set(definedScopes);
+            try {
+              // Discover agent scopes from existing memories
+              const allMemories = await store.list(undefined, undefined, 500, 0);
+              for (const m of allMemories) {
+                if (m.scope) scopes.add(m.scope);
+              }
+            } catch {}
+            // Always include global
+            scopes.add("global");
             for (const scope of scopes) {
               dreamingEngine.run(scope).then((report) => {
                 dreamingLog(
