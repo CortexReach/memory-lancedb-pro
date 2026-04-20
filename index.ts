@@ -64,6 +64,8 @@ import { createLlmClient } from "./src/llm-client.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
 import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
+import { createDreamingEngine, mergeDreamingConfig } from "./src/dreaming-engine.js";
+import type { DreamingConfig } from "./src/dreaming-engine.js";
 import {
   buildSmartMetadata,
   parseSmartMetadata,
@@ -251,6 +253,7 @@ interface PluginConfig {
      */
     categoryField?: string;
   };
+  dreaming?: DreamingConfig;
 }
 
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
@@ -4005,11 +4008,115 @@ const memoryLanceDBProPlugin = {
         // Run initial backup after a short delay, then schedule daily
         setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+
+        // ========================================================================
+        // Dreaming Engine — Periodic memory consolidation
+        // ========================================================================
+
+        const dreamingUserConfig = (api.pluginConfig as Record<string, unknown>)?.dreaming as Record<string, unknown> | undefined;
+        const dreamingCfg = mergeDreamingConfig(dreamingUserConfig);
+
+        let dreamingTimer: ReturnType<typeof setInterval> | null = null;
+
+        if (dreamingCfg.enabled) {
+          const { createDreamingEngine: createDreaming } = await import("./src/dreaming-engine.js");
+
+          const dreamingLog = (msg: string) => api.logger.info(`dreaming: ${msg}`);
+          const dreamingDebug = (msg: string) => api.logger.debug(`dreaming: ${msg}`);
+
+          const dreamingEngine = createDreaming({
+            store,
+            embedder,
+            decayEngine,
+            tierManager,
+            config: dreamingCfg,
+            log: dreamingLog,
+            debugLog: dreamingDebug,
+            workspaceDir: getDefaultWorkspaceDir(),
+          });
+
+          // Simple cron scheduler: checks every 60s, matches minute+hour fields
+          function parseCron(expr: string): { minute: number[]; hour: number[] } {
+            const parts = expr.trim().split(/\s+/);
+            if (parts.length < 2) return { minute: [0], hour: [3] };
+            const parseField = (field: string, min: number, max: number): number[] => {
+              if (field === "*") {
+                const r: number[] = [];
+                for (let i = min; i <= max; i++) r.push(i);
+                return r;
+              }
+              return field.split(",").flatMap((p) => {
+                const stepMatch = p.match(/^(\*|\d+)\/(\d+)$/);
+                if (stepMatch) {
+                  const base = stepMatch[1] === "*" ? min : parseInt(stepMatch[1], 10);
+                  const step = parseInt(stepMatch[2], 10);
+                  const r: number[] = [];
+                  for (let i = base; i <= max; i += step) r.push(i);
+                  return r;
+                }
+                const n = parseInt(p, 10);
+                return Number.isFinite(n) ? [n] : [];
+              });
+            };
+            return { minute: parseField(parts[0], 0, 59), hour: parseField(parts[1], 0, 23) };
+          }
+
+          const parsedCron = parseCron(dreamingCfg.cron);
+
+          dreamingTimer = setInterval(() => {
+            const now = new Date();
+            if (!parsedCron.minute.includes(now.getMinutes()) || !parsedCron.hour.includes(now.getHours())) return;
+
+            // Run dreaming for each accessible scope (MR1: scope isolation)
+            const scopes = scopeManager.getAllScopes();
+            for (const scope of scopes) {
+              dreamingEngine.run(scope).then((report) => {
+                dreamingLog(
+                  `cycle complete [${report.scope}] — ` +
+                  `light:${report.phases.light.scanned}/${report.phases.light.transitions.length} transitions, ` +
+                  `deep:${report.phases.deep.candidates}/${report.phases.deep.promoted} promoted, ` +
+                  `rem:${report.phases.rem.patterns.length} patterns/${report.phases.rem.reflectionsCreated} reflections`,
+                );
+
+                // Write DREAMS.md
+                const workspaceDir = getDefaultWorkspaceDir();
+                const dreamsPath = join(workspaceDir, "DREAMS.md");
+                const dateStr = new Date().toISOString().replace("T", " ").slice(0, 19);
+                const lines = [
+                  `## Dream Cycle — ${dateStr} [${report.scope}]`, ``,
+                  `**Light Sleep:** ${report.phases.light.scanned} scanned, ${report.phases.light.transitions.length} transitions`,
+                  `**Deep Sleep:** ${report.phases.deep.candidates} candidates, ${report.phases.deep.promoted} promoted`,
+                  `**REM:** ${report.phases.rem.patterns.length} patterns, ${report.phases.rem.reflectionsCreated} reflections`, ``,
+                ];
+                if (report.phases.rem.patterns.length > 0) {
+                  lines.push(`### Patterns`);
+                  for (const p of report.phases.rem.patterns) lines.push(`- ${p}`);
+                  lines.push("");
+                }
+                readFile(dreamsPath, "utf-8").then(
+                  (existing) => writeFile(dreamsPath, lines.join("\n") + "\n" + existing, "utf-8"),
+                  () => writeFile(dreamsPath, lines.join("\n") + "\n", "utf-8"),
+                ).catch(() => {});
+              }).catch((err) => {
+                dreamingLog(`cycle error: ${String(err)}`);
+              });
+            }
+          }, 60_000);
+
+          api.logger.info(
+            `dreaming engine enabled (cron: ${dreamingCfg.cron}, verbose: ${dreamingCfg.verboseLogging})`,
+          );
+        }
       },
       stop: async () => {
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
+        }
+        if (dreamingTimer) {
+          clearInterval(dreamingTimer);
+          dreamingTimer = null;
+          api.logger.info("dreaming: scheduler stopped");
         }
         api.logger.info("memory-lancedb-pro: stopped");
       },
