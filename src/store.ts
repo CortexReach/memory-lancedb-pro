@@ -211,12 +211,6 @@ export class MemoryStore {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
 
-    // Ensure lock file exists before locking (proper-lockfile requires it)
-    if (!existsSync(lockPath)) {
-      try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
-      try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
-    }
-
     // Proactive cleanup of stale lock artifacts (from PR #626, updated for proper-lockfile v4)
     // Only remove stale DIRECTORY artifacts (proper-lockfile v4 uses mkdir, not files)
     if (existsSync(lockPath)) {
@@ -237,8 +231,7 @@ export class MemoryStore {
       } catch {}
     }
 
-    const release = await lockfile.lock(this.config.dbPath, {
-      lockfilePath: lockPath,  // explicit artifact path, avoids ambiguity with proper-lockfile v4 mkdir behavior
+    const release = await lockfile.lock(lockPath, {
       realpath: false,  // Fix #670: skip realpath() to avoid ENOENT after stale lock cleanup
       retries: {
         retries: 10,
