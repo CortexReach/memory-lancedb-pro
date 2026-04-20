@@ -30,6 +30,9 @@ async function runTest() {
     async list() {
       return [legacyEntry];
     },
+    async getById(id) {
+      return id === legacyEntry.id ? legacyEntry : null;
+    },
     async update(id, patch) {
       updates.push({ id, patch });
       return true;
@@ -59,7 +62,7 @@ async function runTest() {
     logs.join("\n"),
     /request failed for model mock: timeout/,
   );
-  assert.equal(typeof updates[0].patch.text, "string");
+  // Phase 2 fix: text is no longer overwritten, only metadata is updated
   assert.ok(updates[0].patch.metadata.includes("upgraded_at"));
 
   console.log("memory-upgrader diagnostics test passed");

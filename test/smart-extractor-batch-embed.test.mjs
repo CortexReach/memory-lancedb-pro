@@ -87,6 +87,9 @@ function makeStore() {
       entries.push({ action: "store", entry });
       return entry;
     },
+    async bulkStore(entries) {
+      entries.forEach((e) => this.store(e));
+    },
     async update(_id, _patch, _scopeFilter) {
       entries.push({ action: "update", id: _id });
     },
