@@ -224,8 +224,14 @@ export class MemoryStore {
         const stat = statSync(lockPath);
         const ageMs = Date.now() - stat.mtimeMs;
         const staleThresholdMs = 5 * 60 * 1000;
-        if (ageMs > staleThresholdMs && stat.isDirectory()) {
-          try { rmSync(lockPath, { recursive: true, force: true }); } catch {}
+        if (ageMs > staleThresholdMs) {
+          try {
+            if (stat.isDirectory()) {
+              rmSync(lockPath, { recursive: true, force: true });
+            } else {
+              unlinkSync(lockPath);  // proper-lockfile v4 artifact is dir; FILE may be pre-created lock
+            }
+          } catch {}
           console.warn(`[memory-lancedb-pro] cleared stale lock: ${lockPath} ageMs=${ageMs}`);
         }
       } catch {}
