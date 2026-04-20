@@ -272,7 +272,9 @@ export class MemoryStore {
         if ((e as NodeJS.ErrnoException).code === 'ERELEASED') {
           // ERELEASED 是預期行為（compromised lock release），忽略
         } else {
-          throw e; // 其他錯誤照拋
+          // release() 錯誤優先於 fn() 錯誤：若 release 本身失敗，視為更嚴重的問題
+          // 而非靜默忽略（這是有意的設計選擇，不反映 fn 的錯誤）
+          throw e;
         }
       }
       if (isCompromised) {
