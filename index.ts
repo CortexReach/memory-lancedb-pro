@@ -26,6 +26,7 @@ import {
   getEffectiveVectorDimensions,
 } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
+import { AccessTracker } from "./src/access-tracker.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
@@ -64,6 +65,8 @@ import { createLlmClient } from "./src/llm-client.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
 import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
+import { createDreamingEngine, mergeDreamingConfig } from "./src/dreaming-engine.js";
+import type { DreamingConfig } from "./src/dreaming-engine.js";
 import {
   buildSmartMetadata,
   parseSmartMetadata,
@@ -251,6 +254,7 @@ interface PluginConfig {
      */
     categoryField?: string;
   };
+  dreaming?: DreamingConfig;
 }
 
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
@@ -268,6 +272,11 @@ function getDefaultDbPath(): string {
 
 function getDefaultWorkspaceDir(): string {
   const home = homedir();
+  // Try workspace-main first (standard OpenClaw layout), fallback to workspace
+  const mainDir = join(home, ".openclaw", "workspace-main");
+  try {
+    if (readFileSync(join(mainDir, "AGENTS.md"))) return mainDir;
+  } catch {}
   return join(home, ".openclaw", "workspace");
 }
 
@@ -1767,6 +1776,14 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     { ...DEFAULT_RETRIEVAL_CONFIG, ...config.retrieval },
     { decayEngine },
   );
+
+  // Wire access tracker so recall operations update access_count on memories
+  const accessTracker = new AccessTracker({
+    store,
+    logger: { warn: (...args: unknown[]) => api.logger.warn(...args), info: (...args: unknown[]) => api.logger.info(...args) },
+    debounceMs: 5000,
+  });
+  retriever.setAccessTracker(accessTracker);
   const scopeManager = createScopeManager(config.scopes);
 
   const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
@@ -3800,6 +3817,7 @@ const memoryLanceDBProPlugin = {
     // ========================================================================
 
     let backupTimer: ReturnType<typeof setInterval> | null = null;
+    let dreamingTimer: ReturnType<typeof setInterval> | null = null;
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
     async function runBackup() {
@@ -3943,11 +3961,134 @@ const memoryLanceDBProPlugin = {
         // Run initial backup after a short delay, then schedule daily
         setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+
+        // ========================================================================
+        // Dreaming Engine — Periodic memory consolidation
+        // ========================================================================
+
+        const dreamingUserConfig = (api.pluginConfig as Record<string, unknown>)?.dreaming as Record<string, unknown> | undefined;
+        const dreamingCfg = mergeDreamingConfig(dreamingUserConfig);
+
+        if (dreamingCfg.enabled) {
+          const { createDreamingEngine: createDreaming } = await import("./src/dreaming-engine.js");
+
+          const dreamingLog = (msg: string) => api.logger.info(`dreaming: ${msg}`);
+          const dreamingDebug = (msg: string) => api.logger.debug(`dreaming: ${msg}`);
+
+          const dreamingEngine = createDreaming({
+            store,
+            embedder,
+            decayEngine,
+            tierManager,
+            config: dreamingCfg,
+            log: dreamingLog,
+            debugLog: dreamingDebug,
+            workspaceDir: getDefaultWorkspaceDir(),
+            fallbackDimensions: config.embedding?.dimensions ?? 1024,
+          });
+
+          // Simple cron scheduler: checks every 60s, matches minute+hour fields
+          function parseCron(expr: string) {
+            const parts = expr.trim().split(/\s+/);
+            if (parts.length < 2) return { minute: [0], hour: [3], dayOfMonth: undefined, month: undefined, dayOfWeek: undefined };
+            const parseField = (field: string, min: number, max: number): number[] | undefined => {
+              if (!field || field === "*") return undefined; // wildcard = match all
+              return field.split(",").flatMap((p) => {
+                const stepMatch = p.match(/^(\*|\d+)\/(\d+)$/);
+                if (stepMatch) {
+                  const base = stepMatch[1] === "*" ? min : parseInt(stepMatch[1], 10);
+                  const step = parseInt(stepMatch[2], 10);
+                  const r: number[] = [];
+                  for (let i = base; i <= max; i += step) r.push(i);
+                  return r;
+                }
+                const n = parseInt(p, 10);
+                return Number.isFinite(n) ? [n] : [];
+              });
+            };
+            return {
+              minute: parseField(parts[0], 0, 59),
+              hour: parseField(parts[1], 0, 23),
+              dayOfMonth: parts.length > 2 ? parseField(parts[2], 1, 31) : undefined,
+              month: parts.length > 3 ? parseField(parts[3], 1, 12) : undefined,
+              dayOfWeek: parts.length > 4 ? parseField(parts[4], 0, 6) : undefined,
+            };
+          }
+
+          const parsedCron = parseCron(dreamingCfg.cron);
+
+          dreamingTimer = setInterval(async () => {
+            const now = new Date();
+            if (parsedCron.minute && !parsedCron.minute.includes(now.getMinutes())) return;
+            if (parsedCron.hour && !parsedCron.hour.includes(now.getHours())) return;
+            if (parsedCron.dayOfMonth && !parsedCron.dayOfMonth.includes(now.getDate())) return;
+            if (parsedCron.month && !parsedCron.month.includes(now.getMonth() + 1)) return;
+            if (parsedCron.dayOfWeek && !parsedCron.dayOfWeek.includes(now.getDay())) return;
+
+            // Run dreaming for each scope that has memories (MR1: scope isolation)
+            // Include both defined scopes and dynamic agent scopes discovered from the store
+            const definedScopes = scopeManager.getAllScopes();
+            const scopes = new Set(definedScopes);
+            try {
+              const allMemories = await store.list(undefined, undefined, 500, 0);
+              for (const m of allMemories) {
+                if (m.scope) scopes.add(m.scope);
+              }
+            } catch {}
+            scopes.add("global");
+
+            // Run scopes sequentially to avoid write races on DREAMS.md
+            const dreamLines: string[] = [];
+            for (const scope of scopes) {
+              try {
+                const report = await dreamingEngine.run(scope);
+                dreamingLog(
+                  `cycle complete [${report.scope}] — ` +
+                  `light:${report.phases.light.scanned}/${report.phases.light.transitions.length} transitions, ` +
+                  `deep:${report.phases.deep.candidates}/${report.phases.deep.promoted} promoted, ` +
+                  `rem:${report.phases.rem.patterns.length} patterns/${report.phases.rem.reflectionsCreated} reflections`,
+                );
+                dreamLines.push(
+                  `## Dream Cycle — ${new Date().toISOString().replace("T", " ").slice(0, 19)} [${report.scope}]`, ``,
+                  `**Light Sleep:** ${report.phases.light.scanned} scanned, ${report.phases.light.transitions.length} transitions`,
+                  `**Deep Sleep:** ${report.phases.deep.candidates} candidates, ${report.phases.deep.promoted} promoted`,
+                  `**REM:** ${report.phases.rem.patterns.length} patterns, ${report.phases.rem.reflectionsCreated} reflections`, ``,
+                );
+                if (report.phases.rem.patterns.length > 0) {
+                  dreamLines.push(`### Patterns`);
+                  for (const p of report.phases.rem.patterns) dreamLines.push(`- ${p}`);
+                  dreamLines.push("");
+                }
+              } catch (err) {
+                dreamingLog(`cycle error [${scope}]: ${String(err)}`);
+              }
+            }
+
+            // Write DREAMS.md once after all scopes complete
+            if (dreamLines.length > 0) {
+              const workspaceDir = getDefaultWorkspaceDir();
+              const dreamsPath = join(workspaceDir, "DREAMS.md");
+              try {
+                const existing = await readFile(dreamsPath, "utf-8").catch(() => "");
+                await writeFile(dreamsPath, dreamLines.join("\n") + "\n" + existing, "utf-8");
+              } catch {}
+            }
+          }, 60_000);
+
+          api.logger.info(
+            `dreaming engine enabled (cron: ${dreamingCfg.cron}, verbose: ${dreamingCfg.verboseLogging})`,
+          );
+        }
       },
       stop: async () => {
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
+        }
+        if (dreamingTimer) {
+          clearInterval(dreamingTimer);
+          dreamingTimer = null;
+          api.logger.info("dreaming: scheduler stopped");
         }
         api.logger.info("memory-lancedb-pro: stopped");
       },
