@@ -264,6 +264,17 @@ export class MemoryStore {
       fnError = e;
       throw e;
     } finally {
+      // 【修復 #415 BUG】release() 必須在 isCompromised 判斷之前呼叫
+      // 否則當 fnError !== null 且 isCompromised === true 時，release() 不會被呼叫，lock 永久洩漏
+      try {
+        await release();
+      } catch (e: unknown) {
+        if ((e as NodeJS.ErrnoException).code === 'ERELEASED') {
+          // ERELEASED 是預期行為（compromised lock release），忽略
+        } else {
+          throw e; // 其他錯誤照拋
+        }
+      }
       if (isCompromised) {
         // fnError 優先：fn() 失敗時，fn 的錯誤比 compromised 重要
         if (fnError !== null) {
@@ -279,19 +290,6 @@ export class MemoryStore {
           `[memory-lancedb-pro] Returning successful result despite compromised lock at "${lockPath}". ` +
           `Callers must not retry this operation automatically.`,
         );
-        // 【修復 #415】compromised 後 release() 會回 ERELEASED，忽略即可
-        // 重要：不要在這裡 return！否則 finally 的 return 會覆蓋 try 的 return 值
-        try {
-          await release();
-        } catch (e: unknown) {
-          if ((e as NodeJS.ErrnoException).code === 'ERELEASED') {
-            // ERELEASED 是預期行為，不做任何事，讓 try 的 return 值通過
-          } else {
-            throw e; // 其他錯誤照拋
-          }
-        }
-      } else {
-        await release();
       }
     }
   }
