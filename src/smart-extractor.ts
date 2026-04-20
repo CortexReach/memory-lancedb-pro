@@ -1169,6 +1169,65 @@ export class SmartExtractor {
       return;
     }
 
+    // FIX #676: When createEntries is provided, push to batch instead of calling
+    // store.store() directly.  The store.update() to invalidate the old record still
+    // runs individually (LanceDB does not support batch partial-updates by ID).
+    if (createEntries) {
+      const now = Date.now();
+      const existingMeta = parseSmartMetadata(existing.metadata, existing);
+      const factKey =
+        existingMeta.fact_key ?? deriveFactKey(candidate.category, candidate.abstract);
+      const storeCategory = this.mapToStoreCategory(candidate.category);
+      const supersedeClassifyText = candidate.content || candidate.abstract;
+
+      createEntries.push({
+        text: candidate.abstract,
+        vector,
+        category: storeCategory,
+        scope: targetScope,
+        importance: this.getDefaultImportance(candidate.category),
+        metadata: stringifySmartMetadata(
+          buildSmartMetadata(
+            {
+              text: candidate.abstract,
+              category: storeCategory,
+            },
+            {
+              l0_abstract: candidate.abstract,
+              l1_overview: candidate.overview,
+              l2_content: candidate.content,
+              memory_category: candidate.category,
+              tier: "working",
+              access_count: 0,
+              confidence: 0.7,
+              source_session: sessionKey,
+              source: "auto-capture",
+              state: "confirmed", // #350: write confirmed to unblock auto-recall
+              memory_layer: "working",
+              injected_count: 0,
+              bad_recall_count: 0,
+              suppressed_until_turn: 0,
+              valid_from: now,
+              fact_key: factKey,
+              supersedes: matchId,
+              relations: appendRelation([], {
+                type: "supersedes",
+                targetId: matchId,
+              }),
+              memory_temporal_type: classifyTemporal(supersedeClassifyText),
+              valid_until: inferExpiry(supersedeClassifyText),
+            },
+          ),
+        ),
+      });
+
+      this.log(
+        `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} (queued for batch)`,
+      );
+      return;
+    }
+
+    // Standalone path (no createEntries — backward compatible)
     const now = Date.now();
     const existingMeta = parseSmartMetadata(existing.metadata, existing);
     const factKey =
