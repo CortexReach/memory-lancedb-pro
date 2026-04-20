@@ -217,22 +217,38 @@ export class MemoryStore {
       try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
     }
 
-    // Proactive cleanup of stale lock artifacts (fixes stale-lock ECOMPROMISED)
+    // Proactive cleanup of stale lock artifacts (from PR #626, updated for proper-lockfile v4)
+    // Only remove stale DIRECTORY artifacts (proper-lockfile v4 uses mkdir, not files)
     if (existsSync(lockPath)) {
       try {
         const stat = statSync(lockPath);
         const ageMs = Date.now() - stat.mtimeMs;
         const staleThresholdMs = 5 * 60 * 1000;
-        if (ageMs > staleThresholdMs) {
-          try { unlinkSync(lockPath); } catch {}
+        if (ageMs > staleThresholdMs && stat.isDirectory()) {
+          try { rmSync(lockPath, { recursive: true, force: true }); } catch {}
           console.warn(`[memory-lancedb-pro] cleared stale lock: ${lockPath} ageMs=${ageMs}`);
         }
       } catch {}
     }
 
-    const release = await lockfile.lock(lockPath, {
-      retries: { retries: 10, factor: 2, minTimeout: 200, maxTimeout: 5000 },
-      stale: 10000,
+    const release = await lockfile.lock(this.config.dbPath, {
+      lockfilePath: lockPath,  // explicit artifact path, avoids ambiguity with proper-lockfile v4 mkdir behavior
+      realpath: false,  // Fix #670: skip realpath() to avoid ENOENT after stale lock cleanup
+      retries: {
+        retries: 10,
+        factor: 2,
+        minTimeout: 1000, // James 保守設定：避免高負載下過度密集重試
+        maxTimeout: 30000, // James 保守設定：支撐更久的 event loop 阻塞
+      },
+      stale: 10000, // 10 秒後視為 stale，觸發 ECOMPROMISED callback
+                     // 注意：ECOMPROMISED 是 ambiguous degradation 訊號，mtime 無法區分
+                     // "holder 崩潰" vs "holder event loop 阻塞"，所以不嘗試區分
+      onCompromised: (err: unknown) => {
+        // 【修復 #415 關鍵】必須是同步 callback
+        // setLockAsCompromised() 不等待 Promise，async throw 無法傳回 caller
+        isCompromised = true;
+        compromisedErr = err;
+      },
     });
     try { return await fn(); } finally { await release(); }
   }
