@@ -4,7 +4,9 @@
   "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, long-context chunking, and management CLI",
   "version": "1.1.0-beta.10",
   "kind": "memory",
-  "skills": ["./skills"],
+  "skills": [
+    "./skills"
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -45,11 +47,17 @@
           },
           "dimensions": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "description": "Internal vector dimensions for LanceDB schema sizing and local embedding validation"
+          },
+          "requestDimensions": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional dimensions/output_dimension value to send to embedding providers that support variable output sizes"
           },
           "omitDimensions": {
             "type": "boolean",
-            "description": "When true, omit the dimensions parameter from embedding requests even if dimensions is configured"
+            "description": "When true, omit dimensions/output_dimension from embedding requests even if requestDimensions is configured"
           },
           "taskQuery": {
             "type": "string",
@@ -164,6 +172,18 @@
         "enum": ["full", "summary", "adaptive", "off"],
         "default": "full",
         "description": "Auto-recall depth mode. 'full': inject with configured per-item budget. 'summary': L0 abstracts only (compact). 'adaptive': analyze query intent to auto-select category and depth. 'off': disable auto-recall injection."
+      },
+      "autoRecallExcludeAgents": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": [],
+        "description": "Blacklist mode for auto-recall injection. Agents in this list are skipped. Agent resolution falls back to 'main' when no explicit agentId is available. If autoRecallIncludeAgents is also set, include wins."
+      },
+      "autoRecallIncludeAgents": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": [],
+        "description": "Whitelist mode for auto-recall injection. Only agents in this list receive auto-recall. Agent resolution falls back to 'main' when no explicit agentId is available. If both include and exclude are set, autoRecallIncludeAgents takes precedence (whitelist wins)."
       },
       "captureAssistant": {
         "type": "boolean"
@@ -854,49 +874,21 @@
           }
         }
       },
-      "scopes": {
+      "confidenceTracking": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "default": {
-            "type": "string",
-            "default": "global"
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Track per-memory confidence based on recall/useful signals"
           },
-          "definitions": {
-            "type": "object",
-            "additionalProperties": {
-              "type": "object",
-              "properties": {
-                "description": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "agentAccess": {
-            "type": "object",
-            "additionalProperties": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          },
-          "shared": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "enabled": {
-                "type": "boolean",
-                "default": true,
-                "description": "Enable cross-agent shared memory scope (read by all agents)"
-              },
-              "autoPromote": {
-                "type": "boolean",
-                "default": false,
-                "description": "Auto-promote memories accessed by 3+ agents to shared scope during dream cycle"
-              }
-            }
+          "decayFactor": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.95,
+            "description": "Decay multiplier applied per recall without useful signal"
           }
         }
       },
@@ -941,46 +933,11 @@
             "description": "Map of regex patterns to search queries for proactive injection"
           }
         }
-      },
-      "dreaming": {
-        "type": "object",
-        "additionalProperties": false,
-        "description": "Dreaming: periodic memory consolidation and promotion from short-term to long-term storage.",
-        "properties": {
-          "enabled": {
-            "type": "boolean",
-            "default": false,
-            "description": "Enable dreaming memory consolidation cycles"
-          },
-          "cron": {
-            "type": "string",
-            "default": "",
-            "description": "Cron expression for dreaming schedule"
-          },
-          "timezone": {
-            "type": "string",
-            "default": "UTC",
-            "description": "Timezone for cron scheduling (IANA format)"
-          },
-          "storageMode": {
-            "type": "string",
-            "enum": ["inline", "separate", "both"],
-            "default": "inline",
-            "description": "How dream insights are stored"
-          },
-          "separateReports": {
-            "type": "boolean",
-            "default": false,
-            "description": "Generate separate dream reports per phase"
-          },
-          "verboseLogging": {
-            "type": "boolean",
-            "default": false,
-            "description": "Enable verbose logging for dreaming cycles"
-          }
-        }
       }
-    }
+    },
+    "required": [
+      "embedding"
+    ]
   },
   "uiHints": {
     "embedding.apiKey": {
@@ -1001,14 +958,20 @@
       "advanced": true
     },
     "embedding.dimensions": {
-      "label": "Vector Dimensions",
+      "label": "Schema Dimensions",
       "placeholder": "auto-detected from model",
-      "help": "Override vector dimensions for custom models not in the built-in lookup table",
+      "help": "Internal vector dimensions used for LanceDB schema sizing and local embedding validation. Override this for custom models not in the built-in lookup table.",
+      "advanced": true
+    },
+    "embedding.requestDimensions": {
+      "label": "Request Dimensions",
+      "placeholder": "omit by default",
+      "help": "Optional dimensions/output_dimension value to send to the embedding API. If unset, no request-side dimensions field is sent.",
       "advanced": true
     },
     "embedding.omitDimensions": {
       "label": "Omit Request Dimensions",
-      "help": "Do not send the dimensions parameter to the embedding API even if embedding.dimensions is configured. Useful for local models like Qwen3-Embedding that reject the field.",
+      "help": "Do not send dimensions/output_dimension to the embedding API even if embedding.requestDimensions is configured. Useful for local models like Qwen3-Embedding that reject the field.",
       "advanced": true
     },
     "embedding.taskQuery": {
@@ -1501,6 +1464,16 @@
     "extractionThrottle.maxExtractionsPerHour": {
       "label": "Max Extractions Per Hour",
       "help": "Rate limit for auto-capture extractions. Prevents excessive LLM calls during rapid-fire sessions.",
+      "advanced": true
+    },
+    "autoRecallExcludeAgents": {
+      "label": "Auto-Recall Excluded Agents",
+      "help": "Blacklist mode. Agents here are skipped for auto-recall. If agentId is unavailable it falls back to 'main'. If autoRecallIncludeAgents is set, include wins.",
+      "advanced": true
+    },
+    "autoRecallIncludeAgents": {
+      "label": "Auto-Recall Included Agents",
+      "help": "Whitelist mode. Only these agents receive auto-recall. If agentId is unavailable it falls back to 'main'. Includes take precedence over excludes.",
       "advanced": true
     }
   }

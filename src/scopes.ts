@@ -215,7 +215,6 @@ export class MemoryScopeManager implements ScopeManager {
       "global",
       SCOPE_PATTERNS.AGENT(normalizedAgentId),
     ];
-    // Check if shared scope is enabled (read from definitions — if "shared" is defined, it's enabled)
     if (this.config.definitions["shared"]) {
       scopes.push("shared");
     }

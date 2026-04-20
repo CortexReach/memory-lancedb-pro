@@ -2190,13 +2190,13 @@ export function registerMemoryExplainRankTool(
 // Tool Registration Helper
 // ============================================================================
 
-// ============================================================================
+// ==========================================================================
 // Entity Graph Tool
-// ============================================================================
+// ==========================================================================
 
 export function registerMemoryEntitiesTool(
   api: OpenClawPluginApi,
-  context: ToolContext & { entityGraph?: { extractEntities(text: string): Array<{ name: string; category: string; normalized: string }>; getRelated(entity: string, depth?: number): Array<{ subject: string; predicate: string; object: string; confidence: number; lastSeen: number }>; getEntityProfile(name: string): { name: string; category: string; factCount: number; relationships: unknown[]; firstSeen: number; lastSeen: number }; getAllEntities(): Array<{ name: string; category: string; normalized: string }> }; },
+  context: ToolContext & { entityGraph?: { extractEntities(text: string): Array<{ name: string; category: string; normalized: string }>; getRelated(entity: string, depth?: number): Array<{ subject: string; predicate: string; object: string; confidence: number; lastSeen: number }>; getEntityProfile(name: string): { name: string; category: string; factCount: number; relationships: unknown[]; firstSeen: number; lastSeen: number }; getAllEntities(): Array<{ name: string; category: string; normalized: string }> } },
 ) {
   api.registerTool(
     (toolCtx) => {
@@ -2210,7 +2210,7 @@ export function registerMemoryEntitiesTool(
           action: Type.Optional(stringEnum(["profile", "related"] as const)),
           depth: Type.Optional(Type.Number({ description: "Relationship traversal depth (default: 1)" })),
         }),
-        async execute(_toolCallId, params) {
+        async execute(_toolCallId: string, params: unknown) {
           const { entity, action = "profile", depth = 1 } = params as { entity: string; action?: "profile" | "related"; depth?: number };
 
           if (!context.entityGraph) {
@@ -2244,9 +2244,9 @@ export function registerMemoryEntitiesTool(
   );
 }
 
-// ============================================================================
+// ==========================================================================
 // Confidence Boost Tool
-// ============================================================================
+// ==========================================================================
 
 export function registerMemoryBoostTool(
   api: OpenClawPluginApi,
@@ -2263,7 +2263,7 @@ export function registerMemoryBoostTool(
           memoryId: Type.Optional(Type.String({ description: "Memory ID to boost (UUID or prefix)" })),
           query: Type.Optional(Type.String({ description: "Search query to find memory when memoryId is omitted" })),
         }),
-        async execute(_toolCallId, params) {
+        async execute(_toolCallId: string, params: unknown) {
           const { memoryId, query } = params as { memoryId?: string; query?: string };
           if (!memoryId && !query) {
             return { content: [{ type: "text", text: "Provide memoryId or query." }], details: { error: "missing_param" } };
@@ -2293,9 +2293,9 @@ export function registerMemoryBoostTool(
   );
 }
 
-// ============================================================================
+// ==========================================================================
 // Shared Memory Write Tool
-// ============================================================================
+// ==========================================================================
 
 export function registerMemorySharedTool(
   api: OpenClawPluginApi,
@@ -2313,16 +2313,14 @@ export function registerMemorySharedTool(
           importance: Type.Optional(Type.Number({ description: "Importance score 0-1 (default: 0.7)" })),
           category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
         }),
-        async execute(_toolCallId, params) {
+        async execute(_toolCallId: string, params: unknown) {
           const { text, importance = 0.7, category = "fact" } = params as { text: string; importance?: number; category?: string };
           const agentId = runtimeContext.agentId;
 
-          // Validate shared scope is accessible
           if (!runtimeContext.scopeManager.isAccessible("shared", agentId)) {
             return { content: [{ type: "text", text: "Shared scope is not enabled or not accessible." }], details: { error: "scope_access_denied", requestedScope: "shared" } };
           }
 
-          // Noise check
           if (isNoise(text)) {
             return { content: [{ type: "text", text: "Skipped: text detected as noise." }], details: { action: "noise_filtered" } };
           }
@@ -2364,9 +2362,9 @@ export function registerMemorySharedTool(
   );
 }
 
-// ============================================================================
+// ==========================================================================
 // Tool Registration Helper
-// ============================================================================
+// ==========================================================================
 
 export function registerAllMemoryTools(
   api: OpenClawPluginApi,
@@ -2385,11 +2383,9 @@ export function registerAllMemoryTools(
   registerMemoryForgetTool(api, context);
   registerMemoryUpdateTool(api, context);
 
-  // Entity graph tool (always registered; returns "disabled" if not configured)
+  // Entity graph, confidence boost, shared scope tools
   registerMemoryEntitiesTool(api, context);
-  // Confidence boost tool (always registered; returns "disabled" if not configured)
   registerMemoryBoostTool(api, context);
-  // Shared memory write tool
   registerMemorySharedTool(api, context);
 
   // Management tools (optional)
