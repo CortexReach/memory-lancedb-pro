@@ -73,7 +73,6 @@ interface EnrichedEntry {
   entry: MemoryEntry;
   newCategory: MemoryCategory;
   enriched: Pick<EnrichedMetadata, "l0_abstract" | "l1_overview" | "l2_content">;
-  error?: string;  // If enrichment failed, record error but don't throw
 }
 
 // ============================================================================
@@ -308,7 +307,6 @@ export class MemoryUpgrader {
           entry,
           newCategory,
           enriched,
-          error: `LLM failed: ${String(err).slice(0, 100)}`,
         };
       }
     } else {
