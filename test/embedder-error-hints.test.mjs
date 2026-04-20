@@ -130,7 +130,7 @@ async function run() {
   installMockEmbeddingClient(jinaEmbedder, async (payload) => {
     assert.equal(payload.task, "retrieval.passage");
     assert.equal(payload.normalized, true);
-    assert.equal(payload.dimensions, 1024);
+    assert.equal(payload.dimensions, undefined, "jina should not send dimensions unless requestDimensions is set");
     return createEmbeddingResponse(1024);
   });
   await jinaEmbedder.embedPassage("hello");
@@ -144,7 +144,7 @@ async function run() {
   });
   installMockEmbeddingClient(genericEmbedder, async (payload) => {
     assert.equal(payload.encoding_format, "float");
-    assert.equal(payload.dimensions, 384);
+    assert.equal(payload.dimensions, undefined, "generic profile should not send dimensions unless requestDimensions is set");
     return createEmbeddingResponse(384);
   });
   await genericEmbedder.embedPassage("hello");
@@ -196,7 +196,7 @@ async function run() {
     apiKey: "test-key",
     model: "voyage-4-lite",
     baseURL: "https://api.voyageai.com/v1",
-    dimensions: 512,
+    requestDimensions: 512,
   });
   installMockEmbeddingClient(voyageDimEmbedder, async (payload) => {
     assert.equal(payload.output_dimension, 512, "voyage should send output_dimension");
@@ -211,7 +211,7 @@ async function run() {
   await withEmbeddingCaptureServer(
     (payload) => {
       assert.equal(payload.encoding_format, "float", "generic profile should send encoding_format");
-      assert.equal(payload.dimensions, 384, "generic profile should send dimensions");
+      assert.equal(payload.dimensions, undefined, "generic profile should not send dimensions by default");
       assert.equal(payload.task, undefined, "generic profile should not send task");
       assert.equal(payload.normalized, undefined, "generic profile should not send normalized");
       return { body: createEmbeddingResponse(384) };
@@ -223,6 +223,24 @@ async function run() {
         model: "custom-embed-model",
         baseURL,
         dimensions: 384,
+      });
+      await embedder.embedPassage("hello world");
+    },
+  );
+
+  await withEmbeddingCaptureServer(
+    (payload) => {
+      assert.equal(payload.encoding_format, "float", "generic profile should send encoding_format");
+      assert.equal(payload.dimensions, 384, "generic profile should send dimensions when requestDimensions is set");
+      return { body: createEmbeddingResponse(384) };
+    },
+    async ({ baseURL }) => {
+      const embedder = new Embedder({
+        provider: "openai-compatible",
+        apiKey: "test-key",
+        model: "text-embedding-3-small",
+        baseURL,
+        requestDimensions: 384,
       });
       await embedder.embedPassage("hello world");
     },

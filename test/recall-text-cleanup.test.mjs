@@ -25,6 +25,7 @@ const origCreateEmbedder = embedderModuleForMock.createEmbedder;
 
 const pluginModule = jiti("../index.ts");
 const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
+const resetRegistration = pluginModule.resetRegistration ?? (() => {});
 const { registerMemoryRecallTool, registerMemoryStoreTool } = jiti("../src/tools.ts");
 const { MemoryRetriever } = jiti("../src/retriever.js");
 const { buildSmartMetadata, stringifySmartMetadata } = jiti("../src/smart-metadata.ts");
@@ -329,6 +330,7 @@ describe("recall text cleanup", () => {
   beforeEach(() => {
     workspaceDir = mkdtempSync(path.join(tmpdir(), "recall-text-cleanup-test-"));
     originalRetrieve = MemoryRetriever.prototype.retrieve;
+    resetRegistration();
   });
 
   afterEach(() => {
@@ -336,6 +338,7 @@ describe("recall text cleanup", () => {
     // Restore factory functions on the .js module (same cache as index.ts uses)
     retrieverModuleForMock.createRetriever = origCreateRetriever;
     embedderModuleForMock.createEmbedder = origCreateEmbedder;
+    resetRegistration();
     rmSync(workspaceDir, { recursive: true, force: true });
   });
 
@@ -1096,4 +1099,3 @@ describe("recall text cleanup", () => {
     }
   });
 });
-

@@ -69,6 +69,10 @@ class EmbeddingCache {
 
   set(text: string, task: string | undefined, vector: number[]): void {
     const k = this.key(text, task);
+    // If key already exists, delete to update insertion order for correct LRU semantics
+    if (this.cache.has(k)) {
+      this.cache.delete(k);
+    }
     // When cache is full, run TTL eviction first (removes expired + oldest).
     // This prevents unbounded growth from stale entries while keeping writes O(1).
     if (this.cache.size >= this.maxSize) {
@@ -105,7 +109,10 @@ export interface EmbeddingConfig {
   apiKey: string | string[];
   model: string;
   baseURL?: string;
+  /** Internal vector dimension for schema sizing and local validation. */
   dimensions?: number;
+  /** Optional API request output dimension for providers that support it. */
+  requestDimensions?: number;
 
   /** Optional task type for query embeddings (e.g. "retrieval.query") */
   taskQuery?: string;
@@ -434,6 +441,14 @@ export function getVectorDimensions(model: string, overrideDims?: number): numbe
   return dims;
 }
 
+export function getEffectiveVectorDimensions(
+  model: string,
+  dimensions?: number,
+  requestDimensions?: number,
+): number {
+  return getVectorDimensions(model, requestDimensions ?? dimensions);
+}
+
 // ============================================================================
 // Embedder Class
 // ============================================================================
@@ -471,7 +486,7 @@ export class Embedder {
     this._taskQuery = config.taskQuery;
     this._taskPassage = config.taskPassage;
     this._normalized = config.normalized;
-    this._requestDimensions = config.dimensions;
+    this._requestDimensions = config.requestDimensions;
     this._omitDimensions = config.omitDimensions === true;
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
@@ -515,7 +530,11 @@ export class Embedder {
       console.log(`[memory-lancedb-pro] Initialized ${this.clients.length} API keys for round-robin rotation`);
     }
 
-    this.dimensions = getVectorDimensions(config.model, config.dimensions);
+    this.dimensions = getEffectiveVectorDimensions(
+      config.model,
+      config.dimensions,
+      config.requestDimensions,
+    );
     this._cache = new EmbeddingCache(256, 30); // 256 entries, 30 min TTL
   }
 

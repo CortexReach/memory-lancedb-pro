@@ -47,11 +47,17 @@
           },
           "dimensions": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "description": "Internal vector dimensions for LanceDB schema sizing and local embedding validation"
+          },
+          "requestDimensions": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional dimensions/output_dimension value to send to embedding providers that support variable output sizes"
           },
           "omitDimensions": {
             "type": "boolean",
-            "description": "When true, omit the dimensions parameter from embedding requests even if dimensions is configured"
+            "description": "When true, omit dimensions/output_dimension from embedding requests even if requestDimensions is configured"
           },
           "taskQuery": {
             "type": "string",
@@ -892,14 +898,20 @@
       "advanced": true
     },
     "embedding.dimensions": {
-      "label": "Vector Dimensions",
+      "label": "Schema Dimensions",
       "placeholder": "auto-detected from model",
-      "help": "Override vector dimensions for custom models not in the built-in lookup table",
+      "help": "Internal vector dimensions used for LanceDB schema sizing and local embedding validation. Override this for custom models not in the built-in lookup table.",
+      "advanced": true
+    },
+    "embedding.requestDimensions": {
+      "label": "Request Dimensions",
+      "placeholder": "omit by default",
+      "help": "Optional dimensions/output_dimension value to send to the embedding API. If unset, no request-side dimensions field is sent.",
       "advanced": true
     },
     "embedding.omitDimensions": {
       "label": "Omit Request Dimensions",
-      "help": "Do not send the dimensions parameter to the embedding API even if embedding.dimensions is configured. Useful for local models like Qwen3-Embedding that reject the field.",
+      "help": "Do not send dimensions/output_dimension to the embedding API even if embedding.requestDimensions is configured. Useful for local models like Qwen3-Embedding that reject the field.",
       "advanced": true
     },
     "embedding.taskQuery": {

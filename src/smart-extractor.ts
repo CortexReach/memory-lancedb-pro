@@ -52,6 +52,8 @@ import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
 import { inferAtomicBrandItemPreferenceSlot } from "./preference-slots.js";
 import { batchDedup } from "./batch-dedup.js";
 
+type StoreEntry = Omit<import("./store.js").MemoryEntry, "id" | "timestamp">;
+
 // ============================================================================
 // Envelope Metadata Stripping
 // ============================================================================
@@ -417,6 +419,8 @@ export class SmartExtractor {
       }
     }
 
+    const createEntries: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[] = [];
+
     for (const { index, candidate } of processableCandidates) {
       try {
         await this.processCandidate(
@@ -427,12 +431,17 @@ export class SmartExtractor {
           targetScope,
           scopeFilter,
           precomputedVectors.get(index),
+          createEntries,
         );
       } catch (err) {
         this.log(
           `memory-pro: smart-extractor: failed to process candidate [${candidate.category}]: ${String(err)}`,
         );
       }
+    }
+
+    if (createEntries.length > 0) {
+      await this.store.bulkStore(createEntries);
     }
 
     return stats;
@@ -653,6 +662,7 @@ export class SmartExtractor {
     targetScope: string,
     scopeFilter?: string[],
     precomputedVector?: number[],
+    createEntries?: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[],
   ): Promise<void> {
     // Profile always merges (skip dedup — admission control still applies)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -662,6 +672,8 @@ export class SmartExtractor {
         sessionKey,
         targetScope,
         scopeFilter,
+        undefined,
+        createEntries,
       );
       if (profileResult === "rejected") {
         stats.rejected = (stats.rejected ?? 0) + 1;
@@ -678,7 +690,7 @@ export class SmartExtractor {
     const vector = precomputedVector ?? await this.embedder.embed(`${candidate.abstract} ${candidate.content}`);
     if (!vector || vector.length === 0) {
       this.log("memory-pro: smart-extractor: embedding failed, storing as-is");
-      await this.storeCandidate(candidate, vector || [], sessionKey, targetScope);
+      createEntries?.push(this.buildStoreEntry(candidate, vector || [], sessionKey, targetScope));
       stats.created++;
       return;
     }
@@ -714,7 +726,7 @@ export class SmartExtractor {
 
     switch (dedupResult.decision) {
       case "create":
-        await this.storeCandidate(candidate, vector, sessionKey, targetScope, admission?.audit);
+        createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
         stats.created++;
         break;
 
@@ -730,11 +742,12 @@ export class SmartExtractor {
             scopeFilter,
             dedupResult.contextLabel,
             admission?.audit,
+            createEntries,
           );
           stats.merged++;
         } else {
           // Category doesn't support merge → create instead
-          await this.storeCandidate(candidate, vector, sessionKey, targetScope, admission?.audit);
+          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
           stats.created++;
         }
         break;
@@ -759,11 +772,12 @@ export class SmartExtractor {
             targetScope,
             scopeFilter,
             admission?.audit,
+            createEntries,
           );
           stats.created++;
           stats.superseded = (stats.superseded ?? 0) + 1;
         } else {
-          await this.storeCandidate(candidate, vector, sessionKey, targetScope, admission?.audit);
+          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
           stats.created++;
         }
         break;
@@ -773,17 +787,17 @@ export class SmartExtractor {
           await this.handleSupport(dedupResult.matchId, { session: sessionKey, timestamp: Date.now() }, dedupResult.reason, dedupResult.contextLabel, scopeFilter, admission?.audit);
           stats.supported = (stats.supported ?? 0) + 1;
         } else {
-          await this.storeCandidate(candidate, vector, sessionKey, targetScope, admission?.audit);
+          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
           stats.created++;
         }
         break;
 
       case "contextualize":
         if (dedupResult.matchId) {
-          await this.handleContextualize(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit);
+          await this.handleContextualize(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries);
           stats.created++;
         } else {
-          await this.storeCandidate(candidate, vector, sessionKey, targetScope, admission?.audit);
+          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
           stats.created++;
         }
         break;
@@ -802,15 +816,16 @@ export class SmartExtractor {
               targetScope,
               scopeFilter,
               admission?.audit,
+              createEntries,
             );
             stats.created++;
             stats.superseded = (stats.superseded ?? 0) + 1;
           } else {
-            await this.handleContradict(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit);
+            await this.handleContradict(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries);
             stats.created++;
           }
         } else {
-          await this.storeCandidate(candidate, vector, sessionKey, targetScope, admission?.audit);
+          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
           stats.created++;
         }
         break;
@@ -964,6 +979,7 @@ export class SmartExtractor {
     targetScope: string,
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
+    createEntries?: StoreEntry[],
   ): Promise<"merged" | "created" | "rejected"> {
     // Find existing profile memory by category
     const embeddingText = `${candidate.abstract} ${candidate.content}`;
@@ -1011,11 +1027,12 @@ export class SmartExtractor {
         scopeFilter,
         undefined,
         admissionAudit,
+        createEntries,
       );
       return "merged";
     } else {
       // No existing profile — create new
-      await this.storeCandidate(candidate, vector || [], sessionKey, targetScope, admissionAudit);
+      createEntries?.push(this.buildStoreEntry(candidate, vector || [], sessionKey, targetScope, admissionAudit));
       return "created";
     }
   }
@@ -1030,6 +1047,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     contextLabel?: string,
     admissionAudit?: AdmissionAuditRecord,
+    createEntries?: StoreEntry[],
   ): Promise<void> {
     let existingAbstract = "";
     let existingOverview = "";
@@ -1051,12 +1069,12 @@ export class SmartExtractor {
       const vector = await this.embedder.embed(
         `${candidate.abstract} ${candidate.content}`,
       );
-      await this.storeCandidate(
+      createEntries?.push(this.buildStoreEntry(
         candidate,
         vector || [],
         "merge-fallback",
         targetScope,
-      );
+      ));
       return;
     }
 
@@ -1141,12 +1159,13 @@ export class SmartExtractor {
     matchId: string,
     sessionKey: string,
     targetScope: string,
-    scopeFilter: string[],
+    scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
+    createEntries?: StoreEntry[],
   ): Promise<void> {
     const existing = await this.store.getById(matchId, scopeFilter);
     if (!existing) {
-      await this.storeCandidate(candidate, vector, sessionKey, targetScope);
+      createEntries?.push(this.buildStoreEntry(candidate, vector || [], sessionKey, targetScope));
       return;
     }
 
@@ -1265,6 +1284,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     contextLabel?: string,
     admissionAudit?: AdmissionAuditRecord,
+    createEntries?: StoreEntry[],
   ): Promise<void> {
     const storeCategory = this.mapToStoreCategory(candidate.category);
     const metadata = stringifySmartMetadata(this.withAdmissionAudit({
@@ -1287,14 +1307,19 @@ export class SmartExtractor {
       relations: [{ type: "contextualizes", targetId: matchId }],
     }, admissionAudit));
 
-    await this.store.store({
+    const entry_c: StoreEntry = {
       text: candidate.abstract,
       vector,
       category: storeCategory,
       scope: targetScope,
       importance: this.getDefaultImportance(candidate.category),
       metadata,
-    });
+    };
+    if (createEntries) {
+      createEntries.push(entry_c);
+    } else {
+      await this.store.store(entry_c);
+    }
 
     this.log(
       `memory-pro: smart-extractor: contextualize [${contextLabel || "general"}] new entry linked to ${matchId.slice(0, 8)}`,
@@ -1314,6 +1339,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     contextLabel?: string,
     admissionAudit?: AdmissionAuditRecord,
+    createEntries?: StoreEntry[],
   ): Promise<void> {
     // 1. Record contradiction on the existing memory
     const existing = await this.store.getById(matchId, scopeFilter);
@@ -1351,14 +1377,19 @@ export class SmartExtractor {
       relations: [{ type: "contradicts", targetId: matchId }],
     }, admissionAudit));
 
-    await this.store.store({
+    const entry_d: StoreEntry = {
       text: candidate.abstract,
       vector,
       category: storeCategory,
       scope: targetScope,
       importance: this.getDefaultImportance(candidate.category),
       metadata,
-    });
+    };
+    if (createEntries) {
+      createEntries.push(entry_d);
+    } else {
+      await this.store.store(entry_d);
+    }
 
     this.log(
       `memory-pro: smart-extractor: contradict [${contextLabel || "general"}] on ${matchId.slice(0, 8)}, new entry created`,
@@ -1370,24 +1401,23 @@ export class SmartExtractor {
   // --------------------------------------------------------------------------
 
   /**
-   * Store a candidate memory as a new entry with L0/L1/L2 metadata.
+   * Build a memory entry from candidate data (without writing).
+   * Used by batch creation to reduce lock acquisitions.
    */
-  private async storeCandidate(
+  private buildStoreEntry(
     candidate: CandidateMemory,
     vector: number[],
     sessionKey: string,
     targetScope: string,
     admissionAudit?: AdmissionAuditRecord,
-  ): Promise<void> {
-    // Map 6-category to existing store categories for backward compatibility
+  ): Omit<import("./store.js").MemoryEntry, "id" | "timestamp"> {
     const storeCategory = this.mapToStoreCategory(candidate.category);
-
     const classifyText = candidate.content || candidate.abstract;
     const metadata = stringifySmartMetadata(
       buildSmartMetadata(
         {
           text: candidate.abstract,
-          category: this.mapToStoreCategory(candidate.category),
+          category: storeCategory,
         },
         {
           l0_abstract: candidate.abstract,
@@ -1406,18 +1436,33 @@ export class SmartExtractor {
           suppressed_until_turn: 0,
           memory_temporal_type: classifyTemporal(classifyText),
           valid_until: inferExpiry(classifyText),
+          ...(admissionAudit ? { admission_audit: JSON.stringify(admissionAudit) } : {}),
         },
       ),
     );
 
-    await this.store.store({
-      text: candidate.abstract, // L0 used as the searchable text
+    return {
+      text: candidate.abstract,
       vector,
       category: storeCategory,
       scope: targetScope,
       importance: this.getDefaultImportance(candidate.category),
       metadata,
-    });
+    };
+  }
+
+  /**
+   * Store a candidate memory as a new entry with L0/L1/L2 metadata.
+   */
+  private async storeCandidate(
+    candidate: CandidateMemory,
+    vector: number[],
+    sessionKey: string,
+    targetScope: string,
+    admissionAudit?: AdmissionAuditRecord,
+  ): Promise<void> {
+    const entry = this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admissionAudit);
+    await this.store.store(entry);
 
     this.log(
       `memory-pro: smart-extractor: created [${candidate.category}] ${candidate.abstract.slice(0, 60)}`,
