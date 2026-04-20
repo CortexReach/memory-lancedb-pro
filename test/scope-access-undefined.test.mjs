@@ -58,6 +58,7 @@ describe("MemoryScopeManager - System & Reflection Scopes", () => {
       assert.deepStrictEqual(manager.getScopeFilter("main"), [
         "global",
         "agent:main",
+        "shared",
         "reflection:agent:main",
       ]);
     });
@@ -155,6 +156,7 @@ describe("MemoryScopeManager - System & Reflection Scopes", () => {
       assert.deepStrictEqual(manager.getAccessibleScopes("main"), [
         "global",
         "agent:main",
+        "shared",
         "reflection:agent:main",
       ]);
       assert.strictEqual(manager.getDefaultScope("main"), "agent:main");

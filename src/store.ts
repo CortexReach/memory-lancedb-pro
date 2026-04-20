@@ -444,6 +444,12 @@ export class MemoryStore {
     return res.length > 0;
   }
 
+  /** Lightweight total row count via LanceDB countRows(). */
+  async count(): Promise<number> {
+    await this.ensureInitialized();
+    return await this.table!.countRows();
+  }
+
   async getById(id: string, scopeFilter?: string[]): Promise<MemoryEntry | null> {
     await this.ensureInitialized();
 

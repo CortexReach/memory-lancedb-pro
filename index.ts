@@ -19,6 +19,9 @@ import { spawn } from "node:child_process";
 // so we downgrade them to debug level when running in CLI mode.
 const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 
+import { createDreamingEngine, DEFAULT_DREAMING_CONFIG, mergeDreamingConfig } from "./src/dreaming-engine.js";
+import type { DreamingConfig } from "./src/dreaming-engine.js";
+
 // Import core components
 import { MemoryStore, validateStoragePath } from "./src/store.js";
 import { createEmbedder, getVectorDimensions } from "./src/embedder.js";
@@ -58,7 +61,6 @@ import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extract
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
 import { NoisePrototypeBank } from "./src/noise-prototypes.js";
 import { createLlmClient } from "./src/llm-client.js";
-import { createDreamingEngine, type DreamingEngine, type DreamingConfig } from "./src/dreaming-engine.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
 import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
@@ -80,6 +82,9 @@ import {
   type AdmissionRejectionAuditEntry,
 } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
+import { createEntityGraph, type EntityGraph } from "./src/entity-graph.js";
+import { createConfidenceTracker, type ConfidenceTracker } from "./src/confidence-tracker.js";
+import { createProactiveInjector, type ProactiveInjector } from "./src/proactive-injector.js";
 
 // ============================================================================
 // Configuration & Types
@@ -184,6 +189,7 @@ interface PluginConfig {
     default?: string;
     definitions?: Record<string, { description: string }>;
     agentAccess?: Record<string, string[]>;
+    shared?: { enabled?: boolean; autoPromote?: boolean };
   };
   enableManagementTools?: boolean;
   sessionStrategy?: SessionStrategy;
@@ -226,7 +232,26 @@ interface PluginConfig {
     skipLowValue?: boolean;
     maxExtractionsPerHour?: number;
   };
-  dreaming?: DreamingConfig;
+  entityGraph?: { enabled?: boolean };
+  proactive?: {
+    enabled?: boolean;
+    staleMemoryDays?: number;
+    entityPrefetch?: boolean;
+    patternTriggers?: Record<string, string>;
+  };
+  dreaming?: {
+    enabled?: boolean;
+    cron?: string;
+    timezone?: string;
+    storageMode?: "inline" | "separate" | "both";
+    separateReports?: boolean;
+    verboseLogging?: boolean;
+    phases?: {
+      light?: { lookbackDays?: number; limit?: number };
+      deep?: { limit?: number; minScore?: number; minRecallCount?: number; recencyHalfLifeDays?: number };
+      rem?: { lookbackDays?: number; limit?: number; minPatternStrength?: number };
+    };
+  };
 }
 
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
@@ -256,9 +281,7 @@ function resolveEnvVars(value: string): string {
   return value.replace(/\$\{([^}]+)\}/g, (_, envVar) => {
     const envValue = process.env[envVar];
     if (!envValue) {
-      // Return empty string instead of throwing — the feature using this value
-      // will simply be unavailable (e.g., reranking disabled).
-      return '';
+      throw new Error(`Environment variable ${envVar} is not set`);
     }
     return envValue;
   });
@@ -1694,6 +1717,14 @@ const memoryLanceDBProPlugin = {
     );
     const scopeManager = createScopeManager(config.scopes);
 
+    // Configure shared scope based on config (default: enabled)
+    const sharedEnabled = config.scopes?.shared?.enabled !== false;
+    if (sharedEnabled && !scopeManager.getScopeDefinition("shared")) {
+      scopeManager.addScopeDefinition("shared", {
+        description: "Cross-agent shared knowledge — read by all agents, written only by explicit writes or dreaming engine",
+      });
+    }
+
     // ClawTeam integration: extend accessible scopes via env var
     const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
     if (clawteamScopes.length > 0) {
@@ -2090,6 +2121,22 @@ const memoryLanceDBProPlugin = {
     });
 
     // ========================================================================
+    // Initialize Priority 3 Enhancements
+    // ========================================================================
+
+    const entityGraph = createEntityGraph({ enabled: config.entityGraph?.enabled ?? false });
+    const confidenceTracker = createConfidenceTracker({ enabled: true });
+    const proactiveInjector = createProactiveInjector(
+      { retriever, entityGraph, scopeManager },
+      {
+        enabled: config.proactive?.enabled ?? false,
+        staleMemoryDays: config.proactive?.staleMemoryDays ?? 7,
+        entityPrefetch: config.proactive?.entityPrefetch ?? true,
+        patternTriggers: config.proactive?.patternTriggers ?? {},
+      },
+    );
+
+    // ========================================================================
     // Markdown Mirror
     // ========================================================================
 
@@ -2110,6 +2157,8 @@ const memoryLanceDBProPlugin = {
         workspaceDir: getDefaultWorkspaceDir(),
         mdMirror,
         workspaceBoundary: config.workspaceBoundary,
+        entityGraph,
+        confidenceTracker,
       },
       {
         enableManagementTools: config.enableManagementTools,
@@ -2149,6 +2198,126 @@ const memoryLanceDBProPlugin = {
             api.logger.warn(`memory-compactor [auto]: failed: ${String(err)}`);
           });
       });
+    }
+
+    // ========================================================================
+    // Dreaming Engine — Periodic memory consolidation
+    // ========================================================================
+
+    const dreamingUserConfig = (api.pluginConfig as Record<string, unknown>)?.dreaming as Record<string, unknown> | undefined;
+    const dreamingCfg = mergeDreamingConfig(dreamingUserConfig);
+
+    if (dreamingCfg.enabled) {
+      const dreamingLog = (msg: string) => api.logger.info(`dreaming: ${msg}`);
+      const dreamingDebug = (msg: string) => api.logger.debug(`dreaming: ${msg}`);
+
+      const dreamingEngine = createDreamingEngine({
+        store,
+        decayEngine,
+        tierManager,
+        config: dreamingCfg,
+        log: dreamingLog,
+        debugLog: dreamingDebug,
+        workspaceDir: getDefaultWorkspaceDir(),
+      });
+
+      // Simple cron parser: supports "minute hour day month weekday"
+      // Handles: "*" (any), specific numbers, and step patterns like "*/N"
+      function parseCron(expr: string): { minute: number[]; hour: number[] } {
+        const parts = expr.trim().split(/\s+/);
+        if (parts.length < 2) return { minute: [0], hour: [3] };
+        const parseField = (field: string, min: number, max: number): number[] => {
+          if (field === "*") {
+            const r: number[] = [];
+            for (let i = min; i <= max; i++) r.push(i);
+            return r;
+          }
+          return field.split(",").flatMap((p) => {
+            const stepMatch = p.match(/^(\*|\d+)\/(\d+)$/);
+            if (stepMatch) {
+              const base = stepMatch[1] === "*" ? min : parseInt(stepMatch[1], 10);
+              const step = parseInt(stepMatch[2], 10);
+              const r: number[] = [];
+              for (let i = base; i <= max; i += step) r.push(i);
+              return r;
+            }
+            const n = parseInt(p, 10);
+            return Number.isFinite(n) ? [n] : [];
+          });
+        };
+        return {
+          minute: parseField(parts[0], 0, 59),
+          hour: parseField(parts[1], 0, 23),
+        };
+      }
+
+      function scheduleWithCron(expr: string, _tz: string, callback: () => Promise<void>): NodeJS.Timeout {
+        const parsed = parseCron(expr);
+
+        function checkAndRun() {
+          const now = new Date();
+          if (parsed.minute.includes(now.getMinutes()) && parsed.hour.includes(now.getHours())) {
+            callback().catch((err) => {
+              dreamingLog(`cycle failed: ${String(err)}`);
+            });
+          }
+        }
+
+        // Check every 60 seconds
+        return setInterval(checkAndRun, 60_000);
+      }
+
+      const dreamingTimer = scheduleWithCron(dreamingCfg.cron, dreamingCfg.timezone, async () => {
+        dreamingLog(`cycle starting (cron: ${dreamingCfg.cron})`);
+        try {
+          const report = await dreamingEngine.run();
+          dreamingLog(
+            `cycle complete — light:${report.phases.light.scanned} scanned/${report.phases.light.transitions.length} transitions, ` +
+            `deep:${report.phases.deep.candidates} candidates/${report.phases.deep.promoted} promoted, ` +
+            `rem:${report.phases.rem.patterns.length} patterns/${report.phases.rem.reflectionsCreated} reflections`,
+          );
+
+          // Write DREAMS.md report
+          const workspaceDir = getDefaultWorkspaceDir();
+          const dreamsPath = join(workspaceDir, "DREAMS.md");
+          const dateStr = new Date().toISOString().replace("T", " ").slice(0, 19);
+          const reportLines = [
+            `## Dream Cycle — ${dateStr}`,
+            ``,
+            `**Light Sleep:** Scanned ${report.phases.light.scanned} memories, ${report.phases.light.transitions.length} tier transitions`,
+            `**Deep Sleep:** ${report.phases.deep.candidates} candidates evaluated, ${report.phases.deep.promoted} promoted to core`,
+            `**REM:** ${report.phases.rem.patterns.length} patterns detected, ${report.phases.rem.reflectionsCreated} reflections created`,
+            ``,
+          ];
+          if (report.phases.rem.patterns.length > 0) {
+            reportLines.push(`### Patterns Detected`);
+            for (const p of report.phases.rem.patterns) {
+              reportLines.push(`- ${p}`);
+            }
+            reportLines.push(``);
+          }
+
+          try {
+            let existing = "";
+            try { existing = await readFile(dreamsPath, "utf-8"); } catch { /* first run */ }
+            const updated = reportLines.join("\n") + "\n" + existing;
+            await writeFile(dreamsPath, updated, "utf-8");
+          } catch (writeErr) {
+            dreamingDebug(`failed to write DREAMS.md: ${String(writeErr)}`);
+          }
+        } catch (err) {
+          dreamingLog(`cycle error: ${String(err)}`);
+        }
+      });
+
+      api.on("gateway_stop", () => {
+        clearInterval(dreamingTimer);
+        dreamingLog("scheduler stopped");
+      });
+
+      (isCliMode() ? api.logger.debug : api.logger.info)(
+        `dreaming engine enabled (cron: ${dreamingCfg.cron}, tz: ${dreamingCfg.timezone}, verbose: ${dreamingCfg.verboseLogging})`,
+      );
     }
 
     // ========================================================================
@@ -2267,10 +2436,15 @@ const memoryLanceDBProPlugin = {
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
 
+          // Use cached raw user message for the recall query to avoid channel
+          // metadata noise (e.g. Slack's Conversation info JSON with message_id,
+          // sender_id, conversation_label) that pollutes the embedding vector and
+          // causes irrelevant memories to rank higher.  Fall back to event.prompt
+          // for non-channel triggers or when no cached message is available.
           // FR-04: Truncate long prompts (e.g. file attachments) before embedding.
           // Auto-recall only needs the user's intent, not full attachment text.
           const MAX_RECALL_QUERY_LENGTH = config.autoRecallMaxQueryLength ?? 2_000;
-          let recallQuery = event.prompt;
+          let recallQuery = lastRawUserMessage.get(cacheKey) || event.prompt;
           if (recallQuery.length > MAX_RECALL_QUERY_LENGTH) {
             const originalLength = recallQuery.length;
             recallQuery = recallQuery.slice(0, MAX_RECALL_QUERY_LENGTH);
@@ -2483,6 +2657,11 @@ const memoryLanceDBProPlugin = {
               );
             }),
           );
+
+          // Track confidence for auto-recalled memories
+          for (const item of selected) {
+            confidenceTracker.recordRecall(item.id);
+          }
 
           const memoryContext = selected.map((item) => item.line).join("\n");
 
@@ -2754,6 +2933,10 @@ const memoryLanceDBProPlugin = {
                 conversationText, sessionKey,
                 { scope: defaultScope, scopeFilter: accessibleScopes },
               );
+              // Extract entities from conversation text into the entity graph
+              if (config.entityGraph?.enabled) {
+                entityGraph.addEntitiesAndRelationships(conversationText);
+              }
               // Charge rate limiter only after successful extraction
               extractionRateLimiter.recordExtraction();
               if (stats.created > 0 || stats.merged > 0) {
@@ -3610,7 +3793,6 @@ const memoryLanceDBProPlugin = {
     // ========================================================================
 
     let backupTimer: ReturnType<typeof setInterval> | null = null;
-    let dreamingTimer: ReturnType<typeof setInterval> | null = null;
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
     async function runBackup() {
@@ -3754,69 +3936,11 @@ const memoryLanceDBProPlugin = {
         // Run initial backup after a short delay, then schedule daily
         setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
-
-        // ========================================================================
-        // Dreaming Engine
-        // ========================================================================
-        let dreamingEngine: DreamingEngine | null = null;
-        dreamingTimer = null;
-
-        const dreamingConfig = config.dreaming as DreamingConfig | undefined;
-        if (dreamingConfig?.enabled) {
-          try {
-            dreamingEngine = createDreamingEngine({
-              store,
-              decayEngine,
-              tierManager,
-              config: dreamingConfig,
-              log: (msg: string) => api.logger.info(msg),
-              debugLog: (msg: string) => api.logger.debug(msg),
-            });
-
-            // Run first dreaming cycle after 5 minutes, then every 6 hours
-            const DREAMING_INTERVAL_MS = 6 * 60 * 60 * 1000;
-            setTimeout(async () => {
-              try {
-                const report = await dreamingEngine!.run();
-                api.logger.info(
-                  `memory-lancedb-pro: dreaming cycle complete — ` +
-                  `light: ${report.phases.light.scanned} scanned, ${report.phases.light.transitions.length} transitions; ` +
-                  `deep: ${report.phases.deep.promoted}/${report.phases.deep.candidates} promoted; ` +
-                  `rem: ${report.phases.rem.patterns.length} patterns, ${report.phases.rem.reflectionsCreated} reflections`,
-                );
-              } catch (err) {
-                api.logger.warn(`memory-lancedb-pro: dreaming cycle failed: ${String(err)}`);
-              }
-            }, 5 * 60 * 1000);
-
-            dreamingTimer = setInterval(async () => {
-              try {
-                const report = await dreamingEngine!.run();
-                api.logger.info(
-                  `memory-lancedb-pro: dreaming cycle complete — ` +
-                  `light: ${report.phases.light.scanned} scanned, ${report.phases.light.transitions.length} transitions; ` +
-                  `deep: ${report.phases.deep.promoted}/${report.phases.deep.candidates} promoted; ` +
-                  `rem: ${report.phases.rem.patterns.length} patterns, ${report.phases.rem.reflectionsCreated} reflections`,
-                );
-              } catch (err) {
-                api.logger.warn(`memory-lancedb-pro: dreaming cycle failed: ${String(err)}`);
-              }
-            }, DREAMING_INTERVAL_MS);
-
-            api.logger.info("memory-lancedb-pro: dreaming engine initialized (interval: 6h)");
-          } catch (err) {
-            api.logger.warn(`memory-lancedb-pro: dreaming init failed: ${String(err)}`);
-          }
-        }
       },
       stop: async () => {
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
-        }
-        if (dreamingTimer) {
-          clearInterval(dreamingTimer);
-          dreamingTimer = null;
         }
         api.logger.info("memory-lancedb-pro: stopped");
       },
@@ -4103,7 +4227,6 @@ export function parsePluginConfig(value: unknown): PluginConfig {
                 : 30,
           }
         : { skipLowValue: false, maxExtractionsPerHour: 30 },
-    dreaming: cfg.dreaming as DreamingConfig | undefined,
   };
 }
 

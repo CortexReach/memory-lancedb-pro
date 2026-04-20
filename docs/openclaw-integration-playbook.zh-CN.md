@@ -46,8 +46,10 @@
 
 这时需要：
 
-- 开启插件 `sessionMemory.enabled`
+- 设置插件 `sessionStrategy: "memoryReflection"`（LLM 结构化反思：去重、错误追踪、lifecycle 评分）
 - 明确决定是否保留 OpenClaw 内置 `session-memory`
+
+> **注意：** 旧版 `sessionMemory.enabled = true` 实际映射为 `systemSessionMemory`（简单摘要直存 LanceDB），而非 `memoryReflection`。如需完整反思管线，请显式使用 `sessionStrategy`。
 
 如果两者同时开启，`/new` 可能产生两类结果：
 
@@ -60,7 +62,7 @@
 
 大部分场景推荐三选一，而不是默认双开。
 
-### 方案 1：只用内置 session-memory
+### 方案 1：禁用（不启用插件 session hook）
 
 适合：
 
@@ -69,29 +71,52 @@
 
 建议配置：
 
-- 插件 `sessionMemory.enabled = false`
+- 插件 `sessionStrategy: "none"`（或不设置 `sessionStrategy`）
 - OpenClaw `hooks.internal.entries.session-memory.enabled = true`
 
-### 方案 2：只用插件 session memory
+### 方案 2：只用插件（LLM 反思模式）
 
 适合：
 
 - 希望 session summary 进入 LanceDB
-- 需要后续参与去重、生命周期排序、统一检索
+- 需要 LLM 结构化提取、去重、lifecycle 评分
 
 建议配置：
 
-- 插件 `sessionMemory.enabled = true`
+- 插件 `sessionStrategy: "memoryReflection"`
 - OpenClaw `hooks.internal.entries.session-memory.enabled = false`
 
-### 方案 3：双写
+### 方案 3：只用插件（简单摘要模式）
+
+适合：
+
+- 希望 session summary 存入 LanceDB
+- 不需要 LLM 反思管线
+
+建议配置：
+
+- 插件 `sessionStrategy: "systemSessionMemory"`
+- OpenClaw `hooks.internal.entries.session-memory.enabled = false`
+
+此模式将会话摘要直接写入 LanceDB，存为 `fact` / `peripheral` 层级条目，不经过 LLM 去重或 lifecycle 评分。
+
+### 方案 4：双写
 
 只在你明确需要以下两类产物时使用：
 
-- workspace 中的摘要文件
-- LanceDB 中可检索的 session 记忆
+- workspace 中的摘要文件（通过内置 session-memory）
+- LanceDB 中可检索的 session 记忆（通过插件 `sessionStrategy`）
 
 若采用双写，建议在团队文档中写清楚，否则后续维护者容易把它误判成重复存储问题。
+
+### 策略对照表
+
+| 配置方式 | 策略 | 行为 |
+|---|---|---|
+| `sessionStrategy: "memoryReflection"` | memoryReflection | LLM 结构化反思：提取、去重、lifecycle 评分 |
+| `sessionStrategy: "systemSessionMemory"` | systemSessionMemory | 简单会话摘要直存 LanceDB（fact/peripheral 层级） |
+| `sessionMemory: { enabled: true }` | systemSessionMemory | 旧版简写，等同于上面的 `systemSessionMemory` |
+| `sessionStrategy: "none"` 或不设置 | none | 插件 session hook 不启用 |
 
 ## 3. 基线检查清单
 
@@ -304,7 +329,7 @@ openclaw memory-pro search "your test keyword" --scope global --limit 5
 
 优先检查：
 
-- 插件 `sessionMemory` 是否开启
+- 插件 `sessionStrategy` 是否设为 `"memoryReflection"` 或 `"systemSessionMemory"`（而非 `"none"`）
 - 插件 Hook 是否真的注册成功且有名字
 - 改完配置后 Gateway 是否已重启
 - 内置 Hook 状态是否符合当前设计

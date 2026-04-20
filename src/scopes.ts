@@ -51,6 +51,9 @@ export const DEFAULT_SCOPE_CONFIG: ScopeConfig = {
     global: {
       description: "Shared knowledge across all agents",
     },
+    shared: {
+      description: "Cross-agent shared knowledge — read by all agents, written only by dreaming engine or explicit writes",
+    },
   },
   agentAccess: {},
 };
@@ -61,12 +64,18 @@ export const DEFAULT_SCOPE_CONFIG: ScopeConfig = {
 
 const SCOPE_PATTERNS = {
   GLOBAL: "global",
+  SHARED: "shared",
   AGENT: (agentId: string) => `agent:${agentId}`,
   CUSTOM: (name: string) => `custom:${name}`,
   REFLECTION: (agentId: string) => `reflection:agent:${agentId}`,
   PROJECT: (projectId: string) => `project:${projectId}`,
   USER: (userId: string) => `user:${userId}`,
 };
+
+/** Check if a scope string is the shared scope. */
+export function isSharedScope(scope: string): boolean {
+  return scope === "shared";
+}
 
 const SYSTEM_BYPASS_IDS = new Set(["system", "undefined"]);
 const warnedLegacyFallbackBypassIds = new Set<string>();
@@ -177,6 +186,7 @@ export class MemoryScopeManager implements ScopeManager {
   private isBuiltInScope(scope: string): boolean {
     return (
       scope === "global" ||
+      scope === "shared" ||
       scope.startsWith("agent:") ||
       scope.startsWith("custom:") ||
       scope.startsWith("project:") ||
@@ -200,10 +210,16 @@ export class MemoryScopeManager implements ScopeManager {
     }
 
     // Agent and reflection scopes are built-in and provisioned implicitly.
-    return withOwnReflectionScope([
+    // Shared scope is included for all agents when enabled (default).
+    const scopes = [
       "global",
       SCOPE_PATTERNS.AGENT(normalizedAgentId),
-    ], normalizedAgentId);
+    ];
+    // Check if shared scope is enabled (read from definitions — if "shared" is defined, it's enabled)
+    if (this.config.definitions["shared"]) {
+      scopes.push("shared");
+    }
+    return withOwnReflectionScope(scopes, normalizedAgentId);
   }
 
   /**

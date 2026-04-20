@@ -122,7 +122,7 @@ describe("ClawTeam Scope Integration", () => {
     it("agent does not have team scopes by default", () => {
       const scopes = manager.getAccessibleScopes("main");
       assert.ok(!scopes.includes("custom:team-demo"), "should NOT include team scope");
-      assert.deepStrictEqual(scopes, ["global", "agent:main", "reflection:agent:main"]);
+      assert.deepStrictEqual(scopes, ["global", "agent:main", "shared", "reflection:agent:main"]);
     });
   });
 });

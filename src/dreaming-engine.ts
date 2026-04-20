@@ -29,6 +29,53 @@ import type { MemoryTier } from "./memory-categories.js";
 
 import { parseSmartMetadata } from "./smart-metadata.js";
 
+// ── Default config & merge helper ──────────────────────────────────
+
+export const DEFAULT_DREAMING_CONFIG: Required<Omit<DreamingConfig, "cron" | "timezone" | "storageMode" | "separateReports">> & { cron: string; timezone: string; storageMode: "inline"; separateReports: false } = {
+  enabled: false,
+  cron: "0 3 * * *",
+  timezone: "UTC",
+  storageMode: "inline",
+  separateReports: false,
+  verboseLogging: false,
+  phases: {
+    light: { lookbackDays: 3, limit: 100 },
+    deep: { limit: 50, minScore: 0.6, minRecallCount: 2, recencyHalfLifeDays: 30 },
+    rem: { lookbackDays: 7, limit: 80, minPatternStrength: 0.7 },
+  },
+};
+
+/** Deep-merge partial user dreaming config over defaults */
+export function mergeDreamingConfig(user: Record<string, unknown> | undefined): DreamingConfig {
+  const base = { ...DEFAULT_DREAMING_CONFIG };
+  if (!user) return base;
+  if (typeof user.enabled === "boolean") base.enabled = user.enabled;
+  if (typeof user.cron === "string") base.cron = user.cron;
+  if (typeof user.timezone === "string") base.timezone = user.timezone;
+  if (typeof user.storageMode === "string") base.storageMode = user.storageMode as DreamingConfig["storageMode"];
+  if (typeof user.separateReports === "boolean") base.separateReports = user.separateReports;
+  if (typeof user.verboseLogging === "boolean") base.verboseLogging = user.verboseLogging;
+  if (user.phases && typeof user.phases === "object") {
+    const phases = user.phases as Record<string, Record<string, unknown>>;
+    if (phases.light) {
+      if (typeof phases.light.lookbackDays === "number") base.phases.light.lookbackDays = phases.light.lookbackDays;
+      if (typeof phases.light.limit === "number") base.phases.light.limit = phases.light.limit;
+    }
+    if (phases.deep) {
+      if (typeof phases.deep.limit === "number") base.phases.deep.limit = phases.deep.limit;
+      if (typeof phases.deep.minScore === "number") base.phases.deep.minScore = phases.deep.minScore;
+      if (typeof phases.deep.minRecallCount === "number") base.phases.deep.minRecallCount = phases.deep.minRecallCount;
+      if (typeof phases.deep.recencyHalfLifeDays === "number") base.phases.deep.recencyHalfLifeDays = phases.deep.recencyHalfLifeDays;
+    }
+    if (phases.rem) {
+      if (typeof phases.rem.lookbackDays === "number") base.phases.rem.lookbackDays = phases.rem.lookbackDays;
+      if (typeof phases.rem.limit === "number") base.phases.rem.limit = phases.rem.limit;
+      if (typeof phases.rem.minPatternStrength === "number") base.phases.rem.minPatternStrength = phases.rem.minPatternStrength;
+    }
+  }
+  return base;
+}
+
 // ── Report types ──────────────────────────────────────────────────
 
 export interface DreamingReport {
