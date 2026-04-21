@@ -17,10 +17,6 @@ const jiti = jitiFactory(import.meta.url, {
   },
 });
 
-const {
-  buildReflectionStorePayloads,
-  storeReflectionToLanceDB,
-} = await jiti("../src/reflection-store.ts");
 const { MemoryStore } = await jiti("../src/store.ts");
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -321,29 +317,32 @@ describe("Issue #680 — memory-reflection critical fixes", () => {
     it("replaces per-item store loop with bulkStore (1 lock instead of N)", async () => {
       const testDbDir = mkdtempSync(path.join(tmpdir(), "tc7-bulkstore-"));
 
-      const store = new MemoryStore({
-        dbPath: testDbDir,
-        vectorDim: 384,
-        logger: { warn: () => {} },
-      });
+      let store;
+      try {
+        store = new MemoryStore({
+          dbPath: testDbDir,
+          vectorDim: 384,
+          logger: { warn: () => {} },
+        });
 
-      // Lazy init — first call triggers ensureInitialized internally
-      const entries = [
-        { text: "reflection point 1", vector: new Array(384).fill(0.1), importance: 0.85, category: "decision", scope: "global", metadata: "{}" },
-        { text: "reflection point 2", vector: new Array(384).fill(0.2), importance: 0.8, category: "fact", scope: "global", metadata: "{}" },
-        { text: "reflection point 3", vector: new Array(384).fill(0.3), importance: 0.8, category: "fact", scope: "global", metadata: "{}" },
-      ];
+        // Lazy init — first call triggers ensureInitialized internally
+        const entries = [
+          { text: "reflection point 1", vector: new Array(384).fill(0.1), importance: 0.85, category: "decision", scope: "global", metadata: "{}" },
+          { text: "reflection point 2", vector: new Array(384).fill(0.2), importance: 0.8, category: "fact", scope: "global", metadata: "{}" },
+          { text: "reflection point 3", vector: new Array(384).fill(0.3), importance: 0.8, category: "fact", scope: "global", metadata: "{}" },
+        ];
 
-      const stored = await store.bulkStore(entries);
+        const stored = await store.bulkStore(entries);
 
-      assert.strictEqual(stored.length, 3, "all 3 entries stored via bulkStore");
-      assert.strictEqual(
-        new Set(stored.map(e => e.id)).size,
-        3,
-        "each entry gets unique id (no duplicates)"
-      );
-
-      rmSync(testDbDir, { recursive: true, force: true });
+        assert.strictEqual(stored.length, 3, "all 3 entries stored via bulkStore");
+        assert.strictEqual(
+          new Set(stored.map(e => e.id)).size,
+          3,
+          "each entry gets unique id (no duplicates)"
+        );
+      } finally {
+        rmSync(testDbDir, { recursive: true, force: true });
+      }
     });
   });
 
