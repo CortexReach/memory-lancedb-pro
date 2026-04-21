@@ -48,6 +48,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/temporal-awareness.test.mjs", args: ["--test"] },
   // Issue #598 regression tests
   { group: "core-regression", runner: "node", file: "test/store-serialization.test.mjs" },
+  // Issue #680 regression tests
+  { group: "core-regression", runner: "node", file: "test/memory-reflection-issue680-tdd.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/access-tracker-retry.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/embedder-cache.test.mjs" },
   // Issue #629 batch embedding fix
