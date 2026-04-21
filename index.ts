@@ -3619,7 +3619,7 @@ const memoryLanceDBProPlugin = {
             }
 
             const importance = mapped.category === "decision" ? 0.85 : 0.8;
-            const metadata = JSON.stringify(buildReflectionMappedMetadata({
+            const baseMetadata = buildReflectionMappedMetadata({
               mappedItem: mapped,
               eventId: reflectionEventId,
               agentId: sourceAgentId,
@@ -3629,7 +3629,10 @@ const memoryLanceDBProPlugin = {
               usedFallback: reflectionGenerated.usedFallback,
               toolErrorSignals,
               sourceReflectionPath: relPath,
-            }));
+            });
+            // embed heading in metadata JSON so it survives bulkStore round-trip to LanceDB
+            baseMetadata._reflectionHeading = mapped.heading;
+            const metadata = JSON.stringify(baseMetadata);
 
             mappedEntries.push({
               text: mapped.text,
@@ -3638,18 +3641,15 @@ const memoryLanceDBProPlugin = {
               category: mapped.category,
               scope: targetScope,
               metadata,
-              // store heading alongside entry so mdMirror can retrieve it after bulkStore
-              // (bulkStore may filter entries, so we cannot use index-based lookup)
-              _reflectionHeading: mapped.heading,
             });
           }
           if (mappedEntries.length > 0) {
             const storedEntries = await store.bulkStore(mappedEntries);
             if (mdMirror) {
               for (const stored of storedEntries) {
-                // heading was stored in metadata alongside the entry
-                const storedWithHeading = stored as typeof storedEntries[0] & { _reflectionHeading?: string };
-                const heading = storedWithHeading._reflectionHeading ?? "unknown";
+                // retrieve heading from metadata JSON (survives LanceDB round-trip)
+                const storedMeta = stored.metadata ? JSON.parse(stored.metadata) : {};
+                const heading = storedMeta._reflectionHeading ?? "unknown";
                 await mdMirror(
                   { text: stored.text, category: stored.category, scope: stored.scope, timestamp: stored.timestamp },
                   { source: `reflection:${heading}`, agentId: sourceAgentId },
