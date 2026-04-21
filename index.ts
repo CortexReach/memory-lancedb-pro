@@ -3638,15 +3638,21 @@ const memoryLanceDBProPlugin = {
               category: mapped.category,
               scope: targetScope,
               metadata,
+              // store heading alongside entry so mdMirror can retrieve it after bulkStore
+              // (bulkStore may filter entries, so we cannot use index-based lookup)
+              _reflectionHeading: mapped.heading,
             });
           }
           if (mappedEntries.length > 0) {
             const storedEntries = await store.bulkStore(mappedEntries);
             if (mdMirror) {
-              for (let i = 0; i < storedEntries.length; i++) {
+              for (const stored of storedEntries) {
+                // heading was stored in metadata alongside the entry
+                const storedWithHeading = stored as typeof storedEntries[0] & { _reflectionHeading?: string };
+                const heading = storedWithHeading._reflectionHeading ?? "unknown";
                 await mdMirror(
-                  { text: mappedEntries[i].text, category: mappedEntries[i].category, scope: mappedEntries[i].scope, timestamp: storedEntries[i].timestamp },
-                  { source: `reflection:${mappedReflectionMemories[i].heading}`, agentId: sourceAgentId },
+                  { text: stored.text, category: stored.category, scope: stored.scope, timestamp: stored.timestamp },
+                  { source: `reflection:${heading}`, agentId: sourceAgentId },
                 );
               }
             }
