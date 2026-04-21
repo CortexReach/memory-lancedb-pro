@@ -11,6 +11,7 @@ import {
   mkdirSync,
   realpathSync,
   lstatSync,
+  rmSync,
   statSync,
   unlinkSync,
 } from "node:fs";
@@ -212,10 +213,35 @@ export class MemoryStore {
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
-    if (!existsSync(lockPath)) {
-      try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
-      try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
+    const staleThresholdMs = 5 * 60 * 1000;
+
+    // Ensure parent directory exists for lock artifact
+    if (!existsSync(this.config.dbPath)) {
+      try { mkdirSync(this.config.dbPath, { recursive: true }); } catch {}
     }
+
+    // Helper: proactively cleanup stale lock artifacts
+    // Cleans up both FILE artifacts (old v3) and DIRECTORY artifacts (v4)
+    const cleanupStaleArtifact = () => {
+      if (!existsSync(lockPath)) return;
+      try {
+        const stat = statSync(lockPath);
+        const ageMs = Date.now() - stat.mtimeMs;
+        if (ageMs > staleThresholdMs) {
+          if (stat.isDirectory()) {
+            try { rmSync(lockPath, { recursive: true, force: true }); } catch {}
+            console.warn(`[memory-lancedb-pro] cleared stale lock dir: ${lockPath} ageMs=${ageMs}`);
+          } else {
+            try { unlinkSync(lockPath); } catch {}
+            console.warn(`[memory-lancedb-pro] cleared stale lock file: ${lockPath} ageMs=${ageMs}`);
+          }
+        }
+      } catch {}
+    };
+
+    // Proactive cleanup before first lock attempt
+    cleanupStaleArtifact();
+
     // 【修復 #415】調整 retries：max wait 從 ~3100ms → ~151秒
     // 指數退避：1s, 2s, 4s, 8s, 16s, 30s×5，總計約 151 秒
     // ECOMPROMISED 透過 onCompromised callback 觸發（非 throw），使用 flag 機制正確處理
@@ -224,38 +250,67 @@ export class MemoryStore {
     let fnSucceeded = false;
     let fnError: unknown = null;
 
-    // Proactive cleanup of stale lock artifacts（from PR #626）
-    // 根本避免 >5 分鐘的 lock artifact 導致 ECOMPROMISED
-    if (existsSync(lockPath)) {
-      try {
-        const stat = statSync(lockPath);
-        const ageMs = Date.now() - stat.mtimeMs;
-        const staleThresholdMs = 5 * 60 * 1000;
-        if (ageMs > staleThresholdMs) {
-          try { unlinkSync(lockPath); } catch {}
-          console.warn(`[memory-lancedb-pro] cleared stale lock: ${lockPath} ageMs=${ageMs}`);
-        }
-      } catch {}
-    }
+    const doLock = async () =>
+      lockfile.lock(lockPath, {
+        realpath: false, // Skip realpath() to avoid ENOENT after stale lock cleanup
+        retries: {
+          retries: 10,
+          factor: 2,
+          minTimeout: 1000, // James 保守設定：避免高負載下過度密集重試
+          maxTimeout: 30000, // James 保守設定：支撐更久的 event loop 阻塞
+        },
+        stale: 10000, // 10 秒後視為 stale，觸發 ECOMPROMISED callback
+                       // 注意：ECOMPROMISED 是 ambiguous degradation 訊號，mtime 無法區分
+                       // "holder 崩潰" vs "holder event loop 阻塞"，所以不嘗試區分
+        onCompromised: (err: unknown) => {
+          // 【修復 #415 關鍵】必須是同步 callback
+          // setLockAsCompromised() 不等待 Promise，async throw 無法傳回 caller
+          isCompromised = true;
+          compromisedErr = err;
+        },
+      });
 
-    const release = await lockfile.lock(lockPath, {
-      realpath: false, // Skip realpath() to avoid ENOENT after stale lock cleanup
-      retries: {
-        retries: 10,
-        factor: 2,
-        minTimeout: 1000, // James 保守設定：避免高負載下過度密集重試
-        maxTimeout: 30000, // James 保守設定：支撐更久的 event loop 阻塞
-      },
-      stale: 10000, // 10 秒後視為 stale，觸發 ECOMPROMISED callback
-                     // 注意：ECOMPROMISED 是 ambiguous degradation 訊號，mtime 無法區分
-                     // "holder 崩潰" vs "holder event loop 阻塞"，所以不嘗試區分
-      onCompromised: (err: unknown) => {
-        // 【修復 #415 關鍵】必須是同步 callback
-        // setLockAsCompromised() 不等待 Promise，async throw 無法傳回 caller
-        isCompromised = true;
-        compromisedErr = err;
-      },
-    });
+    let release: (() => Promise<void>) | undefined;
+    try {
+      release = await doLock();
+    } catch (err: unknown) {
+      // C1: TOCTOU race - artifact created between cleanup and lock()
+      // Clean up any artifact and retry once
+      if ((err as NodeJS.ErrnoException).code === "ELOCKED") {
+        console.warn(`[memory-lancedb-pro] ELOCKED on first attempt, cleaning up and retrying: ${lockPath}`);
+        // Force cleanup of ANY artifact at lockPath (not just stale ones)
+        if (existsSync(lockPath)) {
+          try {
+            const stat = statSync(lockPath);
+            // statSync 成功：知道 artifact 類型，執行對應的刪除
+            try {
+              if (stat.isDirectory()) {
+                rmSync(lockPath, { recursive: true, force: true });
+              } else {
+                unlinkSync(lockPath);
+              }
+              console.warn(`[memory-lancedb-pro] cleaned up artifact for retry: ${lockPath}`);
+            } catch (cleanupErr: unknown) {
+              // rmSync/unlinkSync 失敗時不應盲目重試，否則幾乎必然再次 ELOCKED
+              const errMsg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+              const errCode = (cleanupErr as NodeJS.ErrnoException).code || "UNKNOWN";
+              console.error(`[memory-lancedb-pro] ELOCKED cleanup failed (${errCode}, will not retry): ${lockPath}`);
+              const wrapped = new Error(`ELOCKED cleanup failed (${errCode}): ${errMsg}`, { cause: cleanupErr });
+              (wrapped as NodeJS.ErrnoException).code = errCode;
+              throw wrapped;
+            }
+          } catch (statErr: unknown) {
+            // TOCTOU: artifact 在 existsSync 和 statSync 之间消失了（典型 race）
+            // 不是 cleanup 失敗，視為「已清理」，直接重試
+            const statCode = (statErr as NodeJS.ErrnoException).code;
+            console.warn(`[memory-lancedb-pro] ELOCKED cleanup: statSync ${statCode} (artifact already gone), proceeding to lock: ${lockPath}`);
+          }
+        }
+        release = await doLock();
+      } else {
+        throw err;
+      }
+    }
 
     try {
       const result = await fn();
@@ -296,7 +351,6 @@ export class MemoryStore {
       }
     }
   }
-
   get dbPath(): string {
     return this.config.dbPath;
   }
