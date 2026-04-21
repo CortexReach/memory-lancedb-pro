@@ -3002,22 +3002,8 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: regex fallback found ${toCapture.length} capturable text(s) for agent ${agentId}`,
           );
 
-          // FIX #675: Collect all entries, call bulkStore once (1 lock instead of N)
-          const capturedEntries: Array<{
-            text: string;
-            vector: number[];
-            importance: number;
-            category: string;
-            scope: string;
-            metadata: string;
-          }> = [];
-          const capturedMirrors: Array<{
-            text: string;
-            category: string;
-            scope: string;
-            timestamp: number;
-          }> = [];
-
+          // Store each capturable piece (limit to 2 per conversation)
+          let stored = 0;
           for (const text of toCapture.slice(0, 2)) {
             if (isUserMdExclusiveMemory({ text }, config.workspaceBoundary)) {
               api.logger.info(
@@ -3046,13 +3032,7 @@ const memoryLanceDBProPlugin = {
               continue;
             }
 
-            capturedMirrors.push({
-              text,
-              category,
-              scope: defaultScope,
-              timestamp: Date.now(),
-            });
-            capturedEntries.push({
+            await store.store({
               text,
               vector,
               importance: 0.7,
@@ -3084,29 +3064,20 @@ const memoryLanceDBProPlugin = {
                 ),
               ),
             });
+            stored++;
+
+            // Dual-write to Markdown mirror if enabled
+            if (mdMirror) {
+              await mdMirror(
+                { text, category, scope: defaultScope, timestamp: Date.now() },
+                { source: "auto-capture", agentId },
+              );
+            }
           }
 
-          // FIX #675: Single bulkStore call = 1 lock acquisition for N entries
-          if (capturedEntries.length > 0) {
-            await store.bulkStore(capturedEntries);
-
-            // Dual-write to Markdown mirror if enabled (after successful bulkStore)
-            if (mdMirror) {
-              for (const mirror of capturedMirrors) {
-                await mdMirror(
-                  {
-                    text: mirror.text,
-                    category: mirror.category,
-                    scope: mirror.scope,
-                    timestamp: mirror.timestamp,
-                  },
-                  { source: "auto-capture", agentId },
-                );
-              }
-            }
-
+          if (stored > 0) {
             api.logger.info(
-              `memory-lancedb-pro: auto-captured ${capturedEntries.length} memories for agent ${agentId} in scope ${defaultScope}`,
+              `memory-lancedb-pro: auto-captured ${stored} memories for agent ${agentId} in scope ${defaultScope}`,
             );
           }
         } catch (err) {
