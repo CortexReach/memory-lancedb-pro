@@ -1,545 +1,418 @@
 /**
- * Test: handleSupersede existing-found bulkStore bypass (Issue #676)
- * 
- * Bug: When handleSupersede finds an existing record (existing found path),
- *      it calls store.store() directly instead of pushing to createEntries[]
- *      for batch commit. This breaks the batch flow introduced in PR #669.
- * 
- * Current (broken) code in src/smart-extractor.ts ~line 1178:
- * ```typescript
- * const existing = await this.store.getById(matchId, scopeFilter);
- * if (!existing) {
- *   createEntries?.push(this.buildStoreEntry(...)); // ✅ correctly batched
- *   return;
- * }
- * // ❌ Falls through: calls store.store() directly — breaks batch!
- * await this.store.store({ text: candidate.abstract, vector, ... });
- * ```
- * 
- * Fix: Push to createEntries instead of direct store.store().
- * 
- * These tests SHOULD FAIL on current code (because existing-found path calls store.store()).
- * These tests WOULD PASS after the fix is applied.
+ * Test: handleSupersede batch mode invalidation (Issue #676 + invalidateEntries fix)
+ *
+ * Tests the REAL SmartExtractor.handleSupersede() method via jiti import.
+ *
+ * The fix adds invalidateEntries[] mechanism:
+ * - extractAndPersist creates invalidateEntries[]
+ * - handleSupersede batch path pushes old-entry invalidation to invalidateEntries[]
+ * - After bulkStore(): iterate invalidateEntries and call store.update() for each
+ *
+ * Key invariants tested:
+ * 1. When existing record found in batch mode: NO direct store.store() call
+ * 2. New entry goes into createEntries[] for bulkStore
+ * 3. Old entry gets invalidated via store.update() AFTER bulkStore
+ * 4. superseded_by is intentionally OMITTED in batch mode (new ID unknown)
  */
 
-import { describe, it } from 'node:test';
-import assert from 'node:assert';
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import jitiFactory from "jiti";
 
-// Mock Store that tracks all calls
-class MockStore {
-  constructor() {
-    this.calls = [];
-    this.lockCalls = [];
-    this.mockDb = new Map(); // Simulate existing records
-  }
-  
-  clearCalls() {
-    this.calls = [];
-    this.lockCalls = [];
-  }
-  
-  // Simulate file lock behavior - counts each lock acquisition
-  async runWithFileLock(fn) {
-    const lockCall = { acquired: true, released: false, timestamp: Date.now() };
-    this.lockCalls.push(lockCall);
-    
-    await new Promise(r => setTimeout(r, 1));
-    
-    try {
-      return await fn();
-    } finally {
-      lockCall.released = true;
-    }
-  }
-  
-  // Individual store() - CURRENT BEHAVIOR (BUG: called directly in existing-found path)
-  async store(entry) {
-    this.calls.push({ method: 'store', args: [entry], timestamp: Date.now() });
-    await this.runWithFileLock(async () => {
-      await new Promise(r => setTimeout(r, 5));
-    });
-    return { ...entry, id: 'mock-id-' + Math.random() };
-  }
-  
-  // bulkStore() - SOLUTION (batched writes with single lock)
-  async bulkStore(entries) {
-    this.calls.push({ method: 'bulkStore', args: [entries], timestamp: Date.now() });
-    return this.runWithFileLock(async () => {
-      await new Promise(r => setTimeout(r, 10));
-      return entries.map(e => ({ ...e, id: 'mock-id-' + Math.random() }));
-    });
-  }
-  
-  async update(id, updates, scopeFilter) {
-    this.calls.push({ method: 'update', args: [id, updates], timestamp: Date.now() });
-    await this.runWithFileLock(async () => {
-      await new Promise(r => setTimeout(r, 5));
-    });
-  }
-  
-  // Simulate getById - returns existing record if in mockDb, null otherwise
-  async getById(id, scopeFilter) {
-    const record = this.mockDb.get(id);
-    this.calls.push({ method: 'getById', args: [id], found: !!record, timestamp: Date.now() });
-    return record || null;
-  }
-  
-  // Helper to set up mock existing record
-  setExistingRecord(id, record) {
-    this.mockDb.set(id, record);
-  }
-  
-  async vectorSearch() { return []; }
+const jiti = jitiFactory(import.meta.url, { interopDefault: true });
+const { SmartExtractor } = jiti("../src/smart-extractor.ts");
+
+// ---------------------------------------------------------------------------
+// Mock Store — tracks all operations for verification
+// ---------------------------------------------------------------------------
+
+function makeStore(existingRecords = []) {
+  const calls = { store: [], bulkStore: [], update: [], getById: [], vectorSearch: [] };
+  const db = new Map(existingRecords.map(r => [r.id, r]));
+
+  const store = {
+    async vectorSearch(_vector, _limit, _minScore, _scopeFilter, _opts) {
+      calls.vectorSearch.push({ ts: Date.now() });
+      // Return the first existing record as a match (for supersede trigger)
+      if (db.size > 0) {
+        const first = existingRecords[0];
+        return [{
+          entry: { ...first, vector: _vector },
+          score: 0.95,
+        }];
+      }
+      return [];
+    },
+
+    async getById(id, _scopeFilter) {
+      calls.getById.push({ id, ts: Date.now() });
+      return db.get(id) ?? null;
+    },
+
+    async store(entry) {
+      calls.store.push({ entry, ts: Date.now() });
+      return { ...entry, id: "store-" + Math.random().toString(36).slice(2) };
+    },
+
+    async bulkStore(entries) {
+      calls.bulkStore.push({ entries, ts: Date.now() });
+      return entries.map(e => ({ ...e, id: "bulk-" + Math.random().toString(36).slice(2) }));
+    },
+
+    async update(id, patch, _scopeFilter) {
+      calls.update.push({ id, patch, ts: Date.now() });
+    },
+
+    get calls() { return calls; },
+
+    getStoreCallCount() { return calls.store.length; },
+    getBulkStoreCallCount() { return calls.bulkStore.length; },
+    getUpdateCallCount() { return calls.update.length; },
+  };
+
+  return store;
 }
 
-// Simulate the CURRENT (BUGGY) handleSupersede behavior
-// This replicates the bug: when existing is found, it calls store.store() directly
-async function handleSupersedeCurrentBuggy(store, candidate, vector, matchId, sessionKey, targetScope, scopeFilter, createEntries) {
-  const existing = await store.getById(matchId, scopeFilter);
-  
-  if (!existing) {
-    // ✅ Correctly batched - pushes to createEntries
-    createEntries?.push({
-      text: candidate.abstract,
-      vector,
-      category: candidate.category,
-      scope: targetScope,
-      importance: 0.7,
-    });
-    return;
-  }
-  
-  // ❌ BUG: Falls through and calls store.store() directly - breaks batch!
-  await store.store({
-    text: candidate.abstract,
-    vector,
-    category: candidate.category,
-    scope: targetScope,
-    importance: 0.7,
-    metadata: JSON.stringify({ superseded: true, oldId: matchId }),
+// ---------------------------------------------------------------------------
+// Mock Embedder
+// ---------------------------------------------------------------------------
+
+function makeEmbedder() {
+  return {
+    async embed(text) {
+      // Return deterministic vector based on text for stable dedup
+      return Array(256).fill(0).map((_, i) =>
+        text.length > 0 ? (text.charCodeAt(i % text.length) / 255) : 0
+      );
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Mock LLM
+// ---------------------------------------------------------------------------
+
+function makeLlmForSupersede(existingRecordId) {
+  return {
+    async completeJson(prompt, mode) {
+      if (mode === "extract-candidates") {
+        // Return one preferences candidate (temporal-versioned category for supersede)
+        return {
+          memories: [{
+            category: "preferences",
+            abstract: "Updated preference about coffee",
+            overview: "## Preference\n- Changed to prefer oat milk",
+            content: "User now prefers oat milk in coffee instead of regular milk.",
+          }],
+        };
+      }
+      if (mode === "dedup-decision") {
+        // Trigger supersede: LLM says this new preference supersedes the old one
+        // match_index is 1-based, pointing to the first similar entry from vectorSearch
+        return {
+          decision: "supersede",
+          reason: "The new preference about oat milk supersedes the old dairy preference",
+          match_index: 1,
+        };
+      }
+      return null;
+    },
+  };
+}
+
+function makeLlmForCreate() {
+  return {
+    async completeJson(_prompt, mode) {
+      if (mode === "extract-candidates") {
+        return {
+          memories: [{
+            category: "preferences",
+            abstract: "New preference about tea",
+            overview: "## Preference\n- Likes green tea",
+            content: "User likes green tea.",
+          }],
+        };
+      }
+      if (mode === "dedup-decision") {
+        return { decision: "create", reason: "no similar memory" };
+      }
+      return null;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// SmartExtractor factory
+// ---------------------------------------------------------------------------
+
+function makeExtractor(store, embedder, llm) {
+  return new SmartExtractor(store, embedder, llm, {
+    user: "User",
+    extractMinMessages: 1,
+    extractMaxChars: 8000,
+    defaultScope: "global",
+    log() {},
+    debugLog() {},
   });
 }
 
-// Simulate the FIXED handleSupersede behavior
-// This shows what the fix should do: push to createEntries instead of direct store.store()
-async function handleSupersedeFixed(store, candidate, vector, matchId, sessionKey, targetScope, scopeFilter, createEntries) {
-  const existing = await store.getById(matchId, scopeFilter);
-  
-  if (!existing) {
-    // ✅ Correctly batched when createEntries is provided
-    if (createEntries) {
-      createEntries.push({
-        text: candidate.abstract,
-        vector,
-        category: candidate.category,
-        scope: targetScope,
-        importance: 0.7,
-      });
-    } else {
-      // Fallback to store.store() when createEntries is undefined (backward compat)
-      await store.store({
-        text: candidate.abstract,
-        vector,
-        category: candidate.category,
-        scope: targetScope,
-        importance: 0.7,
-      });
-    }
-    return;
-  }
-  
-  // ✅ FIX: Push to createEntries instead of direct store.store()
-  createEntries?.push({
-    text: candidate.abstract,
-    vector,
-    category: candidate.category,
-    scope: targetScope,
-    importance: 0.7,
-    metadata: JSON.stringify({ superseded: true, oldId: matchId }),
-  });
-}
+// ===========================================================================
+// TESTS
+// ===========================================================================
 
-// ============================================================
-// TEST 1: handleSupersede with existing-found pushes to createEntries
-// ============================================================
-describe('Issue #676: handleSupersede existing-found bypass', () => {
-  
-  /**
-   * BUG REPRODUCTION TEST:
-   * When existing record is found, current code calls store.store() directly.
-   * 
-   * EXPECTED (after fix): Push to createEntries[] instead of store.store().
-   * 
-   * THIS TEST SHOULD FAIL on current code because current code calls store.store() directly.
-   */
-  it('CURRENT CODE: existing-found path calls store.store() directly (BUG)', async () => {
-    const store = new MockStore();
-    const candidate = { abstract: 'Updated fact', category: 'fact', content: '', overview: '' };
-    const vector = [0.5];
-    const matchId = 'existing-record-id';
-    
-    // Set up existing record (so getById returns it)
-    store.setExistingRecord(matchId, {
-      id: matchId,
-      text: 'Old fact',
-      metadata: JSON.stringify({ fact_key: 'old-fact' }),
-    });
-    
-    const createEntries = [];
-    store.clearCalls();
-    
-    await handleSupersedeCurrentBuggy(store, candidate, vector, matchId, 'session:123', 'global', ['global'], createEntries);
-    
-    const storeCallCount = store.calls.filter(c => c.method === 'store').length;
-    const bulkStoreCallCount = store.calls.filter(c => c.method === 'bulkStore').length;
-    
-    console.log(`\n📊 CURRENT (Buggy) Behavior - existing found:`);
-    console.log(`   store.store() calls: ${storeCallCount}`);
-    console.log(`   bulkStore() calls: ${bulkStoreCallCount}`);
-    console.log(`   createEntries pushed: ${createEntries.length}`);
-    
-    // Current buggy behavior: calls store.store() directly, doesn't push to createEntries
-    assert.strictEqual(storeCallCount, 1, 'BUG: Current code calls store.store() directly (breaks batch)');
-    assert.strictEqual(bulkStoreCallCount, 0, 'BUG: Current code never calls bulkStore');
-    assert.strictEqual(createEntries.length, 0, 'BUG: Current code does not push to createEntries');
-  });
-  
-  /**
-   * FIX VERIFICATION TEST:
-   * When existing record is found, fixed code should push to createEntries[].
-   * 
-   * THIS TEST SHOULD PASS (shows what correct behavior should be).
-   */
-  it('FIXED CODE: existing-found path should push to createEntries', async () => {
-    const store = new MockStore();
-    const candidate = { abstract: 'Updated fact', category: 'fact', content: '', overview: '' };
-    const vector = [0.5];
-    const matchId = 'existing-record-id';
-    
-    // Set up existing record
-    store.setExistingRecord(matchId, {
-      id: matchId,
-      text: 'Old fact',
-      metadata: JSON.stringify({ fact_key: 'old-fact' }),
-    });
-    
-    const createEntries = [];
-    store.clearCalls();
-    
-    await handleSupersedeFixed(store, candidate, vector, matchId, 'session:123', 'global', ['global'], createEntries);
-    
-    const storeCallCount = store.calls.filter(c => c.method === 'store').length;
-    const bulkStoreCallCount = store.calls.filter(c => c.method === 'bulkStore').length;
-    
-    console.log(`\n📊 FIXED Behavior - existing found:`);
-    console.log(`   store.store() calls: ${storeCallCount}`);
-    console.log(`   bulkStore() calls: ${bulkStoreCallCount}`);
-    console.log(`   createEntries pushed: ${createEntries.length}`);
-    
-    // Fixed behavior: pushes to createEntries, doesn't call store.store()
-    assert.strictEqual(storeCallCount, 0, 'Fixed code should not call store.store()');
-    assert.strictEqual(createEntries.length, 1, 'Fixed code should push to createEntries');
-  });
-  
-  /**
-   * FAILING TEST (Bug #676):
-   * This test asserts the CORRECT behavior (push to createEntries when existing found).
-   * It SHOULD FAIL on current code because current code calls store.store() directly.
-   * 
-   * After the fix is applied, this test SHOULD PASS.
-   */
-  it('BUG #676 TEST: existing-found should push to createEntries, not store.store() (CURRENTLY FAILS)', async () => {
-    const store = new MockStore();
-    const candidate = { abstract: 'Superseding fact', category: 'fact', content: '', overview: '' };
-    const vector = [0.5];
-    const matchId = 'existing-record-id';
-    
-    // Set up existing record
-    store.setExistingRecord(matchId, {
-      id: matchId,
-      text: 'Old fact',
-      metadata: JSON.stringify({ fact_key: 'old-fact' }),
-    });
-    
-    const createEntries = [];
-    store.clearCalls();
-    
-    // Current buggy behavior
-    await handleSupersedeCurrentBuggy(store, candidate, vector, matchId, 'session:123', 'global', ['global'], createEntries);
-    
-    const storeCallCount = store.calls.filter(c => c.method === 'store').length;
-    
-    // This assertion FAILS on current code because current code calls store.store(), not createEntries.push()
-    assert.strictEqual(storeCallCount, 0, 'BUG #676: existing-found should NOT call store.store() (should push to createEntries instead)');
-  });
-});
+describe("Issue #676: handleSupersede batch mode with real SmartExtractor", () => {
 
-// ============================================================
-// TEST 2: handleSupersede with existing-NOT-found pushes to createEntries
-// ============================================================
-describe('Issue #676: handleSupersede existing-NOT-found', () => {
-  
   /**
-   * When existing record is NOT found, the code correctly pushes to createEntries.
-   * This is the existing correct behavior - this test should PASS.
+   * TC-1: SUPERSEDE decision in batch mode
+   *
+   * Flow: extractAndPersist → processCandidate → deduplicate → handleSupersede
+   *
+   * Expected:
+   * - 0 × store.store() [no individual writes]
+   * - 1 × bulkStore() [all new entries in one batch]
+   * - 1 × store.update() [old entry invalidated after bulkStore]
    */
-  it('existing-NOT-found path correctly pushes to createEntries', async () => {
-    const store = new MockStore();
-    const candidate = { abstract: 'New fact', category: 'fact', content: '', overview: '' };
-    const vector = [0.5];
-    const matchId = 'non-existent-record-id';
-    
-    // Do NOT set up existing record (getById returns null)
-    
-    const createEntries = [];
-    store.clearCalls();
-    
-    await handleSupersedeFixed(store, candidate, vector, matchId, 'session:123', 'global', ['global'], createEntries);
-    
-    const storeCallCount = store.calls.filter(c => c.method === 'store').length;
-    const getByIdCount = store.calls.filter(c => c.method === 'getById').length;
-    
-    console.log(`\n📊 Behavior - existing NOT found:`);
-    console.log(`   getById calls: ${getByIdCount}`);
-    console.log(`   store.store() calls: ${storeCallCount}`);
-    console.log(`   createEntries pushed: ${createEntries.length}`);
-    
-    // Correct behavior: pushes to createEntries when existing NOT found
-    assert.strictEqual(storeCallCount, 0, 'Should not call store.store()');
-    assert.strictEqual(createEntries.length, 1, 'Should push to createEntries');
-  });
-});
-
-// ============================================================
-// TEST 3: createEntries undefined falls back to store.store()
-// ============================================================
-describe('Issue #676: createEntries undefined fallback', () => {
-  
-  /**
-   * When createEntries is not passed (undefined), handleSupersede should
-   * fall back to calling store.store() for backward compatibility.
-   * This ensures the function works standalone without batch context.
-   */
-  it('should fall back to store.store() when createEntries is undefined', async () => {
-    const store = new MockStore();
-    const candidate = { abstract: 'New fact', category: 'fact', content: '', overview: '' };
-    const vector = [0.5];
-    const matchId = 'non-existent-record-id';
-    
-    store.clearCalls();
-    
-    // Call without createEntries (or pass undefined)
-    // Current buggy behavior when existing NOT found still works
-    await handleSupersedeFixed(store, candidate, vector, matchId, 'session:123', 'global', ['global'], undefined);
-    
-    const storeCallCount = store.calls.filter(c => c.method === 'store').length;
-    
-    // When createEntries is undefined, it's ok to call store.store()
-    // (the optional chaining `createEntries?.push()` returns undefined and continues)
-    console.log(`\n📊 Fallback behavior when createEntries undefined:`);
-    console.log(`   store.store() calls: ${storeCallCount}`);
-    
-    // This behavior is acceptable for backward compatibility
-    assert.strictEqual(storeCallCount, 1, 'Should fall back to store.store() when createEntries is undefined');
-  });
-});
-
-// ============================================================
-// TEST 4: SUPERSEDE decision creates new entry AND marks old as superseded
-// ============================================================
-describe('Issue #676: SUPERSEDE semantic behavior', () => {
-  
-  /**
-   * Verify the SUPERSEDE decision semantic:
-   * - New record is created
-   * - Old record is marked as superseded
-   * 
-   * Note: This test validates the semantic behavior, not the batch vs individual store issue.
-   */
-  it('should create new entry and mark old as superseded', async () => {
-    const store = new MockStore();
-    const oldRecordId = 'old-record-id';
-    
-    // Set up existing record
-    store.setExistingRecord(oldRecordId, {
-      id: oldRecordId,
-      text: 'Old fact',
-      metadata: JSON.stringify({ fact_key: 'old-fact', state: 'confirmed' }),
-    });
-    
-    const candidate = { abstract: 'New superseding fact', category: 'fact', content: '', overview: '' };
-    const newVector = [0.5];
-    
-    store.clearCalls();
-    
-    // Fixed behavior: push to createEntries for batch
-    const createEntries = [];
-    await handleSupersedeFixed(store, candidate, newVector, oldRecordId, 'session:123', 'global', ['global'], createEntries);
-    
-    // Verify new entry is pushed to createEntries
-    assert.strictEqual(createEntries.length, 1, 'Should push new entry to createEntries');
-    assert.strictEqual(createEntries[0].text, 'New superseding fact', 'Should have correct text');
-    
-    // Verify store.store was NOT called (would break batch)
-    const storeCallCount = store.calls.filter(c => c.method === 'store').length;
-    assert.strictEqual(storeCallCount, 0, 'Should NOT call store.store() (breaks batch)');
-    
-    console.log(`\n📊 SUPERSEDE semantic:`);
-    console.log(`   New entry pushed to createEntries: ${createEntries.length}`);
-    console.log(`   Old record ID referenced in metadata: ${createEntries[0]?.metadata ? 'yes' : 'no'}`);
-  });
-});
-
-// ============================================================
-// TEST 5: buildStoreEntry is used for supersede new entries
-// ============================================================
-describe('Issue #676: buildStoreEntry for supersede', () => {
-  
-  /**
-   * Verify that buildStoreEntry produces a correct MemoryEntry for the superseding record.
-   * The buildStoreEntry function should construct the proper entry structure.
-   */
-  it('buildStoreEntry should produce correct MemoryEntry structure', async () => {
-    // This tests the structure that should be pushed to createEntries
-    const candidate = {
-      abstract: 'Superseding abstract',
-      overview: 'Superseding overview',
-      content: 'Superseding content',
-      category: 'fact',
-    };
-    const vector = [0.5];
-    const sessionKey = 'session:123';
-    const targetScope = 'global';
-    
-    // Simulate what buildStoreEntry would produce
-    const storeEntry = {
-      text: candidate.abstract,
-      vector,
-      category: 'fact', // mapped category
-      scope: targetScope,
-      importance: 0.7,
+  it("SUPERSEDE: no direct store.store(), uses bulkStore + update", async () => {
+    const existingRecord = {
+      id: "existing-pref-001",
+      text: "Old preference: dairy milk in coffee",
+      category: "preference",
+      scope: "global",
+      importance: 0.8,
       metadata: JSON.stringify({
-        l0_abstract: candidate.abstract,
-        l1_overview: candidate.overview,
-        l2_content: candidate.content,
-        memory_category: candidate.category,
-        tier: 'working',
-        access_count: 0,
-        confidence: 0.7,
-        source_session: sessionKey,
-        source: 'auto-capture',
-        state: 'confirmed',
-        memory_layer: 'working',
-        injected_count: 0,
-        bad_recall_count: 0,
-        suppressed_until_turn: 0,
-        superseded_old_id: 'old-record-id', // Mark which record this supersedes
+        fact_key: "pref-coffee-milk",
+        memory_category: "preferences",
+        state: "confirmed",
+        invalidated_at: null,
       }),
     };
-    
-    // Verify structure
-    assert.strictEqual(storeEntry.text, 'Superseding abstract', 'Should have correct text');
-    assert.strictEqual(storeEntry.vector, vector, 'Should have correct vector');
-    assert.strictEqual(storeEntry.scope, 'global', 'Should have correct scope');
-    assert.ok(storeEntry.metadata.includes('superseded_old_id'), 'Should include superseded reference');
-    
-    console.log(`\n📊 buildStoreEntry output:`);
-    console.log(`   Text: ${storeEntry.text}`);
-    console.log(`   Scope: ${storeEntry.scope}`);
-    console.log(`   Has superseded ref: ${storeEntry.metadata.includes('superseded_old_id')}`);
-  });
-});
 
-// ============================================================
-// TEST 6: Integration - full batch flow with SUPERSEDE
-// ============================================================
-describe('Issue #676: Full Batch Flow Integration', () => {
-  
-  /**
-   * Simulate a complete batch flow where:
-   * - Some decisions push to createEntries (CREATE, SUPERSEDE with existing NOT found)
-   * - Some decisions should also push to createEntries but currently DON'T (SUPERSEDE with existing found - BUG)
-   * - Final bulkStore() call at end
-   */
-  it('BUG #676: current code breaks batch with direct store.store() call in existing-found path', async () => {
-    const store = new MockStore();
-    const createEntries = [];
-    
-    // Scenario: 3 SUPERSEDE decisions
-    // - #1: existing found (BUG: current code calls store.store() directly)
-    // - #2: existing NOT found (correctly pushes to createEntries)
-    // - #3: existing found (BUG: current code calls store.store() directly)
-    
-    const candidate1 = { abstract: 'Fact 1 updated', category: 'fact', content: '', overview: '' };
-    const candidate2 = { abstract: 'Fact 2 new', category: 'fact', content: '', overview: '' };
-    const candidate3 = { abstract: 'Fact 3 updated', category: 'fact', content: '', overview: '' };
-    
-    // Set up existing records for #1 and #3
-    store.setExistingRecord('id-1', { id: 'id-1', text: 'Old 1', metadata: '{}' });
-    store.setExistingRecord('id-3', { id: 'id-3', text: 'Old 3', metadata: '{}' });
-    
-    store.clearCalls();
-    
-    // Current buggy behavior for all 3
-    await handleSupersedeCurrentBuggy(store, candidate1, [0.1], 'id-1', 'session:1', 'global', ['global'], createEntries);
-    await handleSupersedeCurrentBuggy(store, candidate2, [0.2], 'id-2', 'session:2', 'global', ['global'], createEntries); // id-2 doesn't exist
-    await handleSupersedeCurrentBuggy(store, candidate3, [0.3], 'id-3', 'session:3', 'global', ['global'], createEntries);
-    
-    const storeCallCount = store.calls.filter(c => c.method === 'store').length;
-    const bulkStoreCallCount = store.calls.filter(c => c.method === 'bulkStore').length;
-    
-    console.log(`\n📊 Batch Flow - Current (Buggy):`);
-    console.log(`   Decisions: 3`);
-    console.log(`   store.store() calls: ${storeCallCount} (BUG: should be 0)`);
-    console.log(`   bulkStore() calls: ${bulkStoreCallCount} (would be 1 after fix)`);
-    console.log(`   createEntries pushed: ${createEntries.length} (BUG: should be 3)`);
-    
-    // Current buggy behavior: 2 store.store() calls (for #1 and #3), 0 to createEntries
-    assert.strictEqual(storeCallCount, 2, 'BUG: Current code makes 2 direct store.store() calls');
-    assert.strictEqual(createEntries.length, 1, 'BUG: Current code only pushes 1 to createEntries');
+    const store = makeStore([existingRecord]);
+    const embedder = makeEmbedder();
+    const llm = makeLlmForSupersede(existingRecord.id);
+    const extractor = makeExtractor(store, embedder, llm);
+
+    await extractor.extractAndPersist(
+      "User now prefers oat milk in coffee instead of regular milk.",
+      "session:test-1",
+    );
+
+    const storeCount = store.getStoreCallCount();
+    const bulkCount = store.getBulkStoreCallCount();
+    const updateCount = store.getUpdateCallCount();
+
+    console.log(`\n📊 SUPERSEDE batch mode:`);
+    console.log(`   store.store() calls: ${storeCount} (expected: 0)`);
+    console.log(`   bulkStore() calls: ${bulkCount} (expected: 1)`);
+    console.log(`   store.update() calls: ${updateCount} (expected: 1)`);
+    console.log(`   vectorSearch calls: ${store.calls.vectorSearch.length}`);
+
+    assert.strictEqual(storeCount, 0,
+      "SUPERSEDE in batch mode must NOT call store.store() individually");
+    assert.strictEqual(bulkCount, 1,
+      "SUPERSEDE in batch mode must call bulkStore() once for all entries");
+    assert.strictEqual(updateCount, 1,
+      "SUPERSEDE in batch mode must call store.update() for old entry invalidation");
   });
-  
+
   /**
-   * With the fix, all SUPERSEDE decisions push to createEntries.
+   * TC-2: CREATE decision in batch mode (no existing record)
+   *
+   * Expected:
+   * - 0 × store.store()
+   * - 1 × bulkStore()
+   * - 0 × store.update() [no old entry to invalidate]
    */
-  it('FIXED: all SUPERSEDE decisions push to createEntries for batch', async () => {
-    const store = new MockStore();
-    const createEntries = [];
-    
-    const candidate1 = { abstract: 'Fact 1 updated', category: 'fact', content: '', overview: '' };
-    const candidate2 = { abstract: 'Fact 2 new', category: 'fact', content: '', overview: '' };
-    const candidate3 = { abstract: 'Fact 3 updated', category: 'fact', content: '', overview: '' };
-    
-    store.setExistingRecord('id-1', { id: 'id-1', text: 'Old 1', metadata: '{}' });
-    store.setExistingRecord('id-3', { id: 'id-3', text: 'Old 3', metadata: '{}' });
-    
-    store.clearCalls();
-    
-    // Fixed behavior for all 3
-    await handleSupersedeFixed(store, candidate1, [0.1], 'id-1', 'session:1', 'global', ['global'], createEntries);
-    await handleSupersedeFixed(store, candidate2, [0.2], 'id-2', 'session:2', 'global', ['global'], createEntries);
-    await handleSupersedeFixed(store, candidate3, [0.3], 'id-3', 'session:3', 'global', ['global'], createEntries);
-    
-    const storeCallCount = store.calls.filter(c => c.method === 'store').length;
-    const bulkStoreCallCount = store.calls.filter(c => c.method === 'bulkStore').length;
-    
-    console.log(`\n📊 Batch Flow - Fixed:`);
-    console.log(`   Decisions: 3`);
-    console.log(`   store.store() calls: ${storeCallCount}`);
-    console.log(`   bulkStore() calls: ${bulkStoreCallCount}`);
-    console.log(`   createEntries pushed: ${createEntries.length}`);
-    
-    // Fixed behavior: all 3 push to createEntries, 0 direct store.store() calls
-    assert.strictEqual(storeCallCount, 0, 'Fixed code should not call store.store()');
-    assert.strictEqual(createEntries.length, 3, 'Fixed code should push all 3 to createEntries');
-    
-    // Then bulkStore all entries at once
-    if (createEntries.length > 0) {
-      await store.bulkStore(createEntries);
-    }
-    
-    const finalBulkCount = store.calls.filter(c => c.method === 'bulkStore').length;
-    assert.strictEqual(finalBulkCount, 1, 'Should call bulkStore() once with all entries');
-    assert.strictEqual(store.lockCalls.length, 1, 'Should use only 1 lock for all 3 entries');
+  it("CREATE: uses bulkStore, no update needed", async () => {
+    const store = makeStore([]); // no existing records
+    const embedder = makeEmbedder();
+    const llm = makeLlmForCreate();
+    const extractor = makeExtractor(store, embedder, llm);
+
+    await extractor.extractAndPersist(
+      "User likes green tea.",
+      "session:test-2",
+    );
+
+    const storeCount = store.getStoreCallCount();
+    const bulkCount = store.getBulkStoreCallCount();
+    const updateCount = store.getUpdateCallCount();
+
+    console.log(`\n📊 CREATE batch mode:`);
+    console.log(`   store.store() calls: ${storeCount} (expected: 0)`);
+    console.log(`   bulkStore() calls: ${bulkCount} (expected: 1)`);
+    console.log(`   store.update() calls: ${updateCount} (expected: 0)`);
+
+    assert.strictEqual(storeCount, 0,
+      "CREATE in batch mode must NOT call store.store() individually");
+    assert.strictEqual(bulkCount, 1,
+      "CREATE in batch mode must call bulkStore() once");
+    assert.strictEqual(updateCount, 0,
+      "CREATE has no old entry to invalidate");
+  });
+
+  /**
+   * TC-3: Verify bulkStore receives all entries at once
+   *
+   * Multiple CREATE decisions should all be batched into one bulkStore call.
+   */
+  it("bulkStore receives all entries in single call", async () => {
+    const store = makeStore([]);
+    const embedder = makeEmbedder();
+    const llm = {
+      async completeJson(_prompt, mode) {
+        if (mode === "extract-candidates") {
+          return {
+            memories: [
+              {
+                category: "preferences",
+                abstract: "Prefers coffee",
+                overview: "## Pref\n- Coffee",
+                content: "User likes coffee.",
+              },
+              {
+                category: "entities",
+                abstract: "Uses VS Code",
+                overview: "## Entity\n- VS Code",
+                content: "User uses VS Code as editor.",
+              },
+            ],
+          };
+        }
+        if (mode === "dedup-decision") {
+          return { decision: "create", reason: "no match" };
+        }
+        return null;
+      },
+    };
+    const extractor = makeExtractor(store, embedder, llm);
+
+    await extractor.extractAndPersist(
+      "User likes coffee and uses VS Code.",
+      "session:test-3",
+    );
+
+    const bulkCount = store.getBulkStoreCallCount();
+    const firstBulk = store.calls.bulkStore[0];
+    const entryCount = firstBulk?.entries?.length ?? 0;
+
+    console.log(`\n📊 Multiple CREATE batch:`);
+    console.log(`   bulkStore() calls: ${bulkCount} (expected: 1)`);
+    console.log(`   Entries per bulkStore: ${entryCount} (expected: 2)`);
+
+    assert.strictEqual(bulkCount, 1,
+      "Multiple CREATE decisions must be batched into 1 bulkStore call");
+    assert.strictEqual(entryCount, 2,
+      "bulkStore must receive all 2 entries in one call");
+  });
+
+  /**
+   * TC-4: Verify invalidated entry metadata has invalidated_at set
+   *
+   * After store.update() is called, the old entry should have invalidated_at set.
+   * superseded_by is intentionally OMITTED in batch mode (new ID unknown).
+   */
+  it("store.update() receives metadata with invalidated_at", async () => {
+    const existingRecord = {
+      id: "existing-pref-002",
+      text: "Old dairy preference",
+      category: "preference",
+      scope: "global",
+      importance: 0.8,
+      metadata: JSON.stringify({
+        fact_key: "pref-dairy",
+        memory_category: "preferences",
+        state: "confirmed",
+        invalidated_at: null,
+      }),
+    };
+
+    const store = makeStore([existingRecord]);
+    const embedder = makeEmbedder();
+    const llm = makeLlmForSupersede(existingRecord.id);
+    const extractor = makeExtractor(store, embedder, llm);
+
+    await extractor.extractAndPersist(
+      "User now prefers oat milk over dairy.",
+      "session:test-4",
+    );
+
+    const updateCall = store.calls.update[0];
+    assert.ok(updateCall, "store.update() must be called for old entry");
+    assert.strictEqual(updateCall.id, "existing-pref-002",
+      "store.update() must be called with correct old entry ID");
+
+    const updatedMeta = JSON.parse(updateCall.patch.metadata);
+    assert.ok(updatedMeta.invalidated_at > 0,
+      "invalidated_at must be set on old entry");
+
+    // superseded_by is null in batch mode (new ID unknown until bulkStore)
+    // This is intentional - new entry's 'supersedes: matchId' provides dedup signal
+    assert.strictEqual(updatedMeta.superseded_by, undefined,
+      "superseded_by is undefined in batch mode (field omitted from patch — JSON drops undefined keys)");
+
+    console.log(`\n📊 Invalidation metadata:`);
+    console.log(`   invalidated_at: ${updatedMeta.invalidated_at}`);
+    console.log(`   superseded_by: ${updatedMeta.superseded_by}`);
+    console.log(`   fact_key preserved: ${updatedMeta.fact_key}`);
+  });
+
+  /**
+   * TC-5: Non-temporal category (e.g., "cases") should NOT trigger supersede
+   *
+   * Categories not in TEMPORAL_VERSIONED_CATEGORIES fall through to CREATE.
+   */
+  it("Non-temporal category falls through to CREATE, not SUPERSEDE", async () => {
+    const existingRecord = {
+      id: "existing-case-001",
+      text: "Case solved: bug in auth module",
+      category: "fact",
+      scope: "global",
+      importance: 0.8,
+      metadata: JSON.stringify({ fact_key: "case-auth", state: "confirmed" }),
+    };
+
+    const store = makeStore([existingRecord]);
+    const embedder = makeEmbedder();
+    const llm = {
+      async completeJson(_prompt, mode) {
+        if (mode === "extract-candidates") {
+          return {
+            memories: [{
+              category: "cases",
+              abstract: "New case: bug in auth module fixed",
+              overview: "## Case\n- Fixed auth bug",
+              content: "The auth module bug has been fixed.",
+            }],
+          };
+        }
+        if (mode === "dedup-decision") {
+          return { decision: "supersede", reason: "similar", match_index: 1 };
+        }
+        return null;
+      },
+    };
+    const extractor = makeExtractor(store, embedder, llm);
+
+    await extractor.extractAndPersist(
+      "Fixed the auth module bug.",
+      "session:test-5",
+    );
+
+    const storeCount = store.getStoreCallCount();
+    const bulkCount = store.getBulkStoreCallCount();
+    const updateCount = store.getUpdateCallCount();
+
+    console.log(`\n📊 Non-temporal category (cases):`);
+    console.log(`   store.store() calls: ${storeCount}`);
+    console.log(`   bulkStore() calls: ${bulkCount}`);
+    console.log(`   store.update() calls: ${updateCount}`);
+
+    // "cases" is NOT in TEMPORAL_VERSIONED_CATEGORIES, so supersede path is skipped
+    // Even though LLM returns "supersede", the category check blocks it
+    assert.strictEqual(bulkCount, 1,
+      "Non-temporal category must fall through to CREATE via bulkStore");
+    assert.strictEqual(updateCount, 0,
+      "Non-temporal category should NOT call store.update()");
   });
 });
