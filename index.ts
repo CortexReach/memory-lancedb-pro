@@ -3598,17 +3598,22 @@ const memoryLanceDBProPlugin = {
           });
 
           const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
+          const mappedEntries: Array<{ text: string; vector: number[]; importance: number; category: string; scope: string; metadata: string }> = [];
           for (const mapped of mappedReflectionMemories) {
             const vector = await embedder.embedPassage(mapped.text);
             let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
+            let searchFailed = false;
             try {
               existing = await store.vectorSearch(vector, 1, 0.1, [targetScope]);
             } catch (err) {
               api.logger.warn(
-                `memory-reflection: mapped memory duplicate pre-check failed, continue store: ${String(err)}`,
+                `memory-reflection: mapped memory duplicate pre-check failed, skip store: ${String(err)}`,
               );
+              searchFailed = true;
             }
-
+            if (searchFailed) {
+              continue;
+            }
             if (existing.length > 0 && existing[0].score > 0.95) {
               continue;
             }
@@ -3626,7 +3631,7 @@ const memoryLanceDBProPlugin = {
               sourceReflectionPath: relPath,
             }));
 
-            const storedEntry = await store.store({
+            mappedEntries.push({
               text: mapped.text,
               vector,
               importance,
@@ -3634,12 +3639,16 @@ const memoryLanceDBProPlugin = {
               scope: targetScope,
               metadata,
             });
-
+          }
+          if (mappedEntries.length > 0) {
+            const storedEntries = await store.bulkStore(mappedEntries);
             if (mdMirror) {
-              await mdMirror(
-                { text: mapped.text, category: mapped.category, scope: targetScope, timestamp: storedEntry.timestamp },
-                { source: `reflection:${mapped.heading}`, agentId: sourceAgentId },
-              );
+              for (let i = 0; i < storedEntries.length; i++) {
+                await mdMirror(
+                  { text: mappedEntries[i].text, category: mappedEntries[i].category, scope: mappedEntries[i].scope, timestamp: storedEntries[i].timestamp },
+                  { source: `reflection:${mappedReflectionMemories[i].heading}`, agentId: sourceAgentId },
+                );
+              }
             }
           }
 
@@ -3686,9 +3695,7 @@ const memoryLanceDBProPlugin = {
           if (sessionKey) {
             reflectionErrorStateBySession.delete(sessionKey);
             getGlobalReflectionLock().delete(sessionKey);
-            if (reflectionRan) {
-              getSerialGuardMap().set(sessionKey, Date.now());
-            }
+            getSerialGuardMap().set(sessionKey, Date.now());
           }
           pruneReflectionSessionState();
         }
