@@ -3597,9 +3597,14 @@ const memoryLanceDBProPlugin = {
             command: String(event.action || "unknown"),
           });
 
+          const MAX_MAPPED_ENTRIES = 100;
           const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
           const mappedEntries: Array<{ text: string; vector: number[]; importance: number; category: string; scope: string; metadata: string }> = [];
           for (const mapped of mappedReflectionMemories) {
+            if (mappedEntries.length >= MAX_MAPPED_ENTRIES) {
+              api.logger.warn(`memory-reflection: mapped entries cap (${MAX_MAPPED_ENTRIES}) reached, skipping remaining items`);
+              break;
+            }
             const vector = await embedder.embedPassage(mapped.text);
             let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
             let searchFailed = false;
@@ -3647,9 +3652,15 @@ const memoryLanceDBProPlugin = {
             const storedEntries = await store.bulkStore(mappedEntries);
             if (mdMirror) {
               for (const stored of storedEntries) {
-                // retrieve heading from metadata JSON (survives LanceDB round-trip)
-                const storedMeta = stored.metadata ? JSON.parse(stored.metadata) : {};
-                const heading = storedMeta._reflectionHeading ?? "unknown";
+                // retrieve heading from metadata JSON — critical when bulkStore filters entries
+                // because storedEntries[i] may not correspond to mappedEntries[i]
+                let heading = "unknown";
+                try {
+                  const storedMeta = stored.metadata ? JSON.parse(stored.metadata) : {};
+                  heading = storedMeta._reflectionHeading ?? "unknown";
+                } catch {
+                  api.logger.warn(`memory-reflection: failed to parse stored metadata for entry ${stored.id}, using "unknown"`);
+                }
                 await mdMirror(
                   { text: stored.text, category: stored.category, scope: stored.scope, timestamp: stored.timestamp },
                   { source: `reflection:${heading}`, agentId: sourceAgentId },
@@ -3702,6 +3713,9 @@ const memoryLanceDBProPlugin = {
             reflectionErrorStateBySession.delete(sessionKey);
             getGlobalReflectionLock().delete(sessionKey);
             getSerialGuardMap().set(sessionKey, Date.now());
+            // NOTE: This guard is tested via inline simulation in
+            // test/memory-reflection-issue680-tdd.test.mjs "Bug #1: serial guard on early throw".
+            // The test verifies this runs unconditionally in finally (not gated by reflectionRan).
           }
           pruneReflectionSessionState();
         }
