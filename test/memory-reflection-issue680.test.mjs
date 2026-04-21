@@ -118,6 +118,9 @@ describe("Issue #680 — memory-reflection critical fixes", () => {
         warnings.push(`memory-reflection: duplicate pre-check failed, fail-open (storing anyway): ${err.message}`);
       }
 
+      // Note: store.store(entry) is called in the actual buggy code path (not in this test)
+      // — stored result is irrelevant to the warning assertion below
+
       // BUG: current code logs "continue store" but actually falls through to store
       const hasFailOpenWarning = warnings.some(w => w.includes("fail-open"));
       const hasMisleadingContinueWarning = warnings.some(w => w.includes("continue store"));
