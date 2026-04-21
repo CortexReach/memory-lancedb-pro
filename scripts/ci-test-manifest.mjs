@@ -43,6 +43,8 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/cross-process-lock.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/lock-stress-test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/lock-release-on-error.test.mjs", args: ["--test"] },
+  // Issue #670 / PR #674: ELOCKED cleanup + TOCTOU race recovery
+  { group: "core-regression", runner: "node", file: "test/lock-recovery.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/preference-slots.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/is-latest-auto-supersede.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/temporal-awareness.test.mjs", args: ["--test"] },
