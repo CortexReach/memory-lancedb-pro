@@ -420,6 +420,7 @@ export class SmartExtractor {
     }
 
     const createEntries: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[] = [];
+    const invalidateEntries: Array<{ id: string; metadata: string }> = [];
 
     for (const { index, candidate } of processableCandidates) {
       try {
@@ -432,6 +433,7 @@ export class SmartExtractor {
           scopeFilter,
           precomputedVectors.get(index),
           createEntries,
+          invalidateEntries,
         );
       } catch (err) {
         this.log(
@@ -442,6 +444,13 @@ export class SmartExtractor {
 
     if (createEntries.length > 0) {
       await this.store.bulkStore(createEntries);
+    }
+
+    // Invalidate old entries that were superseded (must happen after bulkStore).
+    if (invalidateEntries.length > 0) {
+      for (const inv of invalidateEntries) {
+        await this.store.update(inv.id, { metadata: inv.metadata }, scopeFilter);
+      }
     }
 
     return stats;
@@ -663,6 +672,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     precomputedVector?: number[],
     createEntries?: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[],
+    invalidateEntries?: Array<{ id: string; metadata: string }>,
   ): Promise<void> {
     // Profile always merges (skip dedup — admission control still applies)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -674,6 +684,7 @@ export class SmartExtractor {
         scopeFilter,
         undefined,
         createEntries,
+        invalidateEntries,
       );
       if (profileResult === "rejected") {
         stats.rejected = (stats.rejected ?? 0) + 1;
@@ -773,6 +784,7 @@ export class SmartExtractor {
             scopeFilter,
             admission?.audit,
             createEntries,
+            invalidateEntries,
           );
           stats.created++;
           stats.superseded = (stats.superseded ?? 0) + 1;
@@ -817,6 +829,7 @@ export class SmartExtractor {
               scopeFilter,
               admission?.audit,
               createEntries,
+              invalidateEntries,
             );
             stats.created++;
             stats.superseded = (stats.superseded ?? 0) + 1;
@@ -980,6 +993,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
+    invalidateEntries?: Array<{ id: string; metadata: string }>,
   ): Promise<"merged" | "created" | "rejected"> {
     // Find existing profile memory by category
     const embeddingText = `${candidate.abstract} ${candidate.content}`;
@@ -1162,6 +1176,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
+    invalidateEntries?: Array<{ id: string; metadata: string }>,
   ): Promise<void> {
     const existing = await this.store.getById(matchId, scopeFilter);
     if (!existing) {
@@ -1221,8 +1236,28 @@ export class SmartExtractor {
         ),
       });
 
+      // Invalidate the old entry.  Must happen AFTER bulkStore completes.
+      //
+      // NOTE: superseded_by cannot be set here because we don't know the new entry's ID yet
+      // (LanceDB auto-generates it during bulkStore).  We set invalidated_at to mark the entry
+      // as inactive.  The new entry already has 'supersedes: matchId' (set at creation time),
+      // which is the authoritative link for dedup.  The old entry's superseded_by field is
+      // never read by the retriever — safe to leave as null.  We do NOT add a superseded_by
+      // relation with targetId=null (which would be malformed).
+      const oldMeta = parseSmartMetadata(existing.metadata, existing);
+      const invalidatedMeta = buildSmartMetadata(existing, {
+        fact_key: factKey,
+        invalidated_at: now,
+        // superseded_by: intentionally omitted — new entry ID unknown in batch mode;
+        // new entry's 'supersedes: matchId' provides the authoritative dedup signal
+      });
+      invalidateEntries?.push({
+        id: matchId,
+        metadata: stringifySmartMetadata(invalidatedMeta),
+      });
+
       this.log(
-        `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} (queued for batch)`,
+        `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} (queued for batch + invalidate queued)`,
       );
       return;
     }
