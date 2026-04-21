@@ -351,6 +351,15 @@ describe("Issue #676: handleSupersede batch mode with real SmartExtractor", () =
     assert.strictEqual(updatedMeta.superseded_by, undefined,
       "superseded_by is undefined in batch mode (field omitted from patch — JSON drops undefined keys)");
 
+    // Also verify: new entry's 'supersedes' field is set to existingRecord.id
+    // (This is the authoritative dedup signal — superseded_by on old entry is omitted
+    // because new ID is unknown until bulkStore completes)
+    const newEntry = store.calls.bulkStore[0].entries[0];
+    assert.ok(newEntry, "bulkStore must receive 1 new entry");
+    const newMeta = JSON.parse(newEntry.metadata);
+    assert.strictEqual(newMeta.supersedes, existingRecord.id,
+      "new entry must have supersedes pointing to old entry ID (authoritative dedup signal)");
+
     console.log(`\n📊 Invalidation metadata:`);
     console.log(`   invalidated_at: ${updatedMeta.invalidated_at}`);
     console.log(`   superseded_by: ${updatedMeta.superseded_by}`);
@@ -414,5 +423,11 @@ describe("Issue #676: handleSupersede batch mode with real SmartExtractor", () =
       "Non-temporal category must fall through to CREATE via bulkStore");
     assert.strictEqual(updateCount, 0,
       "Non-temporal category should NOT call store.update()");
+    // Verify category is preserved in the new entry (not accidentally remapped)
+    const newEntry = store.calls.bulkStore[0].entries[0];
+    assert.ok(newEntry, "bulkStore must receive 1 new entry for non-temporal category");
+    // The category may be normalized by mapToStoreCategory, but it should be a valid category
+    assert.ok(['fact', 'preference', 'decision', 'entity', 'other'].includes(newEntry.category),
+      "new entry must have a valid category");
   });
 });
