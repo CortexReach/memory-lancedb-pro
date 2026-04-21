@@ -239,6 +239,7 @@ export class MemoryStore {
     }
 
     const release = await lockfile.lock(lockPath, {
+      realpath: false, // Skip realpath() to avoid ENOENT after stale lock cleanup
       retries: {
         retries: 10,
         factor: 2,
