@@ -447,9 +447,27 @@ export class SmartExtractor {
     }
 
     // Invalidate old entries that were superseded (must happen after bulkStore).
+    // NOTE: Each update() call acquires its own lock. InvalidateEntries.length updates =
+    // InvalidateEntries.length lock acquisitions. This is unavoidable: LanceDB does not support
+    // atomic "bulk update with where clause". The batch mode benefit comes from bulkStore
+    // for new entries (1 lock for N writes), not from the invalidation updates.
+    // If any update fails, we log and continue — bulkStore is already committed.
     if (invalidateEntries.length > 0) {
+      const updateErrors = [];
       for (const inv of invalidateEntries) {
-        await this.store.update(inv.id, { metadata: inv.metadata }, scopeFilter);
+        try {
+          await this.store.update(inv.id, { metadata: inv.metadata }, scopeFilter);
+        } catch (err) {
+          api.logger.warn(
+            `memory-pro: smart-extractor: failed to invalidate superseded entry ${inv.id}: ${String(err)}`,
+          );
+          updateErrors.push({ id: inv.id, err });
+        }
+      }
+      if (updateErrors.length > 0) {
+        api.logger.error(
+          `memory-pro: smart-extractor: ${updateErrors.length}/${invalidateEntries.length} invalidation failures after bulkStore succeeded. Inconsistent supersede state for entries: ${updateErrors.map((e) => e.id).join(', ')}`,
+        );
       }
     }
 
