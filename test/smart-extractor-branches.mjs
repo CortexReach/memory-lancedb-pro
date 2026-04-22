@@ -1668,4 +1668,33 @@ assert.ok(
 
 
 
+
+// ============================================================
+// Unit Test: buildAutoCaptureConversationKeyFromIngress
+// Issue 2: DM with undefined conversationId uses channelId as key
+// ============================================================
+const fn = plugin.buildAutoCaptureConversationKeyFromIngress;
+
+// Test 1: DM with undefined conversationId -> returns channelId
+const dmResult = fn("discord:dm:user123", undefined);
+assert.equal(dmResult, "discord:dm:user123",
+  `DM undefined conversationId: expected "discord:dm:user123", got "${dmResult}"`);
+
+// Test 2: DM with defined conversationId -> returns channelId:conversationId
+const dmWithConv = fn("discord:dm:user123", "channel:1");
+assert.equal(dmWithConv, "discord:dm:user123:channel:1",
+  `DM with conversationId: expected "discord:dm:user123:channel:1", got "${dmWithConv}"`);
+
+// Test 3: Group with conversationId -> returns channelId:conversationId
+const groupResult = fn("discord", "channel:999");
+assert.equal(groupResult, "discord:channel:999",
+  `Group: expected "discord:channel:999", got "${groupResult}"`);
+
+// Test 4: Empty channel -> returns null
+const emptyChannel = fn(undefined, "conv:1");
+assert.equal(emptyChannel, null,
+  `Empty channel: expected null, got "${emptyChannel}"`);
+
+console.log("OK: buildAutoCaptureConversationKeyFromIngress unit tests passed");
+
 console.log("OK: smart extractor branch regression test passed");

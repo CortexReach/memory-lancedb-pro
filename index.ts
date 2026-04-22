@@ -804,7 +804,7 @@ function isExplicitRememberCommand(text: string): boolean {
   return AUTO_CAPTURE_EXPLICIT_REMEMBER_RE.test(text.trim());
 }
 
-function buildAutoCaptureConversationKeyFromIngress(
+export function buildAutoCaptureConversationKeyFromIngress(
   channelId: string | undefined,
   conversationId: string | undefined,
 ): string | null {
@@ -2855,10 +2855,12 @@ const memoryLanceDBProPlugin = {
 
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
           let texts = newTexts;
-          // [Fix #5 REMOVED] isExplicitRememberCommand guard: unreachable under REPLACE strategy.
-          // With REPLACE, texts = pendingIngressTexts (length typically > 1 in multi-turn),
-          // so texts.length === 1 guard can never trigger.
-          // This guard was designed for the old APPEND strategy and is obsolete.
+          // [Fix #5] Explicit remember command: if the last pending text is an explicit remember,
+          // enrich with one piece of prior context so bare "remember this" turns get history.
+          const lastPending = pendingIngressTexts.length > 0 ? pendingIngressTexts[pendingIngressTexts.length - 1] : undefined;
+          if (lastPending !== undefined && isExplicitRememberCommand(lastPending) && priorRecentTexts.length > 0) {
+            texts = [lastPending, ...priorRecentTexts.slice(-1)];
+          }
           if (newTexts.length > 0) {
             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-AUTO_CAPTURE_PENDING_WINDOW);
             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
