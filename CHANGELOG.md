@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-### Fix: cumulative turn counting for auto-capture smart extraction (#417, PR #518)
+### Fix: cumulative turn counting for auto-capture smart extraction (#417, PR #549)
 
 **Bug**: With `extractMinMessages: 2` + `smartExtraction: true`, single-turn DM conversations always fell through to regex fallback, writing dirty data (`l0_abstract == text`, no LLM distillation).
 

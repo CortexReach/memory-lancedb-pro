@@ -2865,7 +2865,6 @@ const memoryLanceDBProPlugin = {
             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
-          // [Fix #6] Cap extractMinMessages to prevent misconfiguration
           const minMessages = config.extractMinMessages ?? 4;
           if (skippedAutoCaptureTexts > 0) {
             api.logger.debug(
