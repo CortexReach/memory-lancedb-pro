@@ -230,11 +230,11 @@ export class MemoryStore {
         if (ageMs > staleThresholdMs) {
           if (stat.isDirectory()) {
             try { rmSync(lockPath, { recursive: true, force: true }); } catch {}
-            console.warn(`[memory-lancedb-pro] cleared stale lock dir: ${lockPath} ageMs=${ageMs}`);
           } else {
             try { unlinkSync(lockPath); } catch {}
-            console.warn(`[memory-lancedb-pro] cleared stale lock file: ${lockPath} ageMs=${ageMs}`);
           }
+          // FIX_W3: 只在 ELOCKED / cleanup failure / TOCTOU 時打 console.warn（error 層級）。
+          // proactive cleanup 成功不打，日誌系統不需要這些噪音。
         }
       } catch {}
     };
