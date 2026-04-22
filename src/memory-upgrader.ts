@@ -176,25 +176,24 @@ function simpleEnrich(
 //
 // REFACTORING NOTE (Issue #632):
 // ---------------------------
-// The old implementation had each entry call store.update() individually, causing:
-//   - N lock acquisitions for N entries = high contention
-//   - Plugin waits seconds while LLM runs between lock acquisitions
-//
+// The old implementation held lock during LLM call (seconds), blocking plugin.
 // The new two-phase approach separates:
-//   - Phase 1: LLM enrichment (no lock, runs quickly)
-//   - Phase 2: DB writes (single lock per batch)
+//   - Phase 1: LLM enrichment (no lock, runs concurrently)
+//   - Phase 2: DB writes (lock held only for DB write, ~milliseconds)
+//
+// Lock count per batch is unchanged (N locks for N entries).
+// The improvement is LOCK HOLD TIME, not lock count.
 //
 // OLD FLOW (removed):
 //   for (const entry of batch) {
-//     await this.upgradeEntry(entry); // LLM + store.update() inside lock
+//     await this.upgradeEntry(entry); // lock held during LLM (seconds, blocks plugin)
 //   }
 //
 // NEW FLOW:
-//   Phase 1: await this.prepareEntry() for all entries (no lock)
-//   Phase 2: await this.writeEnrichedBatch() (single lock for all writes)
+//   Phase 1: await this.prepareEntry() for all entries (no lock, runs quickly)
+//   Phase 2: for each entry: getById() + store.update() (lock ~milliseconds each)
 //
-// The logic inside prepareEntry() is IDENTICAL to what upgradeEntry() did -
-// only the timing/ordering has changed to reduce lock contention.
+// Plugin can acquire lock during Phase 1 (LLM window) and between Phase 2 entries (YIELD_EVERY=5).
 //
 // ============================================================================
 
@@ -368,9 +367,8 @@ export class MemoryUpgrader {
         }
 
         // Step 3: Build enriched metadata using latest entry state
-        const existingMeta = latest.metadata ? (() => {
-          try { return JSON.parse(latest.metadata); } catch { return {}; }
-        })() : {};
+        // Use parseSmartMetadata for robust parsing (has fallback) instead of raw JSON.parse
+        const existingMeta = parseSmartMetadata(latest.metadata, latest);
 
         const newMetadata: EnrichedMetadata = {
           ...buildSmartMetadata(

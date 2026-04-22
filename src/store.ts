@@ -1088,7 +1088,7 @@ export class MemoryStore {
       // If the add fails after delete, attempt best-effort recovery without
       // overwriting a newer concurrent successful update.
       const rollbackCandidate =
-        (await this.getById(original.id).catch(() => null)) ?? original;
+        (await this.getById(original.id, scopeFilter).catch(() => null)) ?? original;
       const resolvedId = escapeSqlLiteral(row.id as string);
       await this.table!.delete(`id = '${resolvedId}'`);
       try {
