@@ -458,14 +458,14 @@ export class SmartExtractor {
         try {
           await this.store.update(inv.id, { metadata: inv.metadata }, scopeFilter);
         } catch (err) {
-          api.logger.warn(
+          this.log(
             `memory-pro: smart-extractor: failed to invalidate superseded entry ${inv.id}: ${String(err)}`,
           );
           updateErrors.push({ id: inv.id, err });
         }
       }
       if (updateErrors.length > 0) {
-        api.logger.error(
+        this.log(
           `memory-pro: smart-extractor: ${updateErrors.length}/${invalidateEntries.length} invalidation failures after bulkStore succeeded. Inconsistent supersede state for entries: ${updateErrors.map((e) => e.id).join(', ')}`,
         );
       }
