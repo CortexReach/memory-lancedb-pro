@@ -358,7 +358,7 @@ function isChatIdBasedAgentId(agentId: string): boolean {
  * numeric chat_id, or not present in the openclaw.json declared agents list.
  * Pass `declaredAgents` (from config.declaredAgents) for authoritative validation.
  */
-function isInvalidAgentIdFormat(
+export function isInvalidAgentIdFormat(
   agentId: string | undefined,
   declaredAgents?: Set<string>,
 ): boolean {
@@ -1940,12 +1940,15 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   };
 }
 
-function isAgentOrSessionExcluded(
+export function isAgentOrSessionExcluded(
   agentId: string,
   sessionKey: string | undefined,
   patterns: string[],
 ): boolean {
   if (!Array.isArray(patterns) || patterns.length === 0) return false;
+
+  // Guard: agentId must be a non-empty string
+  if (typeof agentId !== "string" || !agentId.trim()) return false;
 
   const cleanAgentId = agentId.trim();
   const isInternal = typeof sessionKey === "string" &&
@@ -4443,7 +4446,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   };
 }
 
-export { getDefaultMdMirrorDir };
+export { getDefaultMdMirrorDir, isAgentOrSessionExcluded, isInvalidAgentIdFormat };
 
 /**
  * Resets the registration state — primarily intended for use in tests that need
