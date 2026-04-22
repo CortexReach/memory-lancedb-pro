@@ -3504,6 +3504,13 @@ const memoryLanceDBProPlugin = {
           const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
           let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
           const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
+          // Guard: skip if agentId is invalid format (consistent with other hook sites)
+          if (isInvalidAgentIdFormat(sourceAgentId, config.declaredAgents)) {
+            api.logger.debug?.(
+              `memory-reflection: command hook skipped \u2014 invalid agentId '${sourceAgentId}'`,
+            );
+            return;
+          }
           // Exclude agents/sessions listed in memoryReflection.excludeAgents (supports wildcards)
           const excludePatterns = config.memoryReflection?.excludeAgents;
           if (excludePatterns && isAgentOrSessionExcluded(sourceAgentId, sessionKey, excludePatterns)) {
