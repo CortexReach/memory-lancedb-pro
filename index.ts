@@ -3001,6 +3001,7 @@ const memoryLanceDBProPlugin = {
               api.logger.debug(
                 `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (cumulative=${currentCumulativeCount} < minMessages=${minMessages})`,
               );
+              return; // [Fix] Do NOT fall through to regex fallback when smartExtraction is enabled and below threshold
             }
           }
 
