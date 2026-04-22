@@ -69,6 +69,8 @@ const EXPECTED_BASELINE = [
   { group: "core-regression", runner: "node", file: "test/regex-fallback-bulk-store.test.mjs", args: ["--test"] },
   // Issue #670/#675: lock stale threshold regression
   { group: "core-regression", runner: "node", file: "test/lock-stale-threshold.test.mjs", args: ["--test"] },
+  // Issue #676: handleSupersede invalidation error handler regression (RF-1)
+  { group: "core-regression", runner: "node", file: "test/invalidate-error-regression.test.mjs", args: ["--test"] },
 ];
 
 function fail(message) {
