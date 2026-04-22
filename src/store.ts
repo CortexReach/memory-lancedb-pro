@@ -552,6 +552,16 @@ export class MemoryStore {
 
     // Phase 2: single lock + updateQueue serialization for the entire batch
     // M1 fix: wrap with runSerializedUpdate so bulk ops don't interleave with plugin updates
+    //
+    // IMPORTANT — runSerializedUpdate nesting rationale:
+    // runWithFileLock provides cross-process serialization (file lock).
+    // runSerializedUpdate provides in-process write-order guarantees so that if a plugin
+    // update arrives while bulkUpdateMetadata is queued in updateQueue, it waits for the
+    // bulk to complete first (preserving ordering).
+    // Without runSerializedUpdate: bulk could be interleaved with plugin updates causing
+    // Plugin's new data to be overwritten by the bulk's stale snapshot.
+    // Lock hold time note: runSerializedUpdate adds negligible overhead since the actual
+    // DB ops (query/delete/add) happen inside the lock and are fast (milliseconds).
     return this.runWithFileLock(() =>
       this.runSerializedUpdate(async () => {
         // Step 1: Batch query all entries (1 LanceDB op)
@@ -626,20 +636,34 @@ export class MemoryStore {
         // Step 5: Batch add (1 LanceDB op)
         // H1 fix: if add fails, attempt per-entry recovery and return actual result
         // instead of throwing. This lets caller distinguish partial vs complete failure.
+        // M1 fix: add diagnostic logging so operators can trace recovery path in prod.
         try {
           await this.table!.add(updatedEntries);
         } catch (addError) {
+          const errMsg = addError instanceof Error ? addError.message : String(addError);
+          console.warn(
+            `[memory-lancedb-pro] bulkUpdateMetadata: batch add failed, attempting per-entry recovery. ` +
+            `entries=${updatedEntries.length}, error=${errMsg}`,
+          );
           const recoveryFailed: string[] = [];
           for (const entry of updatedEntries) {
             try {
               await this.table!.add([entry]);
-            } catch {
+            } catch (recoveryErr) {
+              const recMsg = recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr);
+              console.warn(
+                `[memory-lancedb-pro] bulkUpdateMetadata: recovery failed for id=${entry.id}, error=${recMsg}`,
+              );
               if (!failed.includes(entry.id)) {
                 recoveryFailed.push(entry.id);
               }
             }
           }
           const actuallySucceeded = updatedEntries.length - recoveryFailed.length;
+          console.warn(
+            `[memory-lancedb-pro] bulkUpdateMetadata: recovery complete. ` +
+            `succeeded=${actuallySucceeded}, failed=${recoveryFailed.length}`,
+          );
           return {
             success: actuallySucceeded,
             failed: [...failed, ...recoveryFailed],
