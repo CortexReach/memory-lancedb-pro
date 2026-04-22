@@ -14,9 +14,13 @@
  *
  * Two-Phase Processing (Issue #632 fix):
  *   Phase 1: LLM enrichment (no lock, can run concurrently)
- *   Phase 2: DB writes (single lock per batch)
+ *   Phase 2: DB writes (one lock per entry, LLM no longer holds lock)
  *
- * This reduces lock contention from N locks (one per entry) to 1 lock per batch.
+ * This significantly reduces lock hold time vs old approach:
+ *   - OLD: lock held during LLM call (seconds, blocks plugin)
+ *   - NEW: lock only during DB write (milliseconds)
+ *   - Lock count per batch is unchanged (N locks for N entries)
+ *   - The improvement is LOCK HOLD TIME, not lock count
  */
 
 import type { MemoryStore, MemoryEntry } from "./store.js";
@@ -325,13 +329,20 @@ export class MemoryUpgrader {
   // =========================================================================
 
   /**
-   * Phase 2: Write all enriched entries to DB under a single lock.
+   * Phase 2: Write all enriched entries to DB.
    * 
-   * This method groups all DB writes into ONE lock acquisition,
-   * reducing lock contention from N locks (one per entry) to 1 lock per batch.
+   * Each entry update acquires its own lock via store.update().
+   * The key improvement vs the old approach is that lock hold time is
+   * now milliseconds (DB write only) instead of seconds (LLM call held lock).
    * 
-   * The actual update logic (buildSmartMetadata, stringifySmartMetadata, store.update)
-   * is the SAME as it was in the old upgradeEntry() - only the timing changed.
+   * Lock count per batch: N locks for N entries (unchanged from old approach).
+   * The improvement is in lock hold time, not lock acquisition count.
+   *
+   * [FIX MR2] Each entry is re-read before writing to pick up any Plugin
+   * writes that occurred during the Phase 1 enrichment window.
+   * 
+   * [FIX F5] Every YIELD_EVERY entries, we yield 10ms so that concurrent
+   * plugin writes have a chance to acquire the lock between entries.
    */
   private async writeEnrichedBatch(
     batch: EnrichedEntry[],

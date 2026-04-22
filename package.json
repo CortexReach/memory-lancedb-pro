@@ -43,7 +43,6 @@
     "apache-arrow": "18.1.0",
     "json5": "^2.2.3",
     "openai": "^6.21.0",
-    "ioredis": "^5.4.1",
     "proper-lockfile": "^4.1.2"
   },
   "openclaw": {
