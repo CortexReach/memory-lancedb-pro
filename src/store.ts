@@ -250,10 +250,11 @@ export class MemoryStore {
     let fnSucceeded = false;
     let fnError: unknown = null;
 
-    const doLock = async () =>
+    const doLock = (retryOptions?: { retries: number; factor: number; minTimeout: number; maxTimeout: number }) =>
       lockfile.lock(lockPath, {
-        realpath: false, // Skip realpath() to avoid ENOENT after stale lock cleanup
-        retries: {
+        lockfilePath: lockPath, // FIX_M2: 明確指定 artifact = lockPath（不追加 .lock），讓 cleanup 邏輯和 production 一致
+        realpath: false,
+        retries: retryOptions ?? {
           retries: 10,
           factor: 2,
           minTimeout: 1000, // James 保守設定：避免高負載下過度密集重試
@@ -306,7 +307,15 @@ export class MemoryStore {
             console.warn(`[memory-lancedb-pro] ELOCKED cleanup: statSync ${statCode} (artifact already gone), proceeding to lock: ${lockPath}`);
           }
         }
-        release = await doLock();
+        // FIX_W2: 第二次 retry 用更少次數（2 次），避免漫長等待
+        try {
+          release = await doLock({ retries: 2, factor: 1, minTimeout: 100, maxTimeout: 500 });
+        } catch (retryErr: unknown) {
+          // 第二次 ELOCKED 或其他錯誤：視為永久 lock failure，拋有意義錯誤
+          const errMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          const errCode = (retryErr as NodeJS.ErrnoException).code || "UNKNOWN";
+          throw new Error(`ELOCKED retry failed (${errCode}): ${errMsg}`, { cause: retryErr });
+        }
       } else {
         throw err;
       }
