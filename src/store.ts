@@ -550,100 +550,105 @@ export class MemoryStore {
       return { success: 0, failed: [] };
     }
 
-    // Phase 2: single lock for the entire batch (key improvement for Issue #632)
-    return this.runWithFileLock(async () => {
-      // Step 1: Batch query all entries (1 LanceDB op)
-      const ids = pairs.map((p) => `'${escapeSqlLiteral(p.id)}'`).join(", ");
-      const rows = await this.table!.query()
-        .where(`id IN (${ids})`)
-        .toArray();
+    // Phase 2: single lock + updateQueue serialization for the entire batch
+    // M1 fix: wrap with runSerializedUpdate so bulk ops don't interleave with plugin updates
+    return this.runWithFileLock(() =>
+      this.runSerializedUpdate(async () => {
+        // Step 1: Batch query all entries (1 LanceDB op)
+        const ids = pairs.map((p) => `'${escapeSqlLiteral(p.id)}'`).join(", ");
+        const rows = await this.table!.query()
+          .where(`id IN (${ids})`)
+          .toArray();
 
-      const rowMap = new Map<string, Record<string, unknown>>(rows.map((r) => [r.id as string, r]));
-      const foundIds = new Set<string>(rowMap.keys());
-      const failed: string[] = [];
+        const rowMap = new Map<string, Record<string, unknown>>(rows.map((r) => [r.id as string, r]));
+        const foundIds = new Set<string>(rowMap.keys());
+        const failed: string[] = [];
 
-      // Collect entries to update (those that were found)
-      const toUpdate: Array<{ id: string; metadata: string; row: Record<string, unknown> }> = [];
-      for (const pair of pairs) {
-        if (!foundIds.has(pair.id)) {
-          failed.push(pair.id);
-        } else {
-          toUpdate.push({ ...pair, row: rowMap.get(pair.id)! });
-        }
-      }
-
-      if (toUpdate.length === 0) {
-        return { success: 0, failed };
-      }
-
-      // Step 2: Scope filter check (applied per-entry)
-      if (isExplicitDenyAllScopeFilter(scopeFilter)) {
-        for (const item of toUpdate) {
-          failed.push(item.id);
-        }
-        return { success: 0, failed };
-      }
-
-      const allowedIds: string[] = [];
-      for (const item of toUpdate) {
-        const rowScope = (item.row.scope as string | undefined) ?? "global";
-        if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
-          failed.push(item.id);
-        } else {
-          allowedIds.push(item.id);
-        }
-      }
-
-      const filteredToUpdate = toUpdate.filter((item) => allowedIds.includes(item.id));
-      if (filteredToUpdate.length === 0) {
-        return { success: 0, failed };
-      }
-
-      // Step 3: Build updated entries (preserve all original fields, only update metadata)
-      const updatedEntries: MemoryEntry[] = filteredToUpdate.map((item) => {
-        const row = item.row;
-        const rowScope = (row.scope as string | undefined) ?? "global";
-        return {
-          id: row.id as string,
-          text: row.text as string,
-          vector: Array.from(row.vector as Iterable<number>),
-          category: row.category as MemoryEntry["category"],
-          scope: rowScope,
-          importance: Number(row.importance),
-          timestamp: Number(row.timestamp),
-          metadata: item.metadata,
-        };
-      });
-
-      // Step 4: Batch delete (1 LanceDB op)
-      const deleteIds = filteredToUpdate
-        .map((item) => `'${escapeSqlLiteral(item.id)}'`)
-        .join(", ");
-      await this.table!.delete(`id IN (${deleteIds})`);
-
-      // Step 5: Batch add (1 LanceDB op)
-      try {
-        await this.table!.add(updatedEntries);
-      } catch (addError) {
-        // Recovery: try to restore each entry individually
-        for (const entry of updatedEntries) {
-          try {
-            await this.table!.add([entry]);
-          } catch {
-            // If restore fails, record as failed
-            if (!failed.includes(entry.id)) {
-              failed.push(entry.id);
-            }
+        // Collect entries to update (those that were found)
+        const toUpdate: Array<{ id: string; metadata: string; row: Record<string, unknown> }> = [];
+        for (const pair of pairs) {
+          if (!foundIds.has(pair.id)) {
+            failed.push(pair.id);
+          } else {
+            toUpdate.push({ ...pair, row: rowMap.get(pair.id)! });
           }
         }
-        const errMsg = addError instanceof Error ? addError.message : String(addError);
-        throw new Error(
-          `bulkUpdateMetadata: batch add failed, attempted per-entry recovery. errors: ${errMsg}`,
-        );
-      }
 
-      return { success: updatedEntries.length, failed };
-    });
+        if (toUpdate.length === 0) {
+          return { success: 0, failed };
+        }
+
+        // Step 2: Scope filter check (applied per-entry)
+        if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+          for (const item of toUpdate) {
+            failed.push(item.id);
+          }
+          return { success: 0, failed };
+        }
+
+        const allowedIds: string[] = [];
+        for (const item of toUpdate) {
+          const rowScope = (item.row.scope as string | undefined) ?? "global";
+          if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+            failed.push(item.id);
+          } else {
+            allowedIds.push(item.id);
+          }
+        }
+
+        const filteredToUpdate = toUpdate.filter((item) => allowedIds.includes(item.id));
+        if (filteredToUpdate.length === 0) {
+          return { success: 0, failed };
+        }
+
+        // Step 3: Build updated entries (preserve all original fields, only update metadata)
+        const updatedEntries: MemoryEntry[] = filteredToUpdate.map((item) => {
+          const row = item.row;
+          const rowScope = (row.scope as string | undefined) ?? "global";
+          return {
+            id: row.id as string,
+            text: row.text as string,
+            vector: Array.from(row.vector as Iterable<number>),
+            category: row.category as MemoryEntry["category"],
+            scope: rowScope,
+            importance: Number(row.importance),
+            timestamp: Number(row.timestamp),
+            metadata: item.metadata,
+          };
+        });
+
+        // Step 4: Batch delete (1 LanceDB op)
+        const deleteIds = filteredToUpdate
+          .map((item) => `'${escapeSqlLiteral(item.id)}'`)
+          .join(", ");
+        await this.table!.delete(`id IN (${deleteIds})`);
+
+        // Step 5: Batch add (1 LanceDB op)
+        // H1 fix: if add fails, attempt per-entry recovery and return actual result
+        // instead of throwing. This lets caller distinguish partial vs complete failure.
+        try {
+          await this.table!.add(updatedEntries);
+        } catch (addError) {
+          const recoveryFailed: string[] = [];
+          for (const entry of updatedEntries) {
+            try {
+              await this.table!.add([entry]);
+            } catch {
+              if (!failed.includes(entry.id)) {
+                recoveryFailed.push(entry.id);
+              }
+            }
+          }
+          const actuallySucceeded = updatedEntries.length - recoveryFailed.length;
+          return {
+            success: actuallySucceeded,
+            failed: [...failed, ...recoveryFailed],
+          };
+        }
+
+        return { success: updatedEntries.length, failed };
+      })
+    );
   }
 
   /**
