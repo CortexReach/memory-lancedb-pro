@@ -8,11 +8,12 @@
 import Redis from 'ioredis';
 import path from 'node:path';
 import fs from 'node:fs';
+import { tmpdir as nodeTmpdir } from 'node:os';
 
 // 用 lazy import 避免 ESM 問題
-let properLockfile: any = null;
+let properLockfile: typeof import("proper-lockfile") | null = null;
 
-async function loadProperLockfile(): Promise<any> {
+async function loadProperLockfile(): Promise<typeof import("proper-lockfile")> {
   if (!properLockfile) {
     properLockfile = await import('proper-lockfile');
   }
@@ -79,6 +80,7 @@ export class RedisLockManager {
 
     // 如果 Redis 可用但沒有進一步使用，這裡可以加強確認
 
+    const MAX_ATTEMPTS = 600; // Hard cap: prevents infinite loop if clock drift / setTimeout drift
     let attempts = 0;
     while (true) {
       attempts++;
@@ -89,7 +91,6 @@ export class RedisLockManager {
         
         if (result === 'OK') {
           // 成功取得 lock
-          console.log(`[RedisLock] Acquired lock ${key} after ${attempts} attempts`);
           
           // 回傳帶 token 的 release function
           return async () => {
@@ -103,7 +104,6 @@ export class RedisLockManager {
             `;
             try {
               await this.redis.eval(script, 1, lockKey, token);
-              console.log(`[RedisLock] Released lock ${key}`);
             } catch (err) {
               console.warn(`[RedisLock] Failed to release lock: ${err}`);
             }
@@ -114,9 +114,13 @@ export class RedisLockManager {
         console.warn(`[RedisLock] Redis error during acquire (attempt ${attempts}): ${err}`);
       }
 
-      // 檢查是否超時
-      if (Date.now() - startTime > this.maxWait) {
-        throw new Error(`Lock acquisition timeout: ${key} after ${attempts} attempts`);
+      // 檢查是否超時 或 達到最大嘗試次數（circuit breaker）
+      if (Date.now() - startTime > this.maxWait || attempts >= MAX_ATTEMPTS) {
+        throw new Error(
+          attempts >= MAX_ATTEMPTS
+            ? `Lock acquisition hard-cap reached: ${key} after ${attempts} attempts (maxWait may be too short)`
+            : `Lock acquisition timeout: ${key} after ${attempts} attempts (${Date.now() - startTime}ms)`
+        );
       }
 
       // 指數退避等待
@@ -146,9 +150,8 @@ export class RedisLockManager {
    * 建立 file lock（Redis 不可用時的 fallback）
    */
   private createFileLock(key: string, ttl?: number): () => Promise<void> {
-    // Windows tmp 目錄
-    const tmpDir = process.platform === 'win32' ? 'C:\\tmp' : '/tmp';
-    const lockPath = path.join(tmpDir, `.memory-lock-${key}.lock`);
+    // Uses nodeTmpdir from top-level ESM import (line 9)
+    const lockPath = path.join(nodeTmpdir, `.memory-lock-${key}.lock`);
     const lockTTL = (ttl || this.defaultTTL) / 1000; // proper-lockfile 用秒
 
     // 確保目錄存在
@@ -157,27 +160,31 @@ export class RedisLockManager {
       fs.mkdirSync(dir, { recursive: true });
     }
 
-    // 同步取得 file lock（不支援 retries）
+    // Synchronous lock acquisition — no retries. If this fails, throw immediately.
+    // If we return a no-op release when lockSync fails, the caller proceeds without
+    // any lock, which can cause data corruption under concurrent writes.
+    let lockAcquired = false;
     try {
       const lockfile = require('proper-lockfile');
-      lockfile.lockSync(lockPath, {
-        stale: lockTTL,
-      });
-      console.log(`[RedisLock] ✅ File lock acquired: key=${key}, path=${lockPath}`);
+      lockfile.lockSync(lockPath, { stale: lockTTL });
+      lockAcquired = true;
     } catch (err) {
-      console.warn(`[RedisLock] ❌ Failed to acquire file lock: key=${key}, err=${err}`);
+      // Propagate: do NOT swallow this — caller must know the lock path failed
+      throw new Error(`File lock unavailable for key="${key}" (path=${lockPath}): ${err}`);
     }
 
-    // 回傳 release function
+    if (!lockAcquired) {
+      throw new Error(`File lock returned without error but lockAcquired=false for key="${key}"`);
+    }
+
+    // Only reached when lockSync succeeded
     return async () => {
       try {
         const lockfile = require('proper-lockfile');
         await lockfile.unlock(lockPath);
-        console.log(`[RedisLock] ✅ File lock released: key=${key}`);
       } catch (err) {
-        // 忽略 ENOENT（檔案不存在）
         if (!err.message.includes('ENOENT')) {
-          console.warn(`[RedisLock] ❌ Failed to release file lock: key=${key}, err=${err}`);
+          console.warn(`[RedisLock] File unlock failed: key=${key}: ${err}`);
         }
       }
     };
@@ -194,7 +201,6 @@ export async function createRedisLockManager(config?: LockConfig): Promise<Redis
     await manager.connect();
     const isHealthy = await manager.isHealthy();
     if (isHealthy) {
-      console.log('[RedisLock] Redis lock manager initialized');
       return manager;
     } else {
       console.warn('[RedisLock] Redis not healthy, will use file lock fallback');

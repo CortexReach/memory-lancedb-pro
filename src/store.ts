@@ -71,7 +71,6 @@ async function getRedisLockManager(): Promise<any> {
     try {
       const { createRedisLockManager } = await import("./redis-lock.js");
       redisLockManager = await createRedisLockManager();
-      console.log("[memory-lancedb-pro] Redis lock manager initialized");
     } catch (err) {
       console.warn("[memory-lancedb-pro] Redis lock unavailable, using file lock fallback:", err);
       redisLockManager = null;
