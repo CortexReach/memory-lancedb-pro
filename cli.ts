@@ -560,10 +560,10 @@ export async function runImportMarkdown(
     try {
       const stats = await fsPromises.stat(memoryDir);
       if (stats.isDirectory()) {
-        const files = await fsPromises.readdir(memoryDir);
+        const files = await fsPromises.readdir(memoryDir, { withFileTypes: true });
         for (const f of files) {
-          if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
-            mdFiles.push({ filePath: path.join(memoryDir, f), scope: entry.name });
+          if (f.isFile() && f.name.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f.name)) {
+            mdFiles.push({ filePath: path.join(memoryDir, f.name), scope: entry.name });
           }
         }
       }
@@ -592,10 +592,10 @@ export async function runImportMarkdown(
     try {
       const stats = await fsP.stat(agentMemoryDir);
       if (stats.isDirectory()) {
-        const files = await fsP.readdir(agentMemoryDir);
+        const files = await fsP.readdir(agentMemoryDir, { withFileTypes: true });
         for (const f of files) {
-          if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
-            mdFiles.push({ filePath: path.join(agentMemoryDir, f), scope: agentId });
+          if (f.isFile() && f.name.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f.name)) {
+            mdFiles.push({ filePath: path.join(agentMemoryDir, f.name), scope: agentId });
           }
         }
       }
@@ -633,10 +633,10 @@ export async function runImportMarkdown(
     try {
       const stats = await fsPromises.stat(flatMemoryDir);
       if (stats.isDirectory()) {
-        const files = await fsPromises.readdir(flatMemoryDir);
+        const files = await fsPromises.readdir(flatMemoryDir, { withFileTypes: true });
         for (const f of files) {
-          if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
-            mdFiles.push({ filePath: path.join(flatMemoryDir, f), scope: workspaceScope || "global" });
+          if (f.isFile() && f.name.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f.name)) {
+            mdFiles.push({ filePath: path.join(flatMemoryDir, f.name), scope: workspaceScope || "global" });
           }
         }
       }
@@ -658,8 +658,18 @@ export async function runImportMarkdown(
 
   // Parse each file for memory entries (lines starting with "- ")
   for (const { filePath, scope: discoveredScope } of mdFiles) {
-    foundFiles++;
-    let content = await fsPromises.readFile(filePath, "utf-8");
+    let content: string;
+    try {
+      // 已在收集時用 withFileTypes: true 過濾，直接讀取
+      foundFiles++;
+      content = await fsPromises.readFile(filePath, "utf-8");
+    } catch (err) {
+      // I/O errors (permissions, corruption, etc.)
+      console.warn(`  [skip] read failed: ${filePath}: ${(err as Error).message}`);
+      skipped++;
+      continue;
+    }
+    // (fix(import-markdown): CI測試登記 + .md目錄skip保護)
     // Strip UTF-8 BOM (e.g. from Windows Notepad-saved files)
     content = content.replace(/^\uFEFF/, "");
     // Normalize line endings: handle both CRLF (\r\n) and LF (\n)
