@@ -583,8 +583,10 @@ export class MemoryStore {
         }
       } catch (err) {
         // 所有 pending callers 都 reject
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        console.error(`[memory-lancedb-pro] doFlush failed: ${errorMsg}`);
         for (const { reject } of batch) {
-          reject(err as Error);
+          reject(new Error(`batch flush failed: ${errorMsg}`, { cause: err as Error }));
         }
       }
     } finally {
@@ -596,6 +598,19 @@ export class MemoryStore {
    * Force flush before close（用於測試或 shutdown）
    */
   async flush(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    await this.doFlush();
+  }
+
+  /**
+   * Destroy the store instance（防止 timer 洩漏）
+   * 清理所有資源：flush pending entries + 清除 flush timer
+   * 呼叫後 store 实例不可再使用。
+   */
+  async destroy(): Promise<void> {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
