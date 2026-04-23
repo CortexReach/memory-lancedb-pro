@@ -216,6 +216,7 @@ export class MemoryStore {
     reject: (err: Error) => void;
   }> = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private isFlushing = false; // 防止 flush() 與 timer 觸發的 doFlush() 同時跑
   private static readonly FLUSH_INTERVAL_MS = 100;
   private static readonly MAX_BATCH_SIZE = 250;
 
@@ -540,7 +541,7 @@ export class MemoryStore {
       if (overflow.length > 0) {
         // 非同步遞迴，不卡 current call stack
         setImmediate(() => {
-          this.bulkStore(overflow as any).catch(() => {});
+          this.bulkStore(overflow).catch(() => {});
         });
       }
 
@@ -559,31 +560,35 @@ export class MemoryStore {
    * Called by the flush timer and on shutdown.
    */
   private async doFlush(): Promise<void> {
-    if (this.pendingBatch.length === 0) return;
-
-    // splice out the current batch（保護新進的 pending calls）
-    const batch = this.pendingBatch.splice(0, this.pendingBatch.length);
-
-    // 合併所有 entries
-    const allEntries = batch.flatMap((b) => b.entries);
-
-    // 單一 lock acquisition for entire batch
+    if (this.isFlushing) return; // 防止 concurrent doFlush()
+    this.isFlushing = true;
     try {
-      await this.runWithFileLock(async () => {
-        await this.table!.add(allEntries);
-      });
+      if (this.pendingBatch.length === 0) return;
 
-      // 各 caller 的 resolve：依序對應原本的 entries 長度
-      let offset = 0;
-      for (const { entries, resolve } of batch) {
-        resolve(entries); // entries 是完整的 MemoryEntry[]，可直接 resolve
-        offset += entries.length;
+      // splice out the current batch（保護新進的 pending calls）
+      const batch = this.pendingBatch.splice(0, this.pendingBatch.length);
+
+      // 合併所有 entries
+      const allEntries = batch.flatMap((b) => b.entries);
+
+      // 單一 lock acquisition for entire batch
+      try {
+        await this.runWithFileLock(async () => {
+          await this.table!.add(allEntries);
+        });
+
+        // 各 caller 的 resolve
+        for (const { entries, resolve } of batch) {
+          resolve(entries);
+        }
+      } catch (err) {
+        // 所有 pending callers 都 reject
+        for (const { reject } of batch) {
+          reject(err as Error);
+        }
       }
-    } catch (err) {
-      // 所有 pending callers 都 reject
-      for (const { reject } of batch) {
-        reject(err as Error);
-      }
+    } finally {
+      this.isFlushing = false;
     }
   }
 
