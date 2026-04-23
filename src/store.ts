@@ -207,6 +207,18 @@ export class MemoryStore {
   private ftsIndexCreated = false;
   private updateQueue: Promise<void> = Promise.resolve();
 
+  // Cross-call batch accumulator（Issue #690）
+  // 多個 concurrent bulkStore() 會先累積在這裡，每 100ms flush 一次，
+  // 合併成一個 lock acquisition，大幅降低 lock contention。
+  private pendingBatch: Array<{
+    entries: MemoryEntry[];
+    resolve: (entries: MemoryEntry[]) => void;
+    reject: (err: Error) => void;
+  }> = [];
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly FLUSH_INTERVAL_MS = 100;
+  private static readonly MAX_BATCH_SIZE = 250;
+
   constructor(private readonly config: StoreConfig) { }
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -480,46 +492,110 @@ export class MemoryStore {
   }
 
   /**
-   * Bulk store multiple memory entries (single lock acquisition)
-   * 
-   * Reduces lock contention by acquiring lock once for multiple entries.
-   * Use this when auto-capture produces multiple memories.
+   * Bulk store multiple memory entries（cross-call batch accumulation）
+   * Issue #690：多個 concurrent bulkStore() 會先累積在 pendingBatch，
+   * 每 FLUSH_INTERVAL_MS（100ms）flush 一次，合併成一個 lock acquisition，
+   * 避免 100 個 concurrent 變成 100 次 lock acquisition 導致 timeout。
+   * Non-breaking：public API 不變。
    */
   async bulkStore(
     entries: Omit<MemoryEntry, "id" | "timestamp">[],
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
-    
-    // Filter out invalid entries (undefined, null, missing text/vector)
+
+    // Filter out invalid entries（undefined, null, missing text/vector）
     const validEntries = entries.filter(
       (entry) => entry && entry.text && entry.text.length > 0 && entry.vector && entry.vector.length > 0
     );
-    
-    // Early return for empty array (skip lock acquisition)
+
+    // Early return for empty array（skip accumulation）
     if (validEntries.length === 0) {
       return [];
     }
-    
-    const fullEntries: MemoryEntry[] = validEntries.map((entry) => ({
+
+    // Bounding：超過 MAX_BATCH_SIZE 的批次先處理，超出的排下一輪
+    //（理論上不應發生，因為 caller 通常不會傳超大批次）
+    let toStore: MemoryEntry[];
+    let overflow: MemoryEntry[] = [];
+    if (validEntries.length > MemoryStore.MAX_BATCH_SIZE) {
+      toStore = validEntries.slice(0, MemoryStore.MAX_BATCH_SIZE);
+      overflow = validEntries.slice(MemoryStore.MAX_BATCH_SIZE);
+    } else {
+      toStore = validEntries;
+    }
+
+    // 附加 id/timestamp
+    const fullEntries: MemoryEntry[] = toStore.map((entry) => ({
       ...entry,
       id: randomUUID(),
       timestamp: Date.now(),
       metadata: entry.metadata || "{}",
     }));
-    
-    // Single lock acquisition for all entries
-    return this.runWithFileLock(async () => {
-      try {
-        await this.table!.add(fullEntries);
-      } catch (err: any) {
-        const code = err.code || "";
-        const message = err.message || String(err);
-        throw new Error(
-          `Failed to bulk store ${fullEntries.length} memories: ${code} ${message}`,
-        );
+
+    // 回傳小型 Promise，實際寫入在背景 flush 完成
+    return new Promise<MemoryEntry[]>((resolve, reject) => {
+      this.pendingBatch.push({ entries: fullEntries, resolve, reject });
+
+      // 若 overflow 有內容，遞迴排入下一批（很少觸發）
+      if (overflow.length > 0) {
+        // 非同步遞迴，不卡 current call stack
+        setImmediate(() => {
+          this.bulkStore(overflow as any).catch(() => {});
+        });
       }
-      return fullEntries;
+
+      // 啟動定時 flush timer（若尚未啟動）
+      if (!this.flushTimer) {
+        this.flushTimer = setTimeout(() => {
+          this.flushTimer = null;
+          this.doFlush();
+        }, MemoryStore.FLUSH_INTERVAL_MS);
+      }
     });
+  }
+
+  /**
+   * Flush all pending batch entries in a single lock acquisition.
+   * Called by the flush timer and on shutdown.
+   */
+  private async doFlush(): Promise<void> {
+    if (this.pendingBatch.length === 0) return;
+
+    // splice out the current batch（保護新進的 pending calls）
+    const batch = this.pendingBatch.splice(0, this.pendingBatch.length);
+
+    // 合併所有 entries
+    const allEntries = batch.flatMap((b) => b.entries);
+
+    // 單一 lock acquisition for entire batch
+    try {
+      await this.runWithFileLock(async () => {
+        await this.table!.add(allEntries);
+      });
+
+      // 各 caller 的 resolve：依序對應原本的 entries 長度
+      let offset = 0;
+      for (const { entries, resolve } of batch) {
+        resolve(entries); // entries 是完整的 MemoryEntry[]，可直接 resolve
+        offset += entries.length;
+      }
+    } catch (err) {
+      // 所有 pending callers 都 reject
+      for (const { reject } of batch) {
+        reject(err as Error);
+      }
+    }
+  }
+
+  /**
+   * Force flush before close（用於測試或 shutdown）
+   */
+  async flush(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    await this.doFlush();
   }
 
   /**
