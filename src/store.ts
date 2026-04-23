@@ -216,7 +216,7 @@ export class MemoryStore {
     reject: (err: Error) => void;
   }> = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
-  private isFlushing = false; // 防止 flush() 與 timer 觸發的 doFlush() 同時跑
+  private flushLock: Promise<void> = Promise.resolve(); // Promise-based lock，防止 concurrent doFlush()
   private static readonly FLUSH_INTERVAL_MS = 100;
   private static readonly MAX_BATCH_SIZE = 250;
 
@@ -486,6 +486,7 @@ export class MemoryStore {
         const message = e.message || String(err);
         throw new Error(
           `Failed to store memory in "${this.config.dbPath}": ${code} ${message}`,
+          { cause: err as Error },
         );
       }
       return fullEntry;
@@ -560,8 +561,10 @@ export class MemoryStore {
    * Called by the flush timer and on shutdown.
    */
   private async doFlush(): Promise<void> {
-    if (this.isFlushing) return; // 防止 concurrent doFlush()
-    this.isFlushing = true;
+    const prevLock = this.flushLock;
+    let releaseLock: () => void;
+    this.flushLock = new Promise<void>((resolve) => { releaseLock = resolve; });
+    await prevLock; // 等上一個 flush 完成後才開始
     try {
       if (this.pendingBatch.length === 0) return;
 
@@ -582,7 +585,6 @@ export class MemoryStore {
           resolve(entries);
         }
       } catch (err) {
-        // 所有 pending callers 都 reject
         const errorMsg = err instanceof Error ? err.message : String(err);
         console.error(`[memory-lancedb-pro] doFlush failed: ${errorMsg}`);
         for (const { reject } of batch) {
@@ -590,7 +592,7 @@ export class MemoryStore {
         }
       }
     } finally {
-      this.isFlushing = false;
+      releaseLock!(); // 釋放 lock，讓下一個 flush 可以跑
     }
   }
 
