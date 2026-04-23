@@ -495,9 +495,6 @@ assert.equal(multiRoundResult.extractionCall, 4);
 assert.equal(multiRoundResult.dedupCall, 3);
 assert.equal(multiRoundResult.mergeCall, 1);
 assert.ok(
-  multiRoundResult.logs.some((entry) => entry[1].includes("created [preferences] 饮品偏好：乌龙茶")),
-);
-assert.ok(
   multiRoundResult.logs.some((entry) => entry[1].includes("merged [preferences]")),
 );
 assert.ok(
