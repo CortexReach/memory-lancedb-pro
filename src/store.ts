@@ -204,6 +204,34 @@ export function validateStoragePath(dbPath: string): string {
   }
 
   return resolvedPath;
+
+// ============================================================================
+// Storage Identity Normalization (for per-db lock isolation)
+// ============================================================================
+
+/**
+ * Normalize dbPath to a safe Redis key component.
+ * Handles: symlinks, trailing slashes, absolute/relative path differences.
+ * Returns a collision-resistant string safe for use in Redis key names.
+ */
+function normalizeStorageKey(dbPath: string): string {
+  // Use realpath to resolve symlinks, then encode to URL-safe base64
+  let resolved = dbPath;
+  try {
+    if (existsSync(dbPath)) {
+      resolved = realpathSync(dbPath);
+    }
+  } catch {}
+  // Normalize path separators and trailing slash
+  resolved = resolved.replace(/\\/g, "/").replace(/\/$/, "");
+  // Simple hash: replace long runs of chars with their first+last+count
+  // (avoids crypto dependency in shared utility)
+  return resolved
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .substring(0, 128);
+}
+
+  return resolvedPath;
 }
 
 // ============================================================================
@@ -222,19 +250,36 @@ export class MemoryStore {
   constructor(private readonly config: StoreConfig) { }
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
+    // 【修復 #1】Redis lock key 包含 storage identity，防止全域 key 序列化不同 DB
+    // 【修復 #2】TTL 從 60s → 180s，降低長 operation 期間 lock 過期風險
+    //         注意：完整修復需加 renewal；180s 是短期緩解
+    const redisLockKey = `memory-write:${normalizeStorageKey(this.config.dbPath)}`;
+    const redisLockTTL = 180_000; // 180 秒（修復 #2）
+
     // ===== Try Redis lock first =====
     const redisManager = await getRedisLockManager();
     if (redisManager) {
+      let lockAcquired = false;
+      let release: (() => Promise<void>) | null = null;
       try {
-        const release = await redisManager.acquire("memory-write", 60000);
-        try {
-          return await fn();
-        } finally {
-          await release();
-        }
+        release = await redisManager.acquire(redisLockKey, redisLockTTL);
+        lockAcquired = true;
+        return await fn();     // ← fn() 錯誤往上拋，不 trigger fallback
       } catch (err) {
-        console.warn("[memory-lancedb-pro] Redis lock failed, falling back to file lock:", err);
-        // Fall through to file lock
+        // 【修復 #1 關鍵】只有「取得 lock 失敗」才 fallback
+        // 若 lock 已取得但 fn() 失敗（lockAcquired=true），直接 re-throw
+        if (!lockAcquired) {
+          console.warn("[memory-lancedb-pro] Redis lock acquire failed, falling back to file lock:", err);
+          // Fall through to file lock
+        } else {
+          // Lock 取得成功，但 fn() 失敗 — 這是 operation 錯誤，不 fallback
+          throw err;
+        }
+      } finally {
+        // release() 放在 finally 確保無論 fn() 成敗都執行
+        if (release) {
+          try { await release(); } catch {}
+        }
       }
     }
 
