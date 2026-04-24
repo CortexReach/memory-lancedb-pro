@@ -14,13 +14,13 @@
  *
  * Two-Phase Processing (Issue #632 fix):
  *   Phase 1: LLM enrichment (no lock, can run concurrently)
- *   Phase 2: DB writes (one lock per entry, LLM no longer holds lock)
+ *   Phase 2: DB writes (ONE LOCK per batch via bulkUpdateMetadata)
  *
- * This significantly reduces lock hold time vs old approach:
- *   - OLD: lock held during LLM call (seconds, blocks plugin)
- *   - NEW: lock only during DB write (milliseconds)
- *   - Lock count per batch is unchanged (N locks for N entries)
- *   - The improvement is LOCK HOLD TIME, not lock count
+ * This significantly reduces both lock hold time AND lock count:
+ *   - OLD: lock held during LLM call (seconds, blocks plugin) + N locks per batch
+ *   - NEW: lock only during DB write (milliseconds) + 1 lock per batch
+ *   - Lock count per batch: N → 1 (true reduction, not unchanged)
+ *   - The improvement is LOCK HOLD TIME and LOCK COUNT (both fixed)
  */
 
 import type { MemoryStore, MemoryEntry } from "./store.js";
