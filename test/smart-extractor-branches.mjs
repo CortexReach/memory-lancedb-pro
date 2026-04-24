@@ -1531,6 +1531,151 @@ async function runCounterResetSuccessScenario() {
     await new Promise((resolve) => llmServer.close(resolve));
     rmSync(workDir, { recursive: true, force: true });
   }
+
+// ============================================================
+// R2: Stage 2 LLM dedup call verification test
+// Problem: existing counter-reset test uses category="cases" + empty DB.
+// deduplicate() returns {decision:"create"} at empty vectorSearch check,
+// never reaching llmDedupDecision (Stage 2).
+//
+// This test proves Stage 2 is reached by:
+// 1. Seeding a matching memory so vectorSearch finds it (activeSimilar.length > 0)
+// 2. LLM mock distinguishes extractCandidates from dedupDecision calls
+// 3. Assertion: dedupCalls >= 1 proves llmDedupDecision was reached
+// ============================================================
+async function runDedupDecisionLLMCallScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-dedup-llm-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  let extractCalls = 0;
+  let dedupCalls = 0;
+  const embeddingServer = createEmbeddingServer();
+
+  // LLM mock: distinguishes extractCandidates from dedupDecision calls
+  const llmServer = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404); res.end(); return;
+    }
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const prompt = payload.messages?.[1]?.content || "";
+
+    if (prompt.includes("Analyze the following session context")) {
+      extractCalls += 1;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl-test", object: "chat.completion",
+        created: Math.floor(Date.now() / 1000), model: "mock-memory-model",
+        choices: [{
+          index: 0, message: { role: "assistant",
+            content: JSON.stringify({
+              memories: [{
+                category: "preferences",
+                abstract: "使用者偏好將重要修復寫成 regression test",
+                overview: "使用者喜歡把重要修復寫成 regression test",
+                content: "使用者喜歡把重要修復寫成 regression test"
+              }]
+            })
+          }, finish_reason: "stop"
+        }]
+      }));
+    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+      dedupCalls += 1;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl-test", object: "chat.completion",
+        created: Math.floor(Date.now() / 1000), model: "mock-memory-model",
+        choices: [{
+          index: 0, message: { role: "assistant",
+            content: JSON.stringify({ decision: "skip", match_index: 1, reason: "duplicate" })
+          }, finish_reason: "stop"
+        }]
+      }));
+    } else {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl-test", object: "chat.completion",
+        created: Math.floor(Date.now() / 1000), model: "mock-memory-model",
+        choices: [{
+          index: 0, message: { role: "assistant",
+            content: JSON.stringify({ memories: [] })
+          }, finish_reason: "stop"
+        }]
+      }));
+    }
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const llmPort = llmServer.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    // NOTE: extractMinMessages=1 so first agent_end triggers immediately
+    // (not the default 2, which would require 2 turns to accumulate)
+    const api = createMockApi(
+      dbPath, `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${llmPort}`, logs,
+      { extractMinMessages: 1, smartExtraction: true, captureAssistant: false },
+    );
+    plugin.register(api);
+
+    // Seed a memory that matches the LLM-extracted candidate.
+    // seedPreference seeds text="饮品偏好：乌龙茶" with category="preference"
+    // in scope "agent:life". This forces vectorSearch to return results,
+    // bypassing the Stage 1 empty-check in deduplicate(),
+    // so execution reaches Stage 2 (llmDedupDecision).
+    await seedPreference(dbPath);
+
+    const sessionKey = "agent:main:discord:dm:user999";
+    const channelId = "discord";
+    const conversationId = "dm:user999";
+
+    // Turn 1: message_received -> agent_end
+    // cumulative=1 >= extractMinMessages=1 -> triggers smart extraction
+    await api.hooks.message_received(
+      { from: "user:user999", content: "我喜歡把重要的修復寫成 regression test" },
+      { channelId, conversationId, accountId: "default" },
+    );
+    await runAgentEndHook(
+      api,
+      { success: true, messages: [{ role: "user", content: "我喜歡把重要的修復寫成 regression test" }] },
+      { agentId: "main", sessionKey },
+    );
+
+    return { extractCalls, dedupCalls, logs };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+
+// ============================================================
+// R2 assertions: Stage 2 LLM dedup was reached
+// ============================================================
+const dedupResult = await runDedupDecisionLLMCallScenario();
+
+// Assert 1: extractCandidates was called (LLM #1)
+assert.equal(dedupResult.extractCalls, 1,
+  "extractCandidates LLM should be called exactly once. Logs: " +
+  dedupResult.logs.map((e) => e[1]).join(" | "));
+
+// Assert 2 (R2 core): llmDedupDecision was called (LLM #2) — proves Stage 2 reached
+assert.equal(dedupResult.dedupCalls, 1,
+  "llmDedupDecision (Stage 2) should be called exactly once. " +
+  "This proves the full extraction pipeline was traversed. " +
+  "Got " + dedupResult.dedupCalls + " dedup calls. Logs: " +
+  dedupResult.logs.map((e) => e[1]).join(" | "));
+
+// ============================================================
+// End: R2 Stage 2 LLM dedup verification test
+// ============================================================
+
 }
 
 const counterResetResult = await runCounterResetSuccessScenario();
@@ -1668,6 +1813,123 @@ assert.ok(
 
 
 
+
+
+// ============================================================
+// R3: DM key fallback integration test
+// Problem: existing runDmFallbackMustfixScenario never calls message_received.
+// pendingIngressTexts is always empty, so it never tests the actual DM key
+// fallback where conversationId=undefined -> channelId is used as the key.
+//
+// Flow:
+//   message_received(channelId, undefined)
+//     -> buildAutoCaptureConversationKeyFromIngress(channelId, undefined)
+//     -> channel (DM fallback, no conversationId)
+//     -> pendingIngressTexts.set(channelId, [text])
+//   agent_end(sessionKey)
+//     -> buildAutoCaptureConversationKeyFromSessionKey(sessionKey)
+//     -> same channel value (matches!)
+//     -> pendingIngressTexts.get(channelId) -> [texts]
+//     -> smart extraction triggered with pending texts
+// ============================================================
+async function runDmKeyFallbackIntegrationScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-dm-key-fallback-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  let llmCalls = 0;
+  const embeddingServer = createEmbeddingServer();
+
+  const llmServer = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404); res.end(); return;
+    }
+    llmCalls += 1;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl-test", object: "chat.completion",
+      created: Math.floor(Date.now() / 1000), model: "mock-memory-model",
+      choices: [{
+        index: 0, message: { role: "assistant",
+          content: JSON.stringify({
+            memories: [{
+              category: "preferences",
+              abstract: "使用者偏好飲品",
+              overview: "使用者喜歡烏龍茶",
+              content: "使用者長期喜歡烏龍茶。"
+            }]
+          })
+        }, finish_reason: "stop"
+      }]
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const llmPort = llmServer.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    // NOTE: extractMinMessages=1 so first agent_end triggers immediately
+    const api = createMockApi(
+      dbPath, `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${llmPort}`, logs,
+      { extractMinMessages: 1, smartExtraction: true, captureAssistant: false },
+    );
+    plugin.register(api);
+
+    const dmChannelId = "discord:dm:user456";
+    const dmSessionKey = "agent:main:discord:dm:user456";
+
+    // Step 1: message_received with conversationId=undefined
+    // buildAutoCaptureConversationKeyFromIngress("discord:dm:user456", undefined)
+    //   -> conversation=falsy -> returns "discord:dm:user456" (DM fallback)
+    // pendingIngressTexts.set("discord:dm:user456", ["hi"])
+    await api.hooks.message_received(
+      { from: "user:user456", content: "hi" },
+      { channelId: dmChannelId, conversationId: undefined, accountId: "default" },
+    );
+
+    // Step 2: agent_end
+    // buildAutoCaptureConversationKeyFromSessionKey("agent:main:discord:dm:user456")
+    //   -> /^agent:[^:]+:(.+)$/.exec -> "discord:dm:user456" (MATCHES!)
+    // pendingIngressTexts.get("discord:dm:user456") -> ["hi"]
+    // cumulative=1 >= extractMinMessages=1 -> triggers smart extraction
+    await runAgentEndHook(
+      api,
+      { success: true, messages: [{ role: "user", content: "hi" }] },
+      { agentId: "main", sessionKey: dmSessionKey },
+    );
+
+    const freshStore = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const entries = await freshStore.list(["global", "agent:main"], undefined, 10, 0);
+
+    return { entries, llmCalls, logs };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+
+// ============================================================
+// R3 assertions: DM key fallback triggered smart extraction
+// ============================================================
+const dmKeyFallbackResult = await runDmKeyFallbackIntegrationScenario();
+
+// Assert 1 (R3 core): Smart extraction was triggered with pending texts
+// This proves message_received + DM key fallback worked correctly
+assert.ok(dmKeyFallbackResult.llmCalls >= 1,
+  "Smart extraction LLM should be called at least once. " +
+  "This proves the DM key fallback triggered smart extraction with pending texts. " +
+  "Got " + dmKeyFallbackResult.llmCalls + " LLM calls. Logs: " +
+  dmKeyFallbackResult.logs.map((e) => e[1]).join(" | "));
+
+// ============================================================
+// End: R3 DM key fallback integration test
+// ============================================================
 
 // ============================================================
 // Unit Test: buildAutoCaptureConversationKeyFromIngress
