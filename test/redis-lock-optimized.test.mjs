@@ -10,12 +10,18 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import jitiFactory from "jiti";
+// Hermetic: skip if REDIS_URL is not set.
+// CI should set REDIS_URL (e.g. redis://localhost:6379).
+// Local dev without Redis: tests are skipped — set REDIS_URL to run them.
+const SKIP_NO_REDIS = !process.env.REDIS_URL;
+
+
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { RedisLockManager } = jiti("../src/redis-lock.ts");
 
 // 測試 1：同一個 key（排隊）
-describe("Same key (queue)", () => {
+(SKIP_NO_REDIS ? describe.skip : describe)("Same key (queue)", () => {
   it("should be slow - operations wait for each other", async () => {
     const lockManager = new RedisLockManager({ redisUrl: 'localhost:6379' });
     
