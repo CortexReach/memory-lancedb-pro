@@ -4406,7 +4406,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   };
 }
 
-export { getDefaultMdMirrorDir, isAgentOrSessionExcluded, isInvalidAgentIdFormat };
+export { getDefaultMdMirrorDir };
 
 /**
  * Resets the registration state — primarily intended for use in tests that need
