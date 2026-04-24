@@ -682,7 +682,7 @@ export class MemoryRetriever {
       );
     } else {
       results = await this.hybridRetrieval(
-        query, safeLimit, scopeFilter, category, trace,
+        query, safeLimit, scopeFilter, category, trace, source,
       );
     }
 
@@ -759,8 +759,6 @@ export class MemoryRetriever {
       );
 
       failureStage = "vector.postProcess";
-      // Bug 7 fix: when decayEngine is active, skip applyRecencyBoost here because
-      // decayEngine already handles temporal scoring; avoid double-boost.
       const recencyBoosted = this.decayEngine
         ? mapped
         : this.applyRecencyBoost(mapped);

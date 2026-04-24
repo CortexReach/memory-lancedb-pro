@@ -113,6 +113,17 @@ function stripLeadingRuntimeWrappers(text: string): string {
       continue;
     }
 
+    // Bug fix: also strip known boilerplate continuation lines (e.g.
+    // "Results auto-announce to your requester.", "Do not use any memory tools.")
+    // that appear right after the wrapper prefix. These lines do NOT match the
+    // wrapper prefix regex but are part of the wrapper boilerplate.
+    if (strippingLeadIn) {
+      AUTO_CAPTURE_RUNTIME_WRAPPER_BOILERPLATE_RE.lastIndex = 0;
+      if (AUTO_CAPTURE_RUNTIME_WRAPPER_BOILERPLATE_RE.test(current)) {
+        continue;
+      }
+    }
+
     strippingLeadIn = false;
     cleanedLines.push(line);
   }

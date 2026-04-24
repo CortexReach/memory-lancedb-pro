@@ -316,3 +316,102 @@ export function extractReflectionSliceItems(reflectionText: string): ReflectionS
 export function extractInjectableReflectionSliceItems(reflectionText: string): ReflectionSliceItem[] {
   return buildReflectionSliceItemsFromSlices(extractInjectableReflectionSlices(reflectionText));
 }
+
+/**
+ * Check if a recall was actually used by the agent.
+ * This function determines whether the agent's response shows awareness of the injected memories.
+ *
+ * @param responseText    - The agent's response text
+ * @param injectedIds     - Array of memory IDs that were injected
+ * @param injectedSummaries - Optional array of summary text lines that were injected;
+ *                            if the response contains any of these verbatim or partially,
+ *                            it is a strong usage signal even without explicit markers or IDs.
+ * @returns true if the response shows evidence of using the recalled information
+ */
+export function isRecallUsed(
+  responseText: string,
+  injectedIds: string[],
+  injectedSummaries?: string[],
+): boolean {
+  if (!responseText || responseText.length <= 24) {
+    return false;
+  }
+  if ((!injectedIds || injectedIds.length === 0) && (!injectedSummaries || injectedSummaries.length === 0)) {
+    return false;
+  }
+
+  const responseLower = responseText.toLowerCase();
+
+  // Step 1: Check if the response contains any specific injected memory ID.
+  // This is a prerequisite for confirming actual usage.
+  const hasSpecificRecall = injectedIds.some(
+    (id) => id && responseLower.includes(id.toLowerCase()),
+  );
+
+  // Step 2: If a specific ID is present, also check for generic usage phrases.
+  // Both conditions must be met (AND logic) to confirm the recall was used.
+  if (hasSpecificRecall) {
+    const usageMarkers = [
+      "remember",
+      "之前",
+      "记得",
+      "according to",
+      "based on what",
+      "as you mentioned",
+      "如前所述",
+      "如您所說",
+      "如您所说的",
+      "我記得",
+      "我记得",
+      "之前你說",
+      "之前你说",
+      "之前提到",
+      "之前提到的",
+      "根据之前",
+      "依据之前",
+      "按照之前",
+      "照您之前",
+      "照你说的",
+      "from previous",
+      "earlier you",
+      "in the memory",
+      "the memory mentioned",
+      "the memories show",
+    ];
+
+    for (const marker of usageMarkers) {
+      if (responseLower.includes(marker.toLowerCase())) {
+        return true;
+      }
+    }
+  }
+
+  // P1 fix: Summary path — detect when injected summary content appears in the response.
+  // No AND gate here: summary text IS the injected memory, so any verbatim/near-verbatim
+  // overlap is a strong usage signal. The 10-char minimum prevents false positives on
+  // common short words. Guards at function entry already ensure injectedSummaries is non-empty.
+  if (injectedSummaries && injectedSummaries.length > 0) {
+    const responseTrimmedLower = responseText.trim().toLowerCase();
+    for (const summary of injectedSummaries) {
+      if (summary && summary.trim().length > 0) {
+        const summaryLower = summary.trim().toLowerCase();
+        // Check for verbatim or near-verbatim presence (at least 10 chars to avoid
+        // false positives on very short fragments).
+        if (
+          summaryLower.length >= 10 &&
+          (responseTrimmedLower.includes(summaryLower) ||
+            // Also check the reverse (summary contains response snippet — agent echoed it).
+            // F3 fix: require >= 10 chars to avoid false positives on short acknowledgments.
+            (() => {
+              const snippet = responseTrimmedLower.slice(0, Math.min(50, responseTrimmedLower.length));
+              return snippet.length >= 10 && summaryLower.includes(snippet);
+            })())
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
