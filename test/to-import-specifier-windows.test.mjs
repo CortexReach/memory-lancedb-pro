@@ -191,22 +191,25 @@ describe("getExtensionApiImportSpecifiers", () => {
     });
   });
 
-  it("converts OPENCLAW_EXTENSION_API_PATH Windows path to file:// URL (hidden issue #1 fix)", () => {
-    withEnv("OPENCLAW_EXTENSION_API_PATH", "C:\\Program Files\\openclaw\\dist\\extensionAPI.js", () => {
-      const specifiers = getExtensionApiImportSpecifiers();
-      const winSpec = specifiers.find(s => s.startsWith("file:///C:/") && s.includes("openclaw") && s.includes("dist") && s.includes("extensionAPI"));
-      assert.ok(winSpec, `Expected Windows path as file:// URL: ${JSON.stringify(specifiers)}`);
-      assert.ok(winSpec.includes("Program") || winSpec.includes("Program%20"), `Expected Program Files in path, got: ${winSpec}`);
+  // Windows-specific env-var tests — skip on non-Windows CI
+  if (process.platform === "win32") {
+    it("converts OPENCLAW_EXTENSION_API_PATH Windows path to file:// URL (hidden issue #1 fix)", () => {
+      withEnv("OPENCLAW_EXTENSION_API_PATH", "C:\\Program Files\\openclaw\\dist\\extensionAPI.js", () => {
+        const specifiers = getExtensionApiImportSpecifiers();
+        const winSpec = specifiers.find(s => s.startsWith("file:///C:/") && s.includes("openclaw") && s.includes("dist") && s.includes("extensionAPI"));
+        assert.ok(winSpec, `Expected Windows path as file:// URL: ${JSON.stringify(specifiers)}`);
+        assert.ok(winSpec.includes("Program") || winSpec.includes("Program%20"), `Expected Program Files in path, got: ${winSpec}`);
+      });
     });
-  });
 
-  it("converts OPENCLAW_EXTENSION_API_PATH UNC path to file:// URL", () => {
-    withEnv("OPENCLAW_EXTENSION_API_PATH", "\\\\server\\share\\openclaw\\dist\\extensionAPI.js", () => {
-      const specifiers = getExtensionApiImportSpecifiers();
-      const uncSpec = specifiers.find(s => s.startsWith("file://") && s.includes("server") && s.includes("share"));
-      assert.ok(uncSpec, `Expected UNC path as file:// URL: ${JSON.stringify(specifiers)}`);
+    it("converts OPENCLAW_EXTENSION_API_PATH UNC path to file:// URL", () => {
+      withEnv("OPENCLAW_EXTENSION_API_PATH", "\\\\server\\share\\openclaw\\dist\\extensionAPI.js", () => {
+        const specifiers = getExtensionApiImportSpecifiers();
+        const uncSpec = specifiers.find(s => s.startsWith("file://") && s.includes("server") && s.includes("share"));
+        assert.ok(uncSpec, `Expected UNC path as file:// URL: ${JSON.stringify(specifiers)}`);
+      });
     });
-  });
+  }
 
   it("includes POSIX fallback paths on all platforms", () => {
     const specifiers = getExtensionApiImportSpecifiers();
