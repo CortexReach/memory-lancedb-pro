@@ -16,6 +16,16 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import type { SmartMemoryMetadata } from "./smart-metadata.js";
+
+// Minimal type compatible with smart-metadata.ts EntryLike
+type EntryLike = {
+  text?: string;
+  category?: string;
+  importance?: number;
+  timestamp?: number;
+  metadata?: string;
+};
 
 // ============================================================================
 // Types
@@ -44,6 +54,16 @@ export interface StoreConfig {
 
 export interface MetadataPatch {
   [key: string]: unknown;
+}
+
+/**
+ * Marker fields written by memory-upgrader during Phase 2.
+ * These are merged into the existing metadata on top of Plugin-written fields,
+ * preserving fields like injected_count that the Plugin wrote during Phase 1.
+ */
+export interface UpgradeMarker {
+  upgraded_from: string; // original 5-category
+  upgraded_at: number;   // timestamp of upgrade
 }
 
 // ============================================================================
@@ -662,6 +682,186 @@ export class MemoryStore {
           const actuallySucceeded = updatedEntries.length - recoveryFailed.length;
           console.warn(
             `[memory-lancedb-pro] bulkUpdateMetadata: recovery complete. ` +
+            `succeeded=${actuallySucceeded}, failed=${recoveryFailed.length}`,
+          );
+          return {
+            success: actuallySucceeded,
+            failed: [...failed, ...recoveryFailed],
+          };
+        }
+
+        return { success: updatedEntries.length, failed };
+      })
+    );
+  }
+
+  /**
+   * Phase-2 bulk write for memory-upgrader with true re-read protection.
+   *
+   * [FIX MR2] This method fixes the stale-metadata bug in the original design:
+   * - Phase 1 builds a metadata PATCH (LLM enrichment results only)
+   * - Phase 2 re-reads each entry from DB INSIDE the lock
+   * - Merge: base (fresh from DB, has Plugin's injected_count)
+   *           + patch (LLM enrichment: l0_abstract, l1_overview, l2_content)
+   *           + marker (upgraded_from, upgraded_at)
+   *
+   * This ensures Plugin's injected_count=5 (written during Phase 1 window)
+   * is NOT overwritten by Phase 1's snapshot (injected_count=0).
+   *
+   * @param entries - Each entry has an id, a LLM-enrichment PATCH, and upgrade markers
+   * @param scopeFilter - Optional scope filter
+   * @returns success count and failed entry ids
+   */
+  async bulkUpdateMetadataWithPatch(
+    entries: Array<{
+      id: string;
+      /** LLM-enrichment patch: l0_abstract, l1_overview, l2_content, memory_category, tier, etc. */
+      patch: Partial<SmartMemoryMetadata>;
+      /** Upgrade marker: original category and timestamp */
+      marker: UpgradeMarker;
+    }>,
+    scopeFilter?: string[],
+  ): Promise<{ success: number; failed: string[] }> {
+    await this.ensureInitialized();
+
+    if (entries.length === 0) {
+      return { success: 0, failed: [] };
+    }
+
+    return this.runWithFileLock(() =>
+      this.runSerializedUpdate(async () => {
+        // Step 1: Batch query all entries (1 LanceDB op) — re-read fresh state
+        const ids = entries.map((e) => `'${escapeSqlLiteral(e.id)}'`).join(", ");
+        const rows = await this.table!.query()
+          .where(`id IN (${ids})`)
+          .toArray();
+
+        const rowMap = new Map<string, Record<string, unknown>>(rows.map((r) => [r.id as string, r]));
+        const foundIds = new Set<string>(rowMap.keys());
+        const failed: string[] = [];
+
+        // Collect entries to update (those that were found)
+        const toUpdate: Array<{
+          entry: (typeof entries)[0];
+          row: Record<string, unknown>;
+        }> = [];
+        for (const entry of entries) {
+          if (!foundIds.has(entry.id)) {
+            failed.push(entry.id);
+          } else {
+            toUpdate.push({ entry, row: rowMap.get(entry.id)! });
+          }
+        }
+
+        if (toUpdate.length === 0) {
+          return { success: 0, failed };
+        }
+
+        // Step 2: Scope filter check (applied per-entry)
+        if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+          for (const item of toUpdate) {
+            failed.push(item.entry.id);
+          }
+          return { success: 0, failed };
+        }
+
+        const allowedIds: string[] = [];
+        for (const item of toUpdate) {
+          const rowScope = (item.row.scope as string | undefined) ?? "global";
+          if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+            failed.push(item.entry.id);
+          } else {
+            allowedIds.push(item.entry.id);
+          }
+        }
+
+        const filteredToUpdate = toUpdate.filter((item) => allowedIds.includes(item.entry.id));
+        if (filteredToUpdate.length === 0) {
+          return { success: 0, failed };
+        }
+
+        // Step 3: Build updated entries — KEY FIX: merge fresh DB metadata + patch + marker
+        // base = DB re-read fresh metadata (Plugin's injected_count=5 is here)
+        // patch = LLM enrichment results (l0_abstract, l1_overview, l2_content, etc.)
+        // marker = upgraded_from + upgraded_at
+        const updatedEntries: MemoryEntry[] = filteredToUpdate.map((item) => {
+          const { entry, row } = item;
+          const rowScope = (row.scope as string | undefined) ?? "global";
+
+          // [Q8-fix] Strip undefined values before merge.
+          // JS spread: {...base, ...{x:undefined}} OVERWRITES base.x with undefined.
+          // Without this, a partial patch with undefined fields would wipe base values.
+          const cleanPatch = Object.fromEntries(
+            Object.entries(entry.patch as Record<string, unknown>).filter(([, v]) => v !== undefined)
+          );
+          const cleanMarker = Object.fromEntries(
+            Object.entries(entry.marker as Record<string, unknown>).filter(([, v]) => v !== undefined)
+          );
+
+          // Parse fresh metadata from DB — Plugin's injected_count=5 is preserved here
+          const base = parseSmartMetadata(row.metadata as string | undefined, row as EntryLike);
+
+          // Merge: base (Plugin fields) + cleanPatch (LLM fields) + cleanMarker (upgrade fields)
+          const merged: SmartMemoryMetadata = {
+            ...base,            // Plugin-written fields: injected_count=5, last_injected_at, etc.
+            ...cleanPatch,      // LLM enrichment: l0_abstract, l1_overview, l2_content, memory_category, etc.
+            ...cleanMarker,     // Upgrade marker: upgraded_from, upgraded_at
+          };
+
+          return {
+            id: row.id as string,
+            text: row.text as string,
+            // [Q2-fix] Guard against null/undefined vector.
+            // Array.from(null) returns [], which violates LanceDB vector NOT NULL constraint.
+            // row.vector should always exist for entries stored via this store, but guard anyway.
+            vector: row.vector != null
+              ? Array.from(row.vector as Iterable<number>)
+              : (() => { throw new Error(`bulkUpdateMetadataWithPatch: row.vector is null for id=${row.id}`); })(),
+            category: row.category as MemoryEntry["category"],
+            scope: rowScope,
+            importance: Number(row.importance),
+            // [Q7-note] timestamp: we deliberately use row.timestamp (Plugin-written value if any).
+            // Phase 2a does NOT override timestamp — Plugin's write time is preserved.
+            timestamp: Number(row.timestamp),
+            metadata: stringifySmartMetadata(merged),
+          };
+        });
+
+        // Step 4: Batch delete (1 LanceDB op)
+        const deleteIds = filteredToUpdate
+          .map((item) => `'${escapeSqlLiteral(item.entry.id)}'`)
+          .join(", ");
+        await this.table!.delete(`id IN (${deleteIds})`);
+
+        // Step 5: Batch add (1 LanceDB op)
+        try {
+          await this.table!.add(updatedEntries);
+        } catch (addError) {
+          const errMsg = addError instanceof Error ? addError.message : String(addError);
+          console.warn(
+            `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: batch add failed, ` +
+            `attempting per-entry recovery. entries=${updatedEntries.length}, error=${errMsg}`,
+          );
+          // [Q6-fix] Use Set for O(1) lookup instead of O(n) includes.
+          const outerFailed = new Set(failed);
+          const recoveryFailed: string[] = [];
+          for (const entry of updatedEntries) {
+            try {
+              await this.table!.add([entry]);
+            } catch (recoveryErr) {
+              const recMsg = recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr);
+              console.warn(
+                `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: recovery failed ` +
+                `for id=${entry.id}, error=${recMsg}`,
+              );
+              if (!outerFailed.has(entry.id)) {
+                recoveryFailed.push(entry.id);
+              }
+            }
+          }
+          const actuallySucceeded = updatedEntries.length - recoveryFailed.length;
+          console.warn(
+            `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: recovery complete. ` +
             `succeeded=${actuallySucceeded}, failed=${recoveryFailed.length}`,
           );
           return {

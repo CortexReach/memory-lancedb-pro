@@ -82,8 +82,32 @@ function createMockStoreWithLockTracking() {
     },
 
     /**
-     * [v3] bulkUpdateMetadata：單次 lock，批次處理所有 entries。
-     * 對應真實 store.bulkUpdateMetadata() 的行為。
+     * [v3] bulkUpdateMetadataWithPatch：單次 lock，re-read + merge。
+     * [FIX MR2] 這是新的 API，用於修復 stale metadata bug。
+     * re-read 後 merge patch + marker，確保 Plugin 的 injected_count 不被覆蓋。
+     */
+    async bulkUpdateMetadataWithPatch(entries) {
+      return this.runWithFileLock(async () => {
+        state.bulkUpdates.push({ type: "withPatch", entries, timestamp: Date.now() });
+        for (const { id, patch, marker } of entries) {
+          const existing = state.data.get(id);
+          if (existing) {
+            const merged = {
+              ...existing,
+              ...patch,
+              ...marker,
+            };
+            state.data.set(id, merged);
+          }
+        }
+        state.operations.push({ type: "bulkUpdateWithPatch", count: entries.length, time: Date.now() });
+        return { success: entries.length, failed: [] };
+      });
+    },
+
+    /**
+     * [deprecated] bulkUpdateMetadata：保留給舊測試用。
+     * 新實作應使用 bulkUpdateMetadataWithPatch。
      */
     async bulkUpdateMetadata(pairs) {
       return this.runWithFileLock(async () => {
@@ -195,8 +219,8 @@ async function testNewBehavior_TrueOneLockPerBatch() {
 
   // [v3] 關鍵斷言：1 bulkUpdateMetadata = 1 lock（無論 entries 數量）
   assert.equal(store.state.lockCount, 1, "Phase 2: 整批 3 entries 只拿 1 次 lock");
-  assert.equal(store.state.bulkUpdates.length, 1, "應該有 1 次 bulkUpdateMetadata");
-  assert.equal(store.state.updates.length, 3, "應該有 3 次 update（內部追蹤）");
+  assert.equal(store.state.bulkUpdates.length, 1, "應該有 1 次 bulkUpdateMetadataWithPatch");
+  assert.equal(store.state.updates.length, 0, "bulkUpdateMetadataWithPatch 不走 updates");
 
   console.log("  ✅ Test 1 通過：確認 Phase 2 TRUE 1-lock-per-batch");
 }
@@ -322,16 +346,16 @@ async function testNoOverwriteBetweenPluginAndUpgrader() {
   // [F4-fix] 同時追蹤 pluginWrites（來自合併的 Test 3）
   const pluginWrites = [];
   const allUpdates = [];
-  const originalBulkUpdate = store.bulkUpdateMetadata.bind(store);
-  store.bulkUpdateMetadata = async function(pairs) {
-    // 在 bulkUpdateMetadata 開始前，plugin 先寫入 injected_count
+  const originalBulkUpdateWithPatch = store.bulkUpdateMetadataWithPatch.bind(store);
+  store.bulkUpdateMetadataWithPatch = async function(entries) {
+    // 在 bulkUpdateMetadataWithPatch 開始前，plugin 先寫入 injected_count
     await store.update("entry-1", {
       injected_count: 5,
       last_injected_at: Date.now(),
     });
-    pluginWrites.push({ ids: pairs.map(p => p.id) });
+    pluginWrites.push({ ids: entries.map(e => e.id) });
     allUpdates.push({ type: "plugin-before-bulk" });
-    return originalBulkUpdate(pairs);
+    return originalBulkUpdateWithPatch(entries);
   };
 
   const llm = {
@@ -355,7 +379,7 @@ async function testNoOverwriteBetweenPluginAndUpgrader() {
 
   // 驗證：text 保留，metadata 更新，injected_count 來自 plugin 的寫入
   assert.equal(final.text, "Original text that needs upgrading", "Upgrader 不應覆蓋 text");
-  assert.ok(final.metadata.includes("l0_abstract"), "Upgrader 應該更新 metadata");
+  assert.ok(final.l0_abstract, "Upgrader 應該添加 l0_abstract");
   // injected_count 應該保留（plugin 在 bulkUpdateMetadata 前寫入）
   assert.equal(final.injected_count, 5, "Plugin 的 injected_count 應保留");
 

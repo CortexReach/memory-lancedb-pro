@@ -14,7 +14,7 @@
  *
  * Two-Phase Processing (Issue #632 fix):
  *   Phase 1: LLM enrichment (no lock, can run concurrently)
- *   Phase 2: DB writes (ONE LOCK per batch via bulkUpdateMetadata)
+ *   Phase 2: DB writes via bulkUpdateMetadataWithPatch (ONE LOCK per batch)
  *
  * This significantly reduces both lock hold time AND lock count:
  *   - OLD: lock held during LLM call (seconds, blocks plugin) + N locks per batch
@@ -27,7 +27,7 @@ import type { MemoryStore, MemoryEntry } from "./store.js";
 import type { LlmClient } from "./llm-client.js";
 import type { MemoryCategory } from "./memory-categories.js";
 import type { MemoryTier } from "./memory-categories.js";
-import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import { parseSmartMetadata } from "./smart-metadata.js";
 
 // ============================================================================
 // Types
@@ -179,7 +179,7 @@ function simpleEnrich(
 // The old implementation held lock during LLM call (seconds), blocking plugin.
 // The new two-phase approach separates:
 //   - Phase 1: LLM enrichment (no lock, runs concurrently)
-//   - Phase 2: bulkUpdateMetadata() — SINGLE lock for entire batch
+//   - Phase 2: bulkUpdateMetadataWithPatch() — SINGLE lock for entire batch
 //
 // Lock count per batch: 1 lock for all entries (TRUE reduction, not N locks).
 // Lock hold time: milliseconds (DB ops only, LLM not in lock).
@@ -191,10 +191,27 @@ function simpleEnrich(
 //
 // NEW FLOW:
 //   Phase 1: await this.prepareEntry() for all entries (no lock)
-//   Phase 2: await this.store.bulkUpdateMetadata() (1 lock for all writes)
+//   Phase 2: await this.store.bulkUpdateMetadataWithPatch() (1 lock for all writes)
 //
 // Plugin can acquire lock only after Phase 2 completes (full batch).
 //
+// MR2 FIX (Issue #632):
+// ---------------------
+// The old Phase 2 built a complete metadata STRING in Phase 2a,凝固（凝固 =
+// solidify/serialize）it, then passed it to bulkUpdateMetadata(). This caused:
+//   - Phase 1 snapshot (entry.metadata) had injected_count=0
+//   - buildSmartMetadata() preserved injected_count=0 from the snapshot
+//   - bulkUpdateMetadata Step 3 used this Phase 1 string, overwriting
+//     Plugin's injected_count=5 that was written during the Phase 1 window
+//
+// Fix: Phase 2a now passes ONLY a PATCH (LLM enrichment fields) and a MARKER
+// (upgraded_from/upgraded_at). The actual metadata reconstruction happens
+// inside bulkUpdateMetadataWithPatch, which re-reads the DB inside the lock
+// BEFORE building the merged metadata. This ensures:
+//   base = DB re-read (Plugin's injected_count=5 is here)
+//   + patch = LLM fields (l0_abstract, l1_overview, l2_content, memory_category)
+//   + marker = upgraded_from + upgraded_at
+//   → Plugin's injected_count=5 is preserved, LLM fields are added.
 // ============================================================================
 
 export class MemoryUpgrader {
@@ -330,15 +347,18 @@ export class MemoryUpgrader {
   /**
    * Phase 2: Write all enriched entries to DB.
    *
-   * Uses store.bulkUpdateMetadata() for TRUE 1-lock-per-batch behavior:
+   * Uses store.bulkUpdateMetadataWithPatch() for TRUE 1-lock-per-batch behavior:
    *   - Single file lock acquisition for the entire batch
-   *   - Batch query (1 LanceDB op)
+   *   - Batch query (re-read fresh state inside the lock, 1 LanceDB op)
    *   - Batch delete (1 LanceDB op)
    *   - Batch add (1 LanceDB op)
    * Total: 1 lock + 3 LanceDB ops (vs old: N locks + 2N LanceDB ops)
    *
-   * [FIX MR2] bulkUpdateMetadata re-reads each entry inside the lock,
+   * [FIX MR2] bulkUpdateMetadataWithPatch re-reads each entry INSIDE the lock,
    * picking up any Plugin writes that occurred during Phase 1 enrichment window.
+   * Merge: base (DB re-read, has Plugin's injected_count=5)
+   *         + patch (LLM enrichment: l0_abstract, l1_overview, l2_content)
+   *         + marker (upgraded_from, upgraded_at)
    *
    * [FIX F5] YIELD_EVERY is no longer needed: since we hold the lock for the
    * entire batch, Plugin can acquire the lock only after the batch completes.
@@ -349,68 +369,70 @@ export class MemoryUpgrader {
   ): Promise<{ success: number; errors: string[] }> {
     const errors: string[] = [];
 
-    // Phase 2a: Build all metadata pairs in memory (no I/O, no lock)
-    // This mirrors what the old loop did, but collects results instead of writing
-    const pairs: Array<{ id: string; metadata: string; entry: MemoryEntry; newCategory: MemoryCategory; enriched: Pick<EnrichedMetadata, "l0_abstract" | "l1_overview" | "l2_content"> }> = [];
+    // Phase 2a: Build LLM-enrichment patch for each entry (no I/O, no lock)
+    // [FIX MR2] We no longer build a complete metadata string here.
+    // Instead, we pass only the LLM-enrichment PATCH + upgrade MARKER.
+    // The actual merge (fresh DB metadata + patch + marker) happens inside
+    // bulkUpdateMetadataWithPatch, which re-reads each entry INSIDE the lock.
+    // This ensures Plugin's injected_count=5 (written during Phase 1 window)
+    // is preserved: base = DB re-read (has injected_count=5),
+    // then patch + marker are merged on top.
+    const entries: Array<{
+      id: string;
+      patch: {
+        l0_abstract: string;
+        l1_overview: string;
+        l2_content: string;
+        memory_category: MemoryCategory;
+        tier: MemoryTier;
+        access_count: number;
+        confidence: number;
+      };
+      marker: { upgraded_from: string; upgraded_at: number };
+    }> = [];
 
     for (const { entry, newCategory, enriched } of batch) {
       try {
-        // Use parseSmartMetadata for robust parsing (with full fallback)
-        // This preserves Plugin-written fields like injected_count
-        const existingMeta = parseSmartMetadata(entry.metadata, entry);
-
-        const newMetadata: EnrichedMetadata = {
-          ...buildSmartMetadata(
-            { ...entry, metadata: JSON.stringify(existingMeta) },
-            {
-              l0_abstract: enriched.l0_abstract,
-              l1_overview: enriched.l1_overview,
-              l2_content: enriched.l2_content,
-              memory_category: newCategory,
-              tier: "working" as MemoryTier,
-              access_count: 0,
-              confidence: 0.7,
-            },
-          ),
-          upgraded_from: entry.category,
-          upgraded_at: Date.now(),
-        };
-
-        pairs.push({
+        entries.push({
           id: entry.id,
-          metadata: stringifySmartMetadata(newMetadata),
-          entry,
-          newCategory,
-          enriched,
+          patch: {
+            l0_abstract: enriched.l0_abstract,
+            l1_overview: enriched.l1_overview,
+            l2_content: enriched.l2_content,
+            memory_category: newCategory,
+            tier: "working" as MemoryTier,
+            access_count: 0,
+            confidence: 0.7,
+          },
+          marker: {
+            upgraded_from: entry.category,
+            upgraded_at: Date.now(),
+          },
         });
       } catch (err) {
-        const errMsg = `Failed to build metadata for ${entry.id}: ${String(err)}`;
+        const errMsg = `Failed to build patch for ${entry.id}: ${String(err)}`;
         errors.push(errMsg);
         this.log(`memory-upgrader: ERROR — ${errMsg}`);
       }
     }
 
-    if (pairs.length === 0) {
+    if (entries.length === 0) {
       return { success: 0, errors };
     }
 
-    // Phase 2b: Single bulk write (1 lock for entire batch)
+    // Phase 2b: Single bulk write via bulkUpdateMetadataWithPatch
+    // (1 lock for entire batch, re-read inside lock)
     try {
-      const result = await this.store.bulkUpdateMetadata(
-        pairs.map((p) => ({ id: p.id, metadata: p.metadata })),
-      );
-
-      // Report per-entry failures
+      const result = await this.store.bulkUpdateMetadataWithPatch(entries);
       for (const failedId of result.failed) {
-        const errMsg = `bulkUpdateMetadata failed for ${failedId}`;
+        const errMsg = `bulkUpdateMetadataWithPatch failed for ${failedId}`;
         errors.push(errMsg);
         this.log(`memory-upgrader: ERROR — ${errMsg}`);
       }
 
       return { success: result.success, errors };
     } catch (err) {
-      // If bulkUpdateMetadata itself throws, all entries in this batch failed
-      const errMsg = `bulkUpdateMetadata batch failed: ${String(err)}`;
+      const errMsg = `bulkUpdateMetadataWithPatch batch failed: ${String(err)}`;
       errors.push(errMsg);
       this.log(`memory-upgrader: ERROR — ${errMsg}`);
       return { success: 0, errors };

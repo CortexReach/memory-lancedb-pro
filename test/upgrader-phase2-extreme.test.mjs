@@ -67,8 +67,21 @@ function createMockStore() {
     },
 
     /**
-     * [v3] bulkUpdateMetadata：單次 lock，批次處理。
-     * 對應真實 store.bulkUpdateMetadata() 的行為。
+     * [v3] bulkUpdateMetadataWithPatch：單次 lock，re-read + merge。
+     * [FIX MR2] 新 API，re-read 後 merge patch + marker。
+     */
+    async bulkUpdateMetadataWithPatch(entries) {
+      return store.runWithFileLock(async () => {
+        // Note: lockCount already incremented by runWithFileLock
+        for (const { id, patch, marker } of entries) {
+          data.set(id, { ...data.get(id), ...patch, ...marker });
+        }
+        return { success: entries.length, failed: [] };
+      });
+    },
+
+    /**
+     * [v3] bulkUpdateMetadata：單次 lock，批次處理（舊 API，保留給其他測試）。
      */
     async bulkUpdateMetadata(pairs) {
       return store.runWithFileLock(async () => {
