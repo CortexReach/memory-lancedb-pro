@@ -253,55 +253,8 @@ async function testPluginCanWriteDuringPhase1() {
 /**
  * [v3]
  * 測試並發寫入（Plugin + Upgrader）不造成資料遺失。
+ * [F4-fix] 合併自 Test 3：Test 5 現在同時驗證 pluginWrites 追蹤與資料完整性。
  */
-async function testConcurrentWrites_NoDataLoss() {
-  console.log("\n=== Test 3: 並發寫入（Plugin + Upgrader）不造成資料遺失 ===");
-
-  const store = createMockStoreWithLockTracking();
-  const entries = [
-    createLegacyEntry("entry-1", "Legacy memory 1"),
-    createLegacyEntry("entry-2", "Legacy memory 2"),
-  ];
-  store.initData(entries);
-
-  // 初始化 injected_count
-  store.state.data.set("entry-1", { ...entries[0], injected_count: 0 });
-  store.state.data.set("entry-2", { ...entries[1], injected_count: 0 });
-
-  const llm = {
-    async completeJson() {
-      return null; // fallback
-    },
-    getLastError() {
-      return "mock";
-    },
-  };
-
-  const upgrader = createMemoryUpgrader(store, llm);
-
-  // Hook bulkUpdateMetadata 來記錄 plugin 寫入
-  const originalBulkUpdate = store.bulkUpdateMetadata.bind(store);
-  const pluginWrites = [];
-  store.bulkUpdateMetadata = async function(pairs) {
-    // 在 bulkUpdateMetadata 執行前，plugin 搶先寫入
-    await store.runWithFileLock(async () => {
-      await store.update("entry-1", { injected_count: 1 });
-      await store.update("entry-2", { injected_count: 1 });
-      pluginWrites.push({ ids: ["entry-1", "entry-2"] });
-    });
-    return originalBulkUpdate(pairs);
-  };
-
-  await upgrader.upgrade({ batchSize: 2, noLlm: true });
-
-  console.log(`  Upgrader bulkUpdates: ${store.state.bulkUpdates.length}`);
-  console.log(`  Plugin writes: ${pluginWrites.length}`);
-
-  assert.equal(store.state.bulkUpdates.length, 1, "Upgrader 應該執行 1 次 bulkUpdateMetadata");
-  assert.equal(pluginWrites.length, 1, "Plugin 應該寫入 1 次");
-
-  console.log("  ✅ Test 3 通過：並發寫入都成功");
-}
 
 /**
  * [v3]
@@ -366,6 +319,8 @@ async function testNoOverwriteBetweenPluginAndUpgrader() {
     last_injected_at: 0,
   });
 
+  // [F4-fix] 同時追蹤 pluginWrites（來自合併的 Test 3）
+  const pluginWrites = [];
   const allUpdates = [];
   const originalBulkUpdate = store.bulkUpdateMetadata.bind(store);
   store.bulkUpdateMetadata = async function(pairs) {
@@ -374,6 +329,7 @@ async function testNoOverwriteBetweenPluginAndUpgrader() {
       injected_count: 5,
       last_injected_at: Date.now(),
     });
+    pluginWrites.push({ ids: pairs.map(p => p.id) });
     allUpdates.push({ type: "plugin-before-bulk" });
     return originalBulkUpdate(pairs);
   };
@@ -403,7 +359,13 @@ async function testNoOverwriteBetweenPluginAndUpgrader() {
   // injected_count 應該保留（plugin 在 bulkUpdateMetadata 前寫入）
   assert.equal(final.injected_count, 5, "Plugin 的 injected_count 應保留");
 
-  console.log("  ✅ Test 5 通過：不同欄位更新，Plugin 資料受到保護");
+  // [F4-fix] 來自合併的 Test 3：驗證 pluginWrites 追蹤正確
+  console.log(`  Upgrader bulkUpdates: ${store.state.bulkUpdates.length}`);
+  console.log(`  Plugin writes: ${pluginWrites.length}`);
+  assert.equal(store.state.bulkUpdates.length, 1, "Upgrader 應該執行 1 次 bulkUpdateMetadata");
+  assert.equal(pluginWrites.length, 1, "Plugin 應該寫入 1 次");
+
+  console.log("  ✅ Test 5 通過：不同欄位更新 + pluginWrites 追蹤，Plugin 資料受到保護");
 }
 
 // ============================================================================
@@ -419,7 +381,6 @@ async function main() {
   try {
     await testNewBehavior_TrueOneLockPerBatch();
     await testPluginCanWriteDuringPhase1();
-    await testConcurrentWrites_NoDataLoss();
     await testOldVsNew_LockCountDifference();
     await testNoOverwriteBetweenPluginAndUpgrader();
 
