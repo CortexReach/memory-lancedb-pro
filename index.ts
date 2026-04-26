@@ -1899,7 +1899,6 @@ const memoryLanceDBProPlugin = {
       api.logger.debug?.("memory-lancedb-pro: register() called again — skipping re-init (idempotent)");
       return;
     }
-    _registeredApis.add(api);
 
     // Parse and validate configuration
     // ========================================================================
@@ -1908,8 +1907,22 @@ const memoryLanceDBProPlugin = {
     // the same singleton via destructuring. This prevents:
     //   - Memory heap growth from repeated resource creation (~9 calls/process)
     //   - Accumulated session Maps being lost on re-registration
+    //
+    // IMPORTANT: _registeredApis.add(api) is called AFTER successful init.
+    // This ensures that if _initPluginState throws, the api is NOT in the
+    // WeakSet, allowing a subsequent register() call with the same api to retry.
+    // (The old placement — before init — caused permanent breakage on init failure.)
     // ========================================================================
-    if (!_singletonState) { _singletonState = _initPluginState(api); }
+    let singleton: typeof _singletonState;
+    try {
+      if (!_singletonState) { _singletonState = _initPluginState(api); }
+      singleton = _singletonState;
+    } catch (err) {
+      api.logger.error(`memory-lancedb-pro: _initPluginState failed — ${String(err)}`);
+      throw err;
+    }
+    _registeredApis.add(api);
+
     const {
       config,
       resolvedDbPath,
@@ -1930,7 +1943,7 @@ const memoryLanceDBProPlugin = {
       autoCaptureSeenTextCount,
       autoCapturePendingIngressTexts,
       autoCaptureRecentTexts,
-    } = _singletonState;
+    } = singleton;
 
 
     async function sleep(ms: number): Promise<void> {
