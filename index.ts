@@ -2826,14 +2826,13 @@ const memoryLanceDBProPlugin = {
             ? [...(autoCapturePendingIngressTexts.get(conversationKey) || [])]
             : [];
           const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
-          // [Fix #2] Cumulative counting: accumulate across events, not per-event overwrite
-          // Note: Using eligibleTexts.length (raw event text count), not newTexts.length.
-          // newTexts-based counting was rejected because it breaks the extractMinMessages
-          // semantics: the counter is designed to accumulate per-event text count,
-          // not per-event delta. Fix #2 with eligibleTexts.length works correctly for
-          // the real-world case (1 text per event); the double-counting risk only
-          // applies when agent_end delivers full history every time, which does not
-          // occur in the current code path.
+          // [Fix #2] Cumulative counting: accumulate across events, not per-event overwrite.
+          // Counter uses newTexts.length (not eligibleTexts.length) — newTexts is already
+          // deduplicated against previousSeenCount (via slice(previousSeenCount)), so counting
+          // newTexts.length correctly reflects only genuinely new texts per event.
+          // This prevents counter inflation when agent_end delivers a full-history payload
+          // on every turn (replay scenario): eligibleTexts.length would over-count, but
+          // newTexts.length stays accurate because replayed texts are sliced away.
           let newTexts = eligibleTexts;
           if (pendingIngressTexts.length > 0) {
             // [Fix #3] Use pendingIngressTexts as-is (REPLACE, not APPEND).
