@@ -209,7 +209,81 @@ export class MemoryStore {
 
   constructor(private readonly config: StoreConfig) { }
 
+// ============================================================================
+// Redis Lock Manager 工廠（M2: initPromise guard + M1: Redis-first + file-lock fallback）
+// ============================================================================
+
+import type { RedisLockManager } from "./redis-lock.js";
+import { createRedisLockManager } from "./redis-lock.js";
+
+/** M2: initPromise guard — 防止並發建立多個 Redis client */
+let redisLockManager: RedisLockManager | null = null;
+let redisInitPromise: Promise<RedisLockManager | null> | null = null;
+
+async function loadProperLockfile(): Promise<any> {
+  return await import("proper-lockfile");
+}
+
+function nodeTmpdir(): string {
+  // N2 fix: nodeTmpdir() 是 function call，不是 property access
+  const { tmpdir } = require("node:os");
+  return tmpdir();
+}
+
+/**
+ * M2: getRedisLockManager — 使用 initPromise guard，確保只建立一個 Redis client。
+ * M1: Redis-first 策略：Redis 可用時用 Redis lock，否則 fallback 到 file lock。
+ */
+export async function getRedisLockManager(): Promise<RedisLockManager | null> {
+  if (redisLockManager !== null) {
+    return redisLockManager;
+  }
+  if (redisInitPromise !== null) {
+    return redisInitPromise;
+  }
+  redisInitPromise = (async () => {
+    try {
+      return await createRedisLockManager();
+    } catch (err) {
+      console.warn("[store] getRedisLockManager failed:", err);
+      return null;
+    }
+  })();
+  return redisInitPromise;
+}
+
+  /**
+   * 混合鎖實作：Redis lock 優先，失敗時進 file-lock fallback。
+   * M1: RedisUnavailableError 進 file-lock fallback。
+   * M2: getRedisLockManager() 有 initPromise guard，防止並發建立多個 client。
+   */
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      const mgr = await getRedisLockManager();
+      if (mgr) {
+        const release = await mgr.acquire("memory-write", 60000);
+        try {
+          return await fn();
+        } finally {
+          await release();
+        }
+      }
+    } catch (err) {
+      // M1: RedisUnavailableError 時進 file-lock fallback（使用 Symbol.for，ESM-safe）
+      if (err && typeof err === "object" && Symbol.for("RedisUnavailableError") in err) {
+        return this.runWithFileLockCore(fn);
+      }
+      throw err;
+    }
+    // Redis manager 初始化失敗 → fallback 到 file lock
+    return this.runWithFileLockCore(fn);
+  }
+
+  /**
+   * File-lock 核心實作（抽取為 internal method）。
+   * 供 Redis lock 失敗時 fallback 使用。
+   */
+  private async runWithFileLockCore<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
     if (!existsSync(lockPath)) {
