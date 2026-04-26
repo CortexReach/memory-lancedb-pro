@@ -3,7 +3,7 @@
  * PR #593 - Windows path support for extensionAPI.js
  *
  * Tests the behavior of `toImportSpecifier` and `getExtensionApiImportSpecifiers`.
- * Both functions are imported from index.ts (exported for testing) — PR #593.
+ * Both functions are imported from index.ts (exported for testing).
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -20,7 +20,7 @@ const jitiLib = jitiFactory(import.meta.url, {
   },
 });
 
-// Import actual implementations from index.ts via jiti (both exported for testing) — PR #593
+// Import actual implementations from index.ts via jiti (both exported for testing)
 const { toImportSpecifier, getExtensionApiImportSpecifiers } = jitiLib("../index.ts");
 
 // Env helper: set key to value, run fn, restore original
@@ -59,7 +59,7 @@ describe("toImportSpecifier", () => {
     assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
   });
 
-  // --- Windows paths (PR #593) ---
+  // --- Windows paths ---
   if (process.platform === "win32") {
     it("converts Windows drive-letter backslash path to file:// URL", () => {
       const result = toImportSpecifier("C:\\Users\\admin\\AppData\\Roaming\\npm\\node_modules\\openclaw\\dist\\extensionAPI.js");
@@ -88,7 +88,7 @@ describe("toImportSpecifier", () => {
       assert.equal(result, "C:path\\to\\file.js");
     });
 
-    // --- UNC paths (PR #593) ---
+    // --- UNC paths ---
     it("converts UNC path (\\\\server\\share) to file:// URL", () => {
       const result = toImportSpecifier("\\\\server\\share\\path\\to\\file.js");
       assert.ok(result.startsWith("file://"), `Expected file:// URL, got: ${result}`);
