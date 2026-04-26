@@ -195,6 +195,15 @@ function simpleEnrich(
 //
 // Plugin can acquire lock only after Phase 2 completes (full batch).
 //
+// [BATCH-SIZE / LOCK-DURATION TRADEOFF]
+// Phase 2 holds ONE lock for the ENTIRE batch:
+//   - batchSize=10  → lock held for ~10 sequential DB ops (query/delete/add)
+//   - batchSize=100 → lock held for ~100 sequential DB ops (10× longer)
+// Tradeoff: larger batch = fewer lock acquisitions but longer lock hold time per batch.
+// Recommendation: batchSize=10 is a good balance (~10ms lock hold vs LLM seconds).
+// If Plugin latency is critical, use smaller batch (5-10). If throughput is critical,
+// use larger batch (50-100) with monitoring on Plugin write latency p99.
+//
 // MR2 FIX (Issue #632):
 // ---------------------
 // The old Phase 2 built a complete metadata STRING in Phase 2a,凝固（凝固 =
