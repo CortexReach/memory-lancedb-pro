@@ -1,0 +1,42 @@
+{
+  "generatedAt": "2026-04-19T02:26:15.090Z",
+  "policyVersion": "dgg-2684",
+  "writeApplied": true,
+  "configPath": "/Users/albert/.openclaw/openclaw.json",
+  "policyPath": "/Users/albert/.openclaw/extensions/memory-lancedb-pro/scripts/ops/dgg-2684-scope-policy.json",
+  "changedAgentCount": 1,
+  "changedAgents": [
+    {
+      "agentId": "main",
+      "beforeCount": 14,
+      "afterCount": 9,
+      "added": [],
+      "removed": [
+        "agent:kuromi",
+        "agent:hellokitty-exec",
+        "agent:mymelody-pm",
+        "agent:badtz-dev",
+        "agent:cinna-mlds"
+      ]
+    }
+  ],
+  "unchangedAgentCount": 8,
+  "retrievalBefore": {
+    "vectorWeight": 0.55,
+    "bm25Weight": 0.45,
+    "recencyHalfLifeDays": 10,
+    "recencyWeight": 0.18,
+    "hardMinScore": 0.32
+  },
+  "retrievalAfter": {
+    "vectorWeight": 0.55,
+    "bm25Weight": 0.45,
+    "recencyHalfLifeDays": 10,
+    "recencyWeight": 0.18,
+    "hardMinScore": 0.32
+  },
+  "retrievalChangedKeys": [],
+  "retrievalChanges": {},
+  "configSha256Before": "db5771edc93339e7daeff582fae091353e773feb3a7285feee1ed8873f58d859",
+  "configSha256After": "7f99c8a556771311d6119b995259cf3f56b67f56d3a8f6fdd38a933812e541a9"
+}

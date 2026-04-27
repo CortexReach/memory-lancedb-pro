@@ -1,0 +1,94 @@
+{
+  "generatedAt": "2026-04-19T02:26:15.089Z",
+  "policyVersion": "dgg-2684",
+  "source": "before",
+  "agentAccess": {
+    "albot": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "dggd:decisions",
+      "agent:albot"
+    ],
+    "badtz-dev": [
+      "dggd",
+      "dggd:projects",
+      "dggd:ops",
+      "role:dev",
+      "agent:badtz-dev"
+    ],
+    "cinna-mlds": [
+      "dggd",
+      "dggd:projects",
+      "dggd:ops",
+      "role:dev",
+      "agent:cinna-mlds"
+    ],
+    "hellokitty-exec": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "dggd:decisions",
+      "dggd:ops",
+      "role:exec",
+      "agent:hellokitty-exec"
+    ],
+    "koolmi": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "agent:koolmi"
+    ],
+    "kuromi": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "dggd:decisions",
+      "dggd:ops",
+      "role:exec",
+      "role:pm",
+      "role:dev",
+      "agent:kuromi"
+    ],
+    "main": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "dggd:decisions",
+      "dggd:ops",
+      "role:exec",
+      "role:pm",
+      "role:dev",
+      "agent:main",
+      "agent:kuromi",
+      "agent:hellokitty-exec",
+      "agent:mymelody-pm",
+      "agent:badtz-dev",
+      "agent:cinna-mlds"
+    ],
+    "mymelody-pm": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "dggd:decisions",
+      "dggd:ops",
+      "role:pm",
+      "agent:mymelody-pm"
+    ],
+    "tamer": [
+      "dggd",
+      "dggd:team",
+      "dggd:projects",
+      "dggd:decisions",
+      "dggd:ops",
+      "agent:tamer"
+    ]
+  },
+  "retrieval": {
+    "vectorWeight": 0.55,
+    "bm25Weight": 0.45,
+    "recencyHalfLifeDays": 10,
+    "recencyWeight": 0.18,
+    "hardMinScore": 0.32
+  }
+}

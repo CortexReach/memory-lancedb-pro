@@ -48,6 +48,14 @@ function createMockEmbedder() {
 // ============================================================================
 
 describe("MemoryRetriever - Tag Query", () => {
+  it("should expose tuned retrieval defaults from DGG-2684", () => {
+    assert.equal(DEFAULT_RETRIEVAL_CONFIG.vectorWeight, 0.55);
+    assert.equal(DEFAULT_RETRIEVAL_CONFIG.bm25Weight, 0.45);
+    assert.equal(DEFAULT_RETRIEVAL_CONFIG.recencyHalfLifeDays, 10);
+    assert.equal(DEFAULT_RETRIEVAL_CONFIG.recencyWeight, 0.18);
+    assert.equal(DEFAULT_RETRIEVAL_CONFIG.hardMinScore, 0.32);
+  });
+
   describe("BM25-only retrieval with mustContain", () => {
     it("should only return entries literally containing proj:AIF", async () => {
       const entries = [
@@ -285,6 +293,78 @@ describe("MemoryRetriever - Tag Query", () => {
       assert.equal(results.length, 1);
       assert.equal(results[0].entry.id, "1");
       assert.ok(!results.some((r) => r.entry.id === "2"));
+    });
+
+    it("should respect scope tags using entry.scope even without literal tag text", async () => {
+      const entries = [
+        {
+          id: "1",
+          text: "최근 작업 정리",
+          scope: "agent:badtz-dev",
+          category: "fact",
+          timestamp: Date.now(),
+          vector: new Array(384).fill(0.1),
+        },
+        {
+          id: "2",
+          text: "최근 작업 정리",
+          scope: "dggd:ops",
+          category: "fact",
+          timestamp: Date.now(),
+          vector: new Array(384).fill(0.1),
+        },
+      ];
+
+      const store = createMockStore(entries);
+      const embedder = createMockEmbedder();
+      const retriever = new MemoryRetriever(store, embedder, {
+        ...DEFAULT_RETRIEVAL_CONFIG,
+        tagPrefixes: ["agent", "dggd", "scope"],
+      });
+
+      const results = await retriever.retrieve({
+        query: "agent:badtz-dev 최근 작업",
+        limit: 5,
+      });
+
+      assert.equal(results.length, 1);
+      assert.equal(results[0].entry.id, "1");
+    });
+
+    it("should allow nested dggd scope tags (dggd:ops)", async () => {
+      const entries = [
+        {
+          id: "1",
+          text: "최근 작업 정리",
+          scope: "dggd:ops",
+          category: "fact",
+          timestamp: Date.now(),
+          vector: new Array(384).fill(0.1),
+        },
+        {
+          id: "2",
+          text: "최근 작업 정리",
+          scope: "dggd:projects",
+          category: "fact",
+          timestamp: Date.now(),
+          vector: new Array(384).fill(0.1),
+        },
+      ];
+
+      const store = createMockStore(entries);
+      const embedder = createMockEmbedder();
+      const retriever = new MemoryRetriever(store, embedder, {
+        ...DEFAULT_RETRIEVAL_CONFIG,
+        tagPrefixes: ["dggd", "scope"],
+      });
+
+      const results = await retriever.retrieve({
+        query: "dggd:ops 최근 작업",
+        limit: 5,
+      });
+
+      assert.equal(results.length, 1);
+      assert.equal(results[0].entry.id, "1");
     });
   });
 });

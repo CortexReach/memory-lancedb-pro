@@ -317,13 +317,13 @@
             "type": "number",
             "minimum": 0,
             "maximum": 1,
-            "default": 0.7
+            "default": 0.55
           },
           "bm25Weight": {
             "type": "number",
             "minimum": 0,
             "maximum": 1,
-            "default": 0.3
+            "default": 0.45
           },
           "minScore": {
             "type": "number",
@@ -383,14 +383,14 @@
             "type": "number",
             "minimum": 0,
             "maximum": 365,
-            "default": 14,
+            "default": 10,
             "description": "Half-life in days for recency boost. Newer memories get higher scores. Set 0 to disable."
           },
           "recencyWeight": {
             "type": "number",
             "minimum": 0,
             "maximum": 0.5,
-            "default": 0.1,
+            "default": 0.18,
             "description": "Maximum recency boost factor added to score"
           },
           "filterNoise": {
@@ -409,7 +409,7 @@
             "type": "number",
             "minimum": 0,
             "maximum": 1,
-            "default": 0.35,
+            "default": 0.32,
             "description": "Hard cutoff after all scoring stages. Results below this score are discarded."
           },
           "timeDecayHalfLifeDays": {
