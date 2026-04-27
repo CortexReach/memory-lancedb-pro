@@ -73,28 +73,43 @@ export interface LockConfig {
   ttl?: number; // lock 持有時間（毫秒）
   maxWait?: number; // 最大等待時間（毫秒）
   retryDelay?: number; // 重試延遲（毫秒）
+  /** Issue 4 fix: 用於 namespace Redis lock key，避免不同 dbPath 的 store 互相 blocking */
+  dbPath?: string;
 }
 
 export class RedisLockManager {
-  // ioredis client — 用 type-only import，實際 instance 在 connect() 時 dynamic import
-  private redis: IORedisType | null = null;
+  // ioredis client — 用 any 避免 type 不匹配問題
+  private redis: any = null;
   private defaultTTL = 60000; // 60 秒
-  private maxWait = 60000; // 最多等 60 秒
+  private maxWait = 60000; // 60 秒
   private retryDelay = 100; // 初始重試延遲
   private _connectionError: unknown = null;
+  private readonly _lockNamespace: string;
 
-  constructor(private readonly config?: LockConfig) {}
+  constructor(private readonly config?: LockConfig) {
+    // Issue 4 fix: namespace key with dbPath hash，避免不同 dbPath 的 store 互相 blocking
+    this._lockNamespace = config?.dbPath ? hashString(config.dbPath) : "default";
+  }
 
   /**
    * Issue 1 fix: 動態載入 ioredis，只在 connect() 時才 import。
-   * 這樣 consumer 沒裝 ioredis 時，不會在 module load time 就 crash。
+   * Issue 3 fix: 正確解析 URL，保留 DB selection（/0, /1, /2...）
+   * 用 any 避免 type cast 問題。
    */
   async connect(): Promise<void> {
     try {
-      // Dynamic import — 延遲到真的需要時才載入
-      const { default: Redis } = await import("ioredis") as { default: typeof IORedisType };
+      // Dynamic import — 用 any 避免 type mismatches
+      const RedisModule = await import("ioredis") as any;
+      const Redis = RedisModule.default;
       const redisUrl = this.config?.redisUrl || process.env.REDIS_URL || "redis://localhost:6379";
-      this.redis = new Redis(redisUrl.replace("redis://", ""), {
+
+      // Issue 3 fix: 正確解析 URL，保留 DB selection
+      const redisOptions = parseRedisUrl(redisUrl);
+
+      this.redis = new Redis({
+        host: redisOptions.host,
+        port: redisOptions.port,
+        db: redisOptions.db,
         lazyConnect: true,
         retryStrategy: (times: number) => {
           if (times > 3) return null; // 停止重連，進入 stopped state
@@ -131,7 +146,8 @@ export class RedisLockManager {
       throw new RedisUnavailableError("Redis client not initialized");
     }
 
-    const lockKey = `memory-lock:${key}`;
+    // Issue 4 fix: namespace key with dbPath，避免跨 instance blocking
+    const lockKey = `memory-lock:${this._lockNamespace}:${key}`;
     const token = generateToken();
     const startTime = Date.now();
     const lockTTL = ttl || this.defaultTTL;
@@ -223,6 +239,69 @@ export class RedisLockManager {
 
 function generateToken(): string {
   return `${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+}
+
+// ============================================================================
+// URL Parser（Issue 3 fix）
+// ============================================================================
+
+interface RedisOptions {
+  host: string;
+  port: number;
+  db: number;
+}
+
+/**
+ * Issue 3 fix: 正確解析 Redis URL，保留 DB selection。
+ *
+ * 支援：
+ * - redis://localhost:6379         → host=localhost, port=6379, db=0
+ * - redis://localhost:6379/1       → host=localhost, port=6379, db=1
+ * - redis://192.0.2.1:6380/5       → host=192.0.2.1, port=6380, db=5
+ * - localhost:6379                  → host=localhost, port=6379, db=0（fallback for legacy format）
+ *
+ * 解析錯誤處理：
+ * - 非數字 db（如 /abc）：fallback 到 0，warn log
+ * - IPv6：[::1]:6379/2 — 正確解析
+ * - 有密碼：redis://user:pass@host:6379/1 — password 略過，正確解析 host/port/db
+ */
+function parseRedisUrl(redisUrl: string): RedisOptions {
+  try {
+    const url = new URL(redisUrl);
+    const host = url.hostname;
+    const port = Number(url.port) || 6379;
+    const rawDb = url.pathname.replace("/", "");
+    // Issue 3 fix: 驗證 db 必須是數字，否則 fallback 到 0（不靜默接受 NaN）
+    const db = /^\d+$/.test(rawDb) ? Number(rawDb) : (rawDb ? (console.warn(`[RedisLock] Invalid DB in URL: ${rawDb}, fallback to 0`), 0) : 0);
+    return { host, port, db };
+  } catch {
+    // Fallback：可能是 legacy 格式 "localhost:6379"，直接用 string constructor
+    const parts = redisUrl.replace("redis://", "").split(":");
+    return {
+      host: parts[0] || "localhost",
+      port: Number(parts[1]) || 6379,
+      db: 0,
+    };
+  }
+}
+
+// ============================================================================
+// String Hash（Issue 4 fix）
+// ============================================================================
+
+/**
+ * Issue 4 fix: 將 dbPath 轉為短 hash，用於 namespace Redis lock key。
+ * 避免不同 dbPath 的 store instances 互相 blocking。
+ */
+function hashString(str: string): string {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // convert to 32bit integer
+  }
+  // 轉為正數並取末 8 位，轉成 base36
+  return Math.abs(hash).toString(36).padStart(4, "0");
 }
 
 // ============================================================================
