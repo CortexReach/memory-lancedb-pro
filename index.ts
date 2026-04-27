@@ -2858,10 +2858,18 @@ const memoryLanceDBProPlugin = {
           // enrich with one piece of prior context so bare "remember this" turns get history.
           const lastPending = pendingIngressTexts.length > 0 ? pendingIngressTexts[pendingIngressTexts.length - 1] : undefined;
           if (lastPending !== undefined && isExplicitRememberCommand(lastPending) && priorRecentTexts.length > 0) {
-            // [Fix-MF1] Prepend lastPending to newTexts — do NOT replace the batch.
-            // Old: texts = [lastPending, ...priorRecentTexts.slice(-1)] dropped all newTexts.
-            // New: texts = [lastPending, ...newTexts] preserves content while adding history.
-            texts = [lastPending, ...newTexts];
+            // [Fix-MF1 v2] Prepend lastPending to newTexts, avoiding duplicates.
+            // In REPLACE mode, lastPending is already the last element of newTexts (pendingIngressTexts).
+            // We need to move it to front OR use priorRecentTexts for context, not duplicate it.
+            // Solution: prepend lastPending, but skip if it's already the last element (duplicate case).
+            const isDuplicate = newTexts.length > 0 && newTexts[newTexts.length - 1] === lastPending;
+            if (isDuplicate) {
+              // Already have lastPending at end of newTexts, just move it to front
+              texts = [lastPending, ...newTexts.slice(0, -1)];
+            } else {
+              // Normal case: prepend lastPending to provide context
+              texts = [lastPending, ...newTexts];
+            }
           }
           if (newTexts.length > 0) {
             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-AUTO_CAPTURE_PENDING_WINDOW);
