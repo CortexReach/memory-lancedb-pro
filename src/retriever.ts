@@ -105,6 +105,11 @@ export interface RetrievalContext {
   category?: string;
   /** Retrieval source: "manual" for user-triggered, "auto-recall" for system-initiated, "cli" for CLI commands. */
   source?: "manual" | "auto-recall" | "cli";
+  /** Optional AbortSignal. When aborted, in-flight embedding calls cancel and
+   *  the method rejects due to abort (often with AbortError or the signal's
+   *  abort reason) instead of holding the caller's session lock while the
+   *  underlying HTTP request runs to completion. */
+  signal?: AbortSignal;
 }
 
 export interface RetrievalResult extends MemorySearchResult {
@@ -559,7 +564,7 @@ export class MemoryRetriever {
   }
 
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
-    const { query, limit, scopeFilter, category, source } = context;
+    const { query, limit, scopeFilter, category, source, signal } = context;
     const safeLimit = clampInt(limit, 1, 20);
     this.lastDiagnostics = null;
     const diagnostics: RetrievalDiagnostics = {
@@ -615,6 +620,7 @@ export class MemoryRetriever {
           category,
           trace,
           diagnostics,
+          signal,
         );
       } else {
         results = await this.hybridRetrieval(
@@ -625,6 +631,7 @@ export class MemoryRetriever {
           trace,
           source,
           diagnostics,
+          signal,
         );
       }
 
@@ -717,11 +724,12 @@ export class MemoryRetriever {
     category?: string,
     trace?: TraceCollector,
     diagnostics?: RetrievalDiagnostics,
+    signal?: AbortSignal,
   ): Promise<RetrievalResult[]> {
     let failureStage: RetrievalDiagnostics["failureStage"] = "vector.embedQuery";
     try {
       const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
-      const queryVector = await this.embedder.embedQuery(query);
+      const queryVector = await this.embedder.embedQuery(query, signal);
       failureStage = "vector.vectorSearch";
       const results = await this.store.vectorSearch(
         queryVector,
@@ -907,11 +915,12 @@ export class MemoryRetriever {
     trace?: TraceCollector,
     source?: RetrievalContext["source"],
     diagnostics?: RetrievalDiagnostics,
+    signal?: AbortSignal,
   ): Promise<RetrievalResult[]> {
     let failureStage: RetrievalDiagnostics["failureStage"] = "hybrid.embedQuery";
     try {
       const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
-      const queryVector = await this.embedder.embedQuery(query);
+      const queryVector = await this.embedder.embedQuery(query, signal);
       const bm25Query = this.buildBM25Query(query, source);
       if (diagnostics) {
         diagnostics.bm25Query = bm25Query;
