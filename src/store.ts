@@ -214,7 +214,7 @@ export class MemoryStore {
 // ============================================================================
 
 import type { RedisLockManager } from "./redis-lock.js";
-import { createRedisLockManager } from "./redis-lock.js";
+import { createRedisLockManager, RedisUnavailableError } from "./redis-lock.js";
 
 /** M2: initPromise guard — 防止並發建立多個 Redis client */
 let redisLockManager: RedisLockManager | null = null;
@@ -241,14 +241,24 @@ export async function getRedisLockManager(): Promise<RedisLockManager | null> {
   if (redisInitPromise !== null) {
     return redisInitPromise;
   }
-  redisInitPromise = (async () => {
+  // C1 fix: compare-and-swap — 先建 promise 再賦值，避免 T2 覆蓋 T1 的 init promise
+  const initPromise = (async () => {
     try {
-      return await createRedisLockManager();
+      const mgr = await createRedisLockManager();
+      if (mgr !== null) {
+        redisLockManager = mgr; // resolve 後寫入 cache，後續 caller 走 fast path
+      }
+      return mgr;
     } catch (err) {
       console.warn("[store] getRedisLockManager failed:", err);
       return null;
     }
   })();
+  if (redisInitPromise !== null) {
+    // 另一個 caller 比我們先 assigned 了自己的 promise，放棄自己的
+    return redisInitPromise;
+  }
+  redisInitPromise = initPromise;
   return redisInitPromise;
 }
 
@@ -269,7 +279,11 @@ export async function getRedisLockManager(): Promise<RedisLockManager | null> {
         }
       }
     } catch (err) {
-      // M1: RedisUnavailableError 時進 file-lock fallback（使用 Symbol.for，ESM-safe）
+      // M1: RedisUnavailableError 時進 file-lock fallback
+      // H1 fix: instanceof guard 作為第一線，Symbol.for 作為 ESM-safe fallback
+      if (err instanceof RedisUnavailableError) {
+        return this.runWithFileLockCore(fn);
+      }
       if (err && typeof err === "object" && Symbol.for("RedisUnavailableError") in err) {
         return this.runWithFileLockCore(fn);
       }

@@ -19,6 +19,9 @@ import Redis from "ioredis";
  * 不進 fallback，直接 throw。
  */
 export function isRedisConnectionError(err: unknown, depth = 0): boolean {
+  // H2 fix: depth=3 假設文件化
+  // ioredis error chain 通常: MaxRetriesPerRequestError → AggregateError → errors[] → individual errors
+  // 若 depth 到達上限仍未確認為連線錯誤，回傳 false（不誤判，維持既有行為）
   if (depth >= 3) return false;
   if (!(err instanceof Error)) return false;
 
@@ -129,14 +132,8 @@ export class RedisLockManager {
     const startTime = Date.now();
     const lockTTL = ttl || this.defaultTTL;
 
-    // 先 ping 確認 Redis 可用
-    try {
-      await this.redis.ping();
-    } catch (err) {
-      // Redis 不可用 → 拋出 RedisUnavailableError，讓 store.ts 進 file-lock fallback
-      throw new RedisUnavailableError(`Redis ping failed: ${err}`);
-    }
-
+    // H4 fix: 移除 pre-flight ping，直接讓第一個 SET() 自然失敗
+    // 避免 TOCTOU (ping ok 但 set 前 Redis 掛掉)，並節省一次 round-trip
     // MAX_ATTEMPTS circuit breaker：防止無限期重試
     const MAX_ATTEMPTS = 600;
     let attempts = 0;
