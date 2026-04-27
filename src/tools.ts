@@ -1284,7 +1284,7 @@ export function registerMemoryUpdateTool(
           // importance-only change that still needs metadata sync). Shared by
           // the temporal supersede guard and the normal-path metadata rebuild.
           let existing: MemoryEntry | null = null;
-          if (text || importance !== undefined) {
+          if (text || importance !== undefined || category) {
             existing = await context.store.getById(resolvedId, scopeFilter);
           }
 
@@ -1387,6 +1387,7 @@ export function registerMemoryUpdateTool(
               l0_abstract: text,
               l1_overview: `- ${text}`,
               l2_content: text,
+              memory_category: effectiveCategory,
               fact_key: deriveFactKey(effectiveCategory, text),
               memory_temporal_type: classifyTemporal(text),
               confidence:
@@ -1399,10 +1400,19 @@ export function registerMemoryUpdateTool(
             // clears any stale value inherited from the previous text.
             updatedMeta.valid_until = inferExpiry(text);
             updates.metadata = stringifySmartMetadata(updatedMeta);
-          } else if (importance !== undefined && existing) {
-            // Sync confidence for importance-only changes
+          } else if ((importance !== undefined || category) && existing) {
+            // Sync metadata for category-only or importance-only changes
+            const meta = parseSmartMetadata(existing.metadata, existing);
+            const effectiveCategory = (category as any) ?? meta.memory_category;
             const updatedMeta = buildSmartMetadata(existing, {
-              confidence: clamp01(importance, 0.7),
+              memory_category: effectiveCategory,
+              confidence:
+                importance !== undefined
+                  ? clamp01(importance, 0.7)
+                  : meta.confidence,
+              fact_key: category
+                ? deriveFactKey(effectiveCategory, existing.text)
+                : meta.fact_key,
             });
             updates.metadata = stringifySmartMetadata(updatedMeta);
           }

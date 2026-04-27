@@ -1,5 +1,6 @@
 /**
- * Test: memory_update normal path rebuilds smart metadata on text/importance change.
+ * Test: memory_update normal path rebuilds smart metadata on text,
+ * category, and importance changes.
  *
  * Validates the fix for #544: the normal (non-supersede) update path was
  * updating entry.text but leaving l0_abstract / l1_overview / l2_content
@@ -48,14 +49,16 @@ function clamp01(value, fallback = 0.7) {
 
 /**
  * Simulate the updated memory_update handler logic from tools.ts,
- * including the new metadata rebuild for the normal update path (#544).
+ * including metadata rebuilds for the normal update path (#544).
  */
 async function simulateMemoryUpdate(store, resolvedId, text, newVector, importance, category, scopeFilter) {
   // Hoist existing entry fetch (matches the code change)
   let existing = null;
+  if (text || importance !== undefined || category) {
+    existing = await store.getById(resolvedId, scopeFilter);
+  }
 
   if (text && newVector) {
-    existing = await store.getById(resolvedId, scopeFilter);
     if (existing) {
       const meta = parseSmartMetadata(existing.metadata, existing);
       if (TEMPORAL_VERSIONED_CATEGORIES.has(meta.memory_category)) {
@@ -119,7 +122,7 @@ async function simulateMemoryUpdate(store, resolvedId, text, newVector, importan
   if (importance !== undefined) updates.importance = clamp01(importance);
   if (category) updates.category = category;
 
-  // Rebuild smart metadata when text or importance changes (#544)
+  // Rebuild smart metadata when text, category, or importance changes (#544)
   if (text && existing) {
     const meta = parseSmartMetadata(existing.metadata, existing);
     const effectiveCategory = category ? category : meta.memory_category;
@@ -128,6 +131,7 @@ async function simulateMemoryUpdate(store, resolvedId, text, newVector, importan
       l0_abstract: text,
       l1_overview: `- ${text}`,
       l2_content: text,
+      memory_category: effectiveCategory,
       fact_key: deriveFactKey(effectiveCategory, text),
       memory_temporal_type: classifyTemporal(text),
       // Pass 0 when no expiry so buildSmartMetadata clears the old value
@@ -136,16 +140,21 @@ async function simulateMemoryUpdate(store, resolvedId, text, newVector, importan
         importance !== undefined ? clamp01(importance) : meta.confidence,
     });
     updates.metadata = stringifySmartMetadata(updatedMeta);
-  } else if (importance !== undefined && !text) {
-    // Sync confidence for importance-only changes
-    const entry = existing ?? await store.getById(resolvedId, scopeFilter);
-    if (entry) {
-      const meta = parseSmartMetadata(entry.metadata, entry);
-      const updatedMeta = buildSmartMetadata(entry, {
-        confidence: clamp01(importance),
-      });
-      updates.metadata = stringifySmartMetadata(updatedMeta);
-    }
+  } else if ((importance !== undefined || category) && existing) {
+    // Sync metadata for category-only or importance-only changes.
+    const meta = parseSmartMetadata(existing.metadata, existing);
+    const effectiveCategory = category ? category : meta.memory_category;
+    const updatedMeta = buildSmartMetadata(existing, {
+      memory_category: effectiveCategory,
+      confidence:
+        importance !== undefined
+          ? clamp01(importance)
+          : meta.confidence,
+      fact_key: category
+        ? deriveFactKey(effectiveCategory, existing.text)
+        : meta.fact_key,
+    });
+    updates.metadata = stringifySmartMetadata(updatedMeta);
   }
 
   const updated = await store.update(resolvedId, updates, scopeFilter);
@@ -358,9 +367,9 @@ async function runTests() {
     console.log("  OK importance-only change syncs confidence");
 
     // ====================================================================
-    // Test 5: Text unchanged, metadata preserved
+    // Test 5: Category-only change syncs smart metadata
     // ====================================================================
-    console.log("\nTest 5: text unchanged, metadata preserved...");
+    console.log("\nTest 5: category-only change syncs metadata...");
 
     const origText5 = "Uses TypeScript for all projects";
     const entry5 = await store.store({
@@ -386,40 +395,90 @@ async function runTests() {
 
     // Update only category (no text, no importance)
     const result5 = await simulateMemoryUpdate(
-      store, entry5.id, undefined, undefined, undefined, "decision", scopeFilter,
+      store, entry5.id, undefined, undefined, undefined, "preferences", scopeFilter,
     );
 
     assert.equal(result5.action, "updated");
     const after5 = await store.getById(entry5.id, scopeFilter);
-    assert.equal(after5.category, "decision", "category should be updated");
+    assert.equal(after5.category, "preferences", "category should be updated");
     const meta5 = parseSmartMetadata(after5.metadata, after5);
+    assert.equal(meta5.memory_category, "preferences", "metadata category should be synced");
+    assert.equal(
+      meta5.fact_key,
+      deriveFactKey("preferences", origText5),
+      "category-only change should refresh temporal fact_key",
+    );
     // l0/l1/l2 should be unchanged since text was not modified
     assert.equal(meta5.l0_abstract, origText5, "l0 should be preserved");
     assert.equal(meta5.l1_overview, `- ${origText5}`, "l1 should be preserved");
     assert.equal(meta5.l2_content, origText5, "l2 should be preserved");
     assert.equal(meta5.confidence, 0.6, "confidence should be preserved");
 
-    console.log("  OK text unchanged, metadata preserved");
+    console.log("  OK category-only change syncs metadata");
 
     // ====================================================================
-    // Test 6: Supersede path unaffected (regression)
+    // Test 6: Text + category change syncs smart metadata
     // ====================================================================
-    console.log("\nTest 6: supersede path unaffected (regression)...");
+    console.log("\nTest 6: text + category change syncs metadata...");
 
-    const origText6 = "Preferred IDE: Vim";
+    const origText6 = "Incident response checklist lives in Notion";
     const entry6 = await store.store({
       text: origText6,
       vector: makeVector(9),
+      category: "fact",
+      scope: "test",
+      importance: 0.7,
+      metadata: stringifySmartMetadata(
+        buildSmartMetadata(
+          { text: origText6, category: "fact", importance: 0.7 },
+          {
+            l0_abstract: origText6,
+            l1_overview: `- ${origText6}`,
+            l2_content: origText6,
+            memory_category: "cases",
+            tier: "working",
+            confidence: 0.7,
+          },
+        ),
+      ),
+    });
+
+    const newText6 = "Incident response checklist lives in Linear";
+    const result6 = await simulateMemoryUpdate(
+      store, entry6.id, newText6, makeVector(10), undefined, "patterns", scopeFilter,
+    );
+
+    assert.equal(result6.action, "updated");
+    const after6 = await store.getById(entry6.id, scopeFilter);
+    assert.equal(after6.text, newText6, "text should be updated");
+    assert.equal(after6.category, "patterns", "category should be updated");
+    const meta6 = parseSmartMetadata(after6.metadata, after6);
+    assert.equal(meta6.memory_category, "patterns", "metadata category should be synced");
+    assert.equal(meta6.l0_abstract, newText6, "l0 should be updated");
+    assert.equal(meta6.l1_overview, `- ${newText6}`, "l1 should be updated");
+    assert.equal(meta6.l2_content, newText6, "l2 should be updated");
+
+    console.log("  OK text + category change syncs metadata");
+
+    // ====================================================================
+    // Test 7: Supersede path unaffected (regression)
+    // ====================================================================
+    console.log("\nTest 7: supersede path unaffected (regression)...");
+
+    const origText7 = "Preferred IDE: Vim";
+    const entry7 = await store.store({
+      text: origText7,
+      vector: makeVector(11),
       category: "preference",
       scope: "test",
       importance: 0.8,
       metadata: stringifySmartMetadata(
         buildSmartMetadata(
-          { text: origText6, category: "preference", importance: 0.8 },
+          { text: origText7, category: "preference", importance: 0.8 },
           {
-            l0_abstract: origText6,
+            l0_abstract: origText7,
             l1_overview: "- Vim",
-            l2_content: origText6,
+            l2_content: origText7,
             memory_category: "preferences",
             tier: "working",
             confidence: 0.8,
@@ -428,27 +487,27 @@ async function runTests() {
       ),
     });
 
-    const newText6 = "Preferred IDE: VS Code";
-    const result6 = await simulateMemoryUpdate(
-      store, entry6.id, newText6, makeVector(10), undefined, undefined, scopeFilter,
+    const newText7 = "Preferred IDE: VS Code";
+    const result7 = await simulateMemoryUpdate(
+      store, entry7.id, newText7, makeVector(12), undefined, undefined, scopeFilter,
     );
 
-    assert.equal(result6.action, "superseded", "preferences text change should still supersede");
-    assert.ok(result6.newId, "should have new record");
-    assert.equal(result6.oldId, entry6.id, "should reference old record");
+    assert.equal(result7.action, "superseded", "preferences text change should still supersede");
+    assert.ok(result7.newId, "should have new record");
+    assert.equal(result7.oldId, entry7.id, "should reference old record");
 
     // Old record should be invalidated
-    const old6 = await store.getById(entry6.id, scopeFilter);
-    const oldMeta6 = parseSmartMetadata(old6.metadata, old6);
-    assert.ok(oldMeta6.invalidated_at, "old record should be invalidated");
-    assert.equal(isMemoryActiveAt(oldMeta6), false, "old record should be inactive");
+    const old7 = await store.getById(entry7.id, scopeFilter);
+    const oldMeta7 = parseSmartMetadata(old7.metadata, old7);
+    assert.ok(oldMeta7.invalidated_at, "old record should be invalidated");
+    assert.equal(isMemoryActiveAt(oldMeta7), false, "old record should be inactive");
 
     // New record should be active with supersede chain
-    const new6 = await store.getById(result6.newId, scopeFilter);
-    assert.equal(new6.text, newText6, "new record should have updated text");
-    const newMeta6 = parseSmartMetadata(new6.metadata, new6);
-    assert.equal(newMeta6.supersedes, entry6.id, "supersede chain should be intact");
-    assert.equal(isMemoryActiveAt(newMeta6), true, "new record should be active");
+    const new7 = await store.getById(result7.newId, scopeFilter);
+    assert.equal(new7.text, newText7, "new record should have updated text");
+    const newMeta7 = parseSmartMetadata(new7.metadata, new7);
+    assert.equal(newMeta7.supersedes, entry7.id, "supersede chain should be intact");
+    assert.equal(isMemoryActiveAt(newMeta7), true, "new record should be active");
 
     console.log("  OK supersede path unaffected");
 
