@@ -2848,7 +2848,7 @@ const memoryLanceDBProPlugin = {
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
           }
-          const currentCumulativeCount = previousSeenCount + newTexts.length;
+          const currentCumulativeCount = previousSeenCount + texts.length;
           autoCaptureSeenTextCount.set(sessionKey, currentCumulativeCount);
           pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
 
@@ -2858,7 +2858,10 @@ const memoryLanceDBProPlugin = {
           // enrich with one piece of prior context so bare "remember this" turns get history.
           const lastPending = pendingIngressTexts.length > 0 ? pendingIngressTexts[pendingIngressTexts.length - 1] : undefined;
           if (lastPending !== undefined && isExplicitRememberCommand(lastPending) && priorRecentTexts.length > 0) {
-            texts = [lastPending, ...priorRecentTexts.slice(-1)];
+            // [Fix-MF1] Prepend lastPending to newTexts — do NOT replace the batch.
+            // Old: texts = [lastPending, ...priorRecentTexts.slice(-1)] dropped all newTexts.
+            // New: texts = [lastPending, ...newTexts] preserves content while adding history.
+            texts = [lastPending, ...newTexts];
           }
           if (newTexts.length > 0) {
             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-AUTO_CAPTURE_PENDING_WINDOW);
