@@ -17,9 +17,7 @@ import jitiFactory from "jiti";
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { SmartExtractor } = jiti("../src/smart-extractor.ts");
 
-// ============================================================================
 // Helpers
-// ============================================================================
 
 /** Create a mock embedder with call counters for each method. */
 function makeCountingEmbedder(options = {}) {
@@ -87,8 +85,11 @@ function makeStore() {
       entries.push({ action: "store", entry });
       return entry;
     },
-    async bulkStore(entries) {
-      entries.forEach((e) => this.store(e));
+    async bulkStore(batchEntries) {
+      for (const entry of batchEntries) {
+        entries.push({ action: "bulkStore", entry });
+      }
+      return batchEntries;
     },
     async update(_id, _patch, _scopeFilter) {
       entries.push({ action: "update", id: _id });
@@ -115,9 +116,7 @@ function makeExtractor(embedder, llm, store, config = {}) {
   });
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 describe("SmartExtractor batch embedding paths", () => {
 
