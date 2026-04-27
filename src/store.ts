@@ -232,7 +232,8 @@ export class MemoryStore {
    * 同時寫入 → 資料競爭。Fail fast 犧牲可用性，但確保資料一致性。
    */
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
-    const mgr = await getRedisLockManager();
+    // Issue 4 fix: 傳遞 dbPath，namespace Redis lock key
+    const mgr = await getRedisLockManager(this.config.dbPath);
     if (mgr) {
       // Redis lock manager 存在 → 用 Redis lock
       // 如果 runtime 中 Redis 瞬斷，acquire() 會拋出 RedisUnavailableError，
@@ -1346,7 +1347,7 @@ function nodeTmpdir(): string {
  * M2: getRedisLockManager — 使用 initPromise guard，確保只建立一個 Redis client。
  * M1: Redis-first 策略：Redis 可用時用 Redis lock，否則 fallback 到 file lock。
  */
-export async function getRedisLockManager(): Promise<RedisLockManager | null> {
+export async function getRedisLockManager(dbPath?: string): Promise<RedisLockManager | null> {
   if (redisLockManager !== null) {
     return redisLockManager;
   }
@@ -1370,7 +1371,8 @@ export async function getRedisLockManager(): Promise<RedisLockManager | null> {
 
   _initInProgress = true;
   try {
-    const mgr = await createRedisLockManager();
+    // Issue 4 fix: 傳遞 dbPath，讓 Redis lock key 可被 namespace
+    const mgr = await createRedisLockManager(dbPath ? { dbPath } : undefined);
     redisLockManager = mgr;
     return mgr;
   } catch (err) {
