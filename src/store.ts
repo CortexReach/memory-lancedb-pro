@@ -1328,6 +1328,8 @@ export class MemoryStore {
 /** M2: initPromise guard — 防止並發建立多個 Redis client */
 let redisLockManager: RedisLockManager | null = null;
 let redisInitPromise: Promise<RedisLockManager | null> | null = null;
+/** C1/N5 fix: init in-progress flag — 防止 T1/T2 同時 start createRedisLockManager() */
+let _initInProgress = false;
 
 function nodeTmpdir(): string {
   // N2 fix: nodeTmpdir() 是 function call，不是 property access
@@ -1346,23 +1348,30 @@ export async function getRedisLockManager(): Promise<RedisLockManager | null> {
   if (redisInitPromise !== null) {
     return redisInitPromise;
   }
-  // C1 fix: compare-and-swap — 先建 promise 再賦值，避免 T2 覆蓋 T1 的 init promise
-  const initPromise = (async () => {
-    try {
-      const mgr = await createRedisLockManager();
-      if (mgr !== null) {
-        redisLockManager = mgr; // resolve 後寫入 cache，後續 caller 走 fast path
+  // C1 fix: _initInProgress flag — T2 spin-wait 而非自己也 start createRedisLockManager()
+  if (_initInProgress) {
+    // T2: 等 T1 的 init 完成，避免重複建立 client
+    const spinStart = Date.now();
+    while (_initInProgress) {
+      if (Date.now() - spinStart > 5000) {
+        // 5s timeout — init 超過 5s 放棄並走 fallback
+        console.warn("[store] getRedisLockManager: init timeout, returning null");
+        return null;
       }
-      return mgr;
-    } catch (err) {
-      console.warn("[store] getRedisLockManager failed:", err);
-      return null;
+      await new Promise((r) => setTimeout(r, 10));
     }
-  })();
-  if (redisInitPromise !== null) {
-    // 另一個 caller 比我們先 assigned 了自己的 promise，放棄自己的
-    return redisInitPromise;
+    return redisLockManager; // T1 完成後直接用 cache
   }
-  redisInitPromise = initPromise;
-  return redisInitPromise;
+
+  _initInProgress = true;
+  try {
+    const mgr = await createRedisLockManager();
+    redisLockManager = mgr;
+    return mgr;
+  } catch (err) {
+    console.warn("[store] getRedisLockManager failed:", err);
+    return null;
+  } finally {
+    _initInProgress = false;
+  }
 }
