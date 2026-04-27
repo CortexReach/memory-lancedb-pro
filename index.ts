@@ -3804,9 +3804,10 @@ const memoryLanceDBProPlugin = {
 
     async function runBackup() {
       try {
-        const backupDir = api.resolvePath(
-          join(resolvedDbPath, "..", "backups"),
-        );
+        // resolvedDbPath is already absolute (produced by api.resolvePath at
+        // plugin init); wrapping it again triggered a path-argument `undefined`
+        // in OpenClaw 2026.4.x's stricter plugin API. Join directly.
+        const backupDir = join(resolvedDbPath, "..", "backups");
         await mkdir(backupDir, { recursive: true });
 
         const allMemories = await store.list(undefined, undefined, 10000, 0);
