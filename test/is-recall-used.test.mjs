@@ -207,3 +207,72 @@ describe("isRecallUsed array edge cases", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// ID array edge cases
+// ---------------------------------------------------------------------------
+describe("isRecallUsed ID array edge cases", () => {
+  it("All IDs are empty strings — returns false", () => {
+    assert.strictEqual(recall("This is a meaningful response over 24 chars", ["", "", ""], undefined), false);
+  });
+
+  it("Mixed valid and empty IDs — only valid ID checked", () => {
+    // valid ID present with marker → true
+    assert.strictEqual(recall("I remember mem123 from earlier", ["", "mem123", ""], undefined), true);
+    // no valid ID → false (empty strings filtered out)
+    assert.strictEqual(recall("This is a response without any memory", ["", "  ", ""], undefined), false);
+  });
+
+  it("Multiple summaries — ID all invalid but summary succeeds", () => {
+    // IDs all empty/invalid, but summary verbatim triggers
+    assert.strictEqual(
+      recall("prefer typescript for all new projects", ["", "", ""], ["prefer typescript for all new projects"]),
+      true
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Summary 10-char boundary (case-insensitive)
+// ---------------------------------------------------------------------------
+describe("isRecallUsed Summary 10-char boundary (case-insensitive)", () => {
+  it("Summary exactly 10 chars — uppercase in response matches", () => {
+    const summary = "hello worl"; // exactly 10 chars
+    assert.strictEqual(recall("HELLO WORL is preferred here", [], [summary]), true);
+  });
+
+  it("Summary exactly 10 chars — mixed case in response matches", () => {
+    const summary = "hello worl";
+    assert.strictEqual(recall("Hello Worl is the way to go", [], [summary]), true);
+  });
+
+  it("Summary 10+ chars — partial match in response returns true", () => {
+    const summary = "hello worldx"; // 12 chars
+    assert.strictEqual(recall("I suggest hello worldx for all cases", [], [summary]), true);
+  });
+
+  it("Summary exactly 10 chars but response is too short (<= 24)", () => {
+    const summary = "hello worl"; // 10 chars
+    assert.strictEqual(recall("HELLO WORL", [], [summary]), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-language: CJK markers / summary in English response
+// ---------------------------------------------------------------------------
+describe("isRecallUsed cross-language negative cases", () => {
+  it("Chinese marker phrase but response is fully English — no match", () => {
+    // Has Chinese marker substring but response is pure English
+    assert.strictEqual(recall("I remember our previous conversation was helpful", [], undefined), false);
+  });
+
+  it("Chinese summary in response but English-only response — no match", () => {
+    const summary = "使用絕對路徑而非相對路徑";
+    assert.strictEqual(recall("use absolute paths not relative for imports", [], [summary]), false);
+  });
+
+  it("Mixed response — English with CJK summary verbatim match", () => {
+    const summary = "prefer absolute paths"; // English
+    assert.strictEqual(recall("I recommend to prefer absolute paths over relative ones", [], [summary]), true);
+  });
+});
