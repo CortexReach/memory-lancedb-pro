@@ -2848,12 +2848,11 @@ const memoryLanceDBProPlugin = {
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
           }
+          const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
+          let texts = newTexts;
           const currentCumulativeCount = previousSeenCount + texts.length;
           autoCaptureSeenTextCount.set(sessionKey, currentCumulativeCount);
           pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
-
-          const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
-          let texts = newTexts;
           // [Fix #5] Explicit remember command: if the last pending text is an explicit remember,
           // enrich with one piece of prior context so bare "remember this" turns get history.
           const lastPending = pendingIngressTexts.length > 0 ? pendingIngressTexts[pendingIngressTexts.length - 1] : undefined;
