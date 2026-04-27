@@ -213,33 +213,38 @@ export class MemoryStore {
 
   /**
    * 混合鎖實作：Redis lock 優先，失敗時進 file-lock fallback。
-   * M1: RedisUnavailableError 進 file-lock fallback。
-   * M2: getRedisLockManager() 有 initPromise guard，防止並發建立多個 client。
+   *
+   * Option E（init-time decision, runtime fixed）：
+   * getRedisLockManager() 只在第一次呼叫時決定用哪種 lock。
+   * 一旦決定，整個 process 生命週期內不再改變。
+   *
+   * 兩種失敗模式的不同處理：
+   * 1. Init failure（createRedisLockManager() 回傳 null）：
+   *    → 這個 process 從頭到尾都用 file lock（正常 fallback）
+   * 2. Runtime failure（acquire() 拋出 RedisUnavailableError）：
+   *    → 直接 throw，不 fallback
+   *    → 因為這個 process 已經決定用 Redis lock，不會因 Redis 瞬斷就切換到 file lock
+   *    → 這樣避免 split lock domain：Redis-locked 和 file-locked writer 不會同時並存
+   *
+   * 為什麼 runtime failure 不 fallback：
+   * 當 Process A 持有 Redis lock 時，Process B 的 Redis 瞬斷了，
+   * 如果 Process B fallback 到 file lock，兩者就進入不同的 lock domain，
+   * 同時寫入 → 資料競爭。Fail fast 犧牲可用性，但確保資料一致性。
    */
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
-    try {
-      const mgr = await getRedisLockManager();
-      if (mgr) {
-        const release = await mgr.acquire("memory-write", 60000);
-        try {
-          return await fn();
-        } finally {
-          await release();
-        }
+    const mgr = await getRedisLockManager();
+    if (mgr) {
+      // Redis lock manager 存在 → 用 Redis lock
+      // 如果 runtime 中 Redis 瞬斷，acquire() 會拋出 RedisUnavailableError，
+      // 但這裡我們不 catch，讓它直接往上傳 → write fail，不會偷偷繞到 file lock
+      const release = await mgr.acquire("memory-write", 60000);
+      try {
+        return await fn();
+      } finally {
+        await release();
       }
-    } catch (err) {
-      // M1: RedisUnavailableError 時進 file-lock fallback
-      // H1 fix: instanceof guard 作為第一線，Symbol.for 作為 ESM-safe fallback
-      if (err instanceof RedisUnavailableError) {
-        return this.runWithFileLockCore(fn);
-      }
-      // ESM-safe Symbol.for 檢測（跨 module boundary 仍有保障）
-      if (err && typeof err === "object" && Symbol.for("RedisUnavailableError") in err) {
-        return this.runWithFileLockCore(fn);
-      }
-      throw err;
     }
-    // Redis manager 初始化失敗 → fallback 到 file lock
+    // Redis manager 不存在（init failure）→ file lock fallback（正常）
     return this.runWithFileLockCore(fn);
   }
 

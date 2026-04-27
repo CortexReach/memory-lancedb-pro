@@ -4,7 +4,9 @@
  * 實現分散式 lock，用於解決高並發寫入時的 lock contention 問題。
  */
 
-import Redis from "ioredis";
+// Issue 1 fix: 改用 dynamic import，ioredis 只在真的需要時才載入
+// 不再是 top-level static import，避免 consumer 沒裝 ioredis 時就 crash
+import type { Redis as IORedisType } from "ioredis";
 
 // ============================================================================
 // isRedisConnectionError：判斷錯誤是否為 Redis 連線問題（包含 wrapped error 遞迴檢查）
@@ -18,9 +20,6 @@ import Redis from "ioredis";
  * 不進 fallback，直接 throw。
  */
 export function isRedisConnectionError(err: unknown, depth = 0): boolean {
-  // H2 fix: depth=3 假設文件化
-  // ioredis error chain 通常: MaxRetriesPerRequestError → AggregateError → errors[] → individual errors
-  // 若 depth 到達上限仍未確認為連線錯誤，回傳 false（不誤判，維持既有行為）
   if (depth >= 3) return false;
   if (!(err instanceof Error)) return false;
 
@@ -77,36 +76,39 @@ export interface LockConfig {
 }
 
 export class RedisLockManager {
-  private redis: Redis;
+  // ioredis client — 用 type-only import，實際 instance 在 connect() 時 dynamic import
+  private redis: IORedisType | null = null;
   private defaultTTL = 60000; // 60 秒
   private maxWait = 60000; // 最多等 60 秒
   private retryDelay = 100; // 初始重試延遲
   private _connectionError: unknown = null;
 
-  constructor(config?: LockConfig) {
-    const redisUrl = config?.redisUrl || process.env.REDIS_URL || "redis://localhost:6379";
-    this.redis = new Redis(redisUrl.replace("redis://", ""), {
-      lazyConnect: true,
-      retryStrategy: (times) => {
-        if (times > 3) return null; // 停止重連
-        return Math.min(times * 200, 2000);
-      },
-    });
+  constructor(private readonly config?: LockConfig) {}
 
-    // N5：注册 error event listener，捕捉非同步連線錯誤
-    this.redis.on("error", (err) => {
-      if (isRedisConnectionError(err)) {
-        this._connectionError = err;
-      }
-    });
-
-    if (config?.ttl) this.defaultTTL = config.ttl;
-    if (config?.maxWait) this.maxWait = config.maxWait;
-    if (config?.retryDelay) this.retryDelay = config.retryDelay;
-  }
-
+  /**
+   * Issue 1 fix: 動態載入 ioredis，只在 connect() 時才 import。
+   * 這樣 consumer 沒裝 ioredis 時，不會在 module load time 就 crash。
+   */
   async connect(): Promise<void> {
     try {
+      // Dynamic import — 延遲到真的需要時才載入
+      const { default: Redis } = await import("ioredis") as { default: typeof IORedisType };
+      const redisUrl = this.config?.redisUrl || process.env.REDIS_URL || "redis://localhost:6379";
+      this.redis = new Redis(redisUrl.replace("redis://", ""), {
+        lazyConnect: true,
+        retryStrategy: (times: number) => {
+          if (times > 3) return null; // 停止重連，進入 stopped state
+          return Math.min(times * 200, 2000);
+        },
+      });
+
+      // N5 fix: 注册 error event listener，捕捉非同步連線錯誤
+      this.redis.on("error", (err: Error) => {
+        if (isRedisConnectionError(err)) {
+          this._connectionError = err;
+        }
+      });
+
       await this.redis.connect();
     } catch (err) {
       console.warn(`[RedisLock] Could not connect to Redis: ${err}`);
@@ -116,12 +118,19 @@ export class RedisLockManager {
   /**
    * 取得 lock。
    * 連線錯誤（如 ECONNREFUSED、ETIMEDOUT）時立即 throw RedisUnavailableError，
-   * 讓 store.ts 進 file-lock fallback。
+   * 讓子 caller's store.ts 知道要怎麼處理。
    *
-   * H4 fix: 移除 pre-flight ping，直接讓第一個 SET() 自然失敗
-   * 避免 TOCTOU (ping ok 但 set 前 Redis 掛掉)，並節省一次 round-trip
+   * 重要區分（Option E）：
+   * - init time failure（createRedisLockManager() 回傳 null）：正常 fallback
+   * - runtime failure（acquire() 拋出 RedisUnavailableError）：直接 throw，不 fallback
+   *   → 這是為了避免 split lock domain：已經決定用 Redis lock 的 process
+   *     不會在 runtime 因為 Redis 瞬斷就偷偷切換到 file lock
    */
   async acquire(key: string, ttl?: number): Promise<() => Promise<void>> {
+    if (!this.redis) {
+      throw new RedisUnavailableError("Redis client not initialized");
+    }
+
     const lockKey = `memory-lock:${key}`;
     const token = generateToken();
     const startTime = Date.now();
@@ -130,6 +139,7 @@ export class RedisLockManager {
     // MAX_ATTEMPTS circuit breaker：防止無限期重試
     const MAX_ATTEMPTS = 600;
     let attempts = 0;
+
     while (true) {
       attempts++;
 
@@ -137,6 +147,7 @@ export class RedisLockManager {
         const result = await this.redis.set(lockKey, token, "PX", lockTTL, "NX");
 
         if (result === "OK") {
+          const redis = this.redis; // capture for closure
           return async () => {
             const script = `
               if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -146,22 +157,22 @@ export class RedisLockManager {
               end
             `;
             try {
-              await this.redis.eval(script, 1, lockKey, token);
+              await redis.eval(script, 1, lockKey, token);
             } catch (err) {
               console.warn(`[RedisLock] Failed to release lock: ${err}`);
             }
           };
         }
       } catch (err) {
-        // M4/N5 fix: 檢查是否為 ioredis "stopped retry" 死客戶端錯誤
+        // N5 fix: 檢查是否為 ioredis "stopped retry" 死客戶端錯誤
         // 當 retryStrategy 回 null 後，ioredis 不再重連，operation 拋非標準 connection error
-        // 必須轉為 RedisUnavailableError 否則 runWithFileLock fallback 不觸發
+        // 必須轉為 RedisUnavailableError 否則 store.ts 無法正確處理
         const errMsg = err instanceof Error ? err.message : String(err);
         const isIoredisStoppedState =
-          errMsg.includes('Connection is closed') ||
-          errMsg.includes('Stream connection is closed') ||
-          errMsg.includes('is connecting') ||
-          errMsg.includes('is disconnected');
+          errMsg.includes("Connection is closed") ||
+          errMsg.includes("Stream connection is closed") ||
+          errMsg.includes("is connecting") ||
+          errMsg.includes("is disconnected");
         if (isRedisConnectionError(err) || isIoredisStoppedState) {
           throw new RedisUnavailableError(`Redis connection failed: ${err}`);
         }
@@ -182,6 +193,7 @@ export class RedisLockManager {
   }
 
   async isHealthy(): Promise<boolean> {
+    if (!this.redis) return false;
     try {
       await this.redis.ping();
       return true;
@@ -191,7 +203,9 @@ export class RedisLockManager {
   }
 
   async disconnect(): Promise<void> {
-    await this.redis.quit();
+    if (this.redis) {
+      await this.redis.quit();
+    }
   }
 
   get connectionError(): unknown {
@@ -217,7 +231,15 @@ function generateToken(): string {
 
 /**
  * 建立 RedisLockManager 工廠。
- * 連線失敗時回傳 null，讓 caller 知道要進 file lock fallback。
+ *
+ * 重要：這個工廠的回傳值決定了「整個 process 的 lock domain」。
+ * createRedisLockManager() 回傳 null → 這個 process 用 file lock
+ * createRedisLockManager() 回傳 manager → 這個 process 用 Redis lock
+ * 一旦決定，整個 process 生命週期內不再改變（Option E）。
+ *
+ * 區分兩種失敗模式：
+ * - Init failure（連不上 Redis）：回傳 null → file lock fallback（合理）
+ * - Runtime failure（acquire() 時 Redis 瞬斷）：拋出 RedisUnavailableError → 直接 throw（安全）
  */
 export async function createRedisLockManager(config?: LockConfig): Promise<RedisLockManager | null> {
   const manager = new RedisLockManager(config);
