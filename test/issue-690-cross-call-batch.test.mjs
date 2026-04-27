@@ -223,20 +223,51 @@ describe("Issue #690: cross-call batch accumulator", () => {
     }
   });
 
-  it("entries exceeding MAX_BATCH_SIZE are queued for next flush", async () => {
+  // 【修復 Issue #690 overflow contract】
+  // 超過 MAX_BATCH_SIZE → RangeError，不做隱性 overflow
+  it("entries exceeding MAX_BATCH_SIZE throw clear RangeError", async () => {
     ({ store, dir } = makeStore());
     try {
       const COUNT = MemoryStore.MAX_BATCH_SIZE + 50;
       const entries = Array.from({ length: COUNT }, (_, i) => makeEntry(i));
-      const result = await store.bulkStore(entries);
 
-      assert.strictEqual(result.length, MemoryStore.MAX_BATCH_SIZE, "Partial result returned immediately");
+      // Should throw RangeError with clear message
+      await assert.rejects(
+        store.bulkStore(entries),
+        (err) => {
+          return err instanceof RangeError &&
+                 err.message.includes(`exceeds MAX_BATCH_SIZE=${MemoryStore.MAX_BATCH_SIZE}`) &&
+                 err.message.includes('Please split into chunks');
+        },
+        "Should throw RangeError when exceeding MAX_BATCH_SIZE"
+      );
 
-      // Force flush to process overflow
+      // Verify nothing was stored
+      const all = await store.list(undefined, undefined, 10, 0);
+      assert.strictEqual(all.length, 0, "No entries should be stored when RangeError is thrown");
+    } finally {
       await store.flush();
+    }
+  });
 
-      const all = await store.list(undefined, undefined, COUNT + 10, 0);
-      assert.strictEqual(all.length, COUNT, "All entries eventually stored");
+  // Edge case: raw input > MAX_BATCH_SIZE even if filtered result < MAX_BATCH_SIZE
+  it("raw input exceeding MAX_BATCH_SIZE throws even if filtered result is under limit", async () => {
+    ({ store, dir } = makeStore());
+    try {
+      // 300 entries: first 249 are valid, last 51 are null (invalid)
+      // After filter: validEntries.length = 249 (under limit)
+      // But raw entries.length = 300 (over limit) → should throw
+      const entries = Array.from({ length: 300 }, (_, i) =>
+        i < 249 ? makeEntry(i) : null
+      );
+      await assert.rejects(
+        store.bulkStore(entries),
+        (err) => {
+          return err instanceof RangeError &&
+                 err.message.includes('exceeds MAX_BATCH_SIZE');
+        },
+        "Should throw because raw input (300) > MAX_BATCH_SIZE, not because filtered result (249)"
+      );
     } finally {
       await store.flush();
     }

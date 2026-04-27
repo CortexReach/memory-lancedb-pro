@@ -59,7 +59,8 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store-edge-cases.test.mjs", args: ["--test"] },
   // Issue #690 cross-call batch accumulator tests
   { group: "storage-and-schema", runner: "node", file: "test/issue-690-cross-call-batch.test.mjs", args: ["--test"] },
-];
+  // Issue #690 stress test (long-running, runs manually or nightly)
+  { group: "core-regression", runner: "node", file: "test/issue-690-stress-1000.test.mjs", args: ["--test"] },
 
 export function getEntriesForGroup(group) {
   if (!CI_TEST_GROUPS.includes(group)) {

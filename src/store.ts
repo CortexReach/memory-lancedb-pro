@@ -515,19 +515,20 @@ export class MemoryStore {
       return [];
     }
 
-    // Bounding：超過 MAX_BATCH_SIZE 的批次先處理，超出的排下一輪
-    //（理論上不應發生，因為 caller 通常不會傳超大批次）
-    let toStore: MemoryEntry[];
-    let overflow: MemoryEntry[] = [];
-    if (validEntries.length > MemoryStore.MAX_BATCH_SIZE) {
-      toStore = validEntries.slice(0, MemoryStore.MAX_BATCH_SIZE);
-      overflow = validEntries.slice(MemoryStore.MAX_BATCH_SIZE);
-    } else {
-      toStore = validEntries;
+    // 【修復 Issue #690 overflow contract】
+    // 超過 MAX_BATCH_SIZE → 明確拋出 RangeError，不做隱性 overflow
+    // 注意：檢查 entries.length（原始輸入）而非 validEntries.length（過濾後），
+    // 避免「300筆含51筆無效 → filter後249筆 → 意外通過」的 edge case
+    if (entries.length > MemoryStore.MAX_BATCH_SIZE) {
+      throw new RangeError(
+        `bulkStore() received ${validEntries.length} entries, ` +
+        `exceeds MAX_BATCH_SIZE=${MemoryStore.MAX_BATCH_SIZE}. ` +
+        `Please split into chunks of ${MemoryStore.MAX_BATCH_SIZE} or fewer.`
+      );
     }
 
     // 附加 id/timestamp
-    const fullEntries: MemoryEntry[] = toStore.map((entry) => ({
+    const fullEntries: MemoryEntry[] = validEntries.map((entry) => ({
       ...entry,
       id: randomUUID(),
       timestamp: Date.now(),
@@ -537,14 +538,6 @@ export class MemoryStore {
     // 回傳小型 Promise，實際寫入在背景 flush 完成
     return new Promise<MemoryEntry[]>((resolve, reject) => {
       this.pendingBatch.push({ entries: fullEntries, resolve, reject });
-
-      // 若 overflow 有內容，遞迴排入下一批（很少觸發）
-      if (overflow.length > 0) {
-        // 非同步遞迴，不卡 current call stack
-        setImmediate(() => {
-          this.bulkStore(overflow).catch(() => {});
-        });
-      }
 
       // 啟動定時 flush timer（若尚未啟動）
       if (!this.flushTimer) {
