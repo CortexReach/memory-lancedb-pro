@@ -211,48 +211,6 @@ export class MemoryStore {
 
   constructor(private readonly config: StoreConfig) { }
 
-/** M2: initPromise guard — 防止並發建立多個 Redis client */
-let redisLockManager: RedisLockManager | null = null;
-let redisInitPromise: Promise<RedisLockManager | null> | null = null;
-
-function nodeTmpdir(): string {
-  // N2 fix: nodeTmpdir() 是 function call，不是 property access
-  const { tmpdir } = require("node:os");
-  return tmpdir();
-}
-
-/**
- * M2: getRedisLockManager — 使用 initPromise guard，確保只建立一個 Redis client。
- * M1: Redis-first 策略：Redis 可用時用 Redis lock，否則 fallback 到 file lock。
- */
-export async function getRedisLockManager(): Promise<RedisLockManager | null> {
-  if (redisLockManager !== null) {
-    return redisLockManager;
-  }
-  if (redisInitPromise !== null) {
-    return redisInitPromise;
-  }
-  // C1 fix: compare-and-swap — 先建 promise 再賦值，避免 T2 覆蓋 T1 的 init promise
-  const initPromise = (async () => {
-    try {
-      const mgr = await createRedisLockManager();
-      if (mgr !== null) {
-        redisLockManager = mgr; // resolve 後寫入 cache，後續 caller 走 fast path
-      }
-      return mgr;
-    } catch (err) {
-      console.warn("[store] getRedisLockManager failed:", err);
-      return null;
-    }
-  })();
-  if (redisInitPromise !== null) {
-    // 另一個 caller 比我們先 assigned 了自己的 promise，放棄自己的
-    return redisInitPromise;
-  }
-  redisInitPromise = initPromise;
-  return redisInitPromise;
-}
-
   /**
    * 混合鎖實作：Redis lock 優先，失敗時進 file-lock fallback。
    * M1: RedisUnavailableError 進 file-lock fallback。
@@ -1363,4 +1321,48 @@ export async function getRedisLockManager(): Promise<RedisLockManager | null> {
         }),
       );
   }
+}
+
+
+
+/** M2: initPromise guard — 防止並發建立多個 Redis client */
+let redisLockManager: RedisLockManager | null = null;
+let redisInitPromise: Promise<RedisLockManager | null> | null = null;
+
+function nodeTmpdir(): string {
+  // N2 fix: nodeTmpdir() 是 function call，不是 property access
+  const { tmpdir } = require("node:os");
+  return tmpdir();
+}
+
+/**
+ * M2: getRedisLockManager — 使用 initPromise guard，確保只建立一個 Redis client。
+ * M1: Redis-first 策略：Redis 可用時用 Redis lock，否則 fallback 到 file lock。
+ */
+export async function getRedisLockManager(): Promise<RedisLockManager | null> {
+  if (redisLockManager !== null) {
+    return redisLockManager;
+  }
+  if (redisInitPromise !== null) {
+    return redisInitPromise;
+  }
+  // C1 fix: compare-and-swap — 先建 promise 再賦值，避免 T2 覆蓋 T1 的 init promise
+  const initPromise = (async () => {
+    try {
+      const mgr = await createRedisLockManager();
+      if (mgr !== null) {
+        redisLockManager = mgr; // resolve 後寫入 cache，後續 caller 走 fast path
+      }
+      return mgr;
+    } catch (err) {
+      console.warn("[store] getRedisLockManager failed:", err);
+      return null;
+    }
+  })();
+  if (redisInitPromise !== null) {
+    // 另一個 caller 比我們先 assigned 了自己的 promise，放棄自己的
+    return redisInitPromise;
+  }
+  redisInitPromise = initPromise;
+  return redisInitPromise;
 }
