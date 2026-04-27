@@ -2850,25 +2850,21 @@ const memoryLanceDBProPlugin = {
           }
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
           let texts = newTexts;
-          const currentCumulativeCount = previousSeenCount + texts.length;
+          const currentCumulativeCount = previousSeenCount + newTexts.length;
           autoCaptureSeenTextCount.set(sessionKey, currentCumulativeCount);
           pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           // [Fix #5] Explicit remember command: if the last pending text is an explicit remember,
           // enrich with one piece of prior context so bare "remember this" turns get history.
           const lastPending = pendingIngressTexts.length > 0 ? pendingIngressTexts[pendingIngressTexts.length - 1] : undefined;
           if (lastPending !== undefined && isExplicitRememberCommand(lastPending) && priorRecentTexts.length > 0) {
-            // [Fix-MF1 v2] Prepend lastPending to newTexts, avoiding duplicates.
+            // [Fix-MF1 v3] Prepend lastPending to newTexts, avoiding duplicates.
             // In REPLACE mode, lastPending is already the last element of newTexts (pendingIngressTexts).
             // We need to move it to front OR use priorRecentTexts for context, not duplicate it.
             // Solution: prepend lastPending, but skip if it's already the last element (duplicate case).
-            const isDuplicate = newTexts.length > 0 && newTexts[newTexts.length - 1] === lastPending;
-            if (isDuplicate) {
-              // Already have lastPending at end of newTexts, just move it to front
-              texts = [lastPending, ...newTexts.slice(0, -1)];
-            } else {
-              // Normal case: prepend lastPending to provide context
-              texts = [lastPending, ...newTexts];
-            }
+            const isDuplicate = newTexts.length > 0 && newTexts.includes(lastPending);
+            texts = isDuplicate
+              ? [lastPending, ...newTexts.filter((t) => t !== lastPending)]
+              : [lastPending, ...newTexts];
           }
           if (newTexts.length > 0) {
             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-AUTO_CAPTURE_PENDING_WINDOW);
