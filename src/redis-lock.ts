@@ -153,8 +153,16 @@ export class RedisLockManager {
           };
         }
       } catch (err) {
-        // M4：連線錯誤立即進 fallback，不走一般重試
-        if (isRedisConnectionError(err)) {
+        // M4/N5 fix: 檢查是否為 ioredis "stopped retry" 死客戶端錯誤
+        // 當 retryStrategy 回 null 後，ioredis 不再重連，operation 拋非標準 connection error
+        // 必須轉為 RedisUnavailableError 否則 runWithFileLock fallback 不觸發
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const isIoredisStoppedState =
+          errMsg.includes('Connection is closed') ||
+          errMsg.includes('Stream connection is closed') ||
+          errMsg.includes('is connecting') ||
+          errMsg.includes('is disconnected');
+        if (isRedisConnectionError(err) || isIoredisStoppedState) {
           throw new RedisUnavailableError(`Redis connection failed: ${err}`);
         }
         console.warn(`[RedisLock] Redis error during acquire (attempt ${attempts}): ${err}`);
