@@ -1532,6 +1532,15 @@ async function runCounterResetSuccessScenario() {
     rmSync(workDir, { recursive: true, force: true });
   }
 
+
+
+}
+// ============================================================
+// [Fix-MF2] R2: Stage 2 LLM dedup call verification test
+// Moved to module level to ensure assertions execute
+// Previously nested inside runCounterResetSuccessScenario body (unreachable)
+// ============================================================
+
 // ============================================================
 // R2: Stage 2 LLM dedup call verification test
 // Problem: existing counter-reset test uses category="cases" + empty DB.
@@ -1676,7 +1685,10 @@ assert.equal(dedupResult.dedupCalls, 1,
 // End: R2 Stage 2 LLM dedup verification test
 // ============================================================
 
-}
+
+// ============================================================
+// End Fix-MF2 R2 section
+// ============================================================
 
 const counterResetResult = await runCounterResetSuccessScenario();
 
