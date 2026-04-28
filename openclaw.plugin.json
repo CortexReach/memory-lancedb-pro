@@ -1495,5 +1495,10 @@
       "help": "Whitelist mode. Only these agents receive auto-recall. If agentId is unavailable it falls back to 'main'. Includes take precedence over excludes.",
       "advanced": true
     }
-  }
+  },
+  "commandAliases": [
+    {
+      "name": "memory-pro"
+    }
+  ]
 }
