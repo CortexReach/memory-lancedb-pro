@@ -491,7 +491,25 @@ export function getExtensionApiImportSpecifiers(): string[] {
   return [...new Set(specifiers.filter(Boolean))];
 }
 
-async function loadEmbeddedPiRunner(): Promise<EmbeddedPiRunner> {
+/**
+ * Layer 1: 新 SDK API — api.runtime.agent.runEmbeddedPiAgent (4.22+)
+ * Layer 2: 舊 extensionAPI.js dynamic import（4.24-4.26 SDK 仍保留）
+ * Layer 3: CLI fallback
+ *
+ * 遷移自 Bug 2（Issue #606）：原本只使用 Layer 2，現改為 Try-New-First。
+ */
+// eslint-disable-next-line import/export
+export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<EmbeddedPiRunner> {
+  // Layer 1: 嘗試新 SDK API
+  const newApi = (api as unknown as Record<string, unknown>).runtime?.agent;
+  if (typeof newApi?.runEmbeddedPiAgent === "function") {
+    const runner = newApi.runEmbeddedPiAgent.bind(newApi);
+    // Bug 2 fix: 將 Layer 1 結果寫入 cache，避免後續並發呼叫時 Layer 2 覆蓋掉 Layer 1
+    embeddedPiRunnerPromise ??= Promise.resolve(runner as EmbeddedPiRunner);
+    return embeddedPiRunnerPromise;
+  }
+
+  // Layer 2: Fallback 舊 extensionAPI.js
   if (!embeddedPiRunnerPromise) {
     embeddedPiRunnerPromise = (async () => {
       const importErrors: string[] = [];
@@ -512,13 +530,7 @@ async function loadEmbeddedPiRunner(): Promise<EmbeddedPiRunner> {
       );
     })();
   }
-
-  try {
-    return await embeddedPiRunnerPromise;
-  } catch (err) {
-    embeddedPiRunnerPromise = null;
-    throw err;
-  }
+  return embeddedPiRunnerPromise;
 }
 
 function clipDiagnostic(text: string, maxLen = 400): string {
@@ -1184,6 +1196,7 @@ async function generateReflectionText(params: {
   thinkLevel: ReflectionThinkLevel;
   toolErrorSignals?: ReflectionErrorSignal[];
   logger?: { info?: (message: string) => void; warn?: (message: string) => void };
+  api: OpenClawPluginApi;  // SDK migration Bug 2: pass api to use new runtime.agent API
 }): Promise<{ text: string; usedFallback: boolean; promptHash: string; error?: string; runner: "embedded" | "cli" | "fallback" }> {
   const prompt = buildReflectionPrompt(
     params.conversation,
@@ -1210,7 +1223,7 @@ async function generateReflectionText(params: {
       retryState,
       onLog: onRetryLog,
       execute: async () => {
-        const runEmbeddedPiAgent = await loadEmbeddedPiRunner();
+        const runEmbeddedPiAgent = await loadEmbeddedPiRunner(params.api);
         const modelRef = resolveAgentPrimaryModelRef(params.cfg, params.agentId);
         const { provider, model } = modelRef ? splitProviderModel(modelRef) : {};
         const embeddedTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
@@ -3518,6 +3531,7 @@ const memoryLanceDBProPlugin = {
             thinkLevel: reflectionThinkLevel,
             toolErrorSignals,
             logger: api.logger,
+            api,  // SDK migration Bug 2: pass api for new runtime.agent API
           });
           api.logger.info(
             `memory-reflection: command:${action} reflection generation done for session ${currentSessionId}; runner=${reflectionGenerated.runner}; usedFallback=${reflectionGenerated.usedFallback ? "yes" : "no"}`
