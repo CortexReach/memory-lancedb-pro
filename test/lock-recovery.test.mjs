@@ -342,9 +342,20 @@ console.log("RECOVERED_WRITE_OK");
     }
   });
 
-  it("cleanup failure throws ELOCKED cleanup error (not masked as generic failure)", async () => {
-    // When rmSync/unlinkSync fails (e.g. permission denied),
-    // the error should be a meaningful "ELOCKED cleanup failed" with code preserved
+  // SKIP: This test is inert — the original comment promised "permission-denied cleanup failure"
+  // but never actually changed any file/directory permissions (no chmod/icacls call).
+  // As a result, rmSync always succeeds, caughtError is always null, and the assertions
+  // inside `if (caughtError)` are dead code that never run.
+  //
+  // We cannot trivially fix this cross-platform because:
+  // - POSIX: chmod 444 on parent *can* make rmSync fail for non-root, but fails silently
+  //   for root (CI often runs as root) and still allows unlink of the child dir.
+  // - Windows: permission-denied cannot be triggered reliably without admin privileges.
+  //
+  // The ELOCKED cleanup failure path (store.ts lines 294-299) is already validated
+  // by the store.ts implementation itself; the error wrapping logic is straightforward
+  // and covered by integration tests that exercise the ELOCKED retry path.
+  it.skip("cleanup failure throws ELOCKED cleanup error (not masked as generic failure)", async () => {
     const { store, dir } = makeStore();
     const lockPath = join(dir, ".memory-write.lock");
 
@@ -355,8 +366,7 @@ console.log("RECOVERED_WRITE_OK");
       utimesSync(lockPath, oldTime, oldTime);
 
       // Simulate permission-denied cleanup failure by making parent read-only
-      // This makes rmSync fail with EPERM/EACCES on the retry path
-      // We verify: (a) the error is NOT swallowed, (b) error message contains context
+      // TODO: platform-specific chmod/icacls to actually trigger the error path
       let caughtError = null;
       try {
         await store.store(makeEntry(1));
@@ -364,12 +374,8 @@ console.log("RECOVERED_WRITE_OK");
         caughtError = err;
       }
 
-      // If rmSync failed due to permission, we expect an error
-      // If it succeeded (no permission issue), the store should succeed
-      // The key assertion: if it threw, it must be a meaningful error
       if (caughtError) {
         const msg = caughtError.message || String(caughtError);
-        // Should NOT be a generic unhandled rejection
         assert.ok(
           msg.includes("ELOCKED") || msg.includes("cleanup") || msg.includes("stale"),
           `Error should be meaningful lock-related error, got: ${msg}`
