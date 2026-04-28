@@ -53,6 +53,8 @@ export const CI_TEST_MANIFEST = [
   // Issue #632 / PR #639 lock contention fix
   { group: "core-regression", runner: "node", file: "test/upgrader-phase2-lock.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/upgrader-phase2-extreme.test.mjs" },
+  // Issue #632 / PR #639 Blocker 2 rollback regression test
+  { group: "core-regression", runner: "node", file: "test/bulk-recovery-rollback.test.mjs" },
   // Issue #629 batch embedding fix
   { group: "llm-clients-and-auth", runner: "node", file: "test/embedder-ollama-batch-routing.test.mjs" },
   // Issue #665 bulkStore tests
