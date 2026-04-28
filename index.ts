@@ -1675,6 +1675,21 @@ const pluginVersion = getPluginVersion();
 // hook/tool registration for the new API instance" regression that rwmjhb identified.
 let _registeredApis = new WeakSet<OpenClawPluginApi>();
 
+// Dual-track registration: alongside WeakSet (GC-safe), use a Map for explicit
+// rollback tracking and test inspection. WeakSet handles GC safety; Map provides
+// manual clearability and _getRegisteredApisForTest() export.
+// Track: _registeredApisMap (explicit claim/rollback) + _registeredApis (WeakSet guard)
+let _registeredApisMap = new Map<OpenClawPluginApi, boolean>();
+
+/**
+ * Returns the internal registration Map — for unit test inspection only.
+ * Do NOT mutate from outside the plugin.
+ * @public (test API)
+ */
+export function _getRegisteredApisForTest(): Map<OpenClawPluginApi, boolean> {
+  return _registeredApisMap;
+}
+
 // ============================================================================
 // Hook Event Deduplication (Phase 1)
 // ============================================================================
@@ -1930,8 +1945,24 @@ const memoryLanceDBProPlugin = {
     // the same singleton via destructuring. This prevents:
     //   - Memory heap growth from repeated resource creation (~9 calls/process)
     //   - Accumulated session Maps being lost on re-registration
+    //
+    // Dual-track claim: we record registration BEFORE attempting init so that
+    // if init fails, we can explicitly roll back the Map entry — enabling a
+    // subsequent register() retry with the same API object.
+    //   - _registeredApis (WeakSet): GC-safe singleton guard (Phase 2 guard)
+    //   - _registeredApisMap (Map): explicit claim/rollback for test inspection
     // ========================================================================
-    if (!_singletonState) { _singletonState = _initPluginState(api); }
+    _registeredApis.add(api);    // claim before init (Phase 2 singleton guard)
+    _registeredApisMap.set(api, true);  // dual-track: explicit claim for rollback
+    let singleton: typeof _singletonState;
+    try {
+      if (!_singletonState) { _singletonState = _initPluginState(api); }
+      singleton = _singletonState;
+    } catch (err) {
+      api.logger.error(`memory-lancedb-pro: _initPluginState failed — ${String(err)}`);
+      _registeredApisMap.delete(api);  // dual-track rollback: init failed, un-claim
+      throw err;
+    }
     const {
       config,
       resolvedDbPath,
@@ -4286,6 +4317,7 @@ export { getDefaultMdMirrorDir };
  */
 export function resetRegistration() {
   _registeredApis = new WeakSet<OpenClawPluginApi>();
+  _registeredApisMap.clear();  // dual-track: clear Map alongside WeakSet
   _singletonState = null;
   _hookEventDedup.clear();
 }
