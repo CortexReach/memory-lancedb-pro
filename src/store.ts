@@ -145,18 +145,26 @@ function safeToNumber(value: unknown): number {
 }
 
 /**
- * Whitelist of keys that bulkUpdateMetadataWithPatch accepts from LLM enrichment.
- * Protects base fields (tier, access_count, confidence, injected_count, etc.)
- * from accidental overwrites by misbehaving LLM output or prompt injection.
- * [fix-Nice2] Only these keys from entry.patch are merged; all others are ignored.
+ * Whitelist of keys that bulkUpdateMetadataWithPatch accepts from LLM enrichment / upgrade.
+ * LLM-output fields (l0_abstract, l1_overview, l2_content, memory_category) are accepted.
+ * Upgrade-patch fields (tier, access_count, confidence, upgraded_from, upgraded_at) are also accepted.
+ * Any other keys are dropped to prevent accidental overwrites of plugin-managed fields.
  */
-const ALLOWED_PATCH_KEYS: ReadonlySet<string> = new Set([
-  'l0_abstract',
-  'l1_overview',
-  'l2_content',
-  'memory_category',
-  'upgraded_from',
-  'upgraded_at',
+// [fix-PR639] tier, access_count, confidence must be in the whitelist so that
+// writeEnrichedBatch's explicit upgrade values (tier="working", access_count=0,
+// confidence=0.7) are actually applied — not silently dropped by the filter.
+// For legacy entries parseSmartMetadata defaults to the same values, so behaviour
+// is unchanged; the difference is the intent is now honoured rather than ignored.
+const ALLOWED_PATCH_KEYS = new Set([
+  "l0_abstract",
+  "l1_overview",
+  "l2_content",
+  "memory_category",
+  "upgraded_from",
+  "upgraded_at",
+  "tier",
+  "access_count",
+  "confidence",
 ]);
 
 function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight: number }>): number {
