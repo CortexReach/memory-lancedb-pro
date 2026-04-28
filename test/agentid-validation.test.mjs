@@ -103,8 +103,8 @@ describe("isInvalidAgentIdFormat", () => {
     it("returns false for 'main' (the default agent)", () => {
       assert.strictEqual(isInvalidAgentIdFormat("main"), false);
     });
-    it("whitespace-only string is NOT caught by Layer 1 (treated as truthy)", () => {
-      assert.strictEqual(isInvalidAgentIdFormat("   ", makeSet()), false);
+    it("whitespace-only string IS caught by Layer 1 (trimmed = empty)", () => {
+      assert.strictEqual(isInvalidAgentIdFormat("   ", makeSet()), true);
     });
   });
 });
