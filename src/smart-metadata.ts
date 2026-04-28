@@ -61,6 +61,13 @@ export interface SmartMemoryMetadata {
   last_confirmed_use_at?: number;
   bad_recall_count: number;
   suppressed_until_turn: number;
+  /**
+   * Unix ms timestamp until which auto-recall should suppress this memory.
+   * OPTIONAL: `undefined` means this memory has never been written by Tier 1
+   * code (sentinel used for lazy heal of legacy data). `0` means Tier 1 has
+   * touched the memory but there is no active suppression.
+   */
+  suppressed_until_ms?: number;
   canonical_id?: string;
   [key: string]: unknown;
 }
@@ -330,6 +337,15 @@ export function parseSmartMetadata(
     last_confirmed_use_at: normalizeOptionalTimestamp(parsed.last_confirmed_use_at),
     bad_recall_count: clampCount(parsed.bad_recall_count, 0),
     suppressed_until_turn: clampCount(parsed.suppressed_until_turn, 0),
+    // DO NOT replace with `clampCount(parsed.suppressed_until_ms, 0)` directly —
+    // preserving `undefined` is load-bearing for the Tier 1 lazy-heal sentinel
+    // (see JSDoc on SmartMemoryMetadata.suppressed_until_ms). The `undefined`
+    // signal distinguishes "never touched by Tier 1 code" from "Tier 1 touched
+    // but no active suppression (0)".
+    suppressed_until_ms:
+      parsed.suppressed_until_ms !== undefined
+        ? clampCount(parsed.suppressed_until_ms, 0)
+        : undefined,
     canonical_id: normalizeOptionalString(parsed.canonical_id),
   };
 
@@ -419,6 +435,12 @@ export function buildSmartMetadata(
       patch.suppressed_until_turn,
       base.suppressed_until_turn,
     ),
+    suppressed_until_ms:
+      patch.suppressed_until_ms === undefined
+        ? base.suppressed_until_ms
+        : (typeof patch.suppressed_until_ms === "number" && patch.suppressed_until_ms >= 0
+            ? Math.floor(patch.suppressed_until_ms)
+            : 0),
     canonical_id:
       patch.canonical_id === undefined
         ? base.canonical_id
