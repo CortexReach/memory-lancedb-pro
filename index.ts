@@ -211,6 +211,10 @@ interface PluginConfig {
     thinkLevel?: ReflectionThinkLevel;
     errorReminderMaxEntries?: number;
     dedupeErrorSignals?: boolean;
+    /** Cooldown in ms between reflection triggers for the same session. Default: 120000 (2 min). Set to 0 to disable. */
+    serialCooldownMs?: number;
+    /** Agent/session patterns excluded from reflection injection. Supports exact match, wildcard prefix (e.g. "pi-"), and "temp:*". */
+    excludeAgents?: string[];
   };
   mdMirror?: { enabled?: boolean; dir?: string };
   workspaceBoundary?: WorkspaceBoundaryConfig;
@@ -341,6 +345,33 @@ function resolveHookAgentId(
     : parseAgentIdFromSessionKey(sessionKey)) || "main";
 }
 
+// Detect when agentId came from a chat_id / user: source (e.g. "657229412030480397").
+// These are numeric Discord/Telegram IDs mistakenly used as agent IDs and cause
+// auto-recall to timeout. We skip them rather than block all pure-numeric IDs
+// to avoid false positives for intentionally numeric agent names.
+function isChatIdBasedAgentId(agentId: string): boolean {
+  return /^\d+$/.test(agentId); // pure digits = almost certainly a chat_id, not a real agent
+}
+
+/**
+ * Returns true when agentId is invalid — either empty/undefined, detected as a
+ * numeric chat_id, or not present in the openclaw.json declared agents list.
+ * Pass `declaredAgents` (from config.declaredAgents) for authoritative validation.
+ */
+function isInvalidAgentIdFormat(
+  agentId: string | undefined,
+  declaredAgents?: Set<string>,
+): boolean {
+  if (!agentId) return true;
+  // Pure numeric IDs are almost always chat_id extractions, not real agent IDs.
+  if (isChatIdBasedAgentId(agentId)) return true;
+  // If we have a declared agents list, treat unknown IDs as invalid.
+  if (declaredAgents && declaredAgents.size > 0 && !declaredAgents.has(agentId)) {
+    return true;
+  }
+  return false;
+}
+
 function resolveSourceFromSessionKey(sessionKey: string | undefined): string {
   const trimmed = sessionKey?.trim() ?? "";
   const match = /^agent:[^:]+:([^:]+)/.exec(trimmed);
@@ -418,6 +449,7 @@ const DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS = true;
 const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
+const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
 const REFLECTION_FALLBACK_MARKER = "(fallback) Reflection generation failed; storing minimal pointer only.";
 const DIAG_BUILD_TAG = "memory-lancedb-pro-diag-20260308-0058";
 
@@ -1908,6 +1940,37 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   };
 }
 
+function isAgentOrSessionExcluded(
+  agentId: string,
+  sessionKey: string | undefined,
+  patterns: string[],
+): boolean {
+  if (!Array.isArray(patterns) || patterns.length === 0) return false;
+
+  const cleanAgentId = agentId.trim();
+  const isInternal = typeof sessionKey === "string" &&
+    sessionKey.trim().startsWith("temp:memory-reflection");
+
+  for (const pattern of patterns) {
+    const p = typeof pattern === "string" ? pattern.trim() : "";
+    if (!p) continue;
+
+    if (p === "temp:*") {
+      if (isInternal) return true;
+      continue;
+    }
+
+    if (p.endsWith("-")) {
+      // Wildcard prefix match: "pi-" matches "pi-agent" but NOT "pilot" or "ping"
+      if (cleanAgentId.startsWith(p)) return true;
+    } else if (p === cleanAgentId) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 const memoryLanceDBProPlugin = {
   id: "memory-lancedb-pro",
   name: "Memory (LanceDB Pro)",
@@ -2388,6 +2451,12 @@ const memoryLanceDBProPlugin = {
         // - Else if autoRecallExcludeAgents is set: all agents EXCEPT these receive auto-recall
 
         const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+        if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+          api.logger.debug?.(
+            `memory-lancedb-pro: auto-recall skipped \u2014 invalid agentId format '${agentId}'`,
+          );
+          return;
+        }
         if (Array.isArray(config.autoRecallIncludeAgents) && config.autoRecallIncludeAgents.length > 0) {
           if (!config.autoRecallIncludeAgents.includes(agentId)) {
             api.logger.debug?.(
@@ -2396,12 +2465,13 @@ const memoryLanceDBProPlugin = {
             return;
           }
         } else if (
+          agentId !== undefined &&
           Array.isArray(config.autoRecallExcludeAgents) &&
           config.autoRecallExcludeAgents.length > 0 &&
-          config.autoRecallExcludeAgents.includes(agentId)
+          isAgentOrSessionExcluded(agentId, sessionKey, config.autoRecallExcludeAgents)
         ) {
           api.logger.debug?.(
-            `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}'`,
+            `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}' (sessionKey=${sessionKey ?? "(none)"})`,
           );
           return;
         }
@@ -2432,6 +2502,10 @@ const memoryLanceDBProPlugin = {
         const recallWork = async (): Promise<{ prependContext: string } | undefined> => {
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+            api.logger.debug?.(`memory-lancedb-pro: auto-recall skip \u2014 invalid agentId '${agentId}'`);
+            return undefined;
+          }
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
 
           // Use cached raw user message for the recall query to avoid channel
@@ -2775,6 +2849,10 @@ const memoryLanceDBProPlugin = {
 
           // Determine agent ID and default scope
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+            api.logger.debug(`memory-lancedb-pro: auto-capture skip \u2014 invalid agentId '${agentId}'`);
+            return;
+          }
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
           const defaultScope = isSystemBypassId(agentId)
             ? config.scopes?.default ?? "global"
@@ -3293,6 +3371,10 @@ const memoryLanceDBProPlugin = {
             typeof ctx.agentId === "string" ? ctx.agentId : undefined,
             sessionKey,
           );
+          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+            api.logger.debug?.(`memory-lancedb-pro: reflection inheritance skip \u2014 invalid agentId '${agentId}'`);
+            return;
+          }
           const scopes = resolveScopeFilter(scopeManager, agentId);
           const slices = await loadAgentReflectionSlices(agentId, scopes);
           if (slices.invariants.length === 0) return;
@@ -3319,6 +3401,10 @@ const memoryLanceDBProPlugin = {
           typeof ctx.agentId === "string" ? ctx.agentId : undefined,
           sessionKey,
         );
+        if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+          api.logger.debug?.(`memory-lancedb-pro: reflection derived+error skip \u2014 invalid agentId '${agentId}'`);
+          return;
+        }
         pruneReflectionSessionState();
 
         const blocks: string[] = [];
@@ -3391,7 +3477,7 @@ const memoryLanceDBProPlugin = {
         if (!g[REFLECTION_SERIAL_GUARD]) g[REFLECTION_SERIAL_GUARD] = new Map<string, number>();
         return g[REFLECTION_SERIAL_GUARD] as Map<string, number>;
       };
-      const SERIAL_GUARD_COOLDOWN_MS = 120_000; // 2 minutes cooldown per sessionKey
+      // SERIAL_GUARD_COOLDOWN_MS moved to DEFAULT_SERIAL_GUARD_COOLDOWN_MS
 
       const runMemoryReflection = async (event: any) => {
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
@@ -3410,13 +3496,19 @@ const memoryLanceDBProPlugin = {
           api.logger.info(`memory-reflection: skipping re-entrant call for sessionKey=${sessionKey}; already running (global guard)`);
           return;
         }
+        // Parse context before guards so cfg is available for serialCooldownMs
+        const context = (event.context || {}) as Record<string, unknown>;
+        const cfg = context.cfg;
         // Serial loop guard: skip if a reflection for this sessionKey completed recently
         if (sessionKey) {
           const serialGuard = getSerialGuardMap();
           const lastRun = serialGuard.get(sessionKey);
-          if (lastRun && (Date.now() - lastRun) < SERIAL_GUARD_COOLDOWN_MS) {
-            api.logger.info(`memory-reflection: skipping serial re-trigger for sessionKey=${sessionKey}; last run ${(Date.now() - lastRun) / 1000}s ago (cooldown=${SERIAL_GUARD_COOLDOWN_MS / 1000}s)`);
-            return;
+          if (lastRun) {
+            const cooldownMs = config.memoryReflection?.serialCooldownMs ?? DEFAULT_SERIAL_GUARD_COOLDOWN_MS;
+            if ((Date.now() - lastRun) < cooldownMs) {
+              api.logger.info(`memory-reflection: command hook skipped (cooldown ${((Date.now() - lastRun) / 1000).toFixed(0)}s/${(cooldownMs / 1000).toFixed(0)}s, sessionKey=${sessionKey})`);
+              return;
+            }
           }
         }
         if (sessionKey) globalLock.set(sessionKey, true);
@@ -3424,8 +3516,6 @@ const memoryLanceDBProPlugin = {
         try {
           pruneReflectionSessionState();
           const action = String(event?.action || "unknown");
-          const context = (event.context || {}) as Record<string, unknown>;
-          const cfg = context.cfg;
           const workspaceDir = resolveWorkspaceDirFromContext(context);
           if (!cfg) {
             api.logger.warn(`memory-reflection: command:${action} missing cfg in hook context; skip reflection`);
@@ -3436,6 +3526,22 @@ const memoryLanceDBProPlugin = {
           const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
           let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
           const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
+          // Guard: skip if agentId is invalid format (consistent with other hook sites)
+          if (isInvalidAgentIdFormat(sourceAgentId, config.declaredAgents)) {
+            api.logger.debug?.(
+              `memory-reflection: command hook skipped \u2014 invalid agentId '${sourceAgentId}'`,
+            );
+            return;
+          }
+          // Exclude agents/sessions listed in memoryReflection.excludeAgents (supports wildcards)
+          const excludePatterns = config.memoryReflection?.excludeAgents;
+          if (excludePatterns && isAgentOrSessionExcluded(sourceAgentId, sessionKey, excludePatterns)) {
+            api.logger.debug?.(
+              `memory-reflection: command hook skipped (excluded agent=${sourceAgentId}, sessionKey=${sessionKey ?? "(none)"})`,
+            );
+            return;
+          }
+
           const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
           api.logger.info(
             `memory-reflection: command:${action} hook start; sessionKey=${sessionKey || "(none)"}; source=${commandSource || "(unknown)"}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`
@@ -3779,6 +3885,10 @@ const memoryLanceDBProPlugin = {
             typeof ctx.agentId === "string" ? ctx.agentId : undefined,
             sessionKey,
           );
+          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+            api.logger.debug?.(`session-memory [before_reset]: skip \u2014 invalid agentId '${agentId}'`);
+            return;
+          }
           const defaultScope = isSystemBypassId(agentId)
             ? config.scopes?.default ?? "global"
             : scopeManager.getDefaultScope(agentId);
@@ -4107,6 +4217,23 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         .filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
         .map((id) => id.trim())
       : undefined,
+    // Build declaredAgents Set from openclaw.json agents.list for fast validation.
+    declaredAgents: (() => {
+      const s = new Set<string>();
+      const agentsList = (cfg as Record<string, unknown>).agents as Record<string, unknown> | undefined;
+      if (agentsList) {
+        const list = agentsList.list as unknown;
+        if (Array.isArray(list)) {
+          for (const entry of list) {
+            if (entry && typeof entry === "object") {
+              const id = (entry as Record<string, unknown>).id;
+              if (typeof id === "string" && id.trim().length > 0) s.add(id.trim());
+            }
+          }
+        }
+      }
+      return s;
+    })(),
     captureAssistant: cfg.captureAssistant === true,
     retrieval:
       typeof cfg.retrieval === "object" && cfg.retrieval !== null
@@ -4172,6 +4299,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         })(),
         errorReminderMaxEntries: parsePositiveInt(memoryReflectionRaw.errorReminderMaxEntries) ?? DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES,
         dedupeErrorSignals: memoryReflectionRaw.dedupeErrorSignals !== false,
+        serialCooldownMs: parsePositiveInt(memoryReflectionRaw.serialCooldownMs) ?? DEFAULT_SERIAL_GUARD_COOLDOWN_MS,
+        excludeAgents: Array.isArray(memoryReflectionRaw.excludeAgents)
+          ? memoryReflectionRaw.excludeAgents.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+          : undefined,
       }
       : {
         enabled: sessionStrategy === "memoryReflection",
@@ -4185,6 +4316,8 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         thinkLevel: DEFAULT_REFLECTION_THINK_LEVEL,
         errorReminderMaxEntries: DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES,
         dedupeErrorSignals: DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS,
+        serialCooldownMs: DEFAULT_SERIAL_GUARD_COOLDOWN_MS,
+        excludeAgents: undefined,
       },
     sessionMemory:
       typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null

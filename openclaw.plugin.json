@@ -169,7 +169,12 @@
       },
       "recallMode": {
         "type": "string",
-        "enum": ["full", "summary", "adaptive", "off"],
+        "enum": [
+          "full",
+          "summary",
+          "adaptive",
+          "off"
+        ],
         "default": "full",
         "description": "Auto-recall depth mode. 'full': inject with configured per-item budget. 'summary': L0 abstracts only (compact). 'adaptive': analyze query intent to auto-select category and depth. 'off': disable auto-recall injection."
       },
@@ -280,23 +285,78 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "utility": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
-              "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
-              "novelty": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
-              "recency": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
-              "typePrior": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.6 }
+              "utility": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.1
+              },
+              "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.1
+              },
+              "novelty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.1
+              },
+              "recency": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.1
+              },
+              "typePrior": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.6
+              }
             }
           },
           "typePriors": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "profile": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.95 },
-              "preferences": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.9 },
-              "entities": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.75 },
-              "events": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.45 },
-              "cases": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.8 },
-              "patterns": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.85 }
+              "profile": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.95
+              },
+              "preferences": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.9
+              },
+              "entities": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.75
+              },
+              "events": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.45
+              },
+              "cases": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.8
+              },
+              "patterns": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.85
+              }
             }
           }
         }
@@ -670,6 +730,18 @@
           "dedupeErrorSignals": {
             "type": "boolean",
             "default": true
+          },
+          "serialCooldownMs": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cooldown in ms between reflection triggers for the same session. Default: 120000 (2 min). Set to 0 to disable."
+          },
+          "excludeAgents": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Agent/session patterns excluded from reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
           }
         }
       },
@@ -873,6 +945,13 @@
             "description": "Maximum number of auto-capture extractions allowed per hour"
           }
         }
+      },
+      "autoRecallExcludeAgents": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Agent/session patterns excluded from auto-recall and reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
       }
     },
     "required": [
