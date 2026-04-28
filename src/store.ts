@@ -71,6 +71,27 @@ export function __setLockfileModuleForTests(module: any): void {
   lockfileModule = module;
 }
 
+// =========================================================================
+// Redis Lock Domain Decision（single-flight，全程序只決定一次）
+// =========================================================================
+
+// Lazy import：避免 module 層級迴圈依賴
+let _redisLockDomain: import("./redis-lock.js").LockDomain | null = null;
+
+async function getLockDomain(): Promise<import("./redis-lock.js").LockDomain> {
+  if (_redisLockDomain !== null) return _redisLockDomain;
+
+  try {
+    const { determineLockDomain } = await import("./redis-lock.js");
+    _redisLockDomain = await determineLockDomain();
+  } catch {
+    // 若 redis-lock.js 不存在或匯入失敗，預設用 file lock
+    _redisLockDomain = 'file';
+  }
+
+  return _redisLockDomain;
+}
+
 export const loadLanceDB = async (): Promise<
   typeof import("@lancedb/lancedb")
 > => {
