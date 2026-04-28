@@ -253,7 +253,7 @@ export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlice
   const legacyRows = reflectionRows.filter(({ metadata }) => metadata.type === "memory-reflection");
 
   const invariantCandidates = buildInvariantCandidates(itemRows, legacyRows);
-  const derivedCandidates = buildDerivedCandidates(itemRows, legacyRows);
+  const derivedCandidates = buildDerivedCandidates(itemRows, legacyRows, params.agentId);
 
   const invariants = rankReflectionLines(invariantCandidates, {
     now,
@@ -324,7 +324,8 @@ function buildInvariantCandidates(
 
 function buildDerivedCandidates(
   itemRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>,
-  legacyRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>
+  legacyRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>,
+  agentId: string
 ): WeightedLineCandidate[] {
   const itemCandidates = itemRows
     .filter(({ metadata }) => metadata.itemKind === "derived")
@@ -348,7 +349,20 @@ function buildDerivedCandidates(
 
   if (itemCandidates.length > 0) return itemCandidates;
 
-  return legacyRows.flatMap(({ entry, metadata }) => {
+  // ★ 修復：legacy fallback 中，有 derived 內容的 row（來自 combined-legacy），
+  // 如果 owner 是 "main"，則對 sub-agent 不可見，防止 context bleed。
+  // 純 legacy invariant（無 derived）不受影響，正常可見。
+  return legacyRows
+    .filter(({ metadata }) => {
+      const derived = metadata.derived;
+      const hasDerivedContent = Array.isArray(derived) && derived.length > 0;
+      if (!hasDerivedContent) return true;                                  // 無 derived → 正常 legacy invariant
+      const owner = typeof metadata.agentId === "string" ? metadata.agentId.trim() : "";
+      if (!owner) return false;                                             // 有 derived 但無 owner → 不可見
+      if (owner === "main") return false;                                  // ★ main 的 derived 不外流
+      return owner === agentId;                                             // 其他 agent 的 derived → 限本人
+    })
+    .flatMap(({ entry, metadata }) => {
     const timestamp = metadataTimestamp(metadata, entry.timestamp);
     const lines = sanitizeInjectableReflectionLines(toStringArray(metadata.derived));
     if (lines.length === 0) return [];
@@ -426,8 +440,35 @@ function isReflectionMetadataType(type: unknown): boolean {
   return type === "memory-reflection-item" || type === "memory-reflection";
 }
 
-function isOwnedByAgent(metadata: Record<string, unknown>, agentId: string): boolean {
+export function isOwnedByAgent(metadata: Record<string, unknown>, agentId: string): boolean {
   const owner = typeof metadata.agentId === "string" ? metadata.agentId.trim() : "";
+
+  const itemKind = metadata.itemKind;
+
+  // itemKind 只存在於 memory-reflection-item（derived | invariant）
+  // legacy (memory-reflection) 和 mapped (memory-reflection-mapped) 沒有 itemKind（為 undefined）
+  // 因此 undefined !== "derived"，會走 main fallback（維護相容性）
+
+  // 若是 derived 項目（memory-reflection-item）：不做 main fallback，
+  //   且 derived 不允許空白 owner（空白 owner 的 derived 應完全不可見，防止洩漏）
+  // itemKind 必須是 string type，否則會錯誤進入 derived 分支
+  //   （null/undefined/number 等非 string 值應走 legacy fallback）
+  // itemKind 如果是非 null/undefined 但也不是 "derived" 或 "invariant" 的值（malformed），
+  //   視為 data corruption，fail closed — 不接受任何 agent 讀取，防止繞過 ownership 檢查
+  if (typeof itemKind === "string") {
+    // 明確的 derived itemKind
+    if (itemKind === "derived") {
+      if (!owner) return false;
+      return owner === agentId;
+    }
+    // itemKind 是字串，但既不是 "derived" 也不是 "invariant"（malformed）→ fail closed
+    // invariant 走下面 legacy fallback 相容路徑（允許 main fallback）
+  } else if (itemKind !== undefined) {
+    // itemKind 存在但不是 string（null / number / object 等）→ fail closed
+    return false;
+  }
+
+  // Invariant / legacy / mapped / undefined itemKind：允許空的 owner 通行，維護舊的 main fallback
   if (!owner) return true;
   return owner === agentId || owner === "main";
 }
