@@ -50,19 +50,23 @@ describe("isOwnedByAgent — derived ownership fix (Issue #448)", () => {
   });
 
   describe("malformed itemKind (fail-closed)", () => {
-    // When itemKind is not a string, it cannot be "derived" (typeof guard)
-    // Falls through to fallback: empty owner -> true, owner-main -> true
-    it("itemKind = null falls through to fallback (main -> sub visible)", () => {
-      assert.strictEqual(isOwnedByAgent({ itemKind: null, agentId: "main" }, "sub-agent-A"), true);
+    // itemKind === undefined：不存在，視為 legacy/mapped row，維持 fallback（main → sub 看得見）
+    // itemKind === null / number / non-derived string：malformed，fail closed，reject all
+    it("itemKind = null → fail closed（reject all agents）", () => {
+      assert.strictEqual(isOwnedByAgent({ itemKind: null, agentId: "main" }, "sub-agent-A"), false);
     });
-    it("itemKind = undefined falls through to fallback (main -> sub visible)", () => {
+    it("itemKind = number → fail closed（reject all agents）", () => {
+      assert.strictEqual(isOwnedByAgent({ itemKind: 42, agentId: "main" }, "sub-agent-A"), false);
+    });
+    it("itemKind = non-derived string（如 'weird-kind'）→ fail closed", () => {
+      assert.strictEqual(isOwnedByAgent({ itemKind: "weird-kind", agentId: "main" }, "sub-agent-A"), false);
+    });
+  });
+
+  describe("itemKind undefined（不存在 → legacy fallback 相容）", () => {
+    // itemKind 不存在（undefined）等同 legacy/mapped row，維持原本的 main fallback 行為
+    it("itemKind = undefined → 走 legacy fallback（main → sub 看得見）", () => {
       assert.strictEqual(isOwnedByAgent({ itemKind: undefined, agentId: "main" }, "sub-agent-A"), true);
-    });
-    it("itemKind = number falls through to fallback (main -> sub visible)", () => {
-      assert.strictEqual(isOwnedByAgent({ itemKind: 42, agentId: "main" }, "sub-agent-A"), true);
-    });
-    it("itemKind = non-derived string falls through to fallback (main -> sub visible)", () => {
-      assert.strictEqual(isOwnedByAgent({ itemKind: "weird-kind", agentId: "main" }, "sub-agent-A"), true);
     });
   });
 });
