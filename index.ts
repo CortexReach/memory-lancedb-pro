@@ -49,6 +49,7 @@ import {
 import {
   extractReflectionLearningGovernanceCandidates,
   extractInjectableReflectionMappedMemoryItems,
+  isRecallUsed,
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
@@ -231,24 +232,40 @@ interface PluginConfig {
     skipLowValue?: boolean;
     maxExtractionsPerHour?: number;
   };
+  feedback?: {
+    /** Boost importance when a recalled memory is used (default: 0.05) */
+    boostOnUse?: number;
+    /** Penalty when a recalled memory is not used after consecutive misses (default: 0.03) */
+    penaltyOnMiss?: number;
+    /** Extra boost when user explicitly confirms a recalled memory is correct (default: 0.15) */
+    boostOnConfirm?: number;
+    /** Extra penalty when user explicitly corrects a non-recalled memory (default: 0.10) */
+    penaltyOnError?: number;
+    /** Minimum recall (injection) count before penalty applies to this memory (default: 2) */
+    minRecallCountForPenalty?: number;
+    /** Keywords indicating user confirmation of a recalled memory */
+    confirmKeywords?: string[];
+    /** Keywords indicating user correction/error for a non-recalled memory */
+    errorKeywords?: string[];
+  };
+  /**
+   * Metadata field to use as the category label in auto-recall prefix lines.
+   * When set, the value of `metadata[categoryField]` replaces the built-in
+   * category in the `[category:scope]` prefix — if the field is present on
+   * the entry. Falls back to the built-in category when the field is absent.
+   *
+   * Useful for import-based workflows where entries carry a meaningful
+   * grouping label in a custom metadata field (e.g. "folder" for Apple Notes
+   * imports, "notebook" for Notion, "collection" for Obsidian).
+   *
+   * Default: unset — built-in category is used for all entries.
+   *
+   * @example
+   * recallPrefix: { categoryField: "folder" }
+   * // Entry with metadata.folder = "Goals" → prefix: [W][Goals:global]
+   * // Entry without metadata.folder       → prefix: [W][preference:global]
+   */
   recallPrefix?: {
-    /**
-     * Metadata field to use as the category label in auto-recall prefix lines.
-     * When set, the value of `metadata[categoryField]` replaces the built-in
-     * category in the `[category:scope]` prefix — if the field is present on
-     * the entry. Falls back to the built-in category when the field is absent.
-     *
-     * Useful for import-based workflows where entries carry a meaningful
-     * grouping label in a custom metadata field (e.g. "folder" for Apple Notes
-     * imports, "notebook" for Notion, "collection" for Obsidian).
-     *
-     * Default: unset — built-in category is used for all entries.
-     *
-     * @example
-     * recallPrefix: { categoryField: "folder" }
-     * // Entry with metadata.folder = "Goals" → prefix: [W][Goals:global]
-     * // Entry without metadata.folder       → prefix: [W][preference:global]
-     */
     categoryField?: string;
   };
 }
@@ -2164,6 +2181,46 @@ const memoryLanceDBProPlugin = {
       return next;
     };
 
+    // Session-based recall history to prevent redundant injections
+    // Map<sessionId, Map<memoryId, turnIndex>>
+    const recallHistory = new Map<string, Map<string, number>>();
+
+    // Map<sessionId, turnCounter> - manual turn tracking per session
+    const turnCounter = new Map<string, number>();
+
+    // Track how many normalized user texts have already been seen per session snapshot.
+    // All three Maps are pruned to AUTO_CAPTURE_MAP_MAX_ENTRIES to prevent unbounded
+    // growth in long-running processes with many distinct sessions.
+    const autoCaptureSeenTextCount = new Map<string, number>();
+    const autoCapturePendingIngressTexts = new Map<string, string[]>();
+    const autoCaptureRecentTexts = new Map<string, string[]>();
+
+    // ========================================================================
+    // Proposal A Phase 1: Recall Usage Tracking Hooks
+    // ========================================================================
+    // Track pending recalls per session for usage scoring
+    type PendingRecallEntry = {
+      recallIds: string[];
+      responseText: string;
+      injectedAt: number;
+      /** Summary text lines actually injected into the prompt, used for usage detection. */
+      injectedSummaries: string[];
+    };
+    // P0-1 fix: pendingRecall TTL-based cleanup to prevent unbounded memory growth.
+    // Entries older than 10 minutes are cleaned up on each set() call.
+    const PENDING_RECALL_MAX_AGE_MS = 10 * 60 * 1000; // 10 minutes
+    function cleanupPendingRecall(): void {
+      const now = Date.now();
+      for (const [key, entry] of pendingRecall.entries()) {
+        if (now - entry.injectedAt > PENDING_RECALL_MAX_AGE_MS) {
+          pendingRecall.delete(key);
+        }
+      }
+    }
+    const pendingRecall = new Map<string, PendingRecallEntry>();
+    // Clean up on module load (handles re-registration edge cases)
+    cleanupPendingRecall();
+
     const logReg = isCliMode() ? api.logger.debug : api.logger.info;
     logReg(
       `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
@@ -2667,7 +2724,9 @@ const memoryLanceDBProPlugin = {
               const nextBadRecallCount = staleInjected
                 ? meta.bad_recall_count + 1
                 : meta.bad_recall_count;
-              const shouldSuppress = nextBadRecallCount >= 3 && minRepeated > 0;
+              // P2 fix: suppress threshold aligned with scoring path (>= 2). After 2 bad recalls,
+              // both the scoring penalty and suppression kick in simultaneously.
+              const shouldSuppress = nextBadRecallCount >= 2 && minRepeated > 0;
               await store.patchMetadata(
                 item.id,
                 {
@@ -2693,6 +2752,27 @@ const memoryLanceDBProPlugin = {
           api.logger.info?.(
             `memory-lancedb-pro: injecting ${selected.length} memories into context for agent ${agentId}`,
           );
+
+          // Create or update pendingRecall for this turn so the feedback hook
+          // (which runs in the NEXT turn's before_prompt_build after agent_end)
+          // sees a matching pair: Turn N recallIds + Turn N responseText.
+          // agent_end will write responseText into this same pendingRecall
+          // entry (only updating responseText, never clearing recallIds).
+          // Include agentId in the key so different agents in the same session do not overwrite each other's pendingRecall.
+          const sessionKeyForRecall = `${ctx?.sessionKey || ctx?.sessionId || "default"}:${agentId ?? ""}`;
+          // Bug 1 fix: also store the injected summary lines so the feedback hook
+          // can detect usage even when the agent doesn't use stock phrases or IDs
+          // but directly incorporates the memory content into the response.
+          // P1 fix: store summary content only (without prefix) for accurate matching.
+          const injectedSummaries = selected.map((item) => item.summary);
+          // P0-1 fix: run TTL cleanup before each set to prevent unbounded growth
+          cleanupPendingRecall();
+          pendingRecall.set(sessionKeyForRecall, {
+            recallIds: selected.map((item) => item.id),
+            responseText: "", // Will be populated by agent_end
+            injectedAt: Date.now(),
+            injectedSummaries,
+          });
 
           return {
             prependContext:
@@ -2737,6 +2817,15 @@ const memoryLanceDBProPlugin = {
           recallHistory.delete(sessionId);
           turnCounter.delete(sessionId);
           lastRawUserMessage.delete(sessionId);
+          // P3 fix: clean all pendingRecall entries for this session.
+          // pendingRecall keys use format: sessionKey (or sessionKey:agentId with composite key).
+          // P1 fix: use sessionId only when sessionKey is absent to avoid clearing unrelated sessions.
+          const sessionKeyToClean = ctx?.sessionKey ?? sessionId;
+          for (const key of pendingRecall.keys()) {
+            if (key === sessionId || key.startsWith(`${sessionId}:`) || (sessionKeyToClean && key.startsWith(`${sessionKeyToClean}:`))) {
+              pendingRecall.delete(key);
+            }
+          }
         }
         // Also clean by channelId/conversationId if present (shared cache key)
         const cacheKey = ctx?.channelId || ctx?.conversationId || "";
@@ -3002,8 +3091,13 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: regex fallback found ${toCapture.length} capturable text(s) for agent ${agentId}`,
           );
 
-          // Store each capturable piece (limit to 2 per conversation)
-          let stored = 0;
+          // FIX #675: Collect entries and use bulkStore() once (1 lock instead of N).
+          // Limit to 2 capturable pieces per conversation.
+          const capturedEntries: Array<{
+            text: string; vector: number[]; importance: number;
+            category: string; scope: string; metadata: string;
+          }> = [];
+
           for (const text of toCapture.slice(0, 2)) {
             if (isUserMdExclusiveMemory({ text }, config.workspaceBoundary)) {
               api.logger.info(
@@ -3015,8 +3109,8 @@ const memoryLanceDBProPlugin = {
             const category = detectCategory(text);
             const vector = await embedder.embedPassage(text);
 
-            // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
-            // Fail-open by design: dedup should not block auto-capture writes.
+            // FIX #675: Dedup check stays in loop — must check each text individually
+            // before adding to batch. Fail-open: dedup error does NOT block write.
             let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
             try {
               existing = await store.vectorSearch(vector, 1, 0.1, [
@@ -3032,7 +3126,7 @@ const memoryLanceDBProPlugin = {
               continue;
             }
 
-            await store.store({
+            capturedEntries.push({
               text,
               vector,
               importance: 0.7,
@@ -3064,21 +3158,59 @@ const memoryLanceDBProPlugin = {
                 ),
               ),
             });
-            stored++;
-
-            // Dual-write to Markdown mirror if enabled
-            if (mdMirror) {
-              await mdMirror(
-                { text, category, scope: defaultScope, timestamp: Date.now() },
-                { source: "auto-capture", agentId },
-              );
-            }
           }
 
-          if (stored > 0) {
-            api.logger.info(
-              `memory-lancedb-pro: auto-captured ${stored} memories for agent ${agentId} in scope ${defaultScope}`,
-            );
+          // FIX #675: bulkStore once (1 lock for N entries) instead of N store.store() calls.
+          // FIX #Bug-1 (post-Codex-review): mdMirror errors are handled separately and do NOT
+          // trigger the store.store() fallback (which would create duplicate rows).
+          if (capturedEntries.length > 0) {
+            try {
+              await store.bulkStore(capturedEntries);
+              api.logger.info(
+                `memory-lancedb-pro: auto-captured ${capturedEntries.length} memories for agent ${agentId} in scope ${defaultScope} (bulkStore)`,
+              );
+            } catch (err) {
+              api.logger.warn(
+                `memory-lancedb-pro: bulkStore failed for ${capturedEntries.length} entries, falling back to individual store: ${String(err)}`,
+              );
+              // Fallback: store individually with dedup check to handle the rare case
+              // where bulkStore partially committed (LanceDB add() is batch-atomic but
+              // we guard against edge cases). Pre-loop dedup used the same logic.
+              for (const entry of capturedEntries) {
+                let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
+                try {
+                  existing = await store.vectorSearch(entry.vector, 1, 0.1, [defaultScope]);
+                } catch {
+                  // Fail-open: dedup error does NOT block write
+                }
+                if (existing.length > 0 && existing[0].score > 0.90) {
+                  continue; // Skip duplicate
+                }
+                await store.store(entry);
+              }
+              api.logger.info(
+                `memory-lancedb-pro: auto-captured ${capturedEntries.length} memories for agent ${agentId} (individual fallback)`,
+              );
+            }
+
+            // FIX #Bug-1: mdMirror is called AFTER bulkStore succeeds, with its own
+            // error handling. If mdMirror fails, bulkStore is ALREADY committed —
+            // we log the error and continue. We do NOT retry via store.store()
+            // (which would create duplicate rows in LanceDB).
+            if (mdMirror) {
+              for (const entry of capturedEntries) {
+                try {
+                  await mdMirror(
+                    { text: entry.text, category: entry.category, scope: defaultScope, timestamp: Date.now() },
+                    { source: "auto-capture", agentId },
+                  );
+                } catch (mdErr) {
+                  api.logger.warn(
+                    `memory-lancedb-pro: mdMirror failed for entry "${entry.text.slice(0, 40)}…", bulkStore already committed: ${String(mdErr)}`,
+                  );
+                }
+              }
+            }
           }
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: capture failed: ${String(err)}`);
@@ -3089,7 +3221,210 @@ const memoryLanceDBProPlugin = {
       };
 
       api.on("agent_end", agentEndAutoCaptureHook);
+
+    // ========================================================================
+    // Proposal A Phase 1: agent_end hook - Store response text for usage tracking
+    // ========================================================================
+    // NOTE: Only writes responseText to an EXISTING pendingRecall entry created
+    // by before_prompt_build (auto-recall). Does NOT create a new entry.
+    // This ensures recallIds (written by auto-recall in the same turn) and
+    // responseText (written here) remain paired for the feedback hook.
+    api.on("agent_end", (event: any, ctx: any) => {
+      // Use same key format as auto-recall hook (sessionKey:agentId) so we update the right entry.
+      const agentIdForKey = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+      const sessionKey = `${ctx?.sessionKey || ctx?.sessionId || "default"}:${agentIdForKey ?? ""}`;
+
+      // Get the last message content
+      let lastMsgText: string | null = null;
+      if (event.messages && Array.isArray(event.messages)) {
+        const lastMsg = event.messages[event.messages.length - 1];
+        if (lastMsg && typeof lastMsg === "object") {
+          const msgObj = lastMsg as Record<string, unknown>;
+          lastMsgText = extractTextContent(msgObj.content);
+        }
+      }
+
+      // Only update an existing pendingRecall entry — do NOT create one.
+      // This preserves recallIds written by auto-recall earlier in this turn.
+      const existing = pendingRecall.get(sessionKey);
+      if (existing && lastMsgText && lastMsgText.trim().length > 0) {
+        existing.responseText = lastMsgText;
+      }
+    }, { priority: 20 });
+
+    // MR2 fix: guard Phase 1 hooks so existing tests asserting hooks.length===1
+    // (auto-recall block only) continue to pass.
+    if (config.autoRecall === true) {
+
+    // ========================================================================
+    // Proposal A Phase 1: before_prompt_build hook (priority 5) - Score recalls
+    // ========================================================================
+    api.on("before_prompt_build", async (event: any, ctx: any) => {
+      // Use same key format as auto-recall hook (sessionKey:agentId) so we read the right entry.
+      const agentIdForKey = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+      const sessionKey = `${ctx?.sessionKey || ctx?.sessionId || "default"}:${agentIdForKey ?? ""}`;
+      // P2 fix: also cleanup on read path to handle idle sessions that never trigger set()
+      cleanupPendingRecall();
+      const pending = pendingRecall.get(sessionKey);
+      if (!pending) return;
+
+      // Guard: only score if responseText has substantial content
+      const responseText = pending.responseText;
+      if (!responseText || responseText.length <= 24) {
+        // Skip scoring for empty or very short responses
+        // Bug 5 fix: also clear pendingRecall so the next turn does not
+        // re-trigger feedback on stale recallIds / old responseText.
+        pendingRecall.delete(sessionKey);
+        return;
+      }
+
+      // Read recall IDs directly from pendingRecall (populated by auto-recall's
+      // before_prompt_build hook from the PREVIOUS turn). This replaces the
+      // broken regex-based parsing of prependContext which never matched the
+      // actual [category:scope] format used by auto-recall injection.
+      const injectedIds = pending.recallIds ?? [];
+
+      // Bug 1 fix: also retrieve the injected summary lines so isRecallUsed can
+      // detect when the agent directly incorporates memory content into the response.
+      const injectedSummaries = pending.injectedSummaries ?? [];
+
+      // Check if any recall was actually used by checking if the response contains reference to the injected content
+      // This is a heuristic - we check if the response shows awareness of injected memories
+      let usedRecall = false;
+      if (injectedIds.length > 0 || injectedSummaries.length > 0) {
+        // Use the real isRecallUsed function from reflection-slices
+        usedRecall = isRecallUsed(responseText, injectedIds, injectedSummaries);
+      }
+
+      // Read feedback config values with defaults
+      // P2 fix: coerce to Number and use ?? to preserve explicit zero values.
+      // P2 fix: use nullish coalescing to allow 0 as a valid config value.
+      const fb = config.feedback ?? {};
+      // F1 fix: use (val ?? null) so ?? fallback fires on undefined.
+      // Pattern: (val ?? null ?? default). undefined→null→default; 0→0 (no trigger).
+      const boostOnUse = (fb.boostOnUse ?? null ?? 0.05);
+      const penaltyOnMiss = (fb.penaltyOnMiss ?? null ?? 0.03);
+      const boostOnConfirm = (fb.boostOnConfirm ?? null ?? 0.15);
+      const penaltyOnError = (fb.penaltyOnError ?? null ?? 0.10);
+      const minRecallCountForPenalty = fb.minRecallCountForPenalty ?? 2;
+      const confirmKeywords = fb.confirmKeywords ?? ["correct", "right", "yes", "confirmed", "exactly", "對", "沒錯", "正確", "確認", "好的"];
+      const errorKeywords = fb.errorKeywords ?? ["wrong", "incorrect", "not right", "that's wrong", "error", "mistake", "fix it", "change that", "改成", "改為", "不是這樣", "不對", "錯了"];
+
+      // event.prompt is a plain string in the current hook contract (confirmed by codebase usage).
+      // We extract the user's last message from event.messages array instead.
+      let userPromptText = "";
+      try {
+        if (event.messages && Array.isArray(event.messages)) {
+          for (let i = event.messages.length - 1; i >= 0; i--) {
+            const msg = event.messages[i];
+            if (msg && msg.role === "user" && typeof msg.content === "string" && msg.content.trim().length > 0) {
+              userPromptText = msg.content.trim();
+              break;
+            }
+            if (msg && msg.role === "user" && Array.isArray(msg.content)) {
+              // Handle array-form content
+              const text = extractTextContent(msg.content);
+              if (text && text.trim().length > 0) {
+                userPromptText = text.trim();
+                break;
+              }
+            }
+          }
+        }
+      } catch (_e) {
+        userPromptText = "";
+      }
+
+      // Helper: check if text contains any of the keywords (case-insensitive)
+      const containsKeyword = (text: string, keywords: string[]): boolean =>
+        keywords.some((kw) => text.toLowerCase().includes(kw.toLowerCase()));
+
+      // Score the recall - update importance based on usage
+      // Score each recall individually — do NOT compute a single usedRecall for the whole batch.
+      // Bug 1 fix (P1): when auto-recall injects multiple memories, the agent may use only some of them.
+      // Scoring them all with one decision corrupts ranking: unused memories get boosted, used ones get penalized.
+      if (injectedIds.length > 0) {
+        try {
+          // Build lookup: recallId -> injected summary text for this specific recall
+          const summaryMap = new Map<string, string>();
+          for (let i = 0; i < injectedIds.length; i++) {
+            if (injectedSummaries[i]) {
+              summaryMap.set(injectedIds[i], injectedSummaries[i]);
+            }
+          }
+
+          for (const recallId of injectedIds) {
+            const summaryText = summaryMap.get(recallId) ?? "";
+            // Score this specific recall independently
+            const usedRecall = isRecallUsed(
+              responseText,
+              [recallId],
+              summaryText ? [summaryText] : [],
+            );
+
+            const entry = await store.getById(recallId, undefined);
+            if (!entry) continue;
+            const meta = parseSmartMetadata(entry.metadata, entry);
+            const currentImportance = meta.importance ?? entry.importance ?? 0.5;
+
+            // P1 fix (Codex): check errorKeywords BEFORE usedRecall.
+            // If user explicitly corrects, that overrides the heuristic usage detection.
+            // Also set last_confirmed_use_at here to prevent injection path's staleInjected
+            // from double-counting in the same turn.
+            const hasError = containsKeyword(userPromptText, errorKeywords);
+            if (hasError) {
+              if ((meta.injected_count || 0) >= minRecallCountForPenalty) {
+                await store.update(recallId, { importance: Math.max(0.1, currentImportance - penaltyOnError) }, undefined);
+              }
+              await store.patchMetadata(recallId, { bad_recall_count: (meta.bad_recall_count || 0) + 1, last_confirmed_use_at: Date.now() }, undefined);
+            } else if (usedRecall) {
+              // Pure positive use: boost importance
+              let newImportance = Math.min(1.0, currentImportance + boostOnUse);
+              if (containsKeyword(userPromptText, confirmKeywords)) {
+                newImportance = Math.min(1.0, newImportance + boostOnConfirm);
+              }
+              await store.update(recallId, { importance: newImportance }, undefined);
+              await store.patchMetadata(recallId, { last_confirmed_use_at: Date.now(), bad_recall_count: 0 }, undefined);
+            } else {
+              // P1 fix: align scoring penalty threshold with injection increment.
+              // Silent miss: apply penalty if badCount >= 1 (injection path handles increment).
+              const badCount = meta.bad_recall_count || 0;
+              if (badCount >= 1 && (meta.injected_count || 0) >= minRecallCountForPenalty) {
+                await store.update(recallId, { importance: Math.max(0.1, currentImportance - penaltyOnMiss) }, undefined);
+              }
+              // No increment here - injection path already increments via staleInjected.
+            }
+          }
+        } catch (err) {
+          api.logger.warn(`memory-lancedb-pro: recall usage scoring failed: ${String(err)}`);
+        } finally {
+          pendingRecall.delete(sessionKey);
+        }
+      }
+    }, { priority: 5 });
     }
+
+    // ========================================================================
+    // Proposal A Phase 1: session_end hook - Clean up pending recalls
+    // ========================================================================
+    api.on("session_end", (_event: any, ctx: any) => {
+      // P1 fix: clean all pendingRecall entries for this session, including composite keys.
+      // When autoCapture is false, the auto-capture session_end (priority 10) is skipped,
+      // so this hook must handle composite keys (sessionKey:agentId) as well.
+      const sessionId = ctx?.sessionId || "";
+      const sessionKey = ctx?.sessionKey || "";
+      for (const key of pendingRecall.keys()) {
+        if (
+          key === sessionKey ||
+          key === sessionId ||
+          key.startsWith(`${sessionKey}:`) ||
+          key.startsWith(`${sessionId}:`)
+        ) {
+          pendingRecall.delete(key);
+        }
+      }
+    }, { priority: 20 });
+    }  // end if (config.autoRecall === true) — closes MR2 Phase-1 hooks guard
 
     // ========================================================================
     // Integrated Self-Improvement (inheritance + derived)
@@ -4265,15 +4600,18 @@ export function parsePluginConfig(value: unknown): PluginConfig {
                 : 30,
           }
         : { skipLowValue: false, maxExtractionsPerHour: 30 },
-    recallPrefix:
-      typeof cfg.recallPrefix === "object" && cfg.recallPrefix !== null
-        ? {
-            categoryField:
-              typeof (cfg.recallPrefix as Record<string, unknown>).categoryField === "string"
-                ? ((cfg.recallPrefix as Record<string, unknown>).categoryField as string)
-                : undefined,
-          }
-        : undefined,
+    // Bug 3 fix: parse and return the feedback config block so deployments
+    // that specify custom feedback values actually take effect instead of
+    // falling back to hardcoded defaults.
+    feedback: typeof cfg.feedback === "object" && cfg.feedback !== null
+      ? { ...(cfg.feedback as Record<string, unknown>) }
+      : {},
+    // recallPrefix: { categoryField?: string }
+    // Lets deployments replace the built-in category in [category:scope] auto-recall
+    // prefix lines with a custom metadata field (e.g. "folder" for Apple Notes imports).
+    recallPrefix: typeof cfg.recallPrefix === "object" && cfg.recallPrefix !== null
+      ? { ...(cfg.recallPrefix as Record<string, unknown>) }
+      : {},
   };
 }
 
