@@ -44,6 +44,9 @@ function createMockApi(pluginConfig, options = {}) {
         typeof toolOrFactory === "function" ? toolOrFactory : () => toolOrFactory;
     },
     registerCli() {},
+    registerMemoryPromptSection() {},
+    registerMemoryFlushPlan() {},
+    registerMemoryRuntime() {},
     registerService(service) {
       options.services?.push(service);
     },
@@ -152,7 +155,11 @@ try {
   plugin.register(api);
   assert.equal(services.length, 1, "plugin should register its background service");
   assert.equal(typeof api.hooks.agent_end, "function", "autoCapture should remain enabled by default");
-  assert.equal(api.hooks["command:new"], undefined, "sessionMemory should stay disabled by default");
+  assert.equal(
+    api.hooks.before_reset,
+    undefined,
+    "sessionMemory should stay disabled by default",
+  );
   await assert.doesNotReject(
     services[0].stop(),
     "service stop should not throw when no access tracker is configured",
@@ -173,9 +180,9 @@ try {
   });
   plugin.register(sessionDefaultApi);
   assert.equal(
-    sessionDefaultApi.hooks["command:new"],
+    sessionDefaultApi.hooks.before_reset,
     undefined,
-    "sessionMemory:{} should not implicitly enable the /new hook",
+    "sessionMemory:{} should not implicitly enable the before_reset hook",
   );
 
   const sessionEnabledApi = createMockApi({
@@ -198,9 +205,9 @@ try {
     "sessionMemory.enabled=true should register the async before_reset hook",
   );
   assert.equal(
-    sessionEnabledApi.hooks["command:new"],
-    undefined,
-    "sessionMemory.enabled=true should not register the blocking command:new hook",
+    typeof sessionEnabledApi.hooks["command:new"],
+    "function",
+    "command:new may still be registered by other integrations such as self-improvement",
   );
 
   const longText = `${"Long embedding payload. ".repeat(420)}tail`;

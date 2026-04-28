@@ -1348,5 +1348,10 @@
       "help": "Rate limit for auto-capture extractions. Prevents excessive LLM calls during rapid-fire sessions.",
       "advanced": true
     }
-  }
+  },
+  "commandAliases": [
+    {
+      "name": "memory-pro"
+    }
+  ]
 }

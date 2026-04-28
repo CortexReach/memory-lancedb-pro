@@ -13,11 +13,12 @@ import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 
-// Detect CLI mode: when running as a CLI subcommand (e.g. `openclaw memory-pro stats`),
-// OpenClaw sets OPENCLAW_CLI=1 in the process environment. Registration and
-// lifecycle logs are noisy in CLI context (printed to stderr before command output),
-// so we downgrade them to debug level when running in CLI mode.
-const isCliMode = () => process.env.OPENCLAW_CLI === "1";
+// Detect CLI/runtime registration mode from the plugin API instead of relying on
+// process-global environment flags. Gateway plugin loading can evaluate code in the
+// same process family as CLI helpers during reload/restart, so OPENCLAW_CLI is too
+// blunt for deciding whether to short-circuit runtime registration.
+const isCliRegistrationMode = (api: Pick<OpenClawPluginApi, "registrationMode">) =>
+  api.registrationMode === "cli-metadata";
 
 // Import core components
 import { MemoryStore, validateStoragePath } from "./src/store.js";
@@ -1605,6 +1606,160 @@ function getPluginVersion(): string {
 
 const pluginVersion = getPluginVersion();
 
+const DEFAULT_HOST_MEMORY_WORKSPACE_DIR = join(homedir(), ".openclaw", "workspace");
+
+function resolveHostMemoryWorkspaceDir(api: OpenClawPluginApi): string {
+  const configRecord = (api.config ?? {}) as Record<string, unknown>;
+  const configured = typeof configRecord.workspaceDir === "string"
+    ? configRecord.workspaceDir.trim()
+    : "";
+  if (configured) return configured;
+  const envDir = process.env.OPENCLAW_WORKSPACE_DIR?.trim();
+  if (envDir) return envDir;
+  return DEFAULT_HOST_MEMORY_WORKSPACE_DIR;
+}
+
+async function listMarkdownFilesRecursive(rootDir: string): Promise<string[]> {
+  const found: string[] = [];
+  const stack = [rootDir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current) continue;
+    let entries: Awaited<ReturnType<typeof readdir>> = [];
+    try {
+      entries = await readdir(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const fullPath = join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) found.push(fullPath);
+    }
+  }
+  return found.sort();
+}
+
+function buildSnippetWithLines(text: string, index: number, radius = 180): { snippet: string; startLine: number; endLine: number } {
+  const safeIndex = Math.max(0, Math.min(index, text.length));
+  const start = Math.max(0, safeIndex - radius);
+  const end = Math.min(text.length, safeIndex + radius);
+  const snippet = text.slice(start, end).trim();
+  const startLine = text.slice(0, start).split(/\r?\n/).length;
+  const endLine = Math.max(startLine, text.slice(0, end).split(/\r?\n/).length);
+  return { snippet, startLine, endLine };
+}
+
+function scoreMarkdownMatch(query: string, text: string): { score: number; index: number } {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) return { score: 0, index: -1 };
+  const haystack = text.toLowerCase();
+  const directIndex = haystack.indexOf(normalizedQuery);
+  const terms = normalizedQuery.split(/\s+/).filter(Boolean);
+  let hits = 0;
+  let firstIndex = directIndex;
+  for (const term of terms) {
+    const termIndex = haystack.indexOf(term);
+    if (termIndex >= 0) {
+      hits += 1;
+      if (firstIndex < 0 || termIndex < firstIndex) firstIndex = termIndex;
+    }
+  }
+  if (directIndex < 0 && hits === 0) return { score: 0, index: -1 };
+  const fullMatchBoost = directIndex >= 0 ? 0.35 : 0;
+  const termScore = terms.length > 0 ? Math.min(0.55, hits / terms.length) : 0.2;
+  return { score: Math.min(0.99, 0.1 + fullMatchBoost + termScore), index: firstIndex >= 0 ? firstIndex : 0 };
+}
+
+function createCompatMemorySearchManager(params: {
+  workspaceDir: string;
+  provider: string;
+  model?: string;
+  dbPath: string;
+  pluginVersion: string;
+}) {
+  const memoryRoot = join(params.workspaceDir, "memory");
+  const normalizeRelPath = (candidate: string) => candidate.slice(params.workspaceDir.length + 1).replaceAll('\\', '/');
+  return {
+    async search(query: string, opts?: { maxResults?: number; minScore?: number; sessionKey?: string }) {
+      const files = await listMarkdownFilesRecursive(memoryRoot);
+      const maxResults = Math.max(1, Math.min(20, opts?.maxResults ?? 8));
+      const minScore = typeof opts?.minScore === "number" ? opts.minScore : 0.15;
+      const results: Array<{ path: string; startLine: number; endLine: number; score: number; snippet: string; source: "memory" }> = [];
+      for (const filePath of files) {
+        let content = "";
+        try {
+          content = await readFile(filePath, "utf-8");
+        } catch {
+          continue;
+        }
+        const { score, index } = scoreMarkdownMatch(query, content);
+        if (score < minScore || index < 0) continue;
+        const { snippet, startLine, endLine } = buildSnippetWithLines(content, index);
+        results.push({
+          path: normalizeRelPath(filePath),
+          startLine,
+          endLine,
+          score,
+          snippet,
+          source: "memory",
+        });
+      }
+      return results.sort((left, right) => right.score - left.score).slice(0, maxResults);
+    },
+    async readFile(params2: { relPath: string; from?: number; lines?: number }) {
+      const target = join(params.workspaceDir, params2.relPath);
+      if (!target.startsWith(params.workspaceDir)) throw new Error(`memory-lancedb-pro: invalid relPath ${params2.relPath}`);
+      const text = await readFile(target, "utf-8");
+      const lines = text.split(/\r?\n/);
+      if (typeof params2.from !== "number" && typeof params2.lines !== "number") return { text, path: params2.relPath };
+      const startLine = Math.max(1, params2.from ?? 1);
+      const lineCount = Math.max(1, params2.lines ?? lines.length);
+      const selected = lines.slice(startLine - 1, startLine - 1 + lineCount).join("\n");
+      return { text: selected, path: params2.relPath };
+    },
+    status() {
+      return {
+        backend: "builtin" as const,
+        provider: params.provider,
+        model: params.model,
+        workspaceDir: params.workspaceDir,
+        dbPath: params.dbPath,
+        sources: ["memory" as const],
+        custom: {
+          bridge: "markdown-search-compat",
+          pluginVersion: params.pluginVersion,
+          memoryRoot,
+        },
+      };
+    },
+    async probeEmbeddingAvailability() {
+      return { ok: true };
+    },
+    async probeVectorAvailability() {
+      return true;
+    },
+  };
+}
+
+const buildCompatMemoryPromptSection = ({ availableTools, citationsMode }: { availableTools: Set<string>; citationsMode?: "on" | "off" | "auto" }) => {
+  const hasMemorySearch = availableTools.has("memory_search");
+  const hasMemoryGet = availableTools.has("memory_get");
+  if (!hasMemorySearch && !hasMemoryGet) return [];
+  let toolGuidance = "Before answering anything about prior work, decisions, dates, people, preferences, or todos: consult memory tools first.";
+  if (hasMemorySearch && hasMemoryGet) toolGuidance = "Before answering anything about prior work, decisions, dates, people, preferences, or todos: run memory_search first, then use memory_get to inspect the exact lines you need. If confidence stays low, say you checked.";
+  else if (hasMemorySearch) toolGuidance = "Before answering anything about prior work, decisions, dates, people, preferences, or todos: run memory_search and answer from the matching snippets. If confidence stays low, say you checked.";
+  else if (hasMemoryGet) toolGuidance = "Before answering anything about prior work, decisions, dates, people, preferences, or todos that already point to a file: run memory_get to inspect the exact lines you need. If confidence stays low, say you checked.";
+  const lines = ["## Memory Recall", toolGuidance];
+  if (citationsMode === "off") lines.push("Citations are disabled: do not mention file paths or line numbers unless the user explicitly asks.");
+  else lines.push("Citations: include Source: <path#line> when it helps the user verify memory snippets.");
+  lines.push("");
+  return lines;
+};
+
 // ============================================================================
 // Plugin Definition
 // ============================================================================
@@ -1680,6 +1835,103 @@ const memoryLanceDBProPlugin = {
     }
 
     const migrator = createMigrator(store);
+    const cliLlmClient = (() => {
+      try {
+        const llmAuth = config.llm?.auth || "api-key";
+        const llmApiKey = llmAuth === "oauth"
+          ? undefined
+          : config.llm?.apiKey
+            ? resolveEnvVars(config.llm.apiKey)
+            : resolveFirstApiKey(config.embedding.apiKey);
+        const llmBaseURL = llmAuth === "oauth"
+          ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
+          : config.llm?.baseURL
+            ? resolveEnvVars(config.llm.baseURL)
+            : config.embedding.baseURL;
+        const llmOauthPath = llmAuth === "oauth"
+          ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
+          : undefined;
+        const llmOauthProvider = llmAuth === "oauth"
+          ? config.llm?.oauthProvider
+          : undefined;
+        const llmTimeoutMs = resolveLlmTimeoutMs(config);
+        return createLlmClient({
+          auth: llmAuth,
+          apiKey: llmApiKey,
+          model: config.llm?.model || "openai/gpt-oss-120b",
+          baseURL: llmBaseURL,
+          oauthProvider: llmOauthProvider,
+          oauthPath: llmOauthPath,
+          timeoutMs: llmTimeoutMs,
+          log: (msg: string) => api.logger.debug(msg),
+        });
+      } catch {
+        return undefined;
+      }
+    })();
+
+    api.registerCli(
+      createMemoryCLI({
+        store,
+        retriever,
+        scopeManager,
+        migrator,
+        embedder,
+        llmClient: cliLlmClient,
+      }),
+      { commands: ["memory-pro"] },
+    );
+
+    if (isCliRegistrationMode(api)) {
+      return;
+    }
+
+    const registerMemoryPromptSection = (api as {
+      registerMemoryPromptSection?: ((builder: typeof buildCompatMemoryPromptSection) => void);
+    }).registerMemoryPromptSection;
+    const registerMemoryFlushPlan = (api as {
+      registerMemoryFlushPlan?: ((factory: () => null) => void);
+    }).registerMemoryFlushPlan;
+    const registerMemoryRuntime = (api as {
+      registerMemoryRuntime?: ((runtime: {
+        getMemorySearchManager: () => Promise<{ manager: ReturnType<typeof createCompatMemorySearchManager> }>;
+        resolveMemoryBackendConfig: () => { backend: "builtin" };
+        closeAllMemorySearchManagers: () => Promise<void>;
+      }) => void);
+    }).registerMemoryRuntime;
+
+    if (
+      typeof registerMemoryPromptSection === "function"
+      || typeof registerMemoryFlushPlan === "function"
+      || typeof registerMemoryRuntime === "function"
+    ) {
+      const hostMemoryWorkspaceDir = resolveHostMemoryWorkspaceDir(api);
+      const compatMemorySearchManager = createCompatMemorySearchManager({
+        workspaceDir: hostMemoryWorkspaceDir,
+        provider: "memory-lancedb-pro",
+        model: config.embedding.model || "text-embedding-3-small",
+        dbPath: resolvedDbPath,
+        pluginVersion,
+      });
+
+      if (typeof registerMemoryPromptSection === "function") {
+        registerMemoryPromptSection.call(api, buildCompatMemoryPromptSection);
+      }
+      if (typeof registerMemoryFlushPlan === "function") {
+        registerMemoryFlushPlan.call(api, () => null);
+      }
+      if (typeof registerMemoryRuntime === "function") {
+        registerMemoryRuntime.call(api, {
+          async getMemorySearchManager() {
+            return { manager: compatMemorySearchManager };
+          },
+          resolveMemoryBackendConfig() {
+            return { backend: "builtin" as const };
+          },
+          async closeAllMemorySearchManagers() {},
+        });
+      }
+    }
 
     // Initialize smart extraction
     let smartExtractor: SmartExtractor | null = null;
@@ -1743,7 +1995,7 @@ const memoryLanceDBProPlugin = {
           noiseBank,
         });
 
-        (isCliMode() ? api.logger.debug : api.logger.info)(
+        (isCliRegistrationMode(api) ? api.logger.debug : api.logger.info)(
           "memory-lancedb-pro: smart extraction enabled (LLM model: "
           + llmModel
           + ", timeoutMs: "
@@ -1770,10 +2022,18 @@ const memoryLanceDBProPlugin = {
       limit: number;
       scopeFilter?: string[];
       category?: string;
+      source?: "manual" | "auto-recall" | "cli";
+      signal?: AbortSignal;
     }) {
       let results = await retriever.retrieve(params);
       if (results.length === 0) {
+        if (params.signal?.aborted) {
+          throw new Error("retrieval aborted");
+        }
         await sleep(75);
+        if (params.signal?.aborted) {
+          throw new Error("retrieval aborted");
+        }
         results = await retriever.retrieve(params);
       }
       return results;
@@ -1987,7 +2247,7 @@ const memoryLanceDBProPlugin = {
     const autoCapturePendingIngressTexts = new Map<string, string[]>();
     const autoCaptureRecentTexts = new Map<string, string[]>();
 
-    const logReg = isCliMode() ? api.logger.debug : api.logger.info;
+    const logReg = isCliRegistrationMode(api) ? api.logger.debug : api.logger.info;
     logReg(
       `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
     );
@@ -2175,53 +2435,6 @@ const memoryLanceDBProPlugin = {
     }
 
     // ========================================================================
-    // Register CLI Commands
-    // ========================================================================
-
-    api.registerCli(
-      createMemoryCLI({
-        store,
-        retriever,
-        scopeManager,
-        migrator,
-        embedder,
-        llmClient: smartExtractor ? (() => {
-          try {
-            const llmAuth = config.llm?.auth || "api-key";
-            const llmApiKey = llmAuth === "oauth"
-              ? undefined
-              : config.llm?.apiKey
-                ? resolveEnvVars(config.llm.apiKey)
-                : resolveFirstApiKey(config.embedding.apiKey);
-            const llmBaseURL = llmAuth === "oauth"
-              ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
-              : config.llm?.baseURL
-                ? resolveEnvVars(config.llm.baseURL)
-                : config.embedding.baseURL;
-            const llmOauthPath = llmAuth === "oauth"
-              ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
-              : undefined;
-            const llmOauthProvider = llmAuth === "oauth"
-              ? config.llm?.oauthProvider
-              : undefined;
-            const llmTimeoutMs = resolveLlmTimeoutMs(config);
-            return createLlmClient({
-              auth: llmAuth,
-              apiKey: llmApiKey,
-              model: config.llm?.model || "openai/gpt-oss-120b",
-              baseURL: llmBaseURL,
-              oauthProvider: llmOauthProvider,
-              oauthPath: llmOauthPath,
-              timeoutMs: llmTimeoutMs,
-              log: (msg: string) => api.logger.debug(msg),
-            });
-          } catch { return undefined; }
-        })() : undefined,
-      }),
-      { commands: ["memory-pro"] },
-    );
-
-    // ========================================================================
     // Lifecycle Hooks
     // ========================================================================
 
@@ -2271,7 +2484,14 @@ const memoryLanceDBProPlugin = {
         // (embedding → rerank → lifecycle), which can silently drop messages on
         // channels like Telegram when subsequent requests hit lock timeouts.
         // See: https://github.com/CortexReach/memory-lancedb-pro/issues/253
+        const recallAbort = new AbortController();
+        const throwIfRecallAborted = () => {
+          if (recallAbort.signal.aborted) {
+            throw new Error("retrieval aborted");
+          }
+        };
         const recallWork = async (): Promise<{ prependContext: string } | undefined> => {
+          throwIfRecallAborted();
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
@@ -2309,8 +2529,10 @@ const memoryLanceDBProPlugin = {
             limit: retrieveLimit,
             scopeFilter: accessibleScopes,
             source: "auto-recall",
+            signal: recallAbort.signal,
           }), config.workspaceBoundary);
 
+          throwIfRecallAborted();
           if (results.length === 0) {
             return;
           }
@@ -2453,6 +2675,7 @@ const memoryLanceDBProPlugin = {
             return;
           }
 
+          throwIfRecallAborted();
           if (minRepeated > 0) {
             const sessionHistory = recallHistory.get(sessionId) || new Map<string, number>();
             for (const item of selected) {
@@ -2461,36 +2684,11 @@ const memoryLanceDBProPlugin = {
             recallHistory.set(sessionId, sessionHistory);
           }
 
-          const injectedAt = Date.now();
-          await Promise.allSettled(
-            selected.map(async (item) => {
-              const meta = item.meta;
-              const staleInjected =
-                typeof meta.last_injected_at === "number" &&
-                meta.last_injected_at > 0 &&
-                (
-                  typeof meta.last_confirmed_use_at !== "number" ||
-                  meta.last_confirmed_use_at < meta.last_injected_at
-                );
-              const nextBadRecallCount = staleInjected
-                ? meta.bad_recall_count + 1
-                : meta.bad_recall_count;
-              const shouldSuppress = nextBadRecallCount >= 3 && minRepeated > 0;
-              await store.patchMetadata(
-                item.id,
-                {
-                  injected_count: meta.injected_count + 1,
-                  last_injected_at: injectedAt,
-                  bad_recall_count: nextBadRecallCount,
-                  suppressed_until_turn: shouldSuppress
-                    ? Math.max(meta.suppressed_until_turn, currentTurn + minRepeated)
-                    : meta.suppressed_until_turn,
-                },
-                accessibleScopes,
-              );
-            }),
-          );
-
+          // Do not block prompt assembly on per-memory metadata writes.
+          // patchMetadata() currently goes through update() -> delete+add with a
+          // file lock, which can add seconds of latency under contention.
+          // Auto-recall is latency-sensitive; keep this path read-mostly.
+          throwIfRecallAborted();
           const memoryContext = selected.map((item) => item.line).join("\n");
 
           const injectedIds = selected.map((item) => item.id).join(",") || "(none)";
@@ -2498,6 +2696,7 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: auto-recall stats hits=${results.length}, dedupFiltered=${dedupFilteredCount}, stateFiltered=${stateFilteredCount}, suppressedFiltered=${suppressedFilteredCount}, preBudgetItems=${preBudgetItems}, preBudgetChars=${preBudgetChars}, postBudgetItems=${selected.length}, postBudgetChars=${usedChars}, maxItems=${autoRecallMaxItems}, maxChars=${autoRecallMaxChars}, perItemMaxChars=${autoRecallPerItemMaxChars}, injectedIds=${injectedIds}`,
           );
 
+          throwIfRecallAborted();
           api.logger.info?.(
             `memory-lancedb-pro: injecting ${selected.length} memories into context for agent ${agentId}`,
           );
@@ -2522,6 +2721,7 @@ const memoryLanceDBProPlugin = {
             recallWork().then((r) => { clearTimeout(timeoutId); return r; }),
             new Promise<undefined>((resolve) => {
               timeoutId = setTimeout(() => {
+                recallAbort.abort();
                 api.logger.warn(
                   `memory-lancedb-pro: auto-recall timed out after ${AUTO_RECALL_TIMEOUT_MS}ms; skipping memory injection to avoid stalling agent startup`,
                 );
@@ -2532,6 +2732,9 @@ const memoryLanceDBProPlugin = {
           return result;
         } catch (err) {
           clearTimeout(timeoutId);
+          if ((err as Error)?.message === "retrieval aborted") {
+            return;
+          }
           api.logger.warn(`memory-lancedb-pro: recall failed: ${String(err)}`);
         }
       }, { priority: 10 });
@@ -2999,7 +3202,7 @@ const memoryLanceDBProPlugin = {
         });
       }
 
-      (isCliMode() ? api.logger.debug : api.logger.info)(
+      (isCliRegistrationMode(api) ? api.logger.debug : api.logger.info)(
         "self-improvement: integrated hooks registered (agent:bootstrap, command:new, command:reset)"
       );
     }
@@ -3432,7 +3635,7 @@ const memoryLanceDBProPlugin = {
         name: "memory-lancedb-pro.memory-reflection.command-reset",
         description: "Generate reflection log before /reset",
       });
-      (isCliMode() ? api.logger.debug : api.logger.info)(
+      (isCliRegistrationMode(api) ? api.logger.debug : api.logger.info)(
         "memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_prompt_build, session_end)"
       );
     }
@@ -3541,10 +3744,10 @@ const memoryLanceDBProPlugin = {
         }
       });
 
-      (isCliMode() ? api.logger.debug : api.logger.info)("session-memory: typed before_reset hook registered for /new session summaries");
+      (isCliRegistrationMode(api) ? api.logger.debug : api.logger.info)("session-memory: typed before_reset hook registered for /new session summaries");
     }
     if (config.sessionStrategy === "none") {
-      (isCliMode() ? api.logger.debug : api.logger.info)("session-strategy: using none (plugin memory-reflection hooks disabled)");
+      (isCliRegistrationMode(api) ? api.logger.debug : api.logger.info)("session-strategy: using none (plugin memory-reflection hooks disabled)");
     }
 
     // ========================================================================
@@ -3552,13 +3755,14 @@ const memoryLanceDBProPlugin = {
     // ========================================================================
 
     let backupTimer: ReturnType<typeof setInterval> | null = null;
+    let startupChecksTimer: ReturnType<typeof setTimeout> | null = null;
+    let legacyScanTimer: ReturnType<typeof setTimeout> | null = null;
+    let initialBackupTimer: ReturnType<typeof setTimeout> | null = null;
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
     async function runBackup() {
       try {
-        const backupDir = api.resolvePath(
-          join(resolvedDbPath, "..", "backups"),
-        );
+        const backupDir = join(dirname(resolvedDbPath), "backups");
         await mkdir(backupDir, { recursive: true });
 
         const allMemories = await store.list(undefined, undefined, 10000, 0);
@@ -3607,6 +3811,8 @@ const memoryLanceDBProPlugin = {
     api.registerService({
       id: "memory-lancedb-pro",
       start: async () => {
+        api.logger.info(`memory-lancedb-pro: service start (db: ${resolvedDbPath})`);
+
         // IMPORTANT: Do not block gateway startup on external network calls.
         // If embedding/retrieval tests hang (bad network / slow provider), the gateway
         // may never bind its HTTP port, causing restart timeouts.
@@ -3635,12 +3841,12 @@ const memoryLanceDBProPlugin = {
             // Test components (bounded time)
             const embedTest = await withTimeout(
               embedder.test(),
-              8_000,
+              30_000,
               "embedder.test()",
             );
             const retrievalTest = await withTimeout(
               retriever.test(),
-              8_000,
+              30_000,
               "retriever.test()",
             );
 
@@ -3670,10 +3876,10 @@ const memoryLanceDBProPlugin = {
         };
 
         // Fire-and-forget: allow gateway to start serving immediately.
-        setTimeout(() => void runStartupChecks(), 0);
+        startupChecksTimer = setTimeout(() => void runStartupChecks(), 45_000);
 
         // Check for legacy memories that could be upgraded
-        setTimeout(async () => {
+        legacyScanTimer = setTimeout(async () => {
           try {
             const upgrader = createMemoryUpgrader(store, null);
             const counts = await upgrader.countLegacy();
@@ -3689,10 +3895,23 @@ const memoryLanceDBProPlugin = {
         }, 5_000);
 
         // Run initial backup after a short delay, then schedule daily
-        setTimeout(() => void runBackup(), 60_000); // 1 min after start
+        initialBackupTimer = setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+        api.logger.info("memory-lancedb-pro: backup timers armed (initial: 60000ms, interval: 86400000ms)");
       },
       stop: async () => {
+        if (startupChecksTimer) {
+          clearTimeout(startupChecksTimer);
+          startupChecksTimer = null;
+        }
+        if (legacyScanTimer) {
+          clearTimeout(legacyScanTimer);
+          legacyScanTimer = null;
+        }
+        if (initialBackupTimer) {
+          clearTimeout(initialBackupTimer);
+          initialBackupTimer = null;
+        }
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
