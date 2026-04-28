@@ -362,7 +362,8 @@ export function isInvalidAgentIdFormat(
   agentId: string | undefined,
   declaredAgents?: Set<string>,
 ): boolean {
-  if (!agentId) return true;
+  // Layer 1: empty/undefined/whitespace-only are all invalid
+  if (!agentId || (typeof agentId === "string" && !agentId.trim())) return true;
   // Pure numeric IDs are almost always chat_id extractions, not real agent IDs.
   if (isChatIdBasedAgentId(agentId)) return true;
   // If we have a declared agents list, treat unknown IDs as invalid.
@@ -2468,7 +2469,6 @@ const memoryLanceDBProPlugin = {
             return;
           }
         } else if (
-          agentId !== undefined &&
           Array.isArray(config.autoRecallExcludeAgents) &&
           config.autoRecallExcludeAgents.length > 0 &&
           isAgentOrSessionExcluded(agentId, sessionKey, config.autoRecallExcludeAgents)
@@ -4214,8 +4214,12 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         .map((id) => id.trim())
       : undefined,
     // Build declaredAgents Set from openclaw.json agents.list for fast validation.
+    // First try cfg.agents (runtime config), then fallback to reading openclaw.json directly
+    // (same pattern as resolveAgentWorkspaceMap) so Layer 3 validation always works.
     declaredAgents: (() => {
       const s = new Set<string>();
+
+      // Layer 1: try from runtime cfg
       const agentsList = (cfg as Record<string, unknown>).agents as Record<string, unknown> | undefined;
       if (agentsList) {
         const list = agentsList.list as unknown;
@@ -4228,6 +4232,28 @@ export function parsePluginConfig(value: unknown): PluginConfig {
           }
         }
       }
+
+      // Layer 2: fallback to openclaw.json directly if Set is still empty
+      if (s.size === 0) {
+        try {
+          const openclawHome = process.env.OPENCLAW_HOME || join(homedir(), ".openclaw");
+          const configPath = join(openclawHome, "openclaw.json");
+          const raw = readFileSync(configPath, "utf8");
+          const parsed = JSON.parse(raw);
+          const list = parsed?.agents?.list;
+          if (Array.isArray(list)) {
+            for (const entry of list) {
+              if (entry && typeof entry === "object") {
+                const id = (entry as Record<string, unknown>).id;
+                if (typeof id === "string" && id.trim().length > 0) s.add(id.trim());
+              }
+            }
+          }
+        } catch {
+          /* silent */
+        }
+      }
+
       return s;
     })(),
     captureAssistant: cfg.captureAssistant === true,
