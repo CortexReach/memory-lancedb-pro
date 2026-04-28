@@ -53,6 +53,8 @@ export const CI_TEST_MANIFEST = [
   // Issue #629 batch embedding fix
   { group: "llm-clients-and-auth", runner: "node", file: "test/embedder-ollama-batch-routing.test.mjs" },
   // Issue #665 bulkStore tests
+  // Tier 1 memory counter fix
+  { group: "core-regression", runner: "node", file: "test/tier1-counters.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

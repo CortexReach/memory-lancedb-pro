@@ -125,6 +125,20 @@
         "default": 8,
         "description": "Minimum number of turns before the same memory can be recalled again in the same session. Set to 0 to disable deduplication."
       },
+      "autoRecallBadRecallDecayMs": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 86400000,
+        "$comment": "No maximum: 0 disables decay; very large values also effectively disable. Unlike sibling autoRecall* integers, this is a time window with no natural upper bound.",
+        "description": "If a memory's last auto-recall injection was more than this many ms ago, its bad_recall_count is reset to 0 on the next injection. 0 disables decay. Default: 86400000 (24 hours)."
+      },
+      "autoRecallSuppressionDurationMs": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 1800000,
+        "$comment": "No maximum: 0 effectively disables suppression; large values allow long quarantine windows.",
+        "description": "When bad_recall_count reaches the suppression threshold, the memory is suppressed from auto-recall for this many ms from now. Default: 1800000 (30 minutes)."
+      },
       "autoRecallTimeoutMs": {
         "type": "integer",
         "minimum": 500,
