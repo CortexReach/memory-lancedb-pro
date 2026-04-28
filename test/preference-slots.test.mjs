@@ -124,6 +124,11 @@ function makeGuardExtractor({ vectorSearchResults, onDedupCalled }) {
   };
   const embedder = {
     async embed() {
+      stored.push(entry);
+    },
+  };
+  const embedder = {
+    async embed() {
       return [0.1, 0.2, 0.3];
     },
   };

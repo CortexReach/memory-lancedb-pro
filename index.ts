@@ -733,6 +733,33 @@ function splitProviderModel(modelRef: string): { provider?: string; model?: stri
   return { model: s };
 }
 
+
+/**
+ * 當 modelRef 是 bare name（無 / 前綴）時，從 baseURL 推斷 provider。
+ * 使用 "." + suffix 避免 fake-minimax.io 這類 subdomain 欺騙攻擊。
+ * 例如 "fake-minimax.io".endsWith("minimax.io") = true（不安全）
+ * 但 "fake-minimax.io".endsWith(".minimax.io") = false（正確防護）
+ */
+function inferProviderFromBaseURL(baseURL: string | undefined): string | undefined {
+  if (!baseURL) return undefined;
+
+  try {
+    const url = new URL(baseURL);
+    const hostname = url.hostname.toLowerCase();
+
+    // 用 "." + suffix 避免 subdomain 欺騙
+    if (hostname.endsWith(".minimax.io")) return "minimax-portal";
+    if (hostname.endsWith(".openai.com")) return "openai";
+    if (hostname.endsWith(".anthropic.com")) return "anthropic";
+
+    return undefined;
+  } catch {
+    // 無效 URL 回傳 undefined
+    return undefined;
+  }
+}
+
+
 function asNonEmptyString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
@@ -1189,8 +1216,14 @@ async function generateReflectionText(params: {
       onLog: onRetryLog,
       execute: async () => {
         const runEmbeddedPiAgent = await loadEmbeddedPiRunner();
-        const modelRef = resolveAgentPrimaryModelRef(params.cfg, params.agentId);
-        const { provider, model } = modelRef ? splitProviderModel(modelRef) : {};
+        const cfg = params.cfg as Record<string, unknown>;
+        const llmConfig = cfg?.llm as Record<string, unknown> | undefined;
+        const modelRef =
+          (resolveAgentPrimaryModelRef(params.cfg, params.agentId) as string | undefined)
+          ?? (llmConfig?.model as string | undefined);
+        const split = modelRef ? splitProviderModel(modelRef) : { provider: undefined, model: undefined };
+        const provider = split.provider ?? inferProviderFromBaseURL(llmConfig?.baseURL as string | undefined);
+        const model = split.model;
         const embeddedTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
 
         return await withTimeout(

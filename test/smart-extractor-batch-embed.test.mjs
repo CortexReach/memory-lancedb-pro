@@ -85,6 +85,7 @@ function makeStore() {
     },
     async store(entry) {
       entries.push({ action: "store", entry });
+      entries.push({ action: "store", entry });
       return entry;
     },
     async update(_id, _patch, _scopeFilter) {
