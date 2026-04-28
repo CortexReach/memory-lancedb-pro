@@ -12,7 +12,7 @@ function makeExtractor(scopeFilters) {
       return [];
     },
     async store() {},
-    async bulkStore() {},
+    async bulkStore() { return []; },
   };
 
   const embedder = {

@@ -53,6 +53,18 @@ export const CI_TEST_MANIFEST = [
   // Issue #629 batch embedding fix
   { group: "llm-clients-and-auth", runner: "node", file: "test/embedder-ollama-batch-routing.test.mjs" },
   // Issue #665 bulkStore tests
+  { group: "storage-and-schema", runner: "node", file: "test/bulk-store.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/bulk-store-edge-cases.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store-edge-cases.test.mjs", args: ["--test"] },
+  // Issue #676: handleSupersede batch mode invalidation fix
+  { group: "core-regression", runner: "node", file: "test/supersede-existing-found-bulk.test.mjs", args: ["--test"] },
+  // Issue #675: regex fallback bulkStore fix
+  { group: "core-regression", runner: "node", file: "test/regex-fallback-bulk-store.test.mjs", args: ["--test"] },
+  // Issue #670/#675: lock stale threshold regression
+  { group: "core-regression", runner: "node", file: "test/lock-stale-threshold.test.mjs", args: ["--test"] },
+  // Issue #676: handleSupersede invalidation error handler regression (RF-1)
+  { group: "core-regression", runner: "node", file: "test/invalidate-error-regression.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

@@ -420,6 +420,7 @@ export class SmartExtractor {
     }
 
     const createEntries: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[] = [];
+    const invalidateEntries: Array<{ id: string; metadata: string }> = [];
 
     for (const { index, candidate } of processableCandidates) {
       try {
@@ -432,6 +433,7 @@ export class SmartExtractor {
           scopeFilter,
           precomputedVectors.get(index),
           createEntries,
+          invalidateEntries,
         );
       } catch (err) {
         this.log(
@@ -442,6 +444,31 @@ export class SmartExtractor {
 
     if (createEntries.length > 0) {
       await this.store.bulkStore(createEntries);
+    }
+
+    // Invalidate old entries that were superseded (must happen after bulkStore).
+    // NOTE: Each update() call acquires its own lock. InvalidateEntries.length updates =
+    // InvalidateEntries.length lock acquisitions. This is unavoidable: LanceDB does not support
+    // atomic "bulk update with where clause". The batch mode benefit comes from bulkStore
+    // for new entries (1 lock for N writes), not from the invalidation updates.
+    // If any update fails, we log and continue — bulkStore is already committed.
+    if (invalidateEntries.length > 0) {
+      const updateErrors = [];
+      for (const inv of invalidateEntries) {
+        try {
+          await this.store.update(inv.id, { metadata: inv.metadata }, scopeFilter);
+        } catch (err) {
+          this.log(
+            `memory-pro: smart-extractor: failed to invalidate superseded entry ${inv.id}: ${String(err)}`,
+          );
+          updateErrors.push({ id: inv.id, err });
+        }
+      }
+      if (updateErrors.length > 0) {
+        this.log(
+          `memory-pro: smart-extractor: ${updateErrors.length}/${invalidateEntries.length} invalidation failures after bulkStore succeeded. Inconsistent supersede state for entries: ${updateErrors.map((e) => e.id).join(', ')}`,
+        );
+      }
     }
 
     return stats;
@@ -663,6 +690,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     precomputedVector?: number[],
     createEntries?: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[],
+    invalidateEntries?: Array<{ id: string; metadata: string }>,
   ): Promise<void> {
     // Profile always merges (skip dedup — admission control still applies)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -674,6 +702,7 @@ export class SmartExtractor {
         scopeFilter,
         undefined,
         createEntries,
+        invalidateEntries,
       );
       if (profileResult === "rejected") {
         stats.rejected = (stats.rejected ?? 0) + 1;
@@ -773,6 +802,7 @@ export class SmartExtractor {
             scopeFilter,
             admission?.audit,
             createEntries,
+            invalidateEntries,
           );
           stats.created++;
           stats.superseded = (stats.superseded ?? 0) + 1;
@@ -817,6 +847,7 @@ export class SmartExtractor {
               scopeFilter,
               admission?.audit,
               createEntries,
+              invalidateEntries,
             );
             stats.created++;
             stats.superseded = (stats.superseded ?? 0) + 1;
@@ -980,6 +1011,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
+    invalidateEntries?: Array<{ id: string; metadata: string }>,
   ): Promise<"merged" | "created" | "rejected"> {
     // Find existing profile memory by category
     const embeddingText = `${candidate.abstract} ${candidate.content}`;
@@ -1162,6 +1194,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
+    invalidateEntries?: Array<{ id: string; metadata: string }>,
   ): Promise<void> {
     const existing = await this.store.getById(matchId, scopeFilter);
     if (!existing) {
@@ -1169,6 +1202,85 @@ export class SmartExtractor {
       return;
     }
 
+    // FIX #676: When createEntries is provided, push to batch instead of calling
+    // store.store() directly.  The store.update() to invalidate the old record still
+    // runs individually (LanceDB does not support batch partial-updates by ID).
+    if (createEntries) {
+      const now = Date.now();
+      const existingMeta = parseSmartMetadata(existing.metadata, existing);
+      const factKey =
+        existingMeta.fact_key ?? deriveFactKey(candidate.category, candidate.abstract);
+      const storeCategory = this.mapToStoreCategory(candidate.category);
+      const supersedeClassifyText = candidate.content || candidate.abstract;
+
+      createEntries.push({
+        text: candidate.abstract,
+        vector,
+        category: storeCategory,
+        scope: targetScope,
+        importance: this.getDefaultImportance(candidate.category),
+        metadata: stringifySmartMetadata(
+          buildSmartMetadata(
+            {
+              text: candidate.abstract,
+              category: storeCategory,
+            },
+            {
+              l0_abstract: candidate.abstract,
+              l1_overview: candidate.overview,
+              l2_content: candidate.content,
+              memory_category: candidate.category,
+              tier: "working",
+              access_count: 0,
+              confidence: 0.7,
+              source_session: sessionKey,
+              source: "auto-capture",
+              state: "confirmed", // #350: write confirmed to unblock auto-recall
+              memory_layer: "working",
+              injected_count: 0,
+              bad_recall_count: 0,
+              suppressed_until_turn: 0,
+              valid_from: now,
+              fact_key: factKey,
+              supersedes: matchId,
+              relations: appendRelation([], {
+                type: "supersedes",
+                targetId: matchId,
+              }),
+              memory_temporal_type: classifyTemporal(supersedeClassifyText),
+              valid_until: inferExpiry(supersedeClassifyText),
+            },
+          ),
+        ),
+      });
+
+      // Invalidate the old entry.  Must happen AFTER bulkStore completes.
+      //
+      // NOTE: superseded_by cannot be set here because we don't know the new entry's ID yet
+      // (LanceDB auto-generates it during bulkStore).  We set invalidated_at to mark the entry
+      // as inactive.  The new entry already has 'supersedes: matchId' (set at creation time),
+      // which is the authoritative link for dedup.  The old entry's superseded_by field is
+      // never read by the retriever — safe to leave as null.  We do NOT add a superseded_by
+      // relation with targetId=null (which would be malformed).
+      const oldMeta = parseSmartMetadata(existing.metadata, existing);
+      const invalidatedMeta = buildSmartMetadata(existing, {
+        fact_key: factKey,
+        invalidated_at: now,
+        // superseded_by: intentionally omitted — new entry ID unknown in batch mode;
+        // new entry's 'supersedes: matchId' provides the authoritative dedup signal
+      });
+      invalidateEntries?.push({
+        id: matchId,
+        metadata: stringifySmartMetadata(invalidatedMeta),
+      });
+
+      this.log(
+        `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} (queued for batch + invalidate queued)`,
+      );
+      return;
+    }
+
+    // Standalone path (no createEntries — backward compatible)
     const now = Date.now();
     const existingMeta = parseSmartMetadata(existing.metadata, existing);
     const factKey =
