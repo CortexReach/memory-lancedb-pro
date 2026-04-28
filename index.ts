@@ -1232,9 +1232,10 @@ async function generateReflectionText(params: {
         const runEmbeddedPiAgent = await loadEmbeddedPiRunner();
         const cfg = params.cfg as Record<string, unknown>;
         const llmConfig = cfg?.llm as Record<string, unknown> | undefined;
+        const modelRefFromConfig = llmConfig?.model;
         const modelRef =
           (resolveAgentPrimaryModelRef(params.cfg, params.agentId) as string | undefined)
-          ?? (llmConfig?.model as string | undefined);
+          ?? (typeof modelRefFromConfig === "string" ? modelRefFromConfig : undefined);
         const split = modelRef ? splitProviderModel(modelRef) : { provider: undefined, model: undefined };
         const provider = split.provider ?? inferProviderFromBaseURL(llmConfig?.baseURL as string | undefined);
         const model = split.model;
