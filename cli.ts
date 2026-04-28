@@ -498,7 +498,7 @@ export async function runImportMarkdown(
     minTextLength?: string;
     importance?: string;
   }
-  ): Promise<{ imported: number; skipped: number; foundFiles: number }> {
+  ): Promise<{ imported: number; skipped: number; foundFiles: number; skippedShort: number; skippedDedup: number; errorCount: number }> {
   const openclawHome = options.openclawHome
     ? path.resolve(options.openclawHome)
     : path.join(homedir(), ".openclaw");
@@ -507,6 +507,9 @@ export async function runImportMarkdown(
   let imported = 0;
   let skipped = 0;
   let foundFiles = 0;
+  let skippedShort = 0;
+  let skippedDedup = 0;
+  let errorCount = 0;
 
   if (!ctx.embedder) {
     // [FIXED P1] Throw instead of process.exit(1) so CLI handler can catch it
@@ -649,7 +652,11 @@ export async function runImportMarkdown(
   }
 
   if (mdFiles.length === 0) {
-    return { imported: 0, skipped: 0, foundFiles: 0 };
+    return { imported: 0, skipped: 0, foundFiles: 0, skippedShort: 0, skippedDedup: 0, errorCount: 0 };
+  }
+  console.log(`[scan] found ${mdFiles.length} markdown files across ${new Set(mdFiles.map(f => f.scope)).size} workspace(s):`);
+  for (const { filePath, scope } of mdFiles) {
+    console.log(`  [scan] [${scope}] ${filePath}`);
   }
 
   // NaN-safe parsing with bounds — invalid input falls back to defaults instead of
@@ -659,7 +666,7 @@ export async function runImportMarkdown(
   const importanceDefault = Number.isFinite(parseFloat(options.importance ?? "0.7"))
     ? Math.max(0, Math.min(1, parseFloat(options.importance ?? "0.7")))
     : 0.7;
-  const dedupEnabled = !!options.dedup;
+  const dedupEnabled = options.dedup !== false;
 
   // Parse each file for memory entries (lines starting with "- ")
   for (const { filePath, scope: discoveredScope } of mdFiles) {
@@ -667,6 +674,7 @@ export async function runImportMarkdown(
     try {
       // 已在收集時用 withFileTypes: true 過濾，直接讀取
       foundFiles++;
+      console.log(`[scan] reading: ${filePath}`);
       content = await fsPromises.readFile(filePath, "utf-8");
     } catch (err) {
       // I/O errors (permissions, corruption, etc.)
@@ -685,7 +693,7 @@ export async function runImportMarkdown(
       // Supports: "- text", "* text", "+ text" (standard Markdown bullet formats)
       if (!/^[-*+]\s/.test(line)) continue;
       const text = line.slice(2).trim();
-      if (text.length < minTextLength) { skipped++; continue; }
+      if (text.length < minTextLength) { skipped++; skippedShort++; continue; }
 
       // Use --scope if provided, otherwise fall back to per-file discovered scope.
       // This prevents cross-workspace leakage: without --scope, each workspace
@@ -699,9 +707,8 @@ export async function runImportMarkdown(
           const existing = await ctx.store.bm25Search(text, 5, [effectiveScope]);
           if (existing.length > 0 && existing[0].entry.text === text) {
             skipped++;
-            if (!options.dryRun) {
-              console.log(`  [skip] already imported: ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`);
-            }
+            skippedDedup++;
+            console.log(`  [skip] dedup [${effectiveScope}]: ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`);
             continue;
           }
         } catch (err) {
@@ -711,7 +718,7 @@ export async function runImportMarkdown(
       }
 
       if (options.dryRun) {
-        console.log(`  [dry-run] would import: ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
+        console.log(`  [would-import] [${effectiveScope}] ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
         imported++;
         continue;
       }
@@ -728,18 +735,23 @@ export async function runImportMarkdown(
         });
         imported++;
       } catch (err) {
-        console.warn(`  Failed to import: ${text.slice(0, 60)}... — ${err}`);
+        console.warn(`  [skip] error: ${text.slice(0, 60)}... — ${String(err).slice(0, 80)}`);
         skipped++;
+        errorCount++;
       }
     }
   }
 
-  if (options.dryRun) {
-    console.log(`\nDRY RUN — found ${foundFiles} files, ${imported} entries would be imported, ${skipped} skipped${dedupEnabled ? " [dedup enabled]" : ""}`);
-  } else {
-    console.log(`\nImport complete: ${imported} imported, ${skipped} skipped (scanned ${foundFiles} files)${dedupEnabled ? " [dedup enabled]" : ""}`);
-  }
-  return { imported, skipped, foundFiles };
+  console.log(`\nMemory Import Status:`);
+  console.log(`\u2022 Files found: ${foundFiles}`);
+  const totalEntries = imported + skipped;
+  console.log(`\u2022 Entries processed: ${totalEntries}`);
+  console.log(`\u2022 Imported: ${imported}`);
+  if (skippedShort > 0) console.log(`\u2022 Skipped (too short): ${skippedShort}`);
+  if (skippedDedup > 0) console.log(`\u2022 Skipped (dedup): ${skippedDedup}`);
+  if (errorCount > 0) console.log(`\u2022 Errors: ${errorCount}`);
+  if (options.dryRun) console.log(`\n[DRY-RUN] No entries were actually imported.`);
+  return { imported, skipped, foundFiles, skippedShort, skippedDedup, errorCount };
     }
 
 
@@ -1437,8 +1449,8 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       "OpenClaw home directory (default: ~/.openclaw)",
     )
     .option(
-      "--dedup",
-      "Skip entries already in store (scope-aware exact match, requires store.bm25Search)",
+      "--no-dedup",
+      "Disable dedup (dedup is enabled by default)",
     )
     .option(
       "--min-text-length <n>",
