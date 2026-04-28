@@ -755,6 +755,25 @@ function splitProviderModel(modelRef: string): { provider?: string; model?: stri
   return { model: s };
 }
 
+
+/**
+ * When modelRef is a bare name (no / prefix), infer provider from baseURL.
+ * Use "." + suffix to prevent fake-minimax.io subdomain spoofing.
+ */
+function inferProviderFromBaseURL(baseURL: string | undefined): string | undefined {
+  if (!baseURL) return undefined;
+  try {
+    const url = new URL(baseURL);
+    const hostname = url.hostname.toLowerCase();
+    if (hostname.endsWith(".minimax.io")) return "minimax-portal";
+    if (hostname.endsWith(".openai.com")) return "openai";
+    if (hostname.endsWith(".anthropic.com")) return "anthropic";
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function asNonEmptyString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
@@ -1211,8 +1230,14 @@ async function generateReflectionText(params: {
       onLog: onRetryLog,
       execute: async () => {
         const runEmbeddedPiAgent = await loadEmbeddedPiRunner();
-        const modelRef = resolveAgentPrimaryModelRef(params.cfg, params.agentId);
-        const { provider, model } = modelRef ? splitProviderModel(modelRef) : {};
+        const cfg = params.cfg as Record<string, unknown>;
+        const llmConfig = cfg?.llm as Record<string, unknown> | undefined;
+        const modelRef =
+          (resolveAgentPrimaryModelRef(params.cfg, params.agentId) as string | undefined)
+          ?? (llmConfig?.model as string | undefined);
+        const split = modelRef ? splitProviderModel(modelRef) : { provider: undefined, model: undefined };
+        const provider = split.provider ?? inferProviderFromBaseURL(llmConfig?.baseURL as string | undefined);
+        const model = split.model;
         const embeddedTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
 
         return await withTimeout(

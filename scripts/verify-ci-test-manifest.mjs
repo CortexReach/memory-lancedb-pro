@@ -18,6 +18,7 @@ const EXPECTED_BASELINE = [
   { group: "storage-and-schema", runner: "node", file: "test/store-empty-scope-filter.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/recall-text-cleanup.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/to-import-specifier-windows.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/infer-provider-from-baseurl.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/update-consistency-lancedb.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/strip-envelope-metadata.test.mjs", args: ["--test"] },
   { group: "cli-smoke", runner: "node", file: "test/import-markdown/import-markdown.test.mjs", args: ["--test"] },
