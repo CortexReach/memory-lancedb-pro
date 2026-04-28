@@ -442,14 +442,31 @@ type EmbeddedPiRunner = (params: Record<string, unknown>) => Promise<unknown>;
 const requireFromHere = createRequire(import.meta.url);
 let embeddedPiRunnerPromise: Promise<EmbeddedPiRunner> | null = null;
 
-function toImportSpecifier(value: string): string {
+export function toImportSpecifier(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return "";
   if (trimmed.startsWith("file://")) return trimmed;
   if (trimmed.startsWith("/")) return pathToFileURL(trimmed).href;
+  // Handle Windows absolute paths (e.g. C:\Users\... or D:/Program Files/...) — PR #593
+  if (process.platform === 'win32' && /^[a-zA-Z]:[/\\]/.test(trimmed)) return pathToFileURL(trimmed).href;
+  // Handle UNC paths (\\server\share or \\?\UNC\\server\share) — PR #593
+  // Regex breakdown: ^\\\\  = starts with \\
+  //                  [^\\]+   = server name (one or more non-backslash chars)
+  //                  \\[^\\]+ = \ + share name (one or more non-backslash chars)
+  // Examples matched: \\server\share, \\fileserver\company-share, \\?\UNC\server\share
+  // Examples NOT matched: C:\path (drive letter, handled above), /unix/path (POSIX)
+  if (process.platform === 'win32' && /^\\\\[^\\]+\\[^\\]+/.test(trimmed)) {
+    // Extended prefix \\?\UNC\\ means "long UNC name" — already normalized.
+    // Pass directly so we don't double-normalize (e.g. avoid \\?\UNC\\?\UNC\\...).
+    if (trimmed.startsWith('\\\\?\\UNC\\')) return pathToFileURL(trimmed).href;
+    // Standard UNC: \\server\share -> \\?\UNC\\server\share -> file://server/share
+    // strip leading \\ (2 chars) -> server\share, then prefix \\?\UNC\\
+    const normalized = '\\\\?\\UNC\\' + trimmed.slice(2);
+    return pathToFileURL(normalized).href;
+  }
   return trimmed;
 }
-function getExtensionApiImportSpecifiers(): string[] {
+export function getExtensionApiImportSpecifiers(): string[] {
   const envPath = process.env.OPENCLAW_EXTENSION_API_PATH?.trim();
   const specifiers: string[] = [];
 
@@ -465,6 +482,11 @@ function getExtensionApiImportSpecifiers(): string[] {
   specifiers.push(toImportSpecifier("/usr/lib/node_modules/openclaw/dist/extensionAPI.js"));
   specifiers.push(toImportSpecifier("/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js"));
   specifiers.push(toImportSpecifier("/opt/homebrew/lib/node_modules/openclaw/dist/extensionAPI.js"));
+
+  if (process.platform === "win32" && process.env.APPDATA) {
+    const windowsNpmPath = join(process.env.APPDATA, "npm", "node_modules", "openclaw", "dist", "extensionAPI.js");
+    specifiers.push(toImportSpecifier(windowsNpmPath));
+  }
 
   return [...new Set(specifiers.filter(Boolean))];
 }
@@ -780,9 +802,6 @@ function shouldSkipReflectionMessage(role: string, text: string): boolean {
 }
 
 const AUTO_CAPTURE_MAP_MAX_ENTRIES = 2000;
-// Maximum number of recent texts kept in the pending-ingress and recent-texts windows.
-// Must stay in sync with the threshold cap AUTO_CAPTURE_PENDING_WINDOW.
-const AUTO_CAPTURE_PENDING_WINDOW = 6;
 const AUTO_CAPTURE_EXPLICIT_REMEMBER_RE =
   /^(?:请|請)?(?:记住|記住|记一下|記一下|别忘了|別忘了)[。.!?？!]*$/u;
 
@@ -804,16 +823,14 @@ function isExplicitRememberCommand(text: string): boolean {
   return AUTO_CAPTURE_EXPLICIT_REMEMBER_RE.test(text.trim());
 }
 
-export function buildAutoCaptureConversationKeyFromIngress(
+function buildAutoCaptureConversationKeyFromIngress(
   channelId: string | undefined,
   conversationId: string | undefined,
 ): string | null {
   const channel = typeof channelId === "string" ? channelId.trim() : "";
   const conversation = typeof conversationId === "string" ? conversationId.trim() : "";
-  if (!channel) return null;
-  // DM: conversationId=undefined -> fallback to channelId (matches regex extract from sessionKey)
-  // Group: conversationId=exists -> returns channelId:conversationId (matches regex extract)
-  return conversation ? `${channel}:${conversation}` : channel;
+  if (!channel || !conversation) return null;
+  return `${channel}:${conversation}`;
 }
 
 /**
@@ -2202,10 +2219,9 @@ const memoryLanceDBProPlugin = {
       );
       const normalized = normalizeAutoCaptureText("user", event.content, shouldSkipReflectionMessage);
       if (conversationKey && normalized) {
-        const MAX_MESSAGE_LENGTH = 5000;
         const queue = autoCapturePendingIngressTexts.get(conversationKey) || [];
-        queue.push(normalized.slice(0, MAX_MESSAGE_LENGTH));
-        autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-AUTO_CAPTURE_PENDING_WINDOW));
+        queue.push(normalized);
+        autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
         pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
       }
       api.logger.debug(
@@ -2825,49 +2841,31 @@ const memoryLanceDBProPlugin = {
           const pendingIngressTexts = conversationKey
             ? [...(autoCapturePendingIngressTexts.get(conversationKey) || [])]
             : [];
+          if (conversationKey) {
+            autoCapturePendingIngressTexts.delete(conversationKey);
+          }
+
           const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
-          // [Fix #2] Cumulative counting: accumulate across events, not per-event overwrite.
-          // Counter uses newTexts.length (not eligibleTexts.length) — newTexts is already
-          // deduplicated against previousSeenCount (via slice(previousSeenCount)), so counting
-          // newTexts.length correctly reflects only genuinely new texts per event.
-          // This prevents counter inflation when agent_end delivers a full-history payload
-          // on every turn (replay scenario): eligibleTexts.length would over-count, but
-          // newTexts.length stays accurate because replayed texts are sliced away.
           let newTexts = eligibleTexts;
           if (pendingIngressTexts.length > 0) {
-            // [Fix #3] Use pendingIngressTexts as-is (REPLACE, not APPEND).
-            // REPLACE is correct because: (1) Fix #2 cumulative count ensures enough turns
-            // accumulate; (2) Fix #4 (delete) restores original behavior where pending is
-            // event-scoped; (3) APPEND causes deduplication issues when the same text
-            // appears in both pendingIngressTexts and eligibleTexts (after prefix stripping).
             newTexts = pendingIngressTexts;
-            // [Fix #8] Clear consumed pending texts to prevent re-consumption
-            // (conversationKey is guaranteed truthy here since pendingIngressTexts.length > 0
-            // and pendingIngressTexts is [] when conversationKey is falsy)
-            autoCapturePendingIngressTexts.delete(conversationKey);
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
           }
+          autoCaptureSeenTextCount.set(sessionKey, eligibleTexts.length);
+          pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
           let texts = newTexts;
-          const currentCumulativeCount = previousSeenCount + newTexts.length;
-          autoCaptureSeenTextCount.set(sessionKey, currentCumulativeCount);
-          pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
-          // [Fix #5] Explicit remember command: if the last pending text is an explicit remember,
-          // enrich with one piece of prior context so bare "remember this" turns get history.
-          const lastPending = pendingIngressTexts.length > 0 ? pendingIngressTexts[pendingIngressTexts.length - 1] : undefined;
-          if (lastPending !== undefined && isExplicitRememberCommand(lastPending) && priorRecentTexts.length > 0) {
-            // [Fix-MF1 v3] Prepend lastPending to newTexts, avoiding duplicates.
-            // In REPLACE mode, lastPending is already the last element of newTexts (pendingIngressTexts).
-            // We need to move it to front OR use priorRecentTexts for context, not duplicate it.
-            // Solution: prepend lastPending, but skip if it's already the last element (duplicate case).
-            const isDuplicate = newTexts.length > 0 && newTexts.includes(lastPending);
-            texts = isDuplicate
-              ? [lastPending, ...newTexts.filter((t) => t !== lastPending)]
-              : [lastPending, ...newTexts];
+          if (
+            texts.length === 1 &&
+            isExplicitRememberCommand(texts[0]) &&
+            priorRecentTexts.length > 0
+          ) {
+            texts = [...priorRecentTexts.slice(-1), ...texts];
           }
           if (newTexts.length > 0) {
-            const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-AUTO_CAPTURE_PENDING_WINDOW);
+            const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
@@ -2946,68 +2944,37 @@ const memoryLanceDBProPlugin = {
               );
               return;
             }
-            // [Fix #3 updated] Use cumulative count (turn count) for smart extraction threshold
-            if (currentCumulativeCount >= minMessages) {
+            if (cleanTexts.length >= minMessages) {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${currentCumulativeCount} >= minMessages=${minMessages})`,
+                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (${cleanTexts.length} clean texts >= ${minMessages})`,
               );
               const conversationText = cleanTexts.join("\n");
-              // [Fix #10] Wrap extraction in try-catch so a failing extraction does not crash the hook.
-              // Counter is NOT reset on failure — the same window will re-trigger on the next agent_end.
-              let stats;
-              try {
-                stats = await smartExtractor.extractAndPersist(
-                  conversationText, sessionKey,
-                  { scope: defaultScope, scopeFilter: accessibleScopes },
-                );
-              } catch (err) {
-                api.logger.error(
-                  `memory-lancedb-pro: smart extraction failed for agent ${agentId}: ${err instanceof Error ? err.message : String(err)}; skipping extraction this cycle`
-                );
-                // [Fix #10 extended] Clear pending texts on failure so the next cycle
-                // does not re-process the same pending batch. Counter stays high (not reset)
-                // so the same window will re-accumulate toward the next trigger.
-                if (conversationKey) {
-                  autoCapturePendingIngressTexts.delete(conversationKey);
-                }
-                return; // Do not fall through to regex fallback when smart extraction is configured
-              }
+              const stats = await smartExtractor.extractAndPersist(
+                conversationText, sessionKey,
+                { scope: defaultScope, scopeFilter: accessibleScopes },
+              );
+              // Charge rate limiter only after successful extraction
+              extractionRateLimiter.recordExtraction();
               if (stats.created > 0 || stats.merged > 0) {
-                extractionRateLimiter.recordExtraction();
                 api.logger.info(
                   `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
                 );
-                autoCaptureSeenTextCount.set(sessionKey, 0);
                 return; // Smart extraction handled everything
               }
 
-              // [Fix-Must1] Reset counter to previousSeenCount when all candidates are deduplicated
-              // (created=0, merged=0). Without this, counter stays high -> next agent_end
-              // re-triggers -> same dedupe -> retry spiral. Resetting to previousSeenCount ensures
-              // the next event starts fresh (counter = number of genuinely new texts seen so far).
-              autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
-
-              // [Fix-Must1b] When all candidates are skipped AND no boundary texts remain,
-              // skip regex fallback entirely — there is nothing to capture.
-              if ((stats.boundarySkipped ?? 0) === 0) {
+              if ((stats.boundarySkipped ?? 0) > 0) {
                 api.logger.info(
-                  `memory-lancedb-pro: smart extraction produced no candidates and no boundary texts for agent ${agentId}; skipping regex fallback`,
+                  `memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`,
                 );
-                return;
               }
-
-              api.logger.info(
-                `memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`,
-              );
 
               api.logger.info(
                 `memory-lancedb-pro: smart extraction produced no persisted memories for agent ${agentId} (created=${stats.created}, merged=${stats.merged}, skipped=${stats.skipped}); falling back to regex capture`,
               );
             } else {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (cumulative=${currentCumulativeCount} < minMessages=${minMessages})`,
+                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (${cleanTexts.length} < ${minMessages})`,
               );
-              return; // [Fix] Do NOT fall through to regex fallback when smartExtraction is enabled and below threshold
             }
           }
 
@@ -3112,13 +3079,6 @@ const memoryLanceDBProPlugin = {
             api.logger.info(
               `memory-lancedb-pro: auto-captured ${stored} memories for agent ${agentId} in scope ${defaultScope}`,
             );
-            // Note: counter is intentionally NOT reset here. If we reset after regex fallback,
-            // the next turn starts fresh (counter = 1) and requires another full cycle to re-trigger.
-            // This means: Turn 1 stores via regex → counter=0 → Turn 2 counter=1 (<min) → skipped.
-            // This is intentional — regex fallback is a last-resort fallback, not a primary path.
-            // The primary reset mechanisms are:
-            //   1. F1: success block of smart extraction (set(0) on created/merged > 0)
-            //   2. Fix-Must1: all-dedup failure path (set(previousSeenCount) prevents retry spiral)
           }
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: capture failed: ${String(err)}`);

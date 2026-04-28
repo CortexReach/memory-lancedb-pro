@@ -10,6 +10,11 @@ import path from "node:path";
 import * as readline from "node:readline";
 import JSON5 from "json5";
 import { loadLanceDB, type MemoryEntry, type MemoryStore } from "./src/store.js";
+import {
+  parseSmartMetadata,
+  buildSmartMetadata,
+  stringifySmartMetadata,
+} from "./src/smart-metadata.js";
 import { createRetriever, type MemoryRetriever } from "./src/retriever.js";
 import type { MemoryScopeManager } from "./src/scopes.js";
 import type { MemoryMigrator } from "./src/migrate.js";
@@ -560,10 +565,10 @@ export async function runImportMarkdown(
     try {
       const stats = await fsPromises.stat(memoryDir);
       if (stats.isDirectory()) {
-        const files = await fsPromises.readdir(memoryDir);
+        const files = await fsPromises.readdir(memoryDir, { withFileTypes: true });
         for (const f of files) {
-          if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
-            mdFiles.push({ filePath: path.join(memoryDir, f), scope: entry.name });
+          if (f.isFile() && f.name.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f.name)) {
+            mdFiles.push({ filePath: path.join(memoryDir, f.name), scope: entry.name });
           }
         }
       }
@@ -592,10 +597,10 @@ export async function runImportMarkdown(
     try {
       const stats = await fsP.stat(agentMemoryDir);
       if (stats.isDirectory()) {
-        const files = await fsP.readdir(agentMemoryDir);
+        const files = await fsP.readdir(agentMemoryDir, { withFileTypes: true });
         for (const f of files) {
-          if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
-            mdFiles.push({ filePath: path.join(agentMemoryDir, f), scope: agentId });
+          if (f.isFile() && f.name.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f.name)) {
+            mdFiles.push({ filePath: path.join(agentMemoryDir, f.name), scope: agentId });
           }
         }
       }
@@ -633,10 +638,10 @@ export async function runImportMarkdown(
     try {
       const stats = await fsPromises.stat(flatMemoryDir);
       if (stats.isDirectory()) {
-        const files = await fsPromises.readdir(flatMemoryDir);
+        const files = await fsPromises.readdir(flatMemoryDir, { withFileTypes: true });
         for (const f of files) {
-          if (f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f)) {
-            mdFiles.push({ filePath: path.join(flatMemoryDir, f), scope: workspaceScope || "global" });
+          if (f.isFile() && f.name.endsWith(".md") && /^\d{4}-\d{2}-\d{2}/.test(f.name)) {
+            mdFiles.push({ filePath: path.join(flatMemoryDir, f.name), scope: workspaceScope || "global" });
           }
         }
       }
@@ -658,8 +663,18 @@ export async function runImportMarkdown(
 
   // Parse each file for memory entries (lines starting with "- ")
   for (const { filePath, scope: discoveredScope } of mdFiles) {
-    foundFiles++;
-    let content = await fsPromises.readFile(filePath, "utf-8");
+    let content: string;
+    try {
+      // 已在收集時用 withFileTypes: true 過濾，直接讀取
+      foundFiles++;
+      content = await fsPromises.readFile(filePath, "utf-8");
+    } catch (err) {
+      // I/O errors (permissions, corruption, etc.)
+      console.warn(`  [skip] read failed: ${filePath}: ${(err as Error).message}`);
+      skipped++;
+      continue;
+    }
+    // (fix(import-markdown): CI測試登記 + .md目錄skip保護)
     // Strip UTF-8 BOM (e.g. from Windows Notepad-saved files)
     content = content.replace(/^\uFEFF/, "");
     // Normalize line endings: handle both CRLF (\r\n) and LF (\n)
@@ -1748,6 +1763,88 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         }
       } catch (error) {
         console.error("FTS rebuild error:", error);
+        process.exit(1);
+      }
+    });
+
+  // repair-summaries: Detect and fix stale L0/L1/L2 summaries
+  program
+    .command("repair-summaries")
+    .description("Detect and fix L0/L1/L2 summaries that are inconsistent with text (text updated but summaries not regenerated)")
+    .option("--scope <scope>", "Filter by scope (e.g. agent:bs-intern)")
+    .option("--dry-run", "Preview mode — report stale entries without modifying data", false)
+    .action(async (options: { scope?: string; dryRun: boolean }) => {
+      try {
+        const scopeFilter = options.scope ? [options.scope] : undefined;
+
+        // Paginate through all entries
+        const allEntries: MemoryEntry[] = [];
+        const pageSize = 200;
+        let offset = 0;
+        while (true) {
+          const page = await context.store.list(scopeFilter, undefined, pageSize, offset);
+          if (page.length === 0) break;
+          allEntries.push(...page);
+          offset += page.length;
+          if (page.length < pageSize) break;
+        }
+
+        console.log(`Scanned ${allEntries.length} memories${options.scope ? ` (scope: ${options.scope})` : ""}\n`);
+
+        const staleEntries: Array<{ entry: MemoryEntry; l0Prefix: string; textPrefix: string }> = [];
+
+        for (const entry of allEntries) {
+          const meta = parseSmartMetadata(entry.metadata, entry);
+          const textPrefix = entry.text.slice(0, 60).trim();
+          const l0Prefix = (meta.l0_abstract || "").slice(0, 60).trim();
+
+          if (textPrefix !== l0Prefix) {
+            staleEntries.push({ entry, l0Prefix, textPrefix });
+          }
+        }
+
+        if (staleEntries.length === 0) {
+          console.log("No stale summaries found. All L0/L1/L2 are consistent with text.");
+          return;
+        }
+
+        console.log(`Found ${staleEntries.length} stale entries:\n`);
+
+        for (const { entry, l0Prefix, textPrefix } of staleEntries) {
+          console.log(`  [${entry.id.slice(0, 8)}] scope=${entry.scope}`);
+          console.log(`    text:  "${textPrefix}..."`);
+          console.log(`    l0:    "${l0Prefix}..."`);
+        }
+
+        if (options.dryRun) {
+          console.log(`\nDry run complete. ${staleEntries.length} entries would be repaired.`);
+          return;
+        }
+
+        // Apply repairs
+        let repaired = 0;
+        let failed = 0;
+
+        for (const { entry } of staleEntries) {
+          try {
+            // Rebuild L0/L1/L2 using truncation fallback from buildSmartMetadata
+            const rebuilt = buildSmartMetadata(entry, {
+              l0_abstract: entry.text,
+              l1_overview: `- ${entry.text}`,
+              l2_content: entry.text,
+            });
+            const newMetadataStr = stringifySmartMetadata(rebuilt);
+            await context.store.update(entry.id, { metadata: newMetadataStr }, scopeFilter);
+            repaired++;
+          } catch (err) {
+            failed++;
+            console.error(`  Failed to repair ${entry.id.slice(0, 8)}: ${err}`);
+          }
+        }
+
+        console.log(`\nRepair complete: ${repaired} fixed, ${failed} failed out of ${staleEntries.length} stale.`);
+      } catch (error) {
+        console.error("repair-summaries failed:", error);
         process.exit(1);
       }
     });
