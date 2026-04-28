@@ -42,6 +42,7 @@ export type LockDomain = 'redis' | 'file';
 
 let _lockDomainDecision: LockDomain | null = null;
 let _lockDomainPromise: Promise<LockDomain> | null = null;
+let _redisManagerInstance: RedisLockManager | null = null; // Fix #2: 儲存 manager instance，避免連線洩漏
 
 /**
  * 決定全程序使用哪種 lock domain。
@@ -53,6 +54,9 @@ let _lockDomainPromise: Promise<LockDomain> | null = null;
  * 一旦決定用 Redis，就永遠用 Redis（即使後來 Redis 掛了，也不重試）。
  * 一旦決定用 File lock，就永遠用 File lock。
  * 這樣可以避免「req-A 用 Redis lock，req-B 用 file lock」的 domain 分裂問題。
+ *
+ * Fix #1: 成功時將 manager instance 存入 _redisManagerInstance，
+ * 讓後續 routing 可以實際使用 Redis lock（而非只有 decision string）。
  */
 export async function determineLockDomain(): Promise<LockDomain> {
   if (_lockDomainDecision !== null) return _lockDomainDecision;
@@ -62,6 +66,7 @@ export async function determineLockDomain(): Promise<LockDomain> {
     try {
       const manager = await createRedisLockManager();
       if (manager && await manager.isHealthy()) {
+        _redisManagerInstance = manager; // Fix #2: 保留 manager reference
         _lockDomainDecision = 'redis';
         return 'redis';
       }
@@ -73,6 +78,15 @@ export async function determineLockDomain(): Promise<LockDomain> {
   })();
 
   return _lockDomainPromise;
+}
+
+/**
+ * 取得已初始化的 RedisLockManager instance（Fix #1 + #2）。
+ * 只有在 determineLockDomain() 成功決定使用 Redis 時才有值。
+ * 若決定用 file lock 或尚未決定，返回 null。
+ */
+export function getRedisLockManagerInstance(): RedisLockManager | null {
+  return _redisManagerInstance;
 }
 
 // ============================================================================
