@@ -331,8 +331,12 @@ export class MemoryStore {
     } finally {
       // 【修復 #415 BUG】release() 必須在 isCompromised 判斷之前呼叫
       // 否則當 fnError !== null 且 isCompromised === true 時，release() 不會被呼叫，lock 永久洩漏
+      // 【修復 #415 Must Fix #1】若 release 未被賦值（non-ELOCKED error 在賦值前就 throw），
+      // 直接跳過 release，避免 TypeError: release is not a function
       try {
-        await release();
+        if (release) {
+          await release();
+        }
       } catch (e: unknown) {
         if ((e as NodeJS.ErrnoException).code === 'ERELEASED') {
           // ERELEASED 是預期行為（compromised lock release），忽略
