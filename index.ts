@@ -4299,7 +4299,13 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         })(),
         errorReminderMaxEntries: parsePositiveInt(memoryReflectionRaw.errorReminderMaxEntries) ?? DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES,
         dedupeErrorSignals: memoryReflectionRaw.dedupeErrorSignals !== false,
-        serialCooldownMs: parsePositiveInt(memoryReflectionRaw.serialCooldownMs) ?? DEFAULT_SERIAL_GUARD_COOLDOWN_MS,
+        serialCooldownMs: (() => {
+          const raw = memoryReflectionRaw.serialCooldownMs;
+          // null/undefined → use default; explicitly 0 (any type) → disabled
+          if (raw == null) return DEFAULT_SERIAL_GUARD_COOLDOWN_MS;
+          if (Number(raw) === 0) return 0;
+          return parsePositiveInt(raw) ?? DEFAULT_SERIAL_GUARD_COOLDOWN_MS;
+        })(),
         excludeAgents: Array.isArray(memoryReflectionRaw.excludeAgents)
           ? memoryReflectionRaw.excludeAgents.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
           : undefined,
