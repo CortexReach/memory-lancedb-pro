@@ -200,6 +200,31 @@ export function validateStoragePath(dbPath: string): string {
 
 const TABLE_NAME = "memories";
 
+function safeToNumber(value: unknown): number {
+  if (typeof value === 'bigint') return Number(value);
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+  return 0;
+}
+
+/**
+ * Whitelist of keys that bulkUpdateMetadataWithPatch accepts from LLM enrichment.
+ * Protects base fields (tier, access_count, confidence, injected_count, etc.)
+ * from accidental overwrites by misbehaving LLM output or prompt injection.
+ * [fix-Nice2] Only these keys from entry.patch are merged; all others are ignored.
+ */
+const ALLOWED_PATCH_KEYS: ReadonlySet<string> = new Set([
+  'l0_abstract',
+  'l1_overview',
+  'l2_content',
+  'memory_category',
+  'upgraded_from',
+  'upgraded_at',
+]);
+
 export class MemoryStore {
   private db: LanceDB.Connection | null = null;
   private table: LanceDB.Table | null = null;
