@@ -8,6 +8,9 @@
 // 導致 sub-agent 可以看到 main 的 derived 內容。
 //
 // 修復：在 legacy fallback 前，先過濾掉 owner="main" 且有 derived 內容的 legacy row。
+//
+// 環境需求：Node.js >= 22（使用內建 TypeScript 執行，不需要 tsx）
+// CI: .github/workflows/ci.yml — 所有 jobs 明確使用 node-version: 22
 
 import { describe, it } from "node:test";
 import assert from "node:assert";
