@@ -53,6 +53,10 @@ export const CI_TEST_MANIFEST = [
   // Issue #629 batch embedding fix
   { group: "llm-clients-and-auth", runner: "node", file: "test/embedder-ollama-batch-routing.test.mjs" },
   // Issue #665 bulkStore tests
+  // Issue #690 cross-call batch accumulator tests
+  { group: "storage-and-schema", runner: "node", file: "test/issue-690-cross-call-batch.test.mjs", args: ["--test"] },
+  // Issue #690 stress test (long-running, runs manually or nightly)
+  { group: "core-regression", runner: "node", file: "test/issue-690-stress-1000.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

@@ -207,6 +207,19 @@ export class MemoryStore {
   private ftsIndexCreated = false;
   private updateQueue: Promise<void> = Promise.resolve();
 
+  // Cross-call batch accumulator（Issue #690）
+  // 多個 concurrent bulkStore() 會先累積在這裡，每 100ms flush 一次，
+  // 合併成一個 lock acquisition，大幅降低 lock contention。
+  private pendingBatch: Array<{
+    entries: MemoryEntry[];
+    resolve: (entries: MemoryEntry[]) => void;
+    reject: (err: Error) => void;
+  }> = [];
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushLock: Promise<void> = Promise.resolve(); // Promise-based lock，防止 concurrent doFlush()
+  private static readonly FLUSH_INTERVAL_MS = 100;
+  private static readonly MAX_BATCH_SIZE = 250;
+
   constructor(private readonly config: StoreConfig) { }
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -473,6 +486,7 @@ export class MemoryStore {
         const message = e.message || String(err);
         throw new Error(
           `Failed to store memory in "${this.config.dbPath}": ${code} ${message}`,
+          { cause: err as Error },
         );
       }
       return fullEntry;
@@ -480,46 +494,123 @@ export class MemoryStore {
   }
 
   /**
-   * Bulk store multiple memory entries (single lock acquisition)
-   * 
-   * Reduces lock contention by acquiring lock once for multiple entries.
-   * Use this when auto-capture produces multiple memories.
+   * Bulk store multiple memory entries（cross-call batch accumulation）
+   * Issue #690：多個 concurrent bulkStore() 會先累積在 pendingBatch，
+   * 每 FLUSH_INTERVAL_MS（100ms）flush 一次，合併成一個 lock acquisition，
+   * 避免 100 個 concurrent 變成 100 次 lock acquisition 導致 timeout。
+   * Non-breaking：public API 不變。
    */
   async bulkStore(
     entries: Omit<MemoryEntry, "id" | "timestamp">[],
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
-    
-    // Filter out invalid entries (undefined, null, missing text/vector)
+
+    // Filter out invalid entries（undefined, null, missing text/vector）
     const validEntries = entries.filter(
       (entry) => entry && entry.text && entry.text.length > 0 && entry.vector && entry.vector.length > 0
     );
-    
-    // Early return for empty array (skip lock acquisition)
+
+    // Early return for empty array（skip accumulation）
     if (validEntries.length === 0) {
       return [];
     }
-    
+
+    // 【修復 Issue #690 overflow contract】
+    // 超過 MAX_BATCH_SIZE → 明確拋出 RangeError，不做隱性 overflow
+    // 注意：檢查 entries.length（原始輸入）而非 validEntries.length（過濾後），
+    // 避免「300筆含51筆無效 → filter後249筆 → 意外通過」的 edge case
+    if (entries.length > MemoryStore.MAX_BATCH_SIZE) {
+      throw new RangeError(
+        `bulkStore() received ${validEntries.length} entries, ` +
+        `exceeds MAX_BATCH_SIZE=${MemoryStore.MAX_BATCH_SIZE}. ` +
+        `Please split into chunks of ${MemoryStore.MAX_BATCH_SIZE} or fewer.`
+      );
+    }
+
+    // 附加 id/timestamp
     const fullEntries: MemoryEntry[] = validEntries.map((entry) => ({
       ...entry,
       id: randomUUID(),
       timestamp: Date.now(),
       metadata: entry.metadata || "{}",
     }));
-    
-    // Single lock acquisition for all entries
-    return this.runWithFileLock(async () => {
-      try {
-        await this.table!.add(fullEntries);
-      } catch (err: any) {
-        const code = err.code || "";
-        const message = err.message || String(err);
-        throw new Error(
-          `Failed to bulk store ${fullEntries.length} memories: ${code} ${message}`,
-        );
+
+    // 回傳小型 Promise，實際寫入在背景 flush 完成
+    return new Promise<MemoryEntry[]>((resolve, reject) => {
+      this.pendingBatch.push({ entries: fullEntries, resolve, reject });
+
+      // 啟動定時 flush timer（若尚未啟動）
+      if (!this.flushTimer) {
+        this.flushTimer = setTimeout(() => {
+          this.flushTimer = null;
+          this.doFlush();
+        }, MemoryStore.FLUSH_INTERVAL_MS);
       }
-      return fullEntries;
     });
+  }
+
+  /**
+   * Flush all pending batch entries in a single lock acquisition.
+   * Called by the flush timer and on shutdown.
+   */
+  private async doFlush(): Promise<void> {
+    const prevLock = this.flushLock;
+    let releaseLock: () => void;
+    this.flushLock = new Promise<void>((resolve) => { releaseLock = resolve; });
+    await prevLock; // 等上一個 flush 完成後才開始
+    try {
+      if (this.pendingBatch.length === 0) return;
+
+      // splice out the current batch（保護新進的 pending calls）
+      const batch = this.pendingBatch.splice(0, this.pendingBatch.length);
+
+      // 合併所有 entries
+      const allEntries = batch.flatMap((b) => b.entries);
+
+      // 單一 lock acquisition for entire batch
+      try {
+        await this.runWithFileLock(async () => {
+          await this.table!.add(allEntries);
+        });
+
+        // 各 caller 的 resolve
+        for (const { entries, resolve } of batch) {
+          resolve(entries);
+        }
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        console.error(`[memory-lancedb-pro] doFlush failed: ${errorMsg}`);
+        for (const { reject } of batch) {
+          reject(new Error(`batch flush failed: ${errorMsg}`, { cause: err as Error }));
+        }
+      }
+    } finally {
+      releaseLock!(); // 釋放 lock，讓下一個 flush 可以跑
+    }
+  }
+
+  /**
+   * Force flush before close（用於測試或 shutdown）
+   */
+  async flush(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    await this.doFlush();
+  }
+
+  /**
+   * Destroy the store instance（防止 timer 洩漏）
+   * 清理所有資源：flush pending entries + 清除 flush timer
+   * 呼叫後 store 实例不可再使用。
+   */
+  async destroy(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    await this.doFlush();
   }
 
   /**
