@@ -153,14 +153,15 @@ describe("Issue #690: cross-call batch accumulator", () => {
   // ============================================================
   // Error handling: flush failure rejects all pending callers
   // ============================================================
-  it("flush error rejects all pending callers", async () => {
+  // 【新行為】per-chunk isolation: flush 失敗只拒絕該 chunk 的 callers
+  it("flush error rejects only callers in the failed chunk (per-chunk isolation)", async () => {
     ({ store, dir } = makeStore());
     try {
       // 先成功寫入一些資料讓 table 可用
       await store.bulkStore([makeEntry(0)]);
       await store.flush();
 
-      // Mock runWithFileLock to fail on next flush
+      // Mock runWithFileLock to fail on the SECOND flush
       let flushCount = 0;
       const originalRunWithFileLock = store.runWithFileLock.bind(store);
       store.runWithFileLock = async (fn) => {
@@ -171,27 +172,30 @@ describe("Issue #690: cross-call batch accumulator", () => {
         return originalRunWithFileLock(fn);
       };
 
-      // 發 5 個 concurrent calls，第一批 flush 成功（建 table），第二批 flush 失敗
+      // 發 5 個 concurrent calls
+      // 第一批（p1,p2,p3）→ 第一個 flush（成功）
+      // 等 200ms → 第二批（p4,p5）→ 第二個 flush（失敗）
       const p1 = store.bulkStore([makeEntry(1)]);
       const p2 = store.bulkStore([makeEntry(2)]);
       const p3 = store.bulkStore([makeEntry(3)]);
 
-      // 等第一批 flush 完成
-      await sleep(200);
+      await sleep(220); // 等第一批 flush 完成
 
-      // 發第二批（觸發失敗的 flush）
       const p4 = store.bulkStore([makeEntry(4)]);
       const p5 = store.bulkStore([makeEntry(5)]);
 
       const results = await Promise.allSettled([p1, p2, p3, p4, p5]);
       const failures = results.filter((r) => r.status === "rejected");
+      const successes = results.filter((r) => r.status === "fulfilled");
 
-      console.log(`[Issue #690] ${failures.length} rejections after simulated flush error`);
-      // At least some should fail due to the simulated error
-      assert.ok(failures.length > 0, "Expected at least some calls to fail");
+      console.log(`[Issue #690] ${failures.length} rejections, ${successes.length} resolves after per-chunk failure`);
+      // Per-chunk isolation: p4,p5 (failed chunk) reject; p1,p2,p3 (first chunk) resolve
+      assert.strictEqual(failures.length, 2, "Only p4,p5 (second chunk) should reject");
+      assert.strictEqual(successes.length, 3, "p1,p2,p3 (first chunk) should resolve");
     } finally {
       store.runWithFileLock = store.runWithFileLock.bind(store);
-      await store.flush();
+      // 防止 finally flush() 因 lock contention 或殘留 flushError 而拋出
+      try { await store.flush(); } catch (_) { /* mock failure 已反映在 results 中，ignore cleanup error */ }
     }
   });
 
@@ -223,51 +227,45 @@ describe("Issue #690: cross-call batch accumulator", () => {
     }
   });
 
-  // 【修復 Issue #690 overflow contract】
-  // 超過 MAX_BATCH_SIZE → RangeError，不做隱性 overflow
-  it("entries exceeding MAX_BATCH_SIZE throw clear RangeError", async () => {
+  // 【新行為】自動分塊：超過 MAX_BATCH_SIZE 不再 throw RangeError，
+  // 由 doFlush() 內部自動分成多個 chunk 寫入
+  it("entries exceeding MAX_BATCH_SIZE are auto-chunked internally", async () => {
     ({ store, dir } = makeStore());
     try {
       const COUNT = MemoryStore.MAX_BATCH_SIZE + 50;
       const entries = Array.from({ length: COUNT }, (_, i) => makeEntry(i));
 
-      // Should throw RangeError with clear message
-      await assert.rejects(
-        store.bulkStore(entries),
-        (err) => {
-          return err instanceof RangeError &&
-                 err.message.includes(`exceeds MAX_BATCH_SIZE=${MemoryStore.MAX_BATCH_SIZE}`) &&
-                 err.message.includes('Please split into chunks');
-        },
-        "Should throw RangeError when exceeding MAX_BATCH_SIZE"
-      );
+      // Should NOT throw — auto-chunks internally
+      const result = await store.bulkStore(entries);
+      assert.strictEqual(result.length, COUNT, "Should return all entries");
+      await store.flush();
 
-      // Verify nothing was stored
-      const all = await store.list(undefined, undefined, 10, 0);
-      assert.strictEqual(all.length, 0, "No entries should be stored when RangeError is thrown");
+      // Verify all were stored (split across 2 chunks internally)
+      const all = await store.list(undefined, undefined, COUNT + 10, 0);
+      assert.strictEqual(all.length, COUNT, `All ${COUNT} entries should be stored`);
     } finally {
       await store.flush();
     }
   });
 
-  // Edge case: raw input > MAX_BATCH_SIZE even if filtered result < MAX_BATCH_SIZE
-  it("raw input exceeding MAX_BATCH_SIZE throws even if filtered result is under limit", async () => {
+  // Edge case: raw input > MAX_BATCH_SIZE, filtered result < MAX_BATCH_SIZE
+  // Old: throw RangeError. New: auto-chunk based on filtered result
+  it("large batch with invalid entries: auto-chunks filtered result (not raw input)", async () => {
     ({ store, dir } = makeStore());
     try {
       // 300 entries: first 249 are valid, last 51 are null (invalid)
       // After filter: validEntries.length = 249 (under limit)
-      // But raw entries.length = 300 (over limit) → should throw
+      // New behavior: no throw, auto-chunks based on 249 filtered entries
       const entries = Array.from({ length: 300 }, (_, i) =>
         i < 249 ? makeEntry(i) : null
       );
-      await assert.rejects(
-        store.bulkStore(entries),
-        (err) => {
-          return err instanceof RangeError &&
-                 err.message.includes('exceeds MAX_BATCH_SIZE');
-        },
-        "Should throw because raw input (300) > MAX_BATCH_SIZE, not because filtered result (249)"
-      );
+      // Should NOT throw — auto-chunks based on filtered count
+      const result = await store.bulkStore(entries);
+      assert.strictEqual(result.length, 249, "Should return 249 filtered entries");
+      await store.flush();
+
+      const all = await store.list(undefined, undefined, 300, 0);
+      assert.strictEqual(all.length, 249, "All 249 valid entries should be stored");
     } finally {
       await store.flush();
     }

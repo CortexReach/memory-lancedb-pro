@@ -217,6 +217,7 @@ export class MemoryStore {
   }> = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private flushLock: Promise<void> = Promise.resolve(); // Promise-based lock，防止 concurrent doFlush()
+  private flushError: Error | null = null; // 捕捉 doFlush() 中最末錯誤，供 flush()/destroy() rethrow
   private static readonly FLUSH_INTERVAL_MS = 100;
   private static readonly MAX_BATCH_SIZE = 250;
 
@@ -515,18 +516,6 @@ export class MemoryStore {
       return [];
     }
 
-    // 【修復 Issue #690 overflow contract】
-    // 超過 MAX_BATCH_SIZE → 明確拋出 RangeError，不做隱性 overflow
-    // 注意：檢查 entries.length（原始輸入）而非 validEntries.length（過濾後），
-    // 避免「300筆含51筆無效 → filter後249筆 → 意外通過」的 edge case
-    if (entries.length > MemoryStore.MAX_BATCH_SIZE) {
-      throw new RangeError(
-        `bulkStore() received ${validEntries.length} entries, ` +
-        `exceeds MAX_BATCH_SIZE=${MemoryStore.MAX_BATCH_SIZE}. ` +
-        `Please split into chunks of ${MemoryStore.MAX_BATCH_SIZE} or fewer.`
-      );
-    }
-
     // 附加 id/timestamp
     const fullEntries: MemoryEntry[] = validEntries.map((entry) => ({
       ...entry,
@@ -564,25 +553,49 @@ export class MemoryStore {
       // splice out the current batch（保護新進的 pending calls）
       const batch = this.pendingBatch.splice(0, this.pendingBatch.length);
 
-      // 合併所有 entries
+      // 合併所有 entries（攤平每個 caller 的 entries，保持 caller 邊界資訊）
       const allEntries = batch.flatMap((b) => b.entries);
 
-      // 單一 lock acquisition for entire batch
-      try {
-        await this.runWithFileLock(async () => {
-          await this.table!.add(allEntries);
-        });
+      // 【修復 Issue #1: per-chunk failure isolation】
+      // failedCallers 追蹤哪些 caller 有 chunk 寫入失敗，
+      // finally 統一結算（resolve 或 reject），而非在 try/catch 內立即結算
+      const failedCallers = new Set<number>();
 
-        // 各 caller 的 resolve
-        for (const { entries, resolve } of batch) {
-          resolve(entries);
+      // 【修復 Issue #2: 自動分塊】
+      // LanceDB 內部並無批次上限，本層主動分塊避免實際的底層限制
+      for (let i = 0; i < allEntries.length; i += MemoryStore.MAX_BATCH_SIZE) {
+        const chunk = allEntries.slice(i, i + MemoryStore.MAX_BATCH_SIZE);
+        try {
+          await this.runWithFileLock(async () => {
+            await this.table!.add(chunk);
+          });
+        } catch (err) {
+          // 標記此 chunk 區間內的所有 caller 為失敗
+          let callerIdx = 0;
+          let entryOffset = 0;
+          for (const caller of batch) {
+            const callerEnd = entryOffset + caller.entries.length;
+            if (entryOffset < callerEnd && i < callerEnd) {
+              failedCallers.add(callerIdx);
+            }
+            entryOffset = callerEnd;
+            callerIdx++;
+          }
+          this.flushError = err as Error;
+          const errorMsg = err instanceof Error ? err.message : String(err);
+          console.error(`[memory-lancedb-pro] doFlush chunk failed: ${errorMsg}`);
         }
-      } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        console.error(`[memory-lancedb-pro] doFlush failed: ${errorMsg}`);
-        for (const { reject } of batch) {
-          reject(new Error(`batch flush failed: ${errorMsg}`, { cause: err as Error }));
+      }
+
+      // 統一結算：根據 failedCallers 決定 resolve 或 reject
+      let callerIdx = 0;
+      for (const caller of batch) {
+        if (failedCallers.has(callerIdx)) {
+          caller.reject(new Error(`batch flush failed`, { cause: this.flushError as Error }));
+        } else {
+          caller.resolve(caller.entries);
         }
+        callerIdx++;
       }
     } finally {
       releaseLock!(); // 釋放 lock，讓下一個 flush 可以跑
@@ -598,6 +611,13 @@ export class MemoryStore {
       this.flushTimer = null;
     }
     await this.doFlush();
+    // 【修復 Issue #3: flush() error propagation】
+    // doFlush() 已將錯誤存入 this.flushError，這裡重新拋出
+    if (this.flushError) {
+      const err = this.flushError;
+      this.flushError = null;
+      throw err;
+    }
   }
 
   /**
@@ -611,6 +631,12 @@ export class MemoryStore {
       this.flushTimer = null;
     }
     await this.doFlush();
+    // 【修復 Issue #3: destroy() error propagation】
+    if (this.flushError) {
+      const err = this.flushError;
+      this.flushError = null;
+      throw err;
+    }
   }
 
   /**
