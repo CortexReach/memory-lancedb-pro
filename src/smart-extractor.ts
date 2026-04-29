@@ -420,7 +420,7 @@ export class SmartExtractor {
     }
 
     const createEntries: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[] = [];
-    const invalidateEntries: Array<{ id: string; metadata: string; newEntryIndex?: number }> = [];
+    const invalidateEntries: Array<{ id: string; metadata: string; newEntryIndex?: number; _origMetadata?: string }> = [];
 
     for (const { index, candidate } of processableCandidates) {
       try {
@@ -472,24 +472,51 @@ export class SmartExtractor {
     // NOTE: Each update() call acquires its own lock. InvalidateEntries.length updates =
     // InvalidateEntries.length lock acquisitions. This is unavoidable: LanceDB does not support
     // atomic "bulk update with where clause". The batch mode benefit comes from bulkStore
-    // for new entries (1 lock for N writes), not from the invalidation updates.
-    // If any update fails, we log and continue — bulkStore is already committed.
+    // for new entries (1 lock for N writes), not from the invalidation updates).
+    // Invalidation is not atomic: bulkStore commits new entries first, then we
+    // update old entries one by one.  If some updates fail, we roll back the
+    // already-succeeded ones so the old entries stay in their original state
+    // (both old and new would otherwise appear active — breaking isLatest semantics).
     if (invalidateEntries.length > 0) {
-      const updateErrors = [];
-      for (const inv of invalidateEntries) {
-        try {
-          await this.store.update(inv.id, { metadata: inv.metadata }, scopeFilter);
-        } catch (err) {
-          this.log(
-            `memory-pro: smart-extractor: failed to invalidate superseded entry ${inv.id}: ${String(err)}`,
-          );
-          updateErrors.push({ id: inv.id, err });
-        }
-      }
-      if (updateErrors.length > 0) {
+      const results = await Promise.allSettled(
+        invalidateEntries.map((inv) =>
+          this.store.update(inv.id, { metadata: inv.metadata }, scopeFilter),
+        ),
+      );
+
+      const failed = results
+        .map((r, i) => ({ inv: invalidateEntries[i], result: r }))
+        .filter(({ result }) => result.status === 'rejected');
+
+      if (failed.length > 0) {
+        const failedIds = failed.map(({ inv }) => inv.id).join(', ');
+        const failedCount = failed.length;
+        const succeededCount = invalidateEntries.length - failedCount;
+
         this.log(
-          `memory-pro: smart-extractor: ${updateErrors.length}/${invalidateEntries.length} invalidation failures after bulkStore succeeded. Inconsistent supersede state for entries: ${updateErrors.map((e) => e.id).join(', ')}`,
+          `memory-pro: smart-extractor: ${failedCount}/${invalidateEntries.length} invalidation updates failed after bulkStore succeeded. Failed IDs: ${failedIds}. Rolling back ${succeededCount} succeeded update(s)…`,
         );
+
+        // Rollback: revert metadata on entries that were successfully updated.
+        // We stored the original metadata in each invalidateEntry as _origMetadata.
+        const rollbackResults = await Promise.allSettled(
+          failed.map(({ inv }) => {
+            const orig = (inv as any)._origMetadata;
+            if (!orig) return Promise.resolve();
+            return this.store.update(inv.id, { metadata: orig }, scopeFilter);
+          }),
+        );
+
+        const rollbackFailed = rollbackResults.filter((r) => r.status === 'rejected');
+        if (rollbackFailed.length > 0) {
+          this.log(
+            `memory-pro: smart-extractor: ROLLBACK FAILED — ${rollbackFailed.length} entries could not be restored. Database may have inconsistent supersede state. Affected IDs: ${failedIds}`,
+          );
+        } else {
+          this.log(
+            `memory-pro: smart-extractor: Rollback complete — all ${succeededCount} succeeded invalidation(s) reverted. No partial state left.`,
+          );
+        }
       }
     }
 
@@ -712,7 +739,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     precomputedVector?: number[],
     createEntries?: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[],
-    invalidateEntries?: Array<{ id: string; metadata: string; newEntryIndex?: number }>,
+    invalidateEntries?: Array<{ id: string; metadata: string; newEntryIndex?: number; _origMetadata?: string }>,
   ): Promise<void> {
     // Profile always merges (skip dedup — admission control still applies)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -1033,7 +1060,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
-    invalidateEntries?: Array<{ id: string; metadata: string; newEntryIndex?: number }>,
+    invalidateEntries?: Array<{ id: string; metadata: string; newEntryIndex?: number; _origMetadata?: string }>,
   ): Promise<"merged" | "created" | "rejected"> {
     // Find existing profile memory by category
     const embeddingText = `${candidate.abstract} ${candidate.content}`;
@@ -1216,7 +1243,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
-    invalidateEntries?: Array<{ id: string; metadata: string; newEntryIndex?: number }>,
+    invalidateEntries?: Array<{ id: string; metadata: string; newEntryIndex?: number; _origMetadata?: string }>,
   ): Promise<void> {
     const existing = await this.store.getById(matchId, scopeFilter);
     if (!existing) {
@@ -1292,7 +1319,10 @@ export class SmartExtractor {
         id: matchId,
         metadata: stringifySmartMetadata(invalidatedMeta),
         newEntryIndex,  // enables second-pass backfill of superseded_by
-      });
+        // Store original metadata so we can rollback if subsequent invalidation updates fail.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        _origMetadata: existing.metadata,
+      } as any);
 
       this.log(
         `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} (queued for batch + invalidate queued)`,
