@@ -420,7 +420,7 @@ export class SmartExtractor {
     }
 
     const createEntries: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[] = [];
-    const invalidateEntries: Array<{ id: string; metadata: string }> = [];
+    const invalidateEntries: Array<{ id: string; metadata: string; newEntryIndex?: number }> = [];
 
     for (const { index, candidate } of processableCandidates) {
       try {
@@ -443,7 +443,29 @@ export class SmartExtractor {
     }
 
     if (createEntries.length > 0) {
-      await this.store.bulkStore(createEntries);
+      const bulkResults = await this.store.bulkStore(createEntries);
+
+      // SECOND PASS: backfill superseded_by for superseded old entries.
+      // bulkStore returns entries in the same order they were pushed.
+      // For each invalidateEntry that came from a supersede (newEntryIndex is set),
+      // the new entry's ID is at bulkResults[newEntryIndex].id.
+      // We parse the stored metadata and update it with the new entry's ID.
+      if (invalidateEntries.length > 0) {
+        for (const inv of invalidateEntries) {
+          if (inv.newEntryIndex !== undefined && inv.newEntryIndex < bulkResults.length) {
+            const newEntryId = bulkResults[inv.newEntryIndex].id;
+            const oldMeta = parseSmartMetadata(inv.metadata, { id: inv.id });
+            const updatedMeta = buildSmartMetadata({ metadata: inv.metadata, id: inv.id } as any, {
+              superseded_by: newEntryId,
+              relations: appendRelation(oldMeta.relations ?? [], {
+                type: "superseded_by",
+                targetId: newEntryId,
+              }),
+            });
+            inv.metadata = stringifySmartMetadata(updatedMeta);
+          }
+        }
+      }
     }
 
     // Invalidate old entries that were superseded (must happen after bulkStore).
@@ -690,7 +712,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     precomputedVector?: number[],
     createEntries?: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[],
-    invalidateEntries?: Array<{ id: string; metadata: string }>,
+    invalidateEntries?: Array<{ id: string; metadata: string; newEntryIndex?: number }>,
   ): Promise<void> {
     // Profile always merges (skip dedup — admission control still applies)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -1011,7 +1033,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
-    invalidateEntries?: Array<{ id: string; metadata: string }>,
+    invalidateEntries?: Array<{ id: string; metadata: string; newEntryIndex?: number }>,
   ): Promise<"merged" | "created" | "rejected"> {
     // Find existing profile memory by category
     const embeddingText = `${candidate.abstract} ${candidate.content}`;
@@ -1194,7 +1216,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
-    invalidateEntries?: Array<{ id: string; metadata: string }>,
+    invalidateEntries?: Array<{ id: string; metadata: string; newEntryIndex?: number }>,
   ): Promise<void> {
     const existing = await this.store.getById(matchId, scopeFilter);
     if (!existing) {
@@ -1212,6 +1234,9 @@ export class SmartExtractor {
         existingMeta.fact_key ?? deriveFactKey(candidate.category, candidate.abstract);
       const storeCategory = this.mapToStoreCategory(candidate.category);
       const supersedeClassifyText = candidate.content || candidate.abstract;
+
+      // Capture position BEFORE pushing so we can find this new entry in bulkStore results
+      const newEntryIndex = createEntries.length;
 
       createEntries.push({
         text: candidate.abstract,
@@ -1255,23 +1280,18 @@ export class SmartExtractor {
       });
 
       // Invalidate the old entry.  Must happen AFTER bulkStore completes.
-      //
-      // NOTE: superseded_by cannot be set here because we don't know the new entry's ID yet
-      // (LanceDB auto-generates it during bulkStore).  We set invalidated_at to mark the entry
-      // as inactive.  The new entry already has 'supersedes: matchId' (set at creation time),
-      // which is the authoritative link for dedup.  The old entry's superseded_by field is
-      // never read by the retriever — safe to leave as null.  We do NOT add a superseded_by
-      // relation with targetId=null (which would be malformed).
+      // We store newEntryIndex so the second pass can backfill superseded_by
+      // once bulkStore returns the generated IDs.
       const oldMeta = parseSmartMetadata(existing.metadata, existing);
       const invalidatedMeta = buildSmartMetadata(existing, {
         fact_key: factKey,
         invalidated_at: now,
-        // superseded_by: intentionally omitted — new entry ID unknown in batch mode;
-        // new entry's 'supersedes: matchId' provides the authoritative dedup signal
+        // superseded_by: will be set in the second pass after bulkStore returns IDs
       });
       invalidateEntries?.push({
         id: matchId,
         metadata: stringifySmartMetadata(invalidatedMeta),
+        newEntryIndex,  // enables second-pass backfill of superseded_by
       });
 
       this.log(
