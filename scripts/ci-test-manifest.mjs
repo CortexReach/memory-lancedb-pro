@@ -19,6 +19,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/to-import-specifier-windows.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/update-consistency-lancedb.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/strip-envelope-metadata.test.mjs", args: ["--test"] },
+  { group: "cli-smoke", runner: "node", file: "test/import-markdown/import-markdown.test.mjs", args: ["--test"] },
   { group: "cli-smoke", runner: "node", file: "test/cli-smoke.mjs" },
   { group: "cli-smoke", runner: "node", file: "test/functional-e2e.mjs" },
   { group: "storage-and-schema", runner: "node", file: "test/per-agent-auto-recall.test.mjs", args: ["--test"] },
@@ -57,6 +58,13 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/issue-690-cross-call-batch.test.mjs", args: ["--test"] },
   // Issue #690 stress test (long-running, runs manually or nightly)
   { group: "core-regression", runner: "node", file: "test/issue-690-stress-1000.test.mjs", args: ["--test"] },
+  // Issue #665 bulkStore tests (from upstream)
+  { group: "storage-and-schema", runner: "node", file: "test/bulk-store.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/bulk-store-edge-cases.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store-edge-cases.test.mjs", args: ["--test"] },
+  // Issue #680 regression tests (from upstream)
+  { group: "core-regression", runner: "node", file: "test/memory-reflection-issue680-tdd.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

@@ -1921,7 +1921,6 @@ const memoryLanceDBProPlugin = {
       api.logger.debug?.("memory-lancedb-pro: register() called again — skipping re-init (idempotent)");
       return;
     }
-    _registeredApis.add(api);
 
     // Parse and validate configuration
     // ========================================================================
@@ -1930,8 +1929,22 @@ const memoryLanceDBProPlugin = {
     // the same singleton via destructuring. This prevents:
     //   - Memory heap growth from repeated resource creation (~9 calls/process)
     //   - Accumulated session Maps being lost on re-registration
+    //
+    // IMPORTANT: _registeredApis.add(api) is called AFTER successful init.
+    // This ensures that if _initPluginState throws, the api is NOT in the
+    // WeakSet, allowing a subsequent register() call with the same api to retry.
+    // (The old placement — before init — caused permanent breakage on init failure.)
     // ========================================================================
-    if (!_singletonState) { _singletonState = _initPluginState(api); }
+    let singleton: typeof _singletonState;
+    try {
+      if (!_singletonState) { _singletonState = _initPluginState(api); }
+      singleton = _singletonState;
+    } catch (err) {
+      api.logger.error(`memory-lancedb-pro: _initPluginState failed — ${String(err)}`);
+      throw err;
+    }
+    _registeredApis.add(api);
+
     const {
       config,
       resolvedDbPath,
@@ -1952,7 +1965,7 @@ const memoryLanceDBProPlugin = {
       autoCaptureSeenTextCount,
       autoCapturePendingIngressTexts,
       autoCaptureRecentTexts,
-    } = _singletonState;
+    } = singleton;
 
 
     async function sleep(ms: number): Promise<void> {
@@ -3597,24 +3610,34 @@ const memoryLanceDBProPlugin = {
             command: String(event.action || "unknown"),
           });
 
+          const MAX_MAPPED_ENTRIES = 100;
           const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
+          const mappedEntries: Array<{ text: string; vector: number[]; importance: number; category: string; scope: string; metadata: string }> = [];
           for (const mapped of mappedReflectionMemories) {
+            if (mappedEntries.length >= MAX_MAPPED_ENTRIES) {
+              api.logger.warn(`memory-reflection: mapped entries cap (${MAX_MAPPED_ENTRIES}) reached, skipping remaining items`);
+              break;
+            }
             const vector = await embedder.embedPassage(mapped.text);
             let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
+            let searchFailed = false;
             try {
               existing = await store.vectorSearch(vector, 1, 0.1, [targetScope]);
             } catch (err) {
               api.logger.warn(
-                `memory-reflection: mapped memory duplicate pre-check failed, continue store: ${String(err)}`,
+                `memory-reflection: mapped memory duplicate pre-check failed, skip store: ${String(err)}`,
               );
+              searchFailed = true;
             }
-
+            if (searchFailed) {
+              continue;
+            }
             if (existing.length > 0 && existing[0].score > 0.95) {
               continue;
             }
 
             const importance = mapped.category === "decision" ? 0.85 : 0.8;
-            const metadata = JSON.stringify(buildReflectionMappedMetadata({
+            const baseMetadata = buildReflectionMappedMetadata({
               mappedItem: mapped,
               eventId: reflectionEventId,
               agentId: sourceAgentId,
@@ -3624,9 +3647,12 @@ const memoryLanceDBProPlugin = {
               usedFallback: reflectionGenerated.usedFallback,
               toolErrorSignals,
               sourceReflectionPath: relPath,
-            }));
+            });
+            // embed heading in metadata JSON so it survives bulkStore round-trip to LanceDB
+            baseMetadata._reflectionHeading = mapped.heading;
+            const metadata = JSON.stringify(baseMetadata);
 
-            const storedEntry = await store.store({
+            mappedEntries.push({
               text: mapped.text,
               vector,
               importance,
@@ -3634,12 +3660,25 @@ const memoryLanceDBProPlugin = {
               scope: targetScope,
               metadata,
             });
-
+          }
+          if (mappedEntries.length > 0) {
+            const storedEntries = await store.bulkStore(mappedEntries);
             if (mdMirror) {
-              await mdMirror(
-                { text: mapped.text, category: mapped.category, scope: targetScope, timestamp: storedEntry.timestamp },
-                { source: `reflection:${mapped.heading}`, agentId: sourceAgentId },
-              );
+              for (const stored of storedEntries) {
+                // retrieve heading from metadata JSON — critical when bulkStore filters entries
+                // because storedEntries[i] may not correspond to mappedEntries[i]
+                let heading = "unknown";
+                try {
+                  const storedMeta = stored.metadata ? JSON.parse(stored.metadata) : {};
+                  heading = storedMeta._reflectionHeading ?? "unknown";
+                } catch {
+                  api.logger.warn(`memory-reflection: failed to parse stored metadata for entry ${stored.id}, using "unknown"`);
+                }
+                await mdMirror(
+                  { text: stored.text, category: stored.category, scope: stored.scope, timestamp: stored.timestamp },
+                  { source: `reflection:${heading}`, agentId: sourceAgentId },
+                );
+              }
             }
           }
 
@@ -3686,9 +3725,10 @@ const memoryLanceDBProPlugin = {
           if (sessionKey) {
             reflectionErrorStateBySession.delete(sessionKey);
             getGlobalReflectionLock().delete(sessionKey);
-            if (reflectionRan) {
-              getSerialGuardMap().set(sessionKey, Date.now());
-            }
+            getSerialGuardMap().set(sessionKey, Date.now());
+            // NOTE: This guard is tested via inline simulation in
+            // test/memory-reflection-issue680-tdd.test.mjs "Bug #1: serial guard on early throw".
+            // The test verifies this runs unconditionally in finally (not gated by reflectionRan).
           }
           pruneReflectionSessionState();
         }
@@ -4159,7 +4199,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       ? {
         enabled: sessionStrategy === "memoryReflection",
         storeToLanceDB: reflectionStoreToLanceDB,
-        writeLegacyCombined: memoryReflectionRaw.writeLegacyCombined !== false,
+        writeLegacyCombined: memoryReflectionRaw.writeLegacyCombined === true,
         injectMode: reflectionInjectMode,
         agentId: asNonEmptyString(memoryReflectionRaw.agentId),
         messageCount: reflectionMessageCount,
@@ -4176,7 +4216,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       : {
         enabled: sessionStrategy === "memoryReflection",
         storeToLanceDB: reflectionStoreToLanceDB,
-        writeLegacyCombined: true,
+        writeLegacyCombined: false,
         injectMode: "inheritance+derived",
         agentId: undefined,
         messageCount: reflectionMessageCount,
