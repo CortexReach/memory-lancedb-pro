@@ -460,7 +460,6 @@ console.log("RECOVERED_WRITE_OK");
       if (caughtError) {
         const msg = caughtError.message || String(caughtError);
         const code = caughtError.code;
->>>>>>> 85b2bdb (fix(store): ELOCKED safety + ENOTDIR recovery + stale artifact age checks (PR#674))
         assert.ok(
           msg.includes("ENOTDIR") || msg.includes("EACCES") || msg.includes("ENOENT"),
           `Expected ENOTDIR/EACCES/ENOENT, got: ${msg}`,
