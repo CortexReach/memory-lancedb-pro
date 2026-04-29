@@ -3015,10 +3015,6 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: regex fallback found ${toCapture.length} capturable text(s) for agent ${agentId}`,
           );
 
-          );
-
-          );
-
           // FIX #675: Collect entries and use bulkStore() once (1 lock instead of N).
           // Limit to 2 capturable pieces per conversation.
           const capturedEntries: Array<{
@@ -3054,16 +3050,19 @@ const memoryLanceDBProPlugin = {
               continue;
             }
 
-            // FIX Bug #3: batch-internal dedup — skip texts whose vector is too similar
-            // to an entry already in capturedEntries.  Prevents near-duplicate entries
-            // (e.g. "I like coffee" + "I drink coffee daily") from both being bulkStored
-            // when neither exists in the database yet.
+            // FIX Bug #3 + P1: batch-internal dedup — skip texts whose vector is too similar
+            // to an entry already in capturedEntries.  Uses cosine similarity (not raw dot product)
+            // to be consistent with the DB dedup path which uses vectorSearch().score.
             let duplicateInBatch = false;
             for (const prev of capturedEntries) {
               if (prev.vector.length !== vector.length) continue;
               let dot = 0;
               for (let i = 0; i < vector.length; i++) dot += prev.vector[i] * vector[i];
-              if (dot > 0.90) { duplicateInBatch = true; break; }
+              // Cosine similarity = dot / (||prev|| * ||vector||); skip if > 0.90
+              const normPrev = Math.sqrt(prev.vector.reduce((s, v) => s + v * v, 0));
+              const normVec = Math.sqrt(vector.reduce((s, v) => s + v * v, 0));
+              const cosine = normPrev > 0 && normVec > 0 ? dot / (normPrev * normVec) : dot;
+              if (cosine > 0.90) { duplicateInBatch = true; break; }
             }
             if (duplicateInBatch) {
               api.logger.info(
