@@ -253,12 +253,19 @@ export class MemoryStore {
     const doLock = (retryOptions?: { retries: number; factor: number; minTimeout: number; maxTimeout: number }) =>
       lockfile.lock(lockPath, {
         lockfilePath: lockPath, // FIX_M2: 明確指定 artifact = lockPath（不追加 .lock），讓 cleanup 邏輯和 production 一致
+        // 設計說明：當 lockfilePath === lockPath 時，proper-lockfile 的 artifact 就是 lockPath 本身。
+        // v3 行為：artifact 是 .lock FILE（lockPath 檔案本身）。
+        // v4 行為：artifact 是 .lock/ DIR（lockPath 目錄，裡面放 lockfile 的微文件）。
+        // 這是 v4 的 breaking change，cross-process-lock.test.mjs 需跟著更新。
+        // 回收邏輯（cleanupStaleArtifact 和 ELOCKED recovery）都必須同時支援 FILE 和 DIR 兩種 artifact。
         realpath: false,
         retries: retryOptions ?? {
-          retries: 10,
+          retries: 2, // Allow proper-lockfile to internally retry for ~3s (1s+2s backoff).
           factor: 2,
-          minTimeout: 1000, // James 保守設定：避免高負載下過度密集重試
-          maxTimeout: 30000, // James 保守設定：支撐更久的 event loop 阻塞
+          minTimeout: 1000,
+          maxTimeout: 2000,
+          // IMPORTANT: This gives active-holder ELOCKED time to resolve (concurrent writes).
+          // If retries are exhausted, we check artifact age to decide cleanup vs propagate.
         },
         stale: 10000, // 10 秒後視為 stale，觸發 ECOMPROMISED callback
                        // 注意：ECOMPROMISED 是 ambiguous degradation 訊號，mtime 無法區分
@@ -271,50 +278,64 @@ export class MemoryStore {
         },
       });
 
+    // 使用與 proper-lockfile 相同的 10 秒 stale threshold
+    const STALE_THRESHOLD_MS = 10000;
+
     let release: (() => Promise<void>) | undefined;
     try {
       release = await doLock();
     } catch (err: unknown) {
-      // C1: TOCTOU race - artifact created between cleanup and lock()
-      // Clean up any artifact and retry once
-      if ((err as NodeJS.ErrnoException).code === "ELOCKED") {
-        console.warn(`[memory-lancedb-pro] ELOCKED on first attempt, cleaning up and retrying: ${lockPath}`);
-        // Force cleanup of ANY artifact at lockPath (not just stale ones)
+      // C1: TOCTOU race — artifact created between proactive cleanup and lock().
+      // C2: ENOTDIR — proper-lockfile tried to create DIR artifact but found a FILE
+      //      (legacy v3 FILE artifact lying around, or path collision).
+      // Only retry if the artifact is confirmed STALE (another process died).
+      // If artifact is NOT stale, it belongs to an ACTIVE holder — we must NOT
+      // delete it, otherwise two processes enter critical section simultaneously.
+      const errCode = (err as NodeJS.ErrnoException).code;
+      if (errCode === "ELOCKED" || errCode === "ENOTDIR") {
+        console.warn(`[memory-lancedb-pro] ${errCode} on first attempt, checking artifact age: ${lockPath}`);
         if (existsSync(lockPath)) {
           try {
             const stat = statSync(lockPath);
-            // statSync 成功：知道 artifact 類型，執行對應的刪除
-            try {
-              if (stat.isDirectory()) {
-                rmSync(lockPath, { recursive: true, force: true });
-              } else {
-                unlinkSync(lockPath);
-              }
-              console.warn(`[memory-lancedb-pro] cleaned up artifact for retry: ${lockPath}`);
-            } catch (cleanupErr: unknown) {
-              // rmSync/unlinkSync 失敗時不應盲目重試，否則幾乎必然再次 ELOCKED
-              const errMsg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
-              const errCode = (cleanupErr as NodeJS.ErrnoException).code || "UNKNOWN";
-              console.error(`[memory-lancedb-pro] ELOCKED cleanup failed (${errCode}, will not retry): ${lockPath}`);
-              const wrapped = new Error(`ELOCKED cleanup failed (${errCode}): ${errMsg}`, { cause: cleanupErr });
-              (wrapped as NodeJS.ErrnoException).code = errCode;
+            const age = Date.now() - stat.mtimeMs;
+            if (age > STALE_THRESHOLD_MS) {
+              // Artifact is STALE — the previous holder crashed or hung.
+              // Safe to delete and retry.
+              // Use rmSync with recursive=true for BOTH FILE and DIR artifacts.
+              // Note: rmSync with recursive handles files correctly on Linux/Win32.
+              rmSync(lockPath, { recursive: true, force: true });
+              console.warn(`[memory-lancedb-pro] removed stale artifact (age=${age}ms>${STALE_THRESHOLD_MS}ms), retrying: ${lockPath}`);
+            } else {
+              // Artifact is NOT stale — belongs to an ACTIVE holder.
+              // Propagate ELOCKED to avoid breaking mutual exclusion.
+              const errMsg = err instanceof Error ? err.message : String(err);
+              const wrapped = new Error(`ELOCKED: ${lockPath} exists and is NOT stale (age=${age}ms≤${STALE_THRESHOLD_MS}ms); active holder present, not removing`, { cause: err });
+              (wrapped as NodeJS.ErrnoException).code = "ELOCKED";
               throw wrapped;
             }
           } catch (statErr: unknown) {
-            // TOCTOU: artifact 在 existsSync 和 statSync 之间消失了（典型 race）
-            // 不是 cleanup 失敗，視為「已清理」，直接重試
             const statCode = (statErr as NodeJS.ErrnoException).code;
-            console.warn(`[memory-lancedb-pro] ELOCKED cleanup: statSync ${statCode} (artifact already gone), proceeding to lock: ${lockPath}`);
+            if (statCode === "ENOENT") {
+              // TOCTOU: artifact disappeared between existsSync and statSync (another
+              // process released). Proceed to retry.
+              console.warn(`[memory-lancedb-pro] ${errCode} cleanup: statSync ENOENT (artifact gone), retrying: ${lockPath}`);
+            } else {
+              // ENOTDIR or other stat error — artifact replaced by a directory during stall
+              // (Legacy FILE artifact + new process using DIR artifact).
+              const errMsg = statErr instanceof Error ? (statErr as Error).message : String(statErr);
+              const wrapped = new Error(`${errCode} cleanup stat failed (${statCode}): ${errMsg}`, { cause: statErr });
+              (wrapped as NodeJS.ErrnoException).code = statCode;
+              throw wrapped;
+            }
           }
         }
-        // FIX_W2: 第二次 retry 用更少次數（2 次），避免漫長等待
+        // FIX_W2: second attempt — use minimal retries since artifact was confirmed stale
         try {
           release = await doLock({ retries: 2, factor: 1, minTimeout: 100, maxTimeout: 500 });
         } catch (retryErr: unknown) {
-          // 第二次 ELOCKED 或其他錯誤：視為永久 lock failure，拋有意義錯誤
-          const errMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-          const errCode = (retryErr as NodeJS.ErrnoException).code || "UNKNOWN";
-          throw new Error(`ELOCKED retry failed (${errCode}): ${errMsg}`, { cause: retryErr });
+          const errMsg = retryErr instanceof Error ? (retryErr as Error).message : String(retryErr);
+          const retryCode = (retryErr as NodeJS.ErrnoException).code || "UNKNOWN";
+          throw new Error(`${errCode} retry failed (${retryCode}): ${errMsg}`, { cause: retryErr });
         }
       } else {
         throw err;
