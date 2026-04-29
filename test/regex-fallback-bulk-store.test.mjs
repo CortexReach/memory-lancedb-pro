@@ -77,8 +77,10 @@ async function regexFallbackOldPattern(store, embedder, texts, scope, sessionKey
 }
 
 // NEW pattern: collect then bulkStore once = 1 lock
-// FIX Bug #3: batch-internal dedup — skip texts whose vector is too similar
-// to an entry already in capturedEntries (prevents duplicate entries in the same batch).
+// FIX Bug #3 + P1: batch-internal dedup — skip texts whose vector is too similar
+// to an entry already in capturedEntries.  Uses cosine similarity (not raw dot product)
+// to be consistent with the DB dedup path (vectorSearch().score) across providers
+// that don't guarantee unit-normalized embeddings.
 async function regexFallbackNewPattern(store, embedder, texts, scope, sessionKey) {
   const toCapture = texts.filter((t) => t && t.trim().length > 0);
   const capturedEntries = [];
@@ -90,13 +92,17 @@ async function regexFallbackNewPattern(store, embedder, texts, scope, sessionKey
     try { existing = await store.vectorSearch(vector, 1, 0.9, [scope]); } catch { /* fail-open */ }
     if (existing.length > 0 && existing[0].score > 0.90) continue;
     // FIX #675: collect instead of immediate store
-    // FIX Bug #3: batch-internal dedup
+    // FIX Bug #3 + P1: batch-internal dedup using cosine similarity
     let duplicateInBatch = false;
     for (const prev of capturedEntries) {
       if (prev.vector.length !== vector.length) continue;
       let dot = 0;
       for (let i = 0; i < vector.length; i++) dot += prev.vector[i] * vector[i];
-      if (dot > 0.90) { duplicateInBatch = true; break; }
+      // Cosine similarity = dot / (||prev|| * ||vector||); skip if > 0.90
+      const normPrev = Math.sqrt(prev.vector.reduce((s, v) => s + v * v, 0));
+      const normVec = Math.sqrt(vector.reduce((s, v) => s + v * v, 0));
+      const cosine = normPrev > 0 && normVec > 0 ? dot / (normPrev * normVec) : dot;
+      if (cosine > 0.90) { duplicateInBatch = true; break; }
     }
     if (duplicateInBatch) continue;
     capturedEntries.push({ text, vector, importance: 0.7, category, scope, metadata: makeMetadata(text, category, sessionKey) });
