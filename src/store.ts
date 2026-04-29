@@ -16,6 +16,16 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import type { SmartMemoryMetadata } from "./smart-metadata.js";
+
+// Minimal type compatible with smart-metadata.ts EntryLike
+type EntryLike = {
+  text?: string;
+  category?: string;
+  importance?: number;
+  timestamp?: number;
+  metadata?: string;
+};
 
 // ============================================================================
 // Types
@@ -44,6 +54,16 @@ export interface StoreConfig {
 
 export interface MetadataPatch {
   [key: string]: unknown;
+}
+
+/**
+ * Marker fields written by memory-upgrader during Phase 2.
+ * These are merged into the existing metadata on top of Plugin-written fields,
+ * preserving fields like injected_count that the Plugin wrote during Phase 1.
+ */
+export interface UpgradeMarker {
+  upgraded_from: string; // original 5-category
+  upgraded_at: number;   // timestamp of upgrade
 }
 
 // ============================================================================
@@ -108,6 +128,44 @@ function normalizeSearchText(value: string): string {
 function isExplicitDenyAllScopeFilter(scopeFilter?: string[]): boolean {
   return Array.isArray(scopeFilter) && scopeFilter.length === 0;
 }
+
+/**
+ * Safely convert a DB value to number, handling BigInt without truncation.
+ * Number(BigInt) loses precision for large values (e.g. BigInt timestamps).
+ * [fix-Nice1] Use this instead of raw Number() for untrusted DB row fields.
+ */
+function safeToNumber(value: unknown): number {
+  if (typeof value === 'bigint') return Number(value);
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+  return 0;
+}
+
+/**
+ * Whitelist of keys that bulkUpdateMetadataWithPatch accepts from LLM enrichment / upgrade.
+ * LLM-output fields (l0_abstract, l1_overview, l2_content, memory_category) are accepted.
+ * Upgrade-patch fields (tier, access_count, confidence, upgraded_from, upgraded_at) are also accepted.
+ * Any other keys are dropped to prevent accidental overwrites of plugin-managed fields.
+ */
+// [fix-PR639] tier, access_count, confidence must be in the whitelist so that
+// writeEnrichedBatch's explicit upgrade values (tier="working", access_count=0,
+// confidence=0.7) are actually applied — not silently dropped by the filter.
+// For legacy entries parseSmartMetadata defaults to the same values, so behaviour
+// is unchanged; the difference is the intent is now honoured rather than ignored.
+const ALLOWED_PATCH_KEYS = new Set([
+  "l0_abstract",
+  "l1_overview",
+  "l2_content",
+  "memory_category",
+  "upgraded_from",
+  "upgraded_at",
+  "tier",
+  "access_count",
+  "confidence",
+]);
 
 function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight: number }>): number {
   const normalizedQuery = normalizeSearchText(query);
@@ -523,6 +581,415 @@ export class MemoryStore {
   }
 
   /**
+   * Bulk update metadata for multiple entries — single lock acquisition.
+   * 
+   * This is the core method for the Phase 2 upgrader: one lock per batch,
+   * not one lock per entry. This enables the true 1-lock-per-batch behavior
+   * claimed in Issue #632 / PR #639.
+   * 
+   * Flow:
+   *   1. Batch query all ids (1 LanceDB op)
+   *   2. Build updated entries (in-memory)
+   *   3. Batch delete all ids (1 LanceDB op)
+   *   4. Batch add all updated entries (1 LanceDB op)
+   *   Total: 1 lock + 3 LanceDB ops (vs N locks + 2N ops for N × update())
+   * 
+   * @param pairs - Array of { id, metadata } to update
+   * @param scopeFilter - Optional scope filter (applied per-entry)
+   * @returns success count and failed entry ids
+   */
+  async bulkUpdateMetadata(
+    pairs: Array<{ id: string; metadata: string }>,
+    scopeFilter?: string[],
+  ): Promise<{ success: number; failed: string[] }> {
+    await this.ensureInitialized();
+
+    if (pairs.length === 0) {
+      return { success: 0, failed: [] };
+    }
+
+    // Phase 2: single lock + updateQueue serialization for the entire batch
+    // M1 fix: wrap with runSerializedUpdate so bulk ops don't interleave with plugin updates
+    //
+    // IMPORTANT — runSerializedUpdate nesting rationale:
+    // runWithFileLock provides cross-process serialization (file lock).
+    // runSerializedUpdate provides in-process write-order guarantees so that if a plugin
+    // update arrives while bulkUpdateMetadata is queued in updateQueue, it waits for the
+    // bulk to complete first (preserving ordering).
+    // Without runSerializedUpdate: bulk could be interleaved with plugin updates causing
+    // Plugin's new data to be overwritten by the bulk's stale snapshot.
+    // Lock hold time note: runSerializedUpdate adds negligible overhead since the actual
+    // DB ops (query/delete/add) happen inside the lock and are fast (milliseconds).
+    return this.runWithFileLock(() =>
+      this.runSerializedUpdate(async () => {
+        // Step 1: Batch query all entries (1 LanceDB op)
+        const ids = pairs.map((p) => `'${escapeSqlLiteral(p.id)}'`).join(", ");
+        const rows = await this.table!.query()
+          .where(`id IN (${ids})`)
+          .toArray();
+
+        const rowMap = new Map<string, Record<string, unknown>>(rows.map((r) => [r.id as string, r]));
+        const foundIds = new Set<string>(rowMap.keys());
+        const failed: string[] = [];
+
+        // Collect entries to update (those that were found)
+        const toUpdate: Array<{ id: string; metadata: string; row: Record<string, unknown> }> = [];
+        for (const pair of pairs) {
+          if (!foundIds.has(pair.id)) {
+            failed.push(pair.id);
+          } else {
+            toUpdate.push({ ...pair, row: rowMap.get(pair.id)! });
+          }
+        }
+
+        if (toUpdate.length === 0) {
+          return { success: 0, failed };
+        }
+
+        // Step 2: Scope filter check (applied per-entry)
+        if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+          for (const item of toUpdate) {
+            failed.push(item.id);
+          }
+          return { success: 0, failed };
+        }
+
+        const allowedIds: string[] = [];
+        for (const item of toUpdate) {
+          const rowScope = (item.row.scope as string | undefined) ?? "global";
+          if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+            failed.push(item.id);
+          } else {
+            allowedIds.push(item.id);
+          }
+        }
+
+        const filteredToUpdate = toUpdate.filter((item) => allowedIds.includes(item.id));
+        if (filteredToUpdate.length === 0) {
+          return { success: 0, failed };
+        }
+
+        // Step 2.5: Backup originals for rollback (before delete)
+        // [fix-B2] If both batch-add AND per-entry recovery fail, we restore originals
+        // so no data is permanently lost — matching update() rollback semantics.
+        const originalsBackup = new Map(
+          filteredToUpdate.map((item) => [item.id, item.row])
+        );
+
+        // Step 3: Build updated entries (preserve all original fields, only update metadata)
+        const updatedEntries: MemoryEntry[] = filteredToUpdate.map((item) => {
+          const row = item.row;
+          const rowScope = (row.scope as string | undefined) ?? "global";
+          return {
+            id: row.id as string,
+            text: row.text as string,
+            vector: Array.from(row.vector as Iterable<number>),
+            category: row.category as MemoryEntry["category"],
+            scope: rowScope,
+            importance: safeToNumber(row.importance),
+            timestamp: safeToNumber(row.timestamp),
+            metadata: item.metadata,
+          };
+        });
+
+        // Step 4: Batch delete (1 LanceDB op)
+        const deleteIds = filteredToUpdate
+          .map((item) => `'${escapeSqlLiteral(item.id)}'`)
+          .join(", ");
+        await this.table!.delete(`id IN (${deleteIds})`);
+
+        // Step 5: Batch add (1 LanceDB op)
+        // [fix-B2] If add fails, attempt per-entry recovery.
+        // If recovery also fails, restore the original row so no data is permanently lost.
+        try {
+          await this.table!.add(updatedEntries);
+        } catch (addError) {
+          const errMsg = addError instanceof Error ? addError.message : String(addError);
+          console.warn(
+            `[memory-lancedb-pro] bulkUpdateMetadata: batch add failed, attempting per-entry recovery. ` +
+            `entries=${updatedEntries.length}, error=${errMsg}`,
+          );
+          const recoveryFailed: string[] = [];
+          for (const entry of updatedEntries) {
+            try {
+              await this.table!.add([entry]);
+            } catch (recoveryErr) {
+              const recMsg = recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr);
+              console.warn(
+                `[memory-lancedb-pro] bulkUpdateMetadata: per-entry recovery failed for id=${entry.id}, ` +
+                `attempting original restore. error=${recMsg}`,
+              );
+              // [fix-B2] Last line of defence: restore the original row if recovery fails.
+              const originalRow = originalsBackup.get(entry.id);
+              if (originalRow) {
+                try {
+                  const originalEntry: MemoryEntry = {
+                    id: originalRow.id as string,
+                    text: originalRow.text as string,
+                    vector: Array.from(originalRow.vector as Iterable<number>),
+                    category: originalRow.category as MemoryEntry["category"],
+                    scope: (originalRow.scope as string | undefined) ?? "global",
+                    importance: safeToNumber(originalRow.importance),
+                    timestamp: safeToNumber(originalRow.timestamp),
+                    metadata: (originalRow.metadata as string) || "{}",
+                  };
+                  await this.table!.add([originalEntry]);
+                  console.warn(
+                    `[memory-lancedb-pro] bulkUpdateMetadata: original restored for id=${entry.id}`,
+                  );
+                  continue; // restore succeeded — this entry is not failed
+                } catch (restoreErr) {
+                  const rstMsg = restoreErr instanceof Error ? restoreErr.message : String(restoreErr);
+                  console.error(
+                    `[memory-lancedb-pro] FATAL: bulkUpdateMetadata: original restore also failed ` +
+                    `for id=${entry.id}. Data loss may have occurred. error=${rstMsg}`,
+                  );
+                }
+              }
+              if (!failed.includes(entry.id)) {
+                recoveryFailed.push(entry.id);
+              }
+            }
+          }
+          const actuallySucceeded = updatedEntries.length - recoveryFailed.length;
+          console.warn(
+            `[memory-lancedb-pro] bulkUpdateMetadata: recovery complete. ` +
+            `succeeded=${actuallySucceeded}, failed=${recoveryFailed.length}`,
+          );
+          return {
+            success: actuallySucceeded,
+            failed: [...failed, ...recoveryFailed],
+          };
+        }
+
+        return { success: updatedEntries.length, failed };
+      })
+    );
+  }
+
+  /**
+   * Phase-2 bulk write for memory-upgrader with true re-read protection.
+   *
+   * [FIX MR2] This method fixes the stale-metadata bug in the original design:
+   * - Phase 1 builds a metadata PATCH (LLM enrichment results only)
+   * - Phase 2 re-reads each entry from DB INSIDE the lock
+   * - Merge: base (fresh from DB, has Plugin's injected_count)
+   *           + patch (LLM enrichment: l0_abstract, l1_overview, l2_content)
+   *           + marker (upgraded_from, upgraded_at)
+   *
+   * This ensures Plugin's injected_count=5 (written during Phase 1 window)
+   * is NOT overwritten by Phase 1's snapshot (injected_count=0).
+   *
+   * @param entries - Each entry has an id, a LLM-enrichment PATCH, and upgrade markers
+   * @param scopeFilter - Optional scope filter
+   * @returns success count and failed entry ids
+   */
+  async bulkUpdateMetadataWithPatch(
+    entries: Array<{
+      id: string;
+      /** LLM-enrichment patch: l0_abstract, l1_overview, l2_content, memory_category, tier, etc. */
+      patch: Partial<SmartMemoryMetadata>;
+      /** Upgrade marker: original category and timestamp */
+      marker: UpgradeMarker;
+    }>,
+    scopeFilter?: string[],
+  ): Promise<{ success: number; failed: string[] }> {
+    await this.ensureInitialized();
+
+    if (entries.length === 0) {
+      return { success: 0, failed: [] };
+    }
+
+    return this.runWithFileLock(() =>
+      this.runSerializedUpdate(async () => {
+        // Step 1: Batch query all entries (1 LanceDB op) — re-read fresh state
+        const ids = entries.map((e) => `'${escapeSqlLiteral(e.id)}'`).join(", ");
+        const rows = await this.table!.query()
+          .where(`id IN (${ids})`)
+          .toArray();
+
+        const rowMap = new Map<string, Record<string, unknown>>(rows.map((r) => [r.id as string, r]));
+        const foundIds = new Set<string>(rowMap.keys());
+        const failed: string[] = [];
+
+        // Collect entries to update (those that were found)
+        const toUpdate: Array<{
+          entry: (typeof entries)[0];
+          row: Record<string, unknown>;
+        }> = [];
+        for (const entry of entries) {
+          if (!foundIds.has(entry.id)) {
+            failed.push(entry.id);
+          } else {
+            toUpdate.push({ entry, row: rowMap.get(entry.id)! });
+          }
+        }
+
+        if (toUpdate.length === 0) {
+          return { success: 0, failed };
+        }
+
+        // Step 2: Scope filter check (applied per-entry)
+        if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+          for (const item of toUpdate) {
+            failed.push(item.entry.id);
+          }
+          return { success: 0, failed };
+        }
+
+        const allowedIds: string[] = [];
+        for (const item of toUpdate) {
+          const rowScope = (item.row.scope as string | undefined) ?? "global";
+          if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+            failed.push(item.entry.id);
+          } else {
+            allowedIds.push(item.entry.id);
+          }
+        }
+
+        const filteredToUpdate = toUpdate.filter((item) => allowedIds.includes(item.entry.id));
+        if (filteredToUpdate.length === 0) {
+          return { success: 0, failed };
+        }
+
+        // Step 2.5: Backup originals for rollback (before delete)
+        // [fix-B2] Identical protection as bulkUpdateMetadata: if both batch-add
+        // AND per-entry recovery fail, we restore originals so no data is permanently lost.
+        const originalsBackup = new Map(
+          filteredToUpdate.map((item) => [item.entry.id, item.row])
+        );
+
+        // Step 3: Build updated entries — KEY FIX: merge fresh DB metadata + patch + marker
+        // base = DB re-read fresh metadata (Plugin's injected_count=5 is here)
+        // patch = LLM enrichment results (l0_abstract, l1_overview, l2_content, etc.)
+        // marker = upgraded_from + upgraded_at
+        const updatedEntries: MemoryEntry[] = filteredToUpdate.map((item) => {
+          const { entry, row } = item;
+          const rowScope = (row.scope as string | undefined) ?? "global";
+
+          // [Q8-fix] Strip undefined values AND enforce key whitelist before merge.
+          // JS spread: {...base, ...{x:undefined}} OVERWRITES base.x with undefined.
+          // [fix-Nice2] Only whitelisted LLM keys are accepted; all others are dropped
+          // to prevent accidental overwrites of tier/access_count/confidence.
+          const cleanPatch = Object.fromEntries(
+            Object.entries(entry.patch as Record<string, unknown>)
+              .filter(([k]) => ALLOWED_PATCH_KEYS.has(k)) // [fix-Nice2] whitelist gate
+              .filter(([, v]) => v !== undefined)
+          );
+          const cleanMarker = Object.fromEntries(
+            Object.entries(entry.marker as Record<string, unknown>).filter(([, v]) => v !== undefined)
+          );
+
+          // Parse fresh metadata from DB — Plugin's injected_count=5 is preserved here
+          const base = parseSmartMetadata(row.metadata as string | undefined, row as EntryLike);
+
+          // Merge: base (Plugin fields) + cleanPatch (LLM fields, whitelist-filtered) + cleanMarker
+          const merged: SmartMemoryMetadata = {
+            ...base,            // Plugin-written fields: injected_count=5, last_injected_at, etc.
+            ...cleanPatch,     // LLM enrichment: l0_abstract, l1_overview, l2_content, memory_category
+            ...cleanMarker,    // Upgrade marker: upgraded_from, upgraded_at
+          };
+
+          return {
+            id: row.id as string,
+            text: row.text as string,
+            // [Q2-fix] Guard against null/undefined vector.
+            // Array.from(null) returns [], which violates LanceDB vector NOT NULL constraint.
+            // row.vector should always exist for entries stored via this store, but guard anyway.
+            vector: row.vector != null
+              ? Array.from(row.vector as Iterable<number>)
+              : (() => { throw new Error(`bulkUpdateMetadataWithPatch: row.vector is null for id=${row.id}`); })(),
+            category: row.category as MemoryEntry["category"],
+            scope: rowScope,
+            importance: safeToNumber(row.importance),
+            // [Q7-note] timestamp: we deliberately use row.timestamp (Plugin-written value if any).
+            // Phase 2a does NOT override timestamp — Plugin's write time is preserved.
+            timestamp: safeToNumber(row.timestamp),
+            metadata: stringifySmartMetadata(merged),
+          };
+        });
+
+        // Step 4: Batch delete (1 LanceDB op)
+        const deleteIds = filteredToUpdate
+          .map((item) => `'${escapeSqlLiteral(item.entry.id)}'`)
+          .join(", ");
+        await this.table!.delete(`id IN (${deleteIds})`);
+
+        // Step 5: Batch add (1 LanceDB op)
+        // [fix-B2] If add fails, attempt per-entry recovery.
+        // If recovery also fails, restore the original row so no data is permanently lost.
+        try {
+          await this.table!.add(updatedEntries);
+        } catch (addError) {
+          const errMsg = addError instanceof Error ? addError.message : String(addError);
+          console.warn(
+            `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: batch add failed, ` +
+            `attempting per-entry recovery. entries=${updatedEntries.length}, error=${errMsg}`,
+          );
+          // [Q6-fix] Use Set for O(1) lookup instead of O(n) includes.
+          const outerFailed = new Set(failed);
+          const recoveryFailed: string[] = [];
+          for (const entry of updatedEntries) {
+            try {
+              await this.table!.add([entry]);
+            } catch (recoveryErr) {
+              const recMsg = recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr);
+              console.warn(
+                `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: per-entry recovery failed ` +
+                `for id=${entry.id}, attempting original restore. error=${recMsg}`,
+              );
+              // [fix-B2] Last line of defence: restore the original row if recovery fails.
+              const originalRow = originalsBackup.get(entry.id);
+              if (originalRow) {
+                try {
+                  const originalEntry: MemoryEntry = {
+                    id: originalRow.id as string,
+                    text: originalRow.text as string,
+                    // [Q2-fix parity] Guard against null vector during restore, matching main path.
+                    vector: originalRow.vector != null
+                      ? Array.from(originalRow.vector as Iterable<number>)
+                      : (() => { throw new Error(`bulkUpdateMetadataWithPatch: restore: original row.vector is null for id=${originalRow.id}`); })(),
+                    category: originalRow.category as MemoryEntry["category"],
+                    scope: (originalRow.scope as string | undefined) ?? "global",
+                    importance: safeToNumber(originalRow.importance),
+                    timestamp: safeToNumber(originalRow.timestamp),
+                    metadata: (originalRow.metadata as string) || "{}",
+                  };
+                  await this.table!.add([originalEntry]);
+                  console.warn(
+                    `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: original restored for id=${entry.id}`,
+                  );
+                  continue; // restore succeeded — this entry is not failed
+                } catch (restoreErr) {
+                  const rstMsg = restoreErr instanceof Error ? restoreErr.message : String(restoreErr);
+                  console.error(
+                    `[memory-lancedb-pro] FATAL: bulkUpdateMetadataWithPatch: original restore also failed ` +
+                    `for id=${entry.id}. Data loss may have occurred. error=${rstMsg}`,
+                  );
+                }
+              }
+              if (!outerFailed.has(entry.id)) {
+                recoveryFailed.push(entry.id);
+              }
+            }
+          }
+          const actuallySucceeded = updatedEntries.length - recoveryFailed.length;
+          console.warn(
+            `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: recovery complete. ` +
+            `succeeded=${actuallySucceeded}, failed=${recoveryFailed.length}`,
+          );
+          return {
+            success: actuallySucceeded,
+            failed: [...failed, ...recoveryFailed],
+          };
+        }
+
+        return { success: updatedEntries.length, failed };
+      })
+    );
+  }
+
+  /**
    * Import a pre-built entry while preserving its id/timestamp.
    * Used for re-embedding / migration / A/B testing across embedding models.
    * Intentionally separate from `store()` to keep normal writes simple.
@@ -600,8 +1067,8 @@ export class MemoryStore {
       vector: Array.from(row.vector as Iterable<number>),
       category: row.category as MemoryEntry["category"],
       scope: rowScope,
-      importance: Number(row.importance),
-      timestamp: Number(row.timestamp),
+      importance: safeToNumber(row.importance),
+      timestamp: safeToNumber(row.timestamp),
       metadata: (row.metadata as string) || "{}",
     };
   }
@@ -654,8 +1121,8 @@ export class MemoryStore {
         vector: row.vector as number[],
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
-        timestamp: Number(row.timestamp),
+        importance: safeToNumber(row.importance),
+        timestamp: safeToNumber(row.timestamp),
         metadata: (row.metadata as string) || "{}",
       };
 
@@ -732,8 +1199,8 @@ export class MemoryStore {
             vector: row.vector as number[],
             category: row.category as MemoryEntry["category"],
             scope: rowScope,
-            importance: Number(row.importance),
-            timestamp: Number(row.timestamp),
+            importance: safeToNumber(row.importance),
+            timestamp: safeToNumber(row.timestamp),
             metadata: (row.metadata as string) || "{}",
         };
 
@@ -796,8 +1263,8 @@ export class MemoryStore {
         vector: row.vector as number[],
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
-        timestamp: Number(row.timestamp),
+        importance: safeToNumber(row.importance),
+        timestamp: safeToNumber(row.timestamp),
         metadata: (row.metadata as string) || "{}",
       };
 
@@ -934,8 +1401,8 @@ export class MemoryStore {
           vector: [], // Don't include vectors in list results for performance
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
-          importance: Number(row.importance),
-          timestamp: Number(row.timestamp),
+          importance: safeToNumber(row.importance),
+          timestamp: safeToNumber(row.timestamp),
           metadata: (row.metadata as string) || "{}",
         }),
       )
@@ -1066,8 +1533,8 @@ export class MemoryStore {
         vector: Array.from(row.vector as Iterable<number>),
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
-        timestamp: Number(row.timestamp),
+        importance: safeToNumber(row.importance),
+        timestamp: safeToNumber(row.timestamp),
         metadata: (row.metadata as string) || "{}",
       };
 
@@ -1088,7 +1555,7 @@ export class MemoryStore {
       // If the add fails after delete, attempt best-effort recovery without
       // overwriting a newer concurrent successful update.
       const rollbackCandidate =
-        (await this.getById(original.id).catch(() => null)) ?? original;
+        (await this.getById(original.id, scopeFilter).catch(() => null)) ?? original;
       const resolvedId = escapeSqlLiteral(row.id as string);
       await this.table!.delete(`id = '${resolvedId}'`);
       try {
@@ -1277,8 +1744,8 @@ export class MemoryStore {
           vector: Array.isArray(row.vector) ? (row.vector as number[]) : [],
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
-          importance: Number(row.importance),
-          timestamp: Number(row.timestamp),
+          importance: safeToNumber(row.importance),
+          timestamp: safeToNumber(row.timestamp),
           metadata: (row.metadata as string) || "{}",
         }),
       );
