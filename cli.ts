@@ -693,11 +693,18 @@ export async function runImportMarkdown(
       const effectiveScope = options.scope || discoveredScope;
 
       // ── Deduplication check (scope-aware exact match) ───────────────────
-      // Run even in dry-run so --dry-run --dedup reports accurate counts
+      // Use retrieve() for hybrid search + rerank pipeline, then exact match.
+      // Run even in dry-run so --dry-run --dedup reports accurate counts.
+      // Replaces: ctx.store.bm25Search(text, 5) which only checked rank-1.
       if (dedupEnabled) {
         try {
-          const existing = await ctx.store.bm25Search(text, 5, [effectiveScope]);
-          if (existing.length > 0 && existing[0].entry.text === text) {
+          const results = await ctx.retriever.retrieve({
+            query: text,
+            limit: 20,
+            scopeFilter: [effectiveScope],
+            source: "cli",
+          });
+          if (results.length > 0 && results[0].entry.text === text) {
             skipped++;
             if (!options.dryRun) {
               console.log(`  [skip] already imported: ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`);
