@@ -3071,13 +3071,11 @@ const memoryLanceDBProPlugin = {
               continue;
             }
 
-            capturedEntries.push({
-              text,
-              vector,
-              importance: 0.7,
-              category,
-              scope: defaultScope,
-              metadata: stringifySmartMetadata(
+            // Build metadata; if it fails, skip this entry rather than propagating
+            // the exception and leaving capturedEntries in a partial state.
+            let metadata: string;
+            try {
+              metadata = stringifySmartMetadata(
                 buildSmartMetadata(
                   {
                     text,
@@ -3101,7 +3099,21 @@ const memoryLanceDBProPlugin = {
                     suppressed_until_turn: 0,
                   },
                 ),
-              ),
+              );
+            } catch (metadataErr) {
+              api.logger.warn(
+                `memory-lancedb-pro: skipped entry whose metadata construction failed: "${text.slice(0, 40)}": ${String(metadataErr)}`,
+              );
+              continue;
+            }
+
+            capturedEntries.push({
+              text,
+              vector,
+              importance: 0.7,
+              category,
+              scope: defaultScope,
+              metadata,
             });
           }
 
@@ -3118,8 +3130,21 @@ const memoryLanceDBProPlugin = {
               api.logger.warn(
                 `memory-lancedb-pro: bulkStore failed for ${capturedEntries.length} entries, falling back to individual store: ${String(err)}`,
               );
-              // Fallback: store individually (less efficient but preserves the data)
+              // Fallback: store individually, with DB dedup pre-check restored.
+              // (capturedEntries already has batch-internal dedup applied,
+              // but we must also re-apply DB dedup because the entries
+              // may have been filtered by batch dedup in the first pass.)
               for (const entry of capturedEntries) {
+                let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
+                try {
+                  existing = await store.vectorSearch(entry.vector, 1, 0.1, [entry.scope]);
+                } catch { /* fail-open */ }
+                if (existing.length > 0 && existing[0].score > 0.90) {
+                  api.logger.info(
+                    `memory-lancedb-pro: fallback dedup skipped "${entry.text.slice(0, 40)}"`,
+                  );
+                  continue;
+                }
                 await store.store(entry);
               }
               api.logger.info(
