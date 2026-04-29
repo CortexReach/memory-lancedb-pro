@@ -71,6 +71,42 @@ export function __setLockfileModuleForTests(module: any): void {
   lockfileModule = module;
 }
 
+// =========================================================================
+// Redis Lock Domain Decision（single-flight，全程序只決定一次）
+// =========================================================================
+
+// Lazy import：避免 module 層級迴圈依賴
+let _redisLockDomain: import("./redis-lock.js").LockDomain | null = null;
+let _redisLockManager: import("./redis-lock.js").RedisLockManager | null = null;
+
+async function getLockDomain(): Promise<import("./redis-lock.js").LockDomain> {
+  if (_redisLockDomain !== null) return _redisLockDomain;
+
+  try {
+    const { determineLockDomain } = await import("./redis-lock.js");
+    _redisLockDomain = await determineLockDomain();
+  } catch {
+    // 若 redis-lock.js 不存在或匯入失敗，預設用 file lock
+    _redisLockDomain = 'file';
+  }
+
+  return _redisLockDomain;
+}
+
+// Fix #1: 取得 RedisLockManager instance
+async function getRedisLockManager(): Promise<import("./redis-lock.js").RedisLockManager | null> {
+  if (_redisLockManager !== null) return _redisLockManager;
+
+  try {
+    const { getRedisLockManagerInstance } = await import("./redis-lock.js");
+    _redisLockManager = getRedisLockManagerInstance();
+  } catch {
+    _redisLockManager = null;
+  }
+
+  return _redisLockManager;
+}
+
 export const loadLanceDB = async (): Promise<
   typeof import("@lancedb/lancedb")
 > => {
@@ -208,6 +244,26 @@ export class MemoryStore {
   private updateQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly config: StoreConfig) { }
+
+  /**
+   * 統一的 lock routing 方法（Fix #1 核心）。
+   * 根據 determineLockDomain() 的決定，路由到對應的 lock 實作。
+   *
+   * 目前 RedisLockManager 只有骨架（PR-2 才會有 acquire/release），
+   * 所以 Redis path 目前 fallback 到 file lock，避免行為改變。
+   * PR-2 實作 actual Redis locking 時，只需修改這裡的 routing 邏輯。
+   */
+  private async runWithLock<T>(fn: () => Promise<T>): Promise<T> {
+    const domain = await getLockDomain();
+    if (domain === 'redis') {
+      // Fix #1: manager instance 已由 determineLockDomain() 存入 module-level
+      const manager = await getRedisLockManager();
+      if (manager !== null) {
+        // PR-2 實作：return this.runWithRedisLock(fn, manager);
+      }
+    }
+    return this.runWithFileLock(fn);
+  }
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
@@ -464,7 +520,7 @@ export class MemoryStore {
       metadata: entry.metadata || "{}",
     };
 
-    return this.runWithFileLock(async () => {
+    return this.runWithLock(async () => {
       try {
         await this.table!.add([fullEntry]);
       } catch (err: unknown) {
@@ -508,7 +564,7 @@ export class MemoryStore {
     }));
     
     // Single lock acquisition for all entries
-    return this.runWithFileLock(async () => {
+    return this.runWithLock(async () => {
       try {
         await this.table!.add(fullEntries);
       } catch (err: any) {
@@ -551,7 +607,7 @@ export class MemoryStore {
       metadata: entry.metadata || "{}",
     };
 
-    return this.runWithFileLock(async () => {
+    return this.runWithLock(async () => {
       await this.table!.add([full]);
       return full;
     });
@@ -877,7 +933,7 @@ export class MemoryStore {
       throw new Error(`Memory ${resolvedId} is outside accessible scopes`);
     }
 
-    return this.runWithFileLock(async () => {
+    return this.runWithLock(async () => {
       await this.table!.delete(`id = '${resolvedId}'`);
       return true;
     });
@@ -1004,7 +1060,7 @@ export class MemoryStore {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
-    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+    return this.runWithLock(() => this.runSerializedUpdate(async () => {
       // Support both full UUID and short prefix (8+ hex chars), same as delete()
       const uuidRegex =
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1178,7 +1234,7 @@ export class MemoryStore {
 
     const whereClause = conditions.join(" AND ");
 
-    return this.runWithFileLock(async () => {
+    return this.runWithLock(async () => {
       // Count first
       const countResults = await this.table!.query().where(whereClause).toArray();
       const deleteCount = countResults.length;
