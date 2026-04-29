@@ -1959,7 +1959,8 @@ const memoryLanceDBProPlugin = {
       singleton = _singletonState;
     } catch (err) {
       api.logger.error(`memory-lancedb-pro: _initPluginState failed — ${String(err)}`);
-      _registeredApisMap.delete(api);  // dual-track rollback: init failed, un-claim
+      _registeredApis.delete(api);         // dual-track rollback: WeakSet un-claim
+      _registeredApisMap.delete(api);     // dual-track rollback: Map un-claim
       throw err;
     }
     const {
