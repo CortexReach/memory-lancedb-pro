@@ -774,7 +774,7 @@ export async function runImportMarkdown(
     console.log(`\u2022 Skipped (short): ${skippedShort}`);
     console.log(`\u2022 Skipped (dedup): ${dryRunDedupSkipped.length}`);
     console.log(`\u2022 Elapsed: ${elapsed}ms`);
-    return { imported, skipped: skippedShort, foundFiles, skippedShort, skippedDedup: dryRunDedupSkipped.length, errorCount: parseErrors, elapsedMs: elapsed };
+    return { imported, skipped, foundFiles, skippedShort, skippedDedup: dryRunDedupSkipped.length, errorCount: parseErrors, elapsedMs: elapsed };
   }
 
   console.log(`[import] ${pendingEntries.length} entries need embedding (${skippedDedup} dedup hits)`);
