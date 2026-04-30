@@ -663,7 +663,7 @@ export async function runImportMarkdown(
     ? Math.max(0, Math.min(1, parseFloat(options.importance ?? "0.7")))
     : 0.7;
   const dedupEnabled = options.dedup !== false;
-  const batchSize = clampInt(parseInt(options.batchSize ?? "32", 10), 1, 128);
+  const batchSize = clampInt(parseInt(options.batchSize ?? "10", 10), 1, Infinity);
   const FLUSH_THRESHOLD = 100; // bulkStore flush interval
 
   type ParsedEntry = {
@@ -725,6 +725,9 @@ export async function runImportMarkdown(
   const t0 = Date.now();
 
   // ── Phase 2a: dedup check — parallel retrieve() in chunks ──────────────────
+  // Uses retriever.retrieve() (vector + bm25 hybrid) instead of raw bm25Search.
+  // CHUNK=50 prevents overwhelming the retriever with too many parallel requests.
+  // On dedup hit: skip + count. On miss or error: proceed with import.
   console.log(`[import] dedup check: ${dedupEnabled ? "enabled" : "disabled"}`);
   const pendingEntries: ParsedEntry[] = [];
 
@@ -768,10 +771,15 @@ export async function runImportMarkdown(
   }
 
   // ── Phase 2b: batch embed + bulkStore pipeline ────────────────────────────
+  // batchSize: number of texts sent to embedBatchPassage() per call (default: 10).
+  //   Lower = less memory pressure on embedder; higher = fewer API round-trips.
+  // FLUSH_THRESHOLD=100: accumulated entries before calling bulkStore() once.
+  //   Single lock acquisition per bulkStore call reduces lock contention.
   let flushCount = 0;
   const pendingFlush: Array<Omit<import("./src/store.js").MemoryEntry, "id" | "timestamp">> = [];
 
   async function flushPending(): Promise<void> {
+    // splice out current batch; remaining entries stay in queue for next flush
     if (pendingFlush.length === 0) return;
     const batch = pendingFlush.splice(0, pendingFlush.length);
     await ctx.store.bulkStore(batch);
@@ -1541,8 +1549,8 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     )
     .option(
       "--batch-size <n>",
-      "Embedding batch size for batch import (default: 32, max: 128)",
-      "32",
+      "Embedding batch size for batch import (default: 10)",
+      "10",
     )
     .action(async (workspaceGlob, options) => {
       // [FIXED P1] Wrap with try/catch — runImportMarkdown now throws instead of process.exit(1)
