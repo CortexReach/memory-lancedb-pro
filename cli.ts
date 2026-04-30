@@ -488,7 +488,7 @@ async function sleep(ms: number): Promise<void> {
 // ============================================================================
 
 export async function runImportMarkdown(
-  ctx: { embedder?: import("./src/embedder.js").Embedder; store: MemoryStore },
+  ctx: { embedder?: import("./src/embedder.js").Embedder; store: MemoryStore; retriever: MemoryRetriever },
   workspaceGlob: string | undefined,
   options: {
     dryRun?: boolean;
@@ -497,8 +497,9 @@ export async function runImportMarkdown(
     dedup?: boolean;
     minTextLength?: string;
     importance?: string;
+    batchSize?: string;
   }
-  ): Promise<{ imported: number; skipped: number; foundFiles: number }> {
+  ): Promise<{ imported: number; skipped: number; foundFiles: number; skippedShort: number; skippedDedup: number; errorCount: number; elapsedMs: number }> {
   const openclawHome = options.openclawHome
     ? path.resolve(options.openclawHome)
     : path.join(homedir(), ".openclaw");
@@ -507,6 +508,9 @@ export async function runImportMarkdown(
   let imported = 0;
   let skipped = 0;
   let foundFiles = 0;
+  let skippedShort = 0;
+  let skippedDedup = 0;
+  let errorCount = 0;
 
   if (!ctx.embedder) {
     // [FIXED P1] Throw instead of process.exit(1) so CLI handler can catch it
@@ -649,98 +653,183 @@ export async function runImportMarkdown(
   }
 
   if (mdFiles.length === 0) {
-    return { imported: 0, skipped: 0, foundFiles: 0 };
+    return { imported: 0, skipped: 0, foundFiles: 0, skippedShort: 0, skippedDedup: 0, errorCount: 0, elapsedMs: 0 };
   }
 
-  // NaN-safe parsing with bounds — invalid input falls back to defaults instead of
-  // silently passing NaN (e.g. "--min-text-length abc" would otherwise make every
-  // length check behave unexpectedly).
+  // ── Phase 1: parse all files → flat entry list ─────────────────────────────
+  // NaN-safe parsing with bounds
   const minTextLength = clampInt(parseInt(options.minTextLength ?? "5", 10), 1, 10000);
   const importanceDefault = Number.isFinite(parseFloat(options.importance ?? "0.7"))
     ? Math.max(0, Math.min(1, parseFloat(options.importance ?? "0.7")))
     : 0.7;
-  const dedupEnabled = !!options.dedup;
+  const dedupEnabled = options.dedup !== false;
+  const batchSize = clampInt(parseInt(options.batchSize ?? "32", 10), 1, 128);
+  const FLUSH_THRESHOLD = 100; // bulkStore flush interval
 
-  // Parse each file for memory entries (lines starting with "- ")
-  for (const { filePath, scope: discoveredScope } of mdFiles) {
-    let content: string;
-    try {
-      // 已在收集時用 withFileTypes: true 過濾，直接讀取
+  type ParsedEntry = {
+    text: string;
+    effectiveScope: string;
+    filePath: string;
+    discoveredScope: string;
+  };
+
+  const allEntries: ParsedEntry[] = [];
+  let parseErrors = 0;
+
+  // ── Phase 1a: parallel file reads ─────────────────────────────────────────
+  const fileContents = await Promise.all(
+    mdFiles.map(async ({ filePath, scope: discoveredScope }) => {
       foundFiles++;
-      content = await fsPromises.readFile(filePath, "utf-8");
-    } catch (err) {
-      // I/O errors (permissions, corruption, etc.)
-      console.warn(`  [skip] read failed: ${filePath}: ${(err as Error).message}`);
-      skipped++;
-      continue;
-    }
-    // (fix(import-markdown): CI測試登記 + .md目錄skip保護)
-    // Strip UTF-8 BOM (e.g. from Windows Notepad-saved files)
-    content = content.replace(/^\uFEFF/, "");
-    // Normalize line endings: handle both CRLF (\r\n) and LF (\n)
-    const lines = content.split(/\r?\n/);
+      try {
+        const content = await fsPromises.readFile(filePath, "utf-8");
+        return { filePath, discoveredScope, content, error: null };
+      } catch (err) {
+        console.warn(`  [skip] read failed: ${filePath}: ${(err as Error).message}`);
+        parseErrors++;
+        return { filePath, discoveredScope, content: "", error: err };
+      }
+    })
+  );
 
+  // ── Phase 1b: extract bullet lines from each file ─────────────────────────
+  for (const { filePath, discoveredScope, content, error } of fileContents) {
+    if (error) { skipped++; continue; }
+    // Strip UTF-8 BOM (e.g. from Windows Notepad-saved files)
+    const cleaned = content.replace(/^\uFEFF/, "");
+    const lines = cleaned.split(/\r?\n/);
     for (const line of lines) {
-      // Skip non-memory lines
-      // Supports: "- text", "* text", "+ text" (standard Markdown bullet formats)
       if (!/^[-*+]\s/.test(line)) continue;
       const text = line.slice(2).trim();
-      if (text.length < minTextLength) { skipped++; continue; }
-
-      // Use --scope if provided, otherwise fall back to per-file discovered scope.
-      // This prevents cross-workspace leakage: without --scope, each workspace
-      // writes to its own scope instead of collapsing everything into "global".
+      if (text.length < minTextLength) { skipped++; skippedShort++; continue; }
       const effectiveScope = options.scope || discoveredScope;
+      allEntries.push({ text, effectiveScope, filePath, discoveredScope });
+    }
+  }
 
-      // ── Deduplication check (scope-aware exact match) ───────────────────
-      // Run even in dry-run so --dry-run --dedup reports accurate counts
-      if (dedupEnabled) {
-        try {
-          const existing = await ctx.store.bm25Search(text, 5, [effectiveScope]);
-          if (existing.length > 0 && existing[0].entry.text === text) {
-            skipped++;
-            if (!options.dryRun) {
-              console.log(`  [skip] already imported: ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`);
-            }
-            continue;
-          }
-        } catch (err) {
-          // [FIXED P2] Log warning so dedup failure is visible instead of silent
-          console.warn(`  [import-markdown] dedup check failed (${err}), proceeding with import: ${text.slice(0, 60)}...`);
+  console.log(`[import] parsed ${allEntries.length} entries from ${mdFiles.length} file(s)`);
+
+  if (allEntries.length === 0) {
+    return { imported: 0, skipped, foundFiles, skippedShort, skippedDedup: 0, errorCount: parseErrors, elapsedMs: 0 };
+  }
+
+  // ── Dry-run shortcut ───────────────────────────────────────────────────────
+  if (options.dryRun) {
+    for (const e of allEntries) {
+      console.log(`  [dry-run] would import: ${e.text.slice(0, 80)}${e.text.length > 80 ? "..." : ""}`);
+      imported++;
+    }
+    console.log(`\nDRY RUN — found ${foundFiles} files, ${imported} entries would be imported, ${skipped} skipped${dedupEnabled ? " [dedup enabled]" : ""}`);
+    return { imported, skipped, foundFiles, skippedShort, skippedDedup: 0, errorCount: parseErrors, elapsedMs: 0 };
+  }
+
+  const t0 = Date.now();
+
+  // ── Phase 2a: dedup check — parallel retrieve() in chunks ──────────────────
+  console.log(`[import] dedup check: ${dedupEnabled ? "enabled" : "disabled"}`);
+  const pendingEntries: ParsedEntry[] = [];
+
+  if (dedupEnabled) {
+    const CHUNK = 50;
+    for (let c = 0; c < allEntries.length; c += CHUNK) {
+      const chunk = allEntries.slice(c, c + CHUNK);
+      const results = await Promise.all(
+        chunk.map((e) =>
+          ctx.retriever
+            .retrieve({ query: e.text, limit: 20, scopeFilter: [e.effectiveScope], source: "cli" })
+            .then((hits) => ({ e, hits, ok: true as const }))
+            .catch((err) => {
+              console.warn(`  [dedup] check failed: ${err}`);
+              return { e, hits: [] as any[], ok: false as const };
+            })
+        )
+      );
+      for (const { e, hits, ok } of results) {
+        if (!ok || hits.length === 0 || hits[0].entry.text !== e.text) {
+          pendingEntries.push(e);
+        } else {
+          skipped++;
+          skippedDedup++;
+          console.log(`  [skip] already imported: ${e.text.slice(0, 60)}${e.text.length > 60 ? "..." : ""}`);
         }
       }
-
-      if (options.dryRun) {
-        console.log(`  [dry-run] would import: ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
-        imported++;
-        continue;
-      }
-
-      try {
-        const vector = await ctx.embedder!.embedPassage(text);
-        await ctx.store.store({
-          text,
-          vector,
-          importance: importanceDefault,
-          category: "other",
-          scope: effectiveScope,
-          metadata: JSON.stringify({ importedFrom: filePath, sourceScope: discoveredScope }),
-        });
-        imported++;
-      } catch (err) {
-        console.warn(`  Failed to import: ${text.slice(0, 60)}... — ${err}`);
-        skipped++;
+      if (allEntries.length > 10) {
+        console.log(`[import] dedup check: ${Math.min(c + CHUNK, allEntries.length)}/${allEntries.length}`);
       }
     }
-  }
-
-  if (options.dryRun) {
-    console.log(`\nDRY RUN — found ${foundFiles} files, ${imported} entries would be imported, ${skipped} skipped${dedupEnabled ? " [dedup enabled]" : ""}`);
   } else {
-    console.log(`\nImport complete: ${imported} imported, ${skipped} skipped (scanned ${foundFiles} files)${dedupEnabled ? " [dedup enabled]" : ""}`);
+    pendingEntries.push(...allEntries);
   }
-  return { imported, skipped, foundFiles };
+
+  console.log(`[import] ${pendingEntries.length} entries need embedding (${skippedDedup} dedup hits)`);
+  if (pendingEntries.length === 0) {
+    const elapsed = Date.now() - t0;
+    console.log(`\nImport complete: 0 imported, ${skipped} skipped (scanned ${foundFiles} files)`);
+    return { imported: 0, skipped, foundFiles, skippedShort, skippedDedup, errorCount: parseErrors, elapsedMs: elapsed };
+  }
+
+  // ── Phase 2b: batch embed + bulkStore pipeline ────────────────────────────
+  let flushCount = 0;
+  const pendingFlush: Array<Omit<import("./src/store.js").MemoryEntry, "id" | "timestamp">> = [];
+
+  async function flushPending(): Promise<void> {
+    if (pendingFlush.length === 0) return;
+    const batch = pendingFlush.splice(0, pendingFlush.length);
+    await ctx.store.bulkStore(batch);
+    flushCount++;
+    imported += batch.length;
+    console.log(`[import] stored batch ${flushCount} (${batch.length} entries, total: ${imported})`);
+  }
+
+  for (let i = 0; i < pendingEntries.length; i += batchSize) {
+    const batch = pendingEntries.slice(i, i + batchSize);
+    const batchIdx = Math.floor(i / batchSize) + 1;
+    const totalBatches = Math.ceil(pendingEntries.length / batchSize);
+
+    // Embed batch
+    const texts = batch.map((e) => e.text);
+    let vectors: number[][];
+    try {
+      vectors = await ctx.embedder!.embedBatchPassage(texts);
+    } catch (err) {
+      console.warn(`[import] batch ${batchIdx} embed failed (${err}), skipping ${batch.length} entries`);
+      skipped += batch.length;
+      errorCount += batch.length;
+      continue;
     }
+
+    // Build entries and queue for bulkStore
+    for (let j = 0; j < batch.length; j++) {
+      const e = batch[j];
+      pendingFlush.push({
+        text: e.text,
+        vector: vectors[j],
+        importance: importanceDefault,
+        category: "other",
+        scope: e.effectiveScope,
+        metadata: JSON.stringify({ importedFrom: e.filePath, sourceScope: e.discoveredScope }),
+      });
+    }
+
+    // Flush when threshold reached or last batch
+    const isLastBatch = i + batchSize >= pendingEntries.length;
+    if (pendingFlush.length >= FLUSH_THRESHOLD || isLastBatch) {
+      await flushPending();
+    } else {
+      console.log(`[import] embedded batch ${batchIdx}/${totalBatches} (${batch.length} entries)`);
+    }
+  }
+
+  const elapsed = Date.now() - t0;
+
+  console.log(`\nImport complete: ${imported} imported, ${skipped} skipped (scanned ${foundFiles} files)${dedupEnabled ? " [dedup enabled]" : ""}`);
+  console.log(`\u2022 Skipped (short): ${skippedShort}`);
+  console.log(`\u2022 Skipped (dedup): ${skippedDedup}`);
+  console.log(`\u2022 Embed batches: ${Math.ceil(pendingEntries.length / batchSize)}`);
+  console.log(`\u2022 bulkStore calls: ${flushCount}`);
+  console.log(`\u2022 Elapsed: ${elapsed}ms`);
+
+  return { imported, skipped, foundFiles, skippedShort, skippedDedup, errorCount: errorCount + parseErrors, elapsedMs: elapsed };
+}
 
 
 export function registerMemoryCLI(program: Command, context: CLIContext): void {
@@ -1450,6 +1539,11 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       "Importance score for imported entries, 0.0-1.0 (default: 0.7)",
       "0.7",
     )
+    .option(
+      "--batch-size <n>",
+      "Embedding batch size for batch import (default: 32, max: 128)",
+      "32",
+    )
     .action(async (workspaceGlob, options) => {
       // [FIXED P1] Wrap with try/catch — runImportMarkdown now throws instead of process.exit(1)
       try {
@@ -1457,7 +1551,6 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         if (result.foundFiles === 0) {
           console.log("No Markdown memory files found.");
         }
-        // Summary is printed inside runImportMarkdown (removed duplicate output)
       } catch (err) {
         console.error(`import-markdown failed: ${err}`);
         process.exit(1);
