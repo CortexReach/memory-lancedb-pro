@@ -662,8 +662,9 @@ export async function runImportMarkdown(
   const importanceDefault = Number.isFinite(parseFloat(options.importance ?? "0.7"))
     ? Math.max(0, Math.min(1, parseFloat(options.importance ?? "0.7")))
     : 0.7;
-  // parseArgs converts --dedup=false to the string "false" (truthy), so both
-  // !== false (boolean) and !== "false" (string) must be checked.
+  // Commander.js --dedup=false is rejected as "unknown option", but the test helper
+  // passes string "false" directly. Both !== false (boolean) and !== "false" (string)
+  // must be checked so dedup is correctly disabled in both CLI and test contexts.
   const dedupEnabled = (options.dedup as unknown as string | undefined | boolean) !== false
     && (options.dedup as unknown as string | undefined | boolean) !== "false";
   const batchSize = clampInt(parseInt(options.batchSize ?? "10", 10), 1, Infinity);
@@ -1555,7 +1556,11 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     )
     .option(
       "--dedup",
-      "Skip entries already in store (scope-aware exact match, requires store.bm25Search)",
+      "Enable dedup (default: enabled)",
+    )
+    .option(
+      "--no-dedup",
+      "Disable dedup",
     )
     .option(
       "--min-text-length <n>",

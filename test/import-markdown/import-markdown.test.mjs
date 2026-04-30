@@ -160,6 +160,7 @@ describe("import-markdown CLI", () => {
       const { imported } = await runImportMarkdown(ctx, {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "bom-test",
+        dedup: false,
       });
 
       assert.ok(imported >= 1, `expected imported >= 1, got ${imported}`);
@@ -175,6 +176,7 @@ describe("import-markdown CLI", () => {
       const { imported } = await runImportMarkdown(ctx, {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "crlf-test",
+        dedup: false,
       });
 
       assert.strictEqual(imported, 2);
@@ -191,6 +193,7 @@ describe("import-markdown CLI", () => {
       const { imported, skipped } = await runImportMarkdown(ctx, {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "bullet-formats",
+        dedup: false,
       });
 
       assert.strictEqual(imported, 3);
@@ -209,6 +212,7 @@ describe("import-markdown CLI", () => {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "min-len-test",
         minTextLength: 5,
+        dedup: false,
       });
 
       assert.strictEqual(imported, 1); // "合格的文字" (5 chars)
@@ -226,6 +230,7 @@ describe("import-markdown CLI", () => {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "importance-test",
         importance: 0.9,
+        dedup: false,
       });
 
       assert.strictEqual(mockStore.storedRecords[0].importance, 0.9);
@@ -301,6 +306,7 @@ describe("import-markdown CLI", () => {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "dryrun-test",
         dryRun: true,
+        dedup: false,
       });
 
       assert.strictEqual(imported, 1);
@@ -375,6 +381,7 @@ describe("import-markdown CLI", () => {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "p1-error-test",
         batchSize: 1, // Force one entry per batch so we can control which flush fails
+        dedup: false,
       });
 
       // batchSize=1, FLUSH_THRESHOLD=100, 3 entries:
@@ -420,6 +427,7 @@ describe("import-markdown CLI", () => {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "p1-multi-batch-test",
         batchSize: 10,
+        dedup: false,
       });
 
       // FLUSH_THRESHOLD=100, batchSize=10:
@@ -512,6 +520,7 @@ describe("import-markdown CLI", () => {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "return-fields-test",
         minTextLength: 5,
+        dedup: false,
       });
 
       assert.ok("skippedShort" in result, "result should have skippedShort field");
@@ -561,6 +570,7 @@ describe("import-markdown CLI", () => {
       const { elapsedMs } = await runImportMarkdown(ctx, {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "elapsed-test",
+        dedup: false,
       });
 
       assert.ok(elapsedMs >= 0, `elapsedMs should be >= 0, got ${elapsedMs}`);
@@ -598,6 +608,7 @@ describe("import-markdown CLI", () => {
       const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       const { imported } = await runImportMarkdown(ctx, {
         openclawHome: isolatedHome,
+        dedup: false,
       });
 
       assert.strictEqual(imported, 1, "should import the flat memory entry");
@@ -635,6 +646,7 @@ describe("import-markdown CLI", () => {
       const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       const { imported } = await runImportMarkdown(ctx, {
         openclawHome: isolatedHome,
+        dedup: false,
       });
 
       assert.strictEqual(imported, 1);
@@ -675,6 +687,7 @@ describe("import-markdown CLI", () => {
       const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       const { imported } = await runImportMarkdown(ctx, {
         openclawHome: isolatedHome,
+        dedup: false,
       });
 
       assert.strictEqual(imported, 1);
