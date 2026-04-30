@@ -683,9 +683,9 @@ export async function runImportMarkdown(
   // ── Phase 1a: parallel file reads ─────────────────────────────────────────
   const fileContents = await Promise.all(
     mdFiles.map(async ({ filePath, scope: discoveredScope }) => {
-      foundFiles++;
       try {
         const content = await fsPromises.readFile(filePath, "utf-8");
+        foundFiles++; // only count files we successfully read
         return { filePath, discoveredScope, content, error: null };
       } catch (err) {
         console.warn(`  [skip] read failed: ${filePath}: ${(err as Error).message}`);
@@ -697,7 +697,7 @@ export async function runImportMarkdown(
 
   // ── Phase 1b: extract bullet lines from each file ─────────────────────────
   for (const { filePath, discoveredScope, content, error } of fileContents) {
-    if (error) { skipped++; continue; }
+    if (error) { continue; } // parse error already counted in Phase 1a
     // Strip UTF-8 BOM (e.g. from Windows Notepad-saved files)
     const cleaned = content.replace(/^\uFEFF/, "");
     const lines = cleaned.split(/\r?\n/);
@@ -734,7 +734,7 @@ export async function runImportMarkdown(
       const results = await Promise.all(
         chunk.map((e) =>
           ctx.retriever
-            .retrieve({ query: e.text, limit: 20, scopeFilter: [e.effectiveScope], source: "cli" })
+            .retrieve({ query: e.text, limit: 20, scopeFilter: [e.effectiveScope] })
             .then((hits) => ({ e, hits, ok: true as const }))
             .catch((err) => {
               console.warn(`  [dedup] check failed: ${err}`);
@@ -746,7 +746,7 @@ export async function runImportMarkdown(
         if (!ok || hits.length === 0 || hits[0].entry.text !== e.text) {
           pendingEntries.push(e);
         } else {
-          skipped++;
+          // dedup hit — skippedDedup tracks it; do NOT count toward skipped (Phase 1b short entries only)
           skippedDedup++;
           dryRunDedupSkipped.push(e);
           console.log(`  [skip] already imported: ${e.text.slice(0, 60)}${e.text.length > 60 ? "..." : ""}`);
