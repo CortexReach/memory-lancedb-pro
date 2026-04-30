@@ -712,24 +712,16 @@ export async function runImportMarkdown(
     return { imported: 0, skipped, foundFiles, skippedShort, skippedDedup: 0, errorCount: parseErrors, elapsedMs: 0 };
   }
 
-  // ── Dry-run shortcut ───────────────────────────────────────────────────────
-  if (options.dryRun) {
-    for (const e of allEntries) {
-      console.log(`  [dry-run] would import: ${e.text.slice(0, 80)}${e.text.length > 80 ? "..." : ""}`);
-      imported++;
-    }
-    console.log(`\nDRY RUN — found ${foundFiles} files, ${imported} entries would be imported, ${skipped} skipped${dedupEnabled ? " [dedup enabled]" : ""}`);
-    return { imported, skipped, foundFiles, skippedShort, skippedDedup: 0, errorCount: parseErrors, elapsedMs: 0 };
-  }
-
   const t0 = Date.now();
 
   // ── Phase 2a: dedup check — parallel retrieve() in chunks ──────────────────
   // Uses retriever.retrieve() (vector + bm25 hybrid) instead of raw bm25Search.
   // CHUNK=50 prevents overwhelming the retriever with too many parallel requests.
   // On dedup hit: skip + count. On miss or error: proceed with import.
+  // [P2 fix] Runs even in dry-run so --dry-run --dedup shows accurate preview.
   console.log(`[import] dedup check: ${dedupEnabled ? "enabled" : "disabled"}`);
   const pendingEntries: ParsedEntry[] = [];
+  const dryRunDedupSkipped: ParsedEntry[] = [];
 
   if (dedupEnabled) {
     const CHUNK = 50;
@@ -752,6 +744,7 @@ export async function runImportMarkdown(
         } else {
           skipped++;
           skippedDedup++;
+          dryRunDedupSkipped.push(e);
           console.log(`  [skip] already imported: ${e.text.slice(0, 60)}${e.text.length > 60 ? "..." : ""}`);
         }
       }
@@ -761,6 +754,24 @@ export async function runImportMarkdown(
     }
   } else {
     pendingEntries.push(...allEntries);
+  }
+
+  // ── Dry-run shortcut ───────────────────────────────────────────────────────
+  // [P2 fix] dedup has already run above; here we just report without importing.
+  if (options.dryRun) {
+    const elapsed = Date.now() - t0;
+    for (const e of pendingEntries) {
+      console.log(`  [dry-run] would import: ${e.text.slice(0, 80)}${e.text.length > 80 ? "..." : ""}`);
+      imported++;
+    }
+    for (const e of dryRunDedupSkipped) {
+      console.log(`  [dry-run] would skip [dedup]: ${e.text.slice(0, 80)}${e.text.length > 80 ? "..." : ""}`);
+    }
+    console.log(`\nDRY RUN — found ${foundFiles} files, ${imported} entries would be imported, ${dryRunDedupSkipped.length} skipped [dedup enabled]`);
+    console.log(`\u2022 Skipped (short): ${skippedShort}`);
+    console.log(`\u2022 Skipped (dedup): ${dryRunDedupSkipped.length}`);
+    console.log(`\u2022 Elapsed: ${elapsed}ms`);
+    return { imported, skipped: skippedShort, foundFiles, skippedShort, skippedDedup: dryRunDedupSkipped.length, errorCount: parseErrors, elapsedMs: elapsed };
   }
 
   console.log(`[import] ${pendingEntries.length} entries need embedding (${skippedDedup} dedup hits)`);
@@ -782,10 +793,16 @@ export async function runImportMarkdown(
     // splice out current batch; remaining entries stay in queue for next flush
     if (pendingFlush.length === 0) return;
     const batch = pendingFlush.splice(0, pendingFlush.length);
-    await ctx.store.bulkStore(batch);
-    flushCount++;
-    imported += batch.length;
-    console.log(`[import] stored batch ${flushCount} (${batch.length} entries, total: ${imported})`);
+    try {
+      await ctx.store.bulkStore(batch);
+      flushCount++;
+      imported += batch.length;
+      console.log(`[import] stored batch ${flushCount} (${batch.length} entries, total: ${imported})`);
+    } catch (err) {
+      // [P1 fix] count failed batch and continue so remaining batches are processed
+      errorCount += batch.length;
+      console.warn(`[import] bulkStore batch ${flushCount + 1} failed (${err}), ${batch.length} entries not stored`);
+    }
   }
 
   for (let i = 0; i < pendingEntries.length; i += batchSize) {
