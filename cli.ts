@@ -662,7 +662,10 @@ export async function runImportMarkdown(
   const importanceDefault = Number.isFinite(parseFloat(options.importance ?? "0.7"))
     ? Math.max(0, Math.min(1, parseFloat(options.importance ?? "0.7")))
     : 0.7;
-  const dedupEnabled = options.dedup !== false;
+  // parseArgs converts --dedup=false to the string "false" (truthy), so both
+  // !== false (boolean) and !== "false" (string) must be checked.
+  const dedupEnabled = (options.dedup as unknown as string | undefined | boolean) !== false
+    && (options.dedup as unknown as string | undefined | boolean) !== "false";
   const batchSize = clampInt(parseInt(options.batchSize ?? "10", 10), 1, Infinity);
   const FLUSH_THRESHOLD = 100; // bulkStore flush interval
 
