@@ -751,20 +751,21 @@ export async function runImportMarkdown(
       );
       for (const { e, hits, ok, skipEntry } of results) {
         if (hits.length === 0 || hits[0].entry.text !== e.text) {
-          pendingEntries.push(e);
-        } else {
-          // skipEntry=true → dedup check error: skip entry (fail-safe, don't import unknown state)
+          // skipEntry=true: dedup check error → skip entry (fail-safe)
           if (skipEntry) {
             skipped++;
             errorCount++;
             console.log(`  [skip] dedup-err [${e.effectiveScope}]: ${e.text.slice(0, 60)}${e.text.length > 60 ? "..." : ""}`);
           } else {
-            // dedup hit — count toward both skipped and skippedDedup (PR 719 semantics)
-            skipped++;
-            skippedDedup++;
-            dryRunDedupSkipped.push(e);
-            console.log(`  [skip] dedup [${e.effectiveScope}]: ${e.text.slice(0, 60)}${e.text.length > 60 ? "..." : ""}`);
+            // Genuine no-hit → proceed to import
+            pendingEntries.push(e);
           }
+        } else {
+          // dedup hit — count toward both skipped and skippedDedup (PR 719 semantics)
+          skipped++;
+          skippedDedup++;
+          dryRunDedupSkipped.push(e);
+          console.log(`  [skip] dedup [${e.effectiveScope}]: ${e.text.slice(0, 60)}${e.text.length > 60 ? "..." : ""}`);
         }
       }
       if (allEntries.length > 10) {
@@ -803,14 +804,15 @@ export async function runImportMarkdown(
   if (pendingEntries.length === 0) {
     const elapsed = Date.now() - t0;
     const totalEntries = imported + skipped;
+    const totalErrorCount = errorCount + parseErrors;
     console.log(`\nMemory Import Status:`);
-    console.log(`\u2022 Files found: ${foundFiles}`);
-    console.log(`\u2022 Entries processed: ${totalEntries}`);
-    console.log(`\u2022 Imported: ${imported}`);
-    if (skippedShort > 0) console.log(`\u2022 Skipped (too short): ${skippedShort}`);
-    if (skippedDedup > 0) console.log(`\u2022 Skipped (dedup): ${skippedDedup}`);
-    if (parseErrors > 0) console.log(`\u2022 Errors: ${parseErrors}`);
-    return { imported: 0, skipped, foundFiles, skippedShort, skippedDedup, errorCount: parseErrors, elapsedMs: elapsed };
+    console.log(`  Files found: ${foundFiles}`);
+    console.log(`  Entries processed: ${totalEntries}`);
+    console.log(`  Imported: ${imported}`);
+    if (skippedShort > 0) console.log(`  Skipped (too short): ${skippedShort}`);
+    if (skippedDedup > 0) console.log(`  Skipped (dedup): ${skippedDedup}`);
+    if (totalErrorCount > 0) console.log(`  Errors: ${totalErrorCount}`);
+    return { imported: 0, skipped, foundFiles, skippedShort, skippedDedup, errorCount: totalErrorCount, elapsedMs: elapsed };
   }
 
   // ── Phase 2b: batch embed + bulkStore pipeline ────────────────────────────
