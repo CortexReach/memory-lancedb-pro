@@ -681,6 +681,12 @@ export async function runImportMarkdown(
   let parseErrors = 0;
 
   // ── Phase 1a: parallel file reads ─────────────────────────────────────────
+  // [scan] file discovery log — shows all files before reading
+  console.log(`[scan] found ${mdFiles.length} markdown files across ${new Set(mdFiles.map(f => f.scope)).size} workspace(s):`);
+  for (const { filePath, scope } of mdFiles) {
+    console.log(`  [scan] [${scope}] ${filePath}`);
+  }
+
   const fileContents = await Promise.all(
     mdFiles.map(async ({ filePath, scope: discoveredScope }) => {
       try {
@@ -698,6 +704,7 @@ export async function runImportMarkdown(
   // ── Phase 1b: extract bullet lines from each file ─────────────────────────
   for (const { filePath, discoveredScope, content, error } of fileContents) {
     if (error) { continue; } // parse error already counted in Phase 1a
+    console.log(`[scan] reading: ${filePath}`);
     // Strip UTF-8 BOM (e.g. from Windows Notepad-saved files)
     const cleaned = content.replace(/^\uFEFF/, "");
     const lines = cleaned.split(/\r?\n/);
@@ -746,10 +753,11 @@ export async function runImportMarkdown(
         if (!ok || hits.length === 0 || hits[0].entry.text !== e.text) {
           pendingEntries.push(e);
         } else {
-          // dedup hit — skippedDedup tracks it; do NOT count toward skipped (Phase 1b short entries only)
+          // dedup hit — count toward both skipped and skippedDedup (PR 719 semantics)
+          skipped++;
           skippedDedup++;
           dryRunDedupSkipped.push(e);
-          console.log(`  [skip] already imported: ${e.text.slice(0, 60)}${e.text.length > 60 ? "..." : ""}`);
+          console.log(`  [skip] dedup [${e.effectiveScope}]: ${e.text.slice(0, 60)}${e.text.length > 60 ? "..." : ""}`);
         }
       }
       if (allEntries.length > 10) {
@@ -771,17 +779,30 @@ export async function runImportMarkdown(
     for (const e of dryRunDedupSkipped) {
       console.log(`  [dry-run] would skip [dedup]: ${e.text.slice(0, 80)}${e.text.length > 80 ? "..." : ""}`);
     }
+    const totalEntries = imported + skippedShort + dryRunDedupSkipped.length;
     console.log(`\nDRY RUN — found ${foundFiles} files, ${imported} entries would be imported, ${dryRunDedupSkipped.length} skipped [dedup enabled]`);
-    console.log(`\u2022 Skipped (short): ${skippedShort}`);
-    console.log(`\u2022 Skipped (dedup): ${dryRunDedupSkipped.length}`);
+    console.log(`\u2022 Files found: ${foundFiles}`);
+    console.log(`\u2022 Entries processed: ${totalEntries}`);
+    console.log(`\u2022 Imported: ${imported}`);
+    if (skippedShort > 0) console.log(`\u2022 Skipped (too short): ${skippedShort}`);
+    if (dryRunDedupSkipped.length > 0) console.log(`\u2022 Skipped (dedup): ${dryRunDedupSkipped.length}`);
+    if (parseErrors > 0) console.log(`\u2022 Errors: ${parseErrors}`);
     console.log(`\u2022 Elapsed: ${elapsed}ms`);
-    return { imported, skipped, foundFiles, skippedShort, skippedDedup: dryRunDedupSkipped.length, errorCount: parseErrors, elapsedMs: elapsed };
+    console.log(`[DRY-RUN] No entries were actually imported.`);
+    return { imported, skipped: skippedShort + dryRunDedupSkipped.length, foundFiles, skippedShort, skippedDedup: dryRunDedupSkipped.length, errorCount: parseErrors, elapsedMs: elapsed };
   }
 
   console.log(`[import] ${pendingEntries.length} entries need embedding (${skippedDedup} dedup hits)`);
   if (pendingEntries.length === 0) {
     const elapsed = Date.now() - t0;
-    console.log(`\nImport complete: 0 imported, ${skipped} skipped (scanned ${foundFiles} files)`);
+    const totalEntries = imported + skipped;
+    console.log(`\nMemory Import Status:`);
+    console.log(`\u2022 Files found: ${foundFiles}`);
+    console.log(`\u2022 Entries processed: ${totalEntries}`);
+    console.log(`\u2022 Imported: ${imported}`);
+    if (skippedShort > 0) console.log(`\u2022 Skipped (too short): ${skippedShort}`);
+    if (skippedDedup > 0) console.log(`\u2022 Skipped (dedup): ${skippedDedup}`);
+    if (parseErrors > 0) console.log(`\u2022 Errors: ${parseErrors}`);
     return { imported: 0, skipped, foundFiles, skippedShort, skippedDedup, errorCount: parseErrors, elapsedMs: elapsed };
   }
 
@@ -850,15 +871,21 @@ export async function runImportMarkdown(
   }
 
   const elapsed = Date.now() - t0;
+  const totalEntries = imported + skipped;
+  const totalErrorCount = errorCount + parseErrors;
 
-  console.log(`\nImport complete: ${imported} imported, ${skipped} skipped (scanned ${foundFiles} files)${dedupEnabled ? " [dedup enabled]" : ""}`);
-  console.log(`\u2022 Skipped (short): ${skippedShort}`);
-  console.log(`\u2022 Skipped (dedup): ${skippedDedup}`);
+  console.log(`\nMemory Import Status:`);
+  console.log(`\u2022 Files found: ${foundFiles}`);
+  console.log(`\u2022 Entries processed: ${totalEntries}`);
+  console.log(`\u2022 Imported: ${imported}`);
+  if (skippedShort > 0) console.log(`\u2022 Skipped (too short): ${skippedShort}`);
+  if (skippedDedup > 0) console.log(`\u2022 Skipped (dedup): ${skippedDedup}`);
+  if (totalErrorCount > 0) console.log(`\u2022 Errors: ${totalErrorCount}`);
   console.log(`\u2022 Embed batches: ${Math.ceil(pendingEntries.length / batchSize)}`);
   console.log(`\u2022 bulkStore calls: ${flushCount}`);
   console.log(`\u2022 Elapsed: ${elapsed}ms`);
 
-  return { imported, skipped, foundFiles, skippedShort, skippedDedup, errorCount: errorCount + parseErrors, elapsedMs: elapsed };
+  return { imported, skipped, foundFiles, skippedShort, skippedDedup, errorCount: totalErrorCount, elapsedMs: elapsed };
 }
 
 
