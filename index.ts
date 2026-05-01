@@ -4406,6 +4406,7 @@ const memoryLanceDBProPlugin = {
                 if (stepMatch) {
                   const base = stepMatch[1] === "*" ? min : parseInt(stepMatch[1], 10);
                   const step = parseInt(stepMatch[2], 10);
+                  if (step <= 0) return []; // guard: reject step=0 to prevent infinite loop
                   const r: number[] = [];
                   for (let i = base; i <= max; i += step) r.push(i);
                   return r;
@@ -4438,9 +4439,17 @@ const memoryLanceDBProPlugin = {
             const definedScopes = scopeManager.getAllScopes();
             const scopes = new Set(definedScopes);
             try {
-              const allMemories = await store.list(undefined, undefined, 500, 0);
-              for (const m of allMemories) {
-                if (m.scope) scopes.add(m.scope);
+              // Paginate through all memories to discover scopes (avoids 500-limit blind spot)
+              let offset = 0;
+              const batchSize = 1000;
+              while (true) {
+                const batch = await store.list(undefined, undefined, batchSize, offset);
+                if (batch.length === 0) break;
+                for (const m of batch) {
+                  if (m.scope) scopes.add(m.scope);
+                }
+                if (batch.length < batchSize) break;
+                offset += batchSize;
               }
             } catch {}
             scopes.add("global");
