@@ -94,9 +94,9 @@ async function regexFallbackNewPattern(store, embedder, texts, scope, sessionKey
     const category = detectCategory(text);
     const vector = await embedder.embedPassage(text);
 
-    // DB dedup pre-check
+    // DB dedup pre-check — uses 0.1 to match production fallback threshold (fail-open pre-filter)
     let existing = [];
-    try { existing = await store.vectorSearch(vector, 1, 0.9, [scope]); } catch { /* fail-open */ }
+    try { existing = await store.vectorSearch(vector, 1, 0.1, [scope]); } catch { /* fail-open */ }
     if (existing.length > 0 && existing[0].score > 0.90) continue;
 
     // Batch-internal dedup (cosine similarity)
