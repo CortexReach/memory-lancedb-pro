@@ -720,7 +720,7 @@ export async function runImportMarkdown(
 
   // ── Phase 2a: dedup check — parallel retrieve() in chunks ──────────────────
   // Uses retriever.retrieve() (vector + bm25 hybrid) instead of raw bm25Search.
-  // CHUNK=50 prevents overwhelming the retriever with too many parallel requests.
+  // batchSize controls dedup retrieve() parallelism to match embedBatchPassage.
   // On dedup hit: skip + count. On miss or error: proceed with import.
   // [P2 fix] Runs even in dry-run so --dry-run --dedup shows accurate preview.
   console.log(`[import] dedup check: ${dedupEnabled ? "enabled" : "disabled"}`);
@@ -728,9 +728,9 @@ export async function runImportMarkdown(
   const dryRunDedupSkipped: ParsedEntry[] = [];
 
   if (dedupEnabled) {
-    const CHUNK = 50;
-    for (let c = 0; c < allEntries.length; c += CHUNK) {
-      const chunk = allEntries.slice(c, c + CHUNK);
+    // [Fix #6] Use batchSize instead of CHUNK=50 so dedup and embed share the same parallelism unit
+    for (let c = 0; c < allEntries.length; c += batchSize) {
+      const chunk = allEntries.slice(c, c + batchSize);
       const results = await Promise.all(
         chunk.map((e) =>
           ctx.retriever
@@ -753,7 +753,7 @@ export async function runImportMarkdown(
         }
       }
       if (allEntries.length > 10) {
-        console.log(`[import] dedup check: ${Math.min(c + CHUNK, allEntries.length)}/${allEntries.length}`);
+        console.log(`[import] dedup check: ${Math.min(c + batchSize, allEntries.length)}/${allEntries.length}`);
       }
     }
   } else {
@@ -791,21 +791,23 @@ export async function runImportMarkdown(
   // FLUSH_THRESHOLD=100: accumulated entries before calling bulkStore() once.
   //   Single lock acquisition per bulkStore call reduces lock contention.
   let flushCount = 0;
-  const pendingFlush: Array<Omit<import("./src/store.js").MemoryEntry, "id" | "timestamp">> = [];
+  let pendingFlush: Array<Omit<import("./src/store.js").MemoryEntry, "id" | "timestamp">> = [];
 
   async function flushPending(): Promise<void> {
-    // splice out current batch; remaining entries stay in queue for next flush
     if (pendingFlush.length === 0) return;
-    const batch = pendingFlush.splice(0, pendingFlush.length);
+    // [Fix #3] Copy before bulkStore so failure doesn't lose entries
+    const toStore = [...pendingFlush];
+    pendingFlush = [];  // clear immediately; restored on failure
     try {
-      await ctx.store.bulkStore(batch);
+      await ctx.store.bulkStore(toStore);
       flushCount++;
-      imported += batch.length;
-      console.log(`[import] stored batch ${flushCount} (${batch.length} entries, total: ${imported})`);
+      imported += toStore.length;
+      console.log(`[import] stored batch ${flushCount} (${toStore.length} entries, total: ${imported})`);
     } catch (err) {
-      // [P1 fix] count failed batch and continue so remaining batches are processed
-      errorCount += batch.length;
-      console.warn(`[import] bulkStore batch ${flushCount + 1} failed (${err}), ${batch.length} entries not stored`);
+      // [Fix #3] Restore so entries are not silently lost; count as errors
+      pendingFlush = toStore;
+      errorCount += toStore.length;
+      console.warn(`[import] bulkStore failed (${err}), ${toStore.length} entries not stored — restoring for retry`);
     }
   }
 
@@ -820,8 +822,7 @@ export async function runImportMarkdown(
     try {
       vectors = await ctx.embedder!.embedBatchPassage(texts);
     } catch (err) {
-      console.warn(`[import] batch ${batchIdx} embed failed (${err}), skipping ${batch.length} entries`);
-      skipped += batch.length;
+      console.warn(`[import] batch ${batchIdx} embed failed (${err}), ${batch.length} entries not stored`);
       errorCount += batch.length;
       continue;
     }
