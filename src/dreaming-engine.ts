@@ -180,8 +180,10 @@ export function createDreamingEngine(params: DreamingEngineParams): DreamingEngi
 
     dbg(`Light sleep [${scope}]: fetching memories newer than ${new Date(cutoff).toISOString()}`);
 
-    // MR1: Filter by scope
-    const entries = await store.list([scope], undefined, limit * 2, 0);
+    // MR1: Filter by scope — explicitly match only the target scope,
+    // excluding null-scope memories that store.list() may include for backward compat
+    const entries = (await store.list([scope], undefined, limit * 2, 0))
+      .filter((e) => e.scope === scope);
     const recent = entries.filter((e) => e.timestamp > cutoff).slice(0, limit);
 
     dbg(`Light sleep [${scope}]: ${recent.length} recent memories to evaluate`);
@@ -249,8 +251,9 @@ export function createDreamingEngine(params: DreamingEngineParams): DreamingEngi
 
     dbg(`Deep sleep [${scope}]: fetching Working-tier memories`);
 
-    // MR1: Filter by scope
-    const entries = await store.list([scope], undefined, limit * 5, 0);
+    // MR1: Filter by scope — explicitly match only the target scope
+    const entries = (await store.list([scope], undefined, limit * 5, 0))
+      .filter((e) => e.scope === scope);
     const working = entries.filter((e) => {
       const parsed = parseSmartMetadata(e.metadata, e);
       return parsed.tier === "working";
@@ -313,8 +316,9 @@ export function createDreamingEngine(params: DreamingEngineParams): DreamingEngi
 
     dbg(`REM [${scope}]: analyzing memory patterns`);
 
-    // MR1: Filter by scope
-    const entries = await store.list([scope], undefined, limit, 0);
+    // MR1: Filter by scope — explicitly match only the target scope
+    const entries = (await store.list([scope], undefined, limit, 0))
+      .filter((e) => e.scope === scope);
     const recent = entries.filter((e) => e.timestamp > cutoff);
 
     // MR2: Exclude dreaming reflections from analysis
