@@ -9,7 +9,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { MemoryRetriever, RetrievalResult } from "./retriever.js";
-import type { MemoryStore } from "./store.js";
+import type { MemoryEntry, MemoryStore } from "./store.js";
 import { isNoise, ENVELOPE_NOISE_PATTERNS } from "./noise-filter.js";
 import { stripEnvelopeMetadata } from "./smart-extractor.js";
 import { isSystemBypassId, resolveScopeFilter, parseAgentIdFromSessionKey, type MemoryScopeManager } from "./scopes.js";
@@ -1280,14 +1280,20 @@ export function registerMemoryUpdateTool(
             newVector = await context.embedder.embedPassage(text);
           }
 
+          // Fetch existing entry once when we may need it (text change, or
+          // importance-only change that still needs metadata sync). Shared by
+          // the temporal supersede guard and the normal-path metadata rebuild.
+          let existing: MemoryEntry | null = null;
+          if (text || importance !== undefined) {
+            existing = await context.store.getById(resolvedId, scopeFilter);
+          }
+
           // --- Temporal supersede guard ---
           // For temporal-versioned categories (preferences/entities), changing
           // text must go through supersede to preserve the history chain.
-          if (text && newVector) {
-            const existing = await context.store.getById(resolvedId, scopeFilter);
-            if (existing) {
-              const meta = parseSmartMetadata(existing.metadata, existing);
-              if (TEMPORAL_VERSIONED_CATEGORIES.has(meta.memory_category)) {
+          if (text && newVector && existing) {
+            const meta = parseSmartMetadata(existing.metadata, existing);
+            if (TEMPORAL_VERSIONED_CATEGORIES.has(meta.memory_category)) {
                 const now = Date.now();
                 const factKey =
                   meta.fact_key ?? deriveFactKey(meta.memory_category, text);
@@ -1362,7 +1368,6 @@ export function registerMemoryUpdateTool(
                     category: meta.memory_category,
                   },
                 };
-              }
             }
           }
           // --- End temporal supersede guard ---
@@ -1373,6 +1378,34 @@ export function registerMemoryUpdateTool(
           if (importance !== undefined)
             updates.importance = clamp01(importance, 0.7);
           if (category) updates.category = category;
+
+          // Rebuild smart metadata when text or importance changes (#544)
+          if (text && existing) {
+            const meta = parseSmartMetadata(existing.metadata, existing);
+            const effectiveCategory = (category as any) ?? meta.memory_category;
+            const updatedMeta = buildSmartMetadata(existing, {
+              l0_abstract: text,
+              l1_overview: `- ${text}`,
+              l2_content: text,
+              fact_key: deriveFactKey(effectiveCategory, text),
+              memory_temporal_type: classifyTemporal(text),
+              confidence:
+                importance !== undefined
+                  ? clamp01(importance, 0.7)
+                  : meta.confidence,
+            });
+            // Re-derive valid_until from the new text. Explicit override
+            // (not via patch.valid_until) so the absence of a new expiry
+            // clears any stale value inherited from the previous text.
+            updatedMeta.valid_until = inferExpiry(text);
+            updates.metadata = stringifySmartMetadata(updatedMeta);
+          } else if (importance !== undefined && existing) {
+            // Sync confidence for importance-only changes
+            const updatedMeta = buildSmartMetadata(existing, {
+              confidence: clamp01(importance, 0.7),
+            });
+            updates.metadata = stringifySmartMetadata(updatedMeta);
+          }
 
           const updated = await context.store.update(
             resolvedId,

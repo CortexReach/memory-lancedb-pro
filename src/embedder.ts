@@ -33,6 +33,16 @@ class EmbeddingCache {
     this.ttlMs = ttlMinutes * 60_000;
   }
 
+  /** Remove all expired entries. Called on every set() when cache is near capacity. */
+  private _evictExpired(): void {
+    const now = Date.now();
+    for (const [k, entry] of this.cache) {
+      if (now - entry.createdAt > this.ttlMs) {
+        this.cache.delete(k);
+      }
+    }
+  }
+
   private key(text: string, task?: string): string {
     const hash = createHash("sha256").update(`${task || ""}:${text}`).digest("hex").slice(0, 24);
     return hash;
@@ -59,10 +69,19 @@ class EmbeddingCache {
 
   set(text: string, task: string | undefined, vector: number[]): void {
     const k = this.key(text, task);
-    // Evict oldest if full
+    // If key already exists, delete to update insertion order for correct LRU semantics
+    if (this.cache.has(k)) {
+      this.cache.delete(k);
+    }
+    // When cache is full, run TTL eviction first (removes expired + oldest).
+    // This prevents unbounded growth from stale entries while keeping writes O(1).
     if (this.cache.size >= this.maxSize) {
-      const firstKey = this.cache.keys().next().value;
-      if (firstKey !== undefined) this.cache.delete(firstKey);
+      this._evictExpired();
+      // If eviction didn't free enough slots, evict the single oldest LRU entry.
+      if (this.cache.size >= this.maxSize) {
+        const firstKey = this.cache.keys().next().value;
+        if (firstKey !== undefined) this.cache.delete(firstKey);
+      }
     }
     this.cache.set(k, { vector, createdAt: Date.now() });
   }
@@ -90,7 +109,10 @@ export interface EmbeddingConfig {
   apiKey: string | string[];
   model: string;
   baseURL?: string;
+  /** Internal vector dimension for schema sizing and local validation. */
   dimensions?: number;
+  /** Optional API request output dimension for providers that support it. */
+  requestDimensions?: number;
 
   /** Optional task type for query embeddings (e.g. "retrieval.query") */
   taskQuery?: string;
@@ -419,6 +441,14 @@ export function getVectorDimensions(model: string, overrideDims?: number): numbe
   return dims;
 }
 
+export function getEffectiveVectorDimensions(
+  model: string,
+  dimensions?: number,
+  requestDimensions?: number,
+): number {
+  return getVectorDimensions(model, requestDimensions ?? dimensions);
+}
+
 // ============================================================================
 // Embedder Class
 // ============================================================================
@@ -456,7 +486,7 @@ export class Embedder {
     this._taskQuery = config.taskQuery;
     this._taskPassage = config.taskPassage;
     this._normalized = config.normalized;
-    this._requestDimensions = config.dimensions;
+    this._requestDimensions = config.requestDimensions;
     this._omitDimensions = config.omitDimensions === true;
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
@@ -500,7 +530,11 @@ export class Embedder {
       console.log(`[memory-lancedb-pro] Initialized ${this.clients.length} API keys for round-robin rotation`);
     }
 
-    this.dimensions = getVectorDimensions(config.model, config.dimensions);
+    this.dimensions = getEffectiveVectorDimensions(
+      config.model,
+      config.dimensions,
+      config.requestDimensions,
+    );
     this._cache = new EmbeddingCache(256, 30); // 256 entries, 30 min TTL
   }
 
@@ -554,33 +588,96 @@ export class Embedder {
    * Call embeddings.create using native fetch (bypasses OpenAI SDK).
    * Used exclusively for Ollama endpoints where AbortController must work
    * correctly to avoid long-lived stalled sockets.
+   *
+   * For Ollama 0.20.5+: /v1/embeddings may return empty arrays for some models,
+   * so we use /api/embeddings with "prompt" field for single requests (PR #621).
+   * For batch requests, we use /v1/embeddings with "input" array as it's more
+   * efficient and confirmed working in local testing.
+   *
+   * See: https://github.com/CortexReach/memory-lancedb-pro/issues/620
+   * Fix: https://github.com/CortexReach/memory-lancedb-pro/issues/629
    */
   private async embedWithNativeFetch(payload: any, signal?: AbortSignal): Promise<any> {
     if (!this._baseURL) {
       throw new Error("embedWithNativeFetch requires a baseURL");
     }
-    // Ollama's embeddings endpoint is at /v1/embeddings (OpenAI-compatible)
-    const endpoint = this._baseURL.replace(/\/$/, "") + "/embeddings";
 
+    const base = this._baseURL.replace(/\/$/, "").replace(/\/v1$/, "");
     const apiKey = this.clients[0]?.apiKey ?? "ollama";
 
-    const response = await fetch(endpoint, {
+    // Handle batch requests with /v1/embeddings + input array
+    // NOTE: /v1/embeddings is used unconditionally for batch with no fallback.
+    // If a model doesn't support that endpoint, failure will be silent from the user's perspective.
+    // This is acceptable because most Ollama embedding models support /v1/embeddings.
+    if (Array.isArray(payload.input)) {
+      const response = await fetch(base + "/v1/embeddings", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: payload.model,
+          input: payload.input,
+          // NOTE: Other provider options (encoding_format, normalized, dimensions, etc.)
+          // from buildPayload() are intentionally not included. Ollama embedding models
+          // do not support these parameters, so omitting them is correct.
+        }),
+        signal,
+      });
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => "");
+        throw new Error(
+          `Ollama batch embedding failed: ${response.status} ${response.statusText} ??${body.slice(0, 200)}`
+        );
+      }
+
+      const data = await response.json();
+
+      // Validate response count and non-empty embeddings
+      if (
+        !Array.isArray(data?.data) ||
+        data.data.length !== payload.input.length ||
+        data.data.some((item: any) => {
+          const embedding = item?.embedding;
+          return !Array.isArray(embedding) || embedding.length === 0;
+        })
+      ) {
+        throw new Error(
+          `Ollama batch embedding returned invalid response for ${payload.input.length} inputs`
+        );
+      }
+
+      return data;
+    }
+
+    // Single request: use /api/embeddings + prompt (PR #621 fix)
+    const response = await fetch(base + "/api/embeddings", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(payload),
-      signal: signal,
+      body: JSON.stringify({
+        model: payload.model,
+        prompt: payload.input,
+      }),
+      signal,
     });
 
     if (!response.ok) {
       const body = await response.text().catch(() => "");
-      throw new Error(`Ollama embedding failed: ${response.status} ${response.statusText} ??${body.slice(0, 200)}`);
+      throw new Error(
+        `Ollama embedding failed: ${response.status} ${response.statusText} ??${body.slice(0, 200)}`
+      );
     }
 
     const data = await response.json();
-    return data; // OpenAI-compatible shape: { data: [{ embedding: number[] }] }
+
+    // Ollama /api/embeddings returns { embedding: number[] },
+    // convert to OpenAI-compatible shape { data: [{ embedding: number[] }] }
+    return { data: [{ embedding: data.embedding }] };
   }
 
   /**

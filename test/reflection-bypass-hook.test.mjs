@@ -17,6 +17,7 @@ const jiti = jitiFactory(import.meta.url, {
 
 const pluginModule = jiti("../index.ts");
 const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
+const resetRegistration = pluginModule.resetRegistration ?? (() => {});
 const { MemoryStore } = jiti("../src/store.ts");
 const { storeReflectionToLanceDB } = jiti("../src/reflection-store.ts");
 
@@ -134,9 +135,11 @@ describe("reflection hooks tolerate bypass scope filters", () => {
 
   beforeEach(() => {
     workDir = mkdtempSync(path.join(tmpdir(), "reflection-bypass-hook-"));
+    resetRegistration();
   });
 
   afterEach(() => {
+    resetRegistration();
     rmSync(workDir, { recursive: true, force: true });
   });
 

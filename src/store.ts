@@ -11,6 +11,8 @@ import {
   mkdirSync,
   realpathSync,
   lstatSync,
+  statSync,
+  unlinkSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
@@ -62,6 +64,11 @@ async function loadLockfile(): Promise<any> {
     lockfileModule = await import("proper-lockfile");
   }
   return lockfileModule;
+}
+
+/** For unit testing: override the lockfile module with a mock. */
+export function __setLockfileModuleForTests(module: any): void {
+  lockfileModule = module;
 }
 
 export const loadLanceDB = async (): Promise<
@@ -209,11 +216,84 @@ export class MemoryStore {
       try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
       try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
     }
+    // 【修復 #415】調整 retries：max wait 從 ~3100ms → ~151秒
+    // 指數退避：1s, 2s, 4s, 8s, 16s, 30s×5，總計約 151 秒
+    // ECOMPROMISED 透過 onCompromised callback 觸發（非 throw），使用 flag 機制正確處理
+    let isCompromised = false;
+    let compromisedErr: unknown = null;
+    let fnSucceeded = false;
+    let fnError: unknown = null;
+
+    // Proactive cleanup of stale lock artifacts（from PR #626）
+    // 根本避免 >5 分鐘的 lock artifact 導致 ECOMPROMISED
+    if (existsSync(lockPath)) {
+      try {
+        const stat = statSync(lockPath);
+        const ageMs = Date.now() - stat.mtimeMs;
+        const staleThresholdMs = 5 * 60 * 1000;
+        if (ageMs > staleThresholdMs) {
+          try { unlinkSync(lockPath); } catch {}
+          console.warn(`[memory-lancedb-pro] cleared stale lock: ${lockPath} ageMs=${ageMs}`);
+        }
+      } catch {}
+    }
+
     const release = await lockfile.lock(lockPath, {
-      retries: { retries: 5, factor: 2, minTimeout: 100, maxTimeout: 2000 },
-      stale: 10000,
+      retries: {
+        retries: 10,
+        factor: 2,
+        minTimeout: 1000, // James 保守設定：避免高負載下過度密集重試
+        maxTimeout: 30000, // James 保守設定：支撐更久的 event loop 阻塞
+      },
+      stale: 10000, // 10 秒後視為 stale，觸發 ECOMPROMISED callback
+                     // 注意：ECOMPROMISED 是 ambiguous degradation 訊號，mtime 無法區分
+                     // "holder 崩潰" vs "holder event loop 阻塞"，所以不嘗試區分
+      onCompromised: (err: unknown) => {
+        // 【修復 #415 關鍵】必須是同步 callback
+        // setLockAsCompromised() 不等待 Promise，async throw 無法傳回 caller
+        isCompromised = true;
+        compromisedErr = err;
+      },
     });
-    try { return await fn(); } finally { await release(); }
+
+    try {
+      const result = await fn();
+      fnSucceeded = true;
+      return result;
+    } catch (e: unknown) {
+      fnError = e;
+      throw e;
+    } finally {
+      // 【修復 #415 BUG】release() 必須在 isCompromised 判斷之前呼叫
+      // 否則當 fnError !== null 且 isCompromised === true 時，release() 不會被呼叫，lock 永久洩漏
+      try {
+        await release();
+      } catch (e: unknown) {
+        if ((e as NodeJS.ErrnoException).code === 'ERELEASED') {
+          // ERELEASED 是預期行為（compromised lock release），忽略
+        } else {
+          // release() 錯誤優先於 fn() 錯誤：若 release 本身失敗，視為更嚴重的問題
+          // 而非靜默忽略（這是有意的設計選擇，不反映 fn 的錯誤）
+          throw e;
+        }
+      }
+      if (isCompromised) {
+        // fnError 優先：fn() 失敗時，fn 的錯誤比 compromised 重要
+        if (fnError !== null) {
+          throw fnError;
+        }
+        // fn() 尚未完成就 compromised → throw，讓 caller 知道要重試
+        if (!fnSucceeded) {
+          throw compromisedErr as Error;
+        }
+        // fn() 成功執行，但 lock 在執行期間被標記 compromised
+        // 正確行為：回傳成功結果（資料已寫入），明確告知 caller 不要重試
+        console.warn(
+          `[memory-lancedb-pro] Returning successful result despite compromised lock at "${lockPath}". ` +
+          `Callers must not retry this operation automatically.`,
+        );
+      }
+    }
   }
 
   get dbPath(): string {
@@ -387,14 +467,58 @@ export class MemoryStore {
     return this.runWithFileLock(async () => {
       try {
         await this.table!.add([fullEntry]);
-      } catch (err: any) {
-        const code = err.code || "";
-        const message = err.message || String(err);
+      } catch (err: unknown) {
+        const e = err as { code?: string; message?: string };
+        const code = e.code || "";
+        const message = e.message || String(err);
         throw new Error(
           `Failed to store memory in "${this.config.dbPath}": ${code} ${message}`,
         );
       }
       return fullEntry;
+    });
+  }
+
+  /**
+   * Bulk store multiple memory entries (single lock acquisition)
+   * 
+   * Reduces lock contention by acquiring lock once for multiple entries.
+   * Use this when auto-capture produces multiple memories.
+   */
+  async bulkStore(
+    entries: Omit<MemoryEntry, "id" | "timestamp">[],
+  ): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+    
+    // Filter out invalid entries (undefined, null, missing text/vector)
+    const validEntries = entries.filter(
+      (entry) => entry && entry.text && entry.text.length > 0 && entry.vector && entry.vector.length > 0
+    );
+    
+    // Early return for empty array (skip lock acquisition)
+    if (validEntries.length === 0) {
+      return [];
+    }
+    
+    const fullEntries: MemoryEntry[] = validEntries.map((entry) => ({
+      ...entry,
+      id: randomUUID(),
+      timestamp: Date.now(),
+      metadata: entry.metadata || "{}",
+    }));
+    
+    // Single lock acquisition for all entries
+    return this.runWithFileLock(async () => {
+      try {
+        await this.table!.add(fullEntries);
+      } catch (err: any) {
+        const code = err.code || "";
+        const message = err.message || String(err);
+        throw new Error(
+          `Failed to bulk store ${fullEntries.length} memories: ${code} ${message}`,
+        );
+      }
+      return fullEntries;
     });
   }
 

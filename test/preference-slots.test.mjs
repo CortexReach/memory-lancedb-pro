@@ -121,6 +121,10 @@ function makeGuardExtractor({ vectorSearchResults, onDedupCalled }) {
     async store(entry) {
       stored.push(entry);
     },
+    async bulkStore(entries) {
+      stored.push(...entries);
+      return entries;
+    },
   };
   const embedder = {
     async embed() {
@@ -236,6 +240,7 @@ test("dedup guard: non-preference category -> skips guard, goes to LLM", async (
       }];
     },
     async store() {},
+    async bulkStore() { return []; },
   };
   const embedder = {
     async embed() { return [0.1, 0.2, 0.3]; },
