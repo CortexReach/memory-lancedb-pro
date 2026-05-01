@@ -213,6 +213,11 @@ export class MemoryStore {
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
+    // Proactive cleanup threshold: 5 minutes —保守設定
+    // 只清理明顯過時（>5 分鐘）的 artifact，避免誤刪還在工作中的 lock holder
+    // 5 分鐘比 proper-lockfile 內部 stale threshold（10 秒）更寬鬆，因為：
+    // - proactive cleanup 是「預防性」清理（還沒有人抱怨），保守為上
+    // - ELOCKED retry 才是「復原性」處理（有人已經抱怨了），可以更積極
     const staleThresholdMs = 5 * 60 * 1000;
 
     // Ensure parent directory exists for lock artifact
@@ -278,7 +283,12 @@ export class MemoryStore {
         },
       });
 
-    // 使用與 proper-lockfile 相同的 10 秒 stale threshold
+    // ELOCKED/ENOTDIR handler threshold: 10 秒 — 積極設定
+    // 收到 ELOCKED 時，代表有人在等了，應該盡快解鎖
+    // 為什麼比 proactive cleanup（5 分鐘）更積極：
+    // - proactive cleanup：還沒有人抱怨，保守清理避免誤刪正常 lock
+    // - ELOCKED handler：已經有人被 blocked，積極刪除 stale artifact 讓操作繼續
+    // 10 秒與 proper-lockfile 內部 stale threshold 一致（ECOMPROMISED at 10s）
     const STALE_THRESHOLD_MS = 10000;
 
     let release: (() => Promise<void>) | undefined;
