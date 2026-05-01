@@ -61,6 +61,8 @@ const EXPECTED_BASELINE = [
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store-edge-cases.test.mjs", args: ["--test"] },
   // Issue #680 regression tests
   { group: "core-regression", runner: "node", file: "test/memory-reflection-issue680-tdd.test.mjs", args: ["--test"] },
+  // Issue #704 Redis distributed lock — URL parsing fix
+  { group: "storage-and-schema", runner: "node", file: "test/redis-url-parsing.test.mjs" },
 ];
 
 function fail(message) {
