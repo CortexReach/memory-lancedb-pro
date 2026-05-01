@@ -25,6 +25,8 @@ export interface ReflectionMappedMetadata {
   baseWeight: number;
   quality: number;
   sourceReflectionPath?: string;
+  // Issue #680: heading stored in entry for bulkStore filtering recovery
+  _reflectionHeading?: string;
 }
 
 export interface ReflectionMappedDecayDefaults {
