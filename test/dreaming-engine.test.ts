@@ -347,6 +347,58 @@ async function testREMPatternDetection() {
   console.log(`  ✅ REM: pattern detection completed (${report.phases.rem.patterns.length} patterns, ${report.phases.rem.reflectionsCreated} reflections)`);
 }
 
+// MR1 strict: Scope filter excludes null-scope (global) memories when targeting a specific scope
+async function testScopeExcludesNullScope() {
+  // Simulate what store.list() returns: target scope + null-scope memories
+  // (store.list includes OR scope IS NULL for backward compat)
+  const targetEntry = makeEntry({ scope: "agent:main", text: "Agent memory" });
+  const nullScopeEntry = makeEntry({
+    scope: "global", // store normalizes null scope to "global"
+    text: "Global memory that should not be processed for agent:main scope",
+    importance: 0.9,
+    category: "fact",
+  });
+
+  // Mock store that simulates real store.list() behavior: includes null/global-scope
+  // memories when filtering by a specific scope (OR scope IS NULL compat)
+  const store = {
+    list: async (scopeFilter?: string[]) => {
+      let result = [targetEntry, nullScopeEntry];
+      // Simulate real store: filter by scope BUT also include null/global scope
+      if (scopeFilter && scopeFilter.length > 0) {
+        const filtered = result.filter((e) => scopeFilter.includes(e.scope) || e.scope === "global");
+        return filtered;
+      }
+      return result;
+    },
+    store: async (entry: any) => ({ ...entry, id: "mem-new", timestamp: Date.now() }),
+    patchMetadata: async () => {},
+    update: async () => null,
+  } as unknown as MemoryStore;
+
+  const engine = createDreamingEngine({
+    store,
+    embedder: createMockEmbedder(),
+    fallbackDimensions: 1024,
+    decayEngine: createMockDecayEngine(),
+    tierManager: createMockTierManager(),
+    config: mergeDreamingConfig({ enabled: true, phases: { light: { lookbackDays: 365, limit: 100 } } }),
+    log: () => {},
+    debugLog: () => {},
+  });
+
+  const report = await engine.run("agent:main");
+
+  // Light sleep should only scan the target-scope entry, not the global one
+  // (the engine now applies an explicit e.scope === scope filter)
+  assert.ok(
+    report.phases.light.scanned <= 1,
+    "Light sleep should only process memories matching the exact target scope, not null-scope/global memories",
+  );
+
+  console.log("  ✅ MR1 strict: scope filter excludes null-scope memories");
+}
+
 // Error resilience — one phase failure doesn't block others
 async function testErrorResilience() {
   const entries = [makeEntry({ scope: "global" })];
@@ -380,6 +432,7 @@ console.log("Dreaming Engine Tests\n");
 
 await testMergeDreamingConfig();
 await testScopeIsolation();
+await testScopeExcludesNullScope();
 await testReflectionLoopPrevention();
 await testREMEmbedding();
 await testLightSleep();
