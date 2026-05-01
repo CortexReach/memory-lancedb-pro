@@ -217,8 +217,15 @@ export class MemoryStore {
   }> = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private flushLock: Promise<void> = Promise.resolve(); // Promise-based lock，防止 concurrent doFlush()
-  private flushError: Error | null = null; // 捕捉 doFlush() 中最末錯誤，供 flush()/destroy() rethrow
+  // 所有 flush 錯誤的集合（按寫入順序）。flush()/destroy() 重新 throw 時
+  // 只取最後一個錯誤以維持 single-error 行為相容性；全部錯誤仍會
+  // console.error 輸出供診斷。
+  private flushErrors: Error[] = [];
   private static readonly FLUSH_INTERVAL_MS = 100;
+  // 單次 lock acquisition 上限。將大量 entries 拆分多個 chunk 寫入，
+  // 每個 chunk 獨立 lock acquisition，失敗時只影響該 chunk（per-chunk isolation）。
+  // LanceDB 本身無批次上限，此值參考 LanceDB 預設 row-group size（256）
+  // 訂定，在兼顧併發吞吐與記憶體佔用下是一個合理的經驗值。
   private static readonly MAX_BATCH_SIZE = 250;
 
   constructor(private readonly config: StoreConfig) { }
@@ -581,22 +588,33 @@ export class MemoryStore {
             entryOffset = callerEnd;
             callerIdx++;
           }
-          this.flushError = err as Error;
+          // D5 fix: 改為收集所有錯誤而非只保留最後一個
+          this.flushErrors.push(err as Error);
           const errorMsg = err instanceof Error ? err.message : String(err);
           console.error(`[memory-lancedb-pro] doFlush chunk failed: ${errorMsg}`);
         }
       }
 
       // 統一結算：根據 failedCallers 決定 resolve 或 reject
+      // D7 fix: caller.reject() 可能拋出（當 caller promise 已被 resolve/reject 處理過），
+      // 必須用 try/catch 包住，否則 for 迴圈會被中斷，導致後續 caller 完全未被結算
+      const lastError = this.flushErrors.length > 0
+        ? this.flushErrors[this.flushErrors.length - 1]
+        : new Error("flush failed");
       let callerIdx = 0;
       for (const caller of batch) {
         if (failedCallers.has(callerIdx)) {
-          caller.reject(new Error(`batch flush failed`, { cause: this.flushError as Error }));
+          try {
+            caller.reject(new Error(`batch flush failed`, { cause: lastError }));
+          } catch (rejectErr) {
+            console.error(`[memory-lancedb-pro] caller.reject() 拋出（可能被重複結算忽略）: ${rejectErr instanceof Error ? rejectErr.message : String(rejectErr)}`);
+          }
         } else {
           caller.resolve(caller.entries);
         }
         callerIdx++;
       }
+      this.flushErrors = []; // D5 fix: 結算後清除錯誤陣列
     } finally {
       releaseLock!(); // 釋放 lock，讓下一個 flush 可以跑
     }
@@ -606,16 +624,19 @@ export class MemoryStore {
    * Force flush before close（用於測試或 shutdown）
    */
   async flush(): Promise<void> {
+    // D4 fix: 清除 timer 後等前一個 doFlush 完成
+    // 避免 timer callback 已排程但清除動作在它執行前發生，導致重複 doFlush
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+    await this.flushLock;
     await this.doFlush();
     // 【修復 Issue #3: flush() error propagation】
-    // doFlush() 已將錯誤存入 this.flushError，這裡重新拋出
-    if (this.flushError) {
-      const err = this.flushError;
-      this.flushError = null;
+    // doFlush() 已將所有錯誤存入 this.flushErrors，這裡重新拋出（只保留最後一個以維持行為相容）
+    if (this.flushErrors.length > 0) {
+      const err = this.flushErrors[this.flushErrors.length - 1];
+      this.flushErrors = [];
       throw err;
     }
   }
@@ -632,9 +653,9 @@ export class MemoryStore {
     }
     await this.doFlush();
     // 【修復 Issue #3: destroy() error propagation】
-    if (this.flushError) {
-      const err = this.flushError;
-      this.flushError = null;
+    if (this.flushErrors.length > 0) {
+      const err = this.flushErrors[this.flushErrors.length - 1];
+      this.flushErrors = [];
       throw err;
     }
   }
