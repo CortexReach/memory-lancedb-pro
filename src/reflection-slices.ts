@@ -316,3 +316,60 @@ export function extractReflectionSliceItems(reflectionText: string): ReflectionS
 export function extractInjectableReflectionSliceItems(reflectionText: string): ReflectionSliceItem[] {
   return buildReflectionSliceItemsFromSlices(extractInjectableReflectionSlices(reflectionText));
 }
+
+/**
+ * Check if a recall was actually used by the agent.
+ * This function determines whether the agent's response shows awareness of the injected memories.
+ * 
+ * @param responseText - The agent's response text
+ * @param injectedIds - Array of memory IDs that were injected
+ * @returns true if the response shows evidence of using the recalled information
+ */
+export function isRecallUsed(responseText: string, injectedIds: string[]): boolean {
+  if (!responseText || responseText.length <= 24) {
+    return false;
+  }
+  if (!injectedIds || injectedIds.length === 0) {
+    return false;
+  }
+
+  const responseLower = responseText.toLowerCase();
+  
+  // Check for explicit recall usage markers
+  const usageMarkers = [
+    "remember",
+    "之前",
+    "记得",
+    "记得",
+    "according to",
+    "based on what",
+    "as you mentioned",
+    "如前所述",
+    "如您所說",
+    "如您所说的",
+    "我記得",
+    "我记得",
+    "之前你說",
+    "之前你说",
+    "之前提到",
+    "之前提到的",
+    "根据之前",
+    "依据之前",
+    "按照之前",
+    "照您之前",
+    "照你说的",
+    "from previous",
+    "earlier you",
+    "in the memory",
+    "the memory mentioned",
+    "the memories show",
+  ];
+
+  for (const marker of usageMarkers) {
+    if (responseLower.includes(marker.toLowerCase())) {
+      return true;
+    }
+  }
+
+  return false;
+}
