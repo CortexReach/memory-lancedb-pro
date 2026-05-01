@@ -62,6 +62,14 @@ const mockStore = {
   },
 };
 
+// mockRetriever: wraps mockStore.bm25Search to implement the retrieve() interface
+const mockRetriever = {
+  async retrieve({ query, limit = 20, scopeFilter = [] } = {}) {
+    // Delegate to mockStore.bm25Search for the search logic
+    return mockStore.bm25Search(query, limit, scopeFilter);
+  },
+};
+
 function hashString(s) {
   let h = 5381;
   for (let i = 0; i < s.length; i++) {
@@ -120,7 +128,7 @@ describe("import-markdown CLI", () => {
       // UTF-8 BOM (\ufeff) followed by a valid bullet line; BOM-only line should be skipped
       await writeFile(join(wsDir, "MEMORY.md"), "\ufeff- BOM line\n- Real bullet\n", "utf-8");
 
-      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       const { imported } = await runImportMarkdown(ctx, {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "bom-test",
@@ -135,7 +143,7 @@ describe("import-markdown CLI", () => {
       const wsDir = await setupWorkspace("crlf-test");
       await writeFile(join(wsDir, "MEMORY.md"), "- Line one\r\n- Line two\r\n", "utf-8");
 
-      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       const { imported } = await runImportMarkdown(ctx, {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "crlf-test",
@@ -151,7 +159,7 @@ describe("import-markdown CLI", () => {
       await writeFile(join(wsDir, "MEMORY.md"),
         "- Dash bullet\n* Star bullet\n+ Plus bullet\n", "utf-8");
 
-      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       const { imported, skipped } = await runImportMarkdown(ctx, {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "bullet-formats",
@@ -169,7 +177,7 @@ describe("import-markdown CLI", () => {
       await writeFile(join(wsDir, "MEMORY.md"),
         "- 短\n- 中文字\n- 長文字行\n- 合格的文字\n", "utf-8");
 
-      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       const { imported, skipped } = await runImportMarkdown(ctx, {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "min-len-test",
@@ -186,7 +194,7 @@ describe("import-markdown CLI", () => {
       const wsDir = await setupWorkspace("importance-test");
       await writeFile(join(wsDir, "MEMORY.md"), "- Test content line\n", "utf-8");
 
-      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       await runImportMarkdown(ctx, {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "importance-test",
@@ -202,7 +210,7 @@ describe("import-markdown CLI", () => {
       const wsDir = await setupWorkspace("dedup-test");
       await writeFile(join(wsDir, "MEMORY.md"), "- Duplicate content line\n", "utf-8");
 
-      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
 
       // First import (no dedup)
       await runImportMarkdown(ctx, {
@@ -228,7 +236,7 @@ describe("import-markdown CLI", () => {
       const wsDir = await setupWorkspace("dedup-scope-test");
       await writeFile(join(wsDir, "MEMORY.md"), "- Same content line\n", "utf-8");
 
-      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
 
       // First import to scope-A
       await runImportMarkdown(ctx, {
@@ -257,7 +265,7 @@ describe("import-markdown CLI", () => {
       const wsDir = await setupWorkspace("dryrun-test");
       await writeFile(join(wsDir, "MEMORY.md"), "- Dry run test line\n", "utf-8");
 
-      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       const { imported } = await runImportMarkdown(ctx, {
         openclawHome: testWorkspaceDir,
         workspaceGlob: "dryrun-test",
@@ -326,7 +334,7 @@ describe("import-markdown CLI", () => {
         "utf-8",
       );
 
-      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       const { imported } = await runImportMarkdown(ctx, {
         openclawHome: isolatedHome,
       });
@@ -363,7 +371,7 @@ describe("import-markdown CLI", () => {
         "utf-8",
       );
 
-      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       const { imported } = await runImportMarkdown(ctx, {
         openclawHome: isolatedHome,
       });
@@ -403,7 +411,7 @@ describe("import-markdown CLI", () => {
         "utf-8",
       );
 
-      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       const { imported } = await runImportMarkdown(ctx, {
         openclawHome: isolatedHome,
       });
@@ -431,7 +439,7 @@ describe("import-markdown CLI", () => {
       const fakeDir = join(wsDir, "memory", "2026-04-12.md");
       await mkdir(fakeDir, { recursive: true });
 
-      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       let threw = false;
       try {
         const { imported, skipped } = await runImportMarkdown(ctx, {
@@ -467,7 +475,7 @@ describe("import-markdown CLI", () => {
       const fakeDir = join(wsDir, "memory", "2026-04-12.md");
       await mkdir(fakeDir, { recursive: true });
 
-      const ctx = { embedder: mockEmbedder, store: mockStore };
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
       let threw = false;
       try {
         // This specifically tests the flatMemoryDir path (no workspaceGlob)
