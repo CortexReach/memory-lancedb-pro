@@ -53,12 +53,15 @@ function createMockStore(entries: MemoryEntry[]): MemoryStore {
   const patched: Map<string, Record<string, unknown>> = new Map();
 
   return {
-    list: async (scopeFilter?: string[]) => {
+    list: async (scopeFilter?: string[], _category?: string, limit?: number, offset?: number) => {
       let result = [...entries, ...stored];
       if (scopeFilter && scopeFilter.length > 0) {
         result = result.filter((e) => scopeFilter.includes(e.scope));
       }
-      return result;
+      // Apply offset and limit to match real store behavior
+      const o = offset ?? 0;
+      const l = limit ?? result.length;
+      return result.slice(o, o + l);
     },
     store: async (entry) => {
       const full: MemoryEntry = {
@@ -361,15 +364,20 @@ async function testScopeExcludesNullScope() {
 
   // Mock store that simulates real store.list() behavior: includes null/global-scope
   // memories when filtering by a specific scope (OR scope IS NULL compat)
+  // Also supports pagination (offset/limit) since collectExactScope uses it
   const store = {
-    list: async (scopeFilter?: string[]) => {
-      let result = [targetEntry, nullScopeEntry];
+    list: async (scopeFilter?: string[], _category?: string, limit?: number, offset?: number) => {
+      const all = [targetEntry, nullScopeEntry];
+      let result: MemoryEntry[];
       // Simulate real store: filter by scope BUT also include null/global scope
       if (scopeFilter && scopeFilter.length > 0) {
-        const filtered = result.filter((e) => scopeFilter.includes(e.scope) || e.scope === "global");
-        return filtered;
+        result = all.filter((e) => scopeFilter.includes(e.scope) || e.scope === "global");
+      } else {
+        result = all;
       }
-      return result;
+      const o = offset ?? 0;
+      const l = limit ?? result.length;
+      return result.slice(o, o + l);
     },
     store: async (entry: any) => ({ ...entry, id: "mem-new", timestamp: Date.now() }),
     patchMetadata: async () => {},
@@ -397,6 +405,117 @@ async function testScopeExcludesNullScope() {
   );
 
   console.log("  ✅ MR1 strict: scope filter excludes null-scope memories");
+}
+
+// Regression test: Null-scope starvation — target scope memories are found even when
+// null-scope rows exceed the phase limit before target-scope rows in sorted order
+async function testNullScopeStarvation() {
+  const targetScope = "agent:main";
+  const phaseLimit = 10;
+
+  // Create 20 null-scope ("global") entries with NEWER timestamps than target entries
+  // This simulates the real scenario where null-scope rows fill the page
+  const nullScopeEntries: MemoryEntry[] = [];
+  for (let i = 0; i < 20; i++) {
+    nullScopeEntries.push(makeEntry({
+      scope: "global",
+      text: `Global memory ${i}`,
+      importance: 0.9,
+      timestamp: Date.now() - i * 10_000, // Newer timestamps
+      category: "fact",
+    }));
+  }
+
+  // Create target-scope entries with OLDER timestamps (so they appear AFTER global in sort)
+  const targetEntries: MemoryEntry[] = [];
+  for (let i = 0; i < 8; i++) {
+    targetEntries.push(makeEntry({
+      scope: targetScope,
+      text: `Agent memory ${i}`,
+      importance: 0.7,
+      timestamp: Date.now() - 500_000 - i * 10_000, // Older timestamps
+      category: "fact",
+      metadata: JSON.stringify({
+        tier: "working",
+        confidence: 0.7,
+        access_count: 3,
+        last_accessed_at: Date.now() - 100_000,
+        type: "dynamic",
+      }),
+    }));
+  }
+
+  const allEntries = [...nullScopeEntries, ...targetEntries];
+
+  // Mock store that simulates real store.list() behavior:
+  // - Sorts by timestamp DESC (newest first)
+  // - Includes OR scope IS NULL rows (global) when filtering by a scope
+  // - Applies limit/offset after sort
+  const mockStore = {
+    list: async (scopeFilter?: string[], _category?: string, limit?: number, offset?: number) => {
+      // Simulate real store: include target scope + global (null-scope compat)
+      let result = allEntries;
+      if (scopeFilter && scopeFilter.length > 0) {
+        result = result.filter((e) => scopeFilter.includes(e.scope) || e.scope === "global");
+      }
+      // Sort by timestamp DESC (like the real store)
+      result = result.sort((a, b) => b.timestamp - a.timestamp);
+      // Apply offset and limit
+      const o = offset ?? 0;
+      const l = limit ?? result.length;
+      return result.slice(o, o + l);
+    },
+    store: async (entry: any) => ({ ...entry, id: "mem-new", timestamp: Date.now() }),
+    patchMetadata: async () => {},
+    update: async () => null,
+  } as unknown as MemoryStore;
+
+  // Verify the starvation scenario: first page of 10 should be ALL global entries
+  const firstPage = await mockStore.list([targetScope], undefined, 10, 0);
+  const exactScopeInFirstPage = firstPage.filter((e: MemoryEntry) => e.scope === targetScope).length;
+  assert.equal(exactScopeInFirstPage, 0, "First page should have 0 target-scope entries (all filled by global)");
+
+  // Now test that the dreaming engine still processes the target scope correctly
+  // via pagination (collectExactScope)
+  const engine = createDreamingEngine({
+    store: mockStore,
+    embedder: createMockEmbedder(),
+    fallbackDimensions: 1024,
+    decayEngine: createMockDecayEngine(),
+    tierManager: createMockTierManager(),
+    config: mergeDreamingConfig({
+      enabled: true,
+      phases: {
+        light: { lookbackDays: 365, limit: phaseLimit },
+        deep: { limit: phaseLimit, minScore: 0.6, minRecallCount: 1 },
+        rem: { lookbackDays: 365, limit: phaseLimit, minPatternStrength: 0.7 },
+      },
+    }),
+    log: () => {},
+    debugLog: () => {},
+  });
+
+  const report = await engine.run(targetScope);
+
+  // Light sleep should find target-scope memories (paginated past null-scope rows)
+  assert.ok(
+    report.phases.light.scanned > 0,
+    `Light sleep should find target-scope memories despite null-scope starvation (got ${report.phases.light.scanned})`,
+  );
+
+  // Deep sleep should find working-tier target-scope memories
+  assert.ok(
+    report.phases.deep.candidates > 0,
+    `Deep sleep should find target-scope candidates despite null-scope starvation (got ${report.phases.deep.candidates})`,
+  );
+
+  // REM should be able to analyze target-scope memories
+  assert.ok(
+    report.phases.rem.patterns.length >= 0,
+    "REM should run without errors on target-scope memories",
+  );
+
+  console.log(`  ✅ Null-scope starvation: light=${report.phases.light.scanned}, deep=${report.phases.deep.candidates}/${report.phases.deep.promoted}, rem=${report.phases.rem.patterns.length} patterns`);
 }
 
 // Error resilience — one phase failure doesn't block others
@@ -439,6 +558,7 @@ await testLightSleep();
 await testDeepSleep();
 await testREMPatternDetection();
 await testErrorResilience();
+await testNullScopeStarvation();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
