@@ -4046,7 +4046,7 @@ const memoryLanceDBProPlugin = {
             log: dreamingLog,
             debugLog: dreamingDebug,
             workspaceDir: getDefaultWorkspaceDir(),
-            fallbackDimensions: config.embedding?.dimensions ?? 1024,
+            fallbackDimensions: embedder.dimensions,
           });
 
           // Simple cron scheduler: checks every 60s, matches minute+hour fields
@@ -4080,6 +4080,8 @@ const memoryLanceDBProPlugin = {
 
           const parsedCron = parseCron(dreamingCfg.cron);
 
+          let dreamingCycleRunning = false; // Cycle-level guard to prevent overlapping cycles
+
           dreamingTimer = setInterval(async () => {
             const now = new Date();
             if (parsedCron.minute && !parsedCron.minute.includes(now.getMinutes())) return;
@@ -4087,6 +4089,14 @@ const memoryLanceDBProPlugin = {
             if (parsedCron.dayOfMonth && !parsedCron.dayOfMonth.includes(now.getDate())) return;
             if (parsedCron.month && !parsedCron.month.includes(now.getMonth() + 1)) return;
             if (parsedCron.dayOfWeek && !parsedCron.dayOfWeek.includes(now.getDay())) return;
+
+            // Cycle-level guard: skip if a previous cycle is still running
+            if (dreamingCycleRunning) {
+              dreamingLog("skipping cycle — previous cycle still in progress");
+              return;
+            }
+            dreamingCycleRunning = true;
+            try {
 
             // Run dreaming for each scope that has memories (MR1: scope isolation)
             // Include both defined scopes and dynamic agent scopes discovered from the store
@@ -4144,6 +4154,10 @@ const memoryLanceDBProPlugin = {
                 await writeFile(dreamsPath, dreamLines.join("\n") + "\n" + existing, "utf-8");
               } catch {}
             }
+
+            } finally {
+              dreamingCycleRunning = false;
+            }
           }, 60_000);
 
           api.logger.info(
@@ -4160,6 +4174,15 @@ const memoryLanceDBProPlugin = {
           clearInterval(dreamingTimer);
           dreamingTimer = null;
           api.logger.info("dreaming: scheduler stopped");
+        }
+        // Flush and destroy AccessTracker on plugin stop
+        try {
+          if (accessTracker) {
+            accessTracker.destroy();
+            api.logger.info("memory-lancedb-pro: AccessTracker destroyed");
+          }
+        } catch (err) {
+          api.logger.warn(`memory-lancedb-pro: AccessTracker cleanup failed: ${String(err)}`);
         }
         api.logger.info("memory-lancedb-pro: stopped");
       },
