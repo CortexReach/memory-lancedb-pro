@@ -935,7 +935,8 @@ export class MemoryStore {
 
         // Step 5: Batch add (1 LanceDB op)
         // [fix-B2] If add fails, attempt per-entry recovery.
-        // [Q3-fix] Track which entries succeed during recovery to avoid misleading failure counts.
+        // [Q3-fix] Recovery loop: track failures explicitly; successes are derived
+        // as updatedEntries.length - recoveryFailed.length (matching bulkUpdateMetadata).
         try {
           await this.table!.add(updatedEntries);
         } catch (addError) {
@@ -950,7 +951,6 @@ export class MemoryStore {
           for (const entry of updatedEntries) {
             try {
               await this.table!.add([entry]);
-              // [Q3-fix] recovery write succeeded for this entry
             } catch (recoveryErr) {
               const recMsg = recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr);
               console.warn(
