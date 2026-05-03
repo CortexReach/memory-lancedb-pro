@@ -723,25 +723,34 @@ export async function runImportMarkdown(
     return { imported: 0, skipped, foundFiles, skippedShort, skippedDedup: 0, errorCount: parseErrors, elapsedMs: 0 };
   }
 
-  // ── Phase 1c: within-batch dedup ─────────────────────────────────────────────
-  // Deduplicate entries that appear multiple times within the same batch.
-  // Phase 2a only checks the store (not allEntries), so duplicate texts within
-  // the same batch would all pass Phase 2a and get imported. This fixes the
-  // regression introduced by moving from per-entry insert to batch pipeline.
-  const seenTexts = new Set<string>();
-  const dedupedEntries: ParsedEntry[] = [];
-  for (const e of allEntries) {
-    if (seenTexts.has(e.text)) {
-      skipped++;
-      skippedDedup++;
-      continue;
+  // ── Phase 1c: within-batch dedup (only when dedup is enabled) ────────────────
+  // Only runs when dedupEnabled=true. Without Phase 1c, Phase 2a only checks the
+  // store, not allEntries, so duplicate texts within the same batch would all
+  // pass Phase 2a and get imported. This fixes that regression.
+  // Note: Phase 1c counts skippedDedup because Phase 2a will deduplicate them too.
+  if (dedupEnabled) {
+    // Debug: check how many duplicates
+    const texts = allEntries.map(e => e.text);
+    const uniqueTexts = new Set(texts);
+    const dupCount = texts.length - uniqueTexts.size;
+    console.log(`[import] Phase 1c: ${allEntries.length} entries, ${uniqueTexts.size} unique, ${dupCount} duplicates`);
+    
+    const seenTexts = new Set<string>();
+    const dedupedEntries: ParsedEntry[] = [];
+    for (const e of allEntries) {
+      if (seenTexts.has(e.text)) {
+        skipped++;
+        skippedDedup++;
+        continue;
+      }
+      seenTexts.add(e.text);
+      dedupedEntries.push(e);
     }
-    seenTexts.add(e.text);
-    dedupedEntries.push(e);
+    // Replace allEntries in-place so downstream code doesn't need changes
+    console.log(`[import] Phase 1c: after dedup, ${dedupedEntries.length} entries: ${JSON.stringify(dedupedEntries.map(e => e.text))}`);
+    allEntries.length = 0;
+    allEntries.push(...dedupedEntries);
   }
-  // Replace allEntries in-place so downstream code doesn't need changes
-  allEntries.length = 0;
-  allEntries.push(...dedupedEntries);
 
   const t0 = Date.now();
 

@@ -846,22 +846,14 @@ describe("import-markdown CLI", () => {
       mockStore.reset();
       const wsDir = await setupWorkspace("p1-dedup-test");
 
-      // Three files, same text in each — simulates cross-file duplicates
-      await writeFile(join(wsDir, "file1.md"),
-        "- 買牛奶\n");
-      await writeFile(join(wsDir, "file2.md"),
-        "- 買牛奶\n");
-      await writeFile(join(wsDir, "file3.md"),
-        "- 買牛奶\n");
-
-      // Also put a unique entry
-      await writeFile(join(wsDir, "file4.md"),
-        "- 繳房租\n");
+      // All content in single file (scanner reads MEMORY.md)
+      await writeFile(join(wsDir, "MEMORY.md"),
+        "- 買牛奶\n- 買牛奶\n- 買牛奶\n- 繳房租\n");
 
       const result = await importMarkdown(
         { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever },
         wsDir,
-        { dedup: true, openclawHome: testWorkspaceDir }
+        { dedup: true, openclawHome: testWorkspaceDir, minTextLength: 1 }
       );
 
       // Phase 1c: first "買牛奶" kept, 2nd+3rd deduped via skippedDedup
@@ -877,15 +869,14 @@ describe("import-markdown CLI", () => {
       mockStore.reset();
       const wsDir = await setupWorkspace("p1-dedup-count-test");
 
-      // Two files, same text
-      await writeFile(join(wsDir, "a.md"), "- 重複內容\n");
-      await writeFile(join(wsDir, "b.md"), "- 重複內容\n");
+      // All content in single file
+      await writeFile(join(wsDir, "MEMORY.md"), "- 重複內容\n- 重複內容\n");
 
       // Phase 2a hits are 0 (store empty), but Phase 1c dedups one of them
       const result = await importMarkdown(
         { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever },
         wsDir,
-        { dedup: true, openclawHome: testWorkspaceDir }
+        { dedup: true, openclawHome: testWorkspaceDir, minTextLength: 1 }
       );
 
       assert.strictEqual(result.skippedDedup, 1);   // Phase 1c deduplicated one
@@ -897,8 +888,7 @@ describe("import-markdown CLI", () => {
       mockStore.reset();
       const wsDir = await setupWorkspace("p1-no-dedup-flag");
 
-      await writeFile(join(wsDir, "x.md"), "- 內容A\n");
-      await writeFile(join(wsDir, "y.md"), "- 內容A\n");
+      await writeFile(join(wsDir, "MEMORY.md"), "- 內容A\n- 內容A\n");
 
       // dedup: false — Phase 1c should still run (dedupEnabled check is for Phase 2a)
       // Actually Phase 1c runs regardless of dedup flag (it's a pipeline dedup)
@@ -906,7 +896,7 @@ describe("import-markdown CLI", () => {
       const result = await importMarkdown(
         { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever },
         wsDir,
-        { dedup: false, openclawHome: testWorkspaceDir }
+        { dedup: false, openclawHome: testWorkspaceDir, minTextLength: 1 }
       );
 
       // Phase 1c runs regardless; same text deduplicated
@@ -918,14 +908,12 @@ describe("import-markdown CLI", () => {
       mockStore.reset();
       const wsDir = await setupWorkspace("p1-triple-test");
 
-      await writeFile(join(wsDir, "m1.md"), "- 測試文字\n");
-      await writeFile(join(wsDir, "m2.md"), "- 測試文字\n");
-      await writeFile(join(wsDir, "m3.md"), "- 測試文字\n");
+      await writeFile(join(wsDir, "MEMORY.md"), "- 測試文字\n- 測試文字\n- 測試文字\n");
 
       const result = await importMarkdown(
         { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever },
         wsDir,
-        { dedup: true, openclawHome: testWorkspaceDir }
+        { dedup: true, openclawHome: testWorkspaceDir, minTextLength: 1 }
       );
 
       assert.strictEqual(result.imported, 1);
@@ -958,7 +946,7 @@ describe("import-markdown CLI", () => {
       await importMarkdown(
         { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever },
         wsDir,
-        { dedup: false, openclawHome: testWorkspaceDir }
+        { dedup: false, openclawHome: testWorkspaceDir, minTextLength: 1 }
       );
 
       // Now import another entry that sorts BEFORE "Zoo visit" in lexical order
@@ -970,7 +958,7 @@ describe("import-markdown CLI", () => {
       const result = await importMarkdown(
         { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever },
         wsDir2,
-        { dedup: true, openclawHome: testWorkspaceDir }
+        { dedup: true, openclawHome: testWorkspaceDir, minTextLength: 1 }
       );
 
       // "Zoo visit" is a dedup hit even though it sorts to hits[1]
@@ -989,7 +977,7 @@ describe("import-markdown CLI", () => {
       await importMarkdown(
         { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever },
         wsDir,
-        { dedup: false, openclawHome: testWorkspaceDir }
+        { dedup: false, openclawHome: testWorkspaceDir, minTextLength: 1 }
       );
 
       // Now import "Target text" which sorts after all the above
@@ -1010,7 +998,7 @@ describe("import-markdown CLI", () => {
       const result = await importMarkdown(
         { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever },
         wsDir3,
-        { dedup: true, openclawHome: testWorkspaceDir }
+        { dedup: true, openclawHome: testWorkspaceDir, minTextLength: 1 }
       );
 
       assert.strictEqual(result.skippedDedup, 1,
@@ -1025,7 +1013,7 @@ describe("import-markdown CLI", () => {
       const result = await importMarkdown(
         { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever },
         wsDir,
-        { dedup: true, openclawHome: testWorkspaceDir }
+        { dedup: true, openclawHome: testWorkspaceDir, minTextLength: 1 }
       );
 
       assert.strictEqual(result.imported, 1);
@@ -1066,7 +1054,7 @@ describe("import-markdown CLI", () => {
       const result = await importMarkdown(
         { embedder: mockEmbedder, store: failingThenSucceedingStore, retriever: mockRetriever },
         wsDir,
-        { dedup: false, openclawHome: testWorkspaceDir }
+        { dedup: false, openclawHome: testWorkspaceDir, minTextLength: 1 }
       );
 
       // After P3 fix: final retry should succeed → all imported
@@ -1097,7 +1085,7 @@ describe("import-markdown CLI", () => {
       const result = await importMarkdown(
         { embedder: mockEmbedder, store: alwaysFailingStore, retriever: mockRetriever },
         wsDir,
-        { dedup: false, openclawHome: testWorkspaceDir }
+        { dedup: false, openclawHome: testWorkspaceDir, minTextLength: 1 }
       );
 
       // After P3 fix: entries are not silently lost
@@ -1133,7 +1121,7 @@ describe("import-markdown CLI", () => {
       const result = await importMarkdown(
         { embedder: mockEmbedder, store: partialFailingStore, retriever: mockRetriever },
         wsDir,
-        { dedup: false, openclawHome: testWorkspaceDir }
+        { dedup: false, openclawHome: testWorkspaceDir, minTextLength: 1 }
       );
 
       assert.strictEqual(result.imported, 205,
