@@ -949,6 +949,18 @@ export class MemoryStore {
           const outerFailed = new Set(failed);
           const recoveryFailed: string[] = [];
           for (const entry of updatedEntries) {
+            // [Q3-fix] Detect partial batch success: if this entry was already written
+            // (partial batch success before the error), skip per-entry retry to avoid
+            // redundant writes. The entry already has the correct new state from the
+            // partial batch write.
+            const alreadyWritten = await this.hasId(entry.id);
+            if (alreadyWritten) {
+              console.warn(
+                `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: entry ${entry.id} already in DB ` +
+                `(partial batch success), skipping per-entry retry to avoid duplicate writes.`,
+              );
+              continue;
+            }
             try {
               await this.table!.add([entry]);
             } catch (recoveryErr) {
@@ -1208,7 +1220,7 @@ export class MemoryStore {
 
         // LanceDB FTS _score is raw BM25 (unbounded). Normalize with sigmoid.
         // LanceDB may return BigInt for numeric columns; coerce safely.
-        const rawScore = row._score != null ? Number(row._score) : 0;
+        const rawScore = row._score != null ? safeToNumber(row._score) : 0;
         const normalizedScore =
           rawScore > 0 ? 1 / (1 + Math.exp(-rawScore / 5)) : 0.5;
 
