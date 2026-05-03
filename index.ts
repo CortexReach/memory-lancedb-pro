@@ -3167,7 +3167,9 @@ const memoryLanceDBProPlugin = {
               if (prev.vector.length !== vector.length) continue;
               let dot = 0;
               for (let i = 0; i < vector.length; i++) dot += prev.vector[i] * vector[i];
-              // Cosine similarity = dot / (||prev|| * ||vector||); skip if > 0.90
+              // Cosine similarity = dot / (||prev|| * ||vector||); skip if > 0.90.
+              // If either norm is 0 (zero-vector from embedder), cosine falls back to
+              // raw dot (not cosine similarity) — entry will be written (fail-open).
               const normPrev = Math.sqrt(prev.vector.reduce((s, v) => s + v * v, 0));
               const normVec = Math.sqrt(vector.reduce((s, v) => s + v * v, 0));
               const cosine = normPrev > 0 && normVec > 0 ? dot / (normPrev * normVec) : dot;
@@ -3240,9 +3242,8 @@ const memoryLanceDBProPlugin = {
                 `memory-lancedb-pro: bulkStore failed for ${capturedEntries.length} entries, falling back to individual store: ${String(err)}`,
               );
               // Fallback: store individually, with DB dedup pre-check restored.
-              // (capturedEntries already has batch-internal dedup applied,
-              // but we must also re-apply DB dedup because the entries
-              // may have been filtered by batch dedup in the first pass.)
+              // Re-check DB dedup in fallback to catch similar entries written by
+              // concurrent requests between the initial check and bulkStore failure.
               for (const entry of capturedEntries) {
                 let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
                 try {
