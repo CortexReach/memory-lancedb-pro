@@ -793,7 +793,7 @@ function splitProviderModel(modelRef: string): { provider?: string; model?: stri
  * When modelRef is a bare name (no / prefix), infer provider from baseURL.
  * Use "." + suffix to prevent fake-minimax.io subdomain spoofing.
  */
-function inferProviderFromBaseURL(baseURL: string | undefined): string | undefined {
+export function inferProviderFromBaseURL(baseURL: string | undefined): string | undefined {
   if (!baseURL) return undefined;
   try {
     const url = new URL(baseURL);
@@ -1271,9 +1271,15 @@ async function generateReflectionText(params: {
         const cfg = params.cfg as Record<string, unknown>;
         const llmConfig = cfg?.llm as Record<string, unknown> | undefined;
         const modelRefFromConfig = llmConfig?.model;
+
+        // Model resolution chain: agent-specific primary model ref > global llm.model fallback.
+        // The typeof guard ensures a non-string value (e.g. number) does not reach splitProviderModel as-is.
         const modelRef =
           (resolveAgentPrimaryModelRef(params.cfg, params.agentId) as string | undefined)
           ?? (typeof modelRefFromConfig === "string" ? modelRefFromConfig : undefined);
+
+        // Provider resolution chain: parsed from modelRef (e.g. "minimax/MiniMax-M2.7") > inferred from baseURL.
+        // inferProviderFromBaseURL uses .endsWith(".suffix") to prevent subdomain spoofing.
         const split = modelRef ? splitProviderModel(modelRef) : { provider: undefined, model: undefined };
         const provider = split.provider ?? inferProviderFromBaseURL(llmConfig?.baseURL as string | undefined);
         const model = split.model;
