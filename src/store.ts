@@ -64,18 +64,24 @@ async function loadLockfile(): Promise<any> {
   }
   return lockfileModule;
 }
+let redisLockInitPromise: Promise<any> | null = null;
 
-// Initialize Redis lock manager (lazy)
 async function getRedisLockManager(): Promise<any> {
-  if (!redisLockManager) {
-    try {
-      const { createRedisLockManager } = await import("./redis-lock.js");
-      redisLockManager = await createRedisLockManager();
-    } catch (err) {
-      console.warn("[memory-lancedb-pro] Redis lock unavailable, using file lock fallback:", err);
-      redisLockManager = null;
-    }
+  if (redisLockManager) return redisLockManager;
+  if (!redisLockInitPromise) {
+    redisLockInitPromise = (async () => {
+      try {
+        const { createRedisLockManager } = await import("./redis-lock.js");
+        redisLockManager = await createRedisLockManager();
+      } catch (err) {
+        // 確保任何錯誤（包含 module-load/SyntaxError）都能轉換為 resolved null
+        // 避免 initPromise 永遠 pending 讓 caller 永久 block
+        console.warn("[memory-lancedb-pro] Redis lock unavailable, using file lock fallback:", err);
+        redisLockManager = null;
+      }
+    })();
   }
+  await redisLockInitPromise;
   return redisLockManager;
 }
 /** For unit testing: override the lockfile module with a mock. */
@@ -620,6 +626,12 @@ export class MemoryStore {
       .limit(1)
       .toArray();
     return res.length > 0;
+  }
+
+  /** Lightweight total row count via LanceDB countRows(). */
+  async count(): Promise<number> {
+    await this.ensureInitialized();
+    return await this.table!.countRows();
   }
 
   async getById(id: string, scopeFilter?: string[]): Promise<MemoryEntry | null> {

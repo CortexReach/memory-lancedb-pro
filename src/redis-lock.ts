@@ -8,7 +8,7 @@
 import Redis from 'ioredis';
 import path from 'node:path';
 import fs from 'node:fs';
-import { tmpdir as nodeTmpdir } from 'node:os';
+import * as os from 'node:os';
 
 // 用 lazy import 避免 ESM 問題
 let properLockfile: typeof import("proper-lockfile") | null = null;
@@ -109,8 +109,40 @@ export class RedisLockManager {
             }
           };
         }
-      } catch (err) {
-        // 記錄 Redis 錯誤，避免 silent swallow
+      } catch (err: any) {
+        // 區分「連線錯誤」和「競爭鎖」錯誤
+        // 連線錯誤（Redis 掛了）應立即 fallback，不要浪費 maxWait 時間
+        // 使用 err.code（Node.js 標準）做精確判斷，輔以訊息字串抓漏網之魚
+        const errCode = err?.code ?? "";
+        const errMsg = String(err ?? "").toLowerCase();
+        const isConnectionError =
+          // Node.js network error codes（標準 POSIX）
+          errCode === "ECONNREFUSED" ||
+          errCode === "ENOTFOUND" ||
+          errCode === "ETIMEDOUT" ||
+          errCode === "EHOSTUNREACH" ||
+          errCode === "ENETUNREACH" ||
+          errCode === "ECONNRESET" ||
+          errCode === "EPIPE" ||
+          errCode === "EAI_AGAIN" ||
+          errCode === "EADDRINFO" ||
+          // ioredis/Node.js 錯誤訊息變體（大小寫/空格不一致）
+          errMsg.includes("connection is closed") ||
+          errMsg.includes("connection timeout") ||
+          errMsg.includes("connect econnrefused") ||
+          errMsg.includes("connect econnreset") ||
+          errMsg.includes("connect etimedout") ||
+          errMsg.includes("getaddrinfo") ||
+          errMsg.includes("econnrefused") ||
+          errMsg.includes("econnreset") ||
+          errMsg.includes("etimedout") ||
+          errMsg.includes("enotfound") ||
+          errMsg.includes("ehostunreach") ||
+          errMsg.includes("enetunreach");
+        if (isConnectionError) {
+          throw new Error(`Redis connection error (${errCode || "unknown"}), will fallback to file lock: ${err}`);
+        }
+        // 非連線錯誤（只是鎖被佔用）→ 繼續重試
         console.warn(`[RedisLock] Redis error during acquire (attempt ${attempts}): ${err}`);
       }
 
@@ -151,7 +183,7 @@ export class RedisLockManager {
    */
   private createFileLock(key: string, ttl?: number): () => Promise<void> {
     // Uses nodeTmpdir from top-level ESM import (line 9)
-    const lockPath = path.join(nodeTmpdir, `.memory-lock-${key}.lock`);
+    const lockPath = path.join(os.tmpdir(), `.memory-lock-${key}.lock`);
     const lockTTL = (ttl || this.defaultTTL) / 1000; // proper-lockfile 用秒
 
     // 確保目錄存在
