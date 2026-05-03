@@ -3571,6 +3571,8 @@ const memoryLanceDBProPlugin = {
           let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
           const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
           // Guard: skip if agentId is invalid format — consistent with other hook sites (Issue #686)
+          // NOTE: Layer 3 (declaredAgents) intentionally omitted — scope discipline for #686;
+          // Layer 3 is a separate concern for a follow-up PR (not a technical limitation).
           if (isInvalidAgentIdFormat(sourceAgentId)) {
             api.logger.debug?.(
               `memory-reflection: command hook skipped \u2014 invalid agentId '${sourceAgentId}'`,

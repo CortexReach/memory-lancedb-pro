@@ -88,10 +88,10 @@ describe("isInvalidAgentIdFormat — production export (Issue #686)", () => {
     });
   });
 
-  // Layer 3: declaredAgents (signature-compat but NOT enforced in this impl)
-  // NOTE: Layer 3 is intentionally omitted — see JSDoc in index.ts.
-  // A follow-up PR should re-add Layer 3 with proper root-config access.
-  describe("Layer 3 — declaredAgents (signature compat, not enforced)", () => {
+  // Layer 3 — declaredAgents: guard call intentionally omits second param.
+  // Scope discipline: #686 fix is Layer 1+2 only (numeric chat_id block).
+  // Layer 3 (declaredAgents Set) is a separate concern for a follow-up PR.
+  describe("Layer 3 — declaredAgents (signature compat, guard call omits param)", () => {
     it("accepts a declaredAgents Set as second param without crashing", () => {
       const agents = new Set(["main", "dc-channel--123"]);
       assert.doesNotThrow(() => isInvalidAgentIdFormat("main", agents));
@@ -103,7 +103,7 @@ describe("isInvalidAgentIdFormat — production export (Issue #686)", () => {
       assert.strictEqual(isInvalidAgentIdFormat(undefined, agents), true);
       // Layer 2: numeric still blocked even if not in declaredAgents
       assert.strictEqual(isInvalidAgentIdFormat("657229412030480397", agents), true);
-      // Valid agent still allowed (Layer 3 is no-op in this implementation)
+      // Valid agent still allowed (Layer 3 is a no-op in this guard call)
       assert.strictEqual(isInvalidAgentIdFormat("main", agents), false);
     });
   });
