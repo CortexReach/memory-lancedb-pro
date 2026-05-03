@@ -3184,85 +3184,79 @@ const memoryLanceDBProPlugin = {
         return;
       }
 
-      // Extract injected IDs from prependContext if available
-      // The auto-recall injects memories with IDs in the injectedIds field
-      const injectedIds: string[] = [];
-      if (event.prependContext && typeof event.prependContext === "string") {
-        // Parse IDs from injected context - format is typically "- [category:scope] summary"
-        // We'll check if any recall IDs are present in the context
-        const match = event.prependContext.match(/\[([a-f0-9]{8,})\]/gi);
-        if (match) {
-          for (const m of match) {
-            const id = m.slice(1, -1);
-            if (id.length >= 8) injectedIds.push(id);
-          }
-        }
+      // Guard: skip if no recall IDs (shouldn't happen but be safe)
+      if (!pending.recallIds || pending.recallIds.length === 0) {
+        return;
       }
 
-      // Update pending recall entry with IDs
-      pending.recallIds = injectedIds;
-
-      // Check if any recall was actually used by checking if the response contains reference to the injected content
-      // This is a heuristic - we check if the response shows awareness of injected memories
-      let usedRecall = false;
-      if (injectedIds.length > 0) {
-        // Use the real isRecallUsed function from reflection-slices
-        usedRecall = isRecallUsed(responseText, injectedIds);
+      // TTL cleanup: evict stale entries older than 10 minutes to prevent
+      // unbounded Map growth when session_end never fires (crash, SIGKILL, etc.)
+      const now = Date.now();
+      const PENDING_RECALL_TTL_MS = 10 * 60 * 1000;
+      if (pending.injectedAt && now - pending.injectedAt > PENDING_RECALL_TTL_MS) {
+        pendingRecall.delete(sessionKey);
+        return;
       }
 
-      // Score the recall - update importance based on usage
-      if (injectedIds.length > 0) {
-        try {
-          for (const recallId of injectedIds) {
-            // Bug 2 fix: use store.getById to retrieve the real entry so we
-            // get the actual importance value, instead of calling
-            // parseSmartMetadata with empty placeholder metadata.
-            const entry = await store.getById(recallId, undefined);
-            if (!entry) continue;
-            const meta = parseSmartMetadata(entry.metadata, entry);
+      // Determine if any recalled memory was actually used in the response.
+      // Uses keyword-based usage heuristic (see isRecallUsed in reflection-slices.ts).
+      const usedRecall = isRecallUsed(responseText, pending.recallIds);
 
-            if (usedRecall) {
-              // Recall was used - increase importance (cap at 1.0)
-              // Bug 3 fix: use store.update to directly update the row-level
-              // importance column. patchMetadata only updates the metadata JSON
-              // blob but NOT the entry.importance field, so importance changes
-              // never affected ranking (applyImportanceWeight reads entry.importance).
-              const newImportance = Math.min(1.0, (meta.importance || 0.5) + 0.05);
-              await store.update(
-                recallId,
-                { importance: newImportance },
-                undefined,
-              );
-              // Also update metadata JSON fields via patchMetadata (separate concern)
-              await store.patchMetadata(
-                recallId,
-                { last_confirmed_use_at: Date.now() },
-                undefined,
-              );
-            } else {
-              // Recall was not used - increment bad_recall_count
-              const badCount = (meta.bad_recall_count || 0) + 1;
-              let newImportance = meta.importance || 0.5;
-              // Apply penalty after threshold (3 consecutive unused)
-              if (badCount >= 3) {
-                newImportance = Math.max(0.1, newImportance - 0.03);
-              }
-              await store.update(
-                recallId,
-                { importance: newImportance },
-                undefined,
-              );
-              await store.patchMetadata(
-                recallId,
-                { bad_recall_count: badCount },
-                undefined,
-              );
+      // Score each recalled memory - update importance based on usage
+      try {
+        for (const recallId of pending.recallIds) {
+          // Use store.getById to retrieve the real entry so we get the actual
+          // importance value, instead of calling parseSmartMetadata with empty
+          // placeholder metadata.
+          const entry = await store.getById(recallId, undefined);
+          if (!entry) continue;
+          const meta = parseSmartMetadata(entry.metadata, entry);
+
+          if (usedRecall) {
+            // Recall was used - increase importance (cap at 1.0).
+            // Use store.update to directly update the row-level importance
+            // column. patchMetadata only updates the metadata JSON blob but
+            // NOT the entry.importance field, so importance changes would never
+            // affect ranking (applyImportanceWeight reads entry.importance).
+            const newImportance = Math.min(1.0, (meta.importance || 0.5) + 0.05);
+            await store.update(
+              recallId,
+              { importance: newImportance },
+              undefined,
+            );
+            // Also update metadata JSON fields via patchMetadata (separate concern)
+            await store.patchMetadata(
+              recallId,
+              { last_confirmed_use_at: Date.now() },
+              undefined,
+            );
+          } else {
+            // Recall was not used - increment bad_recall_count
+            const badCount = (meta.bad_recall_count || 0) + 1;
+            let newImportance = meta.importance || 0.5;
+            // Apply penalty after threshold (3 consecutive unused)
+            if (badCount >= 3) {
+              newImportance = Math.max(0.1, newImportance - 0.03);
             }
+            await store.update(
+              recallId,
+              { importance: newImportance },
+              undefined,
+            );
+            await store.patchMetadata(
+              recallId,
+              { bad_recall_count: badCount },
+              undefined,
+            );
           }
-        } catch (err) {
-          api.logger.warn(`memory-lancedb-pro: recall usage scoring failed: ${String(err)}`);
         }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: recall usage scoring failed: ${String(err)}`);
       }
+
+      // Clean up the pendingRecall entry after scoring to prevent re-scoring
+      // the same recallIds on subsequent turns (C3 / Codex P2 fix).
+      pendingRecall.delete(sessionKey);
     }, { priority: 5 });
 
     // ========================================================================
