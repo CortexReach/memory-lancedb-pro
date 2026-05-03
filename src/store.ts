@@ -582,7 +582,11 @@ export class MemoryStore {
           let entryOffset = 0;
           for (const caller of batch) {
             const callerEnd = entryOffset + caller.entries.length;
-            if (entryOffset < callerEnd && i < callerEnd) {
+            // 正確邏輯：chunk [i, i+MAX_BATCH_SIZE) 與 caller [entryOffset, callerEnd) 是否有交集
+            // 交集條件：chunk.start < caller.end AND chunk.end > caller.start
+            // 即 i < callerEnd AND i + MAX_BATCH_SIZE > entryOffset
+            // entryOffset < callerEnd 在 for 迴圈中恆成立（callerEnd = entryOffset + caller.entries.length）
+            if (i < callerEnd && i + MemoryStore.MAX_BATCH_SIZE > entryOffset) {
               failedCallers.add(callerIdx);
             }
             entryOffset = callerEnd;
