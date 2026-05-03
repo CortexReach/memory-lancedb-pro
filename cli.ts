@@ -723,6 +723,26 @@ export async function runImportMarkdown(
     return { imported: 0, skipped, foundFiles, skippedShort, skippedDedup: 0, errorCount: parseErrors, elapsedMs: 0 };
   }
 
+  // ── Phase 1c: within-batch dedup ─────────────────────────────────────────────
+  // Deduplicate entries that appear multiple times within the same batch.
+  // Phase 2a only checks the store (not allEntries), so duplicate texts within
+  // the same batch would all pass Phase 2a and get imported. This fixes the
+  // regression introduced by moving from per-entry insert to batch pipeline.
+  const seenTexts = new Set<string>();
+  const dedupedEntries: ParsedEntry[] = [];
+  for (const e of allEntries) {
+    if (seenTexts.has(e.text)) {
+      skipped++;
+      skippedDedup++;
+      continue;
+    }
+    seenTexts.add(e.text);
+    dedupedEntries.push(e);
+  }
+  // Replace allEntries in-place so downstream code doesn't need changes
+  allEntries.length = 0;
+  allEntries.push(...dedupedEntries);
+
   const t0 = Date.now();
 
   // ── Phase 2a: dedup check — parallel retrieve() in chunks ──────────────────
@@ -750,7 +770,8 @@ export async function runImportMarkdown(
         )
       );
       for (const { e, hits, ok, skipEntry } of results) {
-        if (hits.length === 0 || hits[0].entry.text !== e.text) {
+        const isExactMatch = hits.some(hit => hit.entry.text === e.text);
+        if (!isExactMatch) {
           // skipEntry=true: dedup check error → skip entry (fail-safe)
           if (skipEntry) {
             skipped++;
@@ -876,6 +897,18 @@ export async function runImportMarkdown(
       await flushPending();
     } else {
       console.log(`[import] embedded batch ${batchIdx}/${totalBatches} (${batch.length} entries)`);
+      await flushPending();
+      if (pendingFlush.length > 0) {
+        // Final retry: last batch flush also failed → one more attempt before giving up
+        await flushPending();
+        if (pendingFlush.length > 0) {
+          // All retries exhausted; entries are lost but errorCount already incremented.
+          // Log a clear error so operators notice.
+          errorCount += pendingFlush.length;
+          console.error(`[import] ${pendingFlush.length} entries could not be stored after ${flushCount} bulkStore calls`);
+          pendingFlush = [];
+        }
+      }
     }
   }
 
