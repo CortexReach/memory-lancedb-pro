@@ -498,11 +498,24 @@ export class MemoryStore {
   }
 
   /**
-   * Bulk store multiple memory entries（cross-call batch accumulation）
-   * Issue #690：多個 concurrent bulkStore() 會先累積在 pendingBatch，
-   * 每 FLUSH_INTERVAL_MS（100ms）flush 一次，合併成一個 lock acquisition，
-   * 避免 100 個 concurrent 變成 100 次 lock acquisition 導致 timeout。
-   * Non-breaking：public API 不變。
+   * Store multiple memory entries in a single batch operation.
+   *
+   * @param entries — array of entries to store (id/timestamp are auto-generated)
+   * @returns resolved with persisted entries, or rejected on failure
+   *
+   * @remarks
+   * Entries are accumulated and flushed every {@link FLUSH_INTERVAL_MS} (default 100ms),
+   * or when {@link flush} is called. Multiple concurrent {@link bulkStore} calls are
+   * automatically batched together for efficiency.
+   *
+   * **Non-atomicity for large batches**: When the total entry count exceeds
+   * {@link MAX_BATCH_SIZE} (250), entries are split into multiple chunks and written
+   * sequentially. If a later chunk fails, earlier chunks may already be persisted
+   * in LanceDB — the Promise will be rejected but those entries will NOT be rolled back.
+   * Callers should handle partial-success by catching the rejection and querying
+   * by the returned entry IDs to determine which entries were actually persisted.
+   *
+   * @public
    */
   async bulkStore(
     entries: Omit<MemoryEntry, "id" | "timestamp">[],
@@ -594,6 +607,15 @@ export class MemoryStore {
           }
           const errorMsg = err instanceof Error ? err.message : String(err);
           console.error(`[memory-lancedb-pro] doFlush chunk failed: ${errorMsg}`);
+
+          // 【Issue #5 fix: 錯誤訊息中加入 partial-success 資訊】
+          // 告知 caller 在哪個 chunk 區間失敗，讓 caller 知道有部分 entries 已寫入
+          const chunkStart = i;
+          const chunkEnd = Math.min(i + MemoryStore.MAX_BATCH_SIZE, allEntries.length);
+          lastError = new Error(
+            `batch flush failed at chunk [${chunkStart}, ${chunkEnd}): ${errorMsg}`,
+            { cause: err as Error }
+          );
         }
       }
 
@@ -621,7 +643,18 @@ export class MemoryStore {
   }
 
   /**
-   * Force flush before close（用於測試或 shutdown）
+   * Force flush all pending entries immediately.
+   *
+   * @remarks
+   * By default, entries are flushed automatically every {@link FLUSH_INTERVAL_MS} (100ms).
+   * Call this method when you need to ensure entries are persisted before a process exits
+   * or before the {@link MemoryStore} instance becomes unreachable.
+   *
+   * **Error behavior**: If the flush fails, this method throws the last error from
+   * the underlying LanceDB write operation. Partial entries may have been written
+   * before the error occurred.
+   *
+   * @public
    */
   async flush(): Promise<void> {
     // D4 fix: 清除 timer 後等前一個 doFlush 完成
@@ -640,9 +673,18 @@ export class MemoryStore {
   }
 
   /**
-   * Destroy the store instance（防止 timer 洩漏）
-   * 清理所有資源：flush pending entries + 清除 flush timer
-   * 呼叫後 store 实例不可再使用。
+   * Destroy the store instance and release all resources.
+   *
+   * @remarks
+   * This method flushes all pending entries, clears the flush timer, and releases
+   * the underlying LanceDB connection. After calling this method, the {@link MemoryStore}
+   * instance must not be used.
+   *
+   * **Error behavior**: If the final flush fails, this method throws the last error from
+   * the underlying LanceDB write operation. Callers should treat this as a critical error —
+   * some entries may have been persisted but the instance is no longer usable.
+   *
+   * @public
    */
   async destroy(): Promise<void> {
     if (this.flushTimer) {
