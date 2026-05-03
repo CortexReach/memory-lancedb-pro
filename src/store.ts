@@ -217,10 +217,6 @@ export class MemoryStore {
   }> = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private flushLock: Promise<void> = Promise.resolve(); // Promise-based lock，防止 concurrent doFlush()
-  // 所有 flush 錯誤的集合（按寫入順序）。flush()/destroy() 重新 throw 時
-  // 只取最後一個錯誤以維持 single-error 行為相容性；全部錯誤仍會
-  // console.error 輸出供診斷。
-  private flushErrors: Error[] = [];
   private static readonly FLUSH_INTERVAL_MS = 100;
   // 單次 lock acquisition 上限。將大量 entries 拆分多個 chunk 寫入，
   // 每個 chunk 獨立 lock acquisition，失敗時只影響該 chunk（per-chunk isolation）。
@@ -548,14 +544,17 @@ export class MemoryStore {
   /**
    * Flush all pending batch entries in a single lock acquisition.
    * Called by the flush timer and on shutdown.
+   * @returns {hasError: boolean, lastError?: Error} — error info so callers
+   *   (flush/destroy) can rethrow without relying on shared instance state.
    */
-  private async doFlush(): Promise<void> {
+  private async doFlush(): Promise<{ hasError: boolean; lastError?: Error }> {
     const prevLock = this.flushLock;
     let releaseLock: () => void;
     this.flushLock = new Promise<void>((resolve) => { releaseLock = resolve; });
     await prevLock; // 等上一個 flush 完成後才開始
+    let lastError: Error | undefined;
     try {
-      if (this.pendingBatch.length === 0) return;
+      if (this.pendingBatch.length === 0) return { hasError: false };
 
       // splice out the current batch（保護新進的 pending calls）
       const batch = this.pendingBatch.splice(0, this.pendingBatch.length);
@@ -577,6 +576,7 @@ export class MemoryStore {
             await this.table!.add(chunk);
           });
         } catch (err) {
+          lastError = err as Error;
           // 標記此 chunk 區間內的所有 caller 為失敗
           let callerIdx = 0;
           let entryOffset = 0;
@@ -592,8 +592,6 @@ export class MemoryStore {
             entryOffset = callerEnd;
             callerIdx++;
           }
-          // D5 fix: 改為收集所有錯誤而非只保留最後一個
-          this.flushErrors.push(err as Error);
           const errorMsg = err instanceof Error ? err.message : String(err);
           console.error(`[memory-lancedb-pro] doFlush chunk failed: ${errorMsg}`);
         }
@@ -602,14 +600,12 @@ export class MemoryStore {
       // 統一結算：根據 failedCallers 決定 resolve 或 reject
       // D7 fix: caller.reject() 可能拋出（當 caller promise 已被 resolve/reject 處理過），
       // 必須用 try/catch 包住，否則 for 迴圈會被中斷，導致後續 caller 完全未被結算
-      const lastError = this.flushErrors.length > 0
-        ? this.flushErrors[this.flushErrors.length - 1]
-        : new Error("flush failed");
+      const errorToReport = lastError ?? new Error("flush failed");
       let callerIdx = 0;
       for (const caller of batch) {
         if (failedCallers.has(callerIdx)) {
           try {
-            caller.reject(new Error(`batch flush failed`, { cause: lastError }));
+            caller.reject(new Error(`batch flush failed`, { cause: errorToReport }));
           } catch (rejectErr) {
             console.error(`[memory-lancedb-pro] caller.reject() 拋出（可能被重複結算忽略）: ${rejectErr instanceof Error ? rejectErr.message : String(rejectErr)}`);
           }
@@ -618,7 +614,7 @@ export class MemoryStore {
         }
         callerIdx++;
       }
-      this.flushErrors = []; // D5 fix: 結算後清除錯誤陣列
+      return { hasError: failedCallers.size > 0, lastError };
     } finally {
       releaseLock!(); // 釋放 lock，讓下一個 flush 可以跑
     }
@@ -635,13 +631,11 @@ export class MemoryStore {
       this.flushTimer = null;
     }
     await this.flushLock;
-    await this.doFlush();
+    const result = await this.doFlush();
     // 【修復 Issue #3: flush() error propagation】
-    // doFlush() 已將所有錯誤存入 this.flushErrors，這裡重新拋出（只保留最後一個以維持行為相容）
-    if (this.flushErrors.length > 0) {
-      const err = this.flushErrors[this.flushErrors.length - 1];
-      this.flushErrors = [];
-      throw err;
+    // doFlush() 回傳 error info，flush() 據此重新拋出（只保留最後一個以維持行為相容）
+    if (result.hasError && result.lastError) {
+      throw result.lastError;
     }
   }
 
@@ -655,12 +649,10 @@ export class MemoryStore {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
-    await this.doFlush();
+    const result = await this.doFlush();
     // 【修復 Issue #3: destroy() error propagation】
-    if (this.flushErrors.length > 0) {
-      const err = this.flushErrors[this.flushErrors.length - 1];
-      this.flushErrors = [];
-      throw err;
+    if (result.hasError && result.lastError) {
+      throw result.lastError;
     }
   }
 
