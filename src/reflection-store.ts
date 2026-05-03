@@ -318,8 +318,8 @@ export function loadAgentReflectionSlicesFromEntries(params: LoadReflectionSlice
     return lines.some((line) => !resolvedDerivedTexts.has(normalizeReflectionLineForAggregation(line)));
   });
 
-  const invariantCandidates = buildInvariantCandidates(unresolvedItemRows, invariantLegacyRows);
-  const derivedCandidates = buildDerivedCandidates(unresolvedItemRows, derivedLegacyRows, params.agentId);
+  const invariantCandidates = buildInvariantCandidates(unresolvedItemRows, invariantLegacyRows, resolvedInvariantTexts);
+  const derivedCandidates = buildDerivedCandidates(unresolvedItemRows, derivedLegacyRows, params.agentId, resolvedDerivedTexts);
 
   const invariants = rankReflectionLines(invariantCandidates, {
     now,
@@ -347,7 +347,8 @@ type WeightedLineCandidate = {
 
 function buildInvariantCandidates(
   itemRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>,
-  legacyRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>
+  legacyRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>,
+  resolvedTexts: Set<string>
 ): WeightedLineCandidate[] {
   const itemCandidates = itemRows
     .filter(({ metadata }) => metadata.itemKind === "invariant")
@@ -371,26 +372,38 @@ function buildInvariantCandidates(
 
   if (itemCandidates.length > 0) return itemCandidates;
 
-  return legacyRows.flatMap(({ entry, metadata }) => {
-    const defaults = getReflectionItemDecayDefaults("invariant");
-    const timestamp = metadataTimestamp(metadata, entry.timestamp);
-    const lines = sanitizeInjectableReflectionLines(toStringArray(metadata.invariants));
-    return lines.map((line) => ({
-      line,
-      timestamp,
-      midpointDays: defaults.midpointDays,
-      k: defaults.k,
-      baseWeight: defaults.baseWeight,
-      quality: defaults.quality,
-      usedFallback: metadata.usedFallback === true,
-    }));
-  });
+  // Legacy fallback: filter out resolved lines (P2 fix).
+  // resolvedTexts must be the already-normalized Set so line.normalized === setMember
+  // to pass the resolved filter check.
+  return legacyRows
+    .filter(({ metadata }) => {
+      const lines = sanitizeInjectableReflectionLines(toStringArray(metadata.invariants));
+      if (lines.length === 0) return false;
+      return lines.some((line) => !resolvedTexts.has(normalizeReflectionLineForAggregation(line)));
+    })
+    .flatMap(({ entry, metadata }) => {
+      const defaults = getReflectionItemDecayDefaults("invariant");
+      const timestamp = metadataTimestamp(metadata, entry.timestamp);
+      const lines = sanitizeInjectableReflectionLines(toStringArray(metadata.invariants));
+      return lines
+        .filter((line) => !resolvedTexts.has(normalizeReflectionLineForAggregation(line)))
+        .map((line) => ({
+          line,
+          timestamp,
+          midpointDays: defaults.midpointDays,
+          k: defaults.k,
+          baseWeight: defaults.baseWeight,
+          quality: defaults.quality,
+          usedFallback: metadata.usedFallback === true,
+        }));
+    });
 }
 
 function buildDerivedCandidates(
   itemRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>,
   legacyRows: Array<{ entry: MemoryEntry; metadata: Record<string, unknown> }>,
-  agentId: string
+  agentId: string,
+  resolvedTexts: Set<string>
 ): WeightedLineCandidate[] {
   const itemCandidates = itemRows
     .filter(({ metadata }) => metadata.itemKind === "derived")
@@ -439,15 +452,18 @@ function buildDerivedCandidates(
       quality: computeDerivedLineQuality(lines.length),
     };
 
-    return lines.map((line) => ({
-      line,
-      timestamp,
-      midpointDays: readPositiveNumber(metadata.decayMidpointDays, defaults.midpointDays),
-      k: readPositiveNumber(metadata.decayK, defaults.k),
-      baseWeight: readPositiveNumber(metadata.deriveBaseWeight, defaults.baseWeight),
-      quality: readClampedNumber(metadata.deriveQuality, defaults.quality, 0.2, 1),
-      usedFallback: metadata.usedFallback === true,
-    }));
+    // Legacy fallback: filter out resolved lines (P2 fix).
+    return lines
+      .filter((line) => !resolvedTexts.has(normalizeReflectionLineForAggregation(line)))
+      .map((line) => ({
+        line,
+        timestamp,
+        midpointDays: readPositiveNumber(metadata.decayMidpointDays, defaults.midpointDays),
+        k: readPositiveNumber(metadata.decayK, defaults.k),
+        baseWeight: readPositiveNumber(metadata.deriveBaseWeight, defaults.baseWeight),
+        quality: readClampedNumber(metadata.deriveQuality, defaults.quality, 0.2, 1),
+        usedFallback: metadata.usedFallback === true,
+      }));
   });
 }
 
