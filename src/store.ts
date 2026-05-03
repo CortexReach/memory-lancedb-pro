@@ -247,8 +247,8 @@ export class MemoryStore {
     // Proactive cleanup before first lock attempt
     cleanupStaleArtifact();
 
-    // 【修復 #415】調整 retries：max wait 從 ~3100ms → ~151秒
-    // 指數退避：1s, 2s, 4s, 8s, 16s, 30s×5，總計約 151 秒
+    // 【修復 #415】調整 retries：max wait 從 ~3100ms → ~3秒
+    // proper-lockfile 內部重試：1s + 2s（factor:2, minTimeout:1000, maxTimeout:2000, retries:2）
     // ECOMPROMISED 透過 onCompromised callback 觸發（非 throw），使用 flag 機制正確處理
     let isCompromised = false;
     let compromisedErr: unknown = null;
