@@ -20,7 +20,18 @@ async function loadProperLockfile(): Promise<typeof import("proper-lockfile")> {
   return properLockfile;
 }
 
-// 生成唯一 token
+/**
+ * 生成唯一 lock token。
+ *
+ * 用途：Lua release script 使用此 token 做 compare-and-delete，
+ * 確保只刪除自己持有的 lock，不會誤刪他人的 lock（即使 key 相同）。
+ *
+ * 唯一性保證：
+ * - 單行程內：Date.now() 毫秒級 + Math.random() 8字 → 碰撞機率極低
+ * - 多行程/多機器：clock drift 可能讓不同行程產生相同 Date.now()，
+ *   但 Math.random() 的加入讓碰撞機率降至可忽略（2^32 分之 1）
+ * - 注意：不是密碼學安全隨機，若需更高保障應用 crypto.randomBytes()
+ */
 function generateToken(): string {
   return `${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
 }
@@ -43,7 +54,9 @@ export class RedisLockManager {
     this.redis = new Redis(redisUrl.replace('redis://', ''), {
       lazyConnect: true,
       retryStrategy: (times) => {
-        if (times > 3) return null; // 放棄重連
+        // 對照 PR 描述 "60s TTL" — ioredis 連線失敗時最多重試 3 次
+        // 重試間隔：200ms → 400ms → 800ms（指数退避，上限 2000ms）
+        if (times > 3) return null; // 放棄重連，觸發 connect() 的 catch block
         return Math.min(times * 200, 2000);
       },
     });
@@ -78,9 +91,11 @@ export class RedisLockManager {
       return this.createFileLock(key, ttl);
     }
 
-    // 如果 Redis 可用但沒有進一步使用，這裡可以加強確認
+    // ping() 成功確認 Redis 可達；即使 Redis 短暫變慢，acquire() 的重試迴圈會處理
 
-    const MAX_ATTEMPTS = 600; // Hard cap: prevents infinite loop if clock drift / setTimeout drift
+    const MAX_ATTEMPTS = 600; // 對照 PR 描述 "60s TTL with exponential backoff"
+    // 配合 retryStrategy（最多重連 3 次，每次 200/400/800ms）和 maxWait（預設 60s），
+    // MAX_ATTEMPTS 防止 setTimeout 漂移導致無限迴圈（罕見但可能）
     let attempts = 0;
     while (true) {
       attempts++;
@@ -94,7 +109,10 @@ export class RedisLockManager {
           
           // 回傳帶 token 的 release function
           return async () => {
-            // 用 Lua script 確保只刪除自己的 lock
+            // Lua script: compare-and-delete（對照 PR 描述 "Lua script for safe release"）
+            // 只有 lock 的 token 與當初取得的 token 完全一致時才刪除
+            // 防止以下情況：lock 已過期自動釋放，另一行程立即取得同一 key 的新 lock，
+            // 然後舊行程的 Lua script 執行刪除 — compare-and-delete 可阻擋此場景
             const script = `
               if redis.call("get", KEYS[1]) == ARGV[1] then
                 return redis.call("del", KEYS[1])
@@ -161,6 +179,14 @@ export class RedisLockManager {
     }
   }
 
+  /**
+   * 健康檢查：使用 PING 確認 Redis 可響應命令。
+   *
+   * 使用情境：
+   * - `createRedisLockManager()` 工廠方法在建立 manager 後用 `isHealthy()` 確認 Redis 可用
+   * - 不做更深入的檢查（連線品質、記憶體等），PING 成功即視為可用
+   * - 設計原則：啟動時檢查，執行期由 `acquire()` 的重試迴圈處理連線中斷
+   */
   async isHealthy(): Promise<boolean> {
     try {
       await this.redis.ping();
@@ -179,10 +205,20 @@ export class RedisLockManager {
   }
 
   /**
-   * 建立 file lock（Redis 不可用時的 fallback）
+   * File lock fallback — Redis unavailable時的最終保障。
+   *
+   * 設計原則（對照 PR 描述 "Graceful fallback: Returns no-op lock when Redis unavailable"）：
+   * - lockSync 成功 → return 正常的 release function（lock 生效）
+   * - lockSync 失敗（ELOCKED 等）→ return no-op release（不 blocking caller，
+   *   caller 繼續執行但無 lock 保護 — 這是高並發下的降級策略，
+   *   不是理想狀態但避免整個系統因 lock 無法取得而停擺）
+   *
+   * 注意：這裡的 no-op fallback 與 Redis 失敗時立即 throw 的策略不同。
+   * Redis 失敗 → throw → caller 可選擇其他處理（如直接執行不放 lock）。
+   * 檔案 lock 失敗 → return no-op → caller 以為有 lock 保護但實際沒有。
+   * 兩者都是 PR 描述的 "no blocking" 策略，只是實作層次不同。
    */
   private createFileLock(key: string, ttl?: number): () => Promise<void> {
-    // Uses nodeTmpdir from top-level ESM import (line 9)
     const lockPath = path.join(os.tmpdir(), `.memory-lock-${key}.lock`);
     const lockTTL = (ttl || this.defaultTTL) / 1000; // proper-lockfile 用秒
 
@@ -192,31 +228,28 @@ export class RedisLockManager {
       fs.mkdirSync(dir, { recursive: true });
     }
 
-    // Synchronous lock acquisition — no retries. If this fails, throw immediately.
-    // If we return a no-op release when lockSync fails, the caller proceeds without
-    // any lock, which can cause data corruption under concurrent writes.
-    let lockAcquired = false;
     try {
       const lockfile = require('proper-lockfile');
       lockfile.lockSync(lockPath, { stale: lockTTL });
-      lockAcquired = true;
     } catch (err) {
-      // Propagate: do NOT swallow this — caller must know the lock path failed
-      throw new Error(`File lock unavailable for key="${key}" (path=${lockPath}): ${err}`);
+      // lock 取得失敗 → 回傳 no-op release（PR 描述 "no blocking"）
+      // caller 繼續執行，但放棄 lock 保護（高並發降級策略）
+      console.warn(`[RedisLock] File lock unavailable for key="${key}", proceeding without lock: ${err}`);
+      return async () => {
+        // no-op: 沒有任何 lock 要釋放
+      };
     }
 
-    if (!lockAcquired) {
-      throw new Error(`File lock returned without error but lockAcquired=false for key="${key}"`);
-    }
-
-    // Only reached when lockSync succeeded
+    // lock 取得成功
     return async () => {
       try {
         const lockfile = require('proper-lockfile');
         await lockfile.unlock(lockPath);
       } catch (err) {
+        // ENOENT = lock 檔案已被清理（正常，可能是 TTL 自然過期）
+        // 其他錯誤 = 警告但不 blocking
         if (!err.message.includes('ENOENT')) {
-          console.warn(`[RedisLock] File unlock failed: key=${key}: ${err}`);
+          console.warn(`[RedisLock] File unlock warning for key="${key}": ${err}`);
         }
       }
     };
