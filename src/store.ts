@@ -260,7 +260,7 @@ export class MemoryStore {
     cleanupStaleArtifact();
 
     // 【修復 #415】保守設定：支撐 event loop 阻塞的高負載場景
-    // max wait ~151秒：指數退避 1s+2s+4s+8s+16s+30s×5，total ~151s
+    // max wait ~151秒：指數退避 1s+2s+4s+8s+16s+30s×4，total ~151s
     // ECOMPROMISED 透過 onCompromised callback 觸發（非 throw），使用 flag 機制正確處理
     let isCompromised = false;
     let compromisedErr: unknown = null;
@@ -278,7 +278,7 @@ export class MemoryStore {
         realpath: false,
         retries: retryOptions ?? {
           // 【修復 #415 保守設定】支撐 event loop 阻塞的高負載場景
-          // max wait ~151秒：指數退避 1s+2s+4s+8s+16s+30s×5，total ~151s
+          // max wait ~151秒：指數退避 1s+2s+4s+8s+16s+30s×4，total ~151s
           retries: 10,
           factor: 2,
           minTimeout: 1000, // James 保守設定：避免高負載下過度密集重試
