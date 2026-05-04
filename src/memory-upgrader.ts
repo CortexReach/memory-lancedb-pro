@@ -375,6 +375,7 @@ export class MemoryUpgrader {
    */
   private async writeEnrichedBatch(
     batch: EnrichedEntry[],
+    scopeFilter?: string[],
   ): Promise<{ success: number; errors: string[] }> {
     const errors: string[] = [];
 
@@ -432,7 +433,7 @@ export class MemoryUpgrader {
     // Phase 2b: Single bulk write via bulkUpdateMetadataWithPatch
     // (1 lock for entire batch, re-read inside lock)
     try {
-      const result = await this.store.bulkUpdateMetadataWithPatch(entries);
+      const result = await this.store.bulkUpdateMetadataWithPatch(entries, scopeFilter);
       for (const failedId of result.failed) {
         const errMsg = `bulkUpdateMetadataWithPatch failed for ${failedId}`;
         errors.push(errMsg);
@@ -559,7 +560,10 @@ export class MemoryUpgrader {
       // Now we group all writes into ONE lock acquisition per batch.
       // This is the KEY FIX for Issue #632: from N locks to 1 lock per batch.
       if (enrichedBatch.length > 0) {
-        const writeResult = await this.writeEnrichedBatch(enrichedBatch);
+        const writeResult = await this.writeEnrichedBatch(
+          enrichedBatch,
+          options.scopeFilter ?? this.options.scopeFilter,
+        );
         result.upgraded += writeResult.success;
         result.errors.push(...writeResult.errors);
       }

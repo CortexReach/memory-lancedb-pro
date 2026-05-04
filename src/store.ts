@@ -726,16 +726,14 @@ export class MemoryStore {
           // entries that succeed during recovery to avoid double-counting them).
           const succeededInBatch = new Set<string>();
           const recoveryFailed: string[] = [];
+          let restoredCount = 0;
+          let restoreFailedCount = 0;
           for (const entry of updatedEntries) {
             try {
               await this.table!.add([entry]);
               succeededInBatch.add(entry.id); // [Q3-fix] mark as known-succeeded
             } catch (recoveryErr) {
               const recMsg = recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr);
-              console.warn(
-                `[memory-lancedb-pro] bulkUpdateMetadata: per-entry recovery failed for id=${entry.id}, ` +
-                `attempting original restore. error=${recMsg}`,
-              );
               // [fix-B2] Last line of defence: restore the original row if recovery fails.
               const originalRow = originalsBackup.get(entry.id);
               if (originalRow) {
@@ -751,9 +749,7 @@ export class MemoryStore {
                     metadata: (originalRow.metadata as string) || "{}",
                   };
                   await this.table!.add([originalEntry]);
-                  console.warn(
-                    `[memory-lancedb-pro] bulkUpdateMetadata: original restored for id=${entry.id}`,
-                  );
+                  restoredCount++;
                   continue; // restore succeeded — this entry is not failed
                 } catch (restoreErr) {
                   const rstMsg = restoreErr instanceof Error ? restoreErr.message : String(restoreErr);
@@ -761,6 +757,7 @@ export class MemoryStore {
                     `[memory-lancedb-pro] FATAL: bulkUpdateMetadata: original restore also failed ` +
                     `for id=${entry.id}. Data loss may have occurred. error=${rstMsg}`,
                   );
+                  restoreFailedCount++;
                 }
               }
               if (!failed.includes(entry.id)) {
@@ -770,10 +767,19 @@ export class MemoryStore {
           }
           // [Q3-fix] succeeded count = total - definitively failed
           const actuallySucceeded = updatedEntries.length - recoveryFailed.length;
-          console.warn(
-            `[memory-lancedb-pro] bulkUpdateMetadata: recovery complete. ` +
-            `succeeded=${actuallySucceeded}, failed=${recoveryFailed.length}`,
-          );
+          // EF3-fix: single summary log instead of per-entry noise
+          if (restoredCount > 0 || restoreFailedCount > 0) {
+            console.warn(
+              `[memory-lancedb-pro] bulkUpdateMetadata: recovery: ` +
+              `${restoredCount} originals restored, ${restoreFailedCount} restores failed, ` +
+              `${recoveryFailed.length} entries failed. succeeded=${actuallySucceeded}`,
+            );
+          } else {
+            console.warn(
+              `[memory-lancedb-pro] bulkUpdateMetadata: recovery complete. ` +
+              `succeeded=${actuallySucceeded}, failed=${recoveryFailed.length}`,
+            );
+          }
           return {
             success: actuallySucceeded,
             failed: [...failed, ...recoveryFailed],
@@ -948,6 +954,9 @@ export class MemoryStore {
           // [Q6-fix] Use Set for O(1) lookup instead of O(n) includes.
           const outerFailed = new Set(failed);
           const recoveryFailed: string[] = [];
+          let skippedAlreadyWritten = 0;
+          let restoredCount = 0;
+          let restoreFailedCount = 0;
           for (const entry of updatedEntries) {
             // [Q3-fix] Detect partial batch success: if this entry was already written
             // (partial batch success before the error), skip per-entry retry to avoid
@@ -955,20 +964,13 @@ export class MemoryStore {
             // partial batch write.
             const alreadyWritten = await this.hasId(entry.id);
             if (alreadyWritten) {
-              console.warn(
-                `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: entry ${entry.id} already in DB ` +
-                `(partial batch success), skipping per-entry retry to avoid duplicate writes.`,
-              );
+              skippedAlreadyWritten++;
               continue;
             }
             try {
               await this.table!.add([entry]);
             } catch (recoveryErr) {
               const recMsg = recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr);
-              console.warn(
-                `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: per-entry recovery failed ` +
-                `for id=${entry.id}, attempting original restore. error=${recMsg}`,
-              );
               // [fix-B2] Last line of defence: restore the original row if recovery fails.
               const originalRow = originalsBackup.get(entry.id);
               if (originalRow) {
@@ -987,9 +989,7 @@ export class MemoryStore {
                     metadata: (originalRow.metadata as string) || "{}",
                   };
                   await this.table!.add([originalEntry]);
-                  console.warn(
-                    `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: original restored for id=${entry.id}`,
-                  );
+                  restoredCount++;
                   continue; // restore succeeded — this entry is not failed
                 } catch (restoreErr) {
                   const rstMsg = restoreErr instanceof Error ? restoreErr.message : String(restoreErr);
@@ -997,6 +997,7 @@ export class MemoryStore {
                     `[memory-lancedb-pro] FATAL: bulkUpdateMetadataWithPatch: original restore also failed ` +
                     `for id=${entry.id}. Data loss may have occurred. error=${rstMsg}`,
                   );
+                  restoreFailedCount++;
                 }
               }
               if (!outerFailed.has(entry.id)) {
@@ -1005,10 +1006,20 @@ export class MemoryStore {
             }
           }
           const actuallySucceeded = updatedEntries.length - recoveryFailed.length;
-          console.warn(
-            `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: recovery complete. ` +
-            `succeeded=${actuallySucceeded}, failed=${recoveryFailed.length}`,
-          );
+          // EF3-fix: single summary log instead of per-entry noise
+          if (skippedAlreadyWritten > 0) {
+            console.warn(
+              `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: recovery: ` +
+              `${skippedAlreadyWritten} entries already written (partial batch success), ` +
+              `${restoredCount} originals restored, ${restoreFailedCount} restores failed, ` +
+              `${recoveryFailed.length} entries failed. succeeded=${actuallySucceeded}`,
+            );
+          } else {
+            console.warn(
+              `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: recovery complete. ` +
+              `succeeded=${actuallySucceeded}, failed=${recoveryFailed.length}`,
+            );
+          }
           return {
             success: actuallySucceeded,
             failed: [...failed, ...recoveryFailed],
@@ -1130,7 +1141,7 @@ export class MemoryStore {
     const mapped: MemorySearchResult[] = [];
 
     for (const row of results) {
-      const distance = Number(row._distance ?? 0);
+      const distance = safeToNumber(row._distance ?? 0);
       const score = 1 / (1 + distance);
 
       if (score < minScore) continue;
