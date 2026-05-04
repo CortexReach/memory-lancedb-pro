@@ -63,6 +63,12 @@ const EXPECTED_BASELINE = [
   // Issue #492 agentId validation tests
   { group: "core-regression", runner: "node", file: "test/agentid-validation.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/command-reflection-guard.test.mjs", args: ["--test"] },
+  // Issue #676: handleSupersede batch mode invalidation fix
+  { group: "core-regression", runner: "node", file: "test/supersede-existing-found-bulk.test.mjs", args: ["--test"] },
+  // Issue #675: regex fallback bulkStore fix
+  { group: "core-regression", runner: "node", file: "test/regex-fallback-bulk-store.test.mjs", args: ["--test"] },
+  // Issue #670/#675: lock stale threshold regression
+  { group: "core-regression", runner: "node", file: "test/lock-stale-threshold.test.mjs", args: ["--test"] },
 ];
 
 function fail(message) {
