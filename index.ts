@@ -3139,8 +3139,17 @@ const memoryLanceDBProPlugin = {
               continue;
             }
 
-            const category = detectCategory(text);
-            const vector = await embedder.embedPassage(text);
+            let vector: number[];
+            let category: string;
+            try {
+              category = detectCategory(text);
+              vector = await embedder.embedPassage(text);
+            } catch (err) {
+              api.logger.warn(
+                `memory-lancedb-pro: regex fallback embed/categorize failed for agent ${agentId}, skipping text: ${String(err)}`,
+              );
+              continue;
+            }
 
             // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
             // Fail-open by design: dedup should not block auto-capture writes.

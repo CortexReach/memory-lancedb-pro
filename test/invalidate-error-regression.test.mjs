@@ -28,8 +28,13 @@ const { SmartExtractor } = jiti("../src/smart-extractor.ts");
 
 function makeStoreWithFailingUpdate(existingRecords, failOnUpdateId) {
   const calls = { store: [], bulkStore: [], update: [], getById: [], vectorSearch: [] };
+  // Track update patches separately: initial invalidation patches vs rollback patches.
+  // After bulkStore returns, invalidateEntries.map calls update (invalidation).
+  // Then rollback calls update again on succeeded entries with _origMetadata.
+  // By recording the order and patch, we can verify rollback uses _origMetadata.
+  const updatePatches = []; // { id, patch, ts }
   const db = new Map(existingRecords.map(r => [r.id, r]));
-  let callCount = 0;
+  let updateCallIdx = 0;
 
   return {
     async vectorSearch(_vector, _limit, _minScore, _scopeFilter, _opts) {
@@ -57,8 +62,8 @@ function makeStoreWithFailingUpdate(existingRecords, failOnUpdateId) {
     },
 
     async update(id, patch, _scopeFilter) {
-      calls.update.push({ id, patch, ts: Date.now() });
-      callCount++;
+      calls.update.push({ id, ts: Date.now() });
+      updatePatches.push({ id, patch, idx: updateCallIdx++ });
       // Only the designated ID throws; all others succeed.
       // This lets us control which specific invalidation fails.
       if (id === failOnUpdateId) {
@@ -70,6 +75,7 @@ function makeStoreWithFailingUpdate(existingRecords, failOnUpdateId) {
     getStoreCallCount() { return calls.store.length; },
     getBulkStoreCallCount() { return calls.bulkStore.length; },
     getUpdateCallCount() { return calls.update.length; },
+    getUpdatePatches() { return updatePatches; },
     getUpdateFailedIds() {
       return calls.update
         .filter(c => c.ts === 0) // placeholder; will use separate tracking
@@ -96,7 +102,19 @@ function makeEmbedder() {
       );
     },
     async embedBatch(texts) {
-      return Promise.all(texts.map(t => this.embed(t)));
+      // embedBatch is called once with ALL abstracts (2 in TC-5).
+      // Return orthogonal-ish vectors so batchDedup does NOT collapse them.
+      // Strategy: each text i gets vector where dimension[i] = 1 and
+      // dimension[128+i] = i+1. This ensures near-zero cosine similarity.
+      // Example: text 0 → [1, 0, ..., 0, 1, 0, ...]; text 1 → [0, 1, ..., 0, 2, 0, ...]
+      return texts.map((text, i) => {
+        counter++;
+        return Array.from({ length: 384 }, (_, j) => {
+          if (j === i) return 1.0;
+          if (j === 128 + i) return i + 1;
+          return 0.0;
+        });
+      });
     },
   };
 }
@@ -380,5 +398,152 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
       "Error must be logged after update rejection");
     assert.ok(!errorLog.includes("ReferenceError"),
       "Error must NOT be ReferenceError (that was the original api.logger bug)");
+  });
+
+  /**
+   * TC-5: Rollback correctly restores _origMetadata on succeeded invalidations.
+   *
+   * MR4 (Codex review) concern: pure mock doesn't verify rollback actually works.
+   * This test enhances the mock to track update patches, proving that:
+   * 1. When existing-002 update fails, rollback targets succeeded entries only (existing-001)
+   * 2. Rollback patch contains the original metadata (not the invalidated metadata)
+   * 3. The rollback call order proves it happens AFTER bulkStore (succeeded entries only)
+   */
+  it("TC-5: rollback uses _origMetadata to restore succeeded invalidations", async () => {
+    const existing001 = {
+      id: "existing-001",
+      text: "Old preference A",
+      category: "preference",
+      scope: "global",
+      importance: 0.8,
+      metadata: JSON.stringify({
+        fact_key: "pref-a",
+        memory_category: "preferences",
+        state: "confirmed",
+        invalidated_at: null,
+      }),
+    };
+    const existing002 = {
+      id: "existing-002",
+      text: "Old preference B",
+      category: "preference",
+      scope: "global",
+      importance: 0.8,
+      metadata: JSON.stringify({
+        fact_key: "pref-b",
+        memory_category: "preferences",
+        state: "confirmed",
+        invalidated_at: null,
+      }),
+    };
+
+    // failOnUpdateId = existing-002 → its update fails, existing-001 succeeds.
+    // Rollback should only target existing-001 (the succeeded one).
+    const store = makeStoreWithFailingUpdate([existing001, existing002], "existing-002");
+    const embedder = makeEmbedder();
+    // Custom LLM mock that returns 2 candidates from DIFFERENT categories
+    // (preferences vs facts) so batchDedup doesn't collapse them.
+    // dedup loop: candidate 0 → match_index 1 → existing-001 (vectorSearch idx 0, 1-based index)
+    //             candidate 1 → match_index 2 → existing-002 (vectorSearch idx 1, 1-based index)
+    let decisionIdx = 0;
+    const decisions = [
+      { decision: "supersede", match_index: 1 },
+      { decision: "supersede", match_index: 2 },
+    ];
+    const llm = {
+      async completeJson(_prompt, mode) {
+        if (mode === "extract-candidates") {
+          const result = {
+            memories: [
+              {
+                category: "preferences",
+                abstract: "User prefers oat milk over dairy milk every morning",
+                overview: "## Pref\n- Oat milk preferred",
+                content: "User prefers oat milk over dairy.",
+              },
+              {
+                category: "events",
+                abstract: "User attended a project meeting last Tuesday afternoon",
+                overview: "## Event\n- Meeting attended",
+                content: "User attended a project meeting on Tuesday.",
+              },
+            ],
+          };
+          console.log(`TC-5 extract-candidates returning ${result.memories.length} memories`);
+          return result;
+        }
+        if (mode === "dedup-decision") {
+          const d = decisions[decisionIdx % decisions.length];
+          decisionIdx++;
+          return d;
+        }
+        return null;
+      },
+    };
+    const logSpy = makeLogSpy();
+    const extractor = makeExtractor(store, embedder, llm, logSpy);
+
+    // Debug: verify extractor can be constructed
+    console.log(`\nTC-5 DEBUG: extractor created, about to call extractAndPersist`);
+    console.log(`  store vectorSearch calls before: ${store.calls.vectorSearch.length}`);
+    console.log(`  store update calls before: ${store.getUpdateCallCount()}`);
+    console.log(`  store bulkStore calls before: ${store.getBulkStoreCallCount()}`);
+    console.log(`  log entries before: ${logSpy.entries.length}`);
+
+    await extractor.extractAndPersist(
+      "User updated preferences A and B.",
+      "session:test-rf1-5",
+    );
+
+    console.log(`  store vectorSearch calls after: ${store.calls.vectorSearch.length}`);
+    console.log(`  store update calls after: ${store.getUpdateCallCount()}`);
+    console.log(`  store bulkStore calls after: ${store.getBulkStoreCallCount()}`);
+    console.log(`  log entries after: ${logSpy.entries.length}`);
+    console.log(`  log entries: ${logSpy.entries.join("; ")}`);
+
+    // Verify update call count:
+    // - bulkStore: 1 (for 2 new entries)
+    // - invalidate existing-001: 1 update call (succeeds) → push to succeeded[]
+    // - invalidate existing-002: 1 update call (fails) → push to failed[]
+    // - rollback existing-001: 1 update call (succeeds) → uses _origMetadata
+    // Total: 3 update calls
+    assert.strictEqual(store.getUpdateCallCount(), 3,
+      `Expected 3 update calls (2 invalidation + 1 rollback), got ${store.getUpdateCallCount()}`);
+
+    // Verify rollback happened (last update call should be on existing-001 with original metadata)
+    const patches = store.getUpdatePatches();
+    assert.strictEqual(patches.length, 3, "Should record all 3 update patches");
+
+    const [inv001, inv002, rollback001] = patches;
+
+    // inv001: first update = invalidation of existing-001 (succeeded)
+    assert.strictEqual(inv001.id, "existing-001");
+    assert.ok(inv001.patch.metadata.includes("invalidated_at"),
+      "First patch should be invalidation metadata (includes invalidated_at)");
+
+    // inv002: second update = invalidation of existing-002 (FAILED — update threw)
+    assert.strictEqual(inv002.id, "existing-002");
+    assert.ok(inv002.patch.metadata.includes("invalidated_at"),
+      "Second patch should be invalidation metadata for existing-002");
+
+    // rollback001: third update = rollback of existing-001 with ORIGINAL metadata
+    assert.strictEqual(rollback001.id, "existing-001",
+      "Rollback should target existing-001 (the succeeded invalidation)");
+    assert.ok(!rollback001.patch.metadata.includes("invalidated_at"),
+      "Rollback patch must use _origMetadata (no invalidated_at field)");
+    assert.ok(rollback001.patch.metadata.includes("pref-a"),
+      "Rollback patch must preserve original fact_key from _origMetadata");
+
+    // Verify "ROLLBACK FAILED" log since existing-002 update failed (no actual DB state change)
+    const rollbackFailedLog = logSpy.entries.find(e => e.includes("ROLLBACK FAILED"));
+    assert.ok(!rollbackFailedLog,
+      "Rollback itself should succeed (no ROLLBACK FAILED log)");
+
+    console.log(`\n📊 TC-5:`);
+    console.log(`   update calls: ${store.getUpdateCallCount()} (expected: 3)`);
+    console.log(`   patches:`);
+    for (const p of patches) {
+      console.log(`     [${p.id}] invalidated=${p.patch.metadata.includes("invalidated_at")} rollback_patch=${!p.patch.metadata.includes("invalidated_at")}`);
+    }
   });
 });
