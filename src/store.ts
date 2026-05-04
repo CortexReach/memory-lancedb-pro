@@ -252,7 +252,7 @@ export class MemoryStore {
           if (ageMs > staleThresholdMs) {
             try { unlinkSync(legacyPath); } catch {}
           }
-        } catch {}
+        } catch {} // intentionally swallow — proactive, non-critical
       }
     };
 
@@ -269,12 +269,14 @@ export class MemoryStore {
 
     const doLock = (retryOptions?: { retries: number; factor: number; minTimeout: number; maxTimeout: number }) =>
       lockfile.lock(lockPath, {
-        lockfilePath: lockPath, // FIX_M2: 明確指定 artifact = lockPath（不追加 .lock），讓 cleanup 邏輯和 production 一致
-        // 設計說明：當 lockfilePath === lockPath 時，proper-lockfile 的 artifact 就是 lockPath 本身。
-        // v3 行為：artifact 是 .lock FILE（lockPath 檔案本身）。
-        // v4 行為：artifact 是 .lock/ DIR（lockPath 目錄，裡面放 lockfile 的微文件）。
-        // 這是 v4 的 breaking change，cross-process-lock.test.mjs 需跟著更新。
-        // 回收邏輯（cleanupStaleArtifact 和 ELOCKED recovery）都必須同時支援 FILE 和 DIR 兩種 artifact。
+        // M2 FIX: 不再指定 lockfilePath，保持 v4 預設 artifact 行為。
+        // 預設 artifact = ${lockPath}.lock（目錄），與 legacy v3/v4 代碼一致。
+        // 移除 lockfilePath: lockPath 的原因：
+        //   新版設定 lockfilePath=lockPath 時，artifact = lockPath 本身（與 legacy 隔離），
+        //   混合版本環境下新舊進程可能各自持有不同的 lock 而不自知，破壞 mutual exclusion。
+        // v4 的 artifact 是 ${lockPath}.lock/ 目錄（裡面放微文件）。
+        // v3 的 artifact 是 ${lockPath}.lock/ FILE。
+        // cleanupStaleArtifact 和 ELOCKED handler 必須同時支援 FILE 和 DIR 兩種 artifact。
         realpath: false,
         retries: retryOptions ?? {
           // 【修復 #415 保守設定】支撐 event loop 阻塞的高負載場景
@@ -329,9 +331,25 @@ export class MemoryStore {
             const age = Date.now() - stat.mtimeMs;
             if (age > STALE_THRESHOLD_MS) {
               // Artifact is STALE — the previous holder crashed or hung. Safe to delete.
-              rmSync(artifactPath, { recursive: true, force: true });
-              console.warn(`[memory-lancedb-pro] removed stale ${artifactPath} (age=${age}ms>${STALE_THRESHOLD_MS}ms), retrying`);
-              return true; // proceed to retry
+              // W3 FIX: wrap rmSync to handle race where another process recreates
+              // the artifact between statSync and rmSync (EOF/ENOENT means already gone).
+              try {
+                rmSync(artifactPath, { recursive: true, force: true });
+                console.warn(`[memory-lancedb-pro] removed stale ${artifactPath} (age=${age}ms>${STALE_THRESHOLD_MS}ms), retrying`);
+                return true; // proceed to retry
+              } catch (rmErr: unknown) {
+                const rmCode = (rmErr as NodeJS.ErrnoException).code;
+                if (rmCode === "ENOENT" || rmCode === "EBUSY") {
+                  // Race: artifact was recreated or already deleted — treat as gone, proceed to retry
+                  console.warn(`[memory-lancedb-pro] ${errCode} cleanup: rmSync ${rmCode} (artifact changed during cleanup), retrying`);
+                  return true;
+                }
+                // Genuine cleanup failure
+                const errMsg = err instanceof Error ? err.message : String(err);
+                const wrapped = new Error(`${errCode} cleanup rm failed (${rmCode}): ${rmErr}`, { cause: rmErr });
+                (wrapped as NodeJS.ErrnoException).code = rmCode;
+                throw wrapped;
+              }
             } else {
               // Artifact is NOT stale — belongs to an ACTIVE holder.
               const errMsg = err instanceof Error ? err.message : String(err);
@@ -362,6 +380,9 @@ export class MemoryStore {
           shouldRetry = tryCleanup(legacyPath);
         }
 
+        // M1 FIX: must never execute fn() without a confirmed lock acquisition.
+        // shouldRetry=false means an ACTIVE holder is present (age <= STALE_THRESHOLD_MS).
+        // Fall-through would run fn() without holding any lock — breaks mutual exclusion.
         if (shouldRetry) {
           // FIX_W2: second attempt — use minimal retries since artifact was confirmed stale
           try {
@@ -371,6 +392,11 @@ export class MemoryStore {
             const retryCode = (retryErr as NodeJS.ErrnoException).code || "UNKNOWN";
             throw new Error(`${errCode} retry failed (${retryCode}): ${errMsg}`, { cause: retryErr });
           }
+        } else {
+          // shouldRetry=false means active holder present; propagate ELOCKED instead.
+          const wrapped = new Error(`ELOCKED: active lock holder present on both ${lockPath} and ${lockPath + ".lock"}; not removing, propagating`, { cause: err });
+          (wrapped as NodeJS.ErrnoException).code = "ELOCKED";
+          throw wrapped;
         }
       } else {
         throw err;
