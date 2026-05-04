@@ -54,6 +54,18 @@ import { batchDedup } from "./batch-dedup.js";
 
 type StoreEntry = Omit<import("./store.js").MemoryEntry, "id" | "timestamp">;
 
+/**
+ * Represents a pending invalidation for an existing memory entry.
+ * Carries the new metadata to write, plus the original metadata for
+ * rollback if the update fails.
+ */
+interface InvalidateEntry {
+  id: string;
+  metadata: string;
+  newEntryIndex?: number;
+  _origMetadata?: string;
+}
+
 // ============================================================================
 // Envelope Metadata Stripping
 // ============================================================================
@@ -420,7 +432,7 @@ export class SmartExtractor {
     }
 
     const createEntries: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[] = [];
-    const invalidateEntries: Array<{ id: string; metadata: string; newEntryIndex?: number; _origMetadata?: string }> = [];
+    const invalidateEntries: InvalidateEntry[] = [];
 
     for (const { index, candidate } of processableCandidates) {
       try {
@@ -455,7 +467,7 @@ export class SmartExtractor {
           if (inv.newEntryIndex !== undefined && inv.newEntryIndex < bulkResults.length) {
             const newEntryId = bulkResults[inv.newEntryIndex].id;
             const oldMeta = parseSmartMetadata(inv.metadata, { id: inv.id });
-            const updatedMeta = buildSmartMetadata({ metadata: inv.metadata, id: inv.id } as any, {
+            const updatedMeta = buildSmartMetadata({ metadata: inv.metadata }, {
               superseded_by: newEntryId,
               relations: appendRelation(oldMeta.relations ?? [], {
                 type: "superseded_by",
@@ -505,7 +517,7 @@ export class SmartExtractor {
 
         const rollbackResults = await Promise.allSettled(
           succeeded.map(({ inv }) => {
-            const orig = (inv as any)._origMetadata;
+            const orig = inv._origMetadata;
             if (!orig) return Promise.resolve();
             return this.store.update(inv.id, { metadata: orig }, scopeFilter);
           }),
@@ -743,7 +755,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     precomputedVector?: number[],
     createEntries?: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[],
-    invalidateEntries?: Array<{ id: string; metadata: string; newEntryIndex?: number; _origMetadata?: string }>,
+    invalidateEntries?: InvalidateEntry[],
   ): Promise<void> {
     // Profile always merges (skip dedup — admission control still applies)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -1064,7 +1076,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
-    invalidateEntries?: Array<{ id: string; metadata: string; newEntryIndex?: number; _origMetadata?: string }>,
+    invalidateEntries?: InvalidateEntry[],
   ): Promise<"merged" | "created" | "rejected"> {
     // Find existing profile memory by category
     const embeddingText = `${candidate.abstract} ${candidate.content}`;
@@ -1247,7 +1259,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
-    invalidateEntries?: Array<{ id: string; metadata: string; newEntryIndex?: number; _origMetadata?: string }>,
+    invalidateEntries?: InvalidateEntry[],
   ): Promise<void> {
     const existing = await this.store.getById(matchId, scopeFilter);
     if (!existing) {
@@ -1324,9 +1336,8 @@ export class SmartExtractor {
         metadata: stringifySmartMetadata(invalidatedMeta),
         newEntryIndex,  // enables second-pass backfill of superseded_by
         // Store original metadata so we can rollback if subsequent invalidation updates fail.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         _origMetadata: existing.metadata,
-      } as any);
+      });
 
       this.log(
         `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} (queued for batch + invalidate queued)`,
