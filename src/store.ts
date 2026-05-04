@@ -324,7 +324,7 @@ export class MemoryStore {
       const errCode = (err as NodeJS.ErrnoException).code;
 
       if (errCode === "ELOCKED" || errCode === "ENOTDIR") {
-        console.warn(`[memory-lancedb-pro] ${errCode} on first attempt, checking artifact age: ${lockPath}`);
+        console.debug(`[memory-lancedb-pro] ${errCode} on first attempt, checking artifact age: ${lockPath}`);
 
         // Helper: check + cleanup artifact at a given path, return whether retry should proceed
         const tryCleanup = (artifactPath: string): boolean => {
@@ -338,13 +338,13 @@ export class MemoryStore {
               // the artifact between statSync and rmSync (EOF/ENOENT means already gone).
               try {
                 rmSync(artifactPath, { recursive: true, force: true });
-                console.warn(`[memory-lancedb-pro] removed stale ${artifactPath} (age=${age}ms>${STALE_THRESHOLD_MS}ms), retrying`);
+                console.debug(`[memory-lancedb-pro] removed stale ${artifactPath} (age=${age}ms>${STALE_THRESHOLD_MS}ms), retrying`);
                 return true; // proceed to retry
               } catch (rmErr: unknown) {
                 const rmCode = (rmErr as NodeJS.ErrnoException).code;
                 if (rmCode === "ENOENT" || rmCode === "EBUSY") {
                   // Race: artifact was recreated or already deleted — treat as gone, proceed to retry
-                  console.warn(`[memory-lancedb-pro] ${errCode} cleanup: rmSync ${rmCode} (artifact changed during cleanup), retrying`);
+                  console.debug(`[memory-lancedb-pro] ${errCode} cleanup: rmSync ${rmCode} (artifact changed during cleanup), retrying`);
                   return true;
                 }
                 // Genuine cleanup failure
@@ -364,7 +364,7 @@ export class MemoryStore {
             if (statCode === "ENOENT") {
               // TOCTOU: artifact disappeared between existsSync and statSync (another
               // process released). Proceed to retry.
-              console.warn(`[memory-lancedb-pro] ${errCode} cleanup: statSync ENOENT (artifact gone), retrying`);
+              console.debug(`[memory-lancedb-pro] ${errCode} cleanup: statSync ENOENT (artifact gone), retrying`);
               return true;
             } else {
               const errMsg = statErr instanceof Error ? (statErr as Error).message : String(statErr);
