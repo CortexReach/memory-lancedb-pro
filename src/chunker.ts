@@ -37,6 +37,8 @@ export interface ChunkerConfig {
   semanticSplit: boolean;
   /** Max lines per chunk before we try to split earlier on a line boundary. */
   maxLinesPerChunk: number;
+  /** Use AST-aware splitting for code blocks (default: true). */
+  astAwareCodeSplit?: boolean;
 }
 
 // Common embedding context limits (provider/model specific). These are typically
@@ -189,6 +191,237 @@ const CJK_CHAR_TOKEN_DIVISOR = 2.5;
 const CJK_RATIO_THRESHOLD = 0.3;
 
 // ============================================================================
+// AST-aware Code Chunking
+// ============================================================================
+
+export type CodeLanguage = 'javascript' | 'typescript' | 'python' | 'go' | 'rust';
+
+const CODE_LANGUAGE_PATTERNS: Array<{ pattern: RegExp; lang: CodeLanguage }> = [
+  // Python: must check before JS (def/class are specific)
+  {
+    pattern: /\b(def\s|class\s|import\s|from\s|async\s+def\s|print\()/,
+    lang: 'python',
+  },
+  // Go: func and package keywords
+  {
+    pattern: /\b(func\s|package\s|import\s")/,
+    lang: 'go',
+  },
+  // Rust: fn/impl/pub are distinct
+  {
+    pattern: /\bfn\s|impl\s|pub\s|let\s+mut\s/,
+    lang: 'rust',
+  },
+  // TypeScript: interface / type alias / : type annotations (check before JS 'function')
+  {
+    pattern: /\b(interface\s|type\s+|:\s*(?:string|number|boolean|unknown|never|any|void|object|Error|Promise|Record|Array|Map|Set)\b)/,
+    lang: 'typescript',
+  },
+  // JavaScript / TypeScript: function, const/let/var, arrow, import/export, class
+  {
+    pattern: /\b(function|const\s|let\s|var\s|=>|import\s|export\s|class\s)/,
+    lang: 'javascript',
+  },
+];
+
+/**
+ * Detect if text is code and return the language, or null if not code.
+ * Uses only the first 200 chars to avoid being misled by comments.
+ */
+export function detectCodeLanguage(text: string): CodeLanguage | null {
+  const sample = text.slice(0, 400);
+  for (const { pattern, lang } of CODE_LANGUAGE_PATTERNS) {
+    if (pattern.test(sample)) return lang;
+  }
+  return null;
+}
+
+// Supported top-level declaration node types per language
+const JS_DECLARATION_TYPES = new Set([
+  'function_declaration',
+  'class_declaration',
+  'method_definition',
+  'arrow_function',
+  'export_statement',
+  'export_default_declaration',
+  'interface_declaration',
+  'type_alias_declaration',
+  'lexical_declaration', // const/let declarations
+  'variable_declaration',
+]);
+
+const PYTHON_DECLARATION_TYPES = new Set([
+  'function_definition',
+  'class_definition',
+  'decorated_definition',
+]);
+
+function isDeclarationNode(node: { type: string }, lang: CodeLanguage): boolean {
+  if (lang === 'javascript' || lang === 'typescript') {
+    return JS_DECLARATION_TYPES.has(node.type);
+  }
+  if (lang === 'python') return PYTHON_DECLARATION_TYPES.has(node.type);
+  return false;
+}
+
+/**
+ * Sub-split an oversized declaration at the statement level.
+ * Falls back to chunkDocument for the sub-split logic.
+ */
+function subChunk(text: string, config: ChunkerConfig): ChunkResult {
+  // For now, fall back to the character-based chunker within an oversized declaration.
+  // This preserves the existing behavior for sub-chunks while ensuring top-level
+  // declarations (functions/classes) are kept intact.
+  return chunkDocument(text, config);
+}
+
+/**
+ * AST-aware chunker for code. Parses the code with tree-sitter and splits
+ * on top-level declaration boundaries (function, class, etc.) instead of
+ * arbitrary character positions.
+ *
+ * NOTE: This function is synchronous to match the sync signature of smartChunk.
+ * tree-sitter is loaded via require() with a try-catch fallback.
+ */
+export function astChunk(
+  code: string,
+  language: CodeLanguage,
+  config: ChunkerConfig
+): ChunkResult {
+  // Attempt to load tree-sitter and language grammars
+  let LanguageMap: Record<string, any>;
+  // tree-sitter exports Parser as the default export (module.exports = Parser)
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  let TreeSitterParser: any;
+
+  try {
+    TreeSitterParser = require('tree-sitter');
+
+    if (language === 'javascript' || language === 'typescript') {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const JavaScript = require('tree-sitter-javascript');
+      LanguageMap = { javascript: JavaScript, typescript: JavaScript };
+    } else if (language === 'python') {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const Python = require('tree-sitter-python');
+      LanguageMap = { python: Python };
+    } else {
+      // Unsupported language — fall back
+      return chunkDocument(code, config);
+    }
+  } catch {
+    // tree-sitter not installed — fall back to character-based chunking
+    return chunkDocument(code, config);
+  }
+
+  const parser = new TreeSitterParser();
+  const chunks: string[] = [];
+  const metadatas: ChunkMetadata[] = [];
+
+  // Set language on the parser
+  let languageSet = false;
+  for (const [, langModule] of Object.entries(LanguageMap)) {
+    try {
+      parser.setLanguage(langModule);
+      languageSet = true;
+      break;
+    } catch {
+      // try next language
+    }
+  }
+
+  if (!languageSet) {
+    return chunkDocument(code, config);
+  }
+
+  let tree: any;
+  try {
+    tree = parser.parse(code);
+  } catch {
+    return chunkDocument(code, config);
+  }
+
+  const root = tree.rootNode;
+
+  // If there are ERROR nodes at the top level, the language parser likely does not
+  // support this syntax (e.g., TypeScript interface parsed by tree-sitter-javascript).
+  // Fall back to chunkDocument to avoid producing broken/incomplete chunks.
+  const hasErrorNodes = root.children.some(c => c.type === 'ERROR');
+  if (hasErrorNodes) {
+    return chunkDocument(code, config);
+  }
+
+  // Collect non-declaration content (comments, imports, etc.) that would otherwise be lost.
+  // These are prepended to the next declaration chunk to preserve no-content-left-behind semantics.
+  let pendingNonDecl = '';
+
+  // Walk top-level children
+  for (const child of root.children) {
+    // Skip non-named nodes and ERROR nodes
+    if (!child.type || child.type === 'ERROR') continue;
+
+    if (!isDeclarationNode(child, language)) {
+      // Collect non-declaration content (comments, imports, exports, etc.)
+      const text = code.slice(child.startIndex, child.endIndex);
+      if (text.length > 0) {
+        pendingNonDecl += (pendingNonDecl.length > 0 ? '\n' : '') + text;
+      }
+      continue;
+    }
+
+    const text = code.slice(child.startIndex, child.endIndex);
+
+    if (text.length === 0) continue;
+
+    // Prepend any pending non-declaration content to this declaration chunk
+    const fullText = pendingNonDecl.length > 0 ? pendingNonDecl + '\n' + text : text;
+    pendingNonDecl = ''; // reset
+
+    if (fullText.length <= config.maxChunkSize) {
+      chunks.push(fullText);
+      metadatas.push({
+        startIndex: child.startIndex,
+        endIndex: child.endIndex,
+        length: fullText.length,
+      });
+    } else {
+      // Oversized declaration with prepended content.
+      // We accept that this chunk may exceed maxChunkSize — splitting
+      // mid-declaration would break { } balance (Issue #692).
+      // Sub-splitting at statement level is Phase 2 work.
+      chunks.push(fullText);
+      metadatas.push({
+        startIndex: child.startIndex,
+        endIndex: child.endIndex,
+        length: fullText.length,
+      });
+    }
+  }
+
+  // If there is trailing non-declaration content (e.g., trailing comments with no following decl),
+  // emit it as its own chunk (fall back to chunkDocument to handle sizing).
+  if (pendingNonDecl.length > 0) {
+    const trailing = chunkDocument(pendingNonDecl, config);
+    for (let i = 0; i < trailing.chunks.length; i++) {
+      chunks.push(trailing.chunks[i]);
+      metadatas.push(trailing.metadatas[i]);
+    }
+  }
+
+  // If we got nothing (e.g. empty file, parse error), fall back
+  if (chunks.length === 0) {
+    return chunkDocument(code, config);
+  }
+
+  return {
+    chunks,
+    metadatas,
+    totalOriginalLength: code.length,
+    chunkCount: chunks.length,
+  };
+}
+
+// ============================================================================
 // Chunking Core
 // ============================================================================
 
@@ -276,7 +509,16 @@ export function smartChunk(text: string, embedderModel?: string): ChunkResult {
     minChunkSize: Math.max(100, Math.floor(base * 0.1 / divisor)),
     semanticSplit: true,
     maxLinesPerChunk: 50,
+    astAwareCodeSplit: true,
   };
+
+  // AST-aware code path: only activate when explicitly enabled
+  if (config.astAwareCodeSplit === true) {
+    const lang = detectCodeLanguage(text);
+    if (lang !== null) {
+      return astChunk(text, lang, config);
+    }
+  }
 
   return chunkDocument(text, config);
 }
