@@ -217,12 +217,17 @@ export class MemoryStore {
   }> = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private flushLock: Promise<void> = Promise.resolve(); // Promise-based lock，防止 concurrent doFlush()
+  // 【MR4 fix】標記實例已摧毀，防止 destroy() 後 bulkStore() 悄悄重啟 timer
+  private destroyed = false;
   private static readonly FLUSH_INTERVAL_MS = 100;
   // 單次 lock acquisition 上限。將大量 entries 拆分多個 chunk 寫入，
   // 每個 chunk 獨立 lock acquisition，失敗時只影響該 chunk（per-chunk isolation）。
   // LanceDB 本身無批次上限，此值參考 LanceDB 預設 row-group size（256）
   // 訂定，在兼顧併發吞吐與記憶體佔用下是一個合理的經驗值。
   private static readonly MAX_BATCH_SIZE = 250;
+  // 【MR2 fix】pendingBatch 上限，防止高生產率時無限增長。
+  // 當 pending callers 超過此值時，block 並同步 flush，確保 pendingBatch 不會無限膨胀。
+  private static readonly MAX_PENDING_BATCH_SIZE = 1000;
 
   constructor(private readonly config: StoreConfig) { }
 
@@ -520,6 +525,10 @@ export class MemoryStore {
   async bulkStore(
     entries: Omit<MemoryEntry, "id" | "timestamp">[],
   ): Promise<MemoryEntry[]> {
+    // 【MR4 fix】阻止 destroy() 後的呼叫
+    if (this.destroyed) {
+      throw new Error("MemoryStore instance has been destroyed");
+    }
     await this.ensureInitialized();
 
     // Filter out invalid entries（undefined, null, missing text/vector）
@@ -540,7 +549,14 @@ export class MemoryStore {
       metadata: entry.metadata || "{}",
     }));
 
-    // 回傳小型 Promise，實際寫入在背景 flush 完成
+    // 【MR2 fix】當 pendingBatch 達到上限時，等待前一個 flush 完成後再加入
+    // 這確保 pendingBatch 有上限，不會无限增长
+    if (this.pendingBatch.length >= MemoryStore.MAX_PENDING_BATCH_SIZE) {
+      // 等 flushLock 釋放（即上一個 doFlush 完成後）
+      await this.flushLock;
+    }
+
+    // 回錄小型 Promise，實際寫入在背景 flush 完成
     return new Promise<MemoryEntry[]>((resolve, reject) => {
       this.pendingBatch.push({ entries: fullEntries, resolve, reject });
 
@@ -548,7 +564,11 @@ export class MemoryStore {
       if (!this.flushTimer) {
         this.flushTimer = setTimeout(() => {
           this.flushTimer = null;
-          this.doFlush();
+          // 【MR3 fix】doFlush() 可能同步拋出（例如 LanceDB 同步錯誤），
+          // fire-and-forget 若無 .catch() 會觸發 Node.js unhandled promise rejection
+          this.doFlush().catch((err) => {
+            console.error(`[memory-lancedb-pro] doFlush() timer callback error: ${err instanceof Error ? err.message : String(err)}`);
+          });
         }, MemoryStore.FLUSH_INTERVAL_MS);
       }
     });
@@ -622,12 +642,17 @@ export class MemoryStore {
       // 統一結算：根據 failedCallers 決定 resolve 或 reject
       // D7 fix: caller.reject() 可能拋出（當 caller promise 已被 resolve/reject 處理過），
       // 必須用 try/catch 包住，否則 for 迴圈會被中斷，導致後續 caller 完全未被結算
+      // 【F3 fix】錯誤訊息包含 chunk 範圍，讓 caller 從 error.message 就能判斷哪些 entries 可能已寫入
       const errorToReport = lastError ?? new Error("flush failed");
       let callerIdx = 0;
       for (const caller of batch) {
         if (failedCallers.has(callerIdx)) {
+          // 從 errorToReport.message 解析 chunk 範圍（例如 "batch flush failed at chunk [250, 500): ...")
+          const chunkInfo = errorToReport.message.includes("chunk [")
+            ? ` (${errorToReport.message.match(/chunk \[(\d+), (\d+)\]/)?.[0]})`
+            : "";
           try {
-            caller.reject(new Error(`batch flush failed`, { cause: errorToReport }));
+            caller.reject(new Error(`batch flush failed${chunkInfo}`, { cause: errorToReport }));
           } catch (rejectErr) {
             console.error(`[memory-lancedb-pro] caller.reject() 拋出（可能被重複結算忽略）: ${rejectErr instanceof Error ? rejectErr.message : String(rejectErr)}`);
           }
@@ -691,6 +716,8 @@ export class MemoryStore {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+    // 【MR4 fix】設定 destroyed flag，阻止後續 bulkStore() 呼叫
+    this.destroyed = true;
     const result = await this.doFlush();
     // 【修復 Issue #3: destroy() error propagation】
     if (result.hasError && result.lastError) {
