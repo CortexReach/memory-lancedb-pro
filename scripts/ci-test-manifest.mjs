@@ -64,6 +64,9 @@ export const CI_TEST_MANIFEST = [
   // Issue #492 agentId validation tests
   { group: "core-regression", runner: "node", file: "test/agentid-validation.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/command-reflection-guard.test.mjs", args: ["--test"] },
+  // Issue #693 extraction write validation tests
+  { group: "core-regression", runner: "node", file: "test/extraction-validation.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/dedup-false-alarm.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
