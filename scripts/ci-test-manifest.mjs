@@ -63,6 +63,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/bulk-recovery-rollback.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/upgrader-whitelist-regression.test.mjs" },
   // Issue #680 regression tests
+  { group: "core-regression", runner: "node", file: "test/memory-reflection-issue680-tdd.test.mjs", args: ["--test"] },
   // Issue #492 agentId validation tests
   { group: "core-regression", runner: "node", file: "test/agentid-validation.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/command-reflection-guard.test.mjs", args: ["--test"] },
