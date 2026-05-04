@@ -3116,7 +3116,17 @@ const memoryLanceDBProPlugin = {
         let timeoutId: ReturnType<typeof setTimeout> | undefined;
         try {
           const result = await Promise.race([
-            recallWork(recallAbort.signal).then((r) => { clearTimeout(timeoutId); return r; }),
+            recallWork(recallAbort.signal)
+              .then((r) => { clearTimeout(timeoutId); return r; })
+              .catch((err) => {
+                // Suppress only the late rejection when OUR timeout controller
+                // won the race — the timeout path already resolved undefined.
+                // Other errors (non-abort) still propagate via Promise.race.
+                if (recallAbort.signal.aborted) {
+                  return undefined as unknown as never;
+                }
+                throw err;
+              }),
             new Promise<undefined>((resolve) => {
               timeoutId = setTimeout(() => {
                 // Cancel in-flight embedding/retrieval HTTP calls so they don't
