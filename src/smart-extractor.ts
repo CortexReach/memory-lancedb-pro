@@ -497,10 +497,14 @@ export class SmartExtractor {
           `memory-pro: smart-extractor: ${failedCount}/${invalidateEntries.length} invalidation updates failed after bulkStore succeeded. Failed IDs: ${failedIds}. Rolling back ${succeededCount} succeeded update(s)…`,
         );
 
-        // Rollback: revert metadata on entries that were successfully updated.
-        // We stored the original metadata in each invalidateEntry as _origMetadata.
+        // Rollback: revert metadata on entries whose invalidation update SUCCEEDED.
+        // Entries whose update failed were never modified — no rollback needed for them.
+        const succeeded = results
+          .map((r, i) => ({ inv: invalidateEntries[i], result: r }))
+          .filter(({ result }) => result.status === 'fulfilled');
+
         const rollbackResults = await Promise.allSettled(
-          failed.map(({ inv }) => {
+          succeeded.map(({ inv }) => {
             const orig = (inv as any)._origMetadata;
             if (!orig) return Promise.resolve();
             return this.store.update(inv.id, { metadata: orig }, scopeFilter);

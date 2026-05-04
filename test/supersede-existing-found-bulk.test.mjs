@@ -310,7 +310,7 @@ describe("Issue #676: handleSupersede batch mode with real SmartExtractor", () =
    * TC-4: Verify invalidated entry metadata has invalidated_at set
    *
    * After store.update() is called, the old entry should have invalidated_at set.
-   * superseded_by is intentionally OMITTED in batch mode (new ID unknown).
+   * superseded_by is BACKFILLED in batch mode (from bulkStore result ID in second pass).
    */
   it("store.update() receives metadata with invalidated_at", async () => {
     const existingRecord = {
@@ -346,18 +346,18 @@ describe("Issue #676: handleSupersede batch mode with real SmartExtractor", () =
     assert.ok(updatedMeta.invalidated_at > 0,
       "invalidated_at must be set on old entry");
 
-    // superseded_by is null in batch mode (new ID unknown until bulkStore)
-    // This is intentional - new entry's 'supersedes: matchId' provides dedup signal
-    assert.strictEqual(updatedMeta.superseded_by, undefined,
-      "superseded_by is undefined in batch mode (field omitted from patch — JSON drops undefined keys)");
-
-    // Also verify: new entry's 'supersedes' field is set to existingRecord.id
-    // (This is the authoritative dedup signal — superseded_by on old entry is omitted
-    // because new ID is unknown until bulkStore completes)
+    // After backfill (PR #678 second-pass): superseded_by is set from bulkStore result ID.
+    // The new entry's 'supersedes: matchId' still provides the primary dedup signal,
+    // but superseded_by backlink on the old entry is now also set for completeness.
     const newEntry = store.calls.bulkStore[0].entries[0];
     assert.ok(newEntry, "bulkStore must receive 1 new entry");
-    const newMeta = JSON.parse(newEntry.metadata);
-    assert.strictEqual(newMeta.supersedes, existingRecord.id,
+    // Backfill: old entry's superseded_by now points to the new entry's generated ID.
+    // We verify the field is present/non-null rather than asserting a specific value
+    // since the mock store generates IDs differently than production.
+    assert.ok(updatedMeta.superseded_by != null && updatedMeta.superseded_by !== undefined,
+      "superseded_by must be backfilled from bulkStore result (not undefined/null after backfill)");
+    const parsedNewMeta = JSON.parse(newEntry.metadata);
+    assert.strictEqual(parsedNewMeta.supersedes, existingRecord.id,
       "new entry must have supersedes pointing to old entry ID (authoritative dedup signal)");
 
     console.log(`\n📊 Invalidation metadata:`);

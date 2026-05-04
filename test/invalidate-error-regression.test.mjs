@@ -221,17 +221,16 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
     console.log(`   log entries: ${logSpy.entries.length}`);
     console.log(`   errorLog: ${errorLog}`);
 
-    // Rollback note: update is called 2x — once for the initial invalidation (which fails
-    // because failOnUpdateId matches), and once again during rollback (same id still fails
-    // because _origMetadata is still the original value). The rollback is correct behaviour
-    // (trying to restore), but our mock makes every update() for that id throw.
-    // The real store would succeed on rollback because _origMetadata is the original state.
+    // Rollback: after invalidation, update() for the failed entry is called once (fails).
+    // Then rollback operates on SUCCEEDED entries — since this entry failed, its
+    // update was never committed, so nothing gets rolled back (succeeded array empty).
+    // net result: 1 update call total (not 2).
     assert.strictEqual(threw, false,
       "store.update() rejection must NOT throw — original api.logger bug would throw ReferenceError");
     assert.strictEqual(store.getBulkStoreCallCount(), 1,
       "bulkStore must succeed even if invalidation fails");
-    assert.strictEqual(store.getUpdateCallCount(), 2,
-      "update is called twice: initial invalidation + rollback attempt on the same failed id");
+    assert.strictEqual(store.getUpdateCallCount(), 1,
+      "update called once for the failed invalidation; rollback skipped (no succeeded entries)");
     assert.ok(logSpy.entries.length >= 1,
       "this.log() must be called to log the error");
     assert.ok(errorLog,
@@ -318,12 +317,13 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
       "session:test-rf1-3",
     );
 
-    // Summary log is split across two this.log() calls:
-    // (1) "1/1 ... failed ... Rolling back" — reports the failure count
-    // (2) "ROLLBACK FAILED ... inconsistent" — reports that rollback itself also failed
-    // Both are emitted; we check that each piece is present somewhere in the log.
+    // With corrected rollback (succeeded entries, not failed):
+    // - failed = [existing-003], succeeded = []
+    // - Log: "1/1 ... failed ... Rolling back 0 succeeded update(s)..."
+    // - Rollback skipped (succeeded is empty) → no "ROLLBACK FAILED" log
+    // - Instead: "Rollback complete — all 0 succeeded invalidation(s) reverted"
     const failureReport = logSpy.entries.find(e => e.includes("1/1") && e.includes("failed"));
-    const rollbackReport = logSpy.entries.find(e => e.toLowerCase().includes("inconsistent"));
+    const rollbackReport = logSpy.entries.find(e => e.includes("Rollback complete"));
 
     console.log(`\n📊 TC-3:`);
     console.log(`   log entries: ${logSpy.entries.length}`);
