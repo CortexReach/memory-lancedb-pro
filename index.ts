@@ -1672,9 +1672,16 @@ function createAdmissionRejectionAuditWriter(
     return null;
   }
 
-  const filePath = api.resolvePath(
-    resolveRejectedAuditFilePath(resolvedDbPath, config.admissionControl),
+  const rawFilePath = resolveRejectedAuditFilePath(
+    resolvedDbPath,
+    config.admissionControl,
   );
+  // resolveRejectedAuditFilePath returns an already-absolute derived path
+  // (join of resolvedDbPath + ".."). User-configured relative paths are
+  // resolved here; absolute user paths pass through unchanged.
+  const filePath = rawFilePath.startsWith("/")
+    ? rawFilePath
+    : api.resolvePath(rawFilePath);
 
   return async (entry: AdmissionRejectionAuditEntry) => {
     try {
