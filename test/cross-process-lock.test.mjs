@@ -62,8 +62,12 @@ describe("cross-process file locking", () => {
         store2.store({ text: "s2", vector: [0.4, 0.5, 0.6], category: "fact", scope: "global", importance: 0.5, metadata: "{}" }),
       ]);
 
-      // 至少一個成功（另一個可能因 ELOCKED 或順利取得 lock）
       const successes = results.filter(r => r.status === "fulfilled");
+      // At least one should succeed (the other may get ELOCKED if it arrived second,
+      // or both may succeed if serialized). MR5 NOTE: successes.length >= 1 is
+      // intentionally lenient — normal contention should serialize writers (2 successes)
+      // but under high load/GC the second writer may timeout. A stricter assertion
+      // (=== 2) would make this test flaky.
       assert.ok(successes.length >= 1, `Expected at least 1 success, got ${successes.length}`);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -72,8 +76,8 @@ describe("cross-process file locking", () => {
 
   it("cleans up lock artifact after successful release", async () => {
     const { store, dir } = makeStore();
-    // With lockfilePath: lockPath (PR#674), proper-lockfile v4 creates a DIRECTORY
-    // artifact at lockPath. After successful release() the transient dir is removed.
+    // proper-lockfile v4 creates a DIRECTORY artifact at ${lockPath}.lock/
+    // (without lockfilePath override). After successful release() the transient dir is removed.
     const lockPath = join(dir, ".memory-write.lock");
 
     await store.store({ text: "t", vector: [0.1, 0.2, 0.3], category: "fact", scope: "global", importance: 0.5, metadata: "{}" });

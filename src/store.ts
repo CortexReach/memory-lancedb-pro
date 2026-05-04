@@ -227,9 +227,14 @@ export class MemoryStore {
 
     // Helper: proactively cleanup stale lock artifacts
     // Cleans up both FILE artifacts (old v3) and DIRECTORY artifacts (v4)
-    // Also cleans legacy ${lockPath}.lock (v3 default artifact) for rolling upgrades
+    // Also cleans legacy ${lockPath}.lock (v3 default artifact) for rolling upgrades.
+    // F3 NOTE: cleanup only checks lockPath + ${lockPath}.lock. If proper-lockfile
+    // is configured with a custom lockfilePath, this cleanup will miss it. Custom
+    // lockfilePath support would require storing the artifact path in config.
     const cleanupStaleArtifact = () => {
-      // Primary artifact (v4 + explicit lockfilePath)
+      // Primary artifact (v4 default: ${lockPath}.lock/ — directory)
+      // Note: we check lockPath directly; if artifact is at a custom lockfilePath
+      // (not supported in current impl), this cleanup will not detect it.
       if (existsSync(lockPath)) {
         try {
           const stat = statSync(lockPath);
@@ -299,13 +304,11 @@ export class MemoryStore {
         },
       });
 
-    // ELOCKED/ENOTDIR handler threshold: 10 秒 — 積極設定
-    // 收到 ELOCKED 時，代表有人在等了，應該盡快解鎖
-    // 為什麼比 proactive cleanup（5 分鐘）更積極：
-    // - proactive cleanup：還沒有人抱怨，保守清理避免誤刪正常 lock
-    // - ELOCKED handler：已經有人被 blocked，積極刪除 stale artifact 讓操作繼續
-    // 10 秒與 proper-lockfile 內部 stale threshold 一致（ECOMPROMISED at 10s）
-    const STALE_THRESHOLD_MS = 10000;
+    // F1 FIX: ELOCKED/ENOTDIR handler threshold — 統一用 proactive cleanup 的 5min threshold
+    // 避免不一致：若用 10s threshold，30s old 的 active holder artifact 會被
+    // ELOCKED handler 刪除（>10s），但 proactive cleanup 不會（<5min）——破壞 mutual exclusion。
+    // 統一用 5min：artifact age > 5min 才視為 stale，低於此值不刪，保持與 proactive cleanup 一致。
+    const STALE_THRESHOLD_MS = staleThresholdMs;
 
     let release: (() => Promise<void>) | undefined;
     try {
@@ -345,16 +348,15 @@ export class MemoryStore {
                   return true;
                 }
                 // Genuine cleanup failure
-                const errMsg = err instanceof Error ? err.message : String(err);
                 const wrapped = new Error(`${errCode} cleanup rm failed (${rmCode}): ${rmErr}`, { cause: rmErr });
                 (wrapped as NodeJS.ErrnoException).code = rmCode;
                 throw wrapped;
               }
             } else {
               // Artifact is NOT stale — belongs to an ACTIVE holder.
-              const errMsg = err instanceof Error ? err.message : String(err);
-              const wrapped = new Error(`ELOCKED: ${artifactPath} exists and is NOT stale (age=${age}ms≤${STALE_THRESHOLD_MS}ms); active holder present, not removing`, { cause: err });
-              (wrapped as NodeJS.ErrnoException).code = "ELOCKED";
+              // MR2 FIX: do not claim "NOT stale" for ENOTDIR — staleness is ELOCKED-specific.
+              const wrapped = new Error(`${errCode}: ${artifactPath} exists and is NOT stale (age=${age}ms≤${STALE_THRESHOLD_MS}ms); active holder present, not removing`, { cause: err });
+              (wrapped as NodeJS.ErrnoException).code = errCode;
               throw wrapped;
             }
           } catch (statErr: unknown) {
