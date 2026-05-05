@@ -65,6 +65,32 @@ function createEmbeddingServer() {
   });
 }
 
+function appendHook(api, name, handler) {
+  const existing = api.hooks[name];
+  if (!existing) {
+    api.hooks[name] = handler;
+    return;
+  }
+
+  const handlers = existing.__handlers || [existing];
+  handlers.push(handler);
+
+  const combined = async (...args) => {
+    let result;
+    for (const hook of handlers) {
+      result = await hook(...args);
+      const backgroundRun = hook.__lastRun;
+      if (backgroundRun && typeof backgroundRun.then === "function") {
+        combined.__lastRun = backgroundRun;
+      }
+    }
+    return result;
+  };
+
+  combined.__handlers = handlers;
+  api.hooks[name] = combined;
+}
+
 function createMockApi(dbPath, embeddingBaseURL, llmBaseURL, logs, pluginConfigOverrides = {}) {
   return {
     pluginConfig: {
@@ -139,10 +165,10 @@ function createMockApi(dbPath, embeddingBaseURL, llmBaseURL, logs, pluginConfigO
       this.services.push(service);
     },
     on(name, handler) {
-      this.hooks[name] = handler;
+      appendHook(this, name, handler);
     },
     registerHook(name, handler) {
-      this.hooks[name] = handler;
+      appendHook(this, name, handler);
     },
   };
 }
@@ -1347,7 +1373,7 @@ async function runCumulativeTurnCountingScenario() {
       // extractMinMessages=2 (the key setting for this test)
       { extractMinMessages: 2, smartExtraction: true, captureAssistant: false },
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     const sessionKey = "agent:main:discord:dm:user123";
     const channelId = "discord";
@@ -1467,7 +1493,7 @@ async function runCounterResetSuccessScenario() {
       // extractMinMessages=2: turns 1+2 cumulative=2 triggers extraction
       { extractMinMessages: 2, smartExtraction: true, captureAssistant: false },
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     const sessionKey = "agent:main:discord:dm:user789";
     const channelId = "discord";
@@ -1626,7 +1652,7 @@ async function runDedupDecisionLLMCallScenario() {
       `http://127.0.0.1:${llmPort}`, logs,
       { extractMinMessages: 1, smartExtraction: true, captureAssistant: false },
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     // Seed a memory that matches the LLM-extracted candidate.
     // seedPreference seeds text="饮品偏好：乌龙茶" with category="preference"
@@ -1635,7 +1661,7 @@ async function runDedupDecisionLLMCallScenario() {
     // so execution reaches Stage 2 (llmDedupDecision).
     await seedPreference(dbPath);
 
-    const sessionKey = "agent:main:discord:dm:user999";
+    const sessionKey = "agent:life:discord:dm:user999";
     const channelId = "discord";
     const conversationId = "dm:user999";
 
@@ -1648,7 +1674,7 @@ async function runDedupDecisionLLMCallScenario() {
     await runAgentEndHook(
       api,
       { success: true, messages: [{ role: "user", content: "我喜歡把重要的修復寫成 regression test" }] },
-      { agentId: "main", sessionKey },
+      { agentId: "life", sessionKey },
     );
 
     return { extractCalls, dedupCalls, logs };
@@ -1758,7 +1784,7 @@ async function runDmFallbackMustfixScenario() {
       `http://127.0.0.1:${llmPort}`, logs,
       { extractMinMessages: 1, smartExtraction: true },
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
     const sessionKey = "agent:main:discord:dm:user456";
 
     await runAgentEndHook(api, {
@@ -1885,7 +1911,7 @@ async function runDmKeyFallbackIntegrationScenario() {
       `http://127.0.0.1:${llmPort}`, logs,
       { extractMinMessages: 1, smartExtraction: true, captureAssistant: false },
     );
-    plugin.register(api);
+    registerFreshPlugin(api);
 
     const dmChannelId = "discord:dm:user456";
     const dmSessionKey = "agent:main:discord:dm:user456";
