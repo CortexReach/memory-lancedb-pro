@@ -13,11 +13,12 @@ import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 
-// Detect CLI mode: when running as a CLI subcommand (e.g. `openclaw memory-pro stats`),
-// OpenClaw sets OPENCLAW_CLI=1 in the process environment. Registration and
-// lifecycle logs are noisy in CLI context (printed to stderr before command output),
-// so we downgrade them to debug level when running in CLI mode.
-const isCliMode = () => process.env.OPENCLAW_CLI === "1";
+// Detect CLI/runtime registration mode from the plugin API instead of relying on
+// process-global environment flags. Gateway plugin loading can evaluate code in the
+// same process family as CLI helpers during reload/restart, so OPENCLAW_CLI is too
+// blunt for deciding whether to short-circuit runtime registration.
+const isCliRegistrationMode = (api: Pick<OpenClawPluginApi, "registrationMode">) =>
+  api.registrationMode === "cli-metadata";
 
 // Import core components
 import { MemoryStore, validateStoragePath } from "./src/store.js";
@@ -1890,7 +1891,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         noiseBank,
       });
 
-      (isCliMode() ? api.logger.debug : api.logger.info)(
+      (isCliRegistrationMode(api) ? api.logger.debug : api.logger.info)(
         "memory-lancedb-pro: smart extraction enabled (LLM model: "
         + llmModel
         + ", timeoutMs: "
@@ -1916,7 +1917,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const autoCapturePendingIngressTexts = new Map<string, string[]>();
   const autoCaptureRecentTexts = new Map<string, string[]>();
 
-  const logReg = isCliMode() ? api.logger.debug : api.logger.info;
+  const logReg = isCliRegistrationMode(api) ? api.logger.debug : api.logger.info;
   logReg(
     `memory-lancedb-pro@${pluginVersion}: plugin registered [singleton init] `
     + `(db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`,
@@ -2249,7 +2250,7 @@ const memoryLanceDBProPlugin = {
       return next;
     };
 
-    const logReg = isCliMode() ? api.logger.debug : api.logger.info;
+    const logReg = isCliRegistrationMode(api) ? api.logger.debug : api.logger.info;
     logReg(
       `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
     );
@@ -3330,7 +3331,7 @@ const memoryLanceDBProPlugin = {
         });
       }
 
-      (isCliMode() ? api.logger.debug : api.logger.info)(
+      (isCliRegistrationMode(api) ? api.logger.debug : api.logger.info)(
         "self-improvement: integrated hooks registered (agent:bootstrap, command:new, command:reset)"
       );
     }
@@ -3879,7 +3880,7 @@ const memoryLanceDBProPlugin = {
         name: "memory-lancedb-pro.memory-reflection.command-reset",
         description: "Generate reflection log before /reset",
       });
-      (isCliMode() ? api.logger.debug : api.logger.info)(
+      (isCliRegistrationMode(api) ? api.logger.debug : api.logger.info)(
         "memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_prompt_build, session_end)"
       );
     }
@@ -3992,10 +3993,10 @@ const memoryLanceDBProPlugin = {
         }
       });
 
-      (isCliMode() ? api.logger.debug : api.logger.info)("session-memory: typed before_reset hook registered for /new session summaries");
+      (isCliRegistrationMode(api) ? api.logger.debug : api.logger.info)("session-memory: typed before_reset hook registered for /new session summaries");
     }
     if (config.sessionStrategy === "none") {
-      (isCliMode() ? api.logger.debug : api.logger.info)("session-strategy: using none (plugin memory-reflection hooks disabled)");
+      (isCliRegistrationMode(api) ? api.logger.debug : api.logger.info)("session-strategy: using none (plugin memory-reflection hooks disabled)");
     }
 
     // ========================================================================
