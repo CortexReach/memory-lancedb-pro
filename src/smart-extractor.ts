@@ -435,6 +435,9 @@ export class SmartExtractor {
 
     const createEntries: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[] = [];
     const invalidateEntries: InvalidateEntry[] = [];
+    // MR2: track matchIds already queued for supersession in this batch to prevent
+    // duplicate supersedes of the same entry (which would leave inconsistent superseded_by).
+    const queuedSupersedeMatchIds = new Set<string>();
 
     for (const { index, candidate } of processableCandidates) {
       try {
@@ -448,6 +451,7 @@ export class SmartExtractor {
           precomputedVectors.get(index),
           createEntries,
           invalidateEntries,
+          queuedSupersedeMatchIds,
         );
       } catch (err) {
         this.log(
@@ -783,6 +787,7 @@ export class SmartExtractor {
     precomputedVector?: number[],
     createEntries?: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[],
     invalidateEntries?: InvalidateEntry[],
+    queuedSupersedeMatchIds?: Set<string>,
   ): Promise<void> {
     // Profile always merges (skip dedup — admission control still applies)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -885,19 +890,32 @@ export class SmartExtractor {
           dedupResult.matchId &&
           TEMPORAL_VERSIONED_CATEGORIES.has(candidate.category)
         ) {
-          await this.handleSupersede(
-            candidate,
-            vector,
-            dedupResult.matchId,
-            sessionKey,
-            targetScope,
-            scopeFilter,
-            admission?.audit,
-            createEntries,
-            invalidateEntries,
-          );
-          stats.created++;
-          stats.superseded = (stats.superseded ?? 0) + 1;
+          // MR2: if this matchId is already queued for supersession by an earlier
+          // candidate in this batch, skip the supersede and create as a new entry.
+          // This prevents duplicate new entries and inconsistent superseded_by linkage
+          // when multiple candidates would supersede the same existing record.
+          if (queuedSupersedeMatchIds?.has(dedupResult.matchId)) {
+            this.log(
+              `memory-pro: smart-extractor: matchId ${dedupResult.matchId.slice(0, 8)} already queued for supersession — creating as new entry instead`,
+            );
+            createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
+            stats.created++;
+          } else {
+            queuedSupersedeMatchIds?.add(dedupResult.matchId);
+            await this.handleSupersede(
+              candidate,
+              vector,
+              dedupResult.matchId,
+              sessionKey,
+              targetScope,
+              scopeFilter,
+              admission?.audit,
+              createEntries,
+              invalidateEntries,
+            );
+            stats.created++;
+            stats.superseded = (stats.superseded ?? 0) + 1;
+          }
         } else {
           createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
           stats.created++;
@@ -1356,6 +1374,7 @@ export class SmartExtractor {
       const invalidatedMeta = buildSmartMetadata(existing, {
         fact_key: factKey,
         invalidated_at: now,
+        valid_from: now, // Must be set so second-pass buildSmartMetadata preserves invalidated_at
         // superseded_by: will be set in the second pass after bulkStore returns IDs
       });
       invalidateEntries?.push({

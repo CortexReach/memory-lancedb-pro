@@ -626,26 +626,28 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
 
 
   /**
-   * TC-6: F2 — Two candidates supersede the same existing entry.
+   * TC-6: MR2 — Two candidates would supersede the same existing entry.
    *
-   * F2 (Maintainer review): Rollback only deleted newEntryIds from succeeded
-   * invalidations, leaving orphans from failed invalidations.
+   * With MR2 fix, the second candidate is deduplicated to "create as new"
+   * instead of attempting a supersede that would fail (same entry already has
+   * superseded_by from first candidate's invalidation).
    *
-   * Scenario:
+   * Scenario (MR2 behavior):
    * 1. One existing entry X in DB (existing-001)
-   * 2. Candidate A and Candidate B both match X (same matchId)
-   *    → Both call handleSupersede(X), both queue new entries (A1, B1)
-   *    → Both push invalidateEntries for X (inv[0]: X, inv[1]: X)
-   * 3. bulkStore([A1, B1]) → bulkResults = [A1_with_id, B1_with_id]
-   * 4. Second pass: inv[0].newEntryId = A1.id, inv[1].newEntryId = B1.id
-   * 5. Invalidation (Promise.allSettled):
-   *    → inv[0] update(X, superseded_by=A1.id): succeeds
-   *    → inv[1] update(X, superseded_by=B1.id): FAILS (X already has superseded_by=A1)
-   * 6. Rollback Phase 1 (F2 FIX): deletes ALL newEntryIds (A1.id AND B1.id)
-   *    → BOTH new entries are deleted, including failed inv's orphan
-   * 7. Rollback Phase 2: restores X metadata (succeeded inv[0] only)
+   * 2. Candidate A matches X → handleSupersede(X) → invalidateEntries[0] + A1 queued
+   * 3. Candidate B matches X (same matchId) → MR2 dedup kicks in
+   *    → "matchId existing already queued for supersession — creating as new entry instead"
+   *    → B1 queued as create (NOT in invalidateEntries)
+   * 4. bulkStore([A1, B1]) → bulkResults = [A1_with_id, B1_with_id]
+   * 5. Second pass: inv[0].newEntryId = A1.id
+   * 6. Invalidation: 1 update (inv[0], A's supersede) → succeeds (first update to X)
+   * 7. Rollback Phase 1: deletes A1.id (only entry in invalidateEntries)
+   * 8. Rollback Phase 2: restores X metadata (succeeded inv[0] only)
+   *
+   * Note: B1 is NOT deleted because B was NOT in invalidateEntries (MR2 dedup).
+   * B1 remains as a valid new entry — this is correct behavior.
    */
-  it("TC-6: F2 — rollback deletes ALL newEntryIds (including failed inv's orphan)", async () => {
+  it("TC-6: MR2 — second candidate deduplicated to create (not supersede same entry)", async () => {
     const existing001 = {
       id: "existing-001",
       text: "User prefers oat milk",
@@ -718,15 +720,15 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
     assert.strictEqual(bulkEntries.length, 2,
       "bulkStore should receive 2 new entries (A1 and B1)");
 
-    // update calls: 2 invalidation + 1 rollback = 3 total
-    assert.strictEqual(store.getUpdateCallCount(), 3,
-      `Expected 3 update calls (2 invalidation + 1 rollback), got ${store.getUpdateCallCount()}`);
+    // update calls: 1 invalidation only (MR2 dedup prevents B from even attempting update)
+    // Since no update failed → no rollback triggered
+    assert.strictEqual(store.getUpdateCallCount(), 1,
+      `Expected 1 update call (A's invalidation; B deduped before attempting update), got ${store.getUpdateCallCount()}`);
 
-    // F2 FIX VERIFICATION: delete calls should be 2 (A1.id AND B1.id)
-    // Before F2 fix: only succeeded inv's newEntryId was deleted → 1 delete
-    // After F2 fix: ALL inv.newEntryId are deleted → 2 deletes
-    assert.strictEqual(store.getDeleteCallCount(), 2,
-      `F2 FIX: Rollback should delete BOTH new entries (A1 and B1), got ${store.getDeleteCallCount()} deletes`);
+    // delete calls: 0 (no rollback since no failed invalidations)
+    // This is the correct MR2 behavior: dedup prevents the race condition entirely
+    assert.strictEqual(store.getDeleteCallCount(), 0,
+      `MR2: Rollback should not be triggered (no failed invalidations), got ${store.getDeleteCallCount()} deletes`);
 
     const deleteIds = store.calls.delete.map(d => d.id);
     assert.strictEqual(deleteIds.every(id => id.startsWith("bulk-")), true,
@@ -737,10 +739,10 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
     assert.ok(!rollbackFailedLog,
       "Rollback itself should succeed (no ROLLBACK FAILED log)");
 
-    console.log(`\n📊 TC-6 F2 verification:`);
-    console.log(`   delete calls: ${store.getDeleteCallCount()} (expected: 2 — both A1 AND B1)`);
-    console.log(`   deleted ids: ${deleteIds.join(", ")}`);
-    console.log(`   ✅ Both succeeded and failed inv newEntryIds are deleted`);
+    console.log(`\n📊 TC-6 MR2 verification:`);
+    console.log(`   update calls: ${store.getUpdateCallCount()} (expected: 1 — A's invalidation; B deduped)`);
+    console.log(`   delete calls: ${store.getDeleteCallCount()} (expected: 0 — no rollback needed)`);
+    console.log(`   ✅ MR2 dedup prevents race condition; no failed invalidations, no rollback`);
   });
 
 });
