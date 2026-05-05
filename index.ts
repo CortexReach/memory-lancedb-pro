@@ -3570,22 +3570,15 @@ const memoryLanceDBProPlugin = {
           const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
           let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
           const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
-          // Guard: skip reflection for invalid agentId formats (numeric chat_id, etc.)
-          if (isInvalidAgentIdFormat(sourceAgentId, config.declaredAgents)) {
+          // Guard: skip if agentId is invalid format — consistent with other hook sites (Issue #686)
+          // NOTE: Layer 3 (declaredAgents) intentionally omitted — scope discipline for #686;
+          // Layer 3 is a separate concern for a follow-up PR (not a technical limitation).
+          if (isInvalidAgentIdFormat(sourceAgentId)) {
             api.logger.debug?.(
-              `memory-reflection: command hook skipped (invalid agentId=${sourceAgentId}, sessionKey=${sessionKey ?? "(none)"})`,
+              `memory-reflection: command hook skipped \u2014 invalid agentId '${sourceAgentId}'`,
             );
             return;
           }
-          // Exclude agents/sessions listed in memoryReflection.excludeAgents (supports wildcards)
-          const excludePatterns = config.memoryReflection?.excludeAgents;
-          if (excludePatterns && isAgentOrSessionExcluded(sourceAgentId, sessionKey, excludePatterns)) {
-            api.logger.debug?.(
-              `memory-reflection: command hook skipped (excluded agent=${sourceAgentId}, sessionKey=${sessionKey ?? "(none)"})`,
-            );
-            return;
-          }
-
           const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
           api.logger.info(
             `memory-reflection: command:${action} hook start; sessionKey=${sessionKey || "(none)"}; source=${commandSource || "(unknown)"}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`
@@ -4483,7 +4476,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   };
 }
 
-export { getDefaultMdMirrorDir };
+export { getDefaultMdMirrorDir, isInvalidAgentIdFormat };
 
 /**
  * Resets the registration state — primarily intended for use in tests that need
