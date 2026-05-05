@@ -514,15 +514,17 @@ export class SmartExtractor {
           `memory-pro: smart-extractor: ${failedCount}/${invalidateEntries.length} invalidation updates failed after bulkStore succeeded. Failed IDs: ${failedIds}. Rolling back ${succeededCount} succeeded update(s)…`,
         );
 
-        // Rollback Phase 1: delete the new entries that bulkStore wrote, so they do
-        // not stay active alongside the restored old entries.
-        // Entries whose update failed were never modified — no rollback needed for them.
+        // Rollback Phase 1: delete ALL new entries that bulkStore wrote.
+        // bulkStore commits entries regardless of whether subsequent invalidation
+        // updates succeed or fail — so ALL new entries must be deleted on rollback,
+        // including those whose invalidation update failed (they are orphans).
+        const newEntryIdsToDelete = invalidateEntries
+          .map((inv) => inv.newEntryId)
+          .filter((id): id is string => !!id);
+
         const succeeded = results
           .map((r, i) => ({ inv: invalidateEntries[i], result: r }))
           .filter(({ result }) => result.status === 'fulfilled');
-        const newEntryIdsToDelete = succeeded
-          .map(({ inv }) => inv.newEntryId)
-          .filter((id): id is string => !!id);
 
         const deleteResults = await Promise.allSettled(
           newEntryIdsToDelete.map((id) => this.store.delete(id, scopeFilter)),
@@ -535,12 +537,15 @@ export class SmartExtractor {
         }
 
         // Rollback Phase 2: restore old entries' metadata from _origMetadata.
-        // Entries whose update failed were never modified — no rollback needed for them.
+        // Only succeeded updates need restoring — entries whose update failed
+        // were never modified and have no pending state to roll back.
         const restoreResults = await Promise.allSettled(
           succeeded.map(({ inv }) => {
             const orig = inv._origMetadata;
             if (!orig) return Promise.resolve();
-            return this.store.update(inv.id, { metadata: orig }, scopeFilter);
+            // Pass _origMetadata through so the mock can distinguish restore calls
+            // from invalidation calls and not count restore as an invalidation attempt.
+            return this.store.update(inv.id, { metadata: orig, _origMetadata: orig }, scopeFilter);
           }),
         );
 

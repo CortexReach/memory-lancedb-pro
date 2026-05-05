@@ -89,6 +89,65 @@ function makeStoreWithFailingUpdate(existingRecords, failOnUpdateId) {
     },
   };
 }
+// -------------------------------------------------------------------------
+// Mock Store — per-ID update call counter (for TC-6: same ID updated twice)
+// -------------------------------------------------------------------------
+
+function makeStoreWithPerIdCallCount(existingRecords) {
+  const calls = { store: [], bulkStore: [], update: [], delete: [], getById: [], vectorSearch: [] };
+  const updatePatches = [];
+  const db = new Map(existingRecords.map(r => [r.id, r]));
+  let invalidationCallCount = {};
+  const failOnSecondUpdateId = existingRecords.length === 1 ? existingRecords[0].id : null;
+
+  return {
+    async vectorSearch(_vector, _limit, _minScore, _scopeFilter, _opts) {
+      calls.vectorSearch.push({ ts: Date.now() });
+      const record = existingRecords[0];
+      return [{ entry: { ...record, vector: _vector }, score: 0.95 }];
+    },
+
+    async getById(id, _scopeFilter) {
+      calls.getById.push({ id, ts: Date.now() });
+      return db.get(id) ?? null;
+    },
+
+    async store(entry) {
+      calls.store.push({ entry, ts: Date.now() });
+      return { ...entry, id: "store-" + Math.random().toString(36).slice(2) };
+    },
+
+    async bulkStore(entries) {
+      calls.bulkStore.push({ entries, ts: Date.now() });
+      return entries.map((e, i) => ({ ...e, id: "bulk-" + i + "-" + Math.random().toString(36).slice(2) }));
+    },
+
+    async update(id, patch, _scopeFilter) {
+      calls.update.push({ id, ts: Date.now() });
+      updatePatches.push({ id, patch, idx: calls.update.length });
+      // Restore updates carry _origMetadata and should not count as invalidation attempts
+      if (failOnSecondUpdateId && id === failOnSecondUpdateId && !patch._origMetadata) {
+        const count = (invalidationCallCount[id] ?? 0) + 1;
+        invalidationCallCount[id] = count;
+        if (count > 1) {
+          throw new Error(`store.update() rejected for id=${id} (second update — superseded_by already set)`);
+        }
+      }
+    },
+
+    async delete(id, _scopeFilter) {
+      calls.delete.push({ id, ts: Date.now() });
+    },
+
+    get calls() { return calls; },
+    getStoreCallCount() { return calls.store.length; },
+    getBulkStoreCallCount() { return calls.bulkStore.length; },
+    getUpdateCallCount() { return calls.update.length; },
+    getDeleteCallCount() { return calls.delete.length; },
+    getUpdatePatches() { return updatePatches; },
+  };
+}
+
 
 // ---------------------------------------------------------------------------
 // Mock Embedder — unique vectors per embed call (prevents batchDedup collapse)
@@ -511,15 +570,18 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
 
     // Verify update call count:
     // - bulkStore: 1 (for 2 new entries)
-    // - invalidate existing-001: 1 update call (succeeds) → push to succeeded[]
-    // - invalidate existing-002: 1 update call (fails) → push to failed[]
-    // - rollback Phase 1: delete 1 new entry (for succeeded existing-001)
-    // - rollback Phase 2: restore existing-001: 1 update call (succeeds) → uses _origMetadata
-    // Total: 3 update calls + 1 delete call
+    // - invalidate existing-001: 1 update call (succeeds) → inv[0] has newEntryId set
+    // - invalidate existing-002: 1 update call (fails) → inv[1] has newEntryId set
+    // - rollback Phase 1 (F2 fix): delete BOTH newEntryIds (all invalidateEntries, not just succeeded)
+    //   → inv[0].newEntryId deleted (succeeded) + inv[1].newEntryId deleted (failed orphan)
+    // - rollback Phase 2: restore existing-001: 1 update call → uses _origMetadata
+    // Total: 3 update calls + 2 delete calls (F2 fix: ALL newEntryIds are deleted)
     assert.strictEqual(store.getUpdateCallCount(), 3,
       `Expected 3 update calls (2 invalidation + 1 rollback), got ${store.getUpdateCallCount()}`);
-    assert.strictEqual(store.getDeleteCallCount(), 1,
-      `Expected 1 delete call (removing new entry for succeeded existing-001), got ${store.getDeleteCallCount()}`);
+    // F2 fix: ALL newEntryIds are deleted on rollback (not just succeeded inv's)
+    // inv[0].newEntryId (succeeded) + inv[1].newEntryId (failed orphan) = 2 deletes
+    assert.strictEqual(store.getDeleteCallCount(), 2,
+      `F2 fix: Expected 2 delete calls (all newEntryIds), got ${store.getDeleteCallCount()}`);
     assert.strictEqual(store.calls.delete[0].id.startsWith("bulk-"), true,
       `Delete should target the new entry created by bulkStore, got id=${store.calls.delete[0].id}`);
 
@@ -561,4 +623,124 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
       console.log(`     [${p.id}] invalidated=${p.patch.metadata.includes("invalidated_at")} rollback_patch=${!p.patch.metadata.includes("invalidated_at")}`);
     }
   });
+
+
+  /**
+   * TC-6: F2 — Two candidates supersede the same existing entry.
+   *
+   * F2 (Maintainer review): Rollback only deleted newEntryIds from succeeded
+   * invalidations, leaving orphans from failed invalidations.
+   *
+   * Scenario:
+   * 1. One existing entry X in DB (existing-001)
+   * 2. Candidate A and Candidate B both match X (same matchId)
+   *    → Both call handleSupersede(X), both queue new entries (A1, B1)
+   *    → Both push invalidateEntries for X (inv[0]: X, inv[1]: X)
+   * 3. bulkStore([A1, B1]) → bulkResults = [A1_with_id, B1_with_id]
+   * 4. Second pass: inv[0].newEntryId = A1.id, inv[1].newEntryId = B1.id
+   * 5. Invalidation (Promise.allSettled):
+   *    → inv[0] update(X, superseded_by=A1.id): succeeds
+   *    → inv[1] update(X, superseded_by=B1.id): FAILS (X already has superseded_by=A1)
+   * 6. Rollback Phase 1 (F2 FIX): deletes ALL newEntryIds (A1.id AND B1.id)
+   *    → BOTH new entries are deleted, including failed inv's orphan
+   * 7. Rollback Phase 2: restores X metadata (succeeded inv[0] only)
+   */
+  it("TC-6: F2 — rollback deletes ALL newEntryIds (including failed inv's orphan)", async () => {
+    const existing001 = {
+      id: "existing-001",
+      text: "User prefers oat milk",
+      category: "entity",
+      scope: "global",
+      importance: 0.8,
+      metadata: JSON.stringify({
+        fact_key: "pref-oat",
+        memory_category: "entities",
+        state: "confirmed",
+        invalidated_at: null,
+      }),
+    };
+
+    // makeStoreWithPerIdCallCount:
+    // - vectorSearch always returns existing-001 (both candidates match same entry)
+    // - First update to existing-001 succeeds, second update fails
+    const store = makeStoreWithPerIdCallCount([existing001]);
+    const embedder = makeEmbedder();
+
+    let decisionIdx = 0;
+    const llm = {
+      async completeJson(_prompt, mode) {
+        if (mode === "extract-candidates") {
+          return {
+            memories: [
+              {
+                category: "entities",
+                abstract: "User prefers oat milk over dairy milk every morning",
+                overview: "## Pref\n- Oat milk preferred",
+                content: "User prefers oat milk over dairy.",
+              },
+              {
+                category: "entities",
+                abstract: "User prefers oat milk to stay healthy",
+                overview: "## Pref\n- Oat milk health",
+                content: "User prefers oat milk for health reasons.",
+              },
+            ],
+          };
+        }
+        if (mode === "dedup-decision") {
+          const d = { decision: "supersede", match_index: 1 };
+          decisionIdx++;
+          return d;
+        }
+        return null;
+      },
+    };
+    const logSpy = makeLogSpy();
+    const extractor = makeExtractor(store, embedder, llm, logSpy);
+
+    await extractor.extractAndPersist(
+      "User updated preferences twice.",
+      "session:test-tc6",
+    );
+
+    console.log(`\nTC-6 debug:`);
+    console.log(`  bulkStore calls: ${store.getBulkStoreCallCount()}`);
+    console.log(`  update calls: ${store.getUpdateCallCount()}`);
+    console.log(`  delete calls: ${store.getDeleteCallCount()}`);
+    console.log(`  delete ids: ${store.calls.delete.map(d => d.id).join(", ")}`);
+    console.log(`  log entries: ${logSpy.entries.join("; ")}`);
+
+    // Assertions:
+    // bulkStore: 1 call with 2 entries (A1 and B1)
+    assert.strictEqual(store.getBulkStoreCallCount(), 1,
+      "Should call bulkStore once for 2 new entries");
+    const bulkEntries = store.calls.bulkStore[0].entries;
+    assert.strictEqual(bulkEntries.length, 2,
+      "bulkStore should receive 2 new entries (A1 and B1)");
+
+    // update calls: 2 invalidation + 1 rollback = 3 total
+    assert.strictEqual(store.getUpdateCallCount(), 3,
+      `Expected 3 update calls (2 invalidation + 1 rollback), got ${store.getUpdateCallCount()}`);
+
+    // F2 FIX VERIFICATION: delete calls should be 2 (A1.id AND B1.id)
+    // Before F2 fix: only succeeded inv's newEntryId was deleted → 1 delete
+    // After F2 fix: ALL inv.newEntryId are deleted → 2 deletes
+    assert.strictEqual(store.getDeleteCallCount(), 2,
+      `F2 FIX: Rollback should delete BOTH new entries (A1 and B1), got ${store.getDeleteCallCount()} deletes`);
+
+    const deleteIds = store.calls.delete.map(d => d.id);
+    assert.strictEqual(deleteIds.every(id => id.startsWith("bulk-")), true,
+      `All deleted IDs should come from bulkStore, got: ${deleteIds.join(", ")}`);
+
+    // Verify rollback log shows no failure
+    const rollbackFailedLog = logSpy.entries.find(e => e.includes("ROLLBACK FAILED"));
+    assert.ok(!rollbackFailedLog,
+      "Rollback itself should succeed (no ROLLBACK FAILED log)");
+
+    console.log(`\n📊 TC-6 F2 verification:`);
+    console.log(`   delete calls: ${store.getDeleteCallCount()} (expected: 2 — both A1 AND B1)`);
+    console.log(`   deleted ids: ${deleteIds.join(", ")}`);
+    console.log(`   ✅ Both succeeded and failed inv newEntryIds are deleted`);
+  });
+
 });
