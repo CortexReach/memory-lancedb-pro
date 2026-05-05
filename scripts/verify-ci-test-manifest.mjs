@@ -65,6 +65,8 @@ const EXPECTED_BASELINE = [
   // Issue #492 agentId validation tests
   { group: "core-regression", runner: "node", file: "test/agentid-validation.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/command-reflection-guard.test.mjs", args: ["--test"] },
+  // Tier 1 memory counter fix
+  { group: "core-regression", runner: "node", file: "test/tier1-counters.test.mjs", args: ["--test"] },
 ];
 
 function fail(message) {

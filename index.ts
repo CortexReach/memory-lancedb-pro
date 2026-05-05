@@ -72,6 +72,12 @@ import {
   toLifecycleMemory,
 } from "./src/smart-metadata.js";
 import {
+  computeTier1Patch,
+  isSuppressed as isTier1Suppressed,
+  TIER1_DEFAULT_BAD_RECALL_DECAY_MS,
+  TIER1_DEFAULT_SUPPRESSION_DURATION_MS,
+} from "./src/auto-recall-tier1.js";
+import {
   filterUserMdExclusiveRecallResults,
   isUserMdExclusiveMemory,
   type WorkspaceBoundaryConfig,
@@ -107,6 +113,12 @@ interface PluginConfig {
   autoRecall?: boolean;
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
+  /** If a memory's last auto-recall injection was more than this many ms ago,
+   *  its bad_recall_count is reset to 0 on the next injection. 0 disables decay. Default: 86400000 (24h). */
+  autoRecallBadRecallDecayMs?: number;
+  /** When bad_recall_count reaches the suppression threshold, the memory is
+   *  suppressed from auto-recall for this many ms from now. Default: 1800000 (30min). */
+  autoRecallSuppressionDurationMs?: number;
   autoRecallTimeoutMs?: number;
   autoRecallMaxItems?: number;
   autoRecallMaxChars?: number;
@@ -323,6 +335,22 @@ function parsePositiveInt(value: unknown): number | undefined {
     const resolved = resolveEnvVars(s);
     const n = Number(resolved);
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  }
+  return undefined;
+}
+
+// Like parsePositiveInt but allows 0. Used for fields where 0 is a meaningful
+// "disabled" sentinel (e.g. autoRecallBadRecallDecayMs=0 disables decay).
+function parseNonNegativeInt(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return Math.floor(value);
+  }
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return undefined;
+    const resolved = resolveEnvVars(s);
+    const n = Number(resolved);
+    if (Number.isFinite(n) && n >= 0) return Math.floor(n);
   }
   return undefined;
 }
@@ -2694,7 +2722,7 @@ const memoryLanceDBProPlugin = {
               api.logger.debug(`memory-lancedb-pro: governance: filtered id=${r.entry.id} reason=layer(${meta.memory_layer}) score=${r.score?.toFixed(3)} text=${r.entry.text.slice(0, 50)}`);
               return false;
             }
-            if (meta.suppressed_until_turn > 0 && currentTurn <= meta.suppressed_until_turn) {
+            if (isTier1Suppressed(meta, Date.now())) {
               suppressedFilteredCount++;
               return false;
             }
@@ -2818,33 +2846,22 @@ const memoryLanceDBProPlugin = {
           }
 
           const injectedAt = Date.now();
+          const tier1PatchOpts = {
+            injectedAt,
+            badRecallDecayMs:
+              config.autoRecallBadRecallDecayMs ?? TIER1_DEFAULT_BAD_RECALL_DECAY_MS,
+            suppressionDurationMs:
+              config.autoRecallSuppressionDurationMs ?? TIER1_DEFAULT_SUPPRESSION_DURATION_MS,
+            minRepeated,
+          };
           await Promise.allSettled(
-            selected.map(async (item) => {
-              const meta = item.meta;
-              const staleInjected =
-                typeof meta.last_injected_at === "number" &&
-                meta.last_injected_at > 0 &&
-                (
-                  typeof meta.last_confirmed_use_at !== "number" ||
-                  meta.last_confirmed_use_at < meta.last_injected_at
-                );
-              const nextBadRecallCount = staleInjected
-                ? meta.bad_recall_count + 1
-                : meta.bad_recall_count;
-              const shouldSuppress = nextBadRecallCount >= 3 && minRepeated > 0;
-              await store.patchMetadata(
+            selected.map(async (item) =>
+              store.patchMetadata(
                 item.id,
-                {
-                  injected_count: meta.injected_count + 1,
-                  last_injected_at: injectedAt,
-                  bad_recall_count: nextBadRecallCount,
-                  suppressed_until_turn: shouldSuppress
-                    ? Math.max(meta.suppressed_until_turn, currentTurn + minRepeated)
-                    : meta.suppressed_until_turn,
-                },
+                computeTier1Patch(item.meta, tier1PatchOpts),
                 accessibleScopes,
-              );
-            }),
+              ),
+            ),
           );
 
           const memoryContext = selected.map((item) => item.line).join("\n");
@@ -4476,6 +4493,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecall: cfg.autoRecall === true,
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated) ?? 8,
+    // 0 is a meaningful sentinel for both Tier 1 knobs (disable decay /
+    // collapse suppression to a no-op), so use the non-negative parser.
+    autoRecallBadRecallDecayMs: parseNonNegativeInt(cfg.autoRecallBadRecallDecayMs),
+    autoRecallSuppressionDurationMs: parseNonNegativeInt(cfg.autoRecallSuppressionDurationMs),
     autoRecallMaxItems: parsePositiveInt(cfg.autoRecallMaxItems) ?? 3,
     autoRecallMaxChars: parsePositiveInt(cfg.autoRecallMaxChars) ?? 600,
     autoRecallPerItemMaxChars: parsePositiveInt(cfg.autoRecallPerItemMaxChars) ?? 180,

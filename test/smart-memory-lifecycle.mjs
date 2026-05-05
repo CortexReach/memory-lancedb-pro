@@ -8,6 +8,7 @@ const { buildSmartMetadata, parseSmartMetadata, toLifecycleMemory } = jiti("../s
 const { createDecayEngine, DEFAULT_DECAY_CONFIG } = jiti("../src/decay-engine.ts");
 const { createTierManager, DEFAULT_TIER_CONFIG } = jiti("../src/tier-manager.ts");
 const { createRetriever, DEFAULT_RETRIEVAL_CONFIG } = jiti("../src/retriever.ts");
+const { computeTier1Patch } = jiti("../src/auto-recall-tier1.ts");
 
 const now = Date.now();
 
@@ -216,4 +217,23 @@ assert.equal(
   "fresh working-tier memories should survive decay + hardMinScore filtering",
 );
 
-console.log("OK: smart memory lifecycle test passed");
+// ============================================================================
+// Tier 1 integration assertion
+// ============================================================================
+// Verify the auto-recall injection path's computed patch correctly increments
+// access_count. Imports the same computeTier1Patch consumed by index.ts so any
+// regression in the production helper or in parseSmartMetadata's plumbing
+// surfaces here.
+{
+  const freshMeta = parseSmartMetadata(
+    JSON.stringify({ l0_abstract: "lifecycle-tier1", access_count: 0 }),
+    { text: "lifecycle-tier1", category: "fact" },
+  );
+  const patched = computeTier1Patch(freshMeta, { injectedAt: Date.now() });
+  assert.equal(patched.access_count, 1, "Tier 1: access_count must increment from 0 to 1 on auto-recall injection");
+}
+
+// Final success message printed only after every assertion (legacy lifecycle +
+// Tier 1 integration) has run. Earlier this print was above the Tier 1 block,
+// which made a failing Tier 1 assertion look like "OK passed" + an error.
+console.log("OK: smart memory lifecycle test passed (incl. Tier 1 access_count integration)");
