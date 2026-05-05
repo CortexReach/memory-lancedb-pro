@@ -16,6 +16,8 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import type { RedisLockManager } from "./redis-lock.js";
+import { createRedisLockManager, RedisUnavailableError } from "./redis-lock.js";
 
 // ============================================================================
 // Types
@@ -209,7 +211,49 @@ export class MemoryStore {
 
   constructor(private readonly config: StoreConfig) { }
 
+  /**
+   * 混合鎖實作：Redis lock 優先，失敗時進 file-lock fallback。
+   *
+   * Option E（init-time decision, runtime fixed）：
+   * getRedisLockManager() 只在第一次呼叫時決定用哪種 lock。
+   * 一旦決定，整個 process 生命週期內不再改變。
+   *
+   * 兩種失敗模式的不同處理：
+   * 1. Init failure（createRedisLockManager() 回傳 null）：
+   *    → 這個 process 從頭到尾都用 file lock（正常 fallback）
+   * 2. Runtime failure（acquire() 拋出 RedisUnavailableError）：
+   *    → 直接 throw，不 fallback
+   *    → 因為這個 process 已經決定用 Redis lock，不會因 Redis 瞬斷就切換到 file lock
+   *    → 這樣避免 split lock domain：Redis-locked 和 file-locked writer 不會同時並存
+   *
+   * 為什麼 runtime failure 不 fallback：
+   * 當 Process A 持有 Redis lock 時，Process B 的 Redis 瞬斷了，
+   * 如果 Process B fallback 到 file lock，兩者就進入不同的 lock domain，
+   * 同時寫入 → 資料競爭。Fail fast 犧牲可用性，但確保資料一致性。
+   */
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
+    // Issue 4 fix: 傳遞 dbPath，namespace Redis lock key
+    const mgr = await getRedisLockManager(this.config.dbPath);
+    if (mgr) {
+      // Redis lock manager 存在 → 用 Redis lock
+      // 如果 runtime 中 Redis 瞬斷，acquire() 會拋出 RedisUnavailableError，
+      // 但這裡我們不 catch，讓它直接往上傳 → write fail，不會偷偷繞到 file lock
+      const release = await mgr.acquire("memory-write", 60000);
+      try {
+        return await fn();
+      } finally {
+        await release();
+      }
+    }
+    // Redis manager 不存在（init failure）→ file lock fallback（正常）
+    return this.runWithFileLockCore(fn);
+  }
+
+  /**
+   * File-lock 核心實作（抽取為 internal method）。
+   * 供 Redis lock 失敗時 fallback 使用。
+   */
+  private async runWithFileLockCore<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
     if (!existsSync(lockPath)) {
@@ -1282,5 +1326,59 @@ export class MemoryStore {
           metadata: (row.metadata as string) || "{}",
         }),
       );
+  }
+}
+
+
+
+/** M2: initPromise guard — 防止並發建立多個 Redis client */
+let redisLockManager: RedisLockManager | null = null;
+let redisInitPromise: Promise<RedisLockManager | null> | null = null;
+/** C1/N5 fix: init in-progress flag — 防止 T1/T2 同時 start createRedisLockManager() */
+let _initInProgress = false;
+
+function nodeTmpdir(): string {
+  // N2 fix: nodeTmpdir() 是 function call，不是 property access
+  const { tmpdir } = require("node:os");
+  return tmpdir();
+}
+
+/**
+ * M2: getRedisLockManager — 使用 initPromise guard，確保只建立一個 Redis client。
+ * M1: Redis-first 策略：Redis 可用時用 Redis lock，否則 fallback 到 file lock。
+ */
+export async function getRedisLockManager(dbPath?: string): Promise<RedisLockManager | null> {
+  if (redisLockManager !== null) {
+    return redisLockManager;
+  }
+  if (redisInitPromise !== null) {
+    return redisInitPromise;
+  }
+  // C1 fix: _initInProgress flag — T2 spin-wait 而非自己也 start createRedisLockManager()
+  if (_initInProgress) {
+    // T2: 等 T1 的 init 完成，避免重複建立 client
+    const spinStart = Date.now();
+    while (_initInProgress) {
+      if (Date.now() - spinStart > 5000) {
+        // 5s timeout — init 超過 5s 放棄並走 fallback
+        console.warn("[store] getRedisLockManager: init timeout, returning null");
+        return null;
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return redisLockManager; // T1 完成後直接用 cache
+  }
+
+  _initInProgress = true;
+  try {
+    // Issue 4 fix: 傳遞 dbPath，讓 Redis lock key 可被 namespace
+    const mgr = await createRedisLockManager(dbPath ? { dbPath } : undefined);
+    redisLockManager = mgr;
+    return mgr;
+  } catch (err) {
+    console.warn("[store] getRedisLockManager failed:", err);
+    return null;
+  } finally {
+    _initInProgress = false;
   }
 }
