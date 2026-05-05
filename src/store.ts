@@ -646,9 +646,27 @@ export class MemoryStore {
 
     // [MR5-fix] Deduplicate ids before SQL query to avoid duplicate IN clause
     // and ensure recovery loop has unique ids.
+    // Detect duplicate ids and report skipped ones to caller so no data is silently lost.
+    const seenPairIds = new Map<string, number>();
+    for (const p of pairs) {
+      seenPairIds.set(p.id, (seenPairIds.get(p.id) ?? 0) + 1);
+    }
+    const skippedPairIds: string[] = [];
     const uniquePairs = Array.from(
-      new Map(pairs.map((p) => [p.id, p])).values()
+      new Map(pairs.map((p, idx) => {
+        // Keep first occurrence; record all skipped duplicates for caller reporting
+        if ((seenPairIds.get(p.id) ?? 0) > 1 && idx > pairs.findIndex(x => x.id === p.id)) {
+          skippedPairIds.push(p.id);
+        }
+        return [p.id, p];
+      })).values()
     );
+    if (skippedPairIds.length > 0) {
+      console.warn(
+        `[memory-lancedb-pro] bulkUpdateMetadata: MR5: ` +
+        `${skippedPairIds.length} duplicate id(s) skipped (last-write-wins): ${Array.from(new Set(skippedPairIds)).join(", ")}`
+      );
+    }
 
     // Phase 2: single lock + updateQueue serialization for the entire batch
     // M1 fix: wrap with runSerializedUpdate so bulk ops don't interleave with plugin updates
@@ -842,11 +860,11 @@ export class MemoryStore {
           }
           return {
             success: actuallySucceeded,
-            failed: [...failed, ...recoveryFailed, ...restoreFailedIds], // [F4-fix] include data-loss IDs
+            failed: [...failed, ...recoveryFailed, ...restoreFailedIds, ...Array.from(new Set(skippedPairIds))], // [F4-fix] include data-loss IDs; [MR5-fix] include skipped duplicates
           };
         }
 
-        return { success: updatedEntries.length, failed };
+        return { success: updatedEntries.length, failed: [...failed, ...Array.from(new Set(skippedPairIds))] }; // [MR5-fix] include skipped duplicates
       })
     );
   }
@@ -885,9 +903,30 @@ export class MemoryStore {
     }
 
     // [MR5-fix] Deduplicate entries by id before SQL query and recovery loop.
+    // Detect duplicate ids and report skipped ones to caller so no data is silently lost.
+    const seenIds = new Map<string, number>();
+    for (const e of entries) {
+      seenIds.set(e.id, (seenIds.get(e.id) ?? 0) + 1);
+    }
+    const duplicateIds = Array.from(seenIds.entries())
+      .filter(([, count]) => count > 1)
+      .map(([id]) => id);
+    const skippedIds: string[] = [];
     const uniqueEntries = Array.from(
-      new Map(entries.map((e) => [e.id, e])).values()
+      new Map(entries.map((e, idx) => {
+        // Keep first occurrence; record all skipped duplicates for caller reporting
+        if ((seenIds.get(e.id) ?? 0) > 1 && idx > entries.findIndex(x => x.id === e.id)) {
+          skippedIds.push(e.id);
+        }
+        return [e.id, e];
+      })).values()
     );
+    if (skippedIds.length > 0) {
+      console.warn(
+        `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: MR5: ` +
+        `${skippedIds.length} duplicate id(s) skipped (last-write-wins): ${Array.from(new Set(skippedIds)).join(", ")}`
+      );
+    }
 
     return this.runWithFileLock(() =>
       this.runSerializedUpdate(async () => {
@@ -1145,11 +1184,11 @@ export class MemoryStore {
           }
           return {
             success: actuallySucceeded,
-            failed: [...failed, ...recoveryFailed, ...restoreFailedIds], // [F4-fix] include data-loss IDs
+            failed: [...failed, ...recoveryFailed, ...restoreFailedIds, ...Array.from(new Set(skippedIds))], // [F4-fix] include data-loss IDs; [MR5-fix] include skipped duplicates
           };
         }
 
-        return { success: updatedEntries.length, failed };
+        return { success: updatedEntries.length, failed: [...failed, ...Array.from(new Set(skippedIds))] }; // [MR5-fix] include skipped duplicates
       })
     );
   }
