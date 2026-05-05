@@ -239,6 +239,12 @@ export class MemoryStore {
     }
 
     const release = await lockfile.lock(lockPath, {
+      // 【修復 #670】realpath:false — 避免 proactive cleanup 刪除 stale lock artifact 後，
+      // proper-lockfile v4 的 realpath() 在已刪除檔案上被呼叫，導致 ENOENT。
+      // 情境：T=0 proactive cleanup 刪除 stale lock → T=3ms lock() 的 realpath() → ENOENT
+      // 根本原因：v4 proper-lockfile 的 resolveCanonicalPath 預設呼叫 fs.realpath()。
+      // 解決：realpath:false 完全繞過 realpath()，對 lock file 場景完全無副作用。
+      realpath: false,
       retries: {
         retries: 10,
         factor: 2,
