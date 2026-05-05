@@ -8,6 +8,7 @@ const { buildSmartMetadata, parseSmartMetadata, toLifecycleMemory } = jiti("../s
 const { createDecayEngine, DEFAULT_DECAY_CONFIG } = jiti("../src/decay-engine.ts");
 const { createTierManager, DEFAULT_TIER_CONFIG } = jiti("../src/tier-manager.ts");
 const { createRetriever, DEFAULT_RETRIEVAL_CONFIG } = jiti("../src/retriever.ts");
+const { computeTier1Patch } = jiti("../src/auto-recall-tier1.ts");
 
 const now = Date.now();
 
@@ -222,41 +223,15 @@ console.log("OK: smart memory lifecycle test passed");
 // Tier 1 integration assertion
 // ============================================================================
 // Verify the auto-recall injection path's computed patch correctly increments
-// access_count. This test uses the same pure helper as test/tier1-counters.test.mjs
-// but runs it in the lifecycle context to guard against regression in the shared
-// parse/build plumbing. If parseSmartMetadata or the injection patch ever breaks
-// the access_count contract, this integration assertion fails alongside the
-// unit-level tests in tier1-counters.test.mjs.
+// access_count. Imports the same computeTier1Patch consumed by index.ts so any
+// regression in the production helper or in parseSmartMetadata's plumbing
+// surfaces here.
 {
-  function computeTier1Patch(meta, injectedAt) {
-    let baseBadRecall = meta.bad_recall_count ?? 0;
-    if (meta.suppressed_until_ms === undefined &&
-        ((meta.bad_recall_count ?? 0) > 0 || (meta.suppressed_until_turn ?? 0) > 0)) {
-      baseBadRecall = 0;
-    }
-    const gap = typeof meta.last_injected_at === "number"
-      ? injectedAt - meta.last_injected_at : Infinity;
-    const decayed = (gap > 86_400_000) ? 0 : baseBadRecall;
-    const stale = typeof meta.last_injected_at === "number" && meta.last_injected_at > 0
-      && (typeof meta.last_confirmed_use_at !== "number"
-          || meta.last_confirmed_use_at < meta.last_injected_at);
-    const nextBadRecall = stale ? decayed + 1 : decayed;
-    return {
-      access_count: (meta.access_count ?? 0) + 1,
-      last_accessed_at: injectedAt,
-      injected_count: (meta.injected_count ?? 0) + 1,
-      last_injected_at: injectedAt,
-      bad_recall_count: nextBadRecall,
-      suppressed_until_ms: (nextBadRecall >= 3) ? injectedAt + 1_800_000 : (meta.suppressed_until_ms ?? 0),
-      suppressed_until_turn: 0,
-    };
-  }
-
   const freshMeta = parseSmartMetadata(
     JSON.stringify({ l0_abstract: "lifecycle-tier1", access_count: 0 }),
     { text: "lifecycle-tier1", category: "fact" },
   );
-  const patched = computeTier1Patch(freshMeta, Date.now());
+  const patched = computeTier1Patch(freshMeta, { injectedAt: Date.now() });
   assert.equal(patched.access_count, 1, "Tier 1: access_count must increment from 0 to 1 on auto-recall injection");
   console.log("✓ Tier 1 access_count integration assertion passed");
 }

@@ -9,6 +9,10 @@ const {
   parseSmartMetadata,
   buildSmartMetadata,
 } = jiti("../src/smart-metadata.ts");
+const {
+  computeTier1Patch,
+  isSuppressed,
+} = jiti("../src/auto-recall-tier1.ts");
 
 describe("Tier 1: suppressed_until_ms field presence semantics", () => {
   it("returns undefined when raw JSON does not include the key (sentinel for 'never touched by Tier 1')", () => {
@@ -82,14 +86,9 @@ describe("Tier 1: plugin config schema", () => {
 });
 
 describe("Tier 1: governance filter reads suppressed_until_ms", () => {
-  // Pure-logic test of the filter predicate. We define a local helper that
-  // mirrors the production code, then test it directly. This avoids booting
-  // the plugin runtime for a 2-line condition. End-to-end wiring is verified
-  // by visual inspection of index.ts after the rewrite.
-  function isSuppressed(meta, nowMs) {
-    const suppressUntil = meta.suppressed_until_ms ?? 0;
-    return suppressUntil > 0 && nowMs < suppressUntil;
-  }
+  // Drives the production isSuppressed predicate (imported above). The same
+  // function is consumed by the governance filter in index.ts, so a regression
+  // in either place surfaces here.
 
   it("suppresses when nowMs < suppressed_until_ms", () => {
     const future = Date.now() + 60_000;
@@ -118,56 +117,9 @@ describe("Tier 1: governance filter reads suppressed_until_ms", () => {
 });
 
 describe("Tier 1: bad_recall_count decay and patch shape (Option C)", () => {
-  // Pure-logic helper that mirrors the production computation.
-  function computeTier1Patch(meta, opts) {
-    const {
-      injectedAt,
-      badRecallDecayMs = 86_400_000,
-      suppressionDurationMs = 1_800_000,
-      minRepeated = 8,
-    } = opts;
-
-    // Lazy heal
-    let baseBadRecall = meta.bad_recall_count ?? 0;
-    if (meta.suppressed_until_ms === undefined &&
-        ((meta.bad_recall_count ?? 0) > 0 || (meta.suppressed_until_turn ?? 0) > 0)) {
-      baseBadRecall = 0;
-    }
-
-    // Option C: decay by gap
-    const gapSinceLastInjection = typeof meta.last_injected_at === "number"
-      ? injectedAt - meta.last_injected_at
-      : Infinity;
-    const decayedBadRecall = (badRecallDecayMs > 0 && gapSinceLastInjection > badRecallDecayMs)
-      ? 0
-      : baseBadRecall;
-
-    // staleInjected (existing judgment preserved verbatim)
-    const staleInjected =
-      typeof meta.last_injected_at === "number" &&
-      meta.last_injected_at > 0 &&
-      (
-        typeof meta.last_confirmed_use_at !== "number" ||
-        meta.last_confirmed_use_at < meta.last_injected_at
-      );
-    const nextBadRecallCount = staleInjected
-      ? decayedBadRecall + 1
-      : decayedBadRecall;
-
-    const shouldSuppress = nextBadRecallCount >= 3 && minRepeated > 0;
-
-    return {
-      access_count: (meta.access_count ?? 0) + 1,
-      last_accessed_at: injectedAt,
-      injected_count: (meta.injected_count ?? 0) + 1,
-      last_injected_at: injectedAt,
-      bad_recall_count: nextBadRecallCount,
-      suppressed_until_ms: shouldSuppress
-        ? Math.max(meta.suppressed_until_ms ?? 0, injectedAt + suppressionDurationMs)
-        : (meta.suppressed_until_ms ?? 0),
-      suppressed_until_turn: 0,
-    };
-  }
+  // Drives the production computeTier1Patch (imported above). Tests that
+  // assert on suppression firing pass minRepeated explicitly; tests that only
+  // care about counter shape rely on minRepeated=0 default (no suppression).
 
   it("T1 access_count: accumulates 0 → 1 on first injection", () => {
     const now = Date.now();
