@@ -104,8 +104,11 @@ describe("systemSessionMemory before_reset", () => {
     memoryLanceDBProPlugin.register(api);
 
     assert.equal(typeof api.hooks.before_reset, "function");
-    // selfImprovement registers command:new by default (#391)
-    assert.equal(typeof api.hooks["command:new"], "function");
+    assert.equal(
+      typeof api.hooks["command:new"],
+      "function",
+      "command:new may be occupied by other default integrations such as self-improvement",
+    );
 
     await api.hooks.before_reset(
       {
