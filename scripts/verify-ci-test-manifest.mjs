@@ -58,6 +58,11 @@ const EXPECTED_BASELINE = [
   { group: "storage-and-schema", runner: "node", file: "test/bulk-store-edge-cases.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store-edge-cases.test.mjs", args: ["--test"] },
+  // Issue #632 Phase 2 lock serialization + rollback protection
+  { group: "core-regression", runner: "node", file: "test/upgrader-phase2-lock.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/upgrader-phase2-extreme.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/bulk-recovery-rollback.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/upgrader-whitelist-regression.test.mjs" },
   // Issue #680 regression tests
   { group: "core-regression", runner: "node", file: "test/memory-reflection-issue680-tdd.test.mjs", args: ["--test"] },
   // Issue #492 agentId validation tests
