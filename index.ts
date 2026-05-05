@@ -49,6 +49,7 @@ import {
 import {
   extractReflectionLearningGovernanceCandidates,
   extractInjectableReflectionMappedMemoryItems,
+  isRecallUsed,
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
@@ -2296,6 +2297,17 @@ const memoryLanceDBProPlugin = {
       return next;
     };
 
+    // ========================================================================
+    // Proposal A Phase 1: Recall Usage Tracking Hooks
+    // ========================================================================
+    // Track pending recalls per session for usage scoring
+    type PendingRecallEntry = {
+      recallIds: string[];
+      responseText: string;
+      injectedAt: number;
+    };
+    const pendingRecall = new Map<string, PendingRecallEntry>();
+
     const logReg = isCliMode() ? api.logger.debug : api.logger.info;
     logReg(
       `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
@@ -2846,6 +2858,17 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: injecting ${selected.length} memories into context for agent ${agentId}`,
           );
 
+          // Create or update pendingRecall for this turn so the feedback hook
+          // (which runs in the NEXT turn's before_prompt_build after agent_end)
+          // sees a matching pair: Turn N recallIds + Turn N responseText.
+          // agent_end will write responseText into this same pendingRecall
+          // entry (only updating responseText, never clearing recallIds).
+          const sessionKeyForRecall = ctx?.sessionKey || ctx?.sessionId || "default";
+          pendingRecall.set(sessionKeyForRecall, {
+            recallIds: selected.map((item) => item.id),
+            responseText: "", // Will be populated by agent_end
+            injectedAt: Date.now(),
+          });
           return {
             prependContext:
               `<relevant-memories>\n` +
@@ -3002,14 +3025,14 @@ const memoryLanceDBProPlugin = {
           }
 
           const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
-          // issue #417 Fix #4: cumulative counting — increment not overwrite
-          const cumulativeCount = previousSeenCount + 1;
           let newTexts = eligibleTexts;
           if (pendingIngressTexts.length > 0) {
             newTexts = pendingIngressTexts;
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
           }
+          // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
+          const cumulativeCount = previousSeenCount + newTexts.length;
           autoCaptureSeenTextCount.set(sessionKey, cumulativeCount);
           pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
 
@@ -3102,9 +3125,9 @@ const memoryLanceDBProPlugin = {
               );
               return;
             }
-            if (cleanTexts.length >= minMessages) {
+            if (cumulativeCount >= minMessages) {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (${cleanTexts.length} clean texts >= ${minMessages}, cumulative=${cumulativeCount})`,
+                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
               const conversationText = cleanTexts.join("\n");
               // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
@@ -3131,18 +3154,23 @@ const memoryLanceDBProPlugin = {
                 return; // Smart extraction handled everything
               }
 
-              if ((stats.boundarySkipped ?? 0) > 0) {
+              if ((stats.boundarySkipped ?? 0) === 0) {
                 api.logger.info(
-                  `memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`,
+                  `memory-lancedb-pro: smart extraction produced no candidates and no boundary texts for agent ${agentId}; skipping regex fallback`,
                 );
+                return;
               }
+
+              api.logger.info(
+                `memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`,
+              );
 
               api.logger.info(
                 `memory-lancedb-pro: smart extraction produced no persisted memories for agent ${agentId} (created=${stats.created}, merged=${stats.merged}, skipped=${stats.skipped}); falling back to regex capture`,
               );
             } else {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (${cleanTexts.length} < ${minMessages}, cumulative=${cumulativeCount})`,
+                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (cumulative=${cumulativeCount} < minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
             }
           }
@@ -3259,6 +3287,135 @@ const memoryLanceDBProPlugin = {
 
       api.on("agent_end", agentEndAutoCaptureHook);
     }
+
+    // ========================================================================
+    // Proposal A Phase 1: agent_end hook - Store response text for usage tracking
+    // ========================================================================
+    // NOTE: Only writes responseText to an EXISTING pendingRecall entry created
+    // by before_prompt_build (auto-recall). Does NOT create a new entry.
+    // This ensures recallIds (written by auto-recall in the same turn) and
+    // responseText (written here) remain paired for the feedback hook.
+    api.on("agent_end", (event: any, ctx: any) => {
+      const sessionKey = ctx?.sessionKey || ctx?.sessionId || "default";
+      if (!sessionKey) return;
+
+      // Get the last message content
+      let lastMsgText: string | null = null;
+      if (event.messages && Array.isArray(event.messages)) {
+        const lastMsg = event.messages[event.messages.length - 1];
+        if (lastMsg && typeof lastMsg === "object") {
+          const msgObj = lastMsg as Record<string, unknown>;
+          lastMsgText = extractTextContent(msgObj.content);
+        }
+      }
+
+      // Only update an existing pendingRecall entry — do NOT create one.
+      // This preserves recallIds written by auto-recall earlier in this turn.
+      const existing = pendingRecall.get(sessionKey);
+      if (existing && lastMsgText && lastMsgText.trim().length > 0) {
+        existing.responseText = lastMsgText;
+      }
+    }, { priority: 20 });
+
+    // ========================================================================
+    // Proposal A Phase 1: before_prompt_build hook (priority 5) - Score recalls
+    // ========================================================================
+    api.on("before_prompt_build", async (event: any, ctx: any) => {
+      const sessionKey = ctx?.sessionKey || ctx?.sessionId || "default";
+      const pending = pendingRecall.get(sessionKey);
+      if (!pending) return;
+
+      // Guard: only score if responseText has substantial content
+      const responseText = pending.responseText;
+      if (!responseText || responseText.length <= 24) {
+        // Skip scoring for empty or very short responses
+        return;
+      }
+
+      // Guard: skip if no recall IDs (shouldn't happen but be safe)
+      if (!pending.recallIds || pending.recallIds.length === 0) {
+        return;
+      }
+
+      // TTL cleanup: evict stale entries older than 10 minutes to prevent
+      // unbounded Map growth when session_end never fires (crash, SIGKILL, etc.)
+      const now = Date.now();
+      const PENDING_RECALL_TTL_MS = 10 * 60 * 1000;
+      if (pending.injectedAt && now - pending.injectedAt > PENDING_RECALL_TTL_MS) {
+        pendingRecall.delete(sessionKey);
+        return;
+      }
+
+      // Determine if any recalled memory was actually used in the response.
+      // Uses keyword-based usage heuristic (see isRecallUsed in reflection-slices.ts).
+      const usedRecall = isRecallUsed(responseText, pending.recallIds);
+
+      // Score each recalled memory - update importance based on usage
+      try {
+        for (const recallId of pending.recallIds) {
+          // Use store.getById to retrieve the real entry so we get the actual
+          // importance value, instead of calling parseSmartMetadata with empty
+          // placeholder metadata.
+          const entry = await store.getById(recallId, undefined);
+          if (!entry) continue;
+          const meta = parseSmartMetadata(entry.metadata, entry);
+
+          if (usedRecall) {
+            // Recall was used - increase importance (cap at 1.0).
+            // Use store.update to directly update the row-level importance
+            // column. patchMetadata only updates the metadata JSON blob but
+            // NOT the entry.importance field, so importance changes would never
+            // affect ranking (applyImportanceWeight reads entry.importance).
+            const newImportance = Math.min(1.0, (meta.importance || 0.5) + 0.05);
+            await store.update(
+              recallId,
+              { importance: newImportance },
+              undefined,
+            );
+            // Also update metadata JSON fields via patchMetadata (separate concern)
+            await store.patchMetadata(
+              recallId,
+              { last_confirmed_use_at: Date.now() },
+              undefined,
+            );
+          } else {
+            // Recall was not used - increment bad_recall_count
+            const badCount = (meta.bad_recall_count || 0) + 1;
+            let newImportance = meta.importance || 0.5;
+            // Apply penalty after threshold (3 consecutive unused)
+            if (badCount >= 3) {
+              newImportance = Math.max(0.1, newImportance - 0.03);
+            }
+            await store.update(
+              recallId,
+              { importance: newImportance },
+              undefined,
+            );
+            await store.patchMetadata(
+              recallId,
+              { bad_recall_count: badCount },
+              undefined,
+            );
+          }
+        }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: recall usage scoring failed: ${String(err)}`);
+      }
+
+      // Clean up the pendingRecall entry after scoring to prevent re-scoring
+      // the same recallIds on subsequent turns (C3 / Codex P2 fix).
+      pendingRecall.delete(sessionKey);
+    }, { priority: 5 });
+
+    // ========================================================================
+    // Proposal A Phase 1: session_end hook - Clean up pending recalls
+    // ========================================================================
+    api.on("session_end", (_event: any, ctx: any) => {
+      const sessionKey = ctx?.sessionKey || ctx?.sessionId || "default";
+      if (sessionKey) {
+        pendingRecall.delete(sessionKey);
+      }
+    }, { priority: 20 });
 
     // ========================================================================
     // Integrated Self-Improvement (inheritance + derived)
