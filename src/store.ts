@@ -149,12 +149,12 @@ function safeToNumber(value: unknown): number {
   if (typeof value === 'number') return value;
   if (typeof value === 'string') {
     const parsed = Number(value);
-    if (Number.isNaN(parsed)) return 0;
-    // [MR2-fix] Check unsafe integer precision, matching bigint branch behavior.
-    // "12345678901234567890" parses to 1.23e19 but loses digits — throw instead of silent corruption.
-    if (!Number.isSafeInteger(parsed)) {
-      throw new Error(`safeToNumber: string "${value}" is not a safe integer (got ${parsed}). ` +
-        `Precision would be lost. This indicates data corruption.`);
+    // [F7-fix] Use isFinite instead of isSafeInteger: isSafeInteger rejects valid decimals
+    // (0.7, 0.5, etc.) which are common for importance fields. isFinite accepts all finite
+    // numbers including decimals while still rejecting NaN and Infinity.
+    // [MR2-fix] The BigInt unsafe-precision check stays in the bigint branch above (EF1).
+    if (!Number.isFinite(parsed)) {
+      return 0; // NaN, Infinity, -Infinity → degrade gracefully
     }
     return parsed;
   }
@@ -762,14 +762,23 @@ export class MemoryStore {
           // entries that succeed during recovery to avoid double-counting them).
           const succeededInBatch = new Set<string>();
           const recoveryFailed: string[] = [];
+          const restoreFailedIds: string[] = []; // [F4-fix] Track IDs with data loss so caller knows
           let restoredCount = 0;
           let restoreFailedCount = 0;
           let skippedAlreadyWritten = 0;
+          // [F3-fix] Two-pass: first identify already-written entries, then only process non-written.
+          // Avoids redundant hasId() calls inside the recovery loop and ensures
+          // the retry set is pre-computed before any writes begin.
+          const alreadyWrittenIds = new Set<string>();
+          for (const entry of updatedEntries) {
+            if (await this.hasId(entry.id)) {
+              alreadyWrittenIds.add(entry.id);
+            }
+          }
           for (const entry of updatedEntries) {
             // [F4-fix] Detect partial batch success: skip entries already in DB
             // to avoid redundant writes and misleading recovery failure counts.
-            const alreadyWritten = await this.hasId(entry.id);
-            if (alreadyWritten) {
+            if (alreadyWrittenIds.has(entry.id)) {
               skippedAlreadyWritten++;
               continue;
             }
@@ -806,6 +815,7 @@ export class MemoryStore {
                     `for id=${entry.id}. Data loss may have occurred. error=${rstMsg}`,
                   );
                   restoreFailedCount++;
+                  restoreFailedIds.push(entry.id); // [F4-fix] caller must know which entries had data loss
                 }
               }
               if (!failed.includes(entry.id)) {
@@ -832,7 +842,7 @@ export class MemoryStore {
           }
           return {
             success: actuallySucceeded,
-            failed: [...failed, ...recoveryFailed],
+            failed: [...failed, ...recoveryFailed, ...restoreFailedIds], // [F4-fix] include data-loss IDs
           };
         }
 
@@ -979,7 +989,11 @@ export class MemoryStore {
 
           return {
             id: row.id as string,
-            text: row.text as string,
+            // [F5/F6-fix] Update text to LLM-generated abstract for effective search/recall.
+            // Old design preserved stale text while updating metadata — incorrect.
+            // New design: text = l0_abstract (or l1_overview fallback), keeping text in sync
+            // with the enriched metadata content.
+            text: (merged.l0_abstract ?? merged.l1_overview ?? row.text) as string,
             // [Q2-fix] Guard against null/undefined vector.
             // Array.from(null) returns [], which violates LanceDB vector NOT NULL constraint.
             // row.vector should always exist for entries stored via this store, but guard anyway.
@@ -1017,16 +1031,25 @@ export class MemoryStore {
           // [Q6-fix] Use Set for O(1) lookup instead of O(n) includes.
           const outerFailed = new Set(failed);
           const recoveryFailed: string[] = [];
+          const restoreFailedIds: string[] = []; // [F4-fix] Track IDs with data loss so caller knows
           let skippedAlreadyWritten = 0;
           let restoredCount = 0;
           let restoreFailedCount = 0;
+          // [F3-fix] Two-pass: first identify already-written entries, then only process non-written.
+          // Avoids redundant hasId() calls inside the recovery loop and ensures
+          // the retry set is pre-computed before any writes begin.
+          const alreadyWrittenIds = new Set<string>();
+          for (const entry of updatedEntries) {
+            if (await this.hasId(entry.id)) {
+              alreadyWrittenIds.add(entry.id);
+            }
+          }
           for (const entry of updatedEntries) {
             // [Q3-fix] Detect partial batch success: if this entry was already written
             // (partial batch success before the error), skip per-entry retry to avoid
             // redundant writes. The entry already has the correct new state from the
             // partial batch write.
-            const alreadyWritten = await this.hasId(entry.id);
-            if (alreadyWritten) {
+            if (alreadyWrittenIds.has(entry.id)) {
               skippedAlreadyWritten++;
               continue;
             }
@@ -1061,6 +1084,7 @@ export class MemoryStore {
                     `for id=${entry.id}. Data loss may have occurred. error=${rstMsg}`,
                   );
                   restoreFailedCount++;
+                  restoreFailedIds.push(entry.id); // [F4-fix] caller must know which entries had data loss
                 }
               }
               if (!outerFailed.has(entry.id)) {
@@ -1088,7 +1112,7 @@ export class MemoryStore {
           }
           return {
             success: actuallySucceeded,
-            failed: [...failed, ...recoveryFailed],
+            failed: [...failed, ...recoveryFailed, ...restoreFailedIds], // [F4-fix] include data-loss IDs
           };
         }
 

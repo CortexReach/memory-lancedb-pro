@@ -300,12 +300,19 @@ export class MemoryUpgrader {
     if (!noLlm && this.llm) {
       try {
         const prompt = buildUpgradePrompt(entry.text, newCategory);
-        const llmResult = await this.llm.completeJson<{
-          l0_abstract: string;
-          l1_overview: string;
-          l2_content: string;
-          resolved_category?: string;
-        }>(prompt);
+        // [MR4-fix] Wrap LLM call with 30s timeout: hung completions block Phase 1
+        // and prevent the entire batch from reaching Phase 2 DB writes.
+        const llmResult = await Promise.race([
+          this.llm.completeJson<{
+            l0_abstract: string;
+            l1_overview: string;
+            l2_content: string;
+            resolved_category?: string;
+          }>(prompt),
+          new Promise<null>((_, reject) =>
+            setTimeout(() => reject(new Error("LLM call timed out after 30s")), 30_000),
+          ),
+        ]);
 
         if (!llmResult) {
           throw new Error(this.llm.getLastError() || "LLM returned null");
