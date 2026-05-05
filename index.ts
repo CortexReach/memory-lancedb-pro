@@ -449,6 +449,7 @@ const DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES = 3;
 const DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS = true;
 const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
+const DEFAULT_REFLECTION_AGENT_CACHE_MAX_SIZE = 50;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
 const REFLECTION_FALLBACK_MARKER = "(fallback) Reflection generation failed; storing minimal pointer only.";
@@ -2072,6 +2073,8 @@ const memoryLanceDBProPlugin = {
         timestamp: number;
         metadata?: string;
       };
+      const LIFECYCLE_ENTRIES_MAX_SIZE = 500;
+      const TIER_OVERRIDES_MAX_SIZE = 200;
       const lifecycleEntries = new Map<string, LifecycleEntry>();
       const tierOverrides = new Map<string, string>();
 
@@ -2105,6 +2108,9 @@ const memoryLanceDBProPlugin = {
         api.logger.warn(`memory-lancedb-pro: tier maintenance preload failed: ${String(err)}`);
       }
 
+      // Prevent unbounded growth of lifecycleEntries (#345).
+      pruneMapIfOver(lifecycleEntries, LIFECYCLE_ENTRIES_MAX_SIZE);
+
       const candidates = Array.from(lifecycleEntries.values())
         .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
         .filter((entry) => parseSmartMetadata(entry.metadata, entry).type !== "session-summary");
@@ -2131,6 +2137,9 @@ const memoryLanceDBProPlugin = {
             tierOverrides.set(transition.memoryId, transition.toTier);
           }),
         );
+
+        // Prevent unbounded growth of tierOverrides (#345).
+        pruneMapIfOver(tierOverrides, TIER_OVERRIDES_MAX_SIZE);
 
         if (transitions.length > 0) {
           api.logger.info(
@@ -2246,6 +2255,8 @@ const memoryLanceDBProPlugin = {
       const { invariants, derived } = slices;
       const next = { updatedAt: Date.now(), invariants, derived };
       reflectionByAgentCache.set(cacheKey, next);
+      // Prevent unbounded growth of reflectionByAgentCache (#345).
+      pruneOldestByUpdatedAt(reflectionByAgentCache, DEFAULT_REFLECTION_AGENT_CACHE_MAX_SIZE);
       return next;
     };
 
