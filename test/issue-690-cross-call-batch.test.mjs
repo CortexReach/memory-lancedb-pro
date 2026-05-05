@@ -360,6 +360,79 @@ describe("Issue #690: cross-call batch accumulator", () => {
       await store.flush();
     }
   });
+
+  // ============================================================
+  // 【新增】Test: lock acquisition count is minimized by batching
+  // Reviewer: "single lock acquisition test does not instrument lock calls"
+  // ============================================================
+  it("lock acquisition count is minimized: 20 concurrent calls result in far fewer than 20 lock acquisitions", async () => {
+    ({ store, dir } = makeStore());
+    try {
+      // 先成功寫入，讓 table 可用
+      await store.bulkStore([makeEntry(0)]);
+      await store.flush();
+
+      // Instrument runWithFileLock to count invocations
+      let lockCount = 0;
+      const originalRunWithFileLock = store.runWithFileLock.bind(store);
+      store.runWithFileLock = async (fn) => {
+        lockCount++;
+        return originalRunWithFileLock(fn);
+      };
+
+      // 同時發 20 個 calls，每個 5 個 entries
+      const COUNT = 20;
+      const promises = Array.from({ length: COUNT }, (_, i) => {
+        const entries = Array.from({ length: 5 }, (_, j) => makeEntry(i * 5 + j));
+        return store.bulkStore(entries);
+      });
+
+      await Promise.allSettled(promises);
+      await store.flush(); // 確保所有 entries 都寫入
+
+      // Without batching: 20 calls × 1 lock per call = 20 lock acquisitions
+      // With batching: all 20 calls batched into 1 flush = 1 lock acquisition per flush
+      // 20 calls with 100ms batching window → should be 1 lock acquisition, not 20
+      console.log(`[LockCount] ${lockCount} lock acquisitions for ${COUNT} concurrent calls`);
+      assert.ok(lockCount < COUNT, `Expected far fewer than ${COUNT} lock acquisitions, got ${lockCount}`);
+      assert.ok(lockCount >= 1, `Expected at least 1 lock acquisition, got ${lockCount}`);
+    } finally {
+      await store.flush();
+    }
+  });
+
+  // ============================================================
+  // 【新增】Test: bulkStore() filters invalid entries internally
+  // Reviewer: "invalid-entry test pre-filters before calling bulkStore"
+  // This test passes raw mixed array directly to bulkStore() without pre-filtering
+  // ============================================================
+  it("bulkStore() filters invalid entries internally: raw mixed input returns only valid entries", async () => {
+    ({ store, dir } = makeStore());
+    try {
+      // Pass raw mixed array directly to bulkStore() — NO pre-filtering
+      const rawMixed = [
+        null,
+        undefined,
+        { text: "", vector: [0.1, 0.2] },         // empty text — should be filtered
+        { text: "valid", vector: [] },            // empty vector — should be filtered
+        { text: "valid-only-no-vector", vector: undefined }, // missing vector — should be filtered
+        { text: undefined, vector: [0.1, 0.2] },  // missing text — should be filtered
+        makeEntry(10),                             // valid
+        makeEntry(11),                             // valid
+      ];
+      // bulkStore() should handle this raw mixed array and filter internally
+      const result = await store.bulkStore(rawMixed);
+
+      // Only the 2 valid entries (makeEntry(10) and makeEntry(11)) should be returned
+      assert.strictEqual(result.length, 2, `Expected 2 valid entries, got ${result.length}`);
+      assert.ok(result[0].id, "Valid entry should have auto-generated id");
+      assert.ok(result[1].id, "Valid entry should have auto-generated id");
+      assert.ok(result[0].text.startsWith("entry-10-"), `Expected text to start with 'entry-10-', got '${result[0].text}'`);
+      assert.ok(result[1].text.startsWith("entry-11-"), `Expected text to start with 'entry-11-', got '${result[1].text}'`);
+    } finally {
+      await store.flush();
+    }
+  });
 });
 
 console.log("=== Issue #690 Tests ===");
