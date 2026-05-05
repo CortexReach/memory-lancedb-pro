@@ -728,7 +728,15 @@ export class MemoryStore {
           const recoveryFailed: string[] = [];
           let restoredCount = 0;
           let restoreFailedCount = 0;
+          let skippedAlreadyWritten = 0;
           for (const entry of updatedEntries) {
+            // [F4-fix] Detect partial batch success: skip entries already in DB
+            // to avoid redundant writes and misleading recovery failure counts.
+            const alreadyWritten = await this.hasId(entry.id);
+            if (alreadyWritten) {
+              skippedAlreadyWritten++;
+              continue;
+            }
             try {
               await this.table!.add([entry]);
               succeededInBatch.add(entry.id); // [Q3-fix] mark as known-succeeded
@@ -738,10 +746,14 @@ export class MemoryStore {
               const originalRow = originalsBackup.get(entry.id);
               if (originalRow) {
                 try {
+                  // [MR4-fix] Guard against null vector during restore, matching bulkUpdateMetadataWithPatch.
+                  const vector: number[] = originalRow.vector != null
+                    ? Array.from(originalRow.vector as Iterable<number>)
+                    : (() => { throw new Error(`bulkUpdateMetadata: restore: original row.vector is null for id=${originalRow.id}`); })();
                   const originalEntry: MemoryEntry = {
                     id: originalRow.id as string,
                     text: originalRow.text as string,
-                    vector: Array.from(originalRow.vector as Iterable<number>),
+                    vector,
                     category: originalRow.category as MemoryEntry["category"],
                     scope: (originalRow.scope as string | undefined) ?? "global",
                     importance: safeToNumber(originalRow.importance),
@@ -765,14 +777,16 @@ export class MemoryStore {
               }
             }
           }
-          // [Q3-fix] succeeded count = total - definitively failed
-          const actuallySucceeded = updatedEntries.length - recoveryFailed.length;
+          // [F3-fix] succeeded = entries that received the new enriched state.
+          // Restored originals and skipped already-written entries are NOT successful upgrades.
+          const actuallySucceeded = succeededInBatch.size;
           // EF3-fix: single summary log instead of per-entry noise
           if (restoredCount > 0 || restoreFailedCount > 0) {
             console.warn(
               `[memory-lancedb-pro] bulkUpdateMetadata: recovery: ` +
-              `${restoredCount} originals restored, ${restoreFailedCount} restores failed, ` +
-              `${recoveryFailed.length} entries failed. succeeded=${actuallySucceeded}`,
+              `${skippedAlreadyWritten} already written, ${restoredCount} originals restored, ` +
+              `${restoreFailedCount} restores failed, ${recoveryFailed.length} entries failed. ` +
+              `succeeded=${actuallySucceeded}`,
             );
           } else {
             console.warn(
@@ -1005,7 +1019,10 @@ export class MemoryStore {
               }
             }
           }
-          const actuallySucceeded = updatedEntries.length - recoveryFailed.length;
+          // [F3-fix] succeeded = entries that received the new enriched state.
+          // Restored originals are NOT successful upgrades — they fell back to old data.
+          // Also exclude entries already written before this batch (skippedAlreadyWritten).
+          const actuallySucceeded = updatedEntries.length - recoveryFailed.length - restoredCount - skippedAlreadyWritten;
           // EF3-fix: single summary log instead of per-entry noise
           if (skippedAlreadyWritten > 0) {
             console.warn(
