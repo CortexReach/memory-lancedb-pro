@@ -133,7 +133,9 @@ function isExplicitDenyAllScopeFilter(scopeFilter?: string[]): boolean {
  * [fix-Nice1] Use this instead of raw Number() for untrusted DB row fields.
  *
  * Handles: bigint (with precision check), number, string (with NaN guard), other (→ 0).
- * Throws if bigint conversion would lose precision — callers must guard their data.
+ * Throws if bigint or string conversion would lose precision — callers must guard their data.
+ * Use tryParseNumber() for untrusted external data (e.g. _distance from LanceDB) that
+ * should degrade gracefully instead of throwing.
  */
 function safeToNumber(value: unknown): number {
   if (typeof value === 'bigint') {
@@ -147,7 +149,33 @@ function safeToNumber(value: unknown): number {
   if (typeof value === 'number') return value;
   if (typeof value === 'string') {
     const parsed = Number(value);
-    return Number.isNaN(parsed) ? 0 : parsed;
+    if (Number.isNaN(parsed)) return 0;
+    // [MR2-fix] Check unsafe integer precision, matching bigint branch behavior.
+    // "12345678901234567890" parses to 1.23e19 but loses digits — throw instead of silent corruption.
+    if (!Number.isSafeInteger(parsed)) {
+      throw new Error(`safeToNumber: string "${value}" is not a safe integer (got ${parsed}). ` +
+        `Precision would be lost. This indicates data corruption.`);
+    }
+    return parsed;
+  }
+  return 0;
+}
+
+/**
+ * [MR1-fix] Graceful number parsing for untrusted external data (e.g. _distance from LanceDB).
+ * Unlike safeToNumber, this degrades to 0 instead of throwing so that a single bad row
+ * (e.g. corrupt _distance from a failed vector search) cannot crash all read paths.
+ */
+function tryParseNumber(value: unknown): number {
+  if (typeof value === 'bigint') {
+    const n = Number(value);
+    return Number.isSafeInteger(n) ? n : 0;
+  }
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isNaN(parsed)) return 0;
+    return Number.isSafeInteger(parsed) ? parsed : 0;
   }
   return 0;
 }
@@ -616,6 +644,12 @@ export class MemoryStore {
       return { success: 0, failed: [] };
     }
 
+    // [MR5-fix] Deduplicate ids before SQL query to avoid duplicate IN clause
+    // and ensure recovery loop has unique ids.
+    const uniquePairs = Array.from(
+      new Map(pairs.map((p) => [p.id, p])).values()
+    );
+
     // Phase 2: single lock + updateQueue serialization for the entire batch
     // M1 fix: wrap with runSerializedUpdate so bulk ops don't interleave with plugin updates
     //
@@ -631,7 +665,8 @@ export class MemoryStore {
     return this.runWithFileLock(() =>
       this.runSerializedUpdate(async () => {
         // Step 1: Batch query all entries (1 LanceDB op)
-        const ids = pairs.map((p) => `'${escapeSqlLiteral(p.id)}'`).join(", ");
+        // [MR5-fix] Use uniquePairs to avoid duplicate IN clause
+        const ids = uniquePairs.map((p) => `'${escapeSqlLiteral(p.id)}'`).join(", ");
         const rows = await this.table!.query()
           .where(`id IN (${ids})`)
           .toArray();
@@ -642,7 +677,8 @@ export class MemoryStore {
 
         // Collect entries to update (those that were found)
         const toUpdate: Array<{ id: string; metadata: string; row: Record<string, unknown> }> = [];
-        for (const pair of pairs) {
+        // [MR5-fix] Use uniquePairs to avoid duplicate id processing
+        for (const pair of uniquePairs) {
           if (!foundIds.has(pair.id)) {
             failed.push(pair.id);
           } else {
@@ -838,10 +874,16 @@ export class MemoryStore {
       return { success: 0, failed: [] };
     }
 
+    // [MR5-fix] Deduplicate entries by id before SQL query and recovery loop.
+    const uniqueEntries = Array.from(
+      new Map(entries.map((e) => [e.id, e])).values()
+    );
+
     return this.runWithFileLock(() =>
       this.runSerializedUpdate(async () => {
         // Step 1: Batch query all entries (1 LanceDB op) — re-read fresh state
-        const ids = entries.map((e) => `'${escapeSqlLiteral(e.id)}'`).join(", ");
+        // [MR5-fix] Use uniqueEntries to avoid duplicate IN clause
+        const ids = uniqueEntries.map((e) => `'${escapeSqlLiteral(e.id)}'`).join(", ");
         const rows = await this.table!.query()
           .where(`id IN (${ids})`)
           .toArray();
@@ -855,7 +897,8 @@ export class MemoryStore {
           entry: (typeof entries)[0];
           row: Record<string, unknown>;
         }> = [];
-        for (const entry of entries) {
+        // [MR5-fix] Use uniqueEntries so duplicate ids are not double-counted in failed
+        for (const entry of uniqueEntries) {
           if (!foundIds.has(entry.id)) {
             failed.push(entry.id);
           } else {
@@ -909,13 +952,19 @@ export class MemoryStore {
           // JS spread: {...base, ...{x:undefined}} OVERWRITES base.x with undefined.
           // [fix-Nice2] Only whitelisted LLM keys are accepted; all others are dropped
           // to prevent accidental overwrites of tier/access_count/confidence.
+          // [MR3-fix] Strip undefined AND null values to prevent base-field overwrite.
+          // JS spread: {...base, ...{x:null}} OVERWRITES base.x with null.
+          // [F6-fix] cleanMarker must also pass the ALLOWED_PATCH_KEYS whitelist gate
+          // so marker fields cannot bypass the same restrictions as patch fields.
           const cleanPatch = Object.fromEntries(
             Object.entries(entry.patch as Record<string, unknown>)
               .filter(([k]) => ALLOWED_PATCH_KEYS.has(k)) // [fix-Nice2] whitelist gate
-              .filter(([, v]) => v !== undefined)
+              .filter(([, v]) => v !== undefined && v !== null) // [MR3-fix] drop null too
           );
           const cleanMarker = Object.fromEntries(
-            Object.entries(entry.marker as Record<string, unknown>).filter(([, v]) => v !== undefined)
+            Object.entries(entry.marker as Record<string, unknown>)
+              .filter(([k]) => ALLOWED_PATCH_KEYS.has(k)) // [F6-fix] enforce whitelist
+              .filter(([, v]) => v !== undefined && v !== null) // [MR3-fix] drop null too
           );
 
           // Parse fresh metadata from DB — Plugin's injected_count=5 is preserved here
@@ -1158,7 +1207,7 @@ export class MemoryStore {
     const mapped: MemorySearchResult[] = [];
 
     for (const row of results) {
-      const distance = safeToNumber(row._distance ?? 0);
+      const distance = tryParseNumber(row._distance ?? 0);
       const score = 1 / (1 + distance);
 
       if (score < minScore) continue;
