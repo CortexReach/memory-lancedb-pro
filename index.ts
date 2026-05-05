@@ -475,6 +475,29 @@ type EmbeddedPiRunner = (params: Record<string, unknown>) => Promise<unknown>;
 const requireFromHere = createRequire(import.meta.url);
 let embeddedPiRunnerPromise: Promise<EmbeddedPiRunner> | null = null;
 
+// Circuit breaker for Layer 1: after 3 consecutive failures within 5min, skip Layer 1
+const layer1FailureTimestamps: number[] = [];
+const LAYER1_FAILURE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const LAYER1_FAILURE_THRESHOLD = 3;
+
+/** Reports a Layer 1 runner execution failure. Called by the caller when Layer 1 runner throws. */
+export function reportLayer1Failure(): void {
+  const now = Date.now();
+  layer1FailureTimestamps.push(now);
+  // Keep only failures within the window
+  const cutoff = now - LAYER1_FAILURE_WINDOW_MS;
+  while (layer1FailureTimestamps.length > 0 && layer1FailureTimestamps[0] < cutoff) {
+    layer1FailureTimestamps.shift();
+  }
+}
+
+function isLayer1CircuitOpen(): boolean {
+  const now = Date.now();
+  const cutoff = now - LAYER1_FAILURE_WINDOW_MS;
+  const recentFailures = layer1FailureTimestamps.filter((t) => t >= cutoff);
+  return recentFailures.length >= LAYER1_FAILURE_THRESHOLD;
+}
+
 export function toImportSpecifier(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return "";
@@ -533,13 +556,15 @@ export function getExtensionApiImportSpecifiers(): string[] {
  */
 // eslint-disable-next-line import/export
 export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<EmbeddedPiRunner> {
-  // Layer 1: 嘗試新 SDK API
-  const newApi = (api as unknown as Record<string, unknown>).runtime?.agent;
-  if (typeof newApi?.runEmbeddedPiAgent === "function") {
-    const runner = newApi.runEmbeddedPiAgent.bind(newApi);
-    // Bug 2 fix: 將 Layer 1 結果寫入 cache，避免後續並發呼叫時 Layer 2 覆蓋掉 Layer 1
-    embeddedPiRunnerPromise ??= Promise.resolve(runner as EmbeddedPiRunner);
-    return embeddedPiRunnerPromise;
+  // Layer 1: 嘗試新 SDK API (with circuit breaker)
+  if (!isLayer1CircuitOpen()) {
+    const newApi = (api as unknown as Record<string, unknown>).runtime?.agent;
+    if (typeof newApi?.runEmbeddedPiAgent === "function") {
+      const runner = newApi.runEmbeddedPiAgent.bind(newApi);
+      // Bug 2 fix: 將 Layer 1 結果寫入 cache，避免後續並發呼叫時 Layer 2 覆蓋掉 Layer 1
+      embeddedPiRunnerPromise ??= Promise.resolve(runner as EmbeddedPiRunner);
+      return embeddedPiRunnerPromise;
+    }
   }
 
   // Layer 2: Fallback 舊 extensionAPI.js
@@ -563,7 +588,14 @@ export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<Embe
       );
     })();
   }
-  return embeddedPiRunnerPromise;
+
+  // F2 fix: restore retry-on-failure semantics removed in PR716
+  try {
+    return await embeddedPiRunnerPromise;
+  } catch (err) {
+    embeddedPiRunnerPromise = null;
+    throw err;
+  }
 }
 
 function clipDiagnostic(text: string, maxLen = 400): string {
@@ -1305,6 +1337,8 @@ async function generateReflectionText(params: {
       reflectionText = typeof firstWithText?.text === "string" ? firstWithText.text.trim() : null;
     }
   } catch (err) {
+    // F1 fix: report Layer 1 runner execution failure to open circuit breaker
+    reportLayer1Failure();
     errors.push(`embedded: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
   } finally {
     await unlink(tempSessionFile).catch(() => { });
