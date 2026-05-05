@@ -49,6 +49,8 @@ const EXPECTED_BASELINE = [
   { group: "core-regression", runner: "node", file: "test/temporal-awareness.test.mjs", args: ["--test"] },
   // Issue #598 regression tests
   { group: "core-regression", runner: "node", file: "test/store-serialization.test.mjs" },
+  // Issue #692: AST-based semantic chunking
+  { group: "core-regression", runner: "node", file: "test/ast-code-chunking.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/access-tracker-retry.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/embedder-cache.test.mjs" },
   // Issue #629 batch embedding fix
