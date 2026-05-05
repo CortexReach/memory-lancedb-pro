@@ -49,6 +49,7 @@ import {
 import {
   extractReflectionLearningGovernanceCandidates,
   extractInjectableReflectionMappedMemoryItems,
+  isRecallUsed,
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
@@ -211,6 +212,10 @@ interface PluginConfig {
     thinkLevel?: ReflectionThinkLevel;
     errorReminderMaxEntries?: number;
     dedupeErrorSignals?: boolean;
+    /** Cooldown in ms between reflection triggers for the same session. Default: 120000 (2 min). Set to 0 to disable. */
+    serialCooldownMs?: number;
+    /** Agent/session patterns excluded from reflection injection. Supports exact match, wildcard prefix (e.g. "pi-"), and "temp:*". */
+    excludeAgents?: string[];
   };
   mdMirror?: { enabled?: boolean; dir?: string };
   workspaceBoundary?: WorkspaceBoundaryConfig;
@@ -341,6 +346,34 @@ function resolveHookAgentId(
     : parseAgentIdFromSessionKey(sessionKey)) || "main";
 }
 
+// Detect when agentId came from a chat_id / user: source (e.g. "657229412030480397").
+// These are numeric Discord/Telegram IDs mistakenly used as agent IDs and cause
+// auto-recall to timeout. We skip them rather than block all pure-numeric IDs
+// to avoid false positives for intentionally numeric agent names.
+function isChatIdBasedAgentId(agentId: string): boolean {
+  return /^\d+$/.test(agentId); // pure digits = almost certainly a chat_id, not a real agent
+}
+
+/**
+ * Returns true when agentId is invalid — either empty/undefined, detected as a
+ * numeric chat_id, or not present in the openclaw.json declared agents list.
+ * Pass `declaredAgents` (from config.declaredAgents) for authoritative validation.
+ */
+export function isInvalidAgentIdFormat(
+  agentId: string | undefined,
+  declaredAgents?: Set<string>,
+): boolean {
+  // Layer 1: empty/undefined/whitespace-only are all invalid
+  if (!agentId || (typeof agentId === "string" && !agentId.trim())) return true;
+  // Pure numeric IDs are almost always chat_id extractions, not real agent IDs.
+  if (isChatIdBasedAgentId(agentId)) return true;
+  // If we have a declared agents list, treat unknown IDs as invalid.
+  if (declaredAgents && declaredAgents.size > 0 && !declaredAgents.has(agentId)) {
+    return true;
+  }
+  return false;
+}
+
 function resolveSourceFromSessionKey(sessionKey: string | undefined): string {
   const trimmed = sessionKey?.trim() ?? "";
   const match = /^agent:[^:]+:([^:]+)/.exec(trimmed);
@@ -418,6 +451,7 @@ const DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS = true;
 const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
+const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
 const REFLECTION_FALLBACK_MARKER = "(fallback) Reflection generation failed; storing minimal pointer only.";
 const DIAG_BUILD_TAG = "memory-lancedb-pro-diag-20260308-0058";
 
@@ -441,6 +475,29 @@ type EmbeddedPiRunner = (params: Record<string, unknown>) => Promise<unknown>;
 
 const requireFromHere = createRequire(import.meta.url);
 let embeddedPiRunnerPromise: Promise<EmbeddedPiRunner> | null = null;
+
+// Circuit breaker for Layer 1: after 3 consecutive failures within 5min, skip Layer 1
+const layer1FailureTimestamps: number[] = [];
+const LAYER1_FAILURE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const LAYER1_FAILURE_THRESHOLD = 3;
+
+/** Reports a Layer 1 runner execution failure. Called by the caller when Layer 1 runner throws. */
+export function reportLayer1Failure(): void {
+  const now = Date.now();
+  layer1FailureTimestamps.push(now);
+  // Keep only failures within the window
+  const cutoff = now - LAYER1_FAILURE_WINDOW_MS;
+  while (layer1FailureTimestamps.length > 0 && layer1FailureTimestamps[0] < cutoff) {
+    layer1FailureTimestamps.shift();
+  }
+}
+
+function isLayer1CircuitOpen(): boolean {
+  const now = Date.now();
+  const cutoff = now - LAYER1_FAILURE_WINDOW_MS;
+  const recentFailures = layer1FailureTimestamps.filter((t) => t >= cutoff);
+  return recentFailures.length >= LAYER1_FAILURE_THRESHOLD;
+}
 
 export function toImportSpecifier(value: string): string {
   const trimmed = value.trim();
@@ -491,7 +548,27 @@ export function getExtensionApiImportSpecifiers(): string[] {
   return [...new Set(specifiers.filter(Boolean))];
 }
 
-async function loadEmbeddedPiRunner(): Promise<EmbeddedPiRunner> {
+/**
+ * Layer 1: 新 SDK API — api.runtime.agent.runEmbeddedPiAgent (4.22+)
+ * Layer 2: 舊 extensionAPI.js dynamic import（4.24-4.26 SDK 仍保留）
+ * Layer 3: CLI fallback
+ *
+ * 遷移自 Bug 2（Issue #606）：原本只使用 Layer 2，現改為 Try-New-First。
+ */
+// eslint-disable-next-line import/export
+export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<EmbeddedPiRunner> {
+  // Layer 1: 嘗試新 SDK API (with circuit breaker)
+  if (!isLayer1CircuitOpen()) {
+    const newApi = (api as unknown as Record<string, unknown>).runtime?.agent;
+    if (typeof newApi?.runEmbeddedPiAgent === "function") {
+      const runner = newApi.runEmbeddedPiAgent.bind(newApi);
+      // Bug 2 fix: 將 Layer 1 結果寫入 cache，避免後續並發呼叫時 Layer 2 覆蓋掉 Layer 1
+      embeddedPiRunnerPromise ??= Promise.resolve(runner as EmbeddedPiRunner);
+      return embeddedPiRunnerPromise;
+    }
+  }
+
+  // Layer 2: Fallback 舊 extensionAPI.js
   if (!embeddedPiRunnerPromise) {
     embeddedPiRunnerPromise = (async () => {
       const importErrors: string[] = [];
@@ -513,6 +590,7 @@ async function loadEmbeddedPiRunner(): Promise<EmbeddedPiRunner> {
     })();
   }
 
+  // F2 fix: restore retry-on-failure semantics removed in PR716
   try {
     return await embeddedPiRunnerPromise;
   } catch (err) {
@@ -802,6 +880,8 @@ function shouldSkipReflectionMessage(role: string, text: string): boolean {
 }
 
 const AUTO_CAPTURE_MAP_MAX_ENTRIES = 2000;
+// Guard: skip texts > 5000 chars to prevent embedding API errors (issue #417 Fix #3)
+const MAX_MESSAGE_LENGTH = 5000;
 const AUTO_CAPTURE_EXPLICIT_REMEMBER_RE =
   /^(?:请|請)?(?:记住|記住|记一下|記一下|别忘了|別忘了)[。.!?？!]*$/u;
 
@@ -823,14 +903,17 @@ function isExplicitRememberCommand(text: string): boolean {
   return AUTO_CAPTURE_EXPLICIT_REMEMBER_RE.test(text.trim());
 }
 
-function buildAutoCaptureConversationKeyFromIngress(
+// DM key fallback: exported for unit testing (issue #417 Fix #1)
+export function buildAutoCaptureConversationKeyFromIngress(
   channelId: string | undefined,
   conversationId: string | undefined,
 ): string | null {
   const channel = typeof channelId === "string" ? channelId.trim() : "";
   const conversation = typeof conversationId === "string" ? conversationId.trim() : "";
-  if (!channel || !conversation) return null;
-  return `${channel}:${conversation}`;
+  if (!channel) return null;
+  // DM: conversationId=undefined -> fallback to channelId (matches regex extract from sessionKey)
+  // Group: conversationId=exists -> returns channelId:conversationId (matches regex extract)
+  return conversation ? `${channel}:${conversation}` : channel;
 }
 
 /**
@@ -1184,6 +1267,7 @@ async function generateReflectionText(params: {
   thinkLevel: ReflectionThinkLevel;
   toolErrorSignals?: ReflectionErrorSignal[];
   logger?: { info?: (message: string) => void; warn?: (message: string) => void };
+  api: OpenClawPluginApi;  // SDK migration Bug 2: pass api to use new runtime.agent API
 }): Promise<{ text: string; usedFallback: boolean; promptHash: string; error?: string; runner: "embedded" | "cli" | "fallback" }> {
   const prompt = buildReflectionPrompt(
     params.conversation,
@@ -1210,7 +1294,7 @@ async function generateReflectionText(params: {
       retryState,
       onLog: onRetryLog,
       execute: async () => {
-        const runEmbeddedPiAgent = await loadEmbeddedPiRunner();
+        const runEmbeddedPiAgent = await loadEmbeddedPiRunner(params.api);
         const modelRef = resolveAgentPrimaryModelRef(params.cfg, params.agentId);
         const { provider, model } = modelRef ? splitProviderModel(modelRef) : {};
         const embeddedTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
@@ -1254,6 +1338,8 @@ async function generateReflectionText(params: {
       reflectionText = typeof firstWithText?.text === "string" ? firstWithText.text.trim() : null;
     }
   } catch (err) {
+    // F1 fix: report Layer 1 runner execution failure to open circuit breaker
+    reportLayer1Failure();
     errors.push(`embedded: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
   } finally {
     await unlink(tempSessionFile).catch(() => { });
@@ -1908,6 +1994,40 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   };
 }
 
+export function isAgentOrSessionExcluded(
+  agentId: string,
+  sessionKey: string | undefined,
+  patterns: string[],
+): boolean {
+  if (!Array.isArray(patterns) || patterns.length === 0) return false;
+
+  // Guard: agentId must be a non-empty string
+  if (typeof agentId !== "string" || !agentId.trim()) return false;
+
+  const cleanAgentId = agentId.trim();
+  const isInternal = typeof sessionKey === "string" &&
+    sessionKey.trim().startsWith("temp:memory-reflection");
+
+  for (const pattern of patterns) {
+    const p = typeof pattern === "string" ? pattern.trim() : "";
+    if (!p) continue;
+
+    if (p === "temp:*") {
+      if (isInternal) return true;
+      continue;
+    }
+
+    if (p.endsWith("-")) {
+      // Wildcard prefix match: "pi-" matches "pi-agent" but NOT "pilot" or "ping"
+      if (cleanAgentId.startsWith(p)) return true;
+    } else if (p === cleanAgentId) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 const memoryLanceDBProPlugin = {
   id: "memory-lancedb-pro",
   name: "Memory (LanceDB Pro)",
@@ -2177,6 +2297,17 @@ const memoryLanceDBProPlugin = {
       return next;
     };
 
+    // ========================================================================
+    // Proposal A Phase 1: Recall Usage Tracking Hooks
+    // ========================================================================
+    // Track pending recalls per session for usage scoring
+    type PendingRecallEntry = {
+      recallIds: string[];
+      responseText: string;
+      injectedAt: number;
+    };
+    const pendingRecall = new Map<string, PendingRecallEntry>();
+
     const logReg = isCliMode() ? api.logger.debug : api.logger.info;
     logReg(
       `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
@@ -2226,16 +2357,26 @@ const memoryLanceDBProPlugin = {
     }
 
     api.on("message_received", (event: any, ctx: any) => {
-      const conversationKey = buildAutoCaptureConversationKeyFromIngress(
-        ctx.channelId,
-        ctx.conversationId,
-      );
-      const normalized = normalizeAutoCaptureText("user", event.content, shouldSkipReflectionMessage);
-      if (conversationKey && normalized) {
-        const queue = autoCapturePendingIngressTexts.get(conversationKey) || [];
-        queue.push(normalized);
-        autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
-        pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+      try {
+        const conversationKey = buildAutoCaptureConversationKeyFromIngress(
+          ctx.channelId,
+          ctx.conversationId,
+        );
+        const normalized = normalizeAutoCaptureText("user", event.content, shouldSkipReflectionMessage);
+        if (conversationKey && normalized) {
+          if (normalized.length > MAX_MESSAGE_LENGTH) {
+            api.logger.debug(
+              `memory-lancedb-pro: skipped pending ingress text (len=${normalized.length} > ${MAX_MESSAGE_LENGTH}) channel=${ctx.channelId}`,
+            );
+          } else {
+            const queue = autoCapturePendingIngressTexts.get(conversationKey) || [];
+            queue.push(normalized);
+            autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
+            pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          }
+        }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: message_received auto-capture error: ${String(err)}`);
       }
       api.logger.debug(
         `memory-lancedb-pro: ingress message_received channel=${ctx.channelId} account=${ctx.accountId || "unknown"} conversation=${ctx.conversationId || "unknown"} from=${event.from} len=${event.content.trim().length} preview=${summarizeTextPreview(event.content)}`,
@@ -2401,6 +2542,12 @@ const memoryLanceDBProPlugin = {
         // - Else if autoRecallExcludeAgents is set: all agents EXCEPT these receive auto-recall
 
         const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+        if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+          api.logger.debug?.(
+            `memory-lancedb-pro: auto-recall skipped \u2014 invalid agentId format '${agentId}'`,
+          );
+          return;
+        }
         if (Array.isArray(config.autoRecallIncludeAgents) && config.autoRecallIncludeAgents.length > 0) {
           if (!config.autoRecallIncludeAgents.includes(agentId)) {
             api.logger.debug?.(
@@ -2411,10 +2558,10 @@ const memoryLanceDBProPlugin = {
         } else if (
           Array.isArray(config.autoRecallExcludeAgents) &&
           config.autoRecallExcludeAgents.length > 0 &&
-          config.autoRecallExcludeAgents.includes(agentId)
+          isAgentOrSessionExcluded(agentId, sessionKey, config.autoRecallExcludeAgents)
         ) {
           api.logger.debug?.(
-            `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}'`,
+            `memory-lancedb-pro: auto-recall skipped for excluded agent '${agentId}' (sessionKey=${sessionKey ?? "(none)"})`,
           );
           return;
         }
@@ -2445,6 +2592,10 @@ const memoryLanceDBProPlugin = {
         const recallWork = async (): Promise<{ prependContext: string } | undefined> => {
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+            api.logger.debug?.(`memory-lancedb-pro: auto-recall skip \u2014 invalid agentId '${agentId}'`);
+            return undefined;
+          }
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
 
           // Use cached raw user message for the recall query to avoid channel
@@ -2707,6 +2858,17 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: injecting ${selected.length} memories into context for agent ${agentId}`,
           );
 
+          // Create or update pendingRecall for this turn so the feedback hook
+          // (which runs in the NEXT turn's before_prompt_build after agent_end)
+          // sees a matching pair: Turn N recallIds + Turn N responseText.
+          // agent_end will write responseText into this same pendingRecall
+          // entry (only updating responseText, never clearing recallIds).
+          const sessionKeyForRecall = ctx?.sessionKey || ctx?.sessionId || "default";
+          pendingRecall.set(sessionKeyForRecall, {
+            recallIds: selected.map((item) => item.id),
+            responseText: "", // Will be populated by agent_end
+            injectedAt: Date.now(),
+          });
           return {
             prependContext:
               `<relevant-memories>\n` +
@@ -2788,6 +2950,10 @@ const memoryLanceDBProPlugin = {
 
           // Determine agent ID and default scope
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+            api.logger.debug(`memory-lancedb-pro: auto-capture skip \u2014 invalid agentId '${agentId}'`);
+            return;
+          }
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
           const defaultScope = isSystemBypassId(agentId)
             ? config.scopes?.default ?? "global"
@@ -2865,7 +3031,9 @@ const memoryLanceDBProPlugin = {
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
           }
-          autoCaptureSeenTextCount.set(sessionKey, eligibleTexts.length);
+          // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
+          const cumulativeCount = previousSeenCount + newTexts.length;
+          autoCaptureSeenTextCount.set(sessionKey, cumulativeCount);
           pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
 
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
@@ -2957,36 +3125,52 @@ const memoryLanceDBProPlugin = {
               );
               return;
             }
-            if (cleanTexts.length >= minMessages) {
+            if (cumulativeCount >= minMessages) {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (${cleanTexts.length} clean texts >= ${minMessages})`,
+                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
               const conversationText = cleanTexts.join("\n");
-              const stats = await smartExtractor.extractAndPersist(
-                conversationText, sessionKey,
-                { scope: defaultScope, scopeFilter: accessibleScopes },
-              );
+              // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
+              let stats: Awaited<ReturnType<typeof smartExtractor.extractAndPersist>> | null = null;
+              try {
+                stats = await smartExtractor.extractAndPersist(
+                  conversationText, sessionKey,
+                  { scope: defaultScope, scopeFilter: accessibleScopes },
+                );
+              } catch (err) {
+                api.logger.error(
+                  `memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`,
+                );
+                return; // prevent hook crash — fall through to regex fallback is intentionally skipped
+              }
               // Charge rate limiter only after successful extraction
               extractionRateLimiter.recordExtraction();
               if (stats.created > 0 || stats.merged > 0) {
                 api.logger.info(
-                  `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
+                  `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`,
                 );
+                // issue #417 Fix #5: reset counter after successful extraction
+                autoCaptureSeenTextCount.set(sessionKey, 0);
                 return; // Smart extraction handled everything
               }
 
-              if ((stats.boundarySkipped ?? 0) > 0) {
+              if ((stats.boundarySkipped ?? 0) === 0) {
                 api.logger.info(
-                  `memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`,
+                  `memory-lancedb-pro: smart extraction produced no candidates and no boundary texts for agent ${agentId}; skipping regex fallback`,
                 );
+                return;
               }
+
+              api.logger.info(
+                `memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`,
+              );
 
               api.logger.info(
                 `memory-lancedb-pro: smart extraction produced no persisted memories for agent ${agentId} (created=${stats.created}, merged=${stats.merged}, skipped=${stats.skipped}); falling back to regex capture`,
               );
             } else {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (${cleanTexts.length} < ${minMessages})`,
+                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (cumulative=${cumulativeCount} < minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
             }
           }
@@ -3103,6 +3287,135 @@ const memoryLanceDBProPlugin = {
 
       api.on("agent_end", agentEndAutoCaptureHook);
     }
+
+    // ========================================================================
+    // Proposal A Phase 1: agent_end hook - Store response text for usage tracking
+    // ========================================================================
+    // NOTE: Only writes responseText to an EXISTING pendingRecall entry created
+    // by before_prompt_build (auto-recall). Does NOT create a new entry.
+    // This ensures recallIds (written by auto-recall in the same turn) and
+    // responseText (written here) remain paired for the feedback hook.
+    api.on("agent_end", (event: any, ctx: any) => {
+      const sessionKey = ctx?.sessionKey || ctx?.sessionId || "default";
+      if (!sessionKey) return;
+
+      // Get the last message content
+      let lastMsgText: string | null = null;
+      if (event.messages && Array.isArray(event.messages)) {
+        const lastMsg = event.messages[event.messages.length - 1];
+        if (lastMsg && typeof lastMsg === "object") {
+          const msgObj = lastMsg as Record<string, unknown>;
+          lastMsgText = extractTextContent(msgObj.content);
+        }
+      }
+
+      // Only update an existing pendingRecall entry — do NOT create one.
+      // This preserves recallIds written by auto-recall earlier in this turn.
+      const existing = pendingRecall.get(sessionKey);
+      if (existing && lastMsgText && lastMsgText.trim().length > 0) {
+        existing.responseText = lastMsgText;
+      }
+    }, { priority: 20 });
+
+    // ========================================================================
+    // Proposal A Phase 1: before_prompt_build hook (priority 5) - Score recalls
+    // ========================================================================
+    api.on("before_prompt_build", async (event: any, ctx: any) => {
+      const sessionKey = ctx?.sessionKey || ctx?.sessionId || "default";
+      const pending = pendingRecall.get(sessionKey);
+      if (!pending) return;
+
+      // Guard: only score if responseText has substantial content
+      const responseText = pending.responseText;
+      if (!responseText || responseText.length <= 24) {
+        // Skip scoring for empty or very short responses
+        return;
+      }
+
+      // Guard: skip if no recall IDs (shouldn't happen but be safe)
+      if (!pending.recallIds || pending.recallIds.length === 0) {
+        return;
+      }
+
+      // TTL cleanup: evict stale entries older than 10 minutes to prevent
+      // unbounded Map growth when session_end never fires (crash, SIGKILL, etc.)
+      const now = Date.now();
+      const PENDING_RECALL_TTL_MS = 10 * 60 * 1000;
+      if (pending.injectedAt && now - pending.injectedAt > PENDING_RECALL_TTL_MS) {
+        pendingRecall.delete(sessionKey);
+        return;
+      }
+
+      // Determine if any recalled memory was actually used in the response.
+      // Uses keyword-based usage heuristic (see isRecallUsed in reflection-slices.ts).
+      const usedRecall = isRecallUsed(responseText, pending.recallIds);
+
+      // Score each recalled memory - update importance based on usage
+      try {
+        for (const recallId of pending.recallIds) {
+          // Use store.getById to retrieve the real entry so we get the actual
+          // importance value, instead of calling parseSmartMetadata with empty
+          // placeholder metadata.
+          const entry = await store.getById(recallId, undefined);
+          if (!entry) continue;
+          const meta = parseSmartMetadata(entry.metadata, entry);
+
+          if (usedRecall) {
+            // Recall was used - increase importance (cap at 1.0).
+            // Use store.update to directly update the row-level importance
+            // column. patchMetadata only updates the metadata JSON blob but
+            // NOT the entry.importance field, so importance changes would never
+            // affect ranking (applyImportanceWeight reads entry.importance).
+            const newImportance = Math.min(1.0, (meta.importance || 0.5) + 0.05);
+            await store.update(
+              recallId,
+              { importance: newImportance },
+              undefined,
+            );
+            // Also update metadata JSON fields via patchMetadata (separate concern)
+            await store.patchMetadata(
+              recallId,
+              { last_confirmed_use_at: Date.now() },
+              undefined,
+            );
+          } else {
+            // Recall was not used - increment bad_recall_count
+            const badCount = (meta.bad_recall_count || 0) + 1;
+            let newImportance = meta.importance || 0.5;
+            // Apply penalty after threshold (3 consecutive unused)
+            if (badCount >= 3) {
+              newImportance = Math.max(0.1, newImportance - 0.03);
+            }
+            await store.update(
+              recallId,
+              { importance: newImportance },
+              undefined,
+            );
+            await store.patchMetadata(
+              recallId,
+              { bad_recall_count: badCount },
+              undefined,
+            );
+          }
+        }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: recall usage scoring failed: ${String(err)}`);
+      }
+
+      // Clean up the pendingRecall entry after scoring to prevent re-scoring
+      // the same recallIds on subsequent turns (C3 / Codex P2 fix).
+      pendingRecall.delete(sessionKey);
+    }, { priority: 5 });
+
+    // ========================================================================
+    // Proposal A Phase 1: session_end hook - Clean up pending recalls
+    // ========================================================================
+    api.on("session_end", (_event: any, ctx: any) => {
+      const sessionKey = ctx?.sessionKey || ctx?.sessionId || "default";
+      if (sessionKey) {
+        pendingRecall.delete(sessionKey);
+      }
+    }, { priority: 20 });
 
     // ========================================================================
     // Integrated Self-Improvement (inheritance + derived)
@@ -3306,6 +3619,10 @@ const memoryLanceDBProPlugin = {
             typeof ctx.agentId === "string" ? ctx.agentId : undefined,
             sessionKey,
           );
+          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+            api.logger.debug?.(`memory-lancedb-pro: reflection inheritance skip \u2014 invalid agentId '${agentId}'`);
+            return;
+          }
           const scopes = resolveScopeFilter(scopeManager, agentId);
           const slices = await loadAgentReflectionSlices(agentId, scopes);
           if (slices.invariants.length === 0) return;
@@ -3332,6 +3649,10 @@ const memoryLanceDBProPlugin = {
           typeof ctx.agentId === "string" ? ctx.agentId : undefined,
           sessionKey,
         );
+        if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+          api.logger.debug?.(`memory-lancedb-pro: reflection derived+error skip \u2014 invalid agentId '${agentId}'`);
+          return;
+        }
         pruneReflectionSessionState();
 
         const blocks: string[] = [];
@@ -3404,7 +3725,7 @@ const memoryLanceDBProPlugin = {
         if (!g[REFLECTION_SERIAL_GUARD]) g[REFLECTION_SERIAL_GUARD] = new Map<string, number>();
         return g[REFLECTION_SERIAL_GUARD] as Map<string, number>;
       };
-      const SERIAL_GUARD_COOLDOWN_MS = 120_000; // 2 minutes cooldown per sessionKey
+      // SERIAL_GUARD_COOLDOWN_MS moved to DEFAULT_SERIAL_GUARD_COOLDOWN_MS
 
       const runMemoryReflection = async (event: any) => {
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
@@ -3423,13 +3744,19 @@ const memoryLanceDBProPlugin = {
           api.logger.info(`memory-reflection: skipping re-entrant call for sessionKey=${sessionKey}; already running (global guard)`);
           return;
         }
+        // Parse context before guards so cfg is available for serialCooldownMs
+        const context = (event.context || {}) as Record<string, unknown>;
+        const cfg = context.cfg;
         // Serial loop guard: skip if a reflection for this sessionKey completed recently
         if (sessionKey) {
           const serialGuard = getSerialGuardMap();
           const lastRun = serialGuard.get(sessionKey);
-          if (lastRun && (Date.now() - lastRun) < SERIAL_GUARD_COOLDOWN_MS) {
-            api.logger.info(`memory-reflection: skipping serial re-trigger for sessionKey=${sessionKey}; last run ${(Date.now() - lastRun) / 1000}s ago (cooldown=${SERIAL_GUARD_COOLDOWN_MS / 1000}s)`);
-            return;
+          if (lastRun) {
+            const cooldownMs = config.memoryReflection?.serialCooldownMs ?? DEFAULT_SERIAL_GUARD_COOLDOWN_MS;
+            if ((Date.now() - lastRun) < cooldownMs) {
+              api.logger.info(`memory-reflection: command hook skipped (cooldown ${((Date.now() - lastRun) / 1000).toFixed(0)}s/${(cooldownMs / 1000).toFixed(0)}s, sessionKey=${sessionKey})`);
+              return;
+            }
           }
         }
         if (sessionKey) globalLock.set(sessionKey, true);
@@ -3437,8 +3764,6 @@ const memoryLanceDBProPlugin = {
         try {
           pruneReflectionSessionState();
           const action = String(event?.action || "unknown");
-          const context = (event.context || {}) as Record<string, unknown>;
-          const cfg = context.cfg;
           const workspaceDir = resolveWorkspaceDirFromContext(context);
           if (!cfg) {
             api.logger.warn(`memory-reflection: command:${action} missing cfg in hook context; skip reflection`);
@@ -3449,6 +3774,22 @@ const memoryLanceDBProPlugin = {
           const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
           let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
           const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
+          // Guard: skip reflection for invalid agentId formats (numeric chat_id, etc.)
+          if (isInvalidAgentIdFormat(sourceAgentId, config.declaredAgents)) {
+            api.logger.debug?.(
+              `memory-reflection: command hook skipped (invalid agentId=${sourceAgentId}, sessionKey=${sessionKey ?? "(none)"})`,
+            );
+            return;
+          }
+          // Exclude agents/sessions listed in memoryReflection.excludeAgents (supports wildcards)
+          const excludePatterns = config.memoryReflection?.excludeAgents;
+          if (excludePatterns && isAgentOrSessionExcluded(sourceAgentId, sessionKey, excludePatterns)) {
+            api.logger.debug?.(
+              `memory-reflection: command hook skipped (excluded agent=${sourceAgentId}, sessionKey=${sessionKey ?? "(none)"})`,
+            );
+            return;
+          }
+
           const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
           api.logger.info(
             `memory-reflection: command:${action} hook start; sessionKey=${sessionKey || "(none)"}; source=${commandSource || "(unknown)"}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`
@@ -3531,6 +3872,7 @@ const memoryLanceDBProPlugin = {
             thinkLevel: reflectionThinkLevel,
             toolErrorSignals,
             logger: api.logger,
+            api,  // SDK migration Bug 2: pass api for new runtime.agent API
           });
           api.logger.info(
             `memory-reflection: command:${action} reflection generation done for session ${currentSessionId}; runner=${reflectionGenerated.runner}; usedFallback=${reflectionGenerated.usedFallback ? "yes" : "no"}`
@@ -3819,6 +4161,10 @@ const memoryLanceDBProPlugin = {
             typeof ctx.agentId === "string" ? ctx.agentId : undefined,
             sessionKey,
           );
+          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+            api.logger.debug?.(`session-memory [before_reset]: skip \u2014 invalid agentId '${agentId}'`);
+            return;
+          }
           const defaultScope = isSystemBypassId(agentId)
             ? config.scopes?.default ?? "global"
             : scopeManager.getDefaultScope(agentId);
@@ -4147,6 +4493,25 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         .filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
         .map((id) => id.trim())
       : undefined,
+    // Build declaredAgents Set from runtime cfg.agents only — no disk I/O.
+    // The gateway populates cfg.agents at plugin init time; if empty, the user
+    // has no declared agents and Layer 3 validation is skipped (open set).
+    declaredAgents: (() => {
+      const s = new Set<string>();
+      const agentsList = (cfg as Record<string, unknown>).agents as Record<string, unknown> | undefined;
+      if (agentsList) {
+        const list = agentsList.list as unknown;
+        if (Array.isArray(list)) {
+          for (const entry of list) {
+            if (entry && typeof entry === "object") {
+              const id = (entry as Record<string, unknown>).id;
+              if (typeof id === "string" && id.trim().length > 0) s.add(id.trim());
+            }
+          }
+        }
+      }
+      return s;
+    })(),
     captureAssistant: cfg.captureAssistant === true,
     retrieval:
       typeof cfg.retrieval === "object" && cfg.retrieval !== null
@@ -4212,6 +4577,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         })(),
         errorReminderMaxEntries: parsePositiveInt(memoryReflectionRaw.errorReminderMaxEntries) ?? DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES,
         dedupeErrorSignals: memoryReflectionRaw.dedupeErrorSignals !== false,
+        serialCooldownMs: parsePositiveInt(memoryReflectionRaw.serialCooldownMs) ?? DEFAULT_SERIAL_GUARD_COOLDOWN_MS,
+        excludeAgents: Array.isArray(memoryReflectionRaw.excludeAgents)
+          ? memoryReflectionRaw.excludeAgents.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+          : undefined,
       }
       : {
         enabled: sessionStrategy === "memoryReflection",
@@ -4225,6 +4594,8 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         thinkLevel: DEFAULT_REFLECTION_THINK_LEVEL,
         errorReminderMaxEntries: DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES,
         dedupeErrorSignals: DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS,
+        serialCooldownMs: DEFAULT_SERIAL_GUARD_COOLDOWN_MS,
+        excludeAgents: undefined,
       },
     sessionMemory:
       typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
