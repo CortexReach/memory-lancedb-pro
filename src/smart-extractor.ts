@@ -554,7 +554,7 @@ export class SmartExtractor {
     const maxChars = this.config.extractMaxChars ?? 8000;
     const truncated =
       conversationText.length > maxChars
-        ? conversationText.slice(-maxChars)
+        ? conversationText.slice(0, maxChars)
         : conversationText;
 
     // Strip platform envelope metadata injected by OpenClaw channels
