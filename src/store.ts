@@ -705,7 +705,7 @@ export class MemoryStore {
         }
 
         if (toUpdate.length === 0) {
-          return { success: 0, failed };
+          return { success: 0, failed: [...failed, ...Array.from(new Set(skippedPairIds))] } as { success: number; failed: string[] };
         }
 
         // Step 2: Scope filter check (applied per-entry)
@@ -713,7 +713,7 @@ export class MemoryStore {
           for (const item of toUpdate) {
             failed.push(item.id);
           }
-          return { success: 0, failed };
+          return { success: 0, failed: [...failed, ...Array.from(new Set(skippedPairIds))] } as { success: number; failed: string[] };
         }
 
         const allowedIds: string[] = [];
@@ -728,7 +728,7 @@ export class MemoryStore {
 
         const filteredToUpdate = toUpdate.filter((item) => allowedIds.includes(item.id));
         if (filteredToUpdate.length === 0) {
-          return { success: 0, failed };
+          return { success: 0, failed: [...failed, ...Array.from(new Set(skippedPairIds))] } as { success: number; failed: string[] };
         }
 
         // Step 2.5: Backup originals for rollback (before delete)
@@ -956,7 +956,7 @@ export class MemoryStore {
         }
 
         if (toUpdate.length === 0) {
-          return { success: 0, failed };
+          return { success: 0, failed: [...failed, ...Array.from(new Set(skippedIds))] };
         }
 
         // Step 2: Scope filter check (applied per-entry)
@@ -964,7 +964,7 @@ export class MemoryStore {
           for (const item of toUpdate) {
             failed.push(item.entry.id);
           }
-          return { success: 0, failed };
+          return { success: 0, failed: [...failed, ...Array.from(new Set(skippedIds))] };
         }
 
         const allowedIds: string[] = [];
@@ -1080,9 +1080,13 @@ export class MemoryStore {
               updatedEntries[i].metadata || "{}",
               {} as EntryLike,
             );
+            // [F3-fix] Merge: reReadBase (Plugin's fresh writes during Phase 2a window)
+            // has PRIORITY over currentMeta (which has stale plugin fields from Step 1).
+            // We want: LLM patch + marker from currentMeta, but Plugin's new writes
+            // from reReadBase should win over stale plugin fields in currentMeta.
             updatedEntries[i] = {
               ...updatedEntries[i],
-              metadata: stringifySmartMetadata({ ...reReadBase, ...currentMeta }),
+              metadata: stringifySmartMetadata({ ...currentMeta, ...reReadBase }),
             };
           }
           // if reReadRow is null → row was hard-deleted → keep first-read data (no-op)
