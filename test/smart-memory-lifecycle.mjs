@@ -217,8 +217,6 @@ assert.equal(
   "fresh working-tier memories should survive decay + hardMinScore filtering",
 );
 
-console.log("OK: smart memory lifecycle test passed");
-
 // ============================================================================
 // Tier 1 integration assertion
 // ============================================================================
@@ -233,5 +231,9 @@ console.log("OK: smart memory lifecycle test passed");
   );
   const patched = computeTier1Patch(freshMeta, { injectedAt: Date.now() });
   assert.equal(patched.access_count, 1, "Tier 1: access_count must increment from 0 to 1 on auto-recall injection");
-  console.log("✓ Tier 1 access_count integration assertion passed");
 }
+
+// Final success message printed only after every assertion (legacy lifecycle +
+// Tier 1 integration) has run. Earlier this print was above the Tier 1 block,
+// which made a failing Tier 1 assertion look like "OK passed" + an error.
+console.log("OK: smart memory lifecycle test passed (incl. Tier 1 access_count integration)");
