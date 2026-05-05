@@ -16,6 +16,16 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import type { SmartMemoryMetadata } from "./smart-metadata.js";
+
+// Minimal type compatible with smart-metadata.ts EntryLike
+type EntryLike = {
+  text?: string;
+  category?: string;
+  importance?: number;
+  timestamp?: number;
+  metadata?: string;
+};
 
 // ============================================================================
 // Types
@@ -44,6 +54,16 @@ export interface StoreConfig {
 
 export interface MetadataPatch {
   [key: string]: unknown;
+}
+
+/**
+ * Marker fields written by memory-upgrader during Phase 2.
+ * These are merged into the existing metadata on top of Plugin-written fields,
+ * preserving fields like injected_count that the Plugin wrote during Phase 1.
+ */
+export interface UpgradeMarker {
+  upgraded_from: string; // original 5-category
+  upgraded_at: number;   // timestamp of upgrade
 }
 
 // ============================================================================
@@ -108,6 +128,80 @@ function normalizeSearchText(value: string): string {
 function isExplicitDenyAllScopeFilter(scopeFilter?: string[]): boolean {
   return Array.isArray(scopeFilter) && scopeFilter.length === 0;
 }
+
+/**
+ * [fix-Nice1] Use this instead of raw Number() for untrusted DB row fields.
+ *
+ * Handles: bigint (with precision check), number, string (with NaN guard), other (→ 0).
+ * Throws if bigint or string conversion would lose precision — callers must guard their data.
+ * Use tryParseNumber() for untrusted external data (e.g. _distance from LanceDB) that
+ * should degrade gracefully instead of throwing.
+ */
+function safeToNumber(value: unknown): number {
+  if (typeof value === 'bigint') {
+    const n = Number(value);
+    if (!Number.isSafeInteger(n)) {
+      throw new Error(`safeToNumber: BigInt ${value} loses precision when converted to Number (got ${n}). ` +
+        `This indicates data corruption or out-of-range timestamp.`);
+    }
+    return n;
+  }
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    // [F7-fix] Use isFinite instead of isSafeInteger: isSafeInteger rejects valid decimals
+    // (0.7, 0.5, etc.) which are common for importance fields. isFinite accepts all finite
+    // numbers including decimals while still rejecting NaN and Infinity.
+    // [MR2-fix] The BigInt unsafe-precision check stays in the bigint branch above (EF1).
+    if (!Number.isFinite(parsed)) {
+      return 0; // NaN, Infinity, -Infinity → degrade gracefully
+    }
+    return parsed;
+  }
+  return 0;
+}
+
+/**
+ * [MR1-fix] Graceful number parsing for untrusted external data (e.g. _distance from LanceDB).
+ * Unlike safeToNumber, this degrades to 0 instead of throwing so that a single bad row
+ * (e.g. corrupt _distance from a failed vector search) cannot crash all read paths.
+ */
+function tryParseNumber(value: unknown): number {
+  if (typeof value === 'bigint') {
+    const n = Number(value);
+    return Number.isSafeInteger(n) ? n : 0;
+  }
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isNaN(parsed)) return 0;
+    return Number.isSafeInteger(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+/**
+ * Whitelist of keys that bulkUpdateMetadataWithPatch accepts from LLM enrichment / upgrade.
+ * LLM-output fields (l0_abstract, l1_overview, l2_content, memory_category) are accepted.
+ * Upgrade-patch fields (tier, access_count, confidence, upgraded_from, upgraded_at) are also accepted.
+ * Any other keys are dropped to prevent accidental overwrites of plugin-managed fields.
+ */
+// [fix-PR639] tier, access_count, confidence must be in the whitelist so that
+// writeEnrichedBatch's explicit upgrade values (tier="working", access_count=0,
+// confidence=0.7) are actually applied — not silently dropped by the filter.
+// For legacy entries parseSmartMetadata defaults to the same values, so behaviour
+// is unchanged; the difference is the intent is now honoured rather than ignored.
+const ALLOWED_PATCH_KEYS = new Set([
+  "l0_abstract",
+  "l1_overview",
+  "l2_content",
+  "memory_category",
+  "upgraded_from",
+  "upgraded_at",
+  "tier",
+  "access_count",
+  "confidence",
+]);
 
 function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight: number }>): number {
   const normalizedQuery = normalizeSearchText(query);
@@ -523,6 +617,587 @@ export class MemoryStore {
   }
 
   /**
+   * Bulk update metadata for multiple entries — single lock acquisition.
+   * 
+   * This is the core method for the Phase 2 upgrader: one lock per batch,
+   * not one lock per entry. This enables the true 1-lock-per-batch behavior
+   * claimed in Issue #632 / PR #639.
+   * 
+   * Flow:
+   *   1. Batch query all ids (1 LanceDB op)
+   *   2. Build updated entries (in-memory)
+   *   3. Batch delete all ids (1 LanceDB op)
+   *   4. Batch add all updated entries (1 LanceDB op)
+   *   Total: 1 lock + 3 LanceDB ops (vs N locks + 2N ops for N × update())
+   * 
+   * @param pairs - Array of { id, metadata } to update
+   * @param scopeFilter - Optional scope filter (applied per-entry)
+   * @returns success count and failed entry ids
+   */
+  async bulkUpdateMetadata(
+    pairs: Array<{ id: string; metadata: string }>,
+    scopeFilter?: string[],
+  ): Promise<{ success: number; failed: string[] }> {
+    await this.ensureInitialized();
+
+    if (pairs.length === 0) {
+      return { success: 0, failed: [] };
+    }
+
+    // [MR5-fix] Deduplicate ids before SQL query to avoid duplicate IN clause
+    // and ensure recovery loop has unique ids.
+    // Detect duplicate ids and report skipped ones to caller so no data is silently lost.
+    const seenPairIds = new Map<string, number>();
+    for (const p of pairs) {
+      seenPairIds.set(p.id, (seenPairIds.get(p.id) ?? 0) + 1);
+    }
+    const skippedPairIds: string[] = [];
+    const uniquePairs = Array.from(
+      new Map(pairs.map((p, idx) => {
+        // Keep first occurrence; record all skipped duplicates for caller reporting
+        if ((seenPairIds.get(p.id) ?? 0) > 1 && idx > pairs.findIndex(x => x.id === p.id)) {
+          skippedPairIds.push(p.id);
+        }
+        return [p.id, p];
+      })).values()
+    );
+    if (skippedPairIds.length > 0) {
+      console.warn(
+        `[memory-lancedb-pro] bulkUpdateMetadata: MR5: ` +
+        `${skippedPairIds.length} duplicate id(s) skipped (last-write-wins): ${Array.from(new Set(skippedPairIds)).join(", ")}`
+      );
+    }
+
+    // Phase 2: single lock + updateQueue serialization for the entire batch
+    // M1 fix: wrap with runSerializedUpdate so bulk ops don't interleave with plugin updates
+    //
+    // IMPORTANT — runSerializedUpdate nesting rationale:
+    // runWithFileLock provides cross-process serialization (file lock).
+    // runSerializedUpdate provides in-process write-order guarantees so that if a plugin
+    // update arrives while bulkUpdateMetadata is queued in updateQueue, it waits for the
+    // bulk to complete first (preserving ordering).
+    // Without runSerializedUpdate: bulk could be interleaved with plugin updates causing
+    // Plugin's new data to be overwritten by the bulk's stale snapshot.
+    // Lock hold time note: runSerializedUpdate adds negligible overhead since the actual
+    // DB ops (query/delete/add) happen inside the lock and are fast (milliseconds).
+    return this.runWithFileLock(() =>
+      this.runSerializedUpdate(async () => {
+        // Step 1: Batch query all entries (1 LanceDB op)
+        // [MR5-fix] Use uniquePairs to avoid duplicate IN clause
+        const ids = uniquePairs.map((p) => `'${escapeSqlLiteral(p.id)}'`).join(", ");
+        const rows = await this.table!.query()
+          .where(`id IN (${ids})`)
+          .toArray();
+
+        const rowMap = new Map<string, Record<string, unknown>>(rows.map((r) => [r.id as string, r]));
+        const foundIds = new Set<string>(rowMap.keys());
+        const failed: string[] = [];
+
+        // Collect entries to update (those that were found)
+        const toUpdate: Array<{ id: string; metadata: string; row: Record<string, unknown> }> = [];
+        // [MR5-fix] Use uniquePairs to avoid duplicate id processing
+        for (const pair of uniquePairs) {
+          if (!foundIds.has(pair.id)) {
+            failed.push(pair.id);
+          } else {
+            toUpdate.push({ ...pair, row: rowMap.get(pair.id)! });
+          }
+        }
+
+        if (toUpdate.length === 0) {
+          return { success: 0, failed: [...failed, ...Array.from(new Set(skippedPairIds))] } as { success: number; failed: string[] };
+        }
+
+        // Step 2: Scope filter check (applied per-entry)
+        if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+          for (const item of toUpdate) {
+            failed.push(item.id);
+          }
+          return { success: 0, failed: [...failed, ...Array.from(new Set(skippedPairIds))] } as { success: number; failed: string[] };
+        }
+
+        const allowedIds: string[] = [];
+        for (const item of toUpdate) {
+          const rowScope = (item.row.scope as string | undefined) ?? "global";
+          if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+            failed.push(item.id);
+          } else {
+            allowedIds.push(item.id);
+          }
+        }
+
+        const filteredToUpdate = toUpdate.filter((item) => allowedIds.includes(item.id));
+        if (filteredToUpdate.length === 0) {
+          return { success: 0, failed: [...failed, ...Array.from(new Set(skippedPairIds))] } as { success: number; failed: string[] };
+        }
+
+        // Step 2.5: Backup originals for rollback (before delete)
+        // [fix-B2] If both batch-add AND per-entry recovery fail, we restore originals
+        // so no data is permanently lost — matching update() rollback semantics.
+        const originalsBackup = new Map(
+          filteredToUpdate.map((item) => [item.id, item.row])
+        );
+
+        // Step 3: Build updated entries (preserve all original fields, only update metadata)
+        const updatedEntries: MemoryEntry[] = filteredToUpdate.map((item) => {
+          const row = item.row;
+          const rowScope = (row.scope as string | undefined) ?? "global";
+          // [Q2-fix] Guard against null/undefined vector — matches bulkUpdateMetadataWithPatch.
+          const vector: number[] = row.vector != null
+            ? Array.from(row.vector as Iterable<number>)
+            : (() => { throw new Error(`bulkUpdateMetadata: row.vector is null for id=${row.id}`); })();
+          return {
+            id: row.id as string,
+            text: row.text as string,
+            vector,
+            category: row.category as MemoryEntry["category"],
+            scope: rowScope,
+            importance: safeToNumber(row.importance),
+            timestamp: safeToNumber(row.timestamp),
+            metadata: item.metadata,
+          };
+        });
+
+        // Step 4: Batch delete (1 LanceDB op)
+        const deleteIds = filteredToUpdate
+          .map((item) => `'${escapeSqlLiteral(item.id)}'`)
+          .join(", ");
+        await this.table!.delete(`id IN (${deleteIds})`);
+
+        // Step 5: Batch add (1 LanceDB op)
+        // [fix-B2] If add fails, attempt per-entry recovery.
+        // [Q3-fix] Track which entries succeeded in the batch so recovery doesn't re-write
+        // already-written entries (which would wastefully overwrite fresh data with itself).
+        try {
+          await this.table!.add(updatedEntries);
+        } catch (addError) {
+          const errMsg = addError instanceof Error ? addError.message : String(addError);
+          console.warn(
+            `[memory-lancedb-pro] bulkUpdateMetadata: batch add failed, attempting per-entry recovery. ` +
+            `entries=${updatedEntries.length}, error=${errMsg}`,
+          );
+          // [Q3-fix] Map of id → succeeded-in-batch-add (unknown at this point, but we track
+          // entries that succeed during recovery to avoid double-counting them).
+          const succeededInBatch = new Set<string>();
+          const recoveryFailed: string[] = [];
+          const restoreFailedIds: string[] = []; // [F4-fix] Track IDs with data loss so caller knows
+          let restoredCount = 0;
+          let restoreFailedCount = 0;
+          let skippedAlreadyWritten = 0;
+          // [F3-fix] Two-pass: first identify already-written entries, then only process non-written.
+          // Avoids redundant hasId() calls inside the recovery loop and ensures
+          // the retry set is pre-computed before any writes begin.
+          const alreadyWrittenIds = new Set<string>();
+          for (const entry of updatedEntries) {
+            if (await this.hasId(entry.id)) {
+              alreadyWrittenIds.add(entry.id);
+            }
+          }
+          for (const entry of updatedEntries) {
+            // [F4-fix] Detect partial batch success: skip entries already in DB
+            // to avoid redundant writes and misleading recovery failure counts.
+            if (alreadyWrittenIds.has(entry.id)) {
+              skippedAlreadyWritten++;
+              continue;
+            }
+            try {
+              await this.table!.add([entry]);
+              succeededInBatch.add(entry.id); // [Q3-fix] mark as known-succeeded
+            } catch (recoveryErr) {
+              const recMsg = recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr);
+              // [fix-B2] Last line of defence: restore the original row if recovery fails.
+              const originalRow = originalsBackup.get(entry.id);
+              if (originalRow) {
+                try {
+                  // [MR4-fix] Guard against null vector during restore, matching bulkUpdateMetadataWithPatch.
+                  const vector: number[] = originalRow.vector != null
+                    ? Array.from(originalRow.vector as Iterable<number>)
+                    : (() => { throw new Error(`bulkUpdateMetadata: restore: original row.vector is null for id=${originalRow.id}`); })();
+                  const originalEntry: MemoryEntry = {
+                    id: originalRow.id as string,
+                    text: originalRow.text as string,
+                    vector,
+                    category: originalRow.category as MemoryEntry["category"],
+                    scope: (originalRow.scope as string | undefined) ?? "global",
+                    importance: safeToNumber(originalRow.importance),
+                    timestamp: safeToNumber(originalRow.timestamp),
+                    metadata: (originalRow.metadata as string) || "{}",
+                  };
+                  await this.table!.add([originalEntry]);
+                  restoredCount++;
+                  continue; // restore succeeded — this entry is not failed
+                } catch (restoreErr) {
+                  const rstMsg = restoreErr instanceof Error ? restoreErr.message : String(restoreErr);
+                  console.error(
+                    `[memory-lancedb-pro] FATAL: bulkUpdateMetadata: original restore also failed ` +
+                    `for id=${entry.id}. Data loss may have occurred. error=${rstMsg}`,
+                  );
+                  restoreFailedCount++;
+                  restoreFailedIds.push(entry.id); // [F4-fix] caller must know which entries had data loss
+                }
+              }
+              if (!failed.includes(entry.id)) {
+                recoveryFailed.push(entry.id);
+              }
+            }
+          }
+          // [F3-fix] succeeded = entries that received the new enriched state.
+          // Restored originals and skipped already-written entries are NOT successful upgrades.
+          const actuallySucceeded = succeededInBatch.size;
+          // EF3-fix: single summary log instead of per-entry noise
+          if (restoredCount > 0 || restoreFailedCount > 0) {
+            console.warn(
+              `[memory-lancedb-pro] bulkUpdateMetadata: recovery: ` +
+              `${skippedAlreadyWritten} already written, ${restoredCount} originals restored, ` +
+              `${restoreFailedCount} restores failed, ${recoveryFailed.length} entries failed. ` +
+              `succeeded=${actuallySucceeded}`,
+            );
+          } else {
+            console.warn(
+              `[memory-lancedb-pro] bulkUpdateMetadata: recovery complete. ` +
+              `succeeded=${actuallySucceeded}, failed=${recoveryFailed.length}`,
+            );
+          }
+          return {
+            success: actuallySucceeded,
+            failed: [...failed, ...recoveryFailed, ...restoreFailedIds, ...Array.from(new Set(skippedPairIds))], // [F4-fix] include data-loss IDs; [MR5-fix] include skipped duplicates
+          };
+        }
+
+        return { success: updatedEntries.length, failed: [...failed, ...Array.from(new Set(skippedPairIds))] }; // [MR5-fix] include skipped duplicates
+      })
+    );
+  }
+
+  /**
+   * Phase-2 bulk write for memory-upgrader with true re-read protection.
+   *
+   * [FIX MR2] This method fixes the stale-metadata bug in the original design:
+   * - Phase 1 builds a metadata PATCH (LLM enrichment results only)
+   * - Phase 2 re-reads each entry from DB INSIDE the lock
+   * - Merge: base (fresh from DB, has Plugin's injected_count)
+   *           + patch (LLM enrichment: l0_abstract, l1_overview, l2_content)
+   *           + marker (upgraded_from, upgraded_at)
+   *
+   * This ensures Plugin's injected_count=5 (written during Phase 1 window)
+   * is NOT overwritten by Phase 1's snapshot (injected_count=0).
+   *
+   * @param entries - Each entry has an id, a LLM-enrichment PATCH, and upgrade markers
+   * @param scopeFilter - Optional scope filter
+   * @returns success count and failed entry ids
+   */
+  async bulkUpdateMetadataWithPatch(
+    entries: Array<{
+      id: string;
+      /** LLM-enrichment patch: l0_abstract, l1_overview, l2_content, memory_category, tier, etc. */
+      patch: Partial<SmartMemoryMetadata>;
+      /** Upgrade marker: original category and timestamp */
+      marker: UpgradeMarker;
+    }>,
+    scopeFilter?: string[],
+  ): Promise<{ success: number; failed: string[] }> {
+    await this.ensureInitialized();
+
+    if (entries.length === 0) {
+      return { success: 0, failed: [] };
+    }
+
+    // [MR5-fix] Deduplicate entries by id before SQL query and recovery loop.
+    // Detect duplicate ids and report skipped ones to caller so no data is silently lost.
+    const seenIds = new Map<string, number>();
+    for (const e of entries) {
+      seenIds.set(e.id, (seenIds.get(e.id) ?? 0) + 1);
+    }
+    const duplicateIds = Array.from(seenIds.entries())
+      .filter(([, count]) => count > 1)
+      .map(([id]) => id);
+    const skippedIds: string[] = [];
+    const uniqueEntries = Array.from(
+      new Map(entries.map((e, idx) => {
+        // Keep first occurrence; record all skipped duplicates for caller reporting
+        if ((seenIds.get(e.id) ?? 0) > 1 && idx > entries.findIndex(x => x.id === e.id)) {
+          skippedIds.push(e.id);
+        }
+        return [e.id, e];
+      })).values()
+    );
+    if (skippedIds.length > 0) {
+      console.warn(
+        `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: MR5: ` +
+        `${skippedIds.length} duplicate id(s) skipped (last-write-wins): ${Array.from(new Set(skippedIds)).join(", ")}`
+      );
+    }
+
+    return this.runWithFileLock(() =>
+      this.runSerializedUpdate(async () => {
+        // Step 1: Batch query all entries (1 LanceDB op) — re-read fresh state
+        // [MR5-fix] Use uniqueEntries to avoid duplicate IN clause
+        const ids = uniqueEntries.map((e) => `'${escapeSqlLiteral(e.id)}'`).join(", ");
+        const rows = await this.table!.query()
+          .where(`id IN (${ids})`)
+          .toArray();
+
+        const rowMap = new Map<string, Record<string, unknown>>(rows.map((r) => [r.id as string, r]));
+        const foundIds = new Set<string>(rowMap.keys());
+        const failed: string[] = [];
+
+        // Collect entries to update (those that were found)
+        const toUpdate: Array<{
+          entry: (typeof entries)[0];
+          row: Record<string, unknown>;
+        }> = [];
+        // [MR5-fix] Use uniqueEntries so duplicate ids are not double-counted in failed
+        for (const entry of uniqueEntries) {
+          if (!foundIds.has(entry.id)) {
+            failed.push(entry.id);
+          } else {
+            toUpdate.push({ entry, row: rowMap.get(entry.id)! });
+          }
+        }
+
+        if (toUpdate.length === 0) {
+          return { success: 0, failed: [...failed, ...Array.from(new Set(skippedIds))] };
+        }
+
+        // Step 2: Scope filter check (applied per-entry)
+        if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+          for (const item of toUpdate) {
+            failed.push(item.entry.id);
+          }
+          return { success: 0, failed: [...failed, ...Array.from(new Set(skippedIds))] };
+        }
+
+        const allowedIds: string[] = [];
+        for (const item of toUpdate) {
+          const rowScope = (item.row.scope as string | undefined) ?? "global";
+          if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+            failed.push(item.entry.id);
+          } else {
+            allowedIds.push(item.entry.id);
+          }
+        }
+
+        const filteredToUpdate = toUpdate.filter((item) => allowedIds.includes(item.entry.id));
+        if (filteredToUpdate.length === 0) {
+          return { success: 0, failed };
+        }
+
+        // Step 2.5: Backup originals for rollback (before delete)
+        // [fix-B2] Identical protection as bulkUpdateMetadata: if both batch-add
+        // AND per-entry recovery fail, we restore originals so no data is permanently lost.
+        const originalsBackup = new Map(
+          filteredToUpdate.map((item) => [item.entry.id, item.row])
+        );
+
+        // Step 3: Build updated entries — KEY FIX: merge fresh DB metadata + patch + marker
+        // base = DB re-read fresh metadata (Plugin's injected_count=5 is here)
+        // patch = LLM enrichment results (l0_abstract, l1_overview, l2_content, etc.)
+        // marker = upgraded_from + upgraded_at
+        const updatedEntries: MemoryEntry[] = filteredToUpdate.map((item) => {
+          const { entry, row } = item;
+          const rowScope = (row.scope as string | undefined) ?? "global";
+
+          // [Q8-fix] Strip undefined values AND enforce key whitelist before merge.
+          // JS spread: {...base, ...{x:undefined}} OVERWRITES base.x with undefined.
+          // [fix-Nice2] Only whitelisted LLM keys are accepted; all others are dropped
+          // to prevent accidental overwrites of tier/access_count/confidence.
+          // [MR3-fix] Strip undefined AND null values to prevent base-field overwrite.
+          // JS spread: {...base, ...{x:null}} OVERWRITES base.x with null.
+          // [F6-fix] cleanMarker must also pass the ALLOWED_PATCH_KEYS whitelist gate
+          // so marker fields cannot bypass the same restrictions as patch fields.
+          const cleanPatch = Object.fromEntries(
+            Object.entries(entry.patch as Record<string, unknown>)
+              .filter(([k]) => ALLOWED_PATCH_KEYS.has(k)) // [fix-Nice2] whitelist gate
+              .filter(([, v]) => v !== undefined && v !== null) // [MR3-fix] drop null too
+          );
+          const cleanMarker = Object.fromEntries(
+            Object.entries(entry.marker as Record<string, unknown>)
+              .filter(([k]) => ALLOWED_PATCH_KEYS.has(k)) // [F6-fix] enforce whitelist
+              .filter(([, v]) => v !== undefined && v !== null) // [MR3-fix] drop null too
+          );
+
+          // Parse fresh metadata from DB — Plugin's injected_count=5 is preserved here
+          const base = parseSmartMetadata(row.metadata as string | undefined, row as EntryLike);
+
+          // Merge: base (Plugin fields) + cleanPatch (LLM fields, whitelist-filtered) + cleanMarker
+          const merged: SmartMemoryMetadata = {
+            ...base,            // Plugin-written fields: injected_count=5, last_injected_at, etc.
+            ...cleanPatch,     // LLM enrichment: l0_abstract, l1_overview, l2_content, memory_category
+            ...cleanMarker,    // Upgrade marker: upgraded_from, upgraded_at
+          };
+
+          return {
+            id: row.id as string,
+            // [F5/F6-fix] Update text to LLM-generated abstract for effective search/recall.
+            // Old design preserved stale text while updating metadata — incorrect.
+            // New design: text = l0_abstract (or l1_overview fallback), keeping text in sync
+            // with the enriched metadata content.
+            text: (merged.l0_abstract ?? merged.l1_overview ?? row.text) as string,
+            // [Q2-fix] Guard against null/undefined vector.
+            // Array.from(null) returns [], which violates LanceDB vector NOT NULL constraint.
+            // row.vector should always exist for entries stored via this store, but guard anyway.
+            vector: row.vector != null
+              ? Array.from(row.vector as Iterable<number>)
+              : (() => { throw new Error(`bulkUpdateMetadataWithPatch: row.vector is null for id=${row.id}`); })(),
+            category: row.category as MemoryEntry["category"],
+            scope: rowScope,
+            importance: safeToNumber(row.importance),
+            // [Q7-note] timestamp: we deliberately use row.timestamp (Plugin-written value if any).
+            // Phase 2a does NOT override timestamp — Plugin's write time is preserved.
+            timestamp: safeToNumber(row.timestamp),
+            metadata: stringifySmartMetadata(merged),
+          };
+        });
+
+        // Step 4: Batch delete (1 LanceDB op)
+        const deleteIds = filteredToUpdate
+          .map((item) => `'${escapeSqlLiteral(item.entry.id)}'`)
+          .join(", ");
+        await this.table!.delete(`id IN (${deleteIds})`);
+
+        // [Option-A] Re-read between delete + add to capture Plugin writes
+        // that occurred AFTER the Step 1 query but BEFORE this delete.
+        // Scenario: Plugin writes access_count=X during Phase 2a window.
+        // - First read (Step 1): row.metadata has old access_count
+        // - Plugin writes access_count=X (after Step 1, before this delete)
+        // - This re-read (Step 4.5): row.metadata now has access_count=X
+        //   → merge into updatedEntries so Plugin's write is NOT lost
+        // - If LanceDB hard-deleted the row (reReadRow == null), we fall back
+        //   to the first-read data already in updatedEntries (first-read wins).
+        for (let i = 0; i < filteredToUpdate.length; i++) {
+          const item = filteredToUpdate[i];
+          const reReadId = `'${escapeSqlLiteral(item.entry.id)}'`;
+          const [reReadRow] = await this.table!.query()
+            .where(`id = ${reReadId}`)
+            .limit(1)
+            .toArray();
+          if (reReadRow) {
+            const reReadBase = parseSmartMetadata(
+              reReadRow.metadata as string | undefined,
+              reReadRow as EntryLike,
+            );
+            const currentMeta = parseSmartMetadata(
+              updatedEntries[i].metadata || "{}",
+              {} as EntryLike,
+            );
+            // [F3-fix] Merge: reReadBase (Plugin's fresh writes during Phase 2a window)
+            // has PRIORITY over currentMeta (which has stale plugin fields from Step 1).
+            // We want: LLM patch + marker from currentMeta, but Plugin's new writes
+            // from reReadBase should win over stale plugin fields in currentMeta.
+            updatedEntries[i] = {
+              ...updatedEntries[i],
+              metadata: stringifySmartMetadata({ ...currentMeta, ...reReadBase }),
+            };
+          }
+          // if reReadRow is null → row was hard-deleted → keep first-read data (no-op)
+        }
+
+        // Step 5: Batch add (1 LanceDB op)
+        // [fix-B2] If add fails, attempt per-entry recovery.
+        // [Q3-fix] Recovery loop: track failures explicitly; successes are derived
+        // as updatedEntries.length - recoveryFailed.length (matching bulkUpdateMetadata).
+        try {
+          await this.table!.add(updatedEntries);
+        } catch (addError) {
+          const errMsg = addError instanceof Error ? addError.message : String(addError);
+          console.warn(
+            `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: batch add failed, ` +
+            `attempting per-entry recovery. entries=${updatedEntries.length}, error=${errMsg}`,
+          );
+          // [Q6-fix] Use Set for O(1) lookup instead of O(n) includes.
+          const outerFailed = new Set(failed);
+          const recoveryFailed: string[] = [];
+          const restoreFailedIds: string[] = []; // [F4-fix] Track IDs with data loss so caller knows
+          let skippedAlreadyWritten = 0;
+          let restoredCount = 0;
+          let restoreFailedCount = 0;
+          // [F3-fix] Two-pass: first identify already-written entries, then only process non-written.
+          // Avoids redundant hasId() calls inside the recovery loop and ensures
+          // the retry set is pre-computed before any writes begin.
+          const alreadyWrittenIds = new Set<string>();
+          for (const entry of updatedEntries) {
+            if (await this.hasId(entry.id)) {
+              alreadyWrittenIds.add(entry.id);
+            }
+          }
+          for (const entry of updatedEntries) {
+            // [Q3-fix] Detect partial batch success: if this entry was already written
+            // (partial batch success before the error), skip per-entry retry to avoid
+            // redundant writes. The entry already has the correct new state from the
+            // partial batch write.
+            if (alreadyWrittenIds.has(entry.id)) {
+              skippedAlreadyWritten++;
+              continue;
+            }
+            try {
+              await this.table!.add([entry]);
+            } catch (recoveryErr) {
+              const recMsg = recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr);
+              // [fix-B2] Last line of defence: restore the original row if recovery fails.
+              const originalRow = originalsBackup.get(entry.id);
+              if (originalRow) {
+                try {
+                  const originalEntry: MemoryEntry = {
+                    id: originalRow.id as string,
+                    text: originalRow.text as string,
+                    // [Q2-fix parity] Guard against null vector during restore, matching main path.
+                    vector: originalRow.vector != null
+                      ? Array.from(originalRow.vector as Iterable<number>)
+                      : (() => { throw new Error(`bulkUpdateMetadataWithPatch: restore: original row.vector is null for id=${originalRow.id}`); })(),
+                    category: originalRow.category as MemoryEntry["category"],
+                    scope: (originalRow.scope as string | undefined) ?? "global",
+                    importance: safeToNumber(originalRow.importance),
+                    timestamp: safeToNumber(originalRow.timestamp),
+                    metadata: (originalRow.metadata as string) || "{}",
+                  };
+                  await this.table!.add([originalEntry]);
+                  restoredCount++;
+                  continue; // restore succeeded — this entry is not failed
+                } catch (restoreErr) {
+                  const rstMsg = restoreErr instanceof Error ? restoreErr.message : String(restoreErr);
+                  console.error(
+                    `[memory-lancedb-pro] FATAL: bulkUpdateMetadataWithPatch: original restore also failed ` +
+                    `for id=${entry.id}. Data loss may have occurred. error=${rstMsg}`,
+                  );
+                  restoreFailedCount++;
+                  restoreFailedIds.push(entry.id); // [F4-fix] caller must know which entries had data loss
+                }
+              }
+              if (!outerFailed.has(entry.id)) {
+                recoveryFailed.push(entry.id);
+              }
+            }
+          }
+          // [F3-fix] succeeded = entries that received the new enriched state.
+          // Restored originals are NOT successful upgrades — they fell back to old data.
+          // Also exclude entries already written before this batch (skippedAlreadyWritten).
+          const actuallySucceeded = updatedEntries.length - recoveryFailed.length - restoredCount - skippedAlreadyWritten;
+          // EF3-fix: single summary log instead of per-entry noise
+          if (skippedAlreadyWritten > 0) {
+            console.warn(
+              `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: recovery: ` +
+              `${skippedAlreadyWritten} entries already written (partial batch success), ` +
+              `${restoredCount} originals restored, ${restoreFailedCount} restores failed, ` +
+              `${recoveryFailed.length} entries failed. succeeded=${actuallySucceeded}`,
+            );
+          } else {
+            console.warn(
+              `[memory-lancedb-pro] bulkUpdateMetadataWithPatch: recovery complete. ` +
+              `succeeded=${actuallySucceeded}, failed=${recoveryFailed.length}`,
+            );
+          }
+          return {
+            success: actuallySucceeded,
+            failed: [...failed, ...recoveryFailed, ...restoreFailedIds, ...Array.from(new Set(skippedIds))], // [F4-fix] include data-loss IDs; [MR5-fix] include skipped duplicates
+          };
+        }
+
+        return { success: updatedEntries.length, failed: [...failed, ...Array.from(new Set(skippedIds))] }; // [MR5-fix] include skipped duplicates
+      })
+    );
+  }
+
+  /**
    * Import a pre-built entry while preserving its id/timestamp.
    * Used for re-embedding / migration / A/B testing across embedding models.
    * Intentionally separate from `store()` to keep normal writes simple.
@@ -600,8 +1275,8 @@ export class MemoryStore {
       vector: Array.from(row.vector as Iterable<number>),
       category: row.category as MemoryEntry["category"],
       scope: rowScope,
-      importance: Number(row.importance),
-      timestamp: Number(row.timestamp),
+      importance: safeToNumber(row.importance),
+      timestamp: safeToNumber(row.timestamp),
       metadata: (row.metadata as string) || "{}",
     };
   }
@@ -632,7 +1307,7 @@ export class MemoryStore {
     const mapped: MemorySearchResult[] = [];
 
     for (const row of results) {
-      const distance = Number(row._distance ?? 0);
+      const distance = tryParseNumber(row._distance ?? 0);
       const score = 1 / (1 + distance);
 
       if (score < minScore) continue;
@@ -654,8 +1329,8 @@ export class MemoryStore {
         vector: row.vector as number[],
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
-        timestamp: Number(row.timestamp),
+        importance: safeToNumber(row.importance),
+        timestamp: safeToNumber(row.timestamp),
         metadata: (row.metadata as string) || "{}",
       };
 
@@ -722,7 +1397,7 @@ export class MemoryStore {
 
         // LanceDB FTS _score is raw BM25 (unbounded). Normalize with sigmoid.
         // LanceDB may return BigInt for numeric columns; coerce safely.
-        const rawScore = row._score != null ? Number(row._score) : 0;
+        const rawScore = row._score != null ? safeToNumber(row._score) : 0;
         const normalizedScore =
           rawScore > 0 ? 1 / (1 + Math.exp(-rawScore / 5)) : 0.5;
 
@@ -732,8 +1407,8 @@ export class MemoryStore {
             vector: row.vector as number[],
             category: row.category as MemoryEntry["category"],
             scope: rowScope,
-            importance: Number(row.importance),
-            timestamp: Number(row.timestamp),
+            importance: safeToNumber(row.importance),
+            timestamp: safeToNumber(row.timestamp),
             metadata: (row.metadata as string) || "{}",
         };
 
@@ -796,8 +1471,8 @@ export class MemoryStore {
         vector: row.vector as number[],
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
-        timestamp: Number(row.timestamp),
+        importance: safeToNumber(row.importance),
+        timestamp: safeToNumber(row.timestamp),
         metadata: (row.metadata as string) || "{}",
       };
 
@@ -934,8 +1609,8 @@ export class MemoryStore {
           vector: [], // Don't include vectors in list results for performance
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
-          importance: Number(row.importance),
-          timestamp: Number(row.timestamp),
+          importance: safeToNumber(row.importance),
+          timestamp: safeToNumber(row.timestamp),
           metadata: (row.metadata as string) || "{}",
         }),
       )
@@ -1066,8 +1741,8 @@ export class MemoryStore {
         vector: Array.from(row.vector as Iterable<number>),
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
-        timestamp: Number(row.timestamp),
+        importance: safeToNumber(row.importance),
+        timestamp: safeToNumber(row.timestamp),
         metadata: (row.metadata as string) || "{}",
       };
 
@@ -1088,7 +1763,7 @@ export class MemoryStore {
       // If the add fails after delete, attempt best-effort recovery without
       // overwriting a newer concurrent successful update.
       const rollbackCandidate =
-        (await this.getById(original.id).catch(() => null)) ?? original;
+        (await this.getById(original.id, scopeFilter).catch(() => null)) ?? original;
       const resolvedId = escapeSqlLiteral(row.id as string);
       await this.table!.delete(`id = '${resolvedId}'`);
       try {
@@ -1277,8 +1952,8 @@ export class MemoryStore {
           vector: Array.isArray(row.vector) ? (row.vector as number[]) : [],
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
-          importance: Number(row.importance),
-          timestamp: Number(row.timestamp),
+          importance: safeToNumber(row.importance),
+          timestamp: safeToNumber(row.timestamp),
           metadata: (row.metadata as string) || "{}",
         }),
       );
