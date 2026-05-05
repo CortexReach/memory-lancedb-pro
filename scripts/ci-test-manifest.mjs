@@ -55,9 +55,6 @@ export const CI_TEST_MANIFEST = [
   // Issue #665 bulkStore tests
   // Issue #690 cross-call batch accumulator tests
   { group: "storage-and-schema", runner: "node", file: "test/issue-690-cross-call-batch.test.mjs", args: ["--test"] },
-  // Issue #690 stress test — 本地手動驗證用，不接入 CI
-  // 用途：1000 iterations × 100 concurrent calls，驗證 cross-call batch accumulator 穩定性
-  // 執行：node test/issue-690-stress-1000.test.mjs（本地跑，約 5-10 分鐘）
   // Issue #665 bulkStore tests (from upstream)
   { group: "storage-and-schema", runner: "node", file: "test/bulk-store.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/bulk-store-edge-cases.test.mjs", args: ["--test"] },
