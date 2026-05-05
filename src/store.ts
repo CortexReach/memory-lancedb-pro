@@ -545,17 +545,24 @@ export class MemoryStore {
 
     // 【MR2 fix】單 caller fast path：當 pendingBatch 為空（無其他 caller 等待）時，
     // 立即 flush 不等 100ms timer，讓單次 store() call 無需額外延遲
+    // TOCTOU fix: 先 await flushLock 再檢查 length，確保無 concurrent 兩個 caller
+    // 同時通過 length===0 check 而導致 second doFlush() 跑空 batch（entries 消失）
     if (this.pendingBatch.length === 0) {
-      return new Promise<MemoryEntry[]>((resolve, reject) => {
-        // chunkIdx=0：此 caller 的 entries 從 chunk 0 開始
-        this.pendingBatch.push({ entries: fullEntries, resolve, reject, chunkIdx: 0 });
-        // Immediate flush, no timer needed for single caller
-        this.doFlush().catch((err) => {
-          // 【F2 fix】，即使是 immediate flush 也保存錯誤
-          this.lastBackgroundError = { hasError: true, lastError: err as Error };
-          console.error(`[memory-lancedb-pro] immediate doFlush() error: ${err instanceof Error ? err.message : String(err)}`);
+      await this.flushLock;
+      // Double-check after await: another caller may have pushed while we were waiting
+      if (this.pendingBatch.length === 0) {
+        return new Promise<MemoryEntry[]>((resolve, reject) => {
+          // chunkIdx=0：此 caller 的 entries 從 chunk 0 開始
+          this.pendingBatch.push({ entries: fullEntries, resolve, reject, chunkIdx: 0 });
+          // Immediate flush, no timer needed for single caller
+          this.doFlush().catch((err) => {
+            // 【F2 fix】，即使是 immediate flush 也保存錯誤
+            this.lastBackgroundError = { hasError: true, lastError: err as Error };
+            console.error(`[memory-lancedb-pro] immediate doFlush() error: ${err instanceof Error ? err.message : String(err)}`);
+          });
         });
-      });
+      }
+      // Another caller pushed while we waited — fall through to timer path
     }
 
     // 回錄小型 Promise，實際寫入在背景 flush 完成
