@@ -1016,6 +1016,39 @@ export class MemoryStore {
           .join(", ");
         await this.table!.delete(`id IN (${deleteIds})`);
 
+        // [Option-A] Re-read between delete + add to capture Plugin writes
+        // that occurred AFTER the Step 1 query but BEFORE this delete.
+        // Scenario: Plugin writes access_count=X during Phase 2a window.
+        // - First read (Step 1): row.metadata has old access_count
+        // - Plugin writes access_count=X (after Step 1, before this delete)
+        // - This re-read (Step 4.5): row.metadata now has access_count=X
+        //   → merge into updatedEntries so Plugin's write is NOT lost
+        // - If LanceDB hard-deleted the row (reReadRow == null), we fall back
+        //   to the first-read data already in updatedEntries (first-read wins).
+        for (let i = 0; i < filteredToUpdate.length; i++) {
+          const item = filteredToUpdate[i];
+          const reReadId = `'${escapeSqlLiteral(item.entry.id)}'`;
+          const [reReadRow] = await this.table!.query()
+            .where(`id = ${reReadId}`)
+            .limit(1)
+            .toArray();
+          if (reReadRow) {
+            const reReadBase = parseSmartMetadata(
+              reReadRow.metadata as string | undefined,
+              reReadRow as EntryLike,
+            );
+            const currentMeta = parseSmartMetadata(
+              updatedEntries[i].metadata || "{}",
+              {} as EntryLike,
+            );
+            updatedEntries[i] = {
+              ...updatedEntries[i],
+              metadata: stringifySmartMetadata({ ...reReadBase, ...currentMeta }),
+            };
+          }
+          // if reReadRow is null → row was hard-deleted → keep first-read data (no-op)
+        }
+
         // Step 5: Batch add (1 LanceDB op)
         // [fix-B2] If add fails, attempt per-entry recovery.
         // [Q3-fix] Recovery loop: track failures explicitly; successes are derived
