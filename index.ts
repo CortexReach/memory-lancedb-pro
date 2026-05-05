@@ -3199,8 +3199,13 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: regex fallback found ${toCapture.length} capturable text(s) for agent ${agentId}`,
           );
 
-          // Store each capturable piece (limit to 2 per conversation)
-          let stored = 0;
+          // FIX #675: Collect entries and use bulkStore() once (1 lock instead of N).
+          // Limit to 2 capturable pieces per conversation.
+          const capturedEntries: Array<{
+            text: string; vector: number[]; importance: number;
+            category: string; scope: string; metadata: string;
+          }> = [];
+
           for (const text of toCapture.slice(0, 2)) {
             if (isUserMdExclusiveMemory({ text }, config.workspaceBoundary)) {
               api.logger.info(
@@ -3209,8 +3214,17 @@ const memoryLanceDBProPlugin = {
               continue;
             }
 
-            const category = detectCategory(text);
-            const vector = await embedder.embedPassage(text);
+            let vector: number[];
+            let category: string;
+            try {
+              category = detectCategory(text);
+              vector = await embedder.embedPassage(text);
+            } catch (err) {
+              api.logger.warn(
+                `memory-lancedb-pro: regex fallback embed/categorize failed for agent ${agentId}, skipping text: ${String(err)}`,
+              );
+              continue;
+            }
 
             // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
             // Fail-open by design: dedup should not block auto-capture writes.
@@ -3229,7 +3243,7 @@ const memoryLanceDBProPlugin = {
               continue;
             }
 
-            await store.store({
+            capturedEntries.push({
               text,
               vector,
               importance: 0.7,
@@ -3261,21 +3275,48 @@ const memoryLanceDBProPlugin = {
                 ),
               ),
             });
-            stored++;
-
-            // Dual-write to Markdown mirror if enabled
-            if (mdMirror) {
-              await mdMirror(
-                { text, category, scope: defaultScope, timestamp: Date.now() },
-                { source: "auto-capture", agentId },
-              );
-            }
           }
 
-          if (stored > 0) {
-            api.logger.info(
-              `memory-lancedb-pro: auto-captured ${stored} memories for agent ${agentId} in scope ${defaultScope}`,
-            );
+          // FIX #675: bulkStore once (1 lock for N entries) instead of N store.store() calls (N locks).
+          // FIX #Bug-1 (post-Codex-review): mdMirror errors are handled separately and do NOT
+          // trigger the store.store() fallback (which would create duplicate rows).
+          if (capturedEntries.length > 0) {
+            try {
+              await store.bulkStore(capturedEntries);
+              api.logger.info(
+                `memory-lancedb-pro: auto-captured ${capturedEntries.length} memories for agent ${agentId} in scope ${defaultScope} (bulkStore)`,
+              );
+            } catch (err) {
+              api.logger.warn(
+                `memory-lancedb-pro: bulkStore failed for ${capturedEntries.length} entries, falling back to individual store: ${String(err)}`,
+              );
+              // Fallback: store individually (less efficient but preserves the data)
+              for (const entry of capturedEntries) {
+                await store.store(entry);
+              }
+              api.logger.info(
+                `memory-lancedb-pro: auto-captured ${capturedEntries.length} memories for agent ${agentId} (individual fallback)`,
+              );
+            }
+
+            // FIX #Bug-1: mdMirror is called AFTER bulkStore succeeds, with its own
+            // error handling. If mdMirror fails, bulkStore is ALREADY committed —
+            // we log the error and continue. We do NOT retry via store.store()
+            // (which would create duplicate rows in LanceDB).
+            if (mdMirror) {
+              for (const entry of capturedEntries) {
+                try {
+                  await mdMirror(
+                    { text: entry.text, category: entry.category, scope: entry.scope, timestamp: Date.now() },
+                    { source: "auto-capture", agentId },
+                  );
+                } catch (mdErr) {
+                  api.logger.warn(
+                    `memory-lancedb-pro: mdMirror failed for entry "${entry.text.slice(0, 40)}…", bulkStore already committed: ${String(mdErr)}`,
+                  );
+                }
+              }
+            }
           }
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: capture failed: ${String(err)}`);
