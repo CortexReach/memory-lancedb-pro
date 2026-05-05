@@ -1,8 +1,12 @@
 import type { SmartMemoryMetadata } from "./smart-metadata.ts";
 
 // Suppression fires when bad_recall_count reaches this value (and the recall
-// dedup window is active). Hardcoded by Tier 1 design; if this becomes
-// configurable, expose via opts on computeTier1Patch.
+// dedup window is active). Intentionally a constant rather than public config:
+// the "3 strikes" rule is a behavioral design choice that should hold across
+// deployments, while the companion knobs (decay window, suppression duration)
+// are operational tuning parameters that ops may legitimately tune. If a real
+// use case for tuning the threshold appears, add it as an opt on
+// computeTier1Patch (it already accepts `minRepeated`, so the seam exists).
 export const TIER1_BAD_RECALL_SUPPRESSION_THRESHOLD = 3;
 
 // Default values for the two plugin config fields. Kept here so the

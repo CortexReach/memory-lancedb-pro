@@ -2,9 +2,17 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import path from "node:path";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import jitiFactory from "jiti";
 
+const testDir = path.dirname(fileURLToPath(import.meta.url));
+const pluginSdkStubPath = path.resolve(testDir, "helpers", "openclaw-plugin-sdk-stub.mjs");
+
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
+const jitiWithSdkStub = jitiFactory(import.meta.url, {
+  interopDefault: true,
+  alias: { "openclaw/plugin-sdk": pluginSdkStubPath },
+});
 const {
   parseSmartMetadata,
   buildSmartMetadata,
@@ -13,6 +21,7 @@ const {
   computeTier1Patch,
   isSuppressed,
 } = jiti("../src/auto-recall-tier1.ts");
+const { parsePluginConfig } = jitiWithSdkStub("../index.ts");
 
 describe("Tier 1: suppressed_until_ms field presence semantics", () => {
   it("returns undefined when raw JSON does not include the key (sentinel for 'never touched by Tier 1')", () => {
@@ -51,6 +60,16 @@ describe("Tier 1: suppressed_until_ms field presence semantics", () => {
       { text: "explicit-zero", category: "fact" },
     );
     assert.equal(meta.suppressed_until_ms, 0);
+  });
+
+  it("MR2: treats null as missing (sentinel survives undefined→null round-trip in any persistence layer)", () => {
+    const meta = parseSmartMetadata(
+      JSON.stringify({ l0_abstract: "null-roundtrip", suppressed_until_ms: null }),
+      { text: "null-roundtrip", category: "fact" },
+    );
+    // Without the null-tolerant fix, this would be 0 (treating the memory as
+    // "Tier 1 touched, no suppression") and lazy-heal would never fire.
+    assert.equal(meta.suppressed_until_ms, undefined);
   });
 });
 
@@ -294,5 +313,57 @@ describe("Tier 1: bad_recall_count decay and patch shape (Option C)", () => {
     // No heal (suppressed_until_ms !== undefined); Option C: gap=1h < 24h → no decay
     // staleInjected=true → next=3 (not reset)
     assert.equal(patch.bad_recall_count, 3);
+  });
+});
+
+describe("Tier 1: parsePluginConfig propagates new config fields", () => {
+  // F1 regression: the openclaw.plugin.json schema declares
+  // autoRecallBadRecallDecayMs and autoRecallSuppressionDurationMs, but they
+  // were dropped during config parsing — the runtime always saw undefined and
+  // fell back to defaults regardless of user config.
+  function baseConfig() {
+    return { embedding: { apiKey: "test-api-key" } };
+  }
+
+  it("propagates autoRecallBadRecallDecayMs when set", () => {
+    const parsed = parsePluginConfig({
+      ...baseConfig(),
+      autoRecallBadRecallDecayMs: 3_600_000, // 1h
+    });
+    assert.equal(parsed.autoRecallBadRecallDecayMs, 3_600_000);
+  });
+
+  it("propagates autoRecallSuppressionDurationMs when set", () => {
+    const parsed = parsePluginConfig({
+      ...baseConfig(),
+      autoRecallSuppressionDurationMs: 600_000, // 10min
+    });
+    assert.equal(parsed.autoRecallSuppressionDurationMs, 600_000);
+  });
+
+  it("preserves 0 as a meaningful value (disable decay / collapse suppression)", () => {
+    const parsed = parsePluginConfig({
+      ...baseConfig(),
+      autoRecallBadRecallDecayMs: 0,
+      autoRecallSuppressionDurationMs: 0,
+    });
+    assert.equal(parsed.autoRecallBadRecallDecayMs, 0);
+    assert.equal(parsed.autoRecallSuppressionDurationMs, 0);
+  });
+
+  it("returns undefined when not set (caller falls back to TIER1_DEFAULT_*)", () => {
+    const parsed = parsePluginConfig(baseConfig());
+    assert.equal(parsed.autoRecallBadRecallDecayMs, undefined);
+    assert.equal(parsed.autoRecallSuppressionDurationMs, undefined);
+  });
+
+  it("rejects negative values (returns undefined → falls back to default)", () => {
+    const parsed = parsePluginConfig({
+      ...baseConfig(),
+      autoRecallBadRecallDecayMs: -1,
+      autoRecallSuppressionDurationMs: -1,
+    });
+    assert.equal(parsed.autoRecallBadRecallDecayMs, undefined);
+    assert.equal(parsed.autoRecallSuppressionDurationMs, undefined);
   });
 });

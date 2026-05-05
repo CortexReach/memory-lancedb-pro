@@ -338,6 +338,22 @@ function parsePositiveInt(value: unknown): number | undefined {
   return undefined;
 }
 
+// Like parsePositiveInt but allows 0. Used for fields where 0 is a meaningful
+// "disabled" sentinel (e.g. autoRecallBadRecallDecayMs=0 disables decay).
+function parseNonNegativeInt(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return Math.floor(value);
+  }
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return undefined;
+    const resolved = resolveEnvVars(s);
+    const n = Number(resolved);
+    if (Number.isFinite(n) && n >= 0) return Math.floor(n);
+  }
+  return undefined;
+}
+
 function clampInt(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, Math.floor(value)));
@@ -4272,6 +4288,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecall: cfg.autoRecall === true,
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated) ?? 8,
+    // 0 is a meaningful sentinel for both Tier 1 knobs (disable decay /
+    // collapse suppression to a no-op), so use the non-negative parser.
+    autoRecallBadRecallDecayMs: parseNonNegativeInt(cfg.autoRecallBadRecallDecayMs),
+    autoRecallSuppressionDurationMs: parseNonNegativeInt(cfg.autoRecallSuppressionDurationMs),
     autoRecallMaxItems: parsePositiveInt(cfg.autoRecallMaxItems) ?? 3,
     autoRecallMaxChars: parsePositiveInt(cfg.autoRecallMaxChars) ?? 600,
     autoRecallPerItemMaxChars: parsePositiveInt(cfg.autoRecallPerItemMaxChars) ?? 180,

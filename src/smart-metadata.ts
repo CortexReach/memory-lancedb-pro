@@ -341,9 +341,11 @@ export function parseSmartMetadata(
     // preserving `undefined` is load-bearing for the Tier 1 lazy-heal sentinel
     // (see JSDoc on SmartMemoryMetadata.suppressed_until_ms). The `undefined`
     // signal distinguishes "never touched by Tier 1 code" from "Tier 1 touched
-    // but no active suppression (0)".
+    // but no active suppression (0)". `null` is treated as missing too —
+    // some persistence layers serialize undefined → null on round-trip, and
+    // we want the sentinel to survive that.
     suppressed_until_ms:
-      parsed.suppressed_until_ms !== undefined
+      parsed.suppressed_until_ms != null
         ? clampCount(parsed.suppressed_until_ms, 0)
         : undefined,
     canonical_id: normalizeOptionalString(parsed.canonical_id),
@@ -435,8 +437,11 @@ export function buildSmartMetadata(
       patch.suppressed_until_turn,
       base.suppressed_until_turn,
     ),
+    // Treat null patches the same as undefined (leave base value alone),
+    // mirroring parseSmartMetadata. A patch caller that wants to clear
+    // suppression must pass 0 explicitly.
     suppressed_until_ms:
-      patch.suppressed_until_ms === undefined
+      patch.suppressed_until_ms == null
         ? base.suppressed_until_ms
         : (typeof patch.suppressed_until_ms === "number" && patch.suppressed_until_ms >= 0
             ? Math.floor(patch.suppressed_until_ms)
