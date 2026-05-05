@@ -43,7 +43,10 @@
     "apache-arrow": "18.1.0",
     "json5": "^2.2.3",
     "openai": "^6.21.0",
-    "proper-lockfile": "^4.1.2"
+    "proper-lockfile": "^4.1.2",
+    "tree-sitter": "^0.25.0",
+    "tree-sitter-javascript": "^0.25.0",
+    "tree-sitter-python": "^0.25.0"
   },
   "openclaw": {
     "extensions": [

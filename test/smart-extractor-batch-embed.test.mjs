@@ -99,6 +99,9 @@ function makeStore() {
     async getById(_id, _scopeFilter) {
       return null;
     },
+    async count() {
+      return entries.length;
+    },
     get entries() {
       return [...entries];
     },
