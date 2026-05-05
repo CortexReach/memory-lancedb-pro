@@ -62,6 +62,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/upgrader-phase2-extreme.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/bulk-recovery-rollback.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/upgrader-whitelist-regression.test.mjs" },
+  // Issue #639 PR #639 — Option A (second re-read) verification
+  { group: "core-regression", runner: "node", file: "test/bulk-update-metadata-option-a.test.mjs" },
   // Issue #680 regression tests
   { group: "core-regression", runner: "node", file: "test/memory-reflection-issue680-tdd.test.mjs", args: ["--test"] },
   // Issue #492 agentId validation tests
