@@ -49,6 +49,8 @@ const EXPECTED_BASELINE = [
   { group: "core-regression", runner: "node", file: "test/temporal-awareness.test.mjs", args: ["--test"] },
   // Issue #598 regression tests
   { group: "core-regression", runner: "node", file: "test/store-serialization.test.mjs" },
+  // Issue #692 AST-based semantic chunking
+  { group: "core-regression", runner: "node", file: "test/ast-code-chunking.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/access-tracker-retry.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/embedder-cache.test.mjs" },
   // Issue #629 batch embedding fix
@@ -58,6 +60,8 @@ const EXPECTED_BASELINE = [
   { group: "storage-and-schema", runner: "node", file: "test/bulk-store-edge-cases.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store-edge-cases.test.mjs", args: ["--test"] },
+  // Issue #606 SDK migration Bug 2 regression tests
+  { group: "core-regression", runner: "node", file: "test/issue606_sdk-migration.test.mjs" },
   // Issue #680 regression tests
   { group: "core-regression", runner: "node", file: "test/memory-reflection-issue680-tdd.test.mjs", args: ["--test"] },
   // Issue #736 recall governance - isRecallUsed() unit tests
