@@ -27,7 +27,7 @@ const { SmartExtractor } = jiti("../src/smart-extractor.ts");
 // ---------------------------------------------------------------------------
 
 function makeStoreWithFailingUpdate(existingRecords, failOnUpdateId) {
-  const calls = { store: [], bulkStore: [], update: [], getById: [], vectorSearch: [] };
+  const calls = { store: [], bulkStore: [], update: [], delete: [], getById: [], vectorSearch: [] };
   // Track update patches separately: initial invalidation patches vs rollback patches.
   // After bulkStore returns, invalidateEntries.map calls update (invalidation).
   // Then rollback calls update again on succeeded entries with _origMetadata.
@@ -71,10 +71,16 @@ function makeStoreWithFailingUpdate(existingRecords, failOnUpdateId) {
       }
     },
 
+    async delete(id, _scopeFilter) {
+      calls.delete.push({ id, ts: Date.now() });
+      // Deletes always succeed in the mock.
+    },
+
     get calls() { return calls; },
     getStoreCallCount() { return calls.store.length; },
     getBulkStoreCallCount() { return calls.bulkStore.length; },
     getUpdateCallCount() { return calls.update.length; },
+    getDeleteCallCount() { return calls.delete.length; },
     getUpdatePatches() { return updatePatches; },
     getUpdateFailedIds() {
       return calls.update
@@ -425,13 +431,13 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
     };
     const existing002 = {
       id: "existing-002",
-      text: "Old preference B",
-      category: "preference",
+      text: "Old entity X",
+      category: "entity",
       scope: "global",
       importance: 0.8,
       metadata: JSON.stringify({
-        fact_key: "pref-b",
-        memory_category: "preferences",
+        fact_key: "entity-x",
+        memory_category: "entities",
         state: "confirmed",
         invalidated_at: null,
       }),
@@ -442,13 +448,14 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
     const store = makeStoreWithFailingUpdate([existing001, existing002], "existing-002");
     const embedder = makeEmbedder();
     // Custom LLM mock that returns 2 candidates from DIFFERENT categories
-    // (preferences vs facts) so batchDedup doesn't collapse them.
+    // (preferences vs entities) so batchDedup doesn't collapse them.
+    // Both categories are in TEMPORAL_VERSIONED_CATEGORIES so both go through handleSupersede.
     // dedup loop: candidate 0 → match_index 1 → existing-001 (vectorSearch idx 0, 1-based index)
     //             candidate 1 → match_index 2 → existing-002 (vectorSearch idx 1, 1-based index)
     let decisionIdx = 0;
     const decisions = [
       { decision: "supersede", match_index: 1 },
-      { decision: "supersede", match_index: 2 },
+      { decision: "supersede", match_index: 1 },
     ];
     const llm = {
       async completeJson(_prompt, mode) {
@@ -462,10 +469,10 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
                 content: "User prefers oat milk over dairy.",
               },
               {
-                category: "events",
-                abstract: "User attended a project meeting last Tuesday afternoon",
-                overview: "## Event\n- Meeting attended",
-                content: "User attended a project meeting on Tuesday.",
+                category: "entities",
+                abstract: "Project Alpha is a Q2 initiative led by the engineering team",
+                overview: "## Entity\n- Project Alpha defined",
+                content: "Project Alpha is a Q2 initiative.",
               },
             ],
           };
@@ -498,6 +505,7 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
     console.log(`  store vectorSearch calls after: ${store.calls.vectorSearch.length}`);
     console.log(`  store update calls after: ${store.getUpdateCallCount()}`);
     console.log(`  store bulkStore calls after: ${store.getBulkStoreCallCount()}`);
+    console.log(`  store delete calls after: ${store.getDeleteCallCount()}`);
     console.log(`  log entries after: ${logSpy.entries.length}`);
     console.log(`  log entries: ${logSpy.entries.join("; ")}`);
 
@@ -505,10 +513,15 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
     // - bulkStore: 1 (for 2 new entries)
     // - invalidate existing-001: 1 update call (succeeds) → push to succeeded[]
     // - invalidate existing-002: 1 update call (fails) → push to failed[]
-    // - rollback existing-001: 1 update call (succeeds) → uses _origMetadata
-    // Total: 3 update calls
+    // - rollback Phase 1: delete 1 new entry (for succeeded existing-001)
+    // - rollback Phase 2: restore existing-001: 1 update call (succeeds) → uses _origMetadata
+    // Total: 3 update calls + 1 delete call
     assert.strictEqual(store.getUpdateCallCount(), 3,
       `Expected 3 update calls (2 invalidation + 1 rollback), got ${store.getUpdateCallCount()}`);
+    assert.strictEqual(store.getDeleteCallCount(), 1,
+      `Expected 1 delete call (removing new entry for succeeded existing-001), got ${store.getDeleteCallCount()}`);
+    assert.strictEqual(store.calls.delete[0].id.startsWith("bulk-"), true,
+      `Delete should target the new entry created by bulkStore, got id=${store.calls.delete[0].id}`);
 
     // Verify rollback happened (last update call should be on existing-001 with original metadata)
     const patches = store.getUpdatePatches();
@@ -520,18 +533,20 @@ describe("RF-1: store.update() rejection — error handler regression", () => {
     assert.strictEqual(inv001.id, "existing-001");
     assert.ok(inv001.patch.metadata.includes("invalidated_at"),
       "First patch should be invalidation metadata (includes invalidated_at)");
-
     // inv002: second update = invalidation of existing-002 (FAILED — update threw)
-    assert.strictEqual(inv002.id, "existing-002");
+    assert.strictEqual(inv002.id, "existing-002",
+      "Second patch should be invalidation metadata for existing-002");
     assert.ok(inv002.patch.metadata.includes("invalidated_at"),
       "Second patch should be invalidation metadata for existing-002");
 
-    // rollback001: third update = rollback of existing-001 with ORIGINAL metadata
+    // rollback001: third update = rollback of existing-001 with ORIGINAL metadata.
+    // _origMetadata had invalidated_at: null (active state before invalidation).
+    // The restored metadata string contains "invalidated_at":null (key present, value null).
     assert.strictEqual(rollback001.id, "existing-001",
       "Rollback should target existing-001 (the succeeded invalidation)");
-    assert.ok(!rollback001.patch.metadata.includes("invalidated_at"),
-      "Rollback patch must use _origMetadata (no invalidated_at field)");
-    assert.ok(rollback001.patch.metadata.includes("pref-a"),
+    assert.ok(rollback001.patch.metadata.includes('"invalidated_at":null'),
+      "Rollback patch must use _origMetadata with invalidated_at:null (active state)");
+    assert.ok(rollback001.patch.metadata.includes('"fact_key":"pref-a"'),
       "Rollback patch must preserve original fact_key from _origMetadata");
 
     // Verify "ROLLBACK FAILED" log since existing-002 update failed (no actual DB state change)

@@ -63,6 +63,8 @@ interface InvalidateEntry {
   id: string;
   metadata: string;
   newEntryIndex?: number;
+  /** ID of the new entry created by bulkStore (set during second pass for rollback). */
+  newEntryId?: string;
   _origMetadata?: string;
 }
 
@@ -462,10 +464,12 @@ export class SmartExtractor {
       // For each invalidateEntry that came from a supersede (newEntryIndex is set),
       // the new entry's ID is at bulkResults[newEntryIndex].id.
       // We parse the stored metadata and update it with the new entry's ID.
+      // We also store newEntryId on the inv so the rollback block can delete it.
       if (invalidateEntries.length > 0) {
         for (const inv of invalidateEntries) {
           if (inv.newEntryIndex !== undefined && inv.newEntryIndex < bulkResults.length) {
             const newEntryId = bulkResults[inv.newEntryIndex].id;
+            inv.newEntryId = newEntryId; // persist for rollback
             const oldMeta = parseSmartMetadata(inv.metadata, { id: inv.id });
             const updatedMeta = buildSmartMetadata({ metadata: inv.metadata }, {
               superseded_by: newEntryId,
@@ -486,9 +490,10 @@ export class SmartExtractor {
     // atomic "bulk update with where clause". The batch mode benefit comes from bulkStore
     // for new entries (1 lock for N writes), not from the invalidation updates).
     // Invalidation is not atomic: bulkStore commits new entries first, then we
-    // update old entries one by one.  If some updates fail, we roll back the
-    // already-succeeded ones so the old entries stay in their original state
-    // (both old and new would otherwise appear active — breaking isLatest semantics).
+    // update old entries one by one.  If some updates fail, we roll back:
+    //   1. Delete the new entries that bulkStore wrote (so they don't stay active).
+    //   2. Restore the old entries' metadata from _origMetadata.
+    // Both must succeed or we log ROLLBACK FAILED.
     if (invalidateEntries.length > 0) {
       const results = await Promise.allSettled(
         invalidateEntries.map((inv) =>
@@ -509,13 +514,29 @@ export class SmartExtractor {
           `memory-pro: smart-extractor: ${failedCount}/${invalidateEntries.length} invalidation updates failed after bulkStore succeeded. Failed IDs: ${failedIds}. Rolling back ${succeededCount} succeeded update(s)…`,
         );
 
-        // Rollback: revert metadata on entries whose invalidation update SUCCEEDED.
+        // Rollback Phase 1: delete the new entries that bulkStore wrote, so they do
+        // not stay active alongside the restored old entries.
         // Entries whose update failed were never modified — no rollback needed for them.
         const succeeded = results
           .map((r, i) => ({ inv: invalidateEntries[i], result: r }))
           .filter(({ result }) => result.status === 'fulfilled');
+        const newEntryIdsToDelete = succeeded
+          .map(({ inv }) => inv.newEntryId)
+          .filter((id): id is string => !!id);
 
-        const rollbackResults = await Promise.allSettled(
+        const deleteResults = await Promise.allSettled(
+          newEntryIdsToDelete.map((id) => this.store.delete(id, scopeFilter)),
+        );
+        const deleteFailed = deleteResults.filter((r) => r.status === 'rejected');
+        if (deleteFailed.length > 0) {
+          this.log(
+            `memory-pro: smart-extractor: ROLLBACK FAILED — ${deleteFailed.length} new entry delete(s) failed. Partial rollback: old entries may still be superseded.`,
+          );
+        }
+
+        // Rollback Phase 2: restore old entries' metadata from _origMetadata.
+        // Entries whose update failed were never modified — no rollback needed for them.
+        const restoreResults = await Promise.allSettled(
           succeeded.map(({ inv }) => {
             const orig = inv._origMetadata;
             if (!orig) return Promise.resolve();
@@ -523,14 +544,15 @@ export class SmartExtractor {
           }),
         );
 
-        const rollbackFailed = rollbackResults.filter((r) => r.status === 'rejected');
-        if (rollbackFailed.length > 0) {
+        const restoreFailed = restoreResults.filter((r) => r.status === 'rejected');
+        const totalFailed = deleteFailed.length + restoreFailed.length;
+        if (totalFailed > 0) {
           this.log(
-            `memory-pro: smart-extractor: ROLLBACK FAILED — ${rollbackFailed.length} entries could not be restored. Database may have inconsistent supersede state. Affected IDs: ${failedIds}`,
+            `memory-pro: smart-extractor: ROLLBACK FAILED — ${totalFailed} operations failed (${deleteFailed.length} deletes + ${restoreFailed.length} restores). Database may have inconsistent supersede state. Affected IDs: ${failedIds}`,
           );
         } else {
           this.log(
-            `memory-pro: smart-extractor: Rollback complete — all ${succeededCount} succeeded invalidation(s) reverted. No partial state left.`,
+            `memory-pro: smart-extractor: Rollback complete — ${succeededCount} old entries restored, ${newEntryIdsToDelete.length} new entries deleted. No partial state left.`,
           );
         }
       }
