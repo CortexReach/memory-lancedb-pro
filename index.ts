@@ -1720,9 +1720,12 @@ function createAdmissionRejectionAuditWriter(
     return null;
   }
 
-  const filePath = api.resolvePath(
-    resolveRejectedAuditFilePath(resolvedDbPath, config.admissionControl),
-  );
+  // resolveRejectedAuditFilePath can return an already-absolute path derived
+  // from resolvedDbPath. That path must not be passed back through
+  // api.resolvePath(), because OpenClaw 2026.4+/2026.5 strict plugin APIs can
+  // return undefined for already-resolved absolute paths in this context.
+  const rawPath = resolveRejectedAuditFilePath(resolvedDbPath, config.admissionControl);
+  const filePath = rawPath.startsWith("/") ? rawPath : api.resolvePath(rawPath);
 
   return async (entry: AdmissionRejectionAuditEntry) => {
     try {
@@ -4212,9 +4215,17 @@ const memoryLanceDBProPlugin = {
 
     async function runBackup() {
       try {
-        const backupDir = api.resolvePath(
-          join(resolvedDbPath, "..", "backups"),
-        );
+        if (!resolvedDbPath || typeof resolvedDbPath !== "string") {
+          api.logger.warn(
+            `memory-lancedb-pro: backup skipped — resolvedDbPath is ${String(resolvedDbPath)}`,
+          );
+          return;
+        }
+
+        // resolvedDbPath was already produced by api.resolvePath() during plugin
+        // init. Do not resolve it again; strict OpenClaw plugin APIs can return
+        // undefined for already-resolved absolute paths here, which breaks mkdir.
+        const backupDir = join(resolvedDbPath, "..", "backups");
         await mkdir(backupDir, { recursive: true });
 
         const allMemories = await store.list(undefined, undefined, 10000, 0);

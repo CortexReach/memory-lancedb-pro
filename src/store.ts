@@ -75,8 +75,10 @@ export const loadLanceDB = async (): Promise<
   typeof import("@lancedb/lancedb")
 > => {
   if (!lancedbImportPromise) {
-    // Use require() for CommonJS modules on Windows to avoid ESM URL scheme issues
-    lancedbImportPromise = Promise.resolve(require("@lancedb/lancedb"));
+    // Load LanceDB through native dynamic import so the compiled ESM runtime works
+    // inside OpenClaw 2026.5+. A direct require() is not available in ESM and
+    // causes auto-recall/retrieval to fail with "require is not defined".
+    lancedbImportPromise = import("@lancedb/lancedb");
   }
   try {
     return await lancedbImportPromise;
