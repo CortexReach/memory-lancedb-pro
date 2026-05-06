@@ -116,13 +116,15 @@ let passed = 0;
 let failed = 0;
 
 function test(name: string, fn: () => Promise<void>) {
-  return fn().then(() => {
-    passed++;
-    console.log(`  ✅ ${name}`);
-  }).catch((err) => {
-    failed++;
-    console.error(`  ❌ ${name}: ${err.message}`);
-  });
+  return fn()
+    .then(() => {
+      passed++;
+      console.log(`  ✅ ${name}`);
+    })
+    .catch((err) => {
+      failed++;
+      console.error(`  ❌ ${name}: ${err.message}`);
+    });
 }
 
 // F3: Null-safe config merge

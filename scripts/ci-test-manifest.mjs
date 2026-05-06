@@ -66,6 +66,8 @@ export const CI_TEST_MANIFEST = [
   // Issue #492 agentId validation tests
   { group: "core-regression", runner: "node", file: "test/agentid-validation.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/command-reflection-guard.test.mjs", args: ["--test"] },
+  // Dreaming engine — Issue #565/#571/#577 scope isolation and reflection loop prevention
+  { group: "core-regression", runner: "jiti", file: "test/dreaming-engine.test.ts" },
 ];
 
 export function getEntriesForGroup(group) {
