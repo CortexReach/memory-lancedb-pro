@@ -10,10 +10,23 @@
  * 2. flush() 在 pendingBatch 為空時 → rethrow lastBackgroundError
  * 3. Settlement loop 每個 caller 包 try-catch → 避免 double-settle 中斷 loop
  *
- * S1/S2 已移除（Option A）：
- * fast-path（pendingBatch 空時的 immediate doFlush）不走 timer，
- * caller rejection 由 settlement loop 直接處理。
- * F2 重拋機制在 normal-path（S3）下已充分驗證。
+ * S1/S2 已移除（根本原因分析）：
+ *
+ * F2 的 timer's .catch() 要 catch 到 doFlush() 失敗，需要滿足：
+ *   (a) pendingBatch 在 timer fire 時仍有 entries（不是空陣列）
+ *   (b) doFlush() 在執行時真的失敗（table.add() throw）
+ *
+ * 但在 fast-path（pendingBatch 為空），timer fire 時：
+ *   - pendingBatch 早已被 settlement loop 的 splice(0) 取走並設為空
+ *   - timer's doFlush() 面對空陣列，永遠成功（hasError=false）
+ *   - timer's .catch() 不會被觸發
+ *
+ * 所以 fast-path 場景下 F2 機制根本不可能被 timer's .catch() 處理。
+ * S1/S2 原本設計想測試的「table 在 bulkStore() 返回後被破壞」場景，
+ * 在 fast-path 中 table 在 settlement loop 的同步 doFlush() 時就已經是 null 了，
+ * 不是在 timer's doFlush() 時。
+ *
+ * F2 重拋機制在 normal-path（issue-690-cross-call-batch.test.mjs）下已充分驗證。
  */
 
 import { describe, it, afterEach } from "node:test";
