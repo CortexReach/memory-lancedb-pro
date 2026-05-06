@@ -180,13 +180,17 @@
       },
       "autoRecallExcludeAgents": {
         "type": "array",
-        "items": { "type": "string" },
-        "default": [],
-        "description": "Blacklist mode for auto-recall injection. Agents in this list are skipped. Agent resolution falls back to 'main' when no explicit agentId is available. If autoRecallIncludeAgents is also set, include wins."
+        "items": {
+          "type": "string"
+        },
+        "description": "Blacklist mode for auto-recall injection. Agents in this list are skipped. Agent resolution falls back to 'main' when no explicit agentId is available. If autoRecallIncludeAgents is also set, include wins.",
+        "default": []
       },
       "autoRecallIncludeAgents": {
         "type": "array",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "default": [],
         "description": "Whitelist mode for auto-recall injection. Only agents in this list receive auto-recall. Agent resolution falls back to 'main' when no explicit agentId is available. If both include and exclude are set, autoRecallIncludeAgents takes precedence (whitelist wins)."
       },
@@ -730,18 +734,6 @@
           "dedupeErrorSignals": {
             "type": "boolean",
             "default": true
-          },
-          "serialCooldownMs": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "Cooldown in ms between reflection triggers for the same session. Default: 120000 (2 min). Set to 0 to disable."
-          },
-          "excludeAgents": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Agent/session patterns excluded from reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
           }
         }
       },
@@ -946,12 +938,99 @@
           }
         }
       },
-      "autoRecallExcludeAgents": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        },
-        "description": "Agent/session patterns excluded from auto-recall and reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
+      "dreaming": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Dreaming: periodic memory consolidation and promotion from short-term to long-term storage",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable dreaming memory consolidation cycles"
+          },
+          "cron": {
+            "type": "string",
+            "default": "0 3 * * *",
+            "description": "Cron expression for dreaming schedule (minute hour day month weekday). Uses server local timezone."
+          },
+          "verboseLogging": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable verbose logging for dreaming cycles"
+          },
+          "phases": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Per-phase tuning parameters",
+            "properties": {
+              "light": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "lookbackDays": {
+                    "type": "number",
+                    "minimum": 1,
+                    "default": 3
+                  },
+                  "limit": {
+                    "type": "number",
+                    "minimum": 1,
+                    "default": 100
+                  }
+                }
+              },
+              "deep": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "limit": {
+                    "type": "number",
+                    "minimum": 1,
+                    "default": 50
+                  },
+                  "minScore": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "default": 0.6
+                  },
+                  "minRecallCount": {
+                    "type": "number",
+                    "minimum": 0,
+                    "default": 2
+                  },
+                  "recencyHalfLifeDays": {
+                    "type": "number",
+                    "minimum": 1,
+                    "default": 30
+                  }
+                }
+              },
+              "rem": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "lookbackDays": {
+                    "type": "number",
+                    "minimum": 1,
+                    "default": 7
+                  },
+                  "limit": {
+                    "type": "number",
+                    "minimum": 1,
+                    "default": 80
+                  },
+                  "minPatternStrength": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "default": 0.7
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     },
     "required": [
