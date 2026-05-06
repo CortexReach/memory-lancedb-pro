@@ -210,42 +210,34 @@ describe("F2 fix: lastBackgroundError timer flush error propagation", () => {
   });
 
   // ============================================================
-  // S7: destroy() 自己 doFlush() 失敗 + lastBackgroundError 也有值
+  // S7: destroy() 兩錯誤同時存在 → composite error（方案 D：兩全其美）
   //
-  // Bug scenario（方案 A 前）：
-  //   destroy() 先檢查 lastBackgroundError → throw "timer callback"
-  //   → destroy() 自己的錯誤被靜默丟失（result.lastError 從未被 throw）
-  //   → S7 FAIL：拋出 "timer callback" 而不是 "destroy callback"
+  // 情境：lastBackgroundError 有值 + destroy() 自己 doFlush() 也失敗
   //
-  // 方案 A fix（交換 if 順序）：
-  //   destroy() 先檢查 result.hasError → throw "destroy callback"
-  //   → S7 PASS
+  // 方案 D 行為：
+  // → throw composite error，message 包含兩個錯誤資訊，cause 是 destroy 自己錯誤
+  // → S7 PASS：message 包含 "destroy flush failed" + "background flush also failed"
   // ============================================================
-  it("S7: destroy() throws own error (not timer error) when both exist", async () => {
+  it("S7: destroy() with both errors → composite error preserves both", async () => {
     const { store, dir } = makeStore();
 
     try {
-      // Warm-up：確保 store 初始化完成，pendingBatch 清空
+      // Warm-up
       await store.bulkStore([makeEntry(0)]);
       await store.flush();
 
-      // 步驟 1：塞一個 entry 到 pendingBatch（手動，不走 bulkStore settlement loop）
-      // 因為 warmup 後 pendingBatch 為空，doFlush() 會直接 return { hasError: false }
-      // 我們需要 pendingBatch 有 entry，doFlush() 才會真正嘗試寫入並失敗
+      // 步驟 1：塞 entry 到 pendingBatch（讓 doFlush() 真正嘗試寫入）
       const entry = makeEntry(99);
       store.pendingBatch.push({ entries: [entry], resolve: () => {}, reject: () => {}, chunkIdx: 0 });
 
-      // 步驟 2：手動設定 lastBackgroundError（模擬 timer callback 的 doFlush() 失敗）
+      // 步驟 2：設定 lastBackgroundError（timer callback 的歷史錯誤）
       const bgError = new Error("timer callback flush failed: simulated");
       store.lastBackgroundError = { hasError: true, lastError: bgError };
 
-      // 步驟 3：破壞 table，讓 destroy() 的 doFlush() 也失敗
-      // table = null → doFlush() 的 table.add() 會 throw
+      // 步驟 3：破壞 table（讓 destroy() 的 doFlush() 失敗）
       store.table = null;
 
-      // 步驟 4：呼叫 destroy()
-      // 預期（方案 A fix 後）：throw destroy 自己 doFlush() 的錯誤
-      // 實際（方案 A 前，bug）：throw "timer callback"（lastBackgroundError）
+      // 步驟 4：destroy() → 應該 throw composite error
       let destroyThrew = false;
       let destroyError;
       try {
@@ -255,15 +247,28 @@ describe("F2 fix: lastBackgroundError timer flush error propagation", () => {
         destroyError = err;
       }
 
-      assert.strictEqual(destroyThrew, true, "destroy() should throw when doFlush() fails");
+      assert.strictEqual(destroyThrew, true, "destroy() should throw composite error");
 
-      // 關鍵驗證：應該 throw destroy() 自己的錯誤，不是 timer 的舊錯誤
-      // 方案 A 前（bug）：throw "timer callback flush failed: simulated" → FAIL
-      // 方案 A 後（fix）：throw "Cannot read properties of null" 或包含 "null" 的錯誤 → PASS
+      // 驗證 composite error 的三個條件：
+      // 1. message 同時包含 destroy 自己錯誤和 background 錯誤
       assert.ok(
-        destroyError?.message.includes("null") ||
-        destroyError?.message.includes("table"),
-        `destroy() should throw its OWN error (about null/table), not timer error. Got: "${destroyError?.message}"`
+        destroyError?.message.includes("destroy flush failed") &&
+        destroyError?.message.includes("background flush also failed"),
+        `composite error should mention both errors. Got: "${destroyError?.message}"`
+      );
+
+      // 2. cause 是 destroy() 自己 doFlush() 的錯誤（table null）
+      assert.ok(
+        destroyError?.cause?.message?.includes("null") ||
+        destroyError?.cause?.message?.includes("table"),
+        `cause should be destroy's own error. Got: "${destroyError?.cause?.message}"`
+      );
+
+      // 3. lastBackgroundError 已被清除（不殘留）
+      assert.strictEqual(
+        store.lastBackgroundError,
+        null,
+        "lastBackgroundError should be cleared after throw"
       );
     } finally {
       rmSync(dir, { recursive: true, force: true });

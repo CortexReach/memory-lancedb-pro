@@ -774,14 +774,31 @@ export class MemoryStore {
     //       → timer callback 稍後執行並失敗 → 錯誤被靜音
     await this.flushLock;
 
-    // 【修復 Issue #3: destroy() error propagation】
-    // 【方案 A fix】先檢查 destroy() 自己 doFlush() 的錯誤（更高優先，更新更相關）
-    // 再檢查 lastBackgroundError（timer callback 的歷史錯誤，可能已過時）
+    // 【方案 D fix：兩全其美 — 保留兩個錯誤，不丟失任何一個】
+    //
+    // 三種情境：
+    // 1. destroy() 自己有錯 + lastBackgroundError 也有值 → composite error（兩個都保留）
+    // 2. 只有 destroy() 自己有錯 → 只 throw destroy 的錯誤
+    // 3. 只有 lastBackgroundError 有值 → throw timer 歷史錯誤
     if (result.hasError && result.lastError) {
+      if (this.lastBackgroundError?.hasError) {
+        // 情境 1：兩個錯誤都保留，包成 composite error
+        const timerError = this.lastBackgroundError.lastError ?? new Error("background flush failed");
+        this.lastBackgroundError = null;
+        // throw destroy 自己錯誤，因為更新、更直接
+        // timer 歷史錯誤放在 message 裡讓 caller 知道（cause chain 保留）
+        const compositeError = new Error(
+          `destroy flush failed (${result.lastError.message}); background flush also failed: ${timerError.message}`,
+          { cause: result.lastError }
+        );
+        throw compositeError;
+      }
+      // 情境 2：只有 destroy 自己有錯
       throw result.lastError;
     }
 
     // 【F1 fix】檢查 lastBackgroundError（timers 錯誤的最後堡壘）
+    // 情境 3：只有 lastBackgroundError 有值
     if (this.lastBackgroundError?.hasError) {
       const err = this.lastBackgroundError.lastError ?? new Error("background flush failed");
       this.lastBackgroundError = null;
