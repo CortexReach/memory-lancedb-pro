@@ -555,8 +555,16 @@ export class MemoryStore {
           // chunkIdx=0：此 caller 的 entries 從 chunk 0 開始
           this.pendingBatch.push({ entries: fullEntries, resolve, reject, chunkIdx: 0 });
           // Immediate flush, no timer needed for single caller
-          this.doFlush().catch((err) => {
-            // 【F2 fix】，即使是 immediate flush 也保存錯誤
+          // 【F2 fix】doFlush() 回傳 { hasError, lastError } 而非 throw，所以用 .then() + .catch()
+          // .catch(): doFlush() 同步階段 throw（如 flushLock acquisition 失敗）
+          // .then(): settlement loop 內部 catch 並回傳 { hasError: true } 的情況
+          this.doFlush().then((result) => {
+            if (result.hasError && result.lastError) {
+              this.lastBackgroundError = { hasError: true, lastError: result.lastError };
+              console.error(`[memory-lancedb-pro] immediate doFlush() error: ${result.lastError instanceof Error ? result.lastError.message : String(result.lastError)}`);
+            }
+          }).catch((err) => {
+            // 【F2 fix】同步 throw 的情況（很少見）
             this.lastBackgroundError = { hasError: true, lastError: err as Error };
             console.error(`[memory-lancedb-pro] immediate doFlush() error: ${err instanceof Error ? err.message : String(err)}`);
           });
@@ -581,7 +589,13 @@ export class MemoryStore {
           // fire-and-forget 若無 .catch() 會觸發 Node.js unhandled promise rejection
           // 【F2 fix】儲存錯誤，讓 explicit flush() 可 catch 並 rethrow
           // 避免 fire-and-forget timer error 被 Node.js unhandled rejection 吞掉
-          this.doFlush().catch((err) => {
+          this.doFlush().then((result) => {
+            if (result.hasError && result.lastError) {
+              this.lastBackgroundError = { hasError: true, lastError: result.lastError };
+              console.error(`[memory-lancedb-pro] doFlush() timer callback error: ${result.lastError instanceof Error ? result.lastError.message : String(result.lastError)}`);
+            }
+          }).catch((err) => {
+            // 同步 throw 的情況
             this.lastBackgroundError = { hasError: true, lastError: err as Error };
             console.error(`[memory-lancedb-pro] doFlush() timer callback error: ${err instanceof Error ? err.message : String(err)}`);
           });
