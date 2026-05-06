@@ -1720,9 +1720,16 @@ function createAdmissionRejectionAuditWriter(
     return null;
   }
 
-  const filePath = api.resolvePath(
-    resolveRejectedAuditFilePath(resolvedDbPath, config.admissionControl),
-  );
+  // resolveRejectedAuditFilePath returns:
+  //   - an already-absolute derived path (join of resolvedDbPath + "..") when no
+  //     explicit config is set; these are safe to use directly without re-wrapping
+  //     in api.resolvePath (which returns undefined for already-absolute paths in
+  //     OpenClaw 2026.4.x strict mode).
+  //   - the user-provided explicit path as-is (trimmed). If that path is relative,
+  //     the caller is responsible for resolving it via api.resolvePath.
+  //     Absolute explicit paths pass through unchanged and must NOT be re-resolved.
+  const rawPath = resolveRejectedAuditFilePath(resolvedDbPath, config.admissionControl);
+  const filePath = rawPath.startsWith("/") ? rawPath : api.resolvePath(rawPath);
 
   return async (entry: AdmissionRejectionAuditEntry) => {
     try {
@@ -4212,9 +4219,33 @@ const memoryLanceDBProPlugin = {
 
     async function runBackup() {
       try {
-        const backupDir = api.resolvePath(
-          join(resolvedDbPath, "..", "backups"),
-        );
+        // ── Defensive: guard against undefined resolvedDbPath ─────────────────
+        // api.resolvePath() may return undefined when config.dbPath is an
+        // empty string or an unhandled edge-case, rather than throwing.
+        // This guards against:
+        //   TypeError [ERR_INVALID_ARG_TYPE]: The "path" argument must be
+        //   of type string or an instance of Buffer or URL. Received undefined
+        // (reported: backup failed at join(resolvedDbPath, "..", "backups"))
+        if (!resolvedDbPath || typeof resolvedDbPath !== "string") {
+          api.logger.warn(
+            `memory-lancedb-pro: backup skipped — resolvedDbPath is "${String(resolvedDbPath)}"`,
+          );
+          return;
+        }
+
+        // resolvedDbPath is already absolute (produced by api.resolvePath at
+        // plugin init); wrapping it again triggered a path-argument `undefined`
+        // in OpenClaw 2026.4.x's stricter plugin API. Join directly.
+        const backupDir = join(resolvedDbPath, "..", "backups");
+
+        // ── Secondary guard: ensure join() also returned a valid string ──────
+        if (!backupDir || typeof backupDir !== "string") {
+          api.logger.warn(
+            `memory-lancedb-pro: backup skipped — backupDir resolved to "${String(backupDir)}"`,
+          );
+          return;
+        }
+
         await mkdir(backupDir, { recursive: true });
 
         const allMemories = await store.list(undefined, undefined, 10000, 0);
