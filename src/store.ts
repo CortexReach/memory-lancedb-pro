@@ -75,8 +75,8 @@ export const loadLanceDB = async (): Promise<
   typeof import("@lancedb/lancedb")
 > => {
   if (!lancedbImportPromise) {
-    // Use require() for CommonJS modules on Windows to avoid ESM URL scheme issues
-    lancedbImportPromise = Promise.resolve(require("@lancedb/lancedb"));
+    // Use dynamic import() for cross-platform compatibility (works in both ESM and CJS contexts)
+    lancedbImportPromise = import("@lancedb/lancedb");
   }
   try {
     return await lancedbImportPromise;
