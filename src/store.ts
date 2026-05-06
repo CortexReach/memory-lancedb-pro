@@ -767,6 +767,20 @@ export class MemoryStore {
     // 【MR4 fix】設定 destroyed flag，阻止後續 bulkStore() 呼叫
     this.destroyed = true;
     const result = await this.doFlush();
+
+    // 【F1 fix】等待所有已排程的 timer callback 完成
+    // 透過 await flushLock 確保排隊中的 doFlush 都結束
+    // 防止：timer callback 已排程 → destroy() 清除 timer → destroy() 返回
+    //       → timer callback 稍後執行並失敗 → 錯誤被靜音
+    await this.flushLock;
+
+    // 【F1 fix】檢查 lastBackgroundError（timers 錯誤的最後堡壘）
+    if (this.lastBackgroundError?.hasError) {
+      const err = this.lastBackgroundError.lastError ?? new Error("background flush failed");
+      this.lastBackgroundError = null;
+      throw err;
+    }
+
     // 【修復 Issue #3: destroy() error propagation】
     if (result.hasError && result.lastError) {
       throw result.lastError;

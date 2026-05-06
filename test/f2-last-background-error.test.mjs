@@ -1,26 +1,27 @@
 // test/f2-last-background-error.test.mjs
 /**
- * F2 Fix Verification Test
+ * F2 + F1 Fix Verification Test
  *
- * 問題：Timer-driven doFlush() 是 fire-and-forget，失敗時 caller 的 reject()
+ * F2 Fix: Timer-driven doFlush() 是 fire-and-forget，失敗時 caller 的 reject()
  * 不會被呼叫（fire-and-forget 沒人 .catch()）。
- *
  * F2 Fix:
- * 1. Timer callback .catch() → 儲存錯誤到 lastBackgroundError
+ * 1. Timer callback .then() → 儲存錯誤到 lastBackgroundError
  * 2. flush() 在 pendingBatch 為空時 → rethrow lastBackgroundError
  * 3. Settlement loop 每個 caller 包 try-catch → 避免 double-settle 中斷 loop
+ * 4. doFlush() 內部 catch 並回傳 { hasError: true } 而非 throw
+ *
+ * F1 Fix: destroy() 原本不等待 flushLock、不檢查 lastBackgroundError，
+ * 若 timer callback 的 doFlush() 在 destroy() 返回後執行並失敗，錯誤被靜音。
+ * F1 Fix: destroy() 加 await flushLock + 檢查 lastBackgroundError。
  *
  * S1/S2 直接單元測試（Option B）：
  * 不依賴 timer 時序，直接測試 F2 的兩個子行為：
  * - S1: 移除（fast-path 的 pendingBatch 在 doFlush() 前就被清空，物理上不可能觸發 settlement loop 錯誤路徑）
  * - S2: flush() 在 pendingBatch 空 + lastBackgroundError 有值時 → rethrow
  *
- * 為什麼不依賴時序：
- * F2 的 timer's .catch() 要 catch 到 doFlush() 失敗，需要滿足
- * pendingBatch 在 timer fire 時仍有 entries。但在 fast-path，
- * settlement loop 的 splice(0) 在 timer fire 前就取走了 pendingBatch，
- * timer's doFlush() 面對空陣列，永遠成功。
- * 因此改用直接單元測試驗證 F2 機制。
+ * S5/S6 直接單元測試（F1 destroy() fix）：
+ * - S5: destroy() 在 pendingBatch 空 + lastBackgroundError 有值時 → rethrow
+ * - S6: destroy() 在無 lastBackgroundError 時 → 正常返回
  */
 
 import { describe, it, afterEach } from "node:test";
@@ -60,11 +61,9 @@ describe("F2 fix: lastBackgroundError timer flush error propagation", () => {
   });
 
   // ============================================================
-  // S2: flush() 在 pendingBatch 空 + lastBackgroundError 有值時 → rethrow（F2 核心機制 2/2）
-  // 流程：bulkStore() settlement loop 的 .then() 設定 lastBackgroundError（當 doFlush() 回
-  // 傳 hasError=true）→ warmup flush() 把 pendingBatch 清空 → explicit flush() 看到空 batch +
-  // lastBackgroundError → rethrow
-  // 驗證 explicit flush() 的 rethrow 邏輯
+  // S2: flush() 在 pendingBatch 空 + lastBackgroundError 有值時 → rethrow（F2 核心機制）
+  // 流程：bulkStore() settlement loop 的 .then() 設定 lastBackgroundError
+  // → warmup flush() 把 pendingBatch 清空 → explicit flush() 看到空 batch + lastBackgroundError → rethrow
   // ============================================================
   it("S2: flush() rethrows lastBackgroundError when pendingBatch is empty", async () => {
     const { store, dir } = makeStore();
@@ -86,10 +85,7 @@ describe("F2 fix: lastBackgroundError timer flush error propagation", () => {
       // 等 settlement loop 完成（bulkStore 返回），並讓 .catch() 有機會執行
       await new Promise((r) => setTimeout(r, 50));
 
-      // 此時：
-      // - pendingBatch 為空（已被 settlement loop 的 splice(0) 取走）
-      // - lastBackgroundError 已被設定（settlement loop 的 .catch() 設定的）
-      // - table 仍是 null（沒恢復）
+      // 此時：pendingBatch 為空，lastBackgroundError 已被設定
       assert.ok(
         store.lastBackgroundError !== null && store.lastBackgroundError?.hasError === true,
         `lastBackgroundError should be set, got: ${JSON.stringify(store.lastBackgroundError)}`
@@ -170,6 +166,71 @@ describe("F2 fix: lastBackgroundError timer flush error propagation", () => {
       assert.ok(texts.some((t) => t.includes("entry-200")), "entry-200 should be in DB");
     } finally {
       try { await store.flush(); } catch {}
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // ============================================================
+  // S5: destroy() 在 pendingBatch 空 + lastBackgroundError 有值時拋出（F1 fix）
+  // 流程：手動設定 lastBackgroundError（模擬 timer callback 的 doFlush() 失敗）
+  // → destroy() 的 await flushLock 完成（無排隊中的 doFlush）
+  // → destroy() 檢查 lastBackgroundError → throw
+  // 驗證 destroy() 會 rethrow timer callback 的錯誤
+  // ============================================================
+  it("S5: destroy() rethrows lastBackgroundError when pendingBatch is empty", async () => {
+    const { store, dir } = makeStore();
+
+    try {
+      // Warm-up：確保 store 初始化完成，pendingBatch 清空
+      await store.bulkStore([makeEntry(0)]);
+      await store.flush();
+
+      // 手動設定 lastBackgroundError（模擬 timer callback 的 doFlush() 失敗）
+      const bgError = new Error("timer callback flush failed: simulated");
+      store.lastBackgroundError = { hasError: true, lastError: bgError };
+
+      // destroy() 應該 rethrow lastBackgroundError
+      let destroyThrew = false;
+      let destroyError;
+      try {
+        await store.destroy();
+      } catch (err) {
+        destroyThrew = true;
+        destroyError = err;
+      }
+
+      assert.strictEqual(destroyThrew, true, "destroy() should throw lastBackgroundError");
+      assert.ok(
+        destroyError?.message.includes("timer callback flush failed"),
+        `destroy() error should mention timer failure, got: ${destroyError?.message}`
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // ============================================================
+  // S6: destroy() 成功（無 lastBackgroundError）→ 不拋出
+  // ============================================================
+  it("S6: destroy() succeeds when no background error", async () => {
+    const { store, dir } = makeStore();
+
+    try {
+      await store.bulkStore([makeEntry(0)]);
+      await store.flush();
+
+      // lastBackgroundError 為 null
+      assert.strictEqual(store.lastBackgroundError, null, "lastBackgroundError should be null");
+
+      let destroyThrew = false;
+      try {
+        await store.destroy();
+      } catch (err) {
+        destroyThrew = true;
+      }
+
+      assert.strictEqual(destroyThrew, false, "destroy() should not throw when no background error");
+    } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
