@@ -1,3 +1,10 @@
+## 1.1.0-beta.11 (OpenClaw 2026.5 runtime compatibility)
+
+- Ship compiled `dist/index.js` runtime and point package/OpenClaw extension entries at it.
+- Declare `contracts.tools` for registered agent tools.
+- Avoid double-resolving already-absolute backup/admission audit paths.
+- Load LanceDB via ESM dynamic `import()` instead of `require()`.
+
 # memory-lancedb-pro v1.1.0 — 智能记忆增强
 
 > **日期**: 2026-03-03  
