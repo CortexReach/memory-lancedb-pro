@@ -2,7 +2,7 @@
   "id": "memory-lancedb-pro",
   "name": "Memory (LanceDB Pro)",
   "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, long-context chunking, and management CLI",
-  "version": "1.1.0-beta.10",
+  "version": "1.1.0-beta.11",
   "kind": "memory",
   "skills": [
     "./skills"
@@ -180,13 +180,16 @@
       },
       "autoRecallExcludeAgents": {
         "type": "array",
-        "items": { "type": "string" },
-        "default": [],
-        "description": "Blacklist mode for auto-recall injection. Agents in this list are skipped. Agent resolution falls back to 'main' when no explicit agentId is available. If autoRecallIncludeAgents is also set, include wins."
+        "items": {
+          "type": "string"
+        },
+        "description": "Agent/session patterns excluded from auto-recall and reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
       },
       "autoRecallIncludeAgents": {
         "type": "array",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "default": [],
         "description": "Whitelist mode for auto-recall injection. Only agents in this list receive auto-recall. Agent resolution falls back to 'main' when no explicit agentId is available. If both include and exclude are set, autoRecallIncludeAgents takes precedence (whitelist wins)."
       },
@@ -945,13 +948,6 @@
             "description": "Maximum number of auto-capture extractions allowed per hour"
           }
         }
-      },
-      "autoRecallExcludeAgents": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        },
-        "description": "Agent/session patterns excluded from auto-recall and reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
       }
     },
     "required": [
@@ -1252,7 +1248,7 @@
     },
     "decay.intrinsicWeight": {
       "label": "Decay Intrinsic Weight",
-      "help": "Weight of importance × confidence in lifecycle score.",
+      "help": "Weight of importance \u00d7 confidence in lifecycle score.",
       "advanced": true
     },
     "decay.betaCore": {
@@ -1459,7 +1455,7 @@
     },
     "memoryCompaction.similarityThreshold": {
       "label": "Similarity Threshold",
-      "help": "How similar two memories must be to merge (0–1). 0.88 is a good starting point; raise to 0.92+ for conservative merges.",
+      "help": "How similar two memories must be to merge (0\u20131). 0.88 is a good starting point; raise to 0.92+ for conservative merges.",
       "advanced": true
     },
     "memoryCompaction.cooldownHours": {
@@ -1495,5 +1491,23 @@
       "help": "Whitelist mode. Only these agents receive auto-recall. If agentId is unavailable it falls back to 'main'. Includes take precedence over excludes.",
       "advanced": true
     }
+  },
+  "contracts": {
+    "tools": [
+      "memory_recall",
+      "memory_store",
+      "memory_update",
+      "memory_forget",
+      "memory_list",
+      "memory_stats",
+      "memory_debug",
+      "memory_compact",
+      "memory_archive",
+      "memory_promote",
+      "memory_explain_rank",
+      "self_improvement_log",
+      "self_improvement_extract_skill",
+      "self_improvement_review"
+    ]
   }
 }

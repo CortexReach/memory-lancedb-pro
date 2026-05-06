@@ -75,8 +75,10 @@ export const loadLanceDB = async (): Promise<
   typeof import("@lancedb/lancedb")
 > => {
   if (!lancedbImportPromise) {
-    // Use require() for CommonJS modules on Windows to avoid ESM URL scheme issues
-    lancedbImportPromise = Promise.resolve(require("@lancedb/lancedb"));
+    // Load LanceDB through native dynamic import so the compiled ESM runtime works
+    // inside OpenClaw 2026.5+. A direct require() is not available in ESM and
+    // causes auto-recall/retrieval to fail with "require is not defined".
+    lancedbImportPromise = import("@lancedb/lancedb");
   }
   try {
     return await lancedbImportPromise;
@@ -212,10 +214,13 @@ export class MemoryStore {
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
-    if (!existsSync(lockPath)) {
-      try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
-      try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
-    }
+    const ensureLockTargetExists = async () => {
+      if (!existsSync(lockPath)) {
+        try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
+        try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
+      }
+    };
+    await ensureLockTargetExists();
     // 【修復 #415】調整 retries：max wait 從 ~3100ms → ~151秒
     // 指數退避：1s, 2s, 4s, 8s, 16s, 30s×5，總計約 151 秒
     // ECOMPROMISED 透過 onCompromised callback 觸發（非 throw），使用 flag 機制正確處理
@@ -234,11 +239,12 @@ export class MemoryStore {
         if (ageMs > staleThresholdMs) {
           try { unlinkSync(lockPath); } catch {}
           console.warn(`[memory-lancedb-pro] cleared stale lock: ${lockPath} ageMs=${ageMs}`);
+          await ensureLockTargetExists();
         }
       } catch {}
     }
 
-    const release = await lockfile.lock(lockPath, {
+    const acquireLock = async () => lockfile.lock(lockPath, {
       retries: {
         retries: 10,
         factor: 2,
@@ -255,6 +261,18 @@ export class MemoryStore {
         compromisedErr = err;
       },
     });
+
+    let release: Awaited<ReturnType<typeof acquireLock>>;
+    try {
+      release = await acquireLock();
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        await ensureLockTargetExists();
+        release = await acquireLock();
+      } else {
+        throw err;
+      }
+    }
 
     try {
       const result = await fn();
