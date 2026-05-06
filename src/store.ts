@@ -207,6 +207,33 @@ export class MemoryStore {
   private ftsIndexCreated = false;
   private updateQueue: Promise<void> = Promise.resolve();
 
+  // Cross-call batch accumulator（Issue #690）
+  // 多個 concurrent bulkStore() 會先累積在這裡，每 100ms flush 一次，
+  // 合併成一個 lock acquisition，大幅降低 lock contention。
+  private pendingBatch: Array<{
+    entries: MemoryEntry[];
+    resolve: (entries: MemoryEntry[]) => void;
+    reject: (err: Error) => void;
+    // 【F5/MR1 fix】記錄此 caller 的起始 chunk idx，用於 settlement 時查詢正確的 chunk error
+    chunkIdx: number;
+  }> = [];
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushLock: Promise<void> = Promise.resolve(); // Promise-based lock，防止 concurrent doFlush()
+  // 【MR4 fix】標記實例已摧毀，防止 destroy() 後 bulkStore() 悄悄重啟 timer
+  private destroyed = false;
+  // 【F2 fix】儲存最近一次 background timer flush 的錯誤，
+  // 讓 explicit flush() 可以 rethrow 這個錯誤，避免 timer flush 失敗被吞掉
+  private lastBackgroundError: { hasError: boolean; lastError?: Error } | null = null;
+  private static readonly FLUSH_INTERVAL_MS = 100;
+  // 單次 lock acquisition 上限。將大量 entries 拆分多個 chunk 寫入，
+  // 每個 chunk 獨立 lock acquisition，失敗時只影響該 chunk（per-chunk isolation）。
+  // LanceDB 本身無批次上限，此值參考 LanceDB 預設 row-group size（256）
+  // 訂定，在兼顧併發吞吐與記憶體佔用下是一個合理的經驗值。
+  private static readonly MAX_BATCH_SIZE = 250;
+  // 【MR2 fix】pendingBatch 上限，防止高生產率時無限增長。
+  // 當 pending callers 超過此值時，block 並同步 flush，確保 pendingBatch 不會無限膨胀。
+  private static readonly MAX_PENDING_BATCH_SIZE = 1000;
+
   constructor(private readonly config: StoreConfig) { }
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -455,71 +482,328 @@ export class MemoryStore {
   async store(
     entry: Omit<MemoryEntry, "id" | "timestamp">,
   ): Promise<MemoryEntry> {
-    await this.ensureInitialized();
-
-    const fullEntry: MemoryEntry = {
-      ...entry,
-      id: randomUUID(),
-      timestamp: Date.now(),
-      metadata: entry.metadata || "{}",
-    };
-
-    return this.runWithFileLock(async () => {
-      try {
-        await this.table!.add([fullEntry]);
-      } catch (err: unknown) {
-        const e = err as { code?: string; message?: string };
-        const code = e.code || "";
-        const message = e.message || String(err);
-        throw new Error(
-          `Failed to store memory in "${this.config.dbPath}": ${code} ${message}`,
-        );
-      }
-      return fullEntry;
-    });
+    // F1 fix: store() now routes through bulkStore() accumulator
+    // for consistent lock contention behavior (no per-call file lock).
+    // MR2 fix: when pendingBatch is empty, immediate flush avoids 100ms delay.
+    const results = await this.bulkStore([entry]);
+    return results[0];
   }
 
   /**
-   * Bulk store multiple memory entries (single lock acquisition)
-   * 
-   * Reduces lock contention by acquiring lock once for multiple entries.
-   * Use this when auto-capture produces multiple memories.
+   * Store multiple memory entries in a single batch operation.
+   *
+   * @param entries — array of entries to store (id/timestamp are auto-generated)
+   * @returns resolved with persisted entries, or rejected on failure
+   *
+   * @remarks
+   * Entries are accumulated and flushed every {@link FLUSH_INTERVAL_MS} (default 100ms),
+   * or when {@link flush} is called. Multiple concurrent {@link bulkStore} calls are
+   * automatically batched together for efficiency.
+   *
+   * **Non-atomicity for large batches**: When the total entry count exceeds
+   * {@link MAX_BATCH_SIZE} (250), entries are split into multiple chunks and written
+   * sequentially. If a later chunk fails, earlier chunks may already be persisted
+   * in LanceDB — the Promise will be rejected but those entries will NOT be rolled back.
+   * Callers should handle partial-success by catching the rejection and querying
+   * by the returned entry IDs to determine which entries were actually persisted.
+   *
+   * @public
    */
   async bulkStore(
     entries: Omit<MemoryEntry, "id" | "timestamp">[],
   ): Promise<MemoryEntry[]> {
+    // 【MR4 fix】阻止 destroy() 後的呼叫
+    if (this.destroyed) {
+      throw new Error("MemoryStore instance has been destroyed");
+    }
     await this.ensureInitialized();
-    
-    // Filter out invalid entries (undefined, null, missing text/vector)
+
+    // Filter out invalid entries（undefined, null, missing text/vector）
     const validEntries = entries.filter(
       (entry) => entry && entry.text && entry.text.length > 0 && entry.vector && entry.vector.length > 0
     );
-    
-    // Early return for empty array (skip lock acquisition)
+
+    // Early return for empty array（skip accumulation）
     if (validEntries.length === 0) {
       return [];
     }
-    
+
+    // 附加 id/timestamp
     const fullEntries: MemoryEntry[] = validEntries.map((entry) => ({
       ...entry,
       id: randomUUID(),
       timestamp: Date.now(),
       metadata: entry.metadata || "{}",
     }));
-    
-    // Single lock acquisition for all entries
-    return this.runWithFileLock(async () => {
-      try {
-        await this.table!.add(fullEntries);
-      } catch (err: any) {
-        const code = err.code || "";
-        const message = err.message || String(err);
-        throw new Error(
-          `Failed to bulk store ${fullEntries.length} memories: ${code} ${message}`,
-        );
+
+    // 【MR2 fix】當 pendingBatch 達到上限時，等待前一個 flush 完成後再加入
+    // 這確保 pendingBatch 有上限，不會无限增长
+    if (this.pendingBatch.length >= MemoryStore.MAX_PENDING_BATCH_SIZE) {
+      // 等 flushLock 釋放（即上一個 doFlush 完成後）
+      await this.flushLock;
+    }
+
+    // 【MR2 fix】單 caller fast path：當 pendingBatch 為空（無其他 caller 等待）時，
+    // 立即 flush 不等 100ms timer，讓單次 store() call 無需額外延遲
+    // TOCTOU fix: 先 await flushLock 再檢查 length，確保無 concurrent 兩個 caller
+    // 同時通過 length===0 check 而導致 second doFlush() 跑空 batch（entries 消失）
+    if (this.pendingBatch.length === 0) {
+      await this.flushLock;
+      // Double-check after await: another caller may have pushed while we were waiting
+      if (this.pendingBatch.length === 0) {
+        return new Promise<MemoryEntry[]>((resolve, reject) => {
+          // chunkIdx=0：此 caller 的 entries 從 chunk 0 開始
+          this.pendingBatch.push({ entries: fullEntries, resolve, reject, chunkIdx: 0 });
+          // Immediate flush, no timer needed for single caller
+          // 【F2 fix】doFlush() 回傳 { hasError, lastError } 而非 throw，所以用 .then() + .catch()
+          // .catch(): doFlush() 同步階段 throw（如 flushLock acquisition 失敗）
+          // .then(): settlement loop 內部 catch 並回傳 { hasError: true } 的情況
+          this.doFlush().then((result) => {
+            if (result.hasError && result.lastError) {
+              this.lastBackgroundError = { hasError: true, lastError: result.lastError };
+              console.error(`[memory-lancedb-pro] immediate doFlush() error: ${result.lastError instanceof Error ? result.lastError.message : String(result.lastError)}`);
+            }
+          }).catch((err) => {
+            // 【F2 fix】同步 throw 的情況（很少見）
+            this.lastBackgroundError = { hasError: true, lastError: err as Error };
+            console.error(`[memory-lancedb-pro] immediate doFlush() error: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        });
       }
-      return fullEntries;
+      // Another caller pushed while we waited — fall through to timer path
+    }
+
+    // 回錄小型 Promise，實際寫入在背景 flush 完成
+    return new Promise<MemoryEntry[]>((resolve, reject) => {
+      // 【F5/MR1 fix】計算此 caller 的起始 chunk idx
+      // 現有 entries 總數決定了批次從哪個 chunk 開始
+      const existingEntryCount = this.pendingBatch.reduce((sum, b) => sum + b.entries.length, 0);
+      const chunkIdx = Math.floor(existingEntryCount / MemoryStore.MAX_BATCH_SIZE);
+      this.pendingBatch.push({ entries: fullEntries, resolve, reject, chunkIdx });
+
+      // 啟動定時 flush timer（若尚未啟動）
+      if (!this.flushTimer) {
+        this.flushTimer = setTimeout(() => {
+          this.flushTimer = null;
+          // 【MR3 fix】doFlush() 可能同步拋出（例如 LanceDB 同步錯誤），
+          // fire-and-forget 若無 .catch() 會觸發 Node.js unhandled promise rejection
+          // 【F2 fix】儲存錯誤，讓 explicit flush() 可 catch 並 rethrow
+          // 避免 fire-and-forget timer error 被 Node.js unhandled rejection 吞掉
+          this.doFlush().then((result) => {
+            if (result.hasError && result.lastError) {
+              this.lastBackgroundError = { hasError: true, lastError: result.lastError };
+              console.error(`[memory-lancedb-pro] doFlush() timer callback error: ${result.lastError instanceof Error ? result.lastError.message : String(result.lastError)}`);
+            }
+          }).catch((err) => {
+            // 同步 throw 的情況
+            this.lastBackgroundError = { hasError: true, lastError: err as Error };
+            console.error(`[memory-lancedb-pro] doFlush() timer callback error: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }, MemoryStore.FLUSH_INTERVAL_MS);
+      }
     });
+  }
+
+  /**
+   * Flush all pending batch entries in a single lock acquisition.
+   * Called by the flush timer and on shutdown.
+   * @returns {hasError: boolean, lastError?: Error} — error info so callers
+   *   (flush/destroy) can rethrow without relying on shared instance state.
+   */
+  private async doFlush(): Promise<{ hasError: boolean; lastError?: Error }> {
+    const prevLock = this.flushLock;
+    let releaseLock: () => void;
+    this.flushLock = new Promise<void>((resolve) => { releaseLock = resolve; });
+    await prevLock; // 等上一個 flush 完成後才開始
+    let lastError: Error | undefined;
+    try {
+      if (this.pendingBatch.length === 0) return { hasError: false };
+
+      // splice out the current batch（保護新進的 pending calls）
+      const batch = this.pendingBatch.splice(0, this.pendingBatch.length);
+
+      // 合併所有 entries（攤平每個 caller 的 entries，保持 caller 邊界資訊）
+      const allEntries = batch.flatMap((b) => b.entries);
+
+      // 【F5/MR1 fix】用 Map 儲存每個 chunk 的錯誤，而非只留 lastError
+      // 這樣 settlement 時每個 caller 都能拿到自己所屬 chunk 的正確錯誤
+      const chunkErrors = new Map<number, Error>();
+      // failedCallers 追蹤哪些 caller 有 chunk 寫入失敗
+      const failedCallers = new Set<number>();
+
+      // 【修復 Issue #2: 自動分塊】
+      // LanceDB 內部並無批次上限，本層主動分塊避免實際的底層限制
+      for (let i = 0; i < allEntries.length; i += MemoryStore.MAX_BATCH_SIZE) {
+        const chunk = allEntries.slice(i, i + MemoryStore.MAX_BATCH_SIZE);
+        const chunkIdx = Math.floor(i / MemoryStore.MAX_BATCH_SIZE);
+        try {
+          await this.runWithFileLock(async () => {
+            await this.table!.add(chunk);
+          });
+        } catch (err) {
+          lastError = err as Error;
+          // 標記此 chunk 區間內的所有 caller 為失敗
+          let callerIdx = 0;
+          let entryOffset = 0;
+          for (const caller of batch) {
+            const callerEnd = entryOffset + caller.entries.length;
+            // 正確邏輯：chunk [i, i+MAX_BATCH_SIZE) 與 caller [entryOffset, callerEnd) 是否有交集
+            // 交集條件：chunk.start < caller.end AND chunk.end > caller.start
+            // 即 i < callerEnd AND i + MAX_BATCH_SIZE > entryOffset
+            // entryOffset < callerEnd 在 for 迴圈中恆成立（callerEnd = entryOffset + caller.entries.length）
+            if (i < callerEnd && i + MemoryStore.MAX_BATCH_SIZE > entryOffset) {
+              failedCallers.add(callerIdx);
+            }
+            entryOffset = callerEnd;
+            callerIdx++;
+          }
+          const errorMsg = err instanceof Error ? err.message : String(err);
+          console.error(`[memory-lancedb-pro] doFlush chunk [${chunkIdx}] failed: ${errorMsg}`);
+
+          // 【F5/MR1 fix + Issue #5 fix】每個 chunk 錯誤儲存到 Map，讓 caller settlement
+          // 時能查到自己的 chunk 錯誤，而非都用 lastError（一律都是最後一個 chunk 的錯誤）
+          const chunkStart = i;
+          const chunkEnd = Math.min(i + MemoryStore.MAX_BATCH_SIZE, allEntries.length);
+          const chunkError = new Error(
+            `batch flush failed at chunk [${chunkStart}, ${chunkEnd}): ${errorMsg}`,
+            { cause: err as Error },
+          );
+          chunkErrors.set(chunkIdx, chunkError);
+          lastError = chunkError;
+        }
+      }
+
+      // 統一結算：根據 failedCallers 決定 resolve 或 reject
+      // D7 fix: caller.reject() 可能拋出（當 caller promise 已被 resolve/reject 處理過），
+      // 必須用 try/catch 包住，否則 for 迴圈會被中斷，導致後續 caller 完全未被結算
+      // 【F5/MR1 fix】每個 caller 查自己的 chunkIdx 取得正確的 chunk error
+      let callerIdx = 0;
+      for (const caller of batch) {
+        if (failedCallers.has(callerIdx)) {
+          // 從 caller.chunkIdx 查這個 caller 所屬 chunk 的實際錯誤
+          const callerError = chunkErrors.get(caller.chunkIdx) ?? lastError ?? new Error("flush failed");
+          const chunkInfo = callerError.message.includes("chunk [")
+            ? ` (${callerError.message.match(/chunk \[(\d+), (\d+)\]/)?.[0]})`
+            : "";
+          try {
+            caller.reject(new Error(`batch flush failed${chunkInfo}`, { cause: callerError }));
+          } catch (rejectErr) {
+            console.error(`[memory-lancedb-pro] caller.reject() 拋出（可能被重複結算忽略）: ${rejectErr instanceof Error ? rejectErr.message : String(rejectErr)}`);
+          }
+        } else {
+          caller.resolve(caller.entries);
+        }
+        callerIdx++;
+      }
+      return { hasError: failedCallers.size > 0, lastError };
+    } finally {
+      releaseLock!(); // 釋放 lock，讓下一個 flush 可以跑
+    }
+  }
+
+  /**
+   * Force flush all pending entries immediately.
+   *
+   * @remarks
+   * By default, entries are flushed automatically every {@link FLUSH_INTERVAL_MS} (100ms).
+   * Call this method when you need to ensure entries are persisted before a process exits
+   * or before the {@link MemoryStore} instance becomes unreachable.
+   *
+   * **Error behavior**: If the flush fails, this method throws the last error from
+   * the underlying LanceDB write operation. Partial entries may have been written
+   * before the error occurred.
+   *
+   * @public
+   */
+  async flush(): Promise<void> {
+    // D4 fix: 清除 timer 後等前一個 doFlush 完成
+    // 避免 timer callback 已排程但清除動作在它執行前發生，導致重複 doFlush
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    await this.flushLock;
+    // 【F2 fix】如果 background timer flush 失敗後又有新 entries 進來，
+    // explicit flush() 這次 doFlush() 會成功並清除 lastBackgroundError
+    // 如果 explicit flush() 呼叫時 pendingBatch 為空（代表上次 timer 失敗
+    // 的 entries 已通過其他 retry 機制處理完），此時 rethrow lastBackgroundError
+    // 讓 timer flush failure 不被吞掉
+    if (this.pendingBatch.length === 0 && this.lastBackgroundError?.hasError) {
+      const err = this.lastBackgroundError.lastError ?? new Error("background flush failed");
+      this.lastBackgroundError = null;
+      throw err;
+    }
+    const result = await this.doFlush();
+    // 【F2 fix】成功後清除 background error（表示 error 已被 caller 看到）
+    if (!result.hasError) {
+      this.lastBackgroundError = null;
+    }
+    // 【修復 Issue #3: flush() error propagation】
+    // doFlush() 回傳 error info，flush() 據此重新拋出（只保留最後一個以維持行為相容）
+    if (result.hasError && result.lastError) {
+      throw result.lastError;
+    }
+  }
+
+  /**
+   * Destroy the store instance and release all resources.
+   *
+   * @remarks
+   * This method flushes all pending entries, clears the flush timer, and releases
+   * the underlying LanceDB connection. After calling this method, the {@link MemoryStore}
+   * instance must not be used.
+   *
+   * **Error behavior**: If the final flush fails, this method throws the last error from
+   * the underlying LanceDB write operation. Callers should treat this as a critical error —
+   * some entries may have been persisted but the instance is no longer usable.
+   *
+   * @public
+   */
+  async destroy(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    // 【MR4 fix】設定 destroyed flag，阻止後續 bulkStore() 呼叫
+    this.destroyed = true;
+    const result = await this.doFlush();
+
+    // 【F1 fix】等待所有已排程的 timer callback 完成
+    // 透過 await flushLock 確保排隊中的 doFlush 都結束
+    // 防止：timer callback 已排程 → destroy() 清除 timer → destroy() 返回
+    //       → timer callback 稍後執行並失敗 → 錯誤被靜音
+    await this.flushLock;
+
+    // 【方案 D fix：兩全其美 — 保留兩個錯誤，不丟失任何一個】
+    //
+    // 三種情境：
+    // 1. destroy() 自己有錯 + lastBackgroundError 也有值 → composite error（兩個都保留）
+    // 2. 只有 destroy() 自己有錯 → 只 throw destroy 的錯誤
+    // 3. 只有 lastBackgroundError 有值 → throw timer 歷史錯誤
+    if (result.hasError && result.lastError) {
+      if (this.lastBackgroundError?.hasError) {
+        // 情境 1：兩個錯誤都保留，包成 composite error
+        const timerError = this.lastBackgroundError.lastError ?? new Error("background flush failed");
+        this.lastBackgroundError = null;
+        // throw destroy 自己錯誤，因為更新、更直接
+        // timer 歷史錯誤放在 message 裡讓 caller 知道（cause chain 保留）
+        const compositeError = new Error(
+          `destroy flush failed (${result.lastError.message}); background flush also failed: ${timerError.message}`,
+          { cause: result.lastError }
+        );
+        throw compositeError;
+      }
+      // 情境 2：只有 destroy 自己有錯
+      throw result.lastError;
+    }
+
+    // 【F1 fix】檢查 lastBackgroundError（timers 錯誤的最後堡壘）
+    // 情境 3：只有 lastBackgroundError 有值
+    if (this.lastBackgroundError?.hasError) {
+      const err = this.lastBackgroundError.lastError ?? new Error("background flush failed");
+      this.lastBackgroundError = null;
+      throw err;
+    }
   }
 
   /**
