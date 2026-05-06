@@ -60,11 +60,15 @@ const EXPECTED_BASELINE = [
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store-edge-cases.test.mjs", args: ["--test"] },
   // Issue #680 regression tests
   { group: "core-regression", runner: "node", file: "test/memory-reflection-issue680-tdd.test.mjs", args: ["--test"] },
+  // Issue #606 SDK migration Bug 2 regression tests
+  { group: "core-regression", runner: "node", file: "test/issue606_sdk-migration.test.mjs" },
   // Issue #736 recall governance - isRecallUsed() unit tests
   { group: "core-regression", runner: "node", file: "test/is-recall-used.test.mjs", args: ["--test"] },
   // Issue #492 agentId validation tests
   { group: "core-regression", runner: "node", file: "test/agentid-validation.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/command-reflection-guard.test.mjs", args: ["--test"] },
+  // Dreaming engine — Issue #565/#571/#577 scope isolation and reflection loop prevention
+  { group: "core-regression", runner: "jiti", file: "test/dreaming-engine.test.ts" },
 ];
 
 function fail(message) {
