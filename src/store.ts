@@ -738,9 +738,21 @@ export class MemoryStore {
     if (!result.hasError) {
       this.lastBackgroundError = null;
     }
-    // 【修復 Issue #3: flush() error propagation】
-    // doFlush() 回傳 error info，flush() 據此重新拋出（只保留最後一個以維持行為相容）
+    // 【F2 fix — flush() edge case: 當 explicit flush() 失敗且 lastBackgroundError 也有值時】
+    // 鏡像 destroy() 的 composite error 處理（lines 783-798）
     if (result.hasError && result.lastError) {
+      if (this.lastBackgroundError?.hasError) {
+        // 兩個錯誤都保留，包成 composite error
+        const timerError = this.lastBackgroundError.lastError ?? new Error("background flush failed");
+        this.lastBackgroundError = null;
+        // throw explicit flush() 的錯誤（更新、更直接），timer 歷史錯誤放在 message 讓 caller 知道
+        const compositeError = new Error(
+          `flush failed (${result.lastError.message}); background flush also failed: ${timerError.message}`,
+          { cause: result.lastError }
+        );
+        throw compositeError;
+      }
+      // 只有 explicit flush() 自己的錯誤
       throw result.lastError;
     }
   }

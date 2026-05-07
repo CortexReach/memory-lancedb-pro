@@ -276,6 +276,74 @@ describe("F2 fix: lastBackgroundError timer flush error propagation", () => {
   });
 
   // ============================================================
+  // S8: flush() 兩錯誤同時存在 → composite error（F2 edge case fix）
+  //
+  // 情境：lastBackgroundError 有值（timer callback 歷史錯誤）
+  //      + flush() 自己的 doFlush() 也失敗
+  //
+  // 行為（方向 4）：
+  // → throw composite error，message 包含兩個錯誤資訊，cause 是 flush 自己錯誤
+  // → lastBackgroundError 清除
+  // → 不殘留舊 timer 錯誤到未來的 flush()
+  // ============================================================
+  it("S8: flush() with both errors → composite error preserves both", async () => {
+    const { store, dir } = makeStore();
+
+    try {
+      // Warm-up：確保 store 初始化完成，pendingBatch 清空
+      await store.bulkStore([makeEntry(0)]);
+      await store.flush();
+
+      // 步驟 1：塞 entry 到 pendingBatch（讓 flush() 的 doFlush() 真正嘗試寫入）
+      const entry = makeEntry(99);
+      store.pendingBatch.push({ entries: [entry], resolve: () => {}, reject: () => {}, chunkIdx: 0 });
+
+      // 步驟 2：設定 lastBackgroundError（timer callback 的歷史錯誤）
+      const bgError = new Error("timer callback flush failed: simulated");
+      store.lastBackgroundError = { hasError: true, lastError: bgError };
+
+      // 步驟 3：破壞 table（讓 flush() 的 doFlush() 失敗）
+      store.table = null;
+
+      // 步驟 4：flush() → 應該 throw composite error
+      let flushThrew = false;
+      let flushError;
+      try {
+        await store.flush();
+      } catch (err) {
+        flushThrew = true;
+        flushError = err;
+      }
+
+      assert.strictEqual(flushThrew, true, "flush() should throw composite error");
+
+      // 驗證 composite error 的三個條件：
+      // 1. message 同時包含 flush 自己錯誤和 background 錯誤
+      assert.ok(
+        flushError?.message.includes("flush failed") &&
+        flushError?.message.includes("background flush also failed"),
+        `composite error should mention both errors. Got: "${flushError?.message}"`
+      );
+
+      // 2. cause 是 flush() 自己 doFlush() 的錯誤（table null）
+      assert.ok(
+        flushError?.cause?.message?.includes("null") ||
+        flushError?.cause?.message?.includes("table"),
+        `cause should be flush's own error. Got: "${flushError?.cause?.message}"`
+      );
+
+      // 3. lastBackgroundError 已被清除（不殘留）
+      assert.strictEqual(
+        store.lastBackgroundError,
+        null,
+        "lastBackgroundError should be cleared after throw"
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // ============================================================
   // S6: destroy() 成功（無 lastBackgroundError）→ 不拋出
   // ============================================================
   it("S6: destroy() succeeds when no background error", async () => {
