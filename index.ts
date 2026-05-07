@@ -2860,6 +2860,56 @@ const memoryLanceDBProPlugin = {
         if (!sessionKey) return;
         pruneReflectionSessionState();
 
+        // For exec tool: check exitCode AND scan output text for "exit code N" patterns
+        // Note: OpenClaw exec tool may report exitCode=0 even when command fails,
+        // so we also check the output text for "exit code <non-zero>" markers.
+        if (event.toolName === "exec") {
+          const exitCode = typeof event.exitCode === "number" ? event.exitCode : -1;
+
+          // Extract actual exit code from output text
+          // OpenClaw exec tool embeds "exit: N", "exit code N", or "Command exited with code N" in output.
+          // Matches: "exit: N", "exit N", "exit code N", "Command exited with code N"
+          const resultTextRaw = extractTextFromToolResult(event.result);
+          const exitCodeMatch = resultTextRaw.match(/(?:\bexit(?:\s+code)?|Command\s+exited)\s*[;:]\s*(\d+)\b/i);
+          const actualExitCode = exitCodeMatch ? parseInt(exitCodeMatch[1], 10) : -1;
+
+          // Skip if actualExitCode is 0 (success indicator found in output text)
+          // This handles "exit: 0", "exit code 0", and "Command exited with code 0" formats
+          if (actualExitCode === 0) {
+            return;
+          }
+
+          // Non-zero exit code (from event.exitCode or text) = real error
+          const hasErrorText = typeof event.error === "string" && event.error.trim().length > 0;
+          const hasNonZeroExit = exitCode > 0 || actualExitCode > 0;
+
+          if (hasErrorText) {
+            const signature = normalizeErrorSignature(event.error);
+            addReflectionErrorSignal(sessionKey, {
+              at: Date.now(),
+              toolName: event.toolName || "unknown",
+              summary: summarizeErrorText(event.error),
+              source: "tool_error",
+              signature,
+              signatureHash: sha256Hex(signature).slice(0, 16),
+            }, reflectionDedupeErrorSignals);
+          } else if (hasNonZeroExit) {
+            // Non-zero exit code from event.exitCode or extracted from output text
+            const trackedCode = exitCode > 0 ? exitCode : actualExitCode;
+            const exitMsg = `exit code ${trackedCode}`;
+            const signature = normalizeErrorSignature(exitMsg);
+            addReflectionErrorSignal(sessionKey, {
+              at: Date.now(),
+              toolName: event.toolName || "unknown",
+              summary: exitMsg,
+              source: "tool_exit",
+              signature,
+              signatureHash: sha256Hex(signature).slice(0, 16),
+            }, reflectionDedupeErrorSignals);
+          }
+          return;
+        }
+
         if (typeof event.error === "string" && event.error.trim().length > 0) {
           const signature = normalizeErrorSignature(event.error);
           addReflectionErrorSignal(sessionKey, {
@@ -2877,12 +2927,30 @@ const memoryLanceDBProPlugin = {
         const resultText = resultTextRaw.length > DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS
           ? resultTextRaw.slice(0, DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS)
           : resultTextRaw;
-        if (resultText && containsErrorSignal(resultText)) {
-          const signature = normalizeErrorSignature(resultText);
+
+        // Filter out known plugin log noise before error signal check
+        const KNOWN_LOG_NOISE_PREFIXES = [
+          "memory-lancedb-pro:",
+          "memory-pro:",
+          "memory-reflection:",
+          "[memory-lancedb-pro]",
+          "plugins:",
+          "memory-lancedb:",
+          "[memory-lancedb]",
+        ];
+        const filteredLines = resultText
+          .split("\n")
+          .filter((line: string) =>
+            !KNOWN_LOG_NOISE_PREFIXES.some((prefix) => line.includes(prefix)),
+          );
+        const filteredText = filteredLines.join("\n");
+
+        if (filteredText && containsErrorSignal(filteredText)) {
+          const signature = normalizeErrorSignature(filteredText);
           addReflectionErrorSignal(sessionKey, {
             at: Date.now(),
             toolName: event.toolName || "unknown",
-            summary: summarizeErrorText(resultText),
+            summary: summarizeErrorText(filteredText),
             source: "tool_output",
             signature,
             signatureHash: sha256Hex(signature).slice(0, 16),
