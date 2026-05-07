@@ -750,8 +750,19 @@ export async function runImportMarkdown(
         )
       );
       for (const { e, hits, ok } of results) {
-        if (!ok || hits.length === 0 || hits[0].entry.text !== e.text) {
-          pendingEntries.push(e);
+        // Use hits.some() to scan ALL hits, not just hits[0]
+        // (exact match may be at hits[1+] after reranking)
+        const isExactMatch = hits.some(hit => hit.entry.text === e.text);
+        if (!isExactMatch) {
+          if (!ok) {
+            // Option A fail-safe: retrieve() error → skip + count error
+            // This prevents DB pollution when dedup service is down
+            errorCount++;
+            console.log(`  [skip] dedup-err [${e.effectiveScope}]: ${e.text.slice(0, 60)}${e.text.length > 60 ? "..." : ""}`);
+          } else {
+            // Genuine no-hit → proceed to import
+            pendingEntries.push(e);
+          }
         } else {
           // dedup hit — count toward both skipped and skippedDedup (PR 719 semantics)
           skipped++;
