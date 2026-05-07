@@ -4,11 +4,13 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync, statSync, unlinkSync, } from "node:fs";
 import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 // ============================================================================
 // LanceDB Dynamic Import
 // ============================================================================
 let lancedbImportPromise = null;
+const requireCJS = createRequire(import.meta.url);
 // =========================================================================
 // Cross-Process File Lock (proper-lockfile)
 // =========================================================================
@@ -25,10 +27,11 @@ export function __setLockfileModuleForTests(module) {
 }
 export const loadLanceDB = async () => {
     if (!lancedbImportPromise) {
-        // Load LanceDB through native dynamic import so the compiled ESM runtime works
-        // inside OpenClaw 2026.5+. A direct require() is not available in ESM and
-        // causes auto-recall/retrieval to fail with "require is not defined".
-        lancedbImportPromise = import("@lancedb/lancedb");
+        // Use a createRequire-built require() so LanceDB's CommonJS native bindings
+        // keep Windows-safe CJS semantics while still working in pure ESM runtimes.
+        // Do not name this binding "require": bundlers may rewrite bare require()
+        // calls to their ESM shim, which is what broke OpenClaw 2026.5+ loading.
+        lancedbImportPromise = Promise.resolve(requireCJS("@lancedb/lancedb"));
     }
     try {
         return await lancedbImportPromise;

@@ -54,6 +54,7 @@ export interface MetadataPatch {
 
 let lancedbImportPromise: Promise<typeof import("@lancedb/lancedb")> | null =
   null;
+const requireCJS = createRequire(import.meta.url);
 
 // =========================================================================
 // Cross-Process File Lock (proper-lockfile)
@@ -77,12 +78,13 @@ export const loadLanceDB = async (): Promise<
   typeof import("@lancedb/lancedb")
 > => {
   if (!lancedbImportPromise) {
-    // createRequire builds a real CJS require() from an ESM context.
-    // This preserves native .node binding semantics on Windows (per #267)
-    // while working in pure-ESM Node where global require is undefined.
-    // Named `requireCJS` to prevent esbuild from rewriting it to __require.
-    const requireCJS = createRequire(import.meta.url);
-    lancedbImportPromise = Promise.resolve(requireCJS("@lancedb/lancedb"));
+    // Use a createRequire-built require() so LanceDB's CommonJS native bindings
+    // keep Windows-safe CJS semantics while still working in pure ESM runtimes.
+    // Do not name this binding "require": bundlers may rewrite bare require()
+    // calls to their ESM shim, which is what broke OpenClaw 2026.5+ loading.
+    lancedbImportPromise = Promise.resolve(
+      requireCJS("@lancedb/lancedb") as typeof import("@lancedb/lancedb"),
+    );
   }
   try {
     return await lancedbImportPromise;
