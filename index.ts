@@ -5,7 +5,7 @@
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { homedir, tmpdir } from "node:os";
-import { join, dirname, basename } from "node:path";
+import { join, dirname, basename, win32 as winPath } from "node:path";
 import { readFile, readdir, writeFile, mkdir, appendFile, unlink, stat } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -536,50 +536,78 @@ function isLayer1CircuitOpen(): boolean {
   return recentFailures.length >= LAYER1_FAILURE_THRESHOLD;
 }
 
-export function toImportSpecifier(value: string): string {
+export function toImportSpecifier(
+  value: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
   const trimmed = value.trim();
   if (!trimmed) return "";
   if (trimmed.startsWith("file://")) return trimmed;
-  if (trimmed.startsWith("/")) return pathToFileURL(trimmed).href;
+  if (trimmed.startsWith("/")) return pathToFileURL(trimmed, { windows: false }).href;
   // Handle Windows absolute paths (e.g. C:\Users\... or D:/Program Files/...) — PR #593
-  if (process.platform === 'win32' && /^[a-zA-Z]:[/\\]/.test(trimmed)) return pathToFileURL(trimmed).href;
+  if (platform === 'win32' && /^[a-zA-Z]:[/\\]/.test(trimmed)) {
+    return pathToFileURL(trimmed, { windows: true }).href;
+  }
   // Handle UNC paths (\\server\share or \\?\UNC\\server\share) — PR #593
   // Regex breakdown: ^\\\\  = starts with \\
   //                  [^\\]+   = server name (one or more non-backslash chars)
   //                  \\[^\\]+ = \ + share name (one or more non-backslash chars)
   // Examples matched: \\server\share, \\fileserver\company-share, \\?\UNC\server\share
   // Examples NOT matched: C:\path (drive letter, handled above), /unix/path (POSIX)
-  if (process.platform === 'win32' && /^\\\\[^\\]+\\[^\\]+/.test(trimmed)) {
+  if (platform === 'win32' && /^\\\\[^\\]+\\[^\\]+/.test(trimmed)) {
     // Extended prefix \\?\UNC\\ means "long UNC name" — already normalized.
     // Pass directly so we don't double-normalize (e.g. avoid \\?\UNC\\?\UNC\\...).
-    if (trimmed.startsWith('\\\\?\\UNC\\')) return pathToFileURL(trimmed).href;
+    if (trimmed.startsWith('\\\\?\\UNC\\')) {
+      return pathToFileURL(trimmed, { windows: true }).href;
+    }
     // Standard UNC: \\server\share -> \\?\UNC\\server\share -> file://server/share
     // strip leading \\ (2 chars) -> server\share, then prefix \\?\UNC\\
     const normalized = '\\\\?\\UNC\\' + trimmed.slice(2);
-    return pathToFileURL(normalized).href;
+    return pathToFileURL(normalized, { windows: true }).href;
   }
   return trimmed;
 }
-export function getExtensionApiImportSpecifiers(): string[] {
-  const envPath = process.env.OPENCLAW_EXTENSION_API_PATH?.trim();
+
+type ExtensionImportSpecifierOptions = {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  resolveOpenClawExtensionApi?: () => string;
+};
+
+export function getExtensionApiImportSpecifiers(
+  options: ExtensionImportSpecifierOptions = {},
+): string[] {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const envPath = env.OPENCLAW_EXTENSION_API_PATH?.trim();
+  const joinForPlatform = platform === "win32" ? winPath.join : join;
   const specifiers: string[] = [];
 
-  if (envPath) specifiers.push(toImportSpecifier(envPath));
+  if (envPath) specifiers.push(toImportSpecifier(envPath, platform));
   specifiers.push("openclaw/dist/extensionAPI.js");
 
   try {
-    specifiers.push(toImportSpecifier(requireFromHere.resolve("openclaw/dist/extensionAPI.js")));
+    const resolved = options.resolveOpenClawExtensionApi
+      ? options.resolveOpenClawExtensionApi()
+      : requireFromHere.resolve("openclaw/dist/extensionAPI.js");
+    specifiers.push(toImportSpecifier(resolved, platform));
   } catch {
     // ignore resolve failures and continue fallback probing
   }
 
-  specifiers.push(toImportSpecifier("/usr/lib/node_modules/openclaw/dist/extensionAPI.js"));
-  specifiers.push(toImportSpecifier("/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js"));
-  specifiers.push(toImportSpecifier("/opt/homebrew/lib/node_modules/openclaw/dist/extensionAPI.js"));
-
-  if (process.platform === "win32" && process.env.APPDATA) {
-    const windowsNpmPath = join(process.env.APPDATA, "npm", "node_modules", "openclaw", "dist", "extensionAPI.js");
-    specifiers.push(toImportSpecifier(windowsNpmPath));
+  if (platform === "win32") {
+    if (env.APPDATA) {
+      const windowsNpmPath = joinForPlatform(env.APPDATA, "npm", "node_modules", "openclaw", "dist", "extensionAPI.js");
+      specifiers.push(toImportSpecifier(windowsNpmPath, platform));
+    }
+    if (env.ProgramFiles) {
+      const windowsProgramFilesPath = joinForPlatform(env.ProgramFiles, "nodejs", "node_modules", "openclaw", "dist", "extensionAPI.js");
+      specifiers.push(toImportSpecifier(windowsProgramFilesPath, platform));
+    }
+  } else {
+    specifiers.push(toImportSpecifier("/usr/lib/node_modules/openclaw/dist/extensionAPI.js", platform));
+    specifiers.push(toImportSpecifier("/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js", platform));
+    specifiers.push(toImportSpecifier("/opt/homebrew/lib/node_modules/openclaw/dist/extensionAPI.js", platform));
   }
 
   return [...new Set(specifiers.filter(Boolean))];
@@ -734,7 +762,8 @@ async function runReflectionViaCli(params: {
   ];
 
   return await new Promise<string>((resolve, reject) => {
-    const child = spawn(cliBin, args, {
+    const spawnCommand = buildReflectionCliSpawnCommand(cliBin, args);
+    const child = spawn(spawnCommand.command, spawnCommand.args, {
       cwd: params.workspaceDir,
       env: { ...process.env, NO_COLOR: "1" },
       stdio: ["ignore", "pipe", "pipe"],
@@ -799,6 +828,22 @@ async function runReflectionViaCli(params: {
       }
     });
   });
+}
+
+export function buildReflectionCliSpawnCommand(
+  cliBin: string,
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+  comSpec = process.env.ComSpec?.trim(),
+): { command: string; args: string[] } {
+  if (platform === "win32") {
+    return {
+      command: comSpec || "cmd.exe",
+      args: ["/c", cliBin, ...args],
+    };
+  }
+
+  return { command: cliBin, args };
 }
 
 async function loadSelfImprovementReminderContent(workspaceDir?: string): Promise<string> {
