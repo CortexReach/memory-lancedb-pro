@@ -7,9 +7,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "..");
 
-// EXPECTED_BASELINE is derived from CI_TEST_MANIFEST so they are always in sync.
-// Any PR that adds/removes/reorders test entries in CI_TEST_MANIFEST automatically
-// updates the baseline — no manual snapshot maintenance needed.
 const EXPECTED_BASELINE = CI_TEST_MANIFEST;
 
 function fail(message) {
