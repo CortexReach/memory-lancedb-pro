@@ -74,6 +74,8 @@ export type ExtractionStats = {
   boundarySkipped?: number;
   supported?: number; // context-aware support count
   superseded?: number; // temporal fact replacements
+  /** Count of entries deleted during rollback (bulkStore succeeded then invalidation partially failed). */
+  rolledBack?: number;
 };
 
 /** Validate and normalize a category string. */

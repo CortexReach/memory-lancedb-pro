@@ -62,7 +62,8 @@ type StoreEntry = Omit<import("./store.js").MemoryEntry, "id" | "timestamp">;
 interface InvalidateEntry {
   id: string;
   metadata: string;
-  newEntryIndex?: number;
+  /** Index into bulkStore results (stable across filter), or undefined for non-supersede entries. */
+  bulkIndex?: number;
   /** ID of the new entry created by bulkStore (set during second pass for rollback). */
   newEntryId?: string;
   _origMetadata?: string;
@@ -465,14 +466,14 @@ export class SmartExtractor {
 
       // SECOND PASS: backfill superseded_by for superseded old entries.
       // bulkStore returns entries in the same order they were pushed.
-      // For each invalidateEntry that came from a supersede (newEntryIndex is set),
-      // the new entry's ID is at bulkResults[newEntryIndex].id.
+      // For each invalidateEntry that came from a supersede (bulkIndex is set),
+      // the new entry's ID is at bulkResults[bulkIndex].id.
       // We parse the stored metadata and update it with the new entry's ID.
       // We also store newEntryId on the inv so the rollback block can delete it.
       if (invalidateEntries.length > 0) {
         for (const inv of invalidateEntries) {
-          if (inv.newEntryIndex !== undefined && inv.newEntryIndex < bulkResults.length) {
-            const newEntryId = bulkResults[inv.newEntryIndex].id;
+          if (inv.bulkIndex !== undefined && inv.bulkIndex < bulkResults.length) {
+            const newEntryId = bulkResults[inv.bulkIndex].id;
             inv.newEntryId = newEntryId; // persist for rollback
             const oldMeta = parseSmartMetadata(inv.metadata, { id: inv.id });
             const updatedMeta = buildSmartMetadata({ metadata: inv.metadata }, {
@@ -493,6 +494,14 @@ export class SmartExtractor {
     // InvalidateEntries.length lock acquisitions. This is unavoidable: LanceDB does not support
     // atomic "bulk update with where clause". The batch mode benefit comes from bulkStore
     // for new entries (1 lock for N writes), not from the invalidation updates).
+    //
+    // MR3: Promise.allSettled fans out N concurrent update() calls, all waiting on the same
+    // file lock. This means all N callers hold their own task-slot in the event loop while
+    // waiting for the lock, increasing memory pressure and latency for callers that hit the
+    // lock last. A sequential for...of loop would reduce peak concurrency at the cost of
+    // throughput. Given the comment above acknowledges N lock acquisitions are unavoidable,
+    // we leave the parallel form here for now. A future optimization would batch-invalidate
+    // using store.bulkDelete() once that API exists.
     // Invalidation is not atomic: bulkStore commits new entries first, then we
     // update old entries one by one.  If some updates fail, we roll back:
     //   1. Delete the new entries that bulkStore wrote (so they don't stay active).
@@ -547,15 +556,16 @@ export class SmartExtractor {
           succeeded.map(({ inv }) => {
             const orig = inv._origMetadata;
             if (!orig) return Promise.resolve();
-            // Pass _origMetadata through so the mock can distinguish restore calls
-            // from invalidation calls and not count restore as an invalidation attempt.
-            return this.store.update(inv.id, { metadata: orig, _origMetadata: orig }, scopeFilter);
+            // _origMetadata is internal-only for rollback coordination — strip before write.
+            return this.store.update(inv.id, { metadata: orig }, scopeFilter);
           }),
         );
 
         const restoreFailed = restoreResults.filter((r) => r.status === 'rejected');
         const totalFailed = deleteFailed.length + restoreFailed.length;
         if (totalFailed > 0) {
+          stats.rolledBack = (stats.rolledBack ?? 0) + newEntryIdsToDelete.length;
+
           this.log(
             `memory-pro: smart-extractor: ROLLBACK FAILED — ${totalFailed} operations failed (${deleteFailed.length} deletes + ${restoreFailed.length} restores). Database may have inconsistent supersede state. Affected IDs: ${failedIds}`,
           );
@@ -1324,7 +1334,7 @@ export class SmartExtractor {
       const supersedeClassifyText = candidate.content || candidate.abstract;
 
       // Capture position BEFORE pushing so we can find this new entry in bulkStore results
-      const newEntryIndex = createEntries.length;
+      const bulkIndex = createEntries.length;
 
       createEntries.push({
         text: candidate.abstract,
@@ -1380,7 +1390,7 @@ export class SmartExtractor {
       invalidateEntries?.push({
         id: matchId,
         metadata: stringifySmartMetadata(invalidatedMeta),
-        newEntryIndex,  // enables second-pass backfill of superseded_by
+        bulkIndex,  // enables second-pass backfill of superseded_by
         // Store original metadata so we can rollback if subsequent invalidation updates fail.
         _origMetadata: existing.metadata,
       });
