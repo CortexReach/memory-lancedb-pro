@@ -1,0 +1,29 @@
+name: lancedb_pro
+version: 0.1.0
+description: Optional experimental Hermes-native LanceDB memory provider; isolated from OpenClaw runtime changes.
+type: memory-provider
+entrypoint: __init__.py
+hermes:
+  provider: lancedb_pro
+  install_path: $HERMES_HOME/plugins/lancedb_pro
+capabilities:
+  - manual_store
+  - manual_search
+  - status
+  - forget_single_id
+  - prefetch_auto_recall
+configuration:
+  env:
+    HERMES_MEMORY_JINA_API_KEY: Optional Jina/OpenAI-compatible embedding API key. Never required for local tests.
+    HERMES_MEMORY_EMBED_BASE_URL: Optional embeddings endpoint; defaults to https://api.jina.ai/v1/embeddings.
+    HERMES_MEMORY_EMBED_MODEL: Optional embedding model; defaults to jina-embeddings-v5-text-small.
+    HERMES_MEMORY_EMBED_QUERY_TASK: Optional query embedding task; defaults to retrieval.query.
+    HERMES_MEMORY_EMBED_PASSAGE_TASK: Optional stored-memory embedding task; defaults to retrieval.passage.
+    HERMES_MEMORY_EMBED_DIM: Optional hash fallback dimensions; defaults to 1024.
+    HERMES_MEMORY_LANCEDB_PATH: Optional storage path; defaults to $HERMES_HOME/memory/lancedb-pro.
+    HERMES_MEMORY_LANCEDB_TABLE: Optional LanceDB table name; defaults to hermes_memories. The table always stores Hermes-schema rows.
+    HERMES_MEMORY_LANCEDB_SYNC_TURN: Optional; set true to store every completed turn. Default false.
+    HERMES_MEMORY_LANCEDB_AUTO_CAPTURE: Optional alias for enabling sync_turn. Default false.
+    HERMES_MEMORY_LANCEDB_AUTO_RECALL: Optional; set false to disable prefetch recall. Default true.
+    HERMES_MEMORY_HASH_FALLBACK: Optional; set false to fail instead of falling back to hash embeddings.
+    HERMES_MEMORY_LANCEDB_FORCE_JSON: Optional dev/test flag; set true to force JSONL fallback.

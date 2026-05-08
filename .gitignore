@@ -1,5 +1,8 @@
 node_modules/
+__pycache__/
+*.py[cod]
 .venv-skill-tools
+.migration-venv/
 .memory-lancedb-pro/
 .DS_Store
 memory-plugin-feature-dev
