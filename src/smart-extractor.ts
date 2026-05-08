@@ -563,15 +563,16 @@ export class SmartExtractor {
 
         const restoreFailed = restoreResults.filter((r) => r.status === 'rejected');
         const totalFailed = deleteFailed.length + restoreFailed.length;
+        const deleteSucceeded = deleteResults.filter((r) => r.status === 'fulfilled').length;
         if (totalFailed > 0) {
-          stats.rolledBack = (stats.rolledBack ?? 0) + newEntryIdsToDelete.length;
+          stats.rolledBack = (stats.rolledBack ?? 0) + deleteSucceeded;
 
           this.log(
             `memory-pro: smart-extractor: ROLLBACK FAILED — ${totalFailed} operations failed (${deleteFailed.length} deletes + ${restoreFailed.length} restores). Database may have inconsistent supersede state. Affected IDs: ${failedIds}`,
           );
         } else {
           this.log(
-            `memory-pro: smart-extractor: Rollback complete — ${succeededCount} old entries restored, ${newEntryIdsToDelete.length} new entries deleted. No partial state left.`,
+            `memory-pro: smart-extractor: Rollback complete — ${succeededCount} old entries restored, ${deleteSucceeded} new entries deleted. No partial state left.`,
           );
         }
       }
