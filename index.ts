@@ -3577,6 +3577,15 @@ const memoryLanceDBProPlugin = {
         if (!sessionKey) return;
         pruneReflectionSessionState();
 
+        if (event.toolName === "exec") {
+          const resultTextRaw = extractTextFromToolResult(event.result);
+          const exitCodeMatch = resultTextRaw.match(
+            /(?:\bexit(?:\s+code)?|Command\s+exited)\s*[;:\s](\d+)\b/i
+          );
+          const actualExitCode = exitCodeMatch ? parseInt(exitCodeMatch[1], 10) : -1;
+          if (actualExitCode === 0) { return; }
+        }
+
         if (typeof event.error === "string" && event.error.trim().length > 0) {
           const signature = normalizeErrorSignature(event.error);
           addReflectionErrorSignal(sessionKey, {
