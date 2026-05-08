@@ -8,7 +8,7 @@ const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "..");
 
 const EXPECTED_BASELINE = [
-  { group: "llm-clients-and-auth", runner: "node", file: "test/embedder-error-hints.test.mjs" },
+{ group: "llm-clients-and-auth", runner: "node", file: "test/embedder-error-hints.test.mjs" },
   { group: "llm-clients-and-auth", runner: "node", file: "test/cjk-recursion-regression.test.mjs" },
   { group: "storage-and-schema", runner: "node", file: "test/migrate-legacy-schema.test.mjs" },
   { group: "storage-and-schema", runner: "node", file: "test/config-session-strategy-migration.test.mjs", args: ["--test"] },
@@ -47,25 +47,23 @@ const EXPECTED_BASELINE = [
   { group: "core-regression", runner: "node", file: "test/preference-slots.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/is-latest-auto-supersede.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/temporal-awareness.test.mjs", args: ["--test"] },
-  // Issue #598 regression tests
   { group: "core-regression", runner: "node", file: "test/store-serialization.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/access-tracker-retry.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/embedder-cache.test.mjs" },
-  // Issue #629 batch embedding fix
   { group: "llm-clients-and-auth", runner: "node", file: "test/embedder-ollama-batch-routing.test.mjs" },
-  // Issue #665 bulkStore tests
+  { group: "storage-and-schema", runner: "node", file: "test/issue-690-cross-call-batch.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/bulk-store.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/bulk-store-edge-cases.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store-edge-cases.test.mjs", args: ["--test"] },
-  // Issue #632 Phase 2 lock serialization + rollback protection
   { group: "core-regression", runner: "node", file: "test/upgrader-phase2-lock.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/upgrader-phase2-extreme.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/bulk-recovery-rollback.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/upgrader-whitelist-regression.test.mjs" },
-  // Issue #680 regression tests
+  { group: "core-regression", runner: "node", file: "test/bulk-update-metadata-option-a.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/memory-reflection-issue680-tdd.test.mjs", args: ["--test"] },
-  // Issue #492 agentId validation tests
+  { group: "core-regression", runner: "node", file: "test/issue606_sdk-migration.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/is-recall-used.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/agentid-validation.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/command-reflection-guard.test.mjs", args: ["--test"] },
 ];
