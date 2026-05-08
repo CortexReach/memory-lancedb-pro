@@ -198,4 +198,49 @@ describe("reflection hooks tolerate bypass scope filters", () => {
       "sessionKey-only resolution should not emit warning fallbacks",
     );
   });
+
+  it("suppresses derived reflection on the fresh prompt after command:new", async () => {
+    const pluginConfig = makePluginConfig(workDir);
+    await seedReflection(pluginConfig.dbPath, "main");
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workDir,
+      pluginConfig,
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+
+    const commandHooks = harness.eventHandlers.get("command:new") || [];
+    const reflectionCommandHook = commandHooks.find((hook) =>
+      hook.meta?.name === "memory-lancedb-pro.memory-reflection.command-new"
+    );
+    assert.ok(reflectionCommandHook, "expected memory reflection command:new hook");
+
+    const sessionKey = "agent:main:fresh-after-new";
+    await reflectionCommandHook.handler({
+      sessionKey,
+      timestamp: 1_800_000_000_000,
+      action: "command:new",
+      context: {},
+    }, { sessionKey, agentId: "main" });
+
+    const promptHooks = harness.eventHandlers.get("before_prompt_build") || [];
+    const reflectionHooks = promptHooks
+      .filter((hook) => hook.meta?.priority === 12 || hook.meta?.priority === 15)
+      .sort((a, b) => (a.meta?.priority ?? 99) - (b.meta?.priority ?? 99));
+
+    assert.equal(reflectionHooks.length, 2, "expected reflection before_prompt_build hooks");
+
+    const ctx = { sessionKey, agentId: "main" };
+    const inheritedResult = await reflectionHooks[0].handler({}, ctx);
+    const derivedResult = await reflectionHooks[1].handler({}, ctx);
+
+    assert.match(inheritedResult?.prependContext || "", /<inherited-rules>/);
+    assert.match(inheritedResult?.prependContext || "", /Always verify reflection hook coverage for main\./);
+    assert.doesNotMatch(derivedResult?.prependContext || "", /<derived-focus>/);
+    assert.ok(
+      harness.logs.some(([, msg]) => msg.includes("derived injection suppressed after command:new")),
+      "expected derived suppression to be logged",
+    );
+  });
 });

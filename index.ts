@@ -452,6 +452,9 @@ const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
+// After /new or /reset, the just-closed session may have generated fresh
+// derived deltas. Keep those out of the immediately opened prompt window.
+const DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS = 120_000;
 const REFLECTION_FALLBACK_MARKER = "(fallback) Reflection generation failed; storing minimal pointer only.";
 const DIAG_BUILD_TAG = "memory-lancedb-pro-diag-20260308-0058";
 
@@ -469,6 +472,12 @@ type ReflectionErrorState = {
   lastInjectedCount: number;
   signatureSet: Set<string>;
   updatedAt: number;
+};
+
+type ReflectionDerivedSuppressionState = {
+  updatedAt: number;
+  until: number;
+  reason: string;
 };
 
 type EmbeddedPiRunner = (params: Record<string, unknown>) => Promise<unknown>;
@@ -1800,6 +1809,18 @@ function _dedupHookEvent(handlerName: string, event: any): boolean {
   return false; // first occurrence — proceed
 }
 
+function getCommandActionName(action: unknown): string {
+  if (typeof action !== "string") return "";
+  const normalized = action.trim().toLowerCase();
+  if (!normalized) return "";
+  return normalized.split(":").pop() || normalized;
+}
+
+function isSessionBoundaryReflectionAction(action: unknown): boolean {
+  const name = getCommandActionName(action);
+  return name === "new" || name === "reset";
+}
+
 // ============================================================================
 // Phase 2 — Singleton State Management (PR #598)
 // ============================================================================
@@ -1819,6 +1840,7 @@ interface PluginSingletonState {
   // Session Maps — persist across scope refreshes instead of being recreated
   reflectionErrorStateBySession: Map<string, ReflectionErrorState>;
   reflectionDerivedBySession: Map<string, { updatedAt: number; derived: string[] }>;
+  reflectionDerivedSuppressionBySession: Map<string, ReflectionDerivedSuppressionState>;
   reflectionByAgentCache: Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>;
   recallHistory: Map<string, Map<string, number>>;
   turnCounter: Map<string, number>;
@@ -1957,6 +1979,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   // Session Maps — MUST be in singleton state so they persist across scope refreshes
   const reflectionErrorStateBySession = new Map<string, ReflectionErrorState>();
   const reflectionDerivedBySession = new Map<string, { updatedAt: number; derived: string[] }>();
+  const reflectionDerivedSuppressionBySession = new Map<string, ReflectionDerivedSuppressionState>();
   const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
   const recallHistory = new Map<string, Map<string, number>>();
   const turnCounter = new Map<string, number>();
@@ -1985,6 +2008,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     extractionRateLimiter,
     reflectionErrorStateBySession,
     reflectionDerivedBySession,
+    reflectionDerivedSuppressionBySession,
     reflectionByAgentCache,
     recallHistory,
     turnCounter,
@@ -2079,6 +2103,7 @@ const memoryLanceDBProPlugin = {
       extractionRateLimiter,
       reflectionErrorStateBySession,
       reflectionDerivedBySession,
+      reflectionDerivedSuppressionBySession,
       reflectionByAgentCache,
       recallHistory,
       turnCounter,
@@ -2213,8 +2238,14 @@ const memoryLanceDBProPlugin = {
           reflectionDerivedBySession.delete(key);
         }
       }
+      for (const [key, state] of reflectionDerivedSuppressionBySession.entries()) {
+        if (now > state.until || now - state.updatedAt > DEFAULT_REFLECTION_SESSION_TTL_MS) {
+          reflectionDerivedSuppressionBySession.delete(key);
+        }
+      }
       pruneOldestByUpdatedAt(reflectionErrorStateBySession, DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS);
       pruneOldestByUpdatedAt(reflectionDerivedBySession, DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS);
+      pruneOldestByUpdatedAt(reflectionDerivedSuppressionBySession, DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS);
     };
 
     const getReflectionErrorState = (sessionKey: string): ReflectionErrorState => {
@@ -3658,20 +3689,29 @@ const memoryLanceDBProPlugin = {
         const blocks: string[] = [];
         if (reflectionInjectMode === "inheritance+derived") {
           try {
-            const scopes = resolveScopeFilter(scopeManager, agentId);
-            const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
-            const derivedLines = derivedCache?.derived?.length
-              ? derivedCache.derived
-              : (await loadAgentReflectionSlices(agentId, scopes)).derived;
-            if (derivedLines.length > 0) {
-              blocks.push(
-                [
-                  "<derived-focus>",
-                  "Weighted recent derived execution deltas from reflection memory:",
-                  ...derivedLines.slice(0, 6).map((line, i) => `${i + 1}. ${line}`),
-                  "</derived-focus>",
-                ].join("\n")
+            const now = Date.now();
+            const suppression = sessionKey ? reflectionDerivedSuppressionBySession.get(sessionKey) : undefined;
+            if (suppression && suppression.until > now) {
+              api.logger.debug?.(
+                `memory-reflection: derived injection suppressed after ${suppression.reason} for sessionKey=${sessionKey}`,
               );
+            } else {
+              if (suppression) reflectionDerivedSuppressionBySession.delete(sessionKey);
+              const scopes = resolveScopeFilter(scopeManager, agentId);
+              const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
+              const derivedLines = derivedCache?.derived?.length
+                ? derivedCache.derived
+                : (await loadAgentReflectionSlices(agentId, scopes)).derived;
+              if (derivedLines.length > 0) {
+                blocks.push(
+                  [
+                    "<derived-focus>",
+                    "Weighted recent derived execution deltas from reflection memory:",
+                    ...derivedLines.slice(0, 6).map((line, i) => `${i + 1}. ${line}`),
+                    "</derived-focus>",
+                  ].join("\n")
+                );
+              }
             }
           } catch (err) {
             api.logger.warn(`memory-reflection: derived injection failed: ${String(err)}`);
@@ -3702,6 +3742,7 @@ const memoryLanceDBProPlugin = {
         if (!sessionKey) return;
         reflectionErrorStateBySession.delete(sessionKey);
         reflectionDerivedBySession.delete(sessionKey);
+        reflectionDerivedSuppressionBySession.delete(sessionKey);
         pruneReflectionSessionState();
       }, { priority: 20 });
 
@@ -3729,6 +3770,7 @@ const memoryLanceDBProPlugin = {
 
       const runMemoryReflection = async (event: any) => {
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
+        const action = String(event?.action || "unknown");
 
         // Validate sessionKey BEFORE dedup — invalid/empty keys must NOT pollute the dedup set
         if (!sessionKey) {
@@ -3737,6 +3779,15 @@ const memoryLanceDBProPlugin = {
         }
 
         if (_dedupHookEvent("reflection", event)) return;
+        if (isSessionBoundaryReflectionAction(action)) {
+          const now = Date.now();
+          reflectionDerivedBySession.delete(sessionKey);
+          reflectionDerivedSuppressionBySession.set(sessionKey, {
+            updatedAt: now,
+            until: now + DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS,
+            reason: action,
+          });
+        }
         // Guard against re-entrant calls for the same session (e.g. file-write triggering another command:new)
         // Uses global lock shared across all plugin instances to prevent loop amplification.
         const globalLock = getGlobalReflectionLock();
@@ -3763,7 +3814,6 @@ const memoryLanceDBProPlugin = {
         let reflectionRan = false;
         try {
           pruneReflectionSessionState();
-          const action = String(event?.action || "unknown");
           const workspaceDir = resolveWorkspaceDirFromContext(context);
           if (!cfg) {
             api.logger.warn(`memory-reflection: command:${action} missing cfg in hook context; skip reflection`);
@@ -4043,7 +4093,7 @@ const memoryLanceDBProPlugin = {
                 store.vectorSearch(vector, limit, minScore, scopeFilter),
               store: (entry) => store.store(entry),
             });
-            if (sessionKey && stored.slices.derived.length > 0) {
+            if (sessionKey && stored.slices.derived.length > 0 && !isSessionBoundaryReflectionAction(action)) {
               reflectionDerivedBySession.set(sessionKey, {
                 updatedAt: nowTs,
                 derived: stored.slices.derived,
@@ -4066,6 +4116,15 @@ const memoryLanceDBProPlugin = {
         } finally {
           if (sessionKey) {
             reflectionErrorStateBySession.delete(sessionKey);
+            if (isSessionBoundaryReflectionAction(action)) {
+              const now = Date.now();
+              reflectionDerivedBySession.delete(sessionKey);
+              reflectionDerivedSuppressionBySession.set(sessionKey, {
+                updatedAt: now,
+                until: now + DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS,
+                reason: action,
+              });
+            }
             getGlobalReflectionLock().delete(sessionKey);
             getSerialGuardMap().set(sessionKey, Date.now());
             // NOTE: This guard is tested via inline simulation in
