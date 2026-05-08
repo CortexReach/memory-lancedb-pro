@@ -226,7 +226,7 @@ export function reportLayer1Failure() {
         layer1FailureTimestamps.shift();
     }
 }
-function isLayer1CircuitOpen() {
+export function isLayer1CircuitOpen() {
     const now = Date.now();
     const cutoff = now - LAYER1_FAILURE_WINDOW_MS;
     const recentFailures = layer1FailureTimestamps.filter((t) => t >= cutoff);

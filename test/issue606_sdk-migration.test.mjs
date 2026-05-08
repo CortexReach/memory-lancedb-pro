@@ -282,13 +282,13 @@ describe("loadEmbeddedPiRunner — F1/F2 behavioral integration", () => {
     // We can't easily reset module-level state, so we test the circuit breaker
     // function directly. The actual integration (Layer 1 blocked after N failures)
     // requires a fresh module instance per test which Node test runner doesn't give us.
-    const { isLayer1CircuitOpen } = loadIndexModule();
+    const { isLayer1CircuitOpen } = await import("../dist/index.js");
     // isLayer1CircuitOpen is internal; if it exists and returns boolean, the mechanism is wired
     assert.strictEqual(typeof isLayer1CircuitOpen, "function", "isLayer1CircuitOpen should be exported for testability");
   });
 
   it("F1: reportLayer1Failure is exported and callable", async () => {
-    const { reportLayer1Failure } = loadIndexModule();
+    const { reportLayer1Failure } = await import("../dist/index.js");
     assert.strictEqual(typeof reportLayer1Failure, "function", "reportLayer1Failure must be exported");
     // Calling it should not throw
     assert.doesNotThrow(() => reportLayer1Failure(), "reportLayer1Failure() must not throw");
