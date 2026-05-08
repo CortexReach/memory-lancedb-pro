@@ -105,6 +105,8 @@ export interface RetrievalContext {
   category?: string;
   /** Retrieval source: "manual" for user-triggered, "auto-recall" for system-initiated, "cli" for CLI commands. */
   source?: "manual" | "auto-recall" | "cli";
+  /** AbortSignal for cancellation support */
+  signal?: AbortSignal;
 }
 
 export interface RetrievalResult extends MemorySearchResult {
@@ -608,12 +610,12 @@ export class MemoryRetriever {
       } else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
         mode = "vector";
         results = await this.vectorOnlyRetrieval(
-          query, safeLimit, scopeFilter, category, trace, diagnostics, signal,
+          query, safeLimit, scopeFilter, category, trace, diagnostics,
         );
       } else {
         mode = "hybrid";
         results = await this.hybridRetrieval(
-          query, safeLimit, scopeFilter, category, trace, source, diagnostics, signal,
+          query, safeLimit, scopeFilter, category, trace, source, diagnostics,
         );
       }
 
@@ -656,6 +658,35 @@ export class MemoryRetriever {
     const tagTokens = this.extractTagTokens(query);
     const useLightweightAutoRecall = source === "auto-recall";
     let results: RetrievalResult[];
+    // [FIX] mode and diagnostics must be declared before use
+    let mode: "bm25" | "vector" | "hybrid";
+    const diagnostics: RetrievalDiagnostics = {
+      source,
+      mode: this.config.mode,
+      originalQuery: query,
+      bm25Query: this.config.mode === "vector" ? null : query,
+      queryExpanded: false,
+      limit: safeLimit,
+      scopeFilter: scopeFilter ? [...scopeFilter] : undefined,
+      category,
+      vectorResultCount: 0,
+      bm25ResultCount: 0,
+      fusedResultCount: 0,
+      finalResultCount: 0,
+      stageCounts: {
+        afterMinScore: 0,
+        rerankInput: 0,
+        afterRerank: 0,
+        afterRecency: 0,
+        afterImportance: 0,
+        afterLengthNorm: 0,
+        afterTimeDecay: 0,
+        afterHardMinScore: 0,
+        afterNoiseFilter: 0,
+        afterDiversity: 0,
+      },
+      dropSummary: [],
+    };
 
     if (tagTokens.length > 0 || useLightweightAutoRecall) {
       mode = "bm25";
@@ -665,12 +696,12 @@ export class MemoryRetriever {
     } else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
       mode = "vector";
       results = await this.vectorOnlyRetrieval(
-        query, safeLimit, scopeFilter, category, trace, diagnostics, signal,
+        query, safeLimit, scopeFilter, category, trace, diagnostics,
       );
     } else {
       mode = "hybrid";
       results = await this.hybridRetrieval(
-        query, safeLimit, scopeFilter, category, trace, source, diagnostics, signal,
+        query, safeLimit, scopeFilter, category, trace, source, diagnostics,
       );
     }
 

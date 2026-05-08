@@ -723,6 +723,30 @@ export async function runImportMarkdown(
     return { imported: 0, skipped, foundFiles, skippedShort, skippedDedup: 0, errorCount: parseErrors, elapsedMs: 0 };
   }
 
+  // ── Phase 1c: within-batch dedup ───────────────────────────────────────────
+  // Deduplicate entries that appear multiple times within the same import batch.
+  // Unlike Phase 2a (which checks the DB), Phase 1c catches duplicates in-memory
+  // before they reach the embed queue. Later duplicates are skipped (kept in order).
+  // [FIX] Addresses within-batch duplicate bypass of dedup.
+  const seenTexts = new Set<string>();
+  let withinBatchDedup = 0;
+  const deduplicatedEntries: ParsedEntry[] = [];
+  for (const e of allEntries) {
+    if (seenTexts.has(e.text)) {
+      withinBatchDedup++;
+      skipped++;
+      skippedDedup++;
+      dryRunDedupSkipped.push(e);
+      console.log(`  [skip] within-batch dedup [${e.effectiveScope}]: ${e.text.slice(0, 60)}${e.text.length > 60 ? "..." : ""}`);
+    } else {
+      seenTexts.add(e.text);
+      deduplicatedEntries.push(e);
+    }
+  }
+  if (withinBatchDedup > 0) {
+    console.log(`[import] within-batch dedup: ${withinBatchDedup} duplicate entries removed (${deduplicatedEntries.length} unique remain)`);
+  }
+
   const t0 = Date.now();
 
   // ── Phase 2a: dedup check — parallel retrieve() in chunks ──────────────────
@@ -736,8 +760,8 @@ export async function runImportMarkdown(
 
   if (dedupEnabled) {
     // [Fix #6] Use batchSize instead of CHUNK=50 so dedup and embed share the same parallelism unit
-    for (let c = 0; c < allEntries.length; c += batchSize) {
-      const chunk = allEntries.slice(c, c + batchSize);
+    for (let c = 0; c < deduplicatedEntries.length; c += batchSize) {
+      const chunk = deduplicatedEntries.slice(c, c + batchSize);
       const results = await Promise.all(
         chunk.map((e) =>
           ctx.retriever
@@ -757,6 +781,8 @@ export async function runImportMarkdown(
           if (!ok) {
             // Option A fail-safe: retrieve() error → skip + count error
             // This prevents DB pollution when dedup service is down
+            // [FIX] Also increment skipped so summary totals are accurate
+            skipped++;
             errorCount++;
             console.log(`  [skip] dedup-err [${e.effectiveScope}]: ${e.text.slice(0, 60)}${e.text.length > 60 ? "..." : ""}`);
           } else {
@@ -771,12 +797,12 @@ export async function runImportMarkdown(
           console.log(`  [skip] dedup [${e.effectiveScope}]: ${e.text.slice(0, 60)}${e.text.length > 60 ? "..." : ""}`);
         }
       }
-      if (allEntries.length > 10) {
-        console.log(`[import] dedup check: ${Math.min(c + batchSize, allEntries.length)}/${allEntries.length}`);
+      if (deduplicatedEntries.length > 10) {
+        console.log(`[import] dedup check: ${Math.min(c + batchSize, deduplicatedEntries.length)}/${deduplicatedEntries.length}`);
       }
     }
   } else {
-    pendingEntries.push(...allEntries);
+    pendingEntries.push(...deduplicatedEntries);
   }
 
   // ── Dry-run shortcut ───────────────────────────────────────────────────────
@@ -878,6 +904,28 @@ export async function runImportMarkdown(
       await flushPending();
     } else {
       console.log(`[import] embedded batch ${batchIdx}/${totalBatches} (${batch.length} entries)`);
+    }
+  }
+
+  // [FIX] Final retry: if any restored entries remain after all batches, attempt one more flush
+  if (pendingFlush.length > 0) {
+    console.log(`[import] final flush: ${pendingFlush.length} restored entries remain — attempting last bulkStore`);
+    const finalToStore = [...pendingFlush];
+    pendingFlush = [];
+    try {
+      await ctx.store.bulkStore(finalToStore);
+      flushCount++;
+      imported += finalToStore.length;
+      console.log(`[import] final flush succeeded (${finalToStore.length} entries, total: ${imported})`);
+    } catch (err) {
+      // Give up: entries permanently lost; report clearly so user knows
+      errorCount += finalToStore.length;
+      console.error(`[import] FINAL FLUSH FAILED — ${finalToStore.length} entries permanently not stored: ${err}`);
+      console.error(`[import] MANUAL RECOVERY NEEDED: the following entries were not imported:`);
+      for (const e of finalToStore) {
+        console.error(`  - ${e.text.slice(0, 80)}`);
+      }
+      pendingFlush = []; // clear so return is clean
     }
   }
 
