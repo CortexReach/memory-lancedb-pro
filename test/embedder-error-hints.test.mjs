@@ -103,6 +103,8 @@ async function expectReject(promiseFactory, pattern) {
 async function run() {
   assert.equal(getVectorDimensions("voyage-4-lite"), 1024);
   assert.equal(getVectorDimensions("voyage-3-large"), 1024);
+  assert.equal(getVectorDimensions("bge-m3"), 1024);
+  assert.equal(getVectorDimensions("BAAI/bge-m3"), 1024);
 
   const voyageEmbedder = new Embedder({
     provider: "openai-compatible",
