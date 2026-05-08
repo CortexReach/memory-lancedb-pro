@@ -316,3 +316,102 @@ assert.ok(
 );
 
 console.log("OK: BM25 high-score floor test passed");
+
+// Test: hardMinScore is a final returned-score floor after time decay (#699)
+const decayedEntry = {
+  id: "decayed-hard-min-1",
+  text: "Old operational note that should be below the final hard score floor after decay.",
+  vector: [0.2, 0.8],
+  category: "fact",
+  scope: "global",
+  importance: 1,
+  timestamp: Date.now() - 30 * 24 * 60 * 60 * 1000,
+  metadata: "{}",
+};
+
+const hardMinAfterDecayConfig = {
+  ...DEFAULT_RETRIEVAL_CONFIG,
+  filterNoise: false,
+  rerank: "none",
+  recencyHalfLifeDays: 0,
+  lengthNormAnchor: 0,
+  minScore: 0,
+  hardMinScore: 0.7,
+  timeDecayHalfLifeDays: 1,
+};
+
+const vectorDecayStore = {
+  hasFtsSupport: true,
+  async vectorSearch() {
+    return [{ entry: decayedEntry, score: 0.8 }];
+  },
+  async bm25Search() {
+    return [];
+  },
+  async hasId(id) {
+    return id === decayedEntry.id;
+  },
+};
+
+const vectorDecayRetriever = createRetriever(vectorDecayStore, fakeEmbedder, {
+  ...hardMinAfterDecayConfig,
+  mode: "vector",
+});
+
+const vectorDecayResults = await vectorDecayRetriever.retrieve({
+  query: "old operational note",
+  limit: 5,
+  scopeFilter: ["global"],
+});
+
+assert.equal(
+  vectorDecayResults.length,
+  0,
+  "vector path should drop entries whose final decayed score is below hardMinScore",
+);
+
+const vectorDecayDiagnostics = vectorDecayRetriever.getLastDiagnostics();
+assert.equal(vectorDecayDiagnostics?.stageCounts.afterLengthNorm, 1);
+assert.equal(vectorDecayDiagnostics?.stageCounts.afterTimeDecay, 1);
+assert.equal(vectorDecayDiagnostics?.stageCounts.afterHardMinScore, 0);
+assert.ok(
+  vectorDecayDiagnostics?.dropSummary.some((drop) =>
+    drop.stage === "hardMinScore" &&
+    drop.before === 1 &&
+    drop.after === 0 &&
+    drop.dropped === 1
+  ),
+  "diagnostics should attribute the final post-decay drop to hardMinScore",
+);
+
+const hybridDecayStore = {
+  hasFtsSupport: true,
+  async vectorSearch() {
+    return [{ entry: decayedEntry, score: 0.8 }];
+  },
+  async bm25Search() {
+    return [{ entry: decayedEntry, score: 0.8 }];
+  },
+  async hasId(id) {
+    return id === decayedEntry.id;
+  },
+};
+
+const hybridDecayRetriever = createRetriever(hybridDecayStore, fakeEmbedder, {
+  ...hardMinAfterDecayConfig,
+  mode: "hybrid",
+});
+
+const hybridDecayResults = await hybridDecayRetriever.retrieve({
+  query: "old operational note",
+  limit: 5,
+  scopeFilter: ["global"],
+});
+
+assert.equal(
+  hybridDecayResults.length,
+  0,
+  "hybrid path should drop entries whose final decayed score is below hardMinScore",
+);
+
+console.log("OK: hardMinScore after decay regression test passed");

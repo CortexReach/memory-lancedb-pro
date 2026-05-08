@@ -72,8 +72,8 @@ export interface RetrievalConfig {
    */
   lengthNormAnchor: number;
   /**
-   * Hard cutoff after rerank: discard results below this score.
-   * Applied after all scoring stages (rerank, recency, importance, length norm).
+   * Hard cutoff after final scoring: discard returned results below this score.
+   * Applied after rerank, recency, importance, length norm, and time/lifecycle decay.
    * Higher = fewer but more relevant results. (default: 0.35)
    */
   hardMinScore: number;
@@ -284,20 +284,20 @@ function buildDropSummary(
     },
     {
       order: 6,
-      stage: "hardMinScore" as const,
+      stage: "timeDecay" as const,
       before: diagnostics.stageCounts.afterLengthNorm,
-      after: diagnostics.stageCounts.afterHardMinScore,
+      after: diagnostics.stageCounts.afterTimeDecay,
     },
     {
       order: 7,
-      stage: "timeDecay" as const,
-      before: diagnostics.stageCounts.afterHardMinScore,
-      after: diagnostics.stageCounts.afterTimeDecay,
+      stage: "hardMinScore" as const,
+      before: diagnostics.stageCounts.afterTimeDecay,
+      after: diagnostics.stageCounts.afterHardMinScore,
     },
     {
       order: 8,
       stage: "noiseFilter" as const,
-      before: diagnostics.stageCounts.afterTimeDecay,
+      before: diagnostics.stageCounts.afterHardMinScore,
       after: diagnostics.stageCounts.afterNoiseFilter,
     },
     {
@@ -771,15 +771,15 @@ export class MemoryRetriever {
       if (diagnostics) diagnostics.stageCounts.afterImportance = weighted.length;
       const lengthNormalized = this.applyLengthNormalization(weighted);
       if (diagnostics) diagnostics.stageCounts.afterLengthNorm = lengthNormalized.length;
-      const hardFiltered = lengthNormalized.filter((r) => r.score >= this.config.hardMinScore);
-      if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
       const timeOrDecayRanked = this.decayEngine
-        ? this.applyDecayBoost(hardFiltered)
-        : this.applyTimeDecay(hardFiltered);
+        ? this.applyDecayBoost(lengthNormalized)
+        : this.applyTimeDecay(lengthNormalized);
       if (diagnostics) diagnostics.stageCounts.afterTimeDecay = timeOrDecayRanked.length;
+      const hardFiltered = timeOrDecayRanked.filter((r) => r.score >= this.config.hardMinScore);
+      if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
       const denoised = this.config.filterNoise
-        ? filterNoise(timeOrDecayRanked, (r) => r.entry.text)
-        : timeOrDecayRanked;
+        ? filterNoise(hardFiltered, (r) => r.entry.text)
+        : hardFiltered;
       if (diagnostics) diagnostics.stageCounts.afterNoiseFilter = denoised.length;
       const deduplicated = this.applyMMRDiversity(denoised);
       if (diagnostics) {
@@ -870,23 +870,23 @@ export class MemoryRetriever {
     trace?.endStage(lengthNormalized.map((r) => r.entry.id), lengthNormalized.map((r) => r.score));
     if (diagnostics) diagnostics.stageCounts.afterLengthNorm = lengthNormalized.length;
 
-    trace?.startStage("hard_cutoff", lengthNormalized.map((r) => r.entry.id));
-    const hardFiltered = lengthNormalized.filter((r) => r.score >= this.config.hardMinScore);
-    trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
-    if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
-
     const decayStageName = this.decayEngine ? "decay_boost" : "time_decay";
-    trace?.startStage(decayStageName, hardFiltered.map((r) => r.entry.id));
+    trace?.startStage(decayStageName, lengthNormalized.map((r) => r.entry.id));
     const lifecycleRanked = this.decayEngine
-      ? this.applyDecayBoost(hardFiltered)
-      : this.applyTimeDecay(hardFiltered);
+      ? this.applyDecayBoost(lengthNormalized)
+      : this.applyTimeDecay(lengthNormalized);
     trace?.endStage(lifecycleRanked.map((r) => r.entry.id), lifecycleRanked.map((r) => r.score));
     if (diagnostics) diagnostics.stageCounts.afterTimeDecay = lifecycleRanked.length;
 
-    trace?.startStage("noise_filter", lifecycleRanked.map((r) => r.entry.id));
+    trace?.startStage("hard_cutoff", lifecycleRanked.map((r) => r.entry.id));
+    const hardFiltered = lifecycleRanked.filter((r) => r.score >= this.config.hardMinScore);
+    trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
+    if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
+
+    trace?.startStage("noise_filter", hardFiltered.map((r) => r.entry.id));
     const denoised = this.config.filterNoise
-      ? filterNoise(lifecycleRanked, (r) => r.entry.text)
-      : lifecycleRanked;
+      ? filterNoise(hardFiltered, (r) => r.entry.text)
+      : hardFiltered;
     trace?.endStage(denoised.map((r) => r.entry.id), denoised.map((r) => r.score));
     if (diagnostics) diagnostics.stageCounts.afterNoiseFilter = denoised.length;
 
@@ -1054,23 +1054,23 @@ export class MemoryRetriever {
       trace?.endStage(lengthNormalized.map((r) => r.entry.id), lengthNormalized.map((r) => r.score));
       if (diagnostics) diagnostics.stageCounts.afterLengthNorm = lengthNormalized.length;
 
-      trace?.startStage("hard_cutoff", lengthNormalized.map((r) => r.entry.id));
-      const hardFiltered = lengthNormalized.filter((r) => r.score >= this.config.hardMinScore);
-      trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
-      if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
-
       const decayStageName = this.decayEngine ? "decay_boost" : "time_decay";
-      trace?.startStage(decayStageName, hardFiltered.map((r) => r.entry.id));
+      trace?.startStage(decayStageName, lengthNormalized.map((r) => r.entry.id));
       const lifecycleRanked = this.decayEngine
-        ? this.applyDecayBoost(hardFiltered)
-        : this.applyTimeDecay(hardFiltered);
+        ? this.applyDecayBoost(lengthNormalized)
+        : this.applyTimeDecay(lengthNormalized);
       trace?.endStage(lifecycleRanked.map((r) => r.entry.id), lifecycleRanked.map((r) => r.score));
       if (diagnostics) diagnostics.stageCounts.afterTimeDecay = lifecycleRanked.length;
 
-      trace?.startStage("noise_filter", lifecycleRanked.map((r) => r.entry.id));
+      trace?.startStage("hard_cutoff", lifecycleRanked.map((r) => r.entry.id));
+      const hardFiltered = lifecycleRanked.filter((r) => r.score >= this.config.hardMinScore);
+      trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
+      if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
+
+      trace?.startStage("noise_filter", hardFiltered.map((r) => r.entry.id));
       const denoised = this.config.filterNoise
-        ? filterNoise(lifecycleRanked, (r) => r.entry.text)
-        : lifecycleRanked;
+        ? filterNoise(hardFiltered, (r) => r.entry.text)
+        : hardFiltered;
       trace?.endStage(denoised.map((r) => r.entry.id), denoised.map((r) => r.score));
       if (diagnostics) diagnostics.stageCounts.afterNoiseFilter = denoised.length;
 
