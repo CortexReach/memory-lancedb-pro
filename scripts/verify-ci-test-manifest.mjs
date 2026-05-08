@@ -8,7 +8,7 @@ const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "..");
 
 const EXPECTED_BASELINE = [
-{ group: "llm-clients-and-auth", runner: "node", file: "test/embedder-error-hints.test.mjs" },
+  { group: "llm-clients-and-auth", runner: "node", file: "test/embedder-error-hints.test.mjs" },
   { group: "llm-clients-and-auth", runner: "node", file: "test/cjk-recursion-regression.test.mjs" },
   { group: "storage-and-schema", runner: "node", file: "test/migrate-legacy-schema.test.mjs" },
   { group: "storage-and-schema", runner: "node", file: "test/config-session-strategy-migration.test.mjs", args: ["--test"] },
@@ -67,7 +67,6 @@ const EXPECTED_BASELINE = [
   { group: "core-regression", runner: "node", file: "test/agentid-validation.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/command-reflection-guard.test.mjs", args: ["--test"] },
 ];
-
 function fail(message) {
   throw new Error(message);
 }
