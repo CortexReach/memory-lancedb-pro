@@ -1501,7 +1501,7 @@ export function registerMemoryPromoteTool(api, context) {
                     scopeFilter = [scope];
                 }
                 const resolved = await resolveMemoryId(runtimeContext, memoryId ?? query ?? "", scopeFilter);
-                if (!resolved.ok) {
+                if (resolved.ok === false) {
                     return {
                         content: [{ type: "text", text: resolved.message }],
                         details: resolved.details ?? { error: "resolve_failed" },
@@ -1578,7 +1578,7 @@ export function registerMemoryArchiveTool(api, context) {
                     scopeFilter = [scope];
                 }
                 const resolved = await resolveMemoryId(runtimeContext, memoryId ?? query ?? "", scopeFilter);
-                if (!resolved.ok) {
+                if (resolved.ok === false) {
                     return {
                         content: [{ type: "text", text: resolved.message }],
                         details: resolved.details ?? { error: "resolve_failed" },

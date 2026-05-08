@@ -367,7 +367,7 @@ function rankReflectionLines(candidates, options) {
         .slice(0, options.limit)
         .map((item) => item.line);
 }
-function isReflectionMetadataType(type) {
+export function isReflectionMetadataType(type) {
     return type === "memory-reflection-item" || type === "memory-reflection";
 }
 export function isOwnedByAgent(metadata, agentId) {

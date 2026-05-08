@@ -1,14 +1,14 @@
 // test/issue-690-cross-call-batch.test.mjs
 /**
  * Issue #690: Cross-call batch accumulator test
- * 
+ *
  * 測試目標：100 個 concurrent bulkStore() 呼叫，100% 成功（不 timeout）。
- * 
+ *
  * 背景：cross-call batch accumulator 是 Issue #690 的核心解法：
  * - 多個 concurrent bulkStore() 先累積在 pendingBatch[]
  * - 每 FLUSH_INTERVAL_MS（100ms）flush 一次，合併成一個 lock acquisition
  * - 避免 100 個 concurrent 變成 100 次 lock acquisition 導致 30s timeout
- * 
+ *
  * 驗證：
  * 1. 100 concurrent calls → 100% success（不可繞過）
  * 2. 批次合併：多個 concurrent calls 共享一次 lock acquisition

@@ -28,7 +28,8 @@ import { parseClawteamScopes, applyClawteamScopes } from "./src/clawteam-scope.j
 import { runCompaction, shouldRunCompaction, recordCompactionRun, } from "./src/memory-compactor.js";
 import { runWithReflectionTransientRetryOnce } from "./src/reflection-retry.js";
 import { resolveReflectionSessionSearchDirs, stripResetSuffix } from "./src/session-recovery.js";
-import { storeReflectionToLanceDB, loadAgentReflectionSlicesFromEntries, DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS, } from "./src/reflection-store.js";
+import { storeReflectionToLanceDB, loadAgentReflectionSlicesFromEntries, DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS, isOwnedByAgent, isReflectionMetadataType, } from "./src/reflection-store.js";
+import { parseReflectionMetadata } from "./src/reflection-metadata.js";
 import { extractReflectionLearningGovernanceCandidates, extractInjectableReflectionMappedMemoryItems, isRecallUsed, } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
@@ -293,7 +294,7 @@ export function getExtensionApiImportSpecifiers() {
 export async function loadEmbeddedPiRunner(api) {
     // Layer 1: 嘗試新 SDK API (with circuit breaker)
     if (!isLayer1CircuitOpen()) {
-        const newApi = api.runtime?.agent;
+        const newApi = (api.runtime?.agent);
         if (typeof newApi?.runEmbeddedPiAgent === "function") {
             const runner = newApi.runEmbeddedPiAgent.bind(newApi);
             // Bug 2 fix: 將 Layer 1 結果寫入 cache，避免後續並發呼叫時 Layer 2 覆蓋掉 Layer 1
@@ -2715,8 +2716,9 @@ const memoryLanceDBProPlugin = {
                         // postRotationStartupUntilMs mechanism (PR #49001).
                         // Note: Provider lives in sessionEntry.Provider; MessageThreadId lives in
                         // sessionEntry.threadId (populated from ctx.MessageThreadId at session creation).
-                        const provider = contextForLog.sessionEntry?.Provider ?? "";
-                        const threadId = contextForLog.sessionEntry?.threadId;
+                        const sessionEntryForLog = contextForLog.sessionEntry;
+                        const provider = sessionEntryForLog?.Provider ?? "";
+                        const threadId = sessionEntryForLog?.threadId;
                         if (provider === "discord" && (threadId == null || threadId === "")) {
                             api.logger.info(`self-improvement: command:${action} skipped on Discord channel (non-thread) reset to avoid startup race; use /new in thread or restart gateway if startup is incomplete`);
                             return;

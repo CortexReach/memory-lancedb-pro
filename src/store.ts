@@ -23,7 +23,7 @@ import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmar
 // Types
 // ============================================================================
 
-export interface MemoryEntry {
+export interface MemoryEntry extends Record<string, unknown> {
   id: string;
   text: string;
   vector: number[];
@@ -588,9 +588,16 @@ export class MemoryStore {
     await this.ensureInitialized();
 
     // Filter out invalid entries（undefined, null, missing text/vector）
-    const validEntries = entries.filter(
-      (entry) => entry && entry.text && entry.text.length > 0 && entry.vector && entry.vector.length > 0
-    );
+    const validEntries = entries.filter((entry) => {
+      const candidate = entry as { text?: unknown; vector?: unknown };
+      return (
+        !!candidate &&
+        typeof candidate.text === "string" &&
+        candidate.text.length > 0 &&
+        Array.isArray(candidate.vector) &&
+        candidate.vector.length > 0
+      );
+    });
 
     // Early return for empty array（skip accumulation）
     if (validEntries.length === 0) {
@@ -603,7 +610,7 @@ export class MemoryStore {
       id: randomUUID(),
       timestamp: Date.now(),
       metadata: entry.metadata || "{}",
-    }));
+    }) as MemoryEntry);
 
     // 【MR2 fix】當 pendingBatch 達到上限時，等待前一個 flush 完成後再加入
     // 這確保 pendingBatch 有上限，不會无限增长

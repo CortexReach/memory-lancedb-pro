@@ -34,7 +34,7 @@ type ReflectionErrorSignalLike = {
 
 interface ReflectionStorePayload {
   text: string;
-  metadata: Record<string, unknown>;
+  metadata: object;
   kind: ReflectionStoreKind;
 }
 
@@ -517,7 +517,7 @@ function rankReflectionLines(
     .map((item) => item.line);
 }
 
-function isReflectionMetadataType(type: unknown): boolean {
+export function isReflectionMetadataType(type: unknown): boolean {
   return type === "memory-reflection-item" || type === "memory-reflection";
 }
 
