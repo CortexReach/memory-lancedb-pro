@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,12 +22,17 @@ const retrieverModuleForMock = jiti("../src/retriever.js");
 const embedderModuleForMock = jiti("../src/embedder.js");
 const origCreateRetriever = retrieverModuleForMock.createRetriever;
 const origCreateEmbedder = embedderModuleForMock.createEmbedder;
+let activeCreateRetriever = origCreateRetriever;
+let activeCreateEmbedder = origCreateEmbedder;
+retrieverModuleForMock.createRetriever = (...args) => activeCreateRetriever(...args);
+embedderModuleForMock.createEmbedder = (...args) => activeCreateEmbedder(...args);
 
 const pluginModule = jiti("../index.ts");
 const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
 const resetRegistration = pluginModule.resetRegistration ?? (() => {});
 const { registerMemoryRecallTool, registerMemoryStoreTool } = jiti("../src/tools.ts");
 const { MemoryRetriever } = jiti("../src/retriever.js");
+const { MemoryStore } = jiti("../src/store.js");
 const { buildSmartMetadata, stringifySmartMetadata } = jiti("../src/smart-metadata.ts");
 
 function makeApiCapture() {
@@ -41,24 +46,36 @@ function makeApiCapture() {
   return { api, getCreator: () => capturedCreator };
 }
 
-function createPluginApiHarness({ pluginConfig, resolveRoot }) {
+function createPluginApiHarness({ pluginConfig, resolveRoot, logs, resolvePathCalls }) {
+  resetRegistration();
   const eventHandlers = new Map();
+  let registeredService = null;
+  const logSink = logs ?? { info: [], warn: [], debug: [] };
 
   const api = {
     pluginConfig,
     resolvePath(target) {
       if (typeof target !== "string") return target;
+      resolvePathCalls?.push(target);
       if (path.isAbsolute(target)) return target;
       return path.join(resolveRoot, target);
     },
     logger: {
-      info() {},
-      warn() {},
-      debug() {},
+      info(message) {
+        logSink.info.push(String(message));
+      },
+      warn(message) {
+        logSink.warn.push(String(message));
+      },
+      debug(message) {
+        logSink.debug.push(String(message));
+      },
     },
     registerTool() {},
     registerCli() {},
-    registerService() {},
+    registerService(service) {
+      registeredService = service;
+    },
     on(eventName, handler, meta) {
       const list = eventHandlers.get(eventName) || [];
       list.push({ handler, meta });
@@ -71,7 +88,7 @@ function createPluginApiHarness({ pluginConfig, resolveRoot }) {
     },
   };
 
-  return { api, eventHandlers };
+  return { api, eventHandlers, getService: () => registeredService };
 }
 
 function getAutoRecallHook(eventHandlers) {
@@ -115,6 +132,41 @@ function makeResults() {
       },
     },
   ];
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withCapturedTimers(fn) {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  const timeouts = [];
+  const intervals = [];
+
+  globalThis.setTimeout = (callback, ms, ...args) => {
+    const timer = { callback, ms, args };
+    timeouts.push(timer);
+    return timer;
+  };
+  globalThis.clearTimeout = () => {};
+  globalThis.setInterval = (callback, ms, ...args) => {
+    const timer = { callback, ms, args };
+    intervals.push(timer);
+    return timer;
+  };
+  globalThis.clearInterval = () => {};
+
+  try {
+    return await fn({ timeouts, intervals });
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+    globalThis.setInterval = realSetInterval;
+    globalThis.clearInterval = realClearInterval;
+  }
 }
 
 function makeExpandedResults() {
@@ -333,18 +385,26 @@ function extractRenderedMemoryRecallLines(text) {
 describe("recall text cleanup", () => {
   let workspaceDir;
   let originalRetrieve;
+  let originalPatchMetadata;
+  let originalList;
 
   beforeEach(() => {
     workspaceDir = mkdtempSync(path.join(tmpdir(), "recall-text-cleanup-test-"));
     originalRetrieve = MemoryRetriever.prototype.retrieve;
+    originalPatchMetadata = MemoryStore.prototype.patchMetadata;
+    originalList = MemoryStore.prototype.list;
+    activeCreateRetriever = origCreateRetriever;
+    activeCreateEmbedder = origCreateEmbedder;
     resetRegistration();
   });
 
   afterEach(() => {
     MemoryRetriever.prototype.retrieve = originalRetrieve;
-    // Restore factory functions on the .js module (same cache as index.ts uses)
-    retrieverModuleForMock.createRetriever = origCreateRetriever;
-    embedderModuleForMock.createEmbedder = origCreateEmbedder;
+    MemoryStore.prototype.patchMetadata = originalPatchMetadata;
+    MemoryStore.prototype.list = originalList;
+    // Restore factory delegates captured by index.ts.
+    activeCreateRetriever = origCreateRetriever;
+    activeCreateEmbedder = origCreateEmbedder;
     resetRegistration();
     rmSync(workspaceDir, { recursive: true, force: true });
   });
@@ -387,8 +447,7 @@ describe("recall text cleanup", () => {
     // MemoryRetriever.prototype does NOT reach the instance the plugin creates
     // via createRetriever.  Instead we intercept the factory.
     const mockResults = makeResults();
-    const retrieverMod = jiti("../src/retriever.js");
-    retrieverMod.createRetriever = function mockCreateRetriever(store, embedder, config, options) {
+    activeCreateRetriever = function mockCreateRetriever(store, embedder, config, options) {
       return {
         async retrieve(context = {}) {
           return mockResults;
@@ -400,8 +459,7 @@ describe("recall text cleanup", () => {
         setStatsCollector() {},
       };
     };
-    const embedderMod = jiti("../src/embedder.js");
-    embedderMod.createEmbedder = function mockCreateEmbedder() {
+    activeCreateEmbedder = function mockCreateEmbedder() {
       return {
         async embedQuery() {
           return new Float32Array(384).fill(0);
@@ -599,8 +657,7 @@ describe("recall text cleanup", () => {
     // Intercept the factory functions instead of patching prototype (same jiti
     // cache mismatch reason as the test above).
     const mockResults = makeManyResults(5);
-    const retrieverMod = jiti("../src/retriever.js");
-    retrieverMod.createRetriever = function mockCreateRetriever(store, embedder, config, options) {
+    activeCreateRetriever = function mockCreateRetriever(store, embedder, config, options) {
       return {
         async retrieve(context = {}) {
           return mockResults;
@@ -612,8 +669,7 @@ describe("recall text cleanup", () => {
         setStatsCollector() {},
       };
     };
-    const embedderMod = jiti("../src/embedder.js");
-    embedderMod.createEmbedder = function mockCreateEmbedder() {
+    activeCreateEmbedder = function mockCreateEmbedder() {
       return {
         async embedQuery() {
           return new Float32Array(384).fill(0);
@@ -659,8 +715,7 @@ describe("recall text cleanup", () => {
     // Intercept the factory functions instead of patching prototype (same jiti
     // cache mismatch reason as the test above).
     const mockResults = makeGovernanceFilteredResults();
-    const retrieverMod = jiti("../src/retriever.js");
-    retrieverMod.createRetriever = function mockCreateRetriever(store, embedder, config, options) {
+    activeCreateRetriever = function mockCreateRetriever(store, embedder, config, options) {
       return {
         async retrieve(context = {}) {
           return mockResults;
@@ -672,8 +727,7 @@ describe("recall text cleanup", () => {
         setStatsCollector() {},
       };
     };
-    const embedderMod = jiti("../src/embedder.js");
-    embedderMod.createEmbedder = function mockCreateEmbedder() {
+    activeCreateEmbedder = function mockCreateEmbedder() {
       return {
         async embedQuery() {
           return new Float32Array(384).fill(0);
@@ -708,6 +762,139 @@ describe("recall text cleanup", () => {
     assert.match(output.prependContext, /confirmed durable memory/);
     assert.doesNotMatch(output.prependContext, /pending memory should not auto-recall/);
     assert.doesNotMatch(output.prependContext, /archived memory should not auto-recall/);
+  });
+
+  it("drops late auto-recall results after the timeout", async () => {
+    const logs = { info: [], warn: [], debug: [] };
+    let patchMetadataCalls = 0;
+
+    activeCreateRetriever = function mockCreateRetriever() {
+      return {
+        async retrieve() {
+          await delay(25);
+          return makeResults();
+        },
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+    activeCreateEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() {
+          return new Float32Array(384).fill(0);
+        },
+        async embedPassage() {
+          return new Float32Array(384).fill(0);
+        },
+      };
+    };
+
+    MemoryStore.prototype.patchMetadata = async () => {
+      patchMetadataCalls++;
+    };
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      logs,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: true,
+        autoRecallMinLength: 1,
+        autoRecallTimeoutMs: 1,
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+
+    const autoRecallHook = getAutoRecallHook(harness.eventHandlers);
+    const output = await autoRecallHook(
+      { prompt: "Please recall what I mentioned before about this task." },
+      { sessionId: "auto-timeout", sessionKey: "agent:main:session:auto-timeout", agentId: "main" },
+    );
+
+    assert.equal(output, undefined);
+    await delay(50);
+
+    assert.equal(patchMetadataCalls, 0, "late recall should not update injection metadata");
+    assert.ok(
+      logs.warn.some((line) => line.includes("auto-recall timed out after 1ms")),
+      "expected timeout warning",
+    );
+    assert.ok(
+      logs.warn.some((line) => line.includes("dropping late auto-recall result after timeout")),
+      "expected late-result drop warning",
+    );
+    assert.equal(
+      logs.info.some((line) => /injecting \d+ memories into context/.test(line)),
+      false,
+      "late recall should not log a context injection",
+    );
+  });
+
+  it("writes auto-backups beside the resolved DB path without re-resolving the backup path", async () => {
+    const logs = { info: [], warn: [], debug: [] };
+    const resolvePathCalls = [];
+    const backupMemory = {
+      id: "backup-1",
+      text: "memory to back up",
+      category: "fact",
+      scope: "global",
+      importance: 0.8,
+      timestamp: 1717027200000,
+      metadata: JSON.stringify({ source: "test" }),
+    };
+
+    MemoryStore.prototype.list = async () => [backupMemory];
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      logs,
+      resolvePathCalls,
+      pluginConfig: {
+        dbPath: path.join("memory", "lancedb-pro"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: false,
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+    const service = harness.getService();
+    assert.ok(service, "expected memory service registration");
+
+    await withCapturedTimers(async ({ timeouts }) => {
+      await service.start();
+      const backupTimer = timeouts.find((timer) => timer.ms === 60_000);
+      assert.ok(backupTimer, "expected delayed startup backup timer");
+
+      resolvePathCalls.length = 0;
+      backupTimer.callback(...backupTimer.args);
+    });
+
+    const dateStr = new Date().toISOString().split("T")[0];
+    const backupFile = path.join(workspaceDir, "memory", "backups", `memory-backup-${dateStr}.jsonl`);
+    for (let attempt = 0; attempt < 20 && !existsSync(backupFile); attempt++) {
+      await delay(5);
+    }
+
+    assert.deepEqual(resolvePathCalls, [], "backup should not call api.resolvePath with an already-resolved DB path");
+    assert.ok(existsSync(backupFile), "expected backup JSONL file");
+
+    const [line] = readFileSync(backupFile, "utf8").trim().split(/\r?\n/);
+    assert.deepEqual(JSON.parse(line), backupMemory);
+    assert.ok(
+      logs.info.some((message) => message.includes(`backup completed (1 entries`) && message.includes(backupFile)),
+      "expected backup completion log",
+    );
   });
 
   it("filters USER.md-exclusive facts from memory_recall output", async () => {
@@ -773,8 +960,7 @@ describe("recall text cleanup", () => {
     // Intercept the factory functions instead of patching prototype (same jiti
     // cache mismatch reason as the test above).
     const mockResults = makeUserMdExclusiveResults();
-    const retrieverMod = jiti("../src/retriever.js");
-    retrieverMod.createRetriever = function mockCreateRetriever(store, embedder, config, options) {
+    activeCreateRetriever = function mockCreateRetriever(store, embedder, config, options) {
       return {
         async retrieve(context = {}) {
           return mockResults;
@@ -786,8 +972,7 @@ describe("recall text cleanup", () => {
         setStatsCollector() {},
       };
     };
-    const embedderMod = jiti("../src/embedder.js");
-    embedderMod.createEmbedder = function mockCreateEmbedder() {
+    activeCreateEmbedder = function mockCreateEmbedder() {
       return {
         async embedQuery() {
           return new Float32Array(384).fill(0);
@@ -853,8 +1038,7 @@ describe("recall text cleanup", () => {
     // Intercept the factory functions instead of patching prototype (same jiti
     // cache mismatch reason as the test above).
     const mockResults = makeLegacyAddressingResults();
-    const retrieverMod = jiti("../src/retriever.js");
-    retrieverMod.createRetriever = function mockCreateRetriever(store, embedder, config, options) {
+    activeCreateRetriever = function mockCreateRetriever(store, embedder, config, options) {
       return {
         async retrieve(context = {}) {
           return mockResults;
@@ -866,8 +1050,7 @@ describe("recall text cleanup", () => {
         setStatsCollector() {},
       };
     };
-    const embedderMod = jiti("../src/embedder.js");
-    embedderMod.createEmbedder = function mockCreateEmbedder() {
+    activeCreateEmbedder = function mockCreateEmbedder() {
       return {
         async embedQuery() {
           return new Float32Array(384).fill(0);
@@ -929,8 +1112,7 @@ describe("recall text cleanup", () => {
   // --- PR #602: recall prefix format tests ---
 
   function makeAutoRecallHarness(workspaceDir, mockResults, extraConfig = {}) {
-    const retrieverMod = jiti("../src/retriever.js");
-    retrieverMod.createRetriever = function mockCreateRetriever() {
+    activeCreateRetriever = function mockCreateRetriever() {
       return {
         async retrieve() { return mockResults; },
         getConfig() { return { mode: "hybrid" }; },
@@ -938,8 +1120,7 @@ describe("recall text cleanup", () => {
         setStatsCollector() {},
       };
     };
-    const embedderMod = jiti("../src/embedder.js");
-    embedderMod.createEmbedder = function mockCreateEmbedder() {
+    activeCreateEmbedder = function mockCreateEmbedder() {
       return {
         async embedQuery() { return new Float32Array(384).fill(0); },
         async embedPassage() { return new Float32Array(384).fill(0); },

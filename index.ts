@@ -296,6 +296,15 @@ function resolveEnvVars(value: string): string {
   });
 }
 
+function formatErrorForLog(err: unknown): string {
+  if (err instanceof Error) {
+    const code = (err as { code?: unknown }).code;
+    const codeSuffix = typeof code === "string" && code ? ` [${code}]` : "";
+    return `${err.name}: ${err.message}${codeSuffix}`;
+  }
+  return String(err);
+}
+
 function resolveFirstApiKey(apiKey: string | string[]): string {
   const key = Array.isArray(apiKey) ? apiKey[0] : apiKey;
   if (!key) {
@@ -2589,6 +2598,8 @@ const memoryLanceDBProPlugin = {
         // (embedding → rerank → lifecycle), which can silently drop messages on
         // channels like Telegram when subsequent requests hit lock timeouts.
         // See: https://github.com/CortexReach/memory-lancedb-pro/issues/253
+        let autoRecallTimedOut = false;
+        let lateAutoRecallLogged = false;
         const recallWork = async (): Promise<{ prependContext: string } | undefined> => {
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
@@ -2597,6 +2608,16 @@ const memoryLanceDBProPlugin = {
             return undefined;
           }
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
+          const shouldDropLateAutoRecall = (stage: string): boolean => {
+            if (!autoRecallTimedOut) return false;
+            if (!lateAutoRecallLogged) {
+              lateAutoRecallLogged = true;
+              api.logger.warn?.(
+                `memory-lancedb-pro: dropping late auto-recall result after timeout at ${stage} for agent ${agentId}`,
+              );
+            }
+            return true;
+          };
 
           // Use cached raw user message for the recall query to avoid channel
           // metadata noise (e.g. Slack's Conversation info JSON with message_id,
@@ -2637,6 +2658,8 @@ const memoryLanceDBProPlugin = {
             scopeFilter: accessibleScopes,
             source: "auto-recall",
           }), config.workspaceBoundary);
+
+          if (shouldDropLateAutoRecall("post-retrieve")) return;
 
           if (results.length === 0) {
             return;
@@ -2809,6 +2832,8 @@ const memoryLanceDBProPlugin = {
             return;
           }
 
+          if (shouldDropLateAutoRecall("pre-metadata")) return;
+
           if (minRepeated > 0) {
             const sessionHistory = recallHistory.get(sessionId) || new Map<string, number>();
             for (const item of selected) {
@@ -2846,6 +2871,8 @@ const memoryLanceDBProPlugin = {
               );
             }),
           );
+
+          if (shouldDropLateAutoRecall("pre-context")) return;
 
           const memoryContext = selected.map((item) => item.line).join("\n");
 
@@ -2890,6 +2917,7 @@ const memoryLanceDBProPlugin = {
             recallWork().then((r) => { clearTimeout(timeoutId); return r; }),
             new Promise<undefined>((resolve) => {
               timeoutId = setTimeout(() => {
+                autoRecallTimedOut = true;
                 api.logger.warn(
                   `memory-lancedb-pro: auto-recall timed out after ${AUTO_RECALL_TIMEOUT_MS}ms; skipping memory injection to avoid stalling agent startup`,
                 );
@@ -4211,12 +4239,13 @@ const memoryLanceDBProPlugin = {
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
     async function runBackup() {
+      let stage = "initializing";
+      const backupDir = join(dirname(resolvedDbPath), "backups");
       try {
-        const backupDir = api.resolvePath(
-          join(resolvedDbPath, "..", "backups"),
-        );
+        stage = "creating backup directory";
         await mkdir(backupDir, { recursive: true });
 
+        stage = "listing memories";
         const allMemories = await store.list(undefined, undefined, 10000, 0);
         if (allMemories.length === 0) return;
 
@@ -4235,13 +4264,16 @@ const memoryLanceDBProPlugin = {
           }),
         );
 
+        stage = `writing backup file ${backupFile}`;
         await writeFile(backupFile, lines.join("\n") + "\n");
 
         // Keep only last 7 backups
+        stage = "listing old backups";
         const files = (await readdir(backupDir))
           .filter((f) => f.startsWith("memory-backup-") && f.endsWith(".jsonl"))
           .sort();
         if (files.length > 7) {
+          stage = "pruning old backups";
           const { unlink } = await import("node:fs/promises");
           for (const old of files.slice(0, files.length - 7)) {
             await unlink(join(backupDir, old)).catch(() => { });
@@ -4252,7 +4284,9 @@ const memoryLanceDBProPlugin = {
           `memory-lancedb-pro: backup completed (${allMemories.length} entries → ${backupFile})`,
         );
       } catch (err) {
-        api.logger.warn(`memory-lancedb-pro: backup failed: ${String(err)}`);
+        api.logger.warn(
+          `memory-lancedb-pro: backup failed at ${stage} (dbPath=${resolvedDbPath}, backupDir=${backupDir}): ${formatErrorForLog(err)}`,
+        );
       }
     }
 
