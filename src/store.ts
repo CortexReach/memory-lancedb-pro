@@ -4,6 +4,7 @@
 
 import type * as LanceDB from "@lancedb/lancedb";
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import {
   existsSync,
   accessSync,
@@ -75,8 +76,12 @@ export const loadLanceDB = async (): Promise<
   typeof import("@lancedb/lancedb")
 > => {
   if (!lancedbImportPromise) {
-    // Use require() for CommonJS modules on Windows to avoid ESM URL scheme issues
-    lancedbImportPromise = Promise.resolve(require("@lancedb/lancedb"));
+    // createRequire builds a real CJS require() from an ESM context.
+    // This preserves native .node binding semantics on Windows (per #267)
+    // while working in pure-ESM Node where global require is undefined.
+    // Named `requireCJS` to prevent esbuild from rewriting it to __require.
+    const requireCJS = createRequire(import.meta.url);
+    lancedbImportPromise = Promise.resolve(requireCJS("@lancedb/lancedb"));
   }
   try {
     return await lancedbImportPromise;
