@@ -1748,9 +1748,14 @@ function createAdmissionRejectionAuditWriter(
     return null;
   }
 
-  const filePath = api.resolvePath(
-    resolveRejectedAuditFilePath(resolvedDbPath, config.admissionControl),
-  );
+  const rawPath = resolveRejectedAuditFilePath(resolvedDbPath, config.admissionControl);
+  // Cross-platform absolute-path check: detects POSIX (/path), Windows drive
+  // letter (C:\, C:/), and UNC paths (\\server\share). Only calls api.resolvePath()
+  // for relative paths; absolute paths pass through unchanged.
+  const isAbsolute = rawPath.startsWith("/") ||
+    (process.platform === "win32" && /^[a-zA-Z]:[/\\]/.test(rawPath)) ||
+    (process.platform === "win32" && /^\\{2}[^\\]+\\[^\\]+/.test(rawPath));
+  const filePath = isAbsolute ? rawPath : api.resolvePath(rawPath);
 
   return async (entry: AdmissionRejectionAuditEntry) => {
     try {
@@ -4247,9 +4252,26 @@ const memoryLanceDBProPlugin = {
 
     async function runBackup() {
       try {
-        const backupDir = api.resolvePath(
-          join(resolvedDbPath, "..", "backups"),
-        );
+        // resolvedDbPath is already absolute (produced by api.resolvePath at
+        // plugin init); wrapping it again triggers api.resolvePath(absolute-path)
+        // → undefined in OpenClaw 2026.4.x strict mode, crashing with:
+        //   TypeError [ERR_INVALID_ARG_TYPE]: The "path" argument must be of type
+        //   string or an instance of Buffer or URL. Received undefined
+        // Guard against undefined first (api.resolvePath returns undefined for
+        // empty-string dbPath config rather than throwing).
+        if (!resolvedDbPath || typeof resolvedDbPath !== "string") {
+          api.logger.warn(
+            `memory-lancedb-pro: backup skipped — resolvedDbPath is "${String(resolvedDbPath)}"`,
+          );
+          return;
+        }
+        const backupDir = join(resolvedDbPath, "..", "backups");
+        if (!backupDir || typeof backupDir !== "string") {
+          api.logger.warn(
+            `memory-lancedb-pro: backup skipped — backupDir resolved to "${String(backupDir)}"`,
+          );
+          return;
+        }
         await mkdir(backupDir, { recursive: true });
 
         const allMemories = await store.list(undefined, undefined, 10000, 0);
