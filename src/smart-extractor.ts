@@ -273,6 +273,23 @@ export interface ExtractPersistOptions {
    * - pass a non-empty array to restrict reads to those scopes
    */
   scopeFilter?: string[];
+  /**
+   * Callback invoked when the number of entries actually written to the store
+   * differs from the number of LLM-generated candidates.
+   *
+   * This detects write-path anomalies including:
+   * - SIGKILL / OOM during bulkStore (partial write)
+   * - Concurrent compactor deletions (count window between bulkStore and count())
+   *
+   * The callback is NOT invoked when createEntries is empty (no-op write).
+   * The mismatch field: positive = under-write, negative = over-write (rare).
+   */
+  onExtractionValidationFailed?: (validation: {
+    expected: number;
+    actual: number;
+    mismatch: number;
+    sessionKey: string;
+  }) => void;
 }
 
 export class SmartExtractor {
@@ -441,7 +458,30 @@ export class SmartExtractor {
     }
 
     if (createEntries.length > 0) {
+      // Phase 1: Verify write success via count-before/after.
+      // bulkStore is atomic per entry (randomUUID + table.add), so any
+      // discrepancy here indicates partial failure (SIGKILL/OOM).
+      // LIMITATION: This count-diff approach is only reliable under single-
+      // process assumption (no concurrent compactor/session writes during
+      // extractAndPersist). Concurrent writes inflate actualCreated and can
+      // cause false negatives (mismatch not detected). This is acceptable for
+      // Phase 1 since plugin architecture guarantees single-process extraction.
+      // Phase 2 will address concurrent-safe validation (UUID list compare).
+      const countBefore = await this.store.count();
       await this.store.bulkStore(createEntries);
+      const countAfter = await this.store.count();
+      const actualCreated = countAfter - countBefore;
+      const expectedCreated = createEntries.length;
+
+      if (actualCreated !== expectedCreated) {
+        const mismatch = expectedCreated - actualCreated;
+        options.onExtractionValidationFailed?.({
+          expected: expectedCreated,
+          actual: actualCreated,
+          mismatch,
+          sessionKey,
+        });
+      }
     }
 
     return stats;
