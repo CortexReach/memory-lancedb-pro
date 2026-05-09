@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import { RedisUnavailableError, createRedisLockManager } from "./redis-lock.js";
 
 // ============================================================================
 // Types
@@ -70,6 +71,29 @@ async function loadLockfile(): Promise<any> {
 /** For unit testing: override the lockfile module with a mock. */
 export function __setLockfileModuleForTests(module: any): void {
   lockfileModule = module;
+}
+
+// =========================================================================
+// Redis Lock Manager (per-process singleton, cached after first init)
+// =========================================================================
+
+let redisLockManager: any = null;
+let redisLockInitAttempted = false;
+
+/**
+ * Get or create the per-process Redis lock manager.
+ * Returns null if Redis is unavailable → store.ts falls back to file lock.
+ * Cached after first successful init (per-process singleton).
+ */
+async function getRedisLockManager(dbPath: string) {
+  if (redisLockInitAttempted) {
+    return redisLockManager;
+  }
+  redisLockInitAttempted = true;
+
+  const manager = await createRedisLockManager({ dbPath });
+  redisLockManager = manager; // null = Redis unavailable, use file lock
+  return redisLockManager;
 }
 
 export const loadLanceDB = async (): Promise<
@@ -242,6 +266,31 @@ export class MemoryStore {
   constructor(private readonly config: StoreConfig) { }
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Redis lock 優先（Option E: Redis 失敗 → file lock fallback）
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const manager = await getRedisLockManager(this.config.dbPath);
+    if (manager) {
+      try {
+        const release = await manager.acquire(".memory-write.lock");
+        try {
+          return await fn();
+        } finally {
+          await release();
+        }
+      } catch (err) {
+        // M4 fix: RedisUnavailableError → 無縫 fallback 到 file lock
+        if (err instanceof Error && Symbol.for("RedisUnavailableError") in err) {
+          // Redis 連線失敗，進 file lock fallback
+        } else {
+          throw err; // 其他錯誤（timeout、lock conflict）直接拋出
+        }
+      }
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // File lock fallback（原有的 runWithFileLock 邏輯完整保留）
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
     if (!existsSync(lockPath)) {

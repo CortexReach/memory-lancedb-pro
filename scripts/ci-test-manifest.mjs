@@ -23,6 +23,10 @@ export const CI_TEST_MANIFEST = [
   { group: "cli-smoke", runner: "node", file: "test/functional-e2e.mjs" },
   { group: "storage-and-schema", runner: "node", file: "test/per-agent-auto-recall.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/retriever-rerank-regression.mjs" },
+  // Issue #739 Redis distributed lock tests
+  { group: "core-regression", runner: "node", file: "test/redis-lock-url-parse.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/redis-lock-error-types.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/redis-lock-concurrent-init.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-memory-lifecycle.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-branches.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-embed.test.mjs" },
