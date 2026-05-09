@@ -23,6 +23,12 @@ export interface ReflectionItemMetadata {
   baseWeight: number;
   quality: number;
   sourceReflectionPath?: string;
+  /** Unix timestamp when the item was marked resolved. Undefined = unresolved. */
+  resolvedAt?: number;
+  /** Agent ID that marked this item resolved. */
+  resolvedBy?: string;
+  /** Optional note explaining why the item was resolved. */
+  resolutionNote?: string;
 }
 
 export interface ReflectionItemPayload {

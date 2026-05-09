@@ -1023,6 +1023,194 @@ describe("memory reflection", () => {
       assert.ok(slices.derived.includes("Ignore prior flaky results before comparing the new retriever output."));
       assert.ok(slices.derived.includes("This run override previous cached screenshots with fresh captures."));
     });
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // P1+P2 resolved filtering regression tests
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    // Bug scenario (rwmjhb review, 2026-05-03):
+    // buildInvariantCandidates legacy fallback does NOT filter resolved lines.
+    // When ALL invariant items are resolved AND the legacy row contains a MIX of
+    // resolved + unresolved lines, the row-level filter (lines.some) keeps the row.
+    // Then the fallback flatMaps ALL lines — including the resolved ones.
+    //
+    // Fix: buildInvariantCandidates fallback must filter out resolved lines
+    // using the same normalizeReflectionLineForAggregation check as the row filter.
+    it("legacy fallback must NOT output resolved invariant lines", () => {
+      const now = Date.UTC(2026, 2, 7);
+      const day = 24 * 60 * 60 * 1000;
+      const resolvedAt = now - 1 * day;
+
+      const entries = [
+        // Resolved invariant item — creates resolvedInvariantTexts entry
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            resolvedAt,
+          },
+        }),
+        // Legacy row with BOTH the resolved text AND new unresolved text
+        // Row-level filter (lines.some) keeps this row because "New..." is unresolved.
+        // Legacy fallback flatMaps ALL lines including resolved ones — THIS IS THE BUG.
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection",
+            agentId: "main",
+            reflectionVersion: 3,
+            invariants: [
+              "Already resolved invariant",
+              "New unresolved invariant from legacy",
+            ],
+            derived: [],
+            storedAt: now - 1 * day,
+            decayModel: "logistic",
+            decayMidpointDays: 45,
+            decayK: 0.22,
+          },
+        }),
+      ];
+
+      entries[0].text = "Already resolved invariant"; // matches legacy[0]
+      entries[1].text = "legacy-entry";
+
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      // Unresolved legacy line MUST appear (line.some kept the row)
+      assert.ok(
+        slices.invariants.includes("New unresolved invariant from legacy"),
+        "Unresolved legacy invariant must appear"
+      );
+      // Resolved line must NOT appear — this is the BUG; fallback doesn't filter
+      assert.ok(
+        !slices.invariants.includes("Already resolved invariant"),
+        "Resolved invariant must NOT be revived by legacy fallback"
+      );
+    });
+
+    it("suppresses all output when all items resolved and legacy has only duplicates", () => {
+      // shouldSuppress path: all items resolved + legacy rows exist but all duplicate resolved content
+      const now = Date.UTC(2026, 2, 7);
+      const day = 24 * 60 * 60 * 1000;
+      const resolvedAt = now - 1 * day;
+
+      const entries = [
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            resolvedAt,
+          },
+        }),
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection",
+            agentId: "main",
+            reflectionVersion: 3,
+            invariants: ["Already resolved invariant"], // same content
+            derived: ["Already resolved derived"],
+            storedAt: now - 1 * day,
+            decayModel: "logistic",
+          },
+        }),
+      ];
+
+      entries[0].text = "Already resolved invariant";
+
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      assert.deepEqual(slices.invariants, [], "Should suppress when all resolved and legacy is duplicate");
+      assert.deepEqual(slices.derived, [], "Should suppress derived when all resolved and legacy is duplicate");
+    });
+
+    it("row-level filter excludes legacy rows where ALL lines are resolved", () => {
+      // Row-level filter: lines.some() should exclude rows where every line is resolved
+      const now = Date.UTC(2026, 2, 7);
+      const day = 24 * 60 * 60 * 1000;
+      const resolvedAt = now - 1 * day;
+
+      const entries = [
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            resolvedAt,
+          },
+        }),
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 0.95,
+            resolvedAt,
+          },
+        }),
+        // Legacy row with ONLY resolved content — should be excluded by row filter
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection",
+            agentId: "main",
+            reflectionVersion: 3,
+            invariants: ["Already resolved invariant"], // same → resolved
+            derived: ["Already resolved derived"],       // same → resolved
+            storedAt: now - 1 * day,
+          },
+        }),
+      ];
+
+      entries[0].text = "Already resolved invariant";
+      entries[1].text = "Already resolved derived";
+
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      assert.deepEqual(slices.invariants, [], "Row with only resolved lines should be excluded");
+      assert.deepEqual(slices.derived, [], "Derived row with only resolved lines should be excluded");
+    });
   });
 
   describe("mapped reflection metadata and ranking", () => {
