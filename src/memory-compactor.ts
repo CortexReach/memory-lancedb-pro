@@ -325,35 +325,45 @@ export async function runCompaction(
   let memoriesDeleted = 0;
   let memoriesCreated = 0;
 
-  for (const plan of plans) {
-    const members = plan.memberIndices.map((i) => valid[i]);
+  // 【優化】使用 Promise.all 並行處理所有 plans
+  // 每個 plan 的 embed + store + delete 互相獨立，可以完全平行
+  const planResults = await Promise.all(
+    plans.map(async (plan) => {
+      const members = plan.memberIndices.map((i) => valid[i]);
+      try {
+        // Embed the merged text
+        const vector = await embedder.embedPassage(plan.merged.text);
 
-    try {
-      // Embed the merged text
-      const vector = await embedder.embedPassage(plan.merged.text);
+        // Store merged entry
+        await store.store({
+          text: plan.merged.text,
+          vector,
+          importance: plan.merged.importance,
+          category: plan.merged.category,
+          scope: plan.merged.scope,
+          metadata: plan.merged.metadata,
+        });
+        memoriesCreated++;
 
-      // Store merged entry
-      await store.store({
-        text: plan.merged.text,
-        vector,
-        importance: plan.merged.importance,
-        category: plan.merged.category,
-        scope: plan.merged.scope,
-        metadata: plan.merged.metadata,
-      });
-      memoriesCreated++;
+        // 【優化】members 刪除也平行處理
+        const deleteResults = await Promise.all(
+          members.map(async (m) => {
+            const deleted = await store.delete(m.id);
+            return deleted;
+          })
+        );
+        const deletedCount = deleteResults.filter((d) => d === true).length;
+        memoriesDeleted += deletedCount;
 
-      // Delete source entries
-      for (const m of members) {
-        const deleted = await store.delete(m.id);
-        if (deleted) memoriesDeleted++;
+        return { success: true, deleted: deletedCount };
+      } catch (err) {
+        logger?.warn(
+          `memory-compactor: failed to merge cluster of ${members.length}: ${String(err)}`,
+        );
+        return { success: false, error: err };
       }
-    } catch (err) {
-      logger?.warn(
-        `memory-compactor: failed to merge cluster of ${members.length}: ${String(err)}`,
-      );
-    }
-  }
+    })
+  );
 
   logger?.info(
     `memory-compactor: scanned=${valid.length} clusters=${plans.length} ` +
