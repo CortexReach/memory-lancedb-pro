@@ -7,6 +7,12 @@
   "skills": [
     "./skills"
   ],
+  "hooks": {
+    "allowConversationAccess": true,
+    "timeouts": {
+      "before_prompt_build": 60000
+    }
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
