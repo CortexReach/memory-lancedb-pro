@@ -559,7 +559,7 @@ export class MemoryRetriever {
   }
 
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
-    const { query, limit, scopeFilter, category, source } = context;
+    const { query, limit, scopeFilter, category, source, signal } = context;
     const safeLimit = clampInt(limit, 1, 20);
     this.lastDiagnostics = null;
     const diagnostics: RetrievalDiagnostics = {
@@ -596,35 +596,24 @@ export class MemoryRetriever {
 
       // Check if query contains tag prefixes -> use BM25-only + mustContain
       const tagTokens = this.extractTagTokens(query);
+      const useLightweightAutoRecall = source === "auto-recall";
       let results: RetrievalResult[];
-      if (tagTokens.length > 0) {
+      let mode: "bm25" | "vector" | "hybrid";
+
+      if (tagTokens.length > 0 || useLightweightAutoRecall) {
+        mode = "bm25";
         results = await this.bm25OnlyRetrieval(
-          query,
-          tagTokens,
-          safeLimit,
-          scopeFilter,
-          category,
-          trace,
-          diagnostics,
+          query, tagTokens, safeLimit, scopeFilter, category, trace, diagnostics,
         );
       } else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
+        mode = "vector";
         results = await this.vectorOnlyRetrieval(
-          query,
-          safeLimit,
-          scopeFilter,
-          category,
-          trace,
-          diagnostics,
+          query, safeLimit, scopeFilter, category, trace, diagnostics, signal,
         );
       } else {
+        mode = "hybrid";
         results = await this.hybridRetrieval(
-          query,
-          safeLimit,
-          scopeFilter,
-          category,
-          trace,
-          source,
-          diagnostics,
+          query, safeLimit, scopeFilter, category, trace, source, diagnostics, signal,
         );
       }
 
@@ -633,11 +622,6 @@ export class MemoryRetriever {
       this.lastDiagnostics = diagnostics;
 
       if (trace && this._statsCollector) {
-        const mode = tagTokens.length > 0
-          ? "bm25"
-          : (this.config.mode === "vector" || !this.store.hasFtsSupport)
-            ? "vector"
-            : "hybrid";
         const finalTrace = trace.finalize(query, mode);
         this._statsCollector.recordQuery(finalTrace, source || "unknown");
       }
@@ -665,29 +649,31 @@ export class MemoryRetriever {
   async retrieveWithTrace(
     context: RetrievalContext,
   ): Promise<{ results: RetrievalResult[]; trace: RetrievalTrace }> {
-    const { query, limit, scopeFilter, category, source } = context;
+    const { query, limit, scopeFilter, category, source, signal } = context;
     const safeLimit = clampInt(limit, 1, 20);
     const trace = new TraceCollector();
 
     const tagTokens = this.extractTagTokens(query);
+    const useLightweightAutoRecall = source === "auto-recall";
     let results: RetrievalResult[];
 
-    if (tagTokens.length > 0) {
+    if (tagTokens.length > 0 || useLightweightAutoRecall) {
+      mode = "bm25";
       results = await this.bm25OnlyRetrieval(
-        query, tagTokens, safeLimit, scopeFilter, category, trace,
+        query, tagTokens, safeLimit, scopeFilter, category, trace, diagnostics,
       );
     } else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
+      mode = "vector";
       results = await this.vectorOnlyRetrieval(
-        query, safeLimit, scopeFilter, category, trace,
+        query, safeLimit, scopeFilter, category, trace, diagnostics, signal,
       );
     } else {
+      mode = "hybrid";
       results = await this.hybridRetrieval(
-        query, safeLimit, scopeFilter, category, trace,
+        query, safeLimit, scopeFilter, category, trace, source, diagnostics, signal,
       );
     }
 
-    const mode = tagTokens.length > 0 ? "bm25"
-      : (this.config.mode === "vector" || !this.store.hasFtsSupport) ? "vector" : "hybrid";
     const finalTrace = trace.finalize(query, mode);
 
     if (this._statsCollector) {
