@@ -194,13 +194,16 @@
       },
       "autoRecallExcludeAgents": {
         "type": "array",
-        "items": { "type": "string" },
-        "default": [],
-        "description": "Blacklist mode for auto-recall injection. Agents in this list are skipped. Agent resolution falls back to 'main' when no explicit agentId is available. If autoRecallIncludeAgents is also set, include wins."
+        "items": {
+          "type": "string"
+        },
+        "description": "Agent/session patterns excluded from auto-recall and reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
       },
       "autoRecallIncludeAgents": {
         "type": "array",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "default": [],
         "description": "Whitelist mode for auto-recall injection. Only agents in this list receive auto-recall. Agent resolution falls back to 'main' when no explicit agentId is available. If both include and exclude are set, autoRecallIncludeAgents takes precedence (whitelist wins)."
       },
@@ -959,13 +962,6 @@
             "description": "Maximum number of auto-capture extractions allowed per hour"
           }
         }
-      },
-      "autoRecallExcludeAgents": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        },
-        "description": "Agent/session patterns excluded from auto-recall and reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
       }
     },
     "required": [
@@ -1509,5 +1505,23 @@
       "help": "Whitelist mode. Only these agents receive auto-recall. If agentId is unavailable it falls back to 'main'. Includes take precedence over excludes.",
       "advanced": true
     }
+  },
+  "contracts": {
+    "tools": [
+      "memory_recall",
+      "memory_store",
+      "memory_forget",
+      "memory_update",
+      "memory_stats",
+      "memory_debug",
+      "memory_list",
+      "memory_promote",
+      "memory_archive",
+      "memory_compact",
+      "memory_explain_rank",
+      "self_improvement_log",
+      "self_improvement_extract_skill",
+      "self_improvement_review"
+    ]
   }
 }

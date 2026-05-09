@@ -2751,6 +2751,25 @@ const memoryLanceDBProPlugin = {
             return;
           }
 
+          // Write autoRecall event to JSONL for autodream's RecallTracker
+          const recallLogDir = (config as Record<string, unknown>).recallLogDir as string | undefined
+            ?? join(homedir(), ".openclaw", "memory", "autodream-reports");
+          const autoRecallLogPath = join(recallLogDir, "auto-recall-log.jsonl");
+          const recallEntry = JSON.stringify({
+            ts: Date.now(),
+            query: event.prompt.slice(0, 500),
+            agentId,
+            source: "auto-recall",
+            hits: results.map((r) => ({
+              id: r.entry.id,
+              score: r.score,
+              scope: r.entry.scope,
+            })),
+          });
+          mkdir(recallLogDir, { recursive: true })
+            .then(() => appendFile(autoRecallLogPath, recallEntry + "\n", "utf-8"))
+            .catch((err) => api.logger.warn?.(`memory-lancedb-pro: failed to write auto-recall log: ${err}`));
+
           // Apply intent-based category boost for adaptive mode
           const rankedResults = intent ? applyCategoryBoost(results, intent) : results;
 
