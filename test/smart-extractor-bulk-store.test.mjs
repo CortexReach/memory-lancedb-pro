@@ -66,6 +66,7 @@ class MockStore {
   
   async vectorSearch() { return []; }
   async getById() { return null; }
+  async count() { return 0; }
 }
 
 // ============================================================
