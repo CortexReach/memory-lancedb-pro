@@ -21,11 +21,19 @@ const { batchDedup } = jiti("../src/batch-dedup.ts");
 
 /** 256-dim constant vector with a controlled cosine similarity to a base vector */
 function makeNearDuplicateVector(baseVec, similarity = 0.95) {
-  const dim = baseVec.length;
-  // Scale factor: cosine = scale * |base| / |target| = scale (since |base|=|target|=1)
-  // Actually: cos(base, target) = scale when target = scale * base + orth
+  // cosine(baseVec, scale*baseVec) = 1.0 regardless of scale - scaling doesn't change direction.
+  // To get cosine = similarity < 1.0, we need an orthogonal component:
   const scale = similarity;
-  return baseVec.map(v => v * scale);
+  const dim = baseVec.length;
+  let orth = baseVec.map(() => Math.random() - 0.5);
+  const baseNormSq = orth.reduce((s, v, i) => s + v * v, 0);
+  if (baseNormSq === 0) { orth = baseVec.map(() => Math.random()); }
+  const proj = orth.reduce((s, v, i) => s + v * baseVec[i], 0) / (baseNormSq || 1);
+  for (let i = 0; i < dim; i++) orth[i] -= proj * baseVec[i];
+  const orthNorm = Math.sqrt(Math.max(0, orth.reduce((s, v) => s + v * v, 0)));
+  if (orthNorm > 0) orth = orth.map(v => v / orthNorm);
+  const orthScale = Math.sqrt(Math.max(0, 1 - scale * scale));
+  return baseVec.map((v, i) => v * scale + orth[i] * orthScale);
 }
 
 /** Two identical vectors — maximum similarity */

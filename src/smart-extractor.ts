@@ -290,6 +290,13 @@ export interface ExtractPersistOptions {
     mismatch: number;
     sessionKey: string;
   }) => void;
+  /**
+   * When `true`, a positive mismatch (actual < expected, under-write) throws an Error
+   * that aborts the extraction, signaling the caller to handle the failure.
+   * When `false` (default), the callback is invoked but extraction proceeds.
+   * Does not affect negative mismatch (over-write, rare) - always logs and calls callback.
+   */
+  abortOnExtractionMismatch?: boolean;
 }
 
 export class SmartExtractor {
@@ -466,7 +473,12 @@ export class SmartExtractor {
       // extractAndPersist). Concurrent writes inflate actualCreated and can
       // cause false negatives (mismatch not detected). This is acceptable for
       // Phase 1 since plugin architecture guarantees single-process extraction.
-      // Phase 2 will address concurrent-safe validation (UUID list compare).
+      // Phase 2 will address concurrent-safe validation (UUID list compare):
+      // - Collect UUIDs of entries passed to bulkStore
+      // - After bulkStore, query store for those UUIDs to verify each exists
+      // - This catches both SIGKILL/OOM partial writes AND concurrent compactor deletions
+      // NOTE: supersede entries are included in createEntries and therefore counted
+      // in expectedCreated - the count check validates them normally (F4).
       const countBefore = await this.store.count();
       await this.store.bulkStore(createEntries);
       const countAfter = await this.store.count();
@@ -475,12 +487,34 @@ export class SmartExtractor {
 
       if (actualCreated !== expectedCreated) {
         const mismatch = expectedCreated - actualCreated;
-        options.onExtractionValidationFailed?.({
-          expected: expectedCreated,
-          actual: actualCreated,
-          mismatch,
-          sessionKey,
-        });
+
+        // F3: isolate callback exception so it doesn't propagate and abort extraction
+        try {
+          options.onExtractionValidationFailed?.({
+            expected: expectedCreated,
+            actual: actualCreated,
+            mismatch,
+            sessionKey,
+          });
+        } catch (cbErr) {
+          this.log(
+            "memory-pro: smart-extractor: onExtractionValidationFailed callback threw: " + String(cbErr),
+          );
+        }
+
+        // F6: when mismatch > 0 and abortOnExtractionMismatch is true, throw to abort
+        if (mismatch > 0 && options.abortOnExtractionMismatch === true) {
+          throw new Error(
+            "memory-pro: smart-extractor: extraction aborted: " + mismatch + " entries failed to persist (expected=" + expectedCreated + ", actual=" + actualCreated + ")",
+          );
+        }
+
+        // F6: when mismatch < 0 (over-write), always log as WARNING, never throw
+        if (mismatch < 0) {
+          this.log(
+            "memory-pro: smart-extractor: WARNING - over-write detected: " + Math.abs(mismatch) + " more entries persisted than expected (expected=" + expectedCreated + ", actual=" + actualCreated + "). This is rare and may indicate a concurrent compactor or duplicate session run.",
+          );
+        }
       }
     }
 

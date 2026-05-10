@@ -442,4 +442,37 @@ describe("Issue #693: Extraction write validation", () => {
     assert.strictEqual(validations[0].mismatch, 1);
   });
 
+
+  // --------------------------------------------------------------------------
+  // T7: abortOnExtractionMismatch behavior + negative mismatch
+  // --------------------------------------------------------------------------
+  it("T7: abortOnExtractionMismatch=true throws on under-write, mismatch<0 logs only", async () => {
+    const embedder = makeDeterministicEmbedder();
+    const llmA = makeLlm([{ category: "events", abstract: "User attended strategic planning", overview: "Planning", content: "Strategic planning session attended by user for Q3 roadmap." }]);
+    const storeA = makeStore({ initialCount: 0, dropLastN: 1 });
+    const extractorA = makeExtractor(embedder, llmA, storeA);
+    let caught = null;
+    try {
+      await extractorA.extractAndPersist("User said: I attended strategic planning", "session-abort", { abortOnExtractionMismatch: true });
+    } catch (err) { caught = err; }
+    assert.ok(caught !== null, "T7a: should throw when abortOnExtractionMismatch=true");
+    assert.ok(caught.message.includes("extraction aborted"), "T7a: error mentions extraction aborted");
+
+    const embedderB = makeDeterministicEmbedder();
+    const llmB = makeLlm([{ category: "events", abstract: "User attended standup", overview: "Standup", content: "Team standup attended by user." }]);
+    const storeB = makeStore({ initialCount: 0, dropLastN: 1 });
+    const extractorB = makeExtractor(embedderB, llmB, storeB);
+    let callbackCalled = false;
+    const statsB = await extractorB.extractAndPersist("User said: standup", "session-callback", { abortOnExtractionMismatch: false, onExtractionValidationFailed() { callbackCalled = true; } });
+    assert.strictEqual(callbackCalled, true, "T7b: callback invoked despite no throw");
+    assert.strictEqual(statsB.created, 1, "T7b: one entry written despite mismatch");
+
+    const embedderC = makeDeterministicEmbedder();
+    const llmC = makeLlm([{ category: "events", abstract: "User attended architecture review", overview: "Architecture", content: "Architecture review attended." }]);
+    const storeC = makeStore({ initialCount: 0 });
+    const extractorC = makeExtractor(embedderC, llmC, storeC);
+    const statsC = await extractorC.extractAndPersist("User said: architecture review", "session-normal", {});
+    assert.strictEqual(statsC.created, 1, "T7c: normal extraction completed");
+  });
+
 });
