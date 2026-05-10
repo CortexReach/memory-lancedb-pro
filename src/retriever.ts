@@ -741,6 +741,12 @@ export class MemoryRetriever {
       try {
         queryVector = await this.embedder.embedQuery(query, signal);
       } catch (embedError) {
+        // Only do BM25 fallback for non-abort errors (network/API failures).
+        // If the caller aborted the signal, re-throw immediately — we shouldn't
+        // waste resources doing fallback retrieval after a deliberate cancel.
+        if (signal?.aborted) {
+          throw embedError;
+        }
         // Fallback to BM25 if embedding fails (e.g., network timeout, API error)
         diagnostics.bm25Query = query;
         queryVector = [];
@@ -949,6 +955,12 @@ export class MemoryRetriever {
       try {
         queryVector = await this.embedder.embedQuery(query, signal);
       } catch (embedError) {
+        // Only do BM25 fallback for non-abort errors (network/API failures).
+        // If the caller aborted the signal, re-throw immediately — we shouldn't
+        // waste resources doing fallback retrieval after a deliberate cancel.
+        if (signal?.aborted) {
+          throw embedError;
+        }
         // Fallback to BM25 if embedding fails (e.g., network timeout, API error)
         const bm25Query = this.buildBM25Query(query, source);
         diagnostics.bm25Query = bm25Query;
