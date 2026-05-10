@@ -29,6 +29,10 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/redis-lock-concurrent-init.test.mjs", args: ["--test"] },
   // R1/R2/R3 fix tests: per-dbPath cache, race-safe init, release() error handling
   { group: "core-regression", runner: "node", file: "test/redis-lock-cache-r1-r2-r3.test.mjs", args: ["--test"] },
+  // P3 verification: null manager cache entry race
+  { group: "core-regression", runner: "node", file: "test/p3-null-manager-race.test.mjs", args: ["--test"] },
+  // P4 verification: cache has no TTL/refresh mechanism
+  { group: "core-regression", runner: "node", file: "test/p4-cache-no-refresh.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-memory-lifecycle.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-branches.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-embed.test.mjs" },
