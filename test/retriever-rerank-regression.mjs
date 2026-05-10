@@ -59,7 +59,11 @@ async function runScenario(name, responsePayload) {
   });
 
   try {
-    const retriever = createRetriever(fakeStore, fakeEmbedder, retrieverConfig);
+    const retriever = createRetriever(fakeStore, fakeEmbedder, {
+      ...retrieverConfig,
+      minScore: 0,
+      hardMinScore: 0,
+    });
     const results = await retriever.retrieve({
       query: "TESTMEM-20260306-092541",
       limit: 5,
@@ -127,6 +131,43 @@ async function runTeiScenario() {
 await runTeiScenario();
 
 console.log("OK: rerank regression test passed");
+
+async function runRerankFallbackDiagnosticsScenario() {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  globalThis.fetch = async () => {
+    throw new Error("reranker offline");
+  };
+  console.warn = () => {};
+
+  try {
+    const retriever = createRetriever(fakeStore, fakeEmbedder, retrieverConfig);
+    const results = await retriever.retrieve({
+      query: "TESTMEM-20260306-092541",
+      limit: 5,
+      scopeFilter: ["global"],
+    });
+
+    assert.ok(Array.isArray(results), "rerank fallback should resolve with a result array");
+
+    const diagnostics = retriever.getLastDiagnostics();
+    assert.equal(diagnostics?.failureStage, undefined, "rerank fallback should not mark the whole retrieval failed");
+    assert.equal(diagnostics?.rerankFallback?.provider, "jina");
+    assert.equal(diagnostics?.rerankFallback?.reason, "request_error");
+    assert.match(
+      diagnostics?.rerankFallback?.message || "",
+      /reranker offline/,
+      "diagnostics should include the rerank failure reason",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+  }
+}
+
+await runRerankFallbackDiagnosticsScenario();
+
+console.log("OK: rerank fallback diagnostics test passed");
 
 const lexicalEntry = {
   id: "lexical-regression-1",

@@ -169,6 +169,16 @@ export interface RetrievalDiagnostics {
     | "hybrid.fuseResults"
     | "hybrid.rerank"
     | "hybrid.postProcess";
+  rerankFallback?: {
+    provider: NonNullable<RetrievalConfig["rerankProvider"]>;
+    reason:
+      | "invalid_response"
+      | "http_error"
+      | "timeout"
+      | "request_error"
+      | "cosine_error";
+    message: string;
+  };
   errorMessage?: string;
 }
 
@@ -237,6 +247,10 @@ function extractFailureStage(
   return error instanceof Error
     ? (error as TaggedRetrievalError).retrievalFailureStage
     : undefined;
+}
+
+function formatErrorMessage(error: unknown): string {
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
 
 function buildDropSummary(
@@ -1019,7 +1033,7 @@ export class MemoryRetriever {
       failureStage = "hybrid.rerank";
       if (this.config.rerank !== "none") {
         trace?.startStage("rerank", filtered.map((r) => r.entry.id));
-        reranked = await this.rerankResults(query, queryVector, rerankInput);
+        reranked = await this.rerankResults(query, queryVector, rerankInput, diagnostics);
         trace?.endStage(reranked.map((r) => r.entry.id), reranked.map((r) => r.score));
       } else {
         reranked = filtered;
@@ -1229,6 +1243,7 @@ export class MemoryRetriever {
     query: string,
     queryVector: number[],
     results: RetrievalResult[],
+    diagnostics?: RetrievalDiagnostics,
   ): Promise<RetrievalResult[]> {
     if (results.length === 0) {
       return results;
@@ -1237,6 +1252,14 @@ export class MemoryRetriever {
     // Try cross-encoder rerank via configured provider API
     const provider = this.config.rerankProvider || "jina";
     const hasApiKey = !!this.config.rerankApiKey;
+    const recordFallback = (
+      reason: NonNullable<RetrievalDiagnostics["rerankFallback"]>["reason"],
+      message: string,
+    ) => {
+      if (diagnostics) {
+        diagnostics.rerankFallback = { provider, reason, message };
+      }
+    };
 
     if (this.config.rerank === "cross-encoder" && hasApiKey) {
       try {
@@ -1278,6 +1301,7 @@ export class MemoryRetriever {
           const parsed = parseRerankResponse(provider, data);
 
           if (!parsed) {
+            recordFallback("invalid_response", "Rerank API returned an invalid response shape");
             console.warn(
               "Rerank API: invalid response shape, falling back to cosine",
             );
@@ -1322,14 +1346,21 @@ export class MemoryRetriever {
           }
         } else {
           const errText = await response.text().catch(() => "");
+          recordFallback(
+            "http_error",
+            `Rerank API returned ${response.status}: ${errText.slice(0, 200)}`,
+          );
           console.warn(
             `Rerank API returned ${response.status}: ${errText.slice(0, 200)}, falling back to cosine`,
           );
         }
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
-          console.warn(`Rerank API timed out (${this.config.rerankTimeoutMs ?? 5000}ms), falling back to cosine`);
+          const message = `Rerank API timed out (${this.config.rerankTimeoutMs ?? 5000}ms)`;
+          recordFallback("timeout", message);
+          console.warn(`${message}, falling back to cosine`);
         } else {
+          recordFallback("request_error", formatErrorMessage(error));
           console.warn("Rerank API failed, falling back to cosine:", error);
         }
       }
@@ -1353,6 +1384,7 @@ export class MemoryRetriever {
 
       return reranked.sort((a, b) => b.score - a.score);
     } catch (error) {
+      recordFallback("cosine_error", formatErrorMessage(error));
       console.warn("Reranking failed, returning original results:", error);
       return results;
     }
@@ -1661,6 +1693,9 @@ export class MemoryRetriever {
       dropSummary: this.lastDiagnostics.dropSummary.map((drop) => ({
         ...drop,
       })),
+      rerankFallback: this.lastDiagnostics.rerankFallback
+        ? { ...this.lastDiagnostics.rerankFallback }
+        : undefined,
     };
   }
 
