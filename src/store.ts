@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
-import { RedisUnavailableError, createRedisLockManager } from "./redis-lock.js";
+import { RedisUnavailableError, isRedisConnectionError, createRedisLockManager } from "./redis-lock.js";
 
 // ============================================================================
 // Types
@@ -74,26 +74,42 @@ export function __setLockfileModuleForTests(module: any): void {
 }
 
 // =========================================================================
-// Redis Lock Manager (per-process singleton, cached after first init)
+// Redis Lock Manager (per-dbPath cache, race-safe with Promise-based init)
 // =========================================================================
 
-let redisLockManager: any = null;
-let redisLockInitAttempted = false;
+// Map: dbPath → { manager, initPromise }
+// initPromise = null means "fully initialized" (succeed or failed)
+const redisLockCache = new Map<string, { manager: any; initPromise: Promise<any> | null }>();
 
 /**
- * Get or create the per-process Redis lock manager.
+ * Get or create the per-dbPath Redis lock manager.
+ * Race-safe: concurrent calls for the same dbPath share one init Promise.
  * Returns null if Redis is unavailable → store.ts falls back to file lock.
- * Cached after first successful init (per-process singleton).
+ * Cached after first successful init (per-dbPath cache).
  */
-async function getRedisLockManager(dbPath: string) {
-  if (redisLockInitAttempted) {
-    return redisLockManager;
-  }
-  redisLockInitAttempted = true;
+export async function getRedisLockManager(dbPath: string) {
+  const cached = redisLockCache.get(dbPath);
 
-  const manager = await createRedisLockManager({ dbPath });
-  redisLockManager = manager; // null = Redis unavailable, use file lock
-  return redisLockManager;
+  // Already fully initialized for this dbPath
+  if (cached?.initPromise === null) {
+    return cached.manager;
+  }
+
+  // In-flight init for this dbPath — await it (avoids TOCTOU race)
+  if (cached?.initPromise) {
+    return cached.initPromise;
+  }
+
+  // New dbPath — create init promise
+  const initPromise = (async () => {
+    const manager = await createRedisLockManager({ dbPath });
+    // Mark as fully initialized (initPromise = null)
+    redisLockCache.set(dbPath, { manager, initPromise: null });
+    return manager;
+  })();
+
+  redisLockCache.set(dbPath, { manager: null, initPromise });
+  return initPromise;
 }
 
 export const loadLanceDB = async (): Promise<
@@ -276,7 +292,16 @@ export class MemoryStore {
         try {
           return await fn();
         } finally {
-          await release();
+          // R1 fix: catch release() Redis connection errors → warn + continue (not throw)
+          try {
+            await release();
+          } catch (releaseErr) {
+            if (isRedisConnectionError(releaseErr)) {
+              console.warn(`[memory-lancedb-pro] Redis lock release failed (connection error, non-fatal): ${releaseErr}`);
+            } else {
+              throw releaseErr;
+            }
+          }
         }
       } catch (err) {
         // M4 fix: RedisUnavailableError → 無縫 fallback 到 file lock

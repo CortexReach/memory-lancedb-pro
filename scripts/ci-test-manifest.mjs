@@ -27,6 +27,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/redis-lock-url-parse.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/redis-lock-error-types.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/redis-lock-concurrent-init.test.mjs", args: ["--test"] },
+  // R1/R2/R3 fix tests: per-dbPath cache, race-safe init, release() error handling
+  { group: "core-regression", runner: "node", file: "test/redis-lock-cache-r1-r2-r3.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-memory-lifecycle.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-branches.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-embed.test.mjs" },
