@@ -15,6 +15,7 @@ import {
   statSync,
   unlinkSync,
 } from "node:fs";
+import { access, mkdir, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 
@@ -241,12 +242,19 @@ export class MemoryStore {
 
   constructor(private readonly config: StoreConfig) { }
 
+  // 【P3 修復】async 等價於 existsSync
+  private static async pathExists(p: string): Promise<boolean> {
+    try { await access(p, constants.F_OK); return true; }
+    catch { return false; }
+  }
+
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
-    if (!existsSync(lockPath)) {
-      try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
-      try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
+    // 【P3 修復】async 化 init 區塊：不再 sync blocking
+    if (!(await MemoryStore.pathExists(lockPath))) {
+      try { await mkdir(dirname(lockPath), { recursive: true }); } catch {}
+      try { await writeFile(lockPath, "", { flag: "wx" }); } catch {}
     }
     // 【修復 #415】調整 retries：max wait 從 ~3100ms → ~151秒
     // 指數退避：1s, 2s, 4s, 8s, 16s, 30s×5，總計約 151 秒
@@ -258,13 +266,14 @@ export class MemoryStore {
 
     // Proactive cleanup of stale lock artifacts（from PR #626）
     // 根本避免 >5 分鐘的 lock artifact 導致 ECOMPROMISED
-    if (existsSync(lockPath)) {
+    // 【P3 修復】async 化 stale check：不再 sync blocking
+    if (await MemoryStore.pathExists(lockPath)) {
       try {
-        const stat = statSync(lockPath);
-        const ageMs = Date.now() - stat.mtimeMs;
+        const s = await stat(lockPath);
+        const ageMs = Date.now() - s.mtimeMs;
         const staleThresholdMs = 5 * 60 * 1000;
         if (ageMs > staleThresholdMs) {
-          try { unlinkSync(lockPath); } catch {}
+          try { await unlink(lockPath); } catch {}
           console.warn(`[memory-lancedb-pro] cleared stale lock: ${lockPath} ageMs=${ageMs}`);
         }
       } catch {}
