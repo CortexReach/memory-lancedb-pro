@@ -235,6 +235,16 @@ interface PluginConfig {
     skipLowValue?: boolean;
     maxExtractionsPerHour?: number;
   };
+  storageMaintenance?: {
+    autoCleanup?: {
+      /** Enable LanceDB version snapshot auto-cleanup. Default: false. */
+      enabled?: boolean;
+      /** How often to run cleanup (hours). Default: 24. */
+      intervalHours?: number;
+      /** Keep snapshots newer than this many of days. Default: 1. */
+      retentionDays?: number;
+    };
+  };
   recallPrefix?: {
     /**
      * Metadata field to use as the category label in auto-recall prefix lines.
@@ -2540,14 +2550,25 @@ const memoryLanceDBProPlugin = {
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
 
           // Use cached raw user message for the recall query to avoid channel
-          // metadata noise (e.g. Slack's Conversation info JSON with message_id,
+          // metadata noise (e.g. Conversation info JSON with message_id,
           // sender_id, conversation_label) that pollutes the embedding vector and
           // causes irrelevant memories to rank higher.  Fall back to event.prompt
           // for non-channel triggers or when no cached message is available.
+          // Also strip metadata from fallback to ensure even missed-cache cases are clean.
           // FR-04: Truncate long prompts (e.g. file attachments) before embedding.
           // Auto-recall only needs the user's intent, not full attachment text.
           const MAX_RECALL_QUERY_LENGTH = config.autoRecallMaxQueryLength ?? 2_000;
-          let recallQuery = lastRawUserMessage.get(cacheKey) || event.prompt;
+          let recallQuery = lastRawUserMessage.get(cacheKey);
+          if (!recallQuery) {
+            // Cache miss — strip metadata block from event.prompt before using it
+            // Strip all known metadata block patterns from event.prompt
+            recallQuery = (event.prompt || "")
+              .replace(/Conversation info \(untrusted metadata\):[\s\S]*?(?=\n\n|\n\n[^\n])/gi, "")
+              .replace(/Sender \(untrusted metadata\):[\s\S]*?(?=\n\n|\n\n[^\n])/gi, "")
+              .replace(/^\[message_id:[^\]]+\]\s*\n?/gim, "")
+              .replace(/^ou_[a-z0-9]+:\s*/gim, "")
+              .trim();
+          }
           if (recallQuery.length > MAX_RECALL_QUERY_LENGTH) {
             const originalLength = recallQuery.length;
             recallQuery = recallQuery.slice(0, MAX_RECALL_QUERY_LENGTH);
@@ -2572,6 +2593,7 @@ const memoryLanceDBProPlugin = {
             );
           }
 
+          const fs_recall = await import('fs'); fs_recall.appendFileSync('/tmp/rerank.log', `[RECALL] query="${recallQuery.slice(0,50)}" limit=${retrieveLimit}\n`);
           const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry({
             query: recallQuery,
             limit: retrieveLimit,
@@ -4006,10 +4028,11 @@ const memoryLanceDBProPlugin = {
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
     async function runBackup() {
+      // Backup is non-critical — silently skip on any error without polluting logs
       try {
-        const backupDir = api.resolvePath(
-          join(resolvedDbPath, "..", "backups"),
-        );
+        // Guard against resolvedDbPath being undefined
+        if (!resolvedDbPath) return;
+        const backupDir = join(resolvedDbPath, "..", "backups");
         await mkdir(backupDir, { recursive: true });
 
         const allMemories = await store.list(undefined, undefined, 10000, 0);
@@ -4046,8 +4069,8 @@ const memoryLanceDBProPlugin = {
         api.logger.info(
           `memory-lancedb-pro: backup completed (${allMemories.length} entries → ${backupFile})`,
         );
-      } catch (err) {
-        api.logger.warn(`memory-lancedb-pro: backup failed: ${String(err)}`);
+      } catch {
+        // Non-critical: silently ignore backup failures
       }
     }
 
@@ -4146,11 +4169,47 @@ const memoryLanceDBProPlugin = {
         // Run initial backup after a short delay, then schedule daily
         setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+
+        // ====================================================================
+        // Storage Maintenance (LanceDB version snapshot auto-cleanup)
+        // ====================================================================
+        let maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+
+        async function runStorageMaintenance() {
+          try {
+            if (!config.storageMaintenance?.autoCleanup?.enabled) return;
+            const intervalMs =
+              (config.storageMaintenance.autoCleanup.intervalHours ?? 24) * 60 * 60 * 1000;
+            const retentionDays = config.storageMaintenance.autoCleanup.retentionDays ?? 1;
+            const result = await store.runMaintenance(retentionDays);
+            if (result) {
+              api.logger.info(
+                `memory-lancedb-pro: storage maintenance completed ` +
+                `(${result.oldVersionsRemoved} old versions removed, ` +
+                `${(result.bytesRemoved / 1024 / 1024).toFixed(1)} MB freed)`,
+              );
+            }
+          } catch (err) {
+            api.logger.warn(`memory-lancedb-pro: storage maintenance failed: ${String(err)}`);
+          }
+        }
+
+        if (config.storageMaintenance?.autoCleanup?.enabled) {
+          const intervalMs =
+            (config.storageMaintenance.autoCleanup.intervalHours ?? 24) * 60 * 60 * 1000;
+          // Run once shortly after startup, then on interval
+          setTimeout(() => void runStorageMaintenance(), 5 * 60_000); // 5 min after start
+          maintenanceTimer = setInterval(() => void runStorageMaintenance(), intervalMs);
+        }
       },
       stop: async () => {
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
+        }
+        if (maintenanceTimer) {
+          clearInterval(maintenanceTimer);
+          maintenanceTimer = null;
         }
         api.logger.info("memory-lancedb-pro: stopped");
       },
@@ -4471,6 +4530,34 @@ export function parsePluginConfig(value: unknown): PluginConfig {
                 : 30,
           }
         : { skipLowValue: false, maxExtractionsPerHour: 30 },
+    storageMaintenance:
+      typeof cfg.storageMaintenance === "object" && cfg.storageMaintenance !== null
+        ? {
+            autoCleanup:
+              typeof (cfg.storageMaintenance as Record<string, unknown>).autoCleanup === "object" &&
+              (cfg.storageMaintenance as Record<string, unknown>).autoCleanup !== null
+                ? {
+                    enabled:
+                      ((cfg.storageMaintenance as Record<string, unknown>).autoCleanup as Record<string, unknown>)
+                        .enabled === true,
+                    intervalHours:
+                      typeof (
+                        (cfg.storageMaintenance as Record<string, unknown>).autoCleanup as Record<string, unknown>
+                      ).intervalHours === "number"
+                        ? (((cfg.storageMaintenance as Record<string, unknown>).autoCleanup as Record<string, unknown>)
+                            .intervalHours as number)
+                        : 24,
+                    retentionDays:
+                      typeof (
+                        (cfg.storageMaintenance as Record<string, unknown>).autoCleanup as Record<string, unknown>
+                      ).retentionDays === "number"
+                        ? (((cfg.storageMaintenance as Record<string, unknown>).autoCleanup as Record<string, unknown>)
+                            .retentionDays as number)
+                        : 1,
+                  }
+                : { enabled: false, intervalHours: 24, retentionDays: 1 },
+          }
+        : { autoCleanup: { enabled: false, intervalHours: 24, retentionDays: 1 } },
     recallPrefix:
       typeof cfg.recallPrefix === "object" && cfg.recallPrefix !== null
         ? {

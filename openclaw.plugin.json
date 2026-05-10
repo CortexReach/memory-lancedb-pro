@@ -4,6 +4,9 @@
   "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, long-context chunking, and management CLI",
   "version": "1.1.0-beta.10",
   "kind": "memory",
+  "contracts": {
+    "tools": ["memory_recall", "memory_store", "memory_forget", "memory_update", "memory_stats", "memory_debug", "memory_list", "self_improvement_log", "self_improvement_extract_skill", "self_improvement_review"]
+  },
   "skills": [
     "./skills"
   ],
@@ -905,6 +908,37 @@
             "default": 24,
             "minimum": 1,
             "description": "Minimum hours between automatic compaction runs"
+          }
+        }
+      },
+      "storageMaintenance": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "LanceDB physical storage maintenance: auto-cleanup of old version snapshots to prevent disk bloat.",
+        "properties": {
+          "autoCleanup": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Periodically run Table.optimize() to remove old version snapshots.",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Enable auto-cleanup of LanceDB version snapshots."
+              },
+              "intervalHours": {
+                "type": "integer",
+                "default": 24,
+                "minimum": 1,
+                "description": "How often to run cleanup (hours). Default: 24."
+              },
+              "retentionDays": {
+                "type": "integer",
+                "default": 1,
+                "minimum": 0,
+                "description": "Keep snapshots newer than this many days. 0 = keep only latest. Default: 1."
+              }
+            }
           }
         }
       },

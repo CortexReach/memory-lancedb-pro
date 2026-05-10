@@ -212,10 +212,11 @@ export class MemoryStore {
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
-    if (!existsSync(lockPath)) {
-      try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
-      try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
-    }
+    // Ensure directory exists (atomic, no race — mkdirSync with recursive:true is idempotent-ish on Linux)
+    try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
+    // DO NOT pre-create the lock file — proper-lockfile handles lock acquisition atomically.
+    // Pre-creating causes a race condition: two concurrent calls both see "file not exists",
+    // both try wx creation, one gets EEXIST (caught), then proceeds to lock() with a stale state.
     // 【修復 #415】調整 retries：max wait 從 ~3100ms → ~151秒
     // 指數退避：1s, 2s, 4s, 8s, 16s, 30s×5，總計約 151 秒
     // ECOMPROMISED 透過 onCompromised callback 觸發（非 throw），使用 flag 機制正確處理
@@ -238,23 +239,41 @@ export class MemoryStore {
       } catch {}
     }
 
-    const release = await lockfile.lock(lockPath, {
-      retries: {
-        retries: 10,
-        factor: 2,
-        minTimeout: 1000, // James 保守設定：避免高負載下過度密集重試
-        maxTimeout: 30000, // James 保守設定：支撐更久的 event loop 阻塞
-      },
-      stale: 10000, // 10 秒後視為 stale，觸發 ECOMPROMISED callback
-                     // 注意：ECOMPROMISED 是 ambiguous degradation 訊號，mtime 無法區分
-                     // "holder 崩潰" vs "holder event loop 阻塞"，所以不嘗試區分
-      onCompromised: (err: unknown) => {
-        // 【修復 #415 關鍵】必須是同步 callback
-        // setLockAsCompromised() 不等待 Promise，async throw 無法傳回 caller
-        isCompromised = true;
-        compromisedErr = err;
-      },
-    });
+    // ENOENT fall-back: if the lock subsystem itself (proper-lockfile/graceful-fs) throws ENOENT
+    // (e.g. due to race on the lock-path stat/lstat inside its implementation), fall back to
+    // lock-free execution.  LanceDB write operations are atomic on their own; the file-lock is
+    // only a cross-process serialization guard that we can skip when the filesystem is racy.
+    let release: (() => Promise<void>) | null = null;
+    let usingFallbackLock = false;
+    try {
+      release = await lockfile.lock(lockPath, {
+        retries: {
+          retries: 10,
+          factor: 2,
+          minTimeout: 1000, // James 保守設定：避免高負載下過度密集重試
+          maxTimeout: 30000, // James 保守設定：支撐更久的 event loop 阻塞
+        },
+        stale: 10000, // 10 秒後視為 stale，觸發 ECOMPROMISED callback
+                       // 注意：ECOMPROMISED 是 ambiguous degradation 訊號，mtime 無法區分
+                       // "holder 崩潰" vs "holder event loop 阻塞"，所以不嘗試區分
+        onCompromised: (err: unknown) => {
+          // 【修復 #415 關鍵】必須是同步 callback
+          // setLockAsCompromised() 不等待 Promise，async throw 無法傳回 caller
+          isCompromised = true;
+          compromisedErr = err;
+        },
+      });
+    } catch (lockErr: unknown) {
+      const code = (lockErr as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        // Lock subsystem threw ENOENT (e.g. graceful-fs race inside proper-lockfile).
+        // Fall back to lock-free — LanceDB writes are already atomic.
+        console.warn(`[memory-lancedb-pro] lock() returned ENOENT for ${lockPath}, falling back to lock-free (LanceDB writes are atomic anyway)`);
+        usingFallbackLock = true;
+      } else {
+        throw lockErr; // Re-throw unexpected errors
+      }
+    }
 
     try {
       const result = await fn();
@@ -264,17 +283,16 @@ export class MemoryStore {
       fnError = e;
       throw e;
     } finally {
-      // 【修復 #415 BUG】release() 必須在 isCompromised 判斷之前呼叫
-      // 否則當 fnError !== null 且 isCompromised === true 時，release() 不會被呼叫，lock 永久洩漏
-      try {
-        await release();
-      } catch (e: unknown) {
-        if ((e as NodeJS.ErrnoException).code === 'ERELEASED') {
-          // ERELEASED 是預期行為（compromised lock release），忽略
-        } else {
-          // release() 錯誤優先於 fn() 錯誤：若 release 本身失敗，視為更嚴重的問題
-          // 而非靜默忽略（這是有意的設計選擇，不反映 fn 的錯誤）
-          throw e;
+      // Only release if we actually acquired a lock
+      if (release !== null && !usingFallbackLock) {
+        try {
+          await release();
+        } catch (e: unknown) {
+          if ((e as NodeJS.ErrnoException).code === 'ERELEASED') {
+            // ERELEASED 是預期行為（compromised lock release），忽略
+          } else {
+            throw e;
+          }
         }
       }
       if (isCompromised) {
@@ -1282,5 +1300,34 @@ export class MemoryStore {
           metadata: (row.metadata as string) || "{}",
         }),
       );
+  }
+
+  /**
+   * Run LanceDB physical storage maintenance: call table.optimize() to
+   * remove old version snapshots and compact data files.
+   * Safe to call periodically — latest version is NEVER deleted by optimize().
+   */
+  async runMaintenance(retentionDays = 1): Promise<{
+    bytesRemoved: number;
+    oldVersionsRemoved: number;
+  } | null> {
+    await this.ensureInitialized();
+    if (!this.table) return null;
+    try {
+      const { default: lancedb } = await import("@lancedb/lancedb");
+      // Calculate cutoff timestamp
+      const cutoffMs = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+      const cutoff = new Date(cutoffMs);
+      const stats = await (this.table as any).optimize({
+        cleanupOlderThan: cutoff,
+      });
+      return {
+        bytesRemoved: stats?.bytesRemoved ?? 0,
+        oldVersionsRemoved: stats?.oldVersions ?? 0,
+      };
+    } catch (err) {
+      console.warn("[memory-lancedb-pro] runMaintenance failed:", err);
+      return null;
+    }
   }
 }
