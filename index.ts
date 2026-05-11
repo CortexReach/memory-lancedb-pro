@@ -529,7 +529,7 @@ export function reportLayer1Failure(): void {
   }
 }
 
-function isLayer1CircuitOpen(): boolean {
+export function isLayer1CircuitOpen(): boolean {
   const now = Date.now();
   const cutoff = now - LAYER1_FAILURE_WINDOW_MS;
   const recentFailures = layer1FailureTimestamps.filter((t) => t >= cutoff);
