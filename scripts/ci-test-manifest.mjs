@@ -73,6 +73,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/command-reflection-guard.test.mjs", args: ["--test"] },
   // Tier 1 memory counter fix
   { group: "core-regression", runner: "node", file: "test/tier1-counters.test.mjs", args: ["--test"] },
+  // Issue #795 validateStoragePathAsync background init
+  { group: "core-regression", runner: "node", file: "test/validate-storage-path-async.test.mjs" },
 ];
 
 export function getEntriesForGroup(group) {
