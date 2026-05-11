@@ -88,6 +88,49 @@
       "dbPath": {
         "type": "string"
       },
+      "dreaming": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Dreaming: periodic memory consolidation and promotion from short-term to long-term storage",
+        "properties": {
+          "enabled": {"type": "boolean", "default": false, "description": "Enable dreaming memory consolidation cycles"},
+          "cron": {"type": "string", "default": "0 3 * * *", "description": "Cron expression for dreaming schedule (minute hour day month weekday). Uses server local timezone."},
+          "verboseLogging": {"type": "boolean", "default": false, "description": "Enable verbose logging for dreaming cycles"},
+          "phases": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Per-phase tuning parameters",
+            "properties": {
+              "light": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "lookbackDays": {"type": "number", "minimum": 1, "default": 3},
+                  "limit": {"type": "number", "minimum": 1, "default": 100}
+                }
+              },
+              "deep": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "limit": {"type": "number", "minimum": 1, "default": 50},
+                  "minScore": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.6},
+                  "minRecallCount": {"type": "number", "minimum": 0, "default": 2},
+                  "recencyHalfLifeDays": {"type": "number", "minimum": 1, "default": 30}
+                }
+              },
+              "rem": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "lookbackDays": {"type": "number", "minimum": 1, "default": 7},
+                  "limit": {"type": "number", "minimum": 1, "default": 20}
+                }
+              }
+            }
+          }
+        }
+      },
       "enableManagementTools": {
         "type": "boolean",
         "default": false,
