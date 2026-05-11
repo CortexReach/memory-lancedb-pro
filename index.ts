@@ -20,7 +20,7 @@ import { spawn } from "node:child_process";
 const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 
 // Import core components
-import { MemoryStore, validateStoragePath } from "./src/store.js";
+import { MemoryStore, validateStoragePath, validateStoragePathAsync } from "./src/store.js";
 import {
   createEmbedder,
   getEffectiveVectorDimensions,
@@ -1931,6 +1931,30 @@ interface PluginSingletonState {
 
 let _singletonState: PluginSingletonState | null = null;
 
+// Whether the async background validation (validateStoragePathAsync) has completed.
+// Used to ensure background validation results are logged before hooks execute.
+let _singletonAsyncValidationDone = false;
+
+function _startAsyncValidation(resolvedDbPath: string, api: OpenClawPluginApi): void {
+  // Fire-and-forget: run validateStoragePathAsync in setImmediate so the 5 sync
+  // I/O operations (lstat/realpath/exists/mkdir/access) do NOT block the event loop
+  // during plugin registration. The sync _initPluginState still runs first so
+  // _singletonState is always set before hooks register. This function just
+  // ensures the validation runs without blocking register().
+  setImmediate(async () => {
+    try {
+      await validateStoragePathAsync(resolvedDbPath);
+    } catch (err) {
+      api.logger.warn(
+        `memory-lancedb-pro: storage path async validation failed — ${String(err)}\n` +
+        `  The plugin will still attempt to start, but writes may fail.`,
+      );
+    } finally {
+      _singletonAsyncValidationDone = true;
+    }
+  });
+}
+
 function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const config = parsePluginConfig(api.pluginConfig);
   const resolvedDbPath = api.resolvePath(config.dbPath || getDefaultDbPath());
@@ -2162,6 +2186,15 @@ const memoryLanceDBProPlugin = {
     // ========================================================================
     _registeredApis.add(api);    // claim before init (Phase 2 singleton guard)
     _registeredApisMap.set(api, true);  // dual-track: explicit claim for rollback
+
+    // Start background async validation (fire-and-forget, non-blocking).
+    // We do this after claiming the API slot so that if the sync _initPluginState
+    // below throws, the async validation will have already started but its result
+    // won't matter (plugin failed to start anyway).
+    const config = parsePluginConfig(api.pluginConfig);
+    const resolvedDbPath = api.resolvePath(config.dbPath || getDefaultDbPath());
+    _startAsyncValidation(resolvedDbPath, api);
+
     let singleton: typeof _singletonState;
     try {
       if (!_singletonState) { _singletonState = _initPluginState(api); }

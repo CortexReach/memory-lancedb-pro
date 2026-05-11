@@ -15,6 +15,7 @@ import {
   statSync,
   unlinkSync,
 } from "node:fs";
+import { access, lstat, mkdir, realpath } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 
@@ -197,6 +198,79 @@ export function validateStoragePath(dbPath: string): string {
   }
 
   return resolvedPath;
+}
+
+/**
+ * Async version of validateStoragePath — non-blocking alternative for use in
+ * background initialization. The sync version (above) is used by _initPluginState
+ * synchronously; this version is used for fire-and-forget background init.
+ */
+export async function validateStoragePathAsync(dbPath: string): Promise<string> {
+  let resolvedPath = dbPath;
+
+  // Resolve symlinks (including dangling symlinks)
+  try {
+    const stats = await lstat(dbPath);
+    if (stats.isSymbolicLink()) {
+      try {
+        resolvedPath = await realpath(dbPath);
+      } catch (err: any) {
+        throw Object.assign(
+          new Error(
+            `dbPath "${dbPath}" is a symlink whose target does not exist.\n` +
+            `  Fix: Create the target directory, or update the symlink to point to a valid path.\n` +
+            `  Details: ${err.code || ""} ${err.message}`,
+          ),
+          { code: err?.code }
+        );
+      }
+    }
+  } catch (err: any) {
+    // Missing path is OK (it will be created below)
+    if (err?.code === "ENOENT") {
+      // no-op
+    } else if (
+      typeof err?.message === "string" &&
+      err.message.includes("symlink whose target does not exist")
+    ) {
+      throw err;
+    } else {
+      // Other lstat failures — continue with original path
+    }
+  }
+
+  // Create directory if it doesn't exist
+  if (!await pathExistsAsync(resolvedPath)) {
+    try {
+      await mkdir(resolvedPath, { recursive: true });
+    } catch (err: any) {
+      throw new Error(
+        `Failed to create dbPath directory "${resolvedPath}".\n` +
+        `  Fix: Ensure the parent directory "${dirname(resolvedPath)}" exists and is writable,\n` +
+        `       or create it manually: mkdir -p "${resolvedPath}"\n` +
+        `  Details: ${err.code || ""} ${err.message}`,
+      );
+    }
+  }
+
+  // Check write permissions
+  try {
+    await access(resolvedPath, constants.W_OK);
+  } catch (err: any) {
+    throw new Error(
+      `dbPath directory "${resolvedPath}" is not writable.\n` +
+      `  Fix: Check permissions with: ls -la "${dirname(resolvedPath)}"\n` +
+      `       Or grant write access: chmod u+w "${resolvedPath}"\n` +
+      `  Details: ${err.code || ""} ${err.message}`,
+    );
+  }
+
+  return resolvedPath;
+}
+
+async function pathExistsAsync(p: string): Promise<boolean> {
+  try { await access(p, constants.F_OK); return true; }
+  catch { return false; }
 }
 
 // ============================================================================
