@@ -1329,9 +1329,12 @@ export class MemoryRetriever {
         const model = this.config.rerankModel || "jina-reranker-v3";
         const endpoint =
           this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
-        const documents = results.map((r) => r.entry.text);
+        // Limit documents to candidatePoolSize BEFORE passing to buildRerankRequest.
+        // This ensures ALL providers are limited, not just those that support topN in their API body.
+        // tei/dashscope ignore topN parameter but will now receive sliced documents.
+        const documents = results.slice(0, this.config.candidatePoolSize).map((r) => r.entry.text);
 
-        // Limit topN to candidatePoolSize to avoid overwhelming the rerank API
+        // cap topN for providers that support it (jina/pinecone/voyage)
         const topN = Math.min(results.length, this.config.candidatePoolSize);
         const { headers, body } = buildRerankRequest(
           provider,
