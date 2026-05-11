@@ -125,6 +125,20 @@
         "default": 8,
         "description": "Minimum number of turns before the same memory can be recalled again in the same session. Set to 0 to disable deduplication."
       },
+      "autoRecallBadRecallDecayMs": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 86400000,
+        "$comment": "No maximum: 0 disables decay; very large values also effectively disable. Unlike sibling autoRecall* integers, this is a time window with no natural upper bound.",
+        "description": "If a memory's last auto-recall injection was more than this many ms ago, its bad_recall_count is reset to 0 on the next injection. 0 disables decay. Default: 86400000 (24 hours)."
+      },
+      "autoRecallSuppressionDurationMs": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 1800000,
+        "$comment": "No maximum: 0 effectively disables suppression; large values allow long quarantine windows.",
+        "description": "When bad_recall_count reaches the suppression threshold, the memory is suppressed from auto-recall for this many ms from now. Default: 1800000 (30 minutes)."
+      },
       "autoRecallTimeoutMs": {
         "type": "integer",
         "minimum": 500,
@@ -183,18 +197,9 @@
         "items": {
           "type": "string"
         },
-        "default": [],
-        "description": "Blacklist mode for auto-recall injection. Agents in this list are skipped. Agent resolution falls back to 'main' when no explicit agentId is available. If autoRecallIncludeAgents is also set, include wins."
+        "description": "Agent/session patterns excluded from auto-recall and reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
       },
-            "autoRecallExcludeAgents": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        },
-        "default": [],
-        "description": "Blacklist mode for auto-recall injection. Agents in this list are skipped. Agent resolution falls back to 'main' when no explicit agentId is available. If autoRecallIncludeAgents is also set, include wins."
-      },
-"autoRecallIncludeAgents": {
+      "autoRecallIncludeAgents": {
         "type": "array",
         "items": {
           "type": "string"
@@ -742,6 +747,18 @@
           "dedupeErrorSignals": {
             "type": "boolean",
             "default": true
+          },
+          "serialCooldownMs": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cooldown in ms between reflection triggers for the same session. Default: 120000 (2 min). Set to 0 to disable."
+          },
+          "excludeAgents": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Agent/session patterns excluded from reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
           }
         }
       },
@@ -1026,13 +1043,7 @@
                   "limit": {
                     "type": "number",
                     "minimum": 1,
-                    "default": 80
-                  },
-                  "minPatternStrength": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 1,
-                    "default": 0.7
+                    "default": 20
                   }
                 }
               }
@@ -1339,7 +1350,7 @@
     },
     "decay.intrinsicWeight": {
       "label": "Decay Intrinsic Weight",
-      "help": "Weight of importance \u00d7 confidence in lifecycle score.",
+      "help": "Weight of importance ? confidence in lifecycle score.",
       "advanced": true
     },
     "decay.betaCore": {
@@ -1546,7 +1557,7 @@
     },
     "memoryCompaction.similarityThreshold": {
       "label": "Similarity Threshold",
-      "help": "How similar two memories must be to merge (0\u20131). 0.88 is a good starting point; raise to 0.92+ for conservative merges.",
+      "help": "How similar two memories must be to merge (0??). 0.88 is a good starting point; raise to 0.92+ for conservative merges.",
       "advanced": true
     },
     "memoryCompaction.cooldownHours": {
