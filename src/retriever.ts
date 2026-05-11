@@ -361,7 +361,10 @@ interface RerankItem {
   score: number;
 }
 
-/** Build provider-specific request headers and body */
+/** Build provider-specific request headers and body
+ * Provider encoding: tei= texts, dashscope= input/documents, pinecone= {text}, voyage= top_k, jina= top_n
+ * Note: Documents already sliced BEFORE this call - all providers receive limited candidates.
+ */
 function buildRerankRequest(
   provider: RerankProvider,
   apiKey: string,
