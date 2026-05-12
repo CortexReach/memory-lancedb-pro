@@ -206,6 +206,16 @@ export function parseSmartMetadata(rawMetadata, entry = {}) {
         last_confirmed_use_at: normalizeOptionalTimestamp(parsed.last_confirmed_use_at),
         bad_recall_count: clampCount(parsed.bad_recall_count, 0),
         suppressed_until_turn: clampCount(parsed.suppressed_until_turn, 0),
+        // DO NOT replace with `clampCount(parsed.suppressed_until_ms, 0)` directly —
+        // preserving `undefined` is load-bearing for the Tier 1 lazy-heal sentinel
+        // (see JSDoc on SmartMemoryMetadata.suppressed_until_ms). The `undefined`
+        // signal distinguishes "never touched by Tier 1 code" from "Tier 1 touched
+        // but no active suppression (0)". `null` is treated as missing too —
+        // some persistence layers serialize undefined → null on round-trip, and
+        // we want the sentinel to survive that.
+        suppressed_until_ms: parsed.suppressed_until_ms != null
+            ? clampCount(parsed.suppressed_until_ms, 0)
+            : undefined,
         canonical_id: normalizeOptionalString(parsed.canonical_id),
     };
     return normalized;
@@ -270,6 +280,14 @@ export function buildSmartMetadata(entry, patch = {}) {
             : normalizeOptionalTimestamp(patch.last_confirmed_use_at),
         bad_recall_count: clampCount(patch.bad_recall_count, base.bad_recall_count),
         suppressed_until_turn: clampCount(patch.suppressed_until_turn, base.suppressed_until_turn),
+        // Treat null patches the same as undefined (leave base value alone),
+        // mirroring parseSmartMetadata. A patch caller that wants to clear
+        // suppression must pass 0 explicitly.
+        suppressed_until_ms: patch.suppressed_until_ms == null
+            ? base.suppressed_until_ms
+            : (typeof patch.suppressed_until_ms === "number" && patch.suppressed_until_ms >= 0
+                ? Math.floor(patch.suppressed_until_ms)
+                : 0),
         canonical_id: patch.canonical_id === undefined
             ? base.canonical_id
             : normalizeOptionalString(patch.canonical_id),
