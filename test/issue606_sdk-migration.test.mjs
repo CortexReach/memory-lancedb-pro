@@ -14,9 +14,18 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
+import jitiFactory from "jiti";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const INDEX_PATH = resolve(__dirname, "..", "index.ts");
+const pluginSdkStubPath = resolve(__dirname, "helpers", "openclaw-plugin-sdk-stub.mjs");
+const jiti = jitiFactory(import.meta.url, {
+  interopDefault: true,
+  alias: {
+    "openclaw/plugin-sdk": pluginSdkStubPath,
+  },
+});
+const loadIndexModule = () => jiti("../index.ts");
 
 // ---------------------------------------------------------------------------
 // Static analysis smoke tests — verify migration code is present
@@ -273,13 +282,13 @@ describe("loadEmbeddedPiRunner — F1/F2 behavioral integration", () => {
     // We can't easily reset module-level state, so we test the circuit breaker
     // function directly. The actual integration (Layer 1 blocked after N failures)
     // requires a fresh module instance per test which Node test runner doesn't give us.
-    const { isLayer1CircuitOpen } = await import("../index.ts");
+    const { isLayer1CircuitOpen } = loadIndexModule();
     // isLayer1CircuitOpen is internal; if it exists and returns boolean, the mechanism is wired
     assert.strictEqual(typeof isLayer1CircuitOpen, "function", "isLayer1CircuitOpen should be exported for testability");
   });
 
   it("F1: reportLayer1Failure is exported and callable", async () => {
-    const { reportLayer1Failure } = await import("../index.ts");
+    const { reportLayer1Failure } = loadIndexModule();
     assert.strictEqual(typeof reportLayer1Failure, "function", "reportLayer1Failure must be exported");
     // Calling it should not throw
     assert.doesNotThrow(() => reportLayer1Failure(), "reportLayer1Failure() must not throw");
