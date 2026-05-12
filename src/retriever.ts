@@ -1644,15 +1644,71 @@ export class MemoryRetriever {
   ): RetrievalResult[] {
     if (results.length <= 1) return results;
 
+    // Pre-convert all vectors to plain JS arrays ONCE at entry — avoids
+    // repeated Array.from() calls inside the similarity loop (O(n) → O(1) amortized).
+    const vectors = results.map((r) => {
+      const v = r.entry.vector;
+      return v?.length ? Array.from(v as Iterable<number>) : null;
+    });
+
+    // id→index Map for O(1) lookup — replaces O(n) findIndex in the inner loop.
+    const idToIdx = new Map(results.map((r, i) => [r.entry.id, i]));
+
+    // Guard against duplicate IDs: when two entries share the same id, the Map
+    // keeps only the last index and the inner loop's sVec lookup can return
+    // undefined. Detect this and fall back to the original index-based approach.
+    const seenIds = new Set<string>();
+    for (const r of results) {
+      if (seenIds.has(r.entry.id)) {
+        return this.applyMMRDiversity_Fallback(results, similarityThreshold);
+      }
+      seenIds.add(r.entry.id);
+    }
+
+    const selected: RetrievalResult[] = [];
+    const deferred: RetrievalResult[] = [];
+
+    for (let i = 0; i < results.length; i++) {
+      const candidate = results[i];
+      const cVec = vectors[i];
+      if (!cVec) {
+        // Items without vectors are always included (no comparison possible).
+        selected.push(candidate);
+        continue;
+      }
+
+      const tooSimilar = selected.some((s) => {
+        const sVec = vectors[idToIdx.get(s.entry.id) ?? -1];
+        if (!sVec) return false;
+        const sim = cosineSimilarity(sVec, cVec);
+        return sim > similarityThreshold;
+      });
+
+      if (tooSimilar) {
+        deferred.push(candidate);
+      } else {
+        selected.push(candidate);
+      }
+    }
+
+    return [...selected, ...deferred];
+  }
+
+  /**
+   * Fallback for duplicate IDs — original O(n²) index-based approach.
+   * Used when results contain duplicate entry.id values (Map lookup is ambiguous).
+   */
+  private applyMMRDiversity_Fallback(
+    results: RetrievalResult[],
+    similarityThreshold = 0.85,
+  ): RetrievalResult[] {
+    if (results.length <= 1) return results;
+
     const selected: RetrievalResult[] = [];
     const deferred: RetrievalResult[] = [];
 
     for (const candidate of results) {
-      // Check if this candidate is too similar to any already-selected result
       const tooSimilar = selected.some((s) => {
-        // Both must have vectors to compare.
-        // LanceDB returns Arrow Vector objects (not plain arrays),
-        // so use .length directly and Array.from() for conversion.
         const sVec = s.entry.vector;
         const cVec = candidate.entry.vector;
         if (!sVec?.length || !cVec?.length) return false;
@@ -1668,7 +1724,7 @@ export class MemoryRetriever {
         selected.push(candidate);
       }
     }
-    // Append deferred results at the end (available but deprioritized)
+
     return [...selected, ...deferred];
   }
 
