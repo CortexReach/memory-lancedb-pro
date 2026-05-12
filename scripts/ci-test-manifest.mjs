@@ -51,6 +51,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/store-serialization.test.mjs" },
   // Issue #692: AST-based semantic chunking
   { group: "core-regression", runner: "node", file: "test/ast-code-chunking.test.mjs" },
+  // Issue #763: applyMMRDiversity O(n³)→O(n²) optimization
+  { group: "core-regression", runner: "node", file: "test/mmr-tiny.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/access-tracker-retry.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/embedder-cache.test.mjs" },
   // Issue #629 batch embedding fix
