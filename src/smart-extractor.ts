@@ -25,6 +25,7 @@ import {
   type DedupDecision,
   type DedupResult,
   type ExtractionStats,
+  type ExtractionValidation,
   type MemoryCategory,
   ALWAYS_MERGE_CATEGORIES,
   MERGE_SUPPORTED_CATEGORIES,
@@ -284,12 +285,7 @@ export interface ExtractPersistOptions {
    * The callback is NOT invoked when createEntries is empty (no-op write).
    * The mismatch field: positive = under-write, negative = over-write (rare).
    */
-  onExtractionValidationFailed?: (validation: {
-    expected: number;
-    actual: number;
-    mismatch: number;
-    sessionKey: string;
-  }) => void;
+  onExtractionValidationFailed?: (validation: ExtractionValidation) => void;
   /**
    * When `true`, a positive mismatch (actual < expected, under-write) throws an Error
    * that aborts the extraction, signaling the caller to handle the failure.
@@ -499,6 +495,13 @@ export class SmartExtractor {
         } catch (cbErr) {
           this.log(
             "memory-pro: smart-extractor: onExtractionValidationFailed callback threw: " + String(cbErr),
+          );
+        }
+
+        // F1: when no callback and mismatch > 0, log at minimum so production is not silent
+        if (mismatch > 0 && !options.onExtractionValidationFailed) {
+          this.log(
+            "memory-pro: smart-extractor: extraction mismatch: expected=" + expectedCreated + ", actual=" + actualCreated + " (diff=" + mismatch + "). Provide onExtractionValidationFailed callback or set abortOnExtractionMismatch=true to handle this.",
           );
         }
 
