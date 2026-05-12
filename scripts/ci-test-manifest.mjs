@@ -76,6 +76,9 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/command-reflection-guard.test.mjs", args: ["--test"] },
   // Tier 1 memory counter fix
   { group: "core-regression", runner: "node", file: "test/tier1-counters.test.mjs", args: ["--test"] },
+  // Issue #786 upgrader/compactor/rerank fixes
+  { group: "core-regression", runner: "node", file: "test/upgrader-compactor-rerank-fixes.test.mjs", args: ["--test"] },
+
 ];
 
 export function getEntriesForGroup(group) {
