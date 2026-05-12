@@ -21,7 +21,7 @@
  */
 
 import type { MemoryEntry } from "./store.js";
-import { buildSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import { buildSmartMetadata, reverseMapLegacyCategory, stringifySmartMetadata } from "./smart-metadata.js";
 
 // ============================================================================
 // Types
@@ -230,6 +230,9 @@ export function buildMergedEntry(
   const l1_overview = lines.slice(0, 3).map((l) => `- ${l}`).join("\n");
 
   // --- metadata: build full smart metadata with L0/L1/L2 ---
+  // F1 fix: convert legacy category to new memory_category format
+  const legacyCategory = category as string;
+  const smartCategory = reverseMapLegacyCategory(legacyCategory, text);
   const sourceEntry = members[0];
   const mergedMetadata = buildSmartMetadata(
     { text, metadata: sourceEntry.metadata },
@@ -237,7 +240,7 @@ export function buildMergedEntry(
       l0_abstract,
       l1_overview,
       l2_content: text,
-      memory_category: category,
+      memory_category: smartCategory,
       tier: "working",
       access_count: 0,
       confidence: Math.max(0.5, 0.8 - members.length * 0.05), // confidence decreases with more sources
