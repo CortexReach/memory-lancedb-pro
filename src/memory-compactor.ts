@@ -21,6 +21,7 @@
  */
 
 import type { MemoryEntry } from "./store.js";
+import { buildSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 
 // ============================================================================
 // Types
@@ -222,14 +223,37 @@ export function buildMergedEntry(
   // --- scope: use the first (all should match) ---
   const scope = members[0].scope;
 
-  // --- metadata ---
-  const metadata = JSON.stringify({
-    compacted: true,
-    sourceCount: members.length,
-    compactedAt: Date.now(),
-  });
+  // --- l0_abstract: first line as short summary ---
+  const l0_abstract = lines[0]?.slice(0, 120) ?? "";
 
-  return { text, importance, category, scope, metadata };
+  // --- l1_overview: first 3 lines as bullet overview ---
+  const l1_overview = lines.slice(0, 3).map((l) => `- ${l}`).join("\n");
+
+  // --- metadata: build full smart metadata with L0/L1/L2 ---
+  const sourceEntry = members[0];
+  const mergedMetadata = buildSmartMetadata(
+    { text, metadata: sourceEntry.metadata },
+    {
+      l0_abstract,
+      l1_overview,
+      l2_content: text,
+      memory_category: category,
+      tier: "working",
+      access_count: 0,
+      confidence: Math.max(0.5, 0.8 - members.length * 0.05), // confidence decreases with more sources
+      compacted: true,
+      sourceCount: members.length,
+      compactedAt: Date.now(),
+    },
+  );
+
+  return {
+    text,
+    importance,
+    category,
+    scope,
+    metadata: stringifySmartMetadata(mergedMetadata),
+  };
 }
 
 // ============================================================================

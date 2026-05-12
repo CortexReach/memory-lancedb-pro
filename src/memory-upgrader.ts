@@ -367,10 +367,11 @@ export class MemoryUpgrader {
     };
 
     // Step 4: Update the memory entry
+    // Use l2_content for text column to preserve full content for BM25/FTS.
+    // l0_abstract still lives in metadata for scoreLexicalHit weighting.
     await this.store.update(entry.id, {
-      // Update text to L0 abstract for better search indexing
-      text: enriched.l0_abstract,
-      metadata: stringifySmartMetadata(newMetadata as any),
+      text: enriched.l2_content ?? enriched.l1_overview ?? enriched.l0_abstract,
+      metadata: stringifySmartMetadata(newMetadata),
     });
   }
 }
