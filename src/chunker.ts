@@ -494,7 +494,11 @@ export function chunkDocument(text: string, config: ChunkerConfig = DEFAULT_CHUN
  * We intentionally pick conservative char limits (70% of the reported limit)
  * since token/char ratios vary.
  */
-export function smartChunk(text: string, embedderModel?: string): ChunkResult {
+export function smartChunk(
+  text: string,
+  embedderModel?: string,
+  options?: { astAwareCodeSplit?: boolean },
+): ChunkResult {
   const limit = embedderModel ? EMBEDDING_CONTEXT_LIMITS[embedderModel] : undefined;
   const base = limit ?? 8192;
 
@@ -509,7 +513,7 @@ export function smartChunk(text: string, embedderModel?: string): ChunkResult {
     minChunkSize: Math.max(100, Math.floor(base * 0.1 / divisor)),
     semanticSplit: true,
     maxLinesPerChunk: 50,
-    astAwareCodeSplit: true,
+    astAwareCodeSplit: options?.astAwareCodeSplit ?? true,
   };
 
   // AST-aware code path: only activate when explicitly enabled

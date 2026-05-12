@@ -1962,6 +1962,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     taskPassage: config.embedding.taskPassage,
     normalized: config.embedding.normalized,
     chunking: config.embedding.chunking,
+    astChunking: config.embedding.astChunking,
   });
   const decayEngine = createDecayEngine({
     ...DEFAULT_DECAY_CONFIG,

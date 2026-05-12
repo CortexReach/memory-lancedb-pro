@@ -125,6 +125,8 @@ export interface EmbeddingConfig {
   omitDimensions?: boolean;
   /** Enable automatic chunking for documents exceeding context limits (default: true) */
   chunking?: boolean;
+  /** Use AST-based semantic chunking for code (JavaScript/TypeScript/Python). Default: true. Requires chunking to be enabled. */
+  astChunking?: boolean;
 }
 
 type EmbeddingProviderProfile =
@@ -475,8 +477,10 @@ export class Embedder {
   private readonly _omitDimensions: boolean;
   /** Enable automatic chunking for long documents (default: true) */
   private readonly _autoChunk: boolean;
+  /** Use AST-based semantic chunking for code (default: true). Only used when _autoChunk is true. */
+  private readonly _astChunking: boolean;
 
-  constructor(config: EmbeddingConfig & { chunking?: boolean }) {
+  constructor(config: EmbeddingConfig & { chunking?: boolean; astChunking?: boolean }) {
     // Normalize apiKey to array and resolve environment variables
     const apiKeys = Array.isArray(config.apiKey) ? config.apiKey : [config.apiKey];
     const resolvedKeys = apiKeys.map(k => resolveEnvVars(k));
@@ -490,6 +494,8 @@ export class Embedder {
     this._omitDimensions = config.omitDimensions === true;
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
+    // Enable AST-based code splitting by default (only meaningful when _autoChunk is true)
+    this._astChunking = config.astChunking !== false;
     const profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
     this._capabilities = getEmbeddingCapabilities(profile);
 
@@ -908,7 +914,7 @@ export class Embedder {
       if (isContextError && this._autoChunk) {
         try {
           console.log(`Document exceeded context limit (${errorMsg}), attempting chunking...`);
-          const chunkResult = smartChunk(text, this._model);
+          const chunkResult = smartChunk(text, this._model, { astAwareCodeSplit: this._astChunking });
 
           if (chunkResult.chunks.length === 0) {
             throw new Error(`Failed to chunk document: ${errorMsg}`);
@@ -1042,7 +1048,7 @@ export class Embedder {
 
           const chunkResults = await Promise.all(
             validTexts.map(async (text, idx) => {
-              const chunkResult = smartChunk(text, this._model);
+              const chunkResult = smartChunk(text, this._model, { astAwareCodeSplit: this._astChunking });
               if (chunkResult.chunks.length === 0) {
                 throw new Error("Chunker produced no chunks");
               }
