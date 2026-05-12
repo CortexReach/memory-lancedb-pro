@@ -294,6 +294,39 @@ describe("import-markdown CLI", () => {
     });
   });
 
+
+    it("--no-dedup skips Phase 2a (DB check) even when DB has matching entries", async () => {
+      // --no-dedup sets dedupEnabled=false → Phase 2a is entirely skipped.
+      // Phase 1c still runs (within-file dedup).
+      const wsDir = await setupWorkspace("no-dedup-flag-test");
+      await writeFile(join(wsDir, "MEMORY.md"), "- Same text line\n", "utf-8");
+
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
+
+      // Pre-load the DB with the same entry via dedup=false (Phase 2a skipped, Phase 1c runs)
+      await runImportMarkdown(ctx, {
+        openclawHome: testWorkspaceDir,
+        workspaceGlob: "no-dedup-flag-test",
+        dedup: false,
+      });
+      assert.strictEqual(mockStore.storedRecords.length, 1, "DB should have 1 record after first import");
+
+      // Second import with --no-dedup (dedup=false): Phase 2a skipped → re-imports even though DB has it.
+      // Phase 1c still removes within-file duplicates (but only 1 entry here).
+      const { imported, skippedDedup } = await runImportMarkdown(ctx, {
+        openclawHome: testWorkspaceDir,
+        workspaceGlob: "no-dedup-flag-test",
+        dedup: false,  // --no-dedup equivalent in test helper
+      });
+
+      assert.strictEqual(imported, 1,
+        `--no-dedup should re-import even when DB has the entry (Phase 2a skipped), got imported=${imported}`);
+      assert.strictEqual(skippedDedup, 0,
+        `--no-dedup Phase 2a skipped → skippedDedup should be 0, got ${skippedDedup}`);
+      assert.strictEqual(mockStore.storedRecords.length, 2,
+        "DB should now have 2 records (re-imported via --no-dedup)");
+    });
+
   // ── Dry-run mode ───────────────────────────────────────────────────────────
 
   describe("dry-run mode", () => {
@@ -347,6 +380,73 @@ describe("import-markdown CLI", () => {
   });
 
   // ── Continue on error ──────────────────────────────────────────────────────
+
+
+  // ── Phase 1c: within-batch in-memory dedup ──────────────────────────────────
+
+  describe("Phase 1c within-batch dedup", () => {
+    it("Phase 1c dedup removes duplicate text within the same file import", async () => {
+      // Phase 1c (seenTexts Set) runs BEFORE Phase 2a and is independent of dedup flag.
+      // It removes exact-text duplicates from allEntries before any embed call.
+      const wsDir = await setupWorkspace("phase1c-test");
+      // Three entries: "Entry A" appears twice, "Entry B" once
+      await writeFile(join(wsDir, "MEMORY.md"),
+        "- Entry A\n- Entry B\n- Entry A\n", "utf-8");
+
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
+      // dedup=false: Phase 2a is skipped, isolating Phase 1c's effect.
+      // Phase 1c (always runs) deduplicates [A, B, A] → [A, B] → imported=2.
+      // Without Phase 1c: Phase 2a (skipped) passes all 3 to embed → imported=3.
+      const { imported, skipped, skippedDedup } = await runImportMarkdown(ctx, {
+        openclawHome: testWorkspaceDir,
+        workspaceGlob: "phase1c-test",
+        dedup: false,
+      });
+
+      // Phase 1c removes one exact-duplicate A before any embed.
+      assert.strictEqual(imported, 2,
+        `Phase 1c should dedup within-file [A,B,A] → 2 unique entries, got imported=${imported}`);
+      assert.strictEqual(skippedDedup, 1,
+        `Phase 1c should increment skippedDedup for 1 within-file duplicate`);
+    });
+
+    it("Phase 1c + Phase 2a: dedup: true processes unique entries then checks DB", async () => {
+      // Two imports of the same file with duplicates.
+      // Import 1: Phase 1c [A,B,A]→[A,B], Phase 2a DB empty→import A,B (imported=2, skippedDedup=1)
+      // Import 2: Phase 1c [A,B,A]→[A,B], Phase 2a finds A,B in DB→skip both (imported=0, skippedDedup=3)
+      const wsDir = await setupWorkspace("phase1c-plus-phase2a");
+      await writeFile(join(wsDir, "MEMORY.md"),
+        "- Entry Unique\n- Entry Duplicate\n- Entry Duplicate\n", "utf-8");
+
+      const ctx = { embedder: mockEmbedder, store: mockStore, retriever: mockRetriever };
+
+      // First import: Phase 1c dedups [Unique, Duplicate, Duplicate] → [Unique, Duplicate]
+      const r1 = await runImportMarkdown(ctx, {
+        openclawHome: testWorkspaceDir,
+        workspaceGlob: "phase1c-plus-phase2a",
+        dedup: true,
+      });
+      assert.strictEqual(r1.imported, 2,
+        `First import: Phase 1c [U,D,D]→[U,D], Phase 2a DB empty→import 2, got ${r1.imported}`);
+      assert.strictEqual(r1.skippedDedup, 1,
+        `First import: Phase 1c skipped 1 within-file dup, got skippedDedup=${r1.skippedDedup}`);
+
+      // Second import: Phase 1c [U,D,D]→[U,D], Phase 2a finds U,D in DB→skip both
+      const r2 = await runImportMarkdown(ctx, {
+        openclawHome: testWorkspaceDir,
+        workspaceGlob: "phase1c-plus-phase2a",
+        dedup: true,
+      });
+      // Phase 1c removed 1 dup → 2 unique passed to Phase 2a.
+      // Phase 2a found both in DB → 2 skippedDedup.
+      // Total skippedDedup in this import = 1 (Phase 1c) + 2 (Phase 2a) = 3.
+      assert.strictEqual(r2.imported, 0,
+        `Second import: Phase 2a should skip all 3 (1 Phase1c + 2 Phase2a), got imported=${r2.imported}`);
+      assert.strictEqual(r2.skippedDedup, 3,
+        `Second import: Phase 1c=1 + Phase 2a=2 → skippedDedup=3, got ${r2.skippedDedup}`);
+      assert.strictEqual(mockStore.storedRecords.length, 2, "DB should still have 2 records");
+    });
+  });
 
   describe("continue on error", () => {
     it("continues processing after a store failure (P1 fix)", async () => {

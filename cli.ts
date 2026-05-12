@@ -723,7 +723,9 @@ export async function runImportMarkdown(
     return { imported: 0, skipped, foundFiles, skippedShort, skippedDedup: 0, errorCount: parseErrors, elapsedMs: 0 };
   }
 
-  // ── Phase 1c: within-batch dedup ───────────────────────────────────────────
+  const dryRunDedupSkipped: ParsedEntry[] = [];
+
+  // ── Phase 1c: within-batch dedup ────────────────────────────────────────────
   // Deduplicate entries that appear multiple times within the same import batch.
   // Unlike Phase 2a (which checks the DB), Phase 1c catches duplicates in-memory
   // before they reach the embed queue. Later duplicates are skipped (kept in order).
@@ -756,7 +758,6 @@ export async function runImportMarkdown(
   // [P2 fix] Runs even in dry-run so --dry-run --dedup shows accurate preview.
   console.log(`[import] dedup check: ${dedupEnabled ? "enabled" : "disabled"}`);
   const pendingEntries: ParsedEntry[] = [];
-  const dryRunDedupSkipped: ParsedEntry[] = [];
 
   if (dedupEnabled) {
     // [Fix #6] Use batchSize instead of CHUNK=50 so dedup and embed share the same parallelism unit
