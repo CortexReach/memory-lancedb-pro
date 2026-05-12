@@ -278,6 +278,27 @@ type ReflectionInjectMode = "inheritance-only" | "inheritance+derived";
 // Default Configuration
 // ============================================================================
 
+/**
+ * Resolve openclaw home directory by reading openclaw.json (which declares `home`),
+ * with fallback to OPENCLAW_HOME env-var and then ~/.openclaw/.
+ * Returns undefined if openclaw.json cannot be read.
+ */
+function resolveOpenclawHomeFromConfig(): string | undefined {
+  try {
+    const openclawHome = process.env.OPENCLAW_HOME || join(homedir(), ".openclaw");
+    const configPath = join(openclawHome, "openclaw.json");
+    const raw = readFileSync(configPath, "utf8");
+    const parsed = JSON.parse(raw);
+    // openclaw.json may declare a custom home directory
+    if (parsed?.home && typeof parsed.home === "string") {
+      return parsed.home;
+    }
+    return openclawHome;
+  } catch {
+    return undefined;
+  }
+}
+
 function getDefaultDbPath(): string {
   const home = homedir();
   return join(home, ".openclaw", "memory", "lancedb-pro");
@@ -4450,26 +4471,13 @@ const memoryLanceDBProPlugin = {
 
     async function runBackup() {
       try {
-        // resolvedDbPath is already absolute (produced by api.resolvePath at
-        // plugin init); wrapping it again triggers api.resolvePath(absolute-path)
-        // → undefined in OpenClaw 2026.4.x strict mode, crashing with:
-        //   TypeError [ERR_INVALID_ARG_TYPE]: The "path" argument must be of type
-        //   string or an instance of Buffer or URL. Received undefined
-        // Guard against undefined first (api.resolvePath returns undefined for
-        // empty-string dbPath config rather than throwing).
-        if (!resolvedDbPath || typeof resolvedDbPath !== "string") {
-          api.logger.warn(
-            `memory-lancedb-pro: backup skipped — resolvedDbPath is "${String(resolvedDbPath)}"`,
-          );
-          return;
-        }
-        const backupDir = join(resolvedDbPath, "..", "backups");
-        if (!backupDir || typeof backupDir !== "string") {
-          api.logger.warn(
-            `memory-lancedb-pro: backup skipped — backupDir resolved to "${String(backupDir)}"`,
-          );
-          return;
-        }
+        // Resolve backup directory from openclaw.json (respects `home` field),
+        // with fallback to OPENCLAW_HOME / ~/.openclaw/. This is robust even when
+        // dbPath is unset or the plugin was upgraded from an older version.
+        const openclawHome = resolveOpenclawHomeFromConfig()
+          ?? process.env.OPENCLAW_HOME
+          ?? join(homedir(), ".openclaw");
+        const backupDir = api.resolvePath(join(openclawHome, "backups"));
         await mkdir(backupDir, { recursive: true });
 
         const allMemories = await store.list(undefined, undefined, 10000, 0);
