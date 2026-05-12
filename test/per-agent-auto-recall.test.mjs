@@ -58,6 +58,13 @@ function createPluginApiHarness({ pluginConfig, resolveRoot, debugLogs = [] }) {
   return { api, eventHandlers };
 }
 
+function getAutoRecallHook(eventHandlers) {
+  const hooks = eventHandlers.get("before_prompt_build") || [];
+  const autoRecallHook = hooks.find(({ meta }) => meta?.priority === 10)?.handler;
+  assert.equal(typeof autoRecallHook, "function", "expected an auto-recall before_prompt_build hook");
+  return autoRecallHook;
+}
+
 function baseConfig() {
   return {
     embedding: {
@@ -299,9 +306,7 @@ describe("real before_prompt_build hook", () => {
 
     try {
       memoryLanceDBProPlugin.register(harness.api);
-      const hooks = harness.eventHandlers.get("before_prompt_build") || [];
-      assert.equal(hooks.length, 1, "expected one before_prompt_build hook");
-      const [{ handler: autoRecallHook }] = hooks;
+      const autoRecallHook = getAutoRecallHook(harness.eventHandlers);
 
       const output = await autoRecallHook(
         { prompt: "Please recall my preferences.", sessionKey: "agent:main:session:test-main" },

@@ -50,6 +50,7 @@ import {
 import {
   extractReflectionLearningGovernanceCandidates,
   extractInjectableReflectionMappedMemoryItems,
+  isRecallUsed,
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
@@ -71,6 +72,12 @@ import {
   stringifySmartMetadata,
   toLifecycleMemory,
 } from "./src/smart-metadata.js";
+import {
+  computeTier1Patch,
+  isSuppressed as isTier1Suppressed,
+  TIER1_DEFAULT_BAD_RECALL_DECAY_MS,
+  TIER1_DEFAULT_SUPPRESSION_DURATION_MS,
+} from "./src/auto-recall-tier1.js";
 import {
   filterUserMdExclusiveRecallResults,
   isUserMdExclusiveMemory,
@@ -107,6 +114,12 @@ interface PluginConfig {
   autoRecall?: boolean;
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
+  /** If a memory's last auto-recall injection was more than this many ms ago,
+   *  its bad_recall_count is reset to 0 on the next injection. 0 disables decay. Default: 86400000 (24h). */
+  autoRecallBadRecallDecayMs?: number;
+  /** When bad_recall_count reaches the suppression threshold, the memory is
+   *  suppressed from auto-recall for this many ms from now. Default: 1800000 (30min). */
+  autoRecallSuppressionDurationMs?: number;
   autoRecallTimeoutMs?: number;
   autoRecallMaxItems?: number;
   autoRecallMaxChars?: number;
@@ -327,6 +340,22 @@ function parsePositiveInt(value: unknown): number | undefined {
   return undefined;
 }
 
+// Like parsePositiveInt but allows 0. Used for fields where 0 is a meaningful
+// "disabled" sentinel (e.g. autoRecallBadRecallDecayMs=0 disables decay).
+function parseNonNegativeInt(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return Math.floor(value);
+  }
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return undefined;
+    const resolved = resolveEnvVars(s);
+    const n = Number(resolved);
+    if (Number.isFinite(n) && n >= 0) return Math.floor(n);
+  }
+  return undefined;
+}
+
 function clampInt(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, Math.floor(value)));
@@ -452,6 +481,9 @@ const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
+// After /new or /reset, the just-closed session may have generated fresh
+// derived deltas. Keep those out of the immediately opened prompt window.
+const DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS = 120_000;
 const REFLECTION_FALLBACK_MARKER = "(fallback) Reflection generation failed; storing minimal pointer only.";
 const DIAG_BUILD_TAG = "memory-lancedb-pro-diag-20260308-0058";
 
@@ -471,10 +503,39 @@ type ReflectionErrorState = {
   updatedAt: number;
 };
 
+type ReflectionDerivedSuppressionState = {
+  updatedAt: number;
+  until: number;
+  reason: string;
+};
+
 type EmbeddedPiRunner = (params: Record<string, unknown>) => Promise<unknown>;
 
 const requireFromHere = createRequire(import.meta.url);
 let embeddedPiRunnerPromise: Promise<EmbeddedPiRunner> | null = null;
+
+// Circuit breaker for Layer 1: after 3 consecutive failures within 5min, skip Layer 1
+const layer1FailureTimestamps: number[] = [];
+const LAYER1_FAILURE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const LAYER1_FAILURE_THRESHOLD = 3;
+
+/** Reports a Layer 1 runner execution failure. Called by the caller when Layer 1 runner throws. */
+export function reportLayer1Failure(): void {
+  const now = Date.now();
+  layer1FailureTimestamps.push(now);
+  // Keep only failures within the window
+  const cutoff = now - LAYER1_FAILURE_WINDOW_MS;
+  while (layer1FailureTimestamps.length > 0 && layer1FailureTimestamps[0] < cutoff) {
+    layer1FailureTimestamps.shift();
+  }
+}
+
+export function isLayer1CircuitOpen(): boolean {
+  const now = Date.now();
+  const cutoff = now - LAYER1_FAILURE_WINDOW_MS;
+  const recentFailures = layer1FailureTimestamps.filter((t) => t >= cutoff);
+  return recentFailures.length >= LAYER1_FAILURE_THRESHOLD;
+}
 
 export function toImportSpecifier(value: string): string {
   const trimmed = value.trim();
@@ -525,7 +586,27 @@ export function getExtensionApiImportSpecifiers(): string[] {
   return [...new Set(specifiers.filter(Boolean))];
 }
 
-async function loadEmbeddedPiRunner(): Promise<EmbeddedPiRunner> {
+/**
+ * Layer 1: 新 SDK API — api.runtime.agent.runEmbeddedPiAgent (4.22+)
+ * Layer 2: 舊 extensionAPI.js dynamic import（4.24-4.26 SDK 仍保留）
+ * Layer 3: CLI fallback
+ *
+ * 遷移自 Bug 2（Issue #606）：原本只使用 Layer 2，現改為 Try-New-First。
+ */
+// eslint-disable-next-line import/export
+export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<EmbeddedPiRunner> {
+  // Layer 1: 嘗試新 SDK API (with circuit breaker)
+  if (!isLayer1CircuitOpen()) {
+    const newApi = (api as unknown as Record<string, unknown>).runtime?.agent;
+    if (typeof newApi?.runEmbeddedPiAgent === "function") {
+      const runner = newApi.runEmbeddedPiAgent.bind(newApi);
+      // Bug 2 fix: 將 Layer 1 結果寫入 cache，避免後續並發呼叫時 Layer 2 覆蓋掉 Layer 1
+      embeddedPiRunnerPromise ??= Promise.resolve(runner as EmbeddedPiRunner);
+      return embeddedPiRunnerPromise;
+    }
+  }
+
+  // Layer 2: Fallback 舊 extensionAPI.js
   if (!embeddedPiRunnerPromise) {
     embeddedPiRunnerPromise = (async () => {
       const importErrors: string[] = [];
@@ -547,6 +628,7 @@ async function loadEmbeddedPiRunner(): Promise<EmbeddedPiRunner> {
     })();
   }
 
+  // F2 fix: restore retry-on-failure semantics removed in PR716
   try {
     return await embeddedPiRunnerPromise;
   } catch (err) {
@@ -787,6 +869,25 @@ function splitProviderModel(modelRef: string): { provider?: string; model?: stri
     return { provider: provider || undefined, model: model || undefined };
   }
   return { model: s };
+}
+
+
+/**
+ * When modelRef is a bare name (no / prefix), infer provider from baseURL.
+ * Use "." + suffix to prevent fake-minimax.io subdomain spoofing.
+ */
+export function inferProviderFromBaseURL(baseURL: string | undefined): string | undefined {
+  if (!baseURL) return undefined;
+  try {
+    const url = new URL(baseURL);
+    const hostname = url.hostname.toLowerCase();
+    if (hostname.endsWith(".minimax.io")) return "minimax-portal";
+    if (hostname.endsWith(".openai.com")) return "openai";
+    if (hostname.endsWith(".anthropic.com")) return "anthropic";
+    return undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function asNonEmptyString(value: unknown): string | undefined {
@@ -1223,6 +1324,7 @@ async function generateReflectionText(params: {
   thinkLevel: ReflectionThinkLevel;
   toolErrorSignals?: ReflectionErrorSignal[];
   logger?: { info?: (message: string) => void; warn?: (message: string) => void };
+  api: OpenClawPluginApi;  // SDK migration Bug 2: pass api to use new runtime.agent API
 }): Promise<{ text: string; usedFallback: boolean; promptHash: string; error?: string; runner: "embedded" | "cli" | "fallback" }> {
   const prompt = buildReflectionPrompt(
     params.conversation,
@@ -1249,9 +1351,22 @@ async function generateReflectionText(params: {
       retryState,
       onLog: onRetryLog,
       execute: async () => {
-        const runEmbeddedPiAgent = await loadEmbeddedPiRunner();
-        const modelRef = resolveAgentPrimaryModelRef(params.cfg, params.agentId);
-        const { provider, model } = modelRef ? splitProviderModel(modelRef) : {};
+        const runEmbeddedPiAgent = await loadEmbeddedPiRunner(params.api);
+        const cfg = params.cfg as Record<string, unknown>;
+        const llmConfig = cfg?.llm as Record<string, unknown> | undefined;
+        const modelRefFromConfig = llmConfig?.model;
+
+        // Model resolution chain: agent-specific primary model ref > global llm.model fallback.
+        // The typeof guard ensures a non-string value (e.g. number) does not reach splitProviderModel as-is.
+        const modelRef =
+          (resolveAgentPrimaryModelRef(params.cfg, params.agentId) as string | undefined)
+          ?? (typeof modelRefFromConfig === "string" ? modelRefFromConfig : undefined);
+
+        // Provider resolution chain: parsed from modelRef (e.g. "minimax/MiniMax-M2.7") > inferred from baseURL.
+        // inferProviderFromBaseURL uses .endsWith(".suffix") to prevent subdomain spoofing.
+        const split = modelRef ? splitProviderModel(modelRef) : { provider: undefined, model: undefined };
+        const provider = split.provider ?? inferProviderFromBaseURL(llmConfig?.baseURL as string | undefined);
+        const model = split.model;
         const embeddedTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
 
         return await withTimeout(
@@ -1293,6 +1408,8 @@ async function generateReflectionText(params: {
       reflectionText = typeof firstWithText?.text === "string" ? firstWithText.text.trim() : null;
     }
   } catch (err) {
+    // F1 fix: report Layer 1 runner execution failure to open circuit breaker
+    reportLayer1Failure();
     errors.push(`embedded: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
   } finally {
     await unlink(tempSessionFile).catch(() => { });
@@ -1673,9 +1790,14 @@ function createAdmissionRejectionAuditWriter(
     return null;
   }
 
-  const filePath = api.resolvePath(
-    resolveRejectedAuditFilePath(resolvedDbPath, config.admissionControl),
-  );
+  const rawPath = resolveRejectedAuditFilePath(resolvedDbPath, config.admissionControl);
+  // Cross-platform absolute-path check: detects POSIX (/path), Windows drive
+  // letter (C:\, C:/), and UNC paths (\\server\share). Only calls api.resolvePath()
+  // for relative paths; absolute paths pass through unchanged.
+  const isAbsolute = rawPath.startsWith("/") ||
+    (process.platform === "win32" && /^[a-zA-Z]:[/\\]/.test(rawPath)) ||
+    (process.platform === "win32" && /^\\{2}[^\\]+\\[^\\]+/.test(rawPath));
+  const filePath = isAbsolute ? rawPath : api.resolvePath(rawPath);
 
   return async (entry: AdmissionRejectionAuditEntry) => {
     try {
@@ -1713,6 +1835,21 @@ const pluginVersion = getPluginVersion();
 // Using WeakSet instead of a module-level boolean avoids the "second register() call skips
 // hook/tool registration for the new API instance" regression that rwmjhb identified.
 let _registeredApis = new WeakSet<OpenClawPluginApi>();
+
+// Dual-track registration: alongside WeakSet (GC-safe), use a Map for explicit
+// rollback tracking and test inspection. WeakSet handles GC safety; Map provides
+// manual clearability and _getRegisteredApisForTest() export.
+// Track: _registeredApisMap (explicit claim/rollback) + _registeredApis (WeakSet guard)
+let _registeredApisMap = new Map<OpenClawPluginApi, boolean>();
+
+/**
+ * Returns the internal registration Map — for unit test inspection only.
+ * Do NOT mutate from outside the plugin.
+ * @public (test API)
+ */
+export function _getRegisteredApisForTest(): Map<OpenClawPluginApi, boolean> {
+  return _registeredApisMap;
+}
 
 // ============================================================================
 // Hook Event Deduplication (Phase 1)
@@ -1753,6 +1890,18 @@ function _dedupHookEvent(handlerName: string, event: any): boolean {
   return false; // first occurrence — proceed
 }
 
+function getCommandActionName(action: unknown): string {
+  if (typeof action !== "string") return "";
+  const normalized = action.trim().toLowerCase();
+  if (!normalized) return "";
+  return normalized.split(":").pop() || normalized;
+}
+
+function isSessionBoundaryReflectionAction(action: unknown): boolean {
+  const name = getCommandActionName(action);
+  return name === "new" || name === "reset";
+}
+
 // ============================================================================
 // Phase 2 — Singleton State Management (PR #598)
 // ============================================================================
@@ -1772,6 +1921,7 @@ interface PluginSingletonState {
   // Session Maps — persist across scope refreshes instead of being recreated
   reflectionErrorStateBySession: Map<string, ReflectionErrorState>;
   reflectionDerivedBySession: Map<string, { updatedAt: number; derived: string[] }>;
+  reflectionDerivedSuppressionBySession: Map<string, ReflectionDerivedSuppressionState>;
   reflectionByAgentCache: Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>;
   recallHistory: Map<string, Map<string, number>>;
   turnCounter: Map<string, number>;
@@ -1910,6 +2060,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   // Session Maps — MUST be in singleton state so they persist across scope refreshes
   const reflectionErrorStateBySession = new Map<string, ReflectionErrorState>();
   const reflectionDerivedBySession = new Map<string, { updatedAt: number; derived: string[] }>();
+  const reflectionDerivedSuppressionBySession = new Map<string, ReflectionDerivedSuppressionState>();
   const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
   const recallHistory = new Map<string, Map<string, number>>();
   const turnCounter = new Map<string, number>();
@@ -1938,6 +2089,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     extractionRateLimiter,
     reflectionErrorStateBySession,
     reflectionDerivedBySession,
+    reflectionDerivedSuppressionBySession,
     reflectionByAgentCache,
     recallHistory,
     turnCounter,
@@ -2003,21 +2155,24 @@ const memoryLanceDBProPlugin = {
     //   - Memory heap growth from repeated resource creation (~9 calls/process)
     //   - Accumulated session Maps being lost on re-registration
     //
-    // IMPORTANT: _registeredApis.add(api) is called AFTER successful init.
-    // This ensures that if _initPluginState throws, the api is NOT in the
-    // WeakSet, allowing a subsequent register() call with the same api to retry.
-    // (The old placement — before init — caused permanent breakage on init failure.)
+    // Dual-track claim: we record registration BEFORE attempting init so that
+    // if init fails, we can explicitly roll back the Map entry — enabling a
+    // subsequent register() retry with the same API object.
+    //   - _registeredApis (WeakSet): GC-safe singleton guard (Phase 2 guard)
+    //   - _registeredApisMap (Map): explicit claim/rollback for test inspection
     // ========================================================================
+    _registeredApis.add(api);    // claim before init (Phase 2 singleton guard)
+    _registeredApisMap.set(api, true);  // dual-track: explicit claim for rollback
     let singleton: typeof _singletonState;
     try {
       if (!_singletonState) { _singletonState = _initPluginState(api); }
       singleton = _singletonState;
     } catch (err) {
       api.logger.error(`memory-lancedb-pro: _initPluginState failed — ${String(err)}`);
+      _registeredApis.delete(api);         // dual-track rollback: WeakSet un-claim
+      _registeredApisMap.delete(api);     // dual-track rollback: Map un-claim
       throw err;
     }
-    _registeredApis.add(api);
-
     const {
       config,
       resolvedDbPath,
@@ -2032,6 +2187,7 @@ const memoryLanceDBProPlugin = {
       extractionRateLimiter,
       reflectionErrorStateBySession,
       reflectionDerivedBySession,
+      reflectionDerivedSuppressionBySession,
       reflectionByAgentCache,
       recallHistory,
       turnCounter,
@@ -2166,8 +2322,14 @@ const memoryLanceDBProPlugin = {
           reflectionDerivedBySession.delete(key);
         }
       }
+      for (const [key, state] of reflectionDerivedSuppressionBySession.entries()) {
+        if (now > state.until || now - state.updatedAt > DEFAULT_REFLECTION_SESSION_TTL_MS) {
+          reflectionDerivedSuppressionBySession.delete(key);
+        }
+      }
       pruneOldestByUpdatedAt(reflectionErrorStateBySession, DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS);
       pruneOldestByUpdatedAt(reflectionDerivedBySession, DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS);
+      pruneOldestByUpdatedAt(reflectionDerivedSuppressionBySession, DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS);
     };
 
     const getReflectionErrorState = (sessionKey: string): ReflectionErrorState => {
@@ -2249,6 +2411,17 @@ const memoryLanceDBProPlugin = {
       reflectionByAgentCache.set(cacheKey, next);
       return next;
     };
+
+    // ========================================================================
+    // Proposal A Phase 1: Recall Usage Tracking Hooks
+    // ========================================================================
+    // Track pending recalls per session for usage scoring
+    type PendingRecallEntry = {
+      recallIds: string[];
+      responseText: string;
+      injectedAt: number;
+    };
+    const pendingRecall = new Map<string, PendingRecallEntry>();
 
     const logReg = isCliRegistrationMode(api) ? api.logger.debug : api.logger.info;
     logReg(
@@ -2531,6 +2704,8 @@ const memoryLanceDBProPlugin = {
         // (embedding → rerank → lifecycle), which can silently drop messages on
         // channels like Telegram when subsequent requests hit lock timeouts.
         // See: https://github.com/CortexReach/memory-lancedb-pro/issues/253
+        let autoRecallTimedOut = false;
+        let lateAutoRecallLogged = false;
         const recallWork = async (): Promise<{ prependContext: string } | undefined> => {
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
@@ -2539,6 +2714,16 @@ const memoryLanceDBProPlugin = {
             return undefined;
           }
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
+          const shouldDropLateAutoRecall = (stage: string): boolean => {
+            if (!autoRecallTimedOut) return false;
+            if (!lateAutoRecallLogged) {
+              lateAutoRecallLogged = true;
+              api.logger.warn?.(
+                `memory-lancedb-pro: dropping late auto-recall result after timeout at ${stage} for agent ${agentId}`,
+              );
+            }
+            return true;
+          };
 
           // Use cached raw user message for the recall query to avoid channel
           // metadata noise (e.g. Slack's Conversation info JSON with message_id,
@@ -2579,6 +2764,8 @@ const memoryLanceDBProPlugin = {
             scopeFilter: accessibleScopes,
             source: "auto-recall",
           }), config.workspaceBoundary);
+
+          if (shouldDropLateAutoRecall("post-retrieve")) return;
 
           if (results.length === 0) {
             return;
@@ -2636,7 +2823,7 @@ const memoryLanceDBProPlugin = {
               api.logger.debug(`memory-lancedb-pro: governance: filtered id=${r.entry.id} reason=layer(${meta.memory_layer}) score=${r.score?.toFixed(3)} text=${r.entry.text.slice(0, 50)}`);
               return false;
             }
-            if (meta.suppressed_until_turn > 0 && currentTurn <= meta.suppressed_until_turn) {
+            if (isTier1Suppressed(meta, Date.now())) {
               suppressedFilteredCount++;
               return false;
             }
@@ -2751,6 +2938,8 @@ const memoryLanceDBProPlugin = {
             return;
           }
 
+          if (shouldDropLateAutoRecall("pre-metadata")) return;
+
           if (minRepeated > 0) {
             const sessionHistory = recallHistory.get(sessionId) || new Map<string, number>();
             for (const item of selected) {
@@ -2760,34 +2949,25 @@ const memoryLanceDBProPlugin = {
           }
 
           const injectedAt = Date.now();
+          const tier1PatchOpts = {
+            injectedAt,
+            badRecallDecayMs:
+              config.autoRecallBadRecallDecayMs ?? TIER1_DEFAULT_BAD_RECALL_DECAY_MS,
+            suppressionDurationMs:
+              config.autoRecallSuppressionDurationMs ?? TIER1_DEFAULT_SUPPRESSION_DURATION_MS,
+            minRepeated,
+          };
           await Promise.allSettled(
-            selected.map(async (item) => {
-              const meta = item.meta;
-              const staleInjected =
-                typeof meta.last_injected_at === "number" &&
-                meta.last_injected_at > 0 &&
-                (
-                  typeof meta.last_confirmed_use_at !== "number" ||
-                  meta.last_confirmed_use_at < meta.last_injected_at
-                );
-              const nextBadRecallCount = staleInjected
-                ? meta.bad_recall_count + 1
-                : meta.bad_recall_count;
-              const shouldSuppress = nextBadRecallCount >= 3 && minRepeated > 0;
-              await store.patchMetadata(
+            selected.map(async (item) =>
+              store.patchMetadata(
                 item.id,
-                {
-                  injected_count: meta.injected_count + 1,
-                  last_injected_at: injectedAt,
-                  bad_recall_count: nextBadRecallCount,
-                  suppressed_until_turn: shouldSuppress
-                    ? Math.max(meta.suppressed_until_turn, currentTurn + minRepeated)
-                    : meta.suppressed_until_turn,
-                },
+                computeTier1Patch(item.meta, tier1PatchOpts),
                 accessibleScopes,
-              );
-            }),
+              ),
+            ),
           );
+
+          if (shouldDropLateAutoRecall("pre-context")) return;
 
           const memoryContext = selected.map((item) => item.line).join("\n");
 
@@ -2800,6 +2980,17 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: injecting ${selected.length} memories into context for agent ${agentId}`,
           );
 
+          // Create or update pendingRecall for this turn so the feedback hook
+          // (which runs in the NEXT turn's before_prompt_build after agent_end)
+          // sees a matching pair: Turn N recallIds + Turn N responseText.
+          // agent_end will write responseText into this same pendingRecall
+          // entry (only updating responseText, never clearing recallIds).
+          const sessionKeyForRecall = ctx?.sessionKey || ctx?.sessionId || "default";
+          pendingRecall.set(sessionKeyForRecall, {
+            recallIds: selected.map((item) => item.id),
+            responseText: "", // Will be populated by agent_end
+            injectedAt: Date.now(),
+          });
           return {
             prependContext:
               `<relevant-memories>\n` +
@@ -2821,6 +3012,7 @@ const memoryLanceDBProPlugin = {
             recallWork().then((r) => { clearTimeout(timeoutId); return r; }),
             new Promise<undefined>((resolve) => {
               timeoutId = setTimeout(() => {
+                autoRecallTimedOut = true;
                 api.logger.warn(
                   `memory-lancedb-pro: auto-recall timed out after ${AUTO_RECALL_TIMEOUT_MS}ms; skipping memory injection to avoid stalling agent startup`,
                 );
@@ -2956,14 +3148,14 @@ const memoryLanceDBProPlugin = {
           }
 
           const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
-          // issue #417 Fix #4: cumulative counting — increment not overwrite
-          const cumulativeCount = previousSeenCount + 1;
           let newTexts = eligibleTexts;
           if (pendingIngressTexts.length > 0) {
             newTexts = pendingIngressTexts;
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
           }
+          // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
+          const cumulativeCount = previousSeenCount + newTexts.length;
           autoCaptureSeenTextCount.set(sessionKey, cumulativeCount);
           pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
 
@@ -3056,9 +3248,9 @@ const memoryLanceDBProPlugin = {
               );
               return;
             }
-            if (cleanTexts.length >= minMessages) {
+            if (cumulativeCount >= minMessages) {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (${cleanTexts.length} clean texts >= ${minMessages}, cumulative=${cumulativeCount})`,
+                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
               const conversationText = cleanTexts.join("\n");
               // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
@@ -3085,18 +3277,23 @@ const memoryLanceDBProPlugin = {
                 return; // Smart extraction handled everything
               }
 
-              if ((stats.boundarySkipped ?? 0) > 0) {
+              if ((stats.boundarySkipped ?? 0) === 0) {
                 api.logger.info(
-                  `memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`,
+                  `memory-lancedb-pro: smart extraction produced no candidates and no boundary texts for agent ${agentId}; skipping regex fallback`,
                 );
+                return;
               }
+
+              api.logger.info(
+                `memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`,
+              );
 
               api.logger.info(
                 `memory-lancedb-pro: smart extraction produced no persisted memories for agent ${agentId} (created=${stats.created}, merged=${stats.merged}, skipped=${stats.skipped}); falling back to regex capture`,
               );
             } else {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (${cleanTexts.length} < ${minMessages}, cumulative=${cumulativeCount})`,
+                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (cumulative=${cumulativeCount} < minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
             }
           }
@@ -3125,8 +3322,13 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: regex fallback found ${toCapture.length} capturable text(s) for agent ${agentId}`,
           );
 
-          // Store each capturable piece (limit to 2 per conversation)
-          let stored = 0;
+          // FIX #675: Collect entries and use bulkStore() once (1 lock instead of N).
+          // Limit to 2 capturable pieces per conversation.
+          const capturedEntries: Array<{
+            text: string; vector: number[]; importance: number;
+            category: string; scope: string; metadata: string;
+          }> = [];
+
           for (const text of toCapture.slice(0, 2)) {
             if (isUserMdExclusiveMemory({ text }, config.workspaceBoundary)) {
               api.logger.info(
@@ -3155,13 +3357,34 @@ const memoryLanceDBProPlugin = {
               continue;
             }
 
-            await store.store({
-              text,
-              vector,
-              importance: 0.7,
-              category,
-              scope: defaultScope,
-              metadata: stringifySmartMetadata(
+            // FIX Bug #3 + P1: batch-internal dedup — skip texts whose vector is too similar
+            // to an entry already in capturedEntries.  Uses cosine similarity (not raw dot product)
+            // to be consistent with the DB dedup path which uses vectorSearch().score.
+            let duplicateInBatch = false;
+            for (const prev of capturedEntries) {
+              if (prev.vector.length !== vector.length) continue;
+              let dot = 0;
+              for (let i = 0; i < vector.length; i++) dot += prev.vector[i] * vector[i];
+              // Cosine similarity = dot / (||prev|| * ||vector||); skip if > 0.90.
+              // If either norm is 0 (zero-vector from embedder), cosine falls back to
+              // raw dot (not cosine similarity) — entry will be written (fail-open).
+              const normPrev = Math.sqrt(prev.vector.reduce((s, v) => s + v * v, 0));
+              const normVec = Math.sqrt(vector.reduce((s, v) => s + v * v, 0));
+              const cosine = normPrev > 0 && normVec > 0 ? dot / (normPrev * normVec) : dot;
+              if (cosine > 0.90) { duplicateInBatch = true; break; }
+            }
+            if (duplicateInBatch) {
+              api.logger.info(
+                `memory-lancedb-pro: skipped duplicate-in-batch text for agent ${agentId}: "${text.slice(0, 40)}"`,
+              );
+              continue;
+            }
+
+            // Build metadata; if it fails, skip this entry rather than propagating
+            // the exception and leaving capturedEntries in a partial state.
+            let metadata: string;
+            try {
+              metadata = stringifySmartMetadata(
                 buildSmartMetadata(
                   {
                     text,
@@ -3185,23 +3408,76 @@ const memoryLanceDBProPlugin = {
                     suppressed_until_turn: 0,
                   },
                 ),
-              ),
-            });
-            stored++;
-
-            // Dual-write to Markdown mirror if enabled
-            if (mdMirror) {
-              await mdMirror(
-                { text, category, scope: defaultScope, timestamp: Date.now() },
-                { source: "auto-capture", agentId },
               );
+            } catch (metadataErr) {
+              api.logger.warn(
+                `memory-lancedb-pro: skipped entry whose metadata construction failed: "${text.slice(0, 40)}": ${String(metadataErr)}`,
+              );
+              continue;
             }
+
+            capturedEntries.push({
+              text,
+              vector,
+              importance: 0.7,
+              category,
+              scope: defaultScope,
+              metadata,
+            });
           }
 
-          if (stored > 0) {
-            api.logger.info(
-              `memory-lancedb-pro: auto-captured ${stored} memories for agent ${agentId} in scope ${defaultScope}`,
-            );
+          // FIX #675: bulkStore once (1 lock for N entries) instead of N store.store() calls (N locks).
+          // FIX #Bug-1 (post-Codex-review): mdMirror errors are handled separately and do NOT
+          // trigger the store.store() fallback (which would create duplicate rows).
+          if (capturedEntries.length > 0) {
+            try {
+              await store.bulkStore(capturedEntries);
+              api.logger.info(
+                `memory-lancedb-pro: auto-captured ${capturedEntries.length} memories for agent ${agentId} in scope ${defaultScope} (bulkStore)`,
+              );
+            } catch (err) {
+              api.logger.warn(
+                `memory-lancedb-pro: bulkStore failed for ${capturedEntries.length} entries, falling back to individual store: ${String(err)}`,
+              );
+              // Fallback: store individually, with DB dedup pre-check restored.
+              // Re-check DB dedup in fallback to catch similar entries written by
+              // concurrent requests between the initial check and bulkStore failure.
+              for (const entry of capturedEntries) {
+                let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
+                try {
+                  existing = await store.vectorSearch(entry.vector, 1, 0.1, [entry.scope]);
+                } catch { /* fail-open */ }
+                if (existing.length > 0 && existing[0].score > 0.90) {
+                  api.logger.info(
+                    `memory-lancedb-pro: fallback dedup skipped "${entry.text.slice(0, 40)}"`,
+                  );
+                  continue;
+                }
+                await store.store(entry);
+              }
+              api.logger.info(
+                `memory-lancedb-pro: auto-captured ${capturedEntries.length} memories for agent ${agentId} (individual fallback)`,
+              );
+            }
+
+            // FIX #Bug-1: mdMirror is called AFTER bulkStore succeeds, with its own
+            // error handling. If mdMirror fails, bulkStore is ALREADY committed —
+            // we log the error and continue. We do NOT retry via store.store()
+            // (which would create duplicate rows in LanceDB).
+            if (mdMirror) {
+              for (const entry of capturedEntries) {
+                try {
+                  await mdMirror(
+                    { text: entry.text, category: entry.category, scope: entry.scope, timestamp: Date.now() },
+                    { source: "auto-capture", agentId },
+                  );
+                } catch (mdErr) {
+                  api.logger.warn(
+                    `memory-lancedb-pro: mdMirror failed for entry "${entry.text.slice(0, 40)}…", bulkStore already committed: ${String(mdErr)}`,
+                  );
+                }
+              }
+            }
           }
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: capture failed: ${String(err)}`);
@@ -3213,6 +3489,135 @@ const memoryLanceDBProPlugin = {
 
       api.on("agent_end", agentEndAutoCaptureHook);
     }
+
+    // ========================================================================
+    // Proposal A Phase 1: agent_end hook - Store response text for usage tracking
+    // ========================================================================
+    // NOTE: Only writes responseText to an EXISTING pendingRecall entry created
+    // by before_prompt_build (auto-recall). Does NOT create a new entry.
+    // This ensures recallIds (written by auto-recall in the same turn) and
+    // responseText (written here) remain paired for the feedback hook.
+    api.on("agent_end", (event: any, ctx: any) => {
+      const sessionKey = ctx?.sessionKey || ctx?.sessionId || "default";
+      if (!sessionKey) return;
+
+      // Get the last message content
+      let lastMsgText: string | null = null;
+      if (event.messages && Array.isArray(event.messages)) {
+        const lastMsg = event.messages[event.messages.length - 1];
+        if (lastMsg && typeof lastMsg === "object") {
+          const msgObj = lastMsg as Record<string, unknown>;
+          lastMsgText = extractTextContent(msgObj.content);
+        }
+      }
+
+      // Only update an existing pendingRecall entry — do NOT create one.
+      // This preserves recallIds written by auto-recall earlier in this turn.
+      const existing = pendingRecall.get(sessionKey);
+      if (existing && lastMsgText && lastMsgText.trim().length > 0) {
+        existing.responseText = lastMsgText;
+      }
+    }, { priority: 20 });
+
+    // ========================================================================
+    // Proposal A Phase 1: before_prompt_build hook (priority 5) - Score recalls
+    // ========================================================================
+    api.on("before_prompt_build", async (event: any, ctx: any) => {
+      const sessionKey = ctx?.sessionKey || ctx?.sessionId || "default";
+      const pending = pendingRecall.get(sessionKey);
+      if (!pending) return;
+
+      // Guard: only score if responseText has substantial content
+      const responseText = pending.responseText;
+      if (!responseText || responseText.length <= 24) {
+        // Skip scoring for empty or very short responses
+        return;
+      }
+
+      // Guard: skip if no recall IDs (shouldn't happen but be safe)
+      if (!pending.recallIds || pending.recallIds.length === 0) {
+        return;
+      }
+
+      // TTL cleanup: evict stale entries older than 10 minutes to prevent
+      // unbounded Map growth when session_end never fires (crash, SIGKILL, etc.)
+      const now = Date.now();
+      const PENDING_RECALL_TTL_MS = 10 * 60 * 1000;
+      if (pending.injectedAt && now - pending.injectedAt > PENDING_RECALL_TTL_MS) {
+        pendingRecall.delete(sessionKey);
+        return;
+      }
+
+      // Determine if any recalled memory was actually used in the response.
+      // Uses keyword-based usage heuristic (see isRecallUsed in reflection-slices.ts).
+      const usedRecall = isRecallUsed(responseText, pending.recallIds);
+
+      // Score each recalled memory - update importance based on usage
+      try {
+        for (const recallId of pending.recallIds) {
+          // Use store.getById to retrieve the real entry so we get the actual
+          // importance value, instead of calling parseSmartMetadata with empty
+          // placeholder metadata.
+          const entry = await store.getById(recallId, undefined);
+          if (!entry) continue;
+          const meta = parseSmartMetadata(entry.metadata, entry);
+
+          if (usedRecall) {
+            // Recall was used - increase importance (cap at 1.0).
+            // Use store.update to directly update the row-level importance
+            // column. patchMetadata only updates the metadata JSON blob but
+            // NOT the entry.importance field, so importance changes would never
+            // affect ranking (applyImportanceWeight reads entry.importance).
+            const newImportance = Math.min(1.0, (meta.importance || 0.5) + 0.05);
+            await store.update(
+              recallId,
+              { importance: newImportance },
+              undefined,
+            );
+            // Also update metadata JSON fields via patchMetadata (separate concern)
+            await store.patchMetadata(
+              recallId,
+              { last_confirmed_use_at: Date.now() },
+              undefined,
+            );
+          } else {
+            // Recall was not used - increment bad_recall_count
+            const badCount = (meta.bad_recall_count || 0) + 1;
+            let newImportance = meta.importance || 0.5;
+            // Apply penalty after threshold (3 consecutive unused)
+            if (badCount >= 3) {
+              newImportance = Math.max(0.1, newImportance - 0.03);
+            }
+            await store.update(
+              recallId,
+              { importance: newImportance },
+              undefined,
+            );
+            await store.patchMetadata(
+              recallId,
+              { bad_recall_count: badCount },
+              undefined,
+            );
+          }
+        }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: recall usage scoring failed: ${String(err)}`);
+      }
+
+      // Clean up the pendingRecall entry after scoring to prevent re-scoring
+      // the same recallIds on subsequent turns (C3 / Codex P2 fix).
+      pendingRecall.delete(sessionKey);
+    }, { priority: 5 });
+
+    // ========================================================================
+    // Proposal A Phase 1: session_end hook - Clean up pending recalls
+    // ========================================================================
+    api.on("session_end", (_event: any, ctx: any) => {
+      const sessionKey = ctx?.sessionKey || ctx?.sessionId || "default";
+      if (sessionKey) {
+        pendingRecall.delete(sessionKey);
+      }
+    }, { priority: 20 });
 
     // ========================================================================
     // Integrated Self-Improvement (inheritance + derived)
@@ -3374,6 +3779,15 @@ const memoryLanceDBProPlugin = {
         if (!sessionKey) return;
         pruneReflectionSessionState();
 
+        if (event.toolName === "exec") {
+          const resultTextRaw = extractTextFromToolResult(event.result);
+          const exitCodeMatch = resultTextRaw.match(
+            /(?:\bexit(?:\s+code)?|Command\s+exited)\s*[;:\s](\d+)\b/i
+          );
+          const actualExitCode = exitCodeMatch ? parseInt(exitCodeMatch[1], 10) : -1;
+          if (actualExitCode === 0) { return; }
+        }
+
         if (typeof event.error === "string" && event.error.trim().length > 0) {
           const signature = normalizeErrorSignature(event.error);
           addReflectionErrorSignal(sessionKey, {
@@ -3455,20 +3869,29 @@ const memoryLanceDBProPlugin = {
         const blocks: string[] = [];
         if (reflectionInjectMode === "inheritance+derived") {
           try {
-            const scopes = resolveScopeFilter(scopeManager, agentId);
-            const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
-            const derivedLines = derivedCache?.derived?.length
-              ? derivedCache.derived
-              : (await loadAgentReflectionSlices(agentId, scopes)).derived;
-            if (derivedLines.length > 0) {
-              blocks.push(
-                [
-                  "<derived-focus>",
-                  "Weighted recent derived execution deltas from reflection memory:",
-                  ...derivedLines.slice(0, 6).map((line, i) => `${i + 1}. ${line}`),
-                  "</derived-focus>",
-                ].join("\n")
+            const now = Date.now();
+            const suppression = sessionKey ? reflectionDerivedSuppressionBySession.get(sessionKey) : undefined;
+            if (suppression && suppression.until > now) {
+              api.logger.debug?.(
+                `memory-reflection: derived injection suppressed after ${suppression.reason} for sessionKey=${sessionKey}`,
               );
+            } else {
+              if (suppression) reflectionDerivedSuppressionBySession.delete(sessionKey);
+              const scopes = resolveScopeFilter(scopeManager, agentId);
+              const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
+              const derivedLines = derivedCache?.derived?.length
+                ? derivedCache.derived
+                : (await loadAgentReflectionSlices(agentId, scopes)).derived;
+              if (derivedLines.length > 0) {
+                blocks.push(
+                  [
+                    "<derived-focus>",
+                    "Weighted recent derived execution deltas from reflection memory:",
+                    ...derivedLines.slice(0, 6).map((line, i) => `${i + 1}. ${line}`),
+                    "</derived-focus>",
+                  ].join("\n")
+                );
+              }
             }
           } catch (err) {
             api.logger.warn(`memory-reflection: derived injection failed: ${String(err)}`);
@@ -3499,6 +3922,7 @@ const memoryLanceDBProPlugin = {
         if (!sessionKey) return;
         reflectionErrorStateBySession.delete(sessionKey);
         reflectionDerivedBySession.delete(sessionKey);
+        reflectionDerivedSuppressionBySession.delete(sessionKey);
         pruneReflectionSessionState();
       }, { priority: 20 });
 
@@ -3526,6 +3950,7 @@ const memoryLanceDBProPlugin = {
 
       const runMemoryReflection = async (event: any) => {
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
+        const action = String(event?.action || "unknown");
 
         // Validate sessionKey BEFORE dedup — invalid/empty keys must NOT pollute the dedup set
         if (!sessionKey) {
@@ -3534,6 +3959,15 @@ const memoryLanceDBProPlugin = {
         }
 
         if (_dedupHookEvent("reflection", event)) return;
+        if (isSessionBoundaryReflectionAction(action)) {
+          const now = Date.now();
+          reflectionDerivedBySession.delete(sessionKey);
+          reflectionDerivedSuppressionBySession.set(sessionKey, {
+            updatedAt: now,
+            until: now + DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS,
+            reason: action,
+          });
+        }
         // Guard against re-entrant calls for the same session (e.g. file-write triggering another command:new)
         // Uses global lock shared across all plugin instances to prevent loop amplification.
         const globalLock = getGlobalReflectionLock();
@@ -3560,7 +3994,6 @@ const memoryLanceDBProPlugin = {
         let reflectionRan = false;
         try {
           pruneReflectionSessionState();
-          const action = String(event?.action || "unknown");
           const workspaceDir = resolveWorkspaceDirFromContext(context);
           if (!cfg) {
             api.logger.warn(`memory-reflection: command:${action} missing cfg in hook context; skip reflection`);
@@ -3669,6 +4102,7 @@ const memoryLanceDBProPlugin = {
             thinkLevel: reflectionThinkLevel,
             toolErrorSignals,
             logger: api.logger,
+            api,  // SDK migration Bug 2: pass api for new runtime.agent API
           });
           api.logger.info(
             `memory-reflection: command:${action} reflection generation done for session ${currentSessionId}; runner=${reflectionGenerated.runner}; usedFallback=${reflectionGenerated.usedFallback ? "yes" : "no"}`
@@ -3839,7 +4273,7 @@ const memoryLanceDBProPlugin = {
                 store.vectorSearch(vector, limit, minScore, scopeFilter),
               store: (entry) => store.store(entry),
             });
-            if (sessionKey && stored.slices.derived.length > 0) {
+            if (sessionKey && stored.slices.derived.length > 0 && !isSessionBoundaryReflectionAction(action)) {
               reflectionDerivedBySession.set(sessionKey, {
                 updatedAt: nowTs,
                 derived: stored.slices.derived,
@@ -3862,6 +4296,15 @@ const memoryLanceDBProPlugin = {
         } finally {
           if (sessionKey) {
             reflectionErrorStateBySession.delete(sessionKey);
+            if (isSessionBoundaryReflectionAction(action)) {
+              const now = Date.now();
+              reflectionDerivedBySession.delete(sessionKey);
+              reflectionDerivedSuppressionBySession.set(sessionKey, {
+                updatedAt: now,
+                until: now + DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS,
+                reason: action,
+              });
+            }
             getGlobalReflectionLock().delete(sessionKey);
             getSerialGuardMap().set(sessionKey, Date.now());
             // NOTE: This guard is tested via inline simulation in
@@ -4008,9 +4451,26 @@ const memoryLanceDBProPlugin = {
 
     async function runBackup() {
       try {
-        const backupDir = api.resolvePath(
-          join(resolvedDbPath, "..", "backups"),
-        );
+        // resolvedDbPath is already absolute (produced by api.resolvePath at
+        // plugin init); wrapping it again triggers api.resolvePath(absolute-path)
+        // → undefined in OpenClaw 2026.4.x strict mode, crashing with:
+        //   TypeError [ERR_INVALID_ARG_TYPE]: The "path" argument must be of type
+        //   string or an instance of Buffer or URL. Received undefined
+        // Guard against undefined first (api.resolvePath returns undefined for
+        // empty-string dbPath config rather than throwing).
+        if (!resolvedDbPath || typeof resolvedDbPath !== "string") {
+          api.logger.warn(
+            `memory-lancedb-pro: backup skipped — resolvedDbPath is "${String(resolvedDbPath)}"`,
+          );
+          return;
+        }
+        const backupDir = join(resolvedDbPath, "..", "backups");
+        if (!backupDir || typeof backupDir !== "string") {
+          api.logger.warn(
+            `memory-lancedb-pro: backup skipped — backupDir resolved to "${String(backupDir)}"`,
+          );
+          return;
+        }
         await mkdir(backupDir, { recursive: true });
 
         const allMemories = await store.list(undefined, undefined, 10000, 0);
@@ -4272,6 +4732,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecall: cfg.autoRecall === true,
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated) ?? 8,
+    // 0 is a meaningful sentinel for both Tier 1 knobs (disable decay /
+    // collapse suppression to a no-op), so use the non-negative parser.
+    autoRecallBadRecallDecayMs: parseNonNegativeInt(cfg.autoRecallBadRecallDecayMs),
+    autoRecallSuppressionDurationMs: parseNonNegativeInt(cfg.autoRecallSuppressionDurationMs),
     autoRecallMaxItems: parsePositiveInt(cfg.autoRecallMaxItems) ?? 3,
     autoRecallMaxChars: parsePositiveInt(cfg.autoRecallMaxChars) ?? 600,
     autoRecallPerItemMaxChars: parsePositiveInt(cfg.autoRecallPerItemMaxChars) ?? 180,
@@ -4493,6 +4957,7 @@ export { getDefaultMdMirrorDir };
  */
 export function resetRegistration() {
   _registeredApis = new WeakSet<OpenClawPluginApi>();
+  _registeredApisMap.clear();  // dual-track: clear Map alongside WeakSet
   _singletonState = null;
   _hookEventDedup.clear();
 }

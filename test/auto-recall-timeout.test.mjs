@@ -1,0 +1,227 @@
+import { describe, it, beforeEach, afterEach } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import jitiFactory from "jiti";
+
+const testDir = path.dirname(fileURLToPath(import.meta.url));
+const pluginSdkStubPath = path.resolve(testDir, "helpers", "openclaw-plugin-sdk-stub.mjs");
+const jiti = jitiFactory(import.meta.url, {
+  interopDefault: true,
+  alias: {
+    "openclaw/plugin-sdk": pluginSdkStubPath,
+  },
+});
+
+const retrieverModuleForMock = jiti("../src/retriever.js");
+const embedderModuleForMock = jiti("../src/embedder.js");
+const storeModuleForMock = jiti("../src/store.js");
+const origCreateRetriever = retrieverModuleForMock.createRetriever;
+const origCreateEmbedder = embedderModuleForMock.createEmbedder;
+let activeCreateRetriever = origCreateRetriever;
+let activeCreateEmbedder = origCreateEmbedder;
+
+retrieverModuleForMock.createRetriever = (...args) => activeCreateRetriever(...args);
+embedderModuleForMock.createEmbedder = (...args) => activeCreateEmbedder(...args);
+
+const pluginModule = jiti("../index.ts");
+const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
+const resetRegistration = pluginModule.resetRegistration ?? (() => {});
+const { MemoryStore } = storeModuleForMock;
+const origPatchMetadata = MemoryStore.prototype.patchMetadata;
+
+function createPluginApiHarness({ pluginConfig, resolveRoot, logs }) {
+  const eventHandlers = new Map();
+  const logSink = logs ?? { info: [], warn: [], debug: [] };
+
+  const api = {
+    pluginConfig,
+    resolvePath(target) {
+      if (typeof target !== "string") return target;
+      if (path.isAbsolute(target)) return target;
+      return path.join(resolveRoot, target);
+    },
+    logger: {
+      info(message) {
+        logSink.info.push(String(message));
+      },
+      warn(message) {
+        logSink.warn.push(String(message));
+      },
+      debug(message) {
+        logSink.debug.push(String(message));
+      },
+    },
+    registerTool() {},
+    registerCli() {},
+    registerService() {},
+    on(eventName, handler, meta) {
+      const list = eventHandlers.get(eventName) || [];
+      list.push({ handler, meta });
+      eventHandlers.set(eventName, list);
+    },
+    registerHook(eventName, handler, opts) {
+      const list = eventHandlers.get(eventName) || [];
+      list.push({ handler, meta: opts });
+      eventHandlers.set(eventName, list);
+    },
+  };
+
+  return { api, eventHandlers };
+}
+
+function getAutoRecallHook(eventHandlers) {
+  const hooks = eventHandlers.get("before_prompt_build") || [];
+  const autoRecallHook = hooks.find(({ meta }) => meta?.priority === 10)?.handler;
+  assert.equal(typeof autoRecallHook, "function", "expected an auto-recall before_prompt_build hook");
+  return autoRecallHook;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function makeConfirmedMetadata() {
+  return JSON.stringify({
+    state: "confirmed",
+    memory_layer: "active",
+    injected_count: 0,
+    bad_recall_count: 0,
+    suppressed_until_turn: 0,
+  });
+}
+
+function makeResults() {
+  return [
+    {
+      entry: {
+        id: "m1",
+        text: "remember this",
+        category: "fact",
+        scope: "global",
+        importance: 0.7,
+        timestamp: Date.now(),
+        metadata: makeConfirmedMetadata(),
+      },
+      score: 0.82,
+      sources: {
+        vector: { score: 0.82, rank: 1 },
+        bm25: { score: 0.88, rank: 2 },
+      },
+    },
+    {
+      entry: {
+        id: "m2",
+        text: "prefer concise diffs",
+        category: "preference",
+        scope: "global",
+        importance: 0.8,
+        timestamp: Date.now(),
+        metadata: makeConfirmedMetadata(),
+      },
+      score: 0.77,
+      sources: {
+        vector: { score: 0.77, rank: 2 },
+        bm25: { score: 0.71, rank: 3 },
+      },
+    },
+  ];
+}
+
+describe("auto-recall timeout", () => {
+  let workspaceDir;
+
+  beforeEach(() => {
+    workspaceDir = mkdtempSync(path.join(tmpdir(), "auto-recall-timeout-"));
+    activeCreateRetriever = origCreateRetriever;
+    activeCreateEmbedder = origCreateEmbedder;
+    MemoryStore.prototype.patchMetadata = origPatchMetadata;
+    resetRegistration();
+  });
+
+  afterEach(() => {
+    activeCreateRetriever = origCreateRetriever;
+    activeCreateEmbedder = origCreateEmbedder;
+    retrieverModuleForMock.createRetriever = origCreateRetriever;
+    embedderModuleForMock.createEmbedder = origCreateEmbedder;
+    MemoryStore.prototype.patchMetadata = origPatchMetadata;
+    resetRegistration();
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  it("drops late auto-recall results after the timeout", async () => {
+    const logs = { info: [], warn: [], debug: [] };
+    let patchMetadataCalls = 0;
+
+    activeCreateRetriever = function mockCreateRetriever() {
+      return {
+        async retrieve() {
+          await delay(25);
+          return makeResults();
+        },
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+    activeCreateEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() {
+          return new Float32Array(384).fill(0);
+        },
+        async embedPassage() {
+          return new Float32Array(384).fill(0);
+        },
+      };
+    };
+
+    MemoryStore.prototype.patchMetadata = async () => {
+      patchMetadataCalls++;
+    };
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      logs,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: true,
+        autoRecallMinLength: 1,
+        autoRecallTimeoutMs: 1,
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+
+    const autoRecallHook = getAutoRecallHook(harness.eventHandlers);
+    const output = await autoRecallHook(
+      { prompt: "Please recall what I mentioned before about this task." },
+      { sessionId: "auto-timeout", sessionKey: "agent:main:session:auto-timeout", agentId: "main" },
+    );
+
+    assert.equal(output, undefined);
+    await delay(75);
+
+    assert.equal(patchMetadataCalls, 0, "late recall should not update injection metadata");
+    assert.ok(
+      logs.warn.some((line) => line.includes("auto-recall timed out after 1ms")),
+      "expected timeout warning",
+    );
+    assert.ok(
+      logs.warn.some((line) => line.includes("dropping late auto-recall result after timeout")),
+      "expected late-result drop warning",
+    );
+    assert.equal(
+      logs.info.some((line) => /injecting \d+ memories into context/.test(line)),
+      false,
+      "late recall should not log a context injection",
+    );
+  });
+});
