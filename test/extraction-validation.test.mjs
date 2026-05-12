@@ -475,4 +475,64 @@ describe("Issue #693: Extraction write validation", () => {
     assert.strictEqual(statsC.created, 1, "T7c: normal extraction completed");
   });
 
+  // --------------------------------------------------------------------------
+  // T8: Negative mismatch (over-write) — actual > expected
+  // --------------------------------------------------------------------------
+  it("T8: negative mismatch logs WARNING and never throws", async () => {
+    const embedder = makeDeterministicEmbedder();
+    const llm = makeLlm([{
+      category: "events", abstract: "User attended sprint planning for Q3",
+      overview: "Planning", content: "Sprint planning session attended." }]);
+    const store = makeStore({ initialCount: 3 });
+    const extractor = makeExtractor(embedder, llm, store);
+
+    const originalCount = store.count.bind(store);
+    store.count = async () => (await originalCount()) + 2;
+
+    let callbackInvoked = false;
+    let receivedMismatch = null;
+    const stats = await extractor.extractAndPersist(
+      "User said: sprint planning", "session-t8",
+      {
+        abortOnExtractionMismatch: true,
+        onExtractionValidationFailed(validation) {
+          callbackInvoked = true;
+          receivedMismatch = validation.mismatch;
+        },
+      },
+    );
+
+    assert.strictEqual(callbackInvoked, true, "T8: callback invoked for negative mismatch");
+    assert.ok(receivedMismatch < 0, "T8: mismatch should be negative");
+    assert.strictEqual(stats.created, 1, "T8: extraction completed");
+  });
+
+  // --------------------------------------------------------------------------
+  // T9: Callback throws — extraction should complete
+  // --------------------------------------------------------------------------
+  it("T9: callback throwing does not abort extraction", async () => {
+    const embedder = makeDeterministicEmbedder();
+    const llm = makeLlm([
+      { category: "preferences", abstract: "User prefers dark mode", overview: "Display", content: "Dark mode." },
+      { category: "preferences", abstract: "User prefers quiet workspace", overview: "Workspace", content: "Quiet." },
+    ]);
+    const store = makeStore({ initialCount: 0, dropLastN: 1 });
+    const extractor = makeExtractor(embedder, llm, store);
+
+    let callbackThrew = false;
+    const stats = await extractor.extractAndPersist(
+      "User preferences", "session-t9",
+      {
+        onExtractionValidationFailed() {
+          callbackThrew = true;
+          throw new Error("callback threw");
+        },
+      },
+    );
+
+    assert.strictEqual(callbackThrew, true, "T9: callback was invoked and threw");
+    assert.strictEqual(stats.created, 2, "T9: stats shows 2 candidates");
+    assert.strictEqual(store.rowCount, 1, "T9: store has 1 entry despite mismatch");
+  });
+
 });

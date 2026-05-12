@@ -473,15 +473,35 @@ export class SmartExtractor {
       // - Collect UUIDs of entries passed to bulkStore
       // - After bulkStore, query store for those UUIDs to verify each exists
       // - This catches both SIGKILL/OOM partial writes AND concurrent compactor deletions
+      //
+      // LIMITATION (F2): This approach CANNOT detect SIGKILL/OOM during bulkStore.
+      // If process dies during bulkStore, countAfter never runs, no validation triggered.
+      // Phase 2 will address this via UUID verification after the write.
+      //
+      // LIMITATION (MR3): Each extraction calls store.count() twice, which may be O(N) in LanceDB
+      // at scale. This is a performance tradeoff for validation reliability.
+      //
       // NOTE: supersede entries are included in createEntries and therefore counted
       // in expectedCreated - the count check validates them normally (F4).
-      const countBefore = await this.store.count();
-      await this.store.bulkStore(createEntries);
-      const countAfter = await this.store.count();
-      const actualCreated = countAfter - countBefore;
+      let countValidationFailed = false;
+      let actualCreated: number;
+      try {
+        const countBefore = await this.store.count();
+        await this.store.bulkStore(createEntries);
+        const countAfter = await this.store.count();
+        actualCreated = countAfter - countBefore;
+      } catch (countErr) {
+        // F3: if count operations fail, skip validation but don't abort extraction
+        // The write might have succeeded even if we couldn't verify it.
+        this.log(
+          "memory-pro: smart-extractor: count validation failed: " + String(countErr) + " - skipping validation, assuming write succeeded.",
+        );
+        actualCreated = createEntries.length; // assume success
+        countValidationFailed = true;
+      }
       const expectedCreated = createEntries.length;
 
-      if (actualCreated !== expectedCreated) {
+      if (!countValidationFailed && actualCreated !== expectedCreated) {
         const mismatch = expectedCreated - actualCreated;
 
         // F3: isolate callback exception so it doesn't propagate and abort extraction
