@@ -102,6 +102,21 @@ function clampInt(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.floor(value)));
 }
 
+export function normalizeMemoryTimestamp(value: unknown, fallback = Date.now()): number {
+  const raw = value instanceof Date
+    ? value.getTime()
+    : typeof value === "number"
+      ? value
+      : Number(value);
+
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return fallback;
+  }
+
+  const timestamp = Math.floor(raw);
+  return timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp;
+}
+
 function escapeSqlLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
@@ -852,9 +867,7 @@ export class MemoryStore {
       ...entry,
       scope: entry.scope || "global",
       importance: Number.isFinite(entry.importance) ? entry.importance : 0.7,
-      timestamp: Number.isFinite(entry.timestamp)
-        ? entry.timestamp
-        : Date.now(),
+      timestamp: normalizeMemoryTimestamp(entry.timestamp),
       metadata: entry.metadata || "{}",
     };
 
@@ -908,7 +921,7 @@ export class MemoryStore {
       category: row.category as MemoryEntry["category"],
       scope: rowScope,
       importance: Number(row.importance),
-      timestamp: Number(row.timestamp),
+      timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
       metadata: (row.metadata as string) || "{}",
     };
   }
@@ -962,7 +975,7 @@ export class MemoryStore {
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
         importance: Number(row.importance),
-        timestamp: Number(row.timestamp),
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
 
@@ -1040,7 +1053,7 @@ export class MemoryStore {
             category: row.category as MemoryEntry["category"],
             scope: rowScope,
             importance: Number(row.importance),
-            timestamp: Number(row.timestamp),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: (row.metadata as string) || "{}",
         };
 
@@ -1104,7 +1117,7 @@ export class MemoryStore {
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
         importance: Number(row.importance),
-        timestamp: Number(row.timestamp),
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
 
@@ -1242,7 +1255,7 @@ export class MemoryStore {
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
           importance: Number(row.importance),
-          timestamp: Number(row.timestamp),
+          timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),
       )
@@ -1374,7 +1387,7 @@ export class MemoryStore {
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
         importance: Number(row.importance),
-        timestamp: Number(row.timestamp),
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
 
@@ -1474,7 +1487,7 @@ export class MemoryStore {
     }
 
     if (beforeTimestamp) {
-      conditions.push(`timestamp < ${beforeTimestamp}`);
+      conditions.push(`timestamp < ${normalizeMemoryTimestamp(beforeTimestamp)}`);
     }
 
     if (conditions.length === 0) {
@@ -1559,7 +1572,7 @@ export class MemoryStore {
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
 
-    const conditions: string[] = [`timestamp < ${maxTimestamp}`];
+    const conditions: string[] = [`timestamp < ${normalizeMemoryTimestamp(maxTimestamp)}`];
 
     if (scopeFilter && scopeFilter.length > 0) {
       const scopeConditions = scopeFilter
@@ -1585,7 +1598,7 @@ export class MemoryStore {
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
           importance: Number(row.importance),
-          timestamp: Number(row.timestamp),
+          timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),
       );
