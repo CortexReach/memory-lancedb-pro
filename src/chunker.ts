@@ -297,10 +297,14 @@ export function astChunk(
   try {
     TreeSitterParser = require('tree-sitter');
 
-    if (language === 'javascript' || language === 'typescript') {
+    if (language === 'javascript') {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const JavaScript = require('tree-sitter-javascript');
-      LanguageMap = { javascript: JavaScript, typescript: JavaScript };
+      LanguageMap = { javascript: JavaScript };
+    } else if (language === 'typescript') {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const TypeScript = require('tree-sitter-typescript');
+      LanguageMap = { typescript: TypeScript };
     } else if (language === 'python') {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const Python = require('tree-sitter-python');
