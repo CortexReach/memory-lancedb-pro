@@ -521,20 +521,20 @@ export class SmartExtractor {
       if (!countValidationFailed && actualCreated !== expectedCreated) {
         const mismatch = expectedCreated - actualCreated;
 
-        // F3: isolate callback exception so it doesn't propagate and abort extraction
         const validation: ExtractionValidation = {
           expected: expectedCreated,
           actual: actualCreated,
           mismatch,
           sessionKey,
         };
-        try {
-          options.onExtractionValidationFailed?.(validation);
-        } catch (cbErr) {
-          this.log(
-            "memory-pro: smart-extractor: onExtractionValidationFailed callback threw: " + String(cbErr),
-          );
-        }
+        // F3 FIX: support both sync and async callbacks via Promise.resolve().then()
+        Promise.resolve()
+          .then(() => options.onExtractionValidationFailed?.(validation))
+          .catch((cbErr) => {
+            this.log(
+              "memory-pro: smart-extractor: onExtractionValidationFailed callback threw: " + String(cbErr),
+            );
+          });
 
         // F1: when no callback and mismatch > 0, log at minimum so production is not silent
         if (mismatch > 0 && !options.onExtractionValidationFailed) {

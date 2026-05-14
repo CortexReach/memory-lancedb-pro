@@ -548,4 +548,35 @@ describe("Issue #693: Extraction write validation", () => {
     assert.strictEqual(store.rowCount, 1, "T9: store has 1 entry despite mismatch");
   });
 
+  // --------------------------------------------------------------------------
+  // T10: Async callback support — async callback completes without aborting
+  // --------------------------------------------------------------------------
+  it("T10: async callback support", async () => {
+    const embedder = makeDeterministicEmbedder();
+    const llm = makeLlm([
+      { category: "events", abstract: "User attended team sync", overview: "Sync", content: "Team sync." },
+    ]);
+    const store = makeStore({ initialCount: 0, dropLastN: 1 }); // → mismatch = 1
+    const extractor = makeExtractor(embedder, llm, store);
+
+    let asyncCallbackCompleted = false;
+    const stats = await extractor.extractAndPersist(
+      "User attended team sync", "session-t10",
+      {
+        async onExtractionValidationFailed(validation) {
+          // Simulate async work (e.g., HTTP call to alerting service)
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          asyncCallbackCompleted = true;
+        },
+      },
+    );
+
+    // Wait for async callback to complete
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    assert.strictEqual(asyncCallbackCompleted, true, "T10: async callback was invoked and completed");
+    assert.strictEqual(stats.created, 1, "T10: extraction completed with 1 entry");
+    assert.strictEqual(store.rowCount, 0, "T10: store has 0 entries (dropLastN=1 removed the only entry)");
+  });
+
 });
