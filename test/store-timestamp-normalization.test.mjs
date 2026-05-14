@@ -57,4 +57,51 @@ describe("memory timestamp normalization", () => {
     assert.equal(deleted, 1);
     assert.equal(await store.count(), 0);
   });
+
+  it("does not over-delete raw legacy second rows with millisecond cutoffs", async () => {
+    const store = createStore();
+    await store.count();
+
+    await store.table.add([{
+      id: "raw-legacy-seconds",
+      text: "raw legacy seconds row",
+      vector: [1, 0, 0, 0],
+      category: "fact",
+      scope: "global",
+      importance: 0.7,
+      timestamp: 1_700_000_000,
+      metadata: "{}",
+    }]);
+
+    const deleted = await store.bulkDelete([], 1_600_000_000_000);
+    assert.equal(deleted, 0);
+
+    const loaded = await store.getById("raw-legacy-seconds");
+    assert.equal(loaded?.timestamp, 1_700_000_000_000);
+  });
+
+  it("backfills persisted legacy second timestamps during initialization", async () => {
+    const store = createStore();
+    await store.count();
+
+    await store.table.add([{
+      id: "persisted-legacy-seconds",
+      text: "persisted legacy seconds row",
+      vector: [1, 0, 0, 0],
+      category: "fact",
+      scope: "global",
+      importance: 0.7,
+      timestamp: 1_700_000_000,
+      metadata: "{}",
+    }]);
+
+    const reopened = createStore();
+    const loaded = await reopened.getById("persisted-legacy-seconds");
+    assert.equal(loaded?.timestamp, 1_700_000_000_000);
+
+    const rawRows = await reopened.table.query()
+      .where("id = 'persisted-legacy-seconds'")
+      .toArray();
+    assert.equal(rawRows[0].timestamp, 1_700_000_000_000);
+  });
 });

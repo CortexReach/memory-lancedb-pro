@@ -102,6 +102,8 @@ function clampInt(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.floor(value)));
 }
 
+const LEGACY_SECONDS_TIMESTAMP_MAX = 1_000_000_000_000;
+
 export function normalizeMemoryTimestamp(value: unknown, fallback = Date.now()): number {
   const raw = value instanceof Date
     ? value.getTime()
@@ -114,7 +116,14 @@ export function normalizeMemoryTimestamp(value: unknown, fallback = Date.now()):
   }
 
   const timestamp = Math.floor(raw);
-  return timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp;
+  return timestamp < LEGACY_SECONDS_TIMESTAMP_MAX ? timestamp * 1000 : timestamp;
+}
+
+function timestampBeforePredicate(column: string, value: unknown): string {
+  const maxTimestamp = normalizeMemoryTimestamp(value);
+  const legacySecondsCutoff = Math.floor(maxTimestamp / 1000);
+  return `((${column} >= ${LEGACY_SECONDS_TIMESTAMP_MAX} AND ${column} < ${maxTimestamp}) OR ` +
+    `(${column} > 0 AND ${column} < ${LEGACY_SECONDS_TIMESTAMP_MAX} AND ${column} < ${legacySecondsCutoff}))`;
 }
 
 function escapeSqlLiteral(value: string): string {
@@ -454,6 +463,8 @@ export class MemoryStore {
       }
     }
 
+    await this.backfillLegacySecondTimestamps(table);
+
     // Validate vector dimensions
     // Note: LanceDB returns Arrow Vector objects, not plain JS arrays.
     // Array.isArray() returns false for Arrow Vectors, so use .length instead.
@@ -481,6 +492,37 @@ export class MemoryStore {
 
     this.db = db;
     this.table = table;
+  }
+
+  private async backfillLegacySecondTimestamps(table: LanceDB.Table): Promise<void> {
+    try {
+      const legacyRows = await table.query()
+        .where(`timestamp > 0 AND timestamp < ${LEGACY_SECONDS_TIMESTAMP_MAX}`)
+        .toArray();
+
+      if (legacyRows.length === 0) return;
+
+      const normalizedRows = legacyRows.map((row: any) => ({
+        ...row,
+        vector: Array.from(row.vector as Iterable<number>),
+        scope: (row.scope as string | undefined) ?? "global",
+        metadata: (row.metadata as string) || "{}",
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+      }));
+
+      await this.runWithFileLock(async () => {
+        for (const row of legacyRows) {
+          await table.delete(`id = '${escapeSqlLiteral(row.id as string)}'`);
+        }
+        for (let i = 0; i < normalizedRows.length; i += MemoryStore.MAX_BATCH_SIZE) {
+          await table.add(normalizedRows.slice(i, i + MemoryStore.MAX_BATCH_SIZE));
+        }
+      });
+
+      console.log(`memory-lancedb-pro: normalized ${legacyRows.length} legacy second timestamp row(s)`);
+    } catch (err) {
+      console.warn("memory-lancedb-pro: could not normalize legacy second timestamps:", err);
+    }
   }
 
   private async createFtsIndex(table: LanceDB.Table): Promise<void> {
@@ -1487,7 +1529,7 @@ export class MemoryStore {
     }
 
     if (beforeTimestamp) {
-      conditions.push(`timestamp < ${normalizeMemoryTimestamp(beforeTimestamp)}`);
+      conditions.push(timestampBeforePredicate("timestamp", beforeTimestamp));
     }
 
     if (conditions.length === 0) {
@@ -1572,7 +1614,7 @@ export class MemoryStore {
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
 
-    const conditions: string[] = [`timestamp < ${normalizeMemoryTimestamp(maxTimestamp)}`];
+    const conditions: string[] = [timestampBeforePredicate("timestamp", maxTimestamp)];
 
     if (scopeFilter && scopeFilter.length > 0) {
       const scopeConditions = scopeFilter
