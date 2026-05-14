@@ -20,8 +20,12 @@
  *   4. Delete source entries, store merged entry.
  */
 
-import type { MemoryEntry } from "./store.js";
-import { buildSmartMetadata, reverseMapLegacyCategory, stringifySmartMetadata } from "./smart-metadata.js";
+import type { MemoryEntry, MemoryTier } from "./store.js";
+import {
+  buildSmartMetadata,
+  reverseMapLegacyCategory,
+  stringifySmartMetadata,
+} from "./smart-metadata.js";
 
 // ============================================================================
 // Types
@@ -107,6 +111,34 @@ export function cosineSimilarity(a: number[], b: number[]): number {
   const nb = norm(b);
   if (na === 0 || nb === 0) return 0;
   return Math.max(0, Math.min(1, dot(a, b) / (na * nb)));
+}
+
+// ============================================================================
+// Text helpers
+// ============================================================================
+
+/**
+ * Truncate a string to at most `maxBytes` UTF-8 bytes without splitting multi-byte characters.
+ * Finds the last valid character boundary within the byte limit.
+ */
+function safeTruncate(str: string, maxBytes: number): string {
+  if (str.length === 0) return str;
+  const encoder = new TextEncoder();
+  const encoded = encoder.encode(str);
+  if (encoded.length <= maxBytes) return str;
+  // Binary-search the last valid boundary within maxBytes
+  let lo = 0;
+  let hi = maxBytes;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi + 1) / 2);
+    try {
+      const truncated = new TextDecoder("utf-8", { fatal: true }).decode(encoded.subarray(0, mid));
+      lo = mid;
+    } catch {
+      hi = mid - 1;
+    }
+  }
+  return new TextDecoder("utf-8").decode(encoded.subarray(0, lo));
 }
 
 // ============================================================================
@@ -223,17 +255,53 @@ export function buildMergedEntry(
   // --- scope: use the first (all should match) ---
   const scope = members[0].scope;
 
-  // --- l0_abstract: first line as short summary ---
-  const l0_abstract = lines[0]?.slice(0, 120) ?? "";
+  // --- l0_abstract: first line, truncated at byte boundary to avoid splitting UTF-8 characters ---
+  const firstLine = lines[0] ?? "";
+  const l0_abstract = safeTruncate(firstLine, 120);
 
-  // --- l1_overview: first 3 lines as bullet overview ---
-  const l1_overview = lines.slice(0, 3).map((l) => `- ${l}`).join("\n");
+  // --- l1_overview: aggregate lines from all members fairly (not just members[0]) ---
+  // Collect up to 3 lines per member in order, dedup already handled by line dedup
+  const overviewLines: string[] = [];
+  for (const m of members) {
+    const memberLines = m.text.split("\n").map((l) => l.trim()).filter((l) => l);
+    for (const line of memberLines) {
+      if (overviewLines.length >= 3) break;
+      if (!overviewLines.includes(line)) overviewLines.push(line);
+    }
+    if (overviewLines.length >= 3) break;
+  }
+  const l1_overview = overviewLines.map((l) => `- ${l}`).join("\n");
+
+  // --- lifecycle inheritance: tier from highest-tier member, access_count as average ---
+  // Tier priority: core > working > peripheral
+  const tierPriority = (t: MemoryTier) => (t === "core" ? 2 : t === "working" ? 1 : 0);
+  const inheritedTier = members
+    .map((m) => {
+      try {
+        const meta = JSON.parse(m.metadata ?? "{}");
+        return (meta.tier ?? "working") as MemoryTier;
+      } catch {
+        return "working" as MemoryTier;
+      }
+    })
+    .sort((a, b) => tierPriority(b) - tierPriority(a))[0] ?? "working";
+  const inheritedAccessCount = Math.round(
+    members.reduce((sum, m) => {
+      try {
+        const meta = JSON.parse(m.metadata ?? "{}");
+        return sum + (meta.access_count ?? 0);
+      } catch {
+        return sum;
+      }
+    }, 0) / members.length,
+  );
 
   // --- metadata: build full smart metadata with L0/L1/L2 ---
-  // F1 fix: convert legacy category to new memory_category format
+  // F1 fix: buildSmartMetadata now properly generates full L0/L1/L2 enrichment
   const legacyCategory = category as string;
   const smartCategory = reverseMapLegacyCategory(legacyCategory, text);
   const sourceEntry = members[0];
+  // Pass merged text as entry.text so parseSmartMetadata uses it for normalization
   const mergedMetadata = buildSmartMetadata(
     { text, metadata: sourceEntry.metadata },
     {
@@ -241,8 +309,8 @@ export function buildMergedEntry(
       l1_overview,
       l2_content: text,
       memory_category: smartCategory,
-      tier: "working",
-      access_count: 0,
+      tier: inheritedTier,
+      access_count: inheritedAccessCount,
       confidence: Math.max(0.5, 0.8 - members.length * 0.05), // confidence decreases with more sources
       compacted: true,
       sourceCount: members.length,
