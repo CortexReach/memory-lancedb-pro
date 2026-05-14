@@ -19,19 +19,20 @@ const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { MemoryStore } = jiti("../src/store.ts");
 const { batchDedup } = jiti("../src/batch-dedup.ts");
 
-/** 256-dim constant vector with a controlled cosine similarity to a base vector */
+/** 256-dim vector with cosine similarity to baseVec controlled by parameter.
+ *  Uses a fixed seed so the output is deterministic across test runs. */
 function makeNearDuplicateVector(baseVec, similarity = 0.95) {
-  // cosine(baseVec, scale*baseVec) = 1.0 regardless of scale - scaling doesn't change direction.
-  // To get cosine = similarity < 1.0, we need an orthogonal component:
   const scale = similarity;
   const dim = baseVec.length;
-  let orth = baseVec.map(() => Math.random() - 0.5);
+  // Use a fixed seed so this function is deterministic (not random each call)
+  const orth = Array.from({ length: dim }, (_, i) => (i % 2 === 0 ? 0.5 : -0.5));
   const baseNormSq = orth.reduce((s, v, i) => s + v * v, 0);
-  if (baseNormSq === 0) { orth = baseVec.map(() => Math.random()); }
   const proj = orth.reduce((s, v, i) => s + v * baseVec[i], 0) / (baseNormSq || 1);
   for (let i = 0; i < dim; i++) orth[i] -= proj * baseVec[i];
   const orthNorm = Math.sqrt(Math.max(0, orth.reduce((s, v) => s + v * v, 0)));
-  if (orthNorm > 0) orth = orth.map(v => v / orthNorm);
+  if (orthNorm > 0) for (let i = 0; i < dim; i++) orth[i] /= orthNorm;
+  const orthNorm2 = Math.sqrt(Math.max(0, orth.reduce((s, v) => s + v * v, 0)));
+  if (orthNorm2 > 0) for (let i = 0; i < dim; i++) orth[i] /= orthNorm2;
   const orthScale = Math.sqrt(Math.max(0, 1 - scale * scale));
   return baseVec.map((v, i) => v * scale + orth[i] * orthScale);
 }

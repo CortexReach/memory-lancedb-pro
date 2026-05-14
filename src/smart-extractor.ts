@@ -522,13 +522,14 @@ export class SmartExtractor {
         const mismatch = expectedCreated - actualCreated;
 
         // F3: isolate callback exception so it doesn't propagate and abort extraction
+        const validation: ExtractionValidation = {
+          expected: expectedCreated,
+          actual: actualCreated,
+          mismatch,
+          sessionKey,
+        };
         try {
-          options.onExtractionValidationFailed?.({
-            expected: expectedCreated,
-            actual: actualCreated,
-            mismatch,
-            sessionKey,
-          });
+          options.onExtractionValidationFailed?.(validation);
         } catch (cbErr) {
           this.log(
             "memory-pro: smart-extractor: onExtractionValidationFailed callback threw: " + String(cbErr),

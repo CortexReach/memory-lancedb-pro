@@ -90,7 +90,7 @@ export type ExtractionValidation = {
   actual: number;
   /**
    * expected - actual; positive = under-write (SIGKILL/OOM partial write, fewer rows),
-   * negative = over-write (concurrent compactor DELETED rows before our count, more rows).
+   * negative = over-write (concurrent session ADDED rows before our countAfter, more rows).
    * positive (under-write): callback invoked; if abortOnExtractionMismatch=true throws.
    * negative (over-write): always logged as WARNING and never throws.
    */
