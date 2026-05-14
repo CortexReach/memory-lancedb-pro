@@ -486,8 +486,19 @@ describe("Issue #693: Extraction write validation", () => {
     const store = makeStore({ initialCount: 3 });
     const extractor = makeExtractor(embedder, llm, store);
 
+    // Simulate concurrent compactor race: countBefore returns the pre-write
+    // baseline (3), countAfter returns +2 extra because the compactor deleted
+    // 1 row and another session inserted 3 rows during our bulkStore window.
+    // actualCreated = (3 + 2) - 3 = 2, expectedCreated = 1, mismatch = -1
+    let callCount = 0;
     const originalCount = store.count.bind(store);
-    store.count = async () => (await originalCount()) + 2;
+    store.count = async () => {
+      callCount++;
+      // First call (countBefore): rowCount = 3, no extra offset
+      // Second call (countAfter): rowCount = 4, compactor/session added +2 more
+      const raw = await originalCount();
+      return callCount === 1 ? raw : raw + 2;
+    };
 
     let callbackInvoked = false;
     let receivedMismatch = null;
@@ -502,9 +513,11 @@ describe("Issue #693: Extraction write validation", () => {
       },
     );
 
+    // Negative mismatch: actualCreated (2) > expectedCreated (1) → mismatch = -1
+    // abortOnExtractionMismatch=true does NOT throw for negative mismatch
     assert.strictEqual(callbackInvoked, true, "T8: callback invoked for negative mismatch");
-    assert.ok(receivedMismatch < 0, "T8: mismatch should be negative");
-    assert.strictEqual(stats.created, 1, "T8: extraction completed");
+    assert.ok(receivedMismatch < 0, "T8: mismatch should be negative, got " + receivedMismatch);
+    assert.strictEqual(stats.created, 1, "T8: extraction completed with 1 entry");
   });
 
   // --------------------------------------------------------------------------

@@ -485,19 +485,36 @@ export class SmartExtractor {
       // in expectedCreated - the count check validates them normally (F4).
       let countValidationFailed = false;
       let actualCreated: number;
+      let bulkStoreErr: unknown = null;
+
+      const countBefore = await this.store.count();
       try {
-        const countBefore = await this.store.count();
         await this.store.bulkStore(createEntries);
-        const countAfter = await this.store.count();
-        actualCreated = countAfter - countBefore;
-      } catch (countErr) {
-        // F3: if count operations fail, skip validation but don't abort extraction
-        // The write might have succeeded even if we couldn't verify it.
-        this.log(
-          "memory-pro: smart-extractor: count validation failed: " + String(countErr) + " - skipping validation, assuming write succeeded.",
+      } catch (err) {
+        bulkStoreErr = err;
+      }
+      const countAfter = await this.store.count();
+
+      if (bulkStoreErr) {
+        // F1 FIX: bulkStore failure is a real write failure — throw to abort extraction.
+        // Do NOT swallow it like a count() failure. The write did not succeed.
+        throw new Error(
+          "memory-pro: smart-extractor: bulkStore failed during extraction write validation: " +
+            String(bulkStoreErr),
         );
-        actualCreated = createEntries.length; // assume success
+      }
+
+      try {
+        actualCreated = countAfter - countBefore;
+      } catch (err) {
+        // F3: count() failed — we cannot verify the write, but it may have succeeded.
+        // Skip validation rather than abort extraction.
+        this.log(
+          "memory-pro: smart-extractor: count() failed after bulkStore: " +
+            String(err) + " — skipping validation, assuming write succeeded.",
+        );
         countValidationFailed = true;
+        actualCreated = createEntries.length; // assume success
       }
       const expectedCreated = createEntries.length;
 
