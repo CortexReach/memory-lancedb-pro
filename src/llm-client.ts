@@ -39,6 +39,8 @@ export interface LlmClient {
  * or contain surrounding text.
  */
 function extractJsonFromResponse(text: string): string | null {
+  text = stripReasoningTrace(text);
+
   const fenceMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
   if (fenceMatch) {
     return fenceMatch[1].trim();
@@ -62,6 +64,16 @@ function extractJsonFromResponse(text: string): string | null {
 
   if (lastBrace === -1) return null;
   return text.substring(firstBrace, lastBrace + 1);
+}
+
+function stripReasoningTrace(text: string): string {
+  const closingThinkTag = text.toLowerCase().lastIndexOf("</think>");
+  if (closingThinkTag === -1) return text;
+  return text.slice(closingThinkTag + "</think>".length).trim();
+}
+
+function shouldDisableReasoningForJson(model: string): boolean {
+  return /qwen3|deepseek.*r1|qwq/i.test(model);
 }
 
 function previewText(value: string, maxLen = 200): string {
@@ -190,7 +202,7 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
     async completeJson<T>(prompt: string, label = "generic"): Promise<T | null> {
       lastError = null;
       try {
-        const response = await client.chat.completions.create({
+        const request = {
           model: config.model,
           messages: [
             {
@@ -201,7 +213,12 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
             { role: "user", content: prompt },
           ],
           temperature: 0.1,
-        });
+          ...(shouldDisableReasoningForJson(config.model)
+            ? { chat_template_kwargs: { enable_thinking: false } }
+            : {}),
+        };
+
+        const response = await client.chat.completions.create(request as any);
 
         const raw = response.choices?.[0]?.message?.content;
         if (!raw) {
@@ -421,4 +438,4 @@ export function createLlmClient(config: LlmClientConfig): LlmClient {
   return createApiKeyClient(config, log, warnLog);
 }
 
-export { extractJsonFromResponse, repairCommonJson };
+export { extractJsonFromResponse, repairCommonJson, shouldDisableReasoningForJson, stripReasoningTrace };

@@ -20,7 +20,7 @@ import { spawn } from "node:child_process";
 const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 
 // Import core components
-import { MemoryStore, validateStoragePath } from "./src/store.js";
+import { MemoryStore, normalizeStoragePath, validateStoragePath } from "./src/store.js";
 import {
   createEmbedder,
   getEffectiveVectorDimensions,
@@ -1978,10 +1978,10 @@ let _singletonState: PluginSingletonState | null = null;
 
 function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const config = parsePluginConfig(api.pluginConfig);
-  const resolvedDbPath = api.resolvePath(config.dbPath || getDefaultDbPath());
+  let resolvedDbPath = normalizeStoragePath(api.resolvePath(config.dbPath || getDefaultDbPath()));
 
   try {
-    validateStoragePath(resolvedDbPath);
+    resolvedDbPath = validateStoragePath(resolvedDbPath);
   } catch (err) {
     api.logger.warn(
       `memory-lancedb-pro: storage path issue — ${String(err)}\n` +
