@@ -16,6 +16,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 
 // ============================================================================
@@ -134,13 +135,45 @@ function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight
 // Storage Path Validation
 // ============================================================================
 
+function fileUrlToWindowsPath(url: URL): string {
+  const host = url.hostname && url.hostname !== "localhost" ? url.hostname : "";
+  const pathname = decodeURIComponent(url.pathname);
+
+  if (host) {
+    return `\\\\${host}${pathname.replace(/\//g, "\\")}`;
+  }
+
+  const withoutDriveSlash = /^\/[a-zA-Z]:/.test(pathname)
+    ? pathname.slice(1)
+    : pathname;
+  return withoutDriveSlash.replace(/\//g, "\\");
+}
+
+export function normalizeStoragePath(
+  dbPath: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const trimmed = dbPath.trim();
+  if (!trimmed.startsWith("file://")) return dbPath;
+
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== "file:") return dbPath;
+    return platform === "win32"
+      ? fileUrlToWindowsPath(url)
+      : fileURLToPath(url);
+  } catch {
+    return dbPath;
+  }
+}
+
 /**
  * Validate and prepare the storage directory before LanceDB connection.
  * Resolves symlinks, creates missing directories, and checks write permissions.
  * Returns the resolved absolute path on success, or throws a descriptive error.
  */
 export function validateStoragePath(dbPath: string): string {
-  let resolvedPath = dbPath;
+  let resolvedPath = normalizeStoragePath(dbPath);
 
   // Resolve symlinks (including dangling symlinks)
   try {
@@ -239,7 +272,14 @@ export class MemoryStore {
   // 當 pending callers 超過此值時，block 並同步 flush，確保 pendingBatch 不會無限膨胀。
   private static readonly MAX_PENDING_BATCH_SIZE = 1000;
 
-  constructor(private readonly config: StoreConfig) { }
+  private readonly config: StoreConfig;
+
+  constructor(config: StoreConfig) {
+    this.config = {
+      ...config,
+      dbPath: normalizeStoragePath(config.dbPath),
+    };
+  }
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();

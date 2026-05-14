@@ -72,8 +72,8 @@ export interface RetrievalConfig {
    */
   lengthNormAnchor: number;
   /**
-   * Hard cutoff after rerank: discard results below this score.
-   * Applied after all scoring stages (rerank, recency, importance, length norm).
+   * Hard cutoff after final scoring: discard returned results below this score.
+   * Applied after rerank, recency, importance, length norm, and time/lifecycle decay.
    * Higher = fewer but more relevant results. (default: 0.35)
    */
   hardMinScore: number;
@@ -169,6 +169,16 @@ export interface RetrievalDiagnostics {
     | "hybrid.fuseResults"
     | "hybrid.rerank"
     | "hybrid.postProcess";
+  rerankFallback?: {
+    provider: NonNullable<RetrievalConfig["rerankProvider"]>;
+    reason:
+      | "invalid_response"
+      | "http_error"
+      | "timeout"
+      | "request_error"
+      | "cosine_error";
+    message: string;
+  };
   errorMessage?: string;
 }
 
@@ -239,6 +249,10 @@ function extractFailureStage(
     : undefined;
 }
 
+function formatErrorMessage(error: unknown): string {
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
+
 function buildDropSummary(
   diagnostics: RetrievalDiagnostics,
 ): RetrievalDiagnostics["dropSummary"] {
@@ -284,20 +298,20 @@ function buildDropSummary(
     },
     {
       order: 6,
-      stage: "hardMinScore" as const,
+      stage: "timeDecay" as const,
       before: diagnostics.stageCounts.afterLengthNorm,
-      after: diagnostics.stageCounts.afterHardMinScore,
+      after: diagnostics.stageCounts.afterTimeDecay,
     },
     {
       order: 7,
-      stage: "timeDecay" as const,
-      before: diagnostics.stageCounts.afterHardMinScore,
-      after: diagnostics.stageCounts.afterTimeDecay,
+      stage: "hardMinScore" as const,
+      before: diagnostics.stageCounts.afterTimeDecay,
+      after: diagnostics.stageCounts.afterHardMinScore,
     },
     {
       order: 8,
       stage: "noiseFilter" as const,
-      before: diagnostics.stageCounts.afterTimeDecay,
+      before: diagnostics.stageCounts.afterHardMinScore,
       after: diagnostics.stageCounts.afterNoiseFilter,
     },
     {
@@ -771,15 +785,15 @@ export class MemoryRetriever {
       if (diagnostics) diagnostics.stageCounts.afterImportance = weighted.length;
       const lengthNormalized = this.applyLengthNormalization(weighted);
       if (diagnostics) diagnostics.stageCounts.afterLengthNorm = lengthNormalized.length;
-      const hardFiltered = lengthNormalized.filter((r) => r.score >= this.config.hardMinScore);
-      if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
       const timeOrDecayRanked = this.decayEngine
-        ? this.applyDecayBoost(hardFiltered)
-        : this.applyTimeDecay(hardFiltered);
+        ? this.applyDecayBoost(lengthNormalized)
+        : this.applyTimeDecay(lengthNormalized);
       if (diagnostics) diagnostics.stageCounts.afterTimeDecay = timeOrDecayRanked.length;
+      const hardFiltered = timeOrDecayRanked.filter((r) => r.score >= this.config.hardMinScore);
+      if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
       const denoised = this.config.filterNoise
-        ? filterNoise(timeOrDecayRanked, (r) => r.entry.text)
-        : timeOrDecayRanked;
+        ? filterNoise(hardFiltered, (r) => r.entry.text)
+        : hardFiltered;
       if (diagnostics) diagnostics.stageCounts.afterNoiseFilter = denoised.length;
       const deduplicated = this.applyMMRDiversity(denoised);
       if (diagnostics) {
@@ -870,23 +884,23 @@ export class MemoryRetriever {
     trace?.endStage(lengthNormalized.map((r) => r.entry.id), lengthNormalized.map((r) => r.score));
     if (diagnostics) diagnostics.stageCounts.afterLengthNorm = lengthNormalized.length;
 
-    trace?.startStage("hard_cutoff", lengthNormalized.map((r) => r.entry.id));
-    const hardFiltered = lengthNormalized.filter((r) => r.score >= this.config.hardMinScore);
-    trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
-    if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
-
     const decayStageName = this.decayEngine ? "decay_boost" : "time_decay";
-    trace?.startStage(decayStageName, hardFiltered.map((r) => r.entry.id));
+    trace?.startStage(decayStageName, lengthNormalized.map((r) => r.entry.id));
     const lifecycleRanked = this.decayEngine
-      ? this.applyDecayBoost(hardFiltered)
-      : this.applyTimeDecay(hardFiltered);
+      ? this.applyDecayBoost(lengthNormalized)
+      : this.applyTimeDecay(lengthNormalized);
     trace?.endStage(lifecycleRanked.map((r) => r.entry.id), lifecycleRanked.map((r) => r.score));
     if (diagnostics) diagnostics.stageCounts.afterTimeDecay = lifecycleRanked.length;
 
-    trace?.startStage("noise_filter", lifecycleRanked.map((r) => r.entry.id));
+    trace?.startStage("hard_cutoff", lifecycleRanked.map((r) => r.entry.id));
+    const hardFiltered = lifecycleRanked.filter((r) => r.score >= this.config.hardMinScore);
+    trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
+    if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
+
+    trace?.startStage("noise_filter", hardFiltered.map((r) => r.entry.id));
     const denoised = this.config.filterNoise
-      ? filterNoise(lifecycleRanked, (r) => r.entry.text)
-      : lifecycleRanked;
+      ? filterNoise(hardFiltered, (r) => r.entry.text)
+      : hardFiltered;
     trace?.endStage(denoised.map((r) => r.entry.id), denoised.map((r) => r.score));
     if (diagnostics) diagnostics.stageCounts.afterNoiseFilter = denoised.length;
 
@@ -1019,7 +1033,7 @@ export class MemoryRetriever {
       failureStage = "hybrid.rerank";
       if (this.config.rerank !== "none") {
         trace?.startStage("rerank", filtered.map((r) => r.entry.id));
-        reranked = await this.rerankResults(query, queryVector, rerankInput);
+        reranked = await this.rerankResults(query, queryVector, rerankInput, diagnostics);
         trace?.endStage(reranked.map((r) => r.entry.id), reranked.map((r) => r.score));
       } else {
         reranked = filtered;
@@ -1054,23 +1068,23 @@ export class MemoryRetriever {
       trace?.endStage(lengthNormalized.map((r) => r.entry.id), lengthNormalized.map((r) => r.score));
       if (diagnostics) diagnostics.stageCounts.afterLengthNorm = lengthNormalized.length;
 
-      trace?.startStage("hard_cutoff", lengthNormalized.map((r) => r.entry.id));
-      const hardFiltered = lengthNormalized.filter((r) => r.score >= this.config.hardMinScore);
-      trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
-      if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
-
       const decayStageName = this.decayEngine ? "decay_boost" : "time_decay";
-      trace?.startStage(decayStageName, hardFiltered.map((r) => r.entry.id));
+      trace?.startStage(decayStageName, lengthNormalized.map((r) => r.entry.id));
       const lifecycleRanked = this.decayEngine
-        ? this.applyDecayBoost(hardFiltered)
-        : this.applyTimeDecay(hardFiltered);
+        ? this.applyDecayBoost(lengthNormalized)
+        : this.applyTimeDecay(lengthNormalized);
       trace?.endStage(lifecycleRanked.map((r) => r.entry.id), lifecycleRanked.map((r) => r.score));
       if (diagnostics) diagnostics.stageCounts.afterTimeDecay = lifecycleRanked.length;
 
-      trace?.startStage("noise_filter", lifecycleRanked.map((r) => r.entry.id));
+      trace?.startStage("hard_cutoff", lifecycleRanked.map((r) => r.entry.id));
+      const hardFiltered = lifecycleRanked.filter((r) => r.score >= this.config.hardMinScore);
+      trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
+      if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
+
+      trace?.startStage("noise_filter", hardFiltered.map((r) => r.entry.id));
       const denoised = this.config.filterNoise
-        ? filterNoise(lifecycleRanked, (r) => r.entry.text)
-        : lifecycleRanked;
+        ? filterNoise(hardFiltered, (r) => r.entry.text)
+        : hardFiltered;
       trace?.endStage(denoised.map((r) => r.entry.id), denoised.map((r) => r.score));
       if (diagnostics) diagnostics.stageCounts.afterNoiseFilter = denoised.length;
 
@@ -1229,6 +1243,7 @@ export class MemoryRetriever {
     query: string,
     queryVector: number[],
     results: RetrievalResult[],
+    diagnostics?: RetrievalDiagnostics,
   ): Promise<RetrievalResult[]> {
     if (results.length === 0) {
       return results;
@@ -1237,6 +1252,14 @@ export class MemoryRetriever {
     // Try cross-encoder rerank via configured provider API
     const provider = this.config.rerankProvider || "jina";
     const hasApiKey = !!this.config.rerankApiKey;
+    const recordFallback = (
+      reason: NonNullable<RetrievalDiagnostics["rerankFallback"]>["reason"],
+      message: string,
+    ) => {
+      if (diagnostics) {
+        diagnostics.rerankFallback = { provider, reason, message };
+      }
+    };
 
     if (this.config.rerank === "cross-encoder" && hasApiKey) {
       try {
@@ -1278,6 +1301,7 @@ export class MemoryRetriever {
           const parsed = parseRerankResponse(provider, data);
 
           if (!parsed) {
+            recordFallback("invalid_response", "Rerank API returned an invalid response shape");
             console.warn(
               "Rerank API: invalid response shape, falling back to cosine",
             );
@@ -1322,14 +1346,21 @@ export class MemoryRetriever {
           }
         } else {
           const errText = await response.text().catch(() => "");
+          recordFallback(
+            "http_error",
+            `Rerank API returned ${response.status}: ${errText.slice(0, 200)}`,
+          );
           console.warn(
             `Rerank API returned ${response.status}: ${errText.slice(0, 200)}, falling back to cosine`,
           );
         }
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
-          console.warn(`Rerank API timed out (${this.config.rerankTimeoutMs ?? 5000}ms), falling back to cosine`);
+          const message = `Rerank API timed out (${this.config.rerankTimeoutMs ?? 5000}ms)`;
+          recordFallback("timeout", message);
+          console.warn(`${message}, falling back to cosine`);
         } else {
+          recordFallback("request_error", formatErrorMessage(error));
           console.warn("Rerank API failed, falling back to cosine:", error);
         }
       }
@@ -1353,6 +1384,7 @@ export class MemoryRetriever {
 
       return reranked.sort((a, b) => b.score - a.score);
     } catch (error) {
+      recordFallback("cosine_error", formatErrorMessage(error));
       console.warn("Reranking failed, returning original results:", error);
       return results;
     }
@@ -1732,6 +1764,9 @@ export class MemoryRetriever {
       dropSummary: this.lastDiagnostics.dropSummary.map((drop) => ({
         ...drop,
       })),
+      rerankFallback: this.lastDiagnostics.rerankFallback
+        ? { ...this.lastDiagnostics.rerankFallback }
+        : undefined,
     };
   }
 

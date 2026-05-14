@@ -49,8 +49,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/temporal-awareness.test.mjs", args: ["--test"] },
   // Issue #598 regression tests
   { group: "core-regression", runner: "node", file: "test/store-serialization.test.mjs" },
-  // Issue #692: AST-based semantic chunking
-  // Issue #763: applyMMRDiversity O(n³)→O(n²) optimization
+  { group: "storage-and-schema", runner: "node", file: "test/storage-path-normalization.test.mjs", args: ["--test"] },
+  // Issue #763: applyMMRDiversity O(n^3)->O(n^2) optimization
   { group: "core-regression", runner: "node", file: "test/mmr-tiny.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/access-tracker-retry.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/embedder-cache.test.mjs" },
@@ -60,7 +60,7 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/bulk-store.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/bulk-store-edge-cases.test.mjs", args: ["--test"] },
   // Issue #690 cross-call batch accumulator tests
-  { group: "storage-and-schema", runner: "node", file: "test/issue-690-cross-call-batch.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", "file": "test/issue-690-cross-call-batch.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store-edge-cases.test.mjs", args: ["--test"] },
   // Issue #680 regression tests (from upstream)
