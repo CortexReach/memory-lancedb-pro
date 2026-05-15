@@ -215,6 +215,7 @@
         "items": {
           "type": "string"
         },
+"default": [],
         "description": "Agent/session patterns excluded from auto-recall and reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
       },
       "autoRecallIncludeAgents": {

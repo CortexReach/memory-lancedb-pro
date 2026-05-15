@@ -1579,6 +1579,8 @@ export class MemoryRetriever {
    * Note: this writes back to LanceDB via delete+readd; keep it bounded.
    */
   private async recordAccessAndMaybeTransition(results: RetrievalResult[]): Promise<void> {
+    // F4: removed unused accessCount increment — AccessTracker.recordAccess() already
+    // handles access counting; this function only handles tier transitions.
     if (!this.decayEngine && !this.tierManager) return;
 
     const now = Date.now();
@@ -1587,9 +1589,7 @@ export class MemoryRetriever {
     for (const r of toUpdate) {
       const { memory, meta } = getDecayableFromEntry(r.entry);
 
-      // Update access stats in-memory first
-      const nextAccess = memory.accessCount + 1;
-      meta.access_count = nextAccess;
+      // Update access timestamp (accessCount is tracked by AccessTracker, not here)
       meta.last_accessed_at = now;
       if (meta.created_at === undefined && meta.createdAt === undefined) {
         meta.created_at = memory.createdAt;
@@ -1603,7 +1603,7 @@ export class MemoryRetriever {
 
       const updatedMemory: DecayableMemory = {
         ...memory,
-        accessCount: nextAccess,
+        accessCount: memory.accessCount, // accessCount is managed by AccessTracker, not here
         lastAccessedAt: now,
       };
 
