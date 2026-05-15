@@ -33,7 +33,9 @@ export type MemorySource =
   | "auto-capture"
   | "reflection"
   | "session-summary"
-  | "legacy";
+  | "legacy"
+  // F2: Tag for memories created by the dreaming engine — survives compact/upgrade
+  | "dreaming-engine";
 
 export interface SmartMemoryMetadata {
   l0_abstract: string;
@@ -124,6 +126,8 @@ function normalizeSource(value: unknown): MemorySource {
     case "reflection":
     case "session-summary":
     case "legacy":
+    // F2: Preserve dreaming-engine reflections through compact/upgrade cycles
+    case "dreaming-engine":
       return value;
     default:
       return "legacy";

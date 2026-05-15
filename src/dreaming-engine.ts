@@ -133,8 +133,10 @@ async function collectExactScope(
   let offset = 0;
   // Ratio-based stop: track consecutive pages where <10% of results are target-scope
   let lowRatioPages = 0;
-  const MAX_LOW_RATIO_PAGES = 3; // Stop after 3 consecutive pages with <10% target-scope ratio
-  const LOW_RATIO_THRESHOLD = 0.1;
+  // F1 fix: Raise page limit so target scopes don't starve when mixed with null-scope rows
+  const MAX_LOW_RATIO_PAGES = 5; // Stop after 5 consecutive pages with <threshold% target-scope ratio
+  // F1 fix: Lower threshold so we don't give up on scopes that share pages with others
+  const LOW_RATIO_THRESHOLD = 0.01;
 
   while (collected.length < needed) {
     const page = await store.list([scope], undefined, pageSize, offset);
