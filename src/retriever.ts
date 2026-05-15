@@ -1587,9 +1587,9 @@ export class MemoryRetriever {
     for (const r of toUpdate) {
       const { memory, meta } = getDecayableFromEntry(r.entry);
 
-      // Update access stats in-memory first
-      const nextAccess = memory.accessCount + 1;
-      meta.access_count = nextAccess;
+      // F4: removed unused accessCount increment — AccessTracker handles access counting
+      // accessCount is managed by AccessTracker, not here
+      meta.last_accessed_at = now;
       meta.last_accessed_at = now;
       if (meta.created_at === undefined && meta.createdAt === undefined) {
         meta.created_at = memory.createdAt;
@@ -1601,9 +1601,10 @@ export class MemoryRetriever {
         meta.confidence = memory.confidence;
       }
 
+      // F4: removed unused accessCount increment — AccessTracker handles access counting
       const updatedMemory: DecayableMemory = {
         ...memory,
-        accessCount: nextAccess,
+        accessCount: memory.accessCount,
         lastAccessedAt: now,
       };
 
