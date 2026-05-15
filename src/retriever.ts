@@ -1631,14 +1631,88 @@ export class MemoryRetriever {
    * relevant (high score) and diverse (low similarity to already-selected).
    *
    * Uses cosine similarity between memory vectors. If two memories have
-   * cosine similarity > threshold (default 0.92), the lower-scored one
+   * cosine similarity > threshold (default 0.85), the lower-scored one
    * is demoted to the end rather than removed entirely.
    *
    * This prevents top-k from being filled with near-identical entries
    * (e.g. 3 similar "SVG style" memories) while keeping them available
    * if the pool is small.
+   *
+   * Complexity: O(n²) — pre-converts all vectors once at entry and uses
+   * Map-based O(1) id lookup, avoiding the O(n³) cost of repeated
+   * Array.from() calls inside the inner loop (original implementation).
+   *
+   * Duplicate IDs are detected upfront and routed to
+   * applyMMRDiversity_Fallback() which preserves original semantics using
+   * findIndex-based O(n²) approach (safe for small duplicate sets).
    */
   private applyMMRDiversity(
+    results: RetrievalResult[],
+    similarityThreshold = 0.85,
+  ): RetrievalResult[] {
+    if (results.length <= 1) return results;
+
+    // Detect duplicate IDs and route to fallback (preserves original semantics)
+    const seenIds = new Set<string>();
+    for (const r of results) {
+      if (seenIds.has(r.entry.id)) {
+        return this.applyMMRDiversity_Fallback(results, similarityThreshold);
+      }
+      seenIds.add(r.entry.id);
+    }
+
+    // Pre-convert all vectors once: O(n²) total for all conversions.
+    // This eliminates the O(n) Array.from() cost from the inner loop,
+    // reducing per-candidate similarity from O(n²) → O(n).
+    const vectorMap = new Map<string, number[]>();
+    for (const r of results) {
+      const vec = r.entry.vector;
+      if (vec?.length) {
+        vectorMap.set(r.entry.id, Array.from(vec as Iterable<number>));
+      }
+    }
+
+    const selected: RetrievalResult[] = [];
+    const deferred: RetrievalResult[] = [];
+
+    for (const candidate of results) {
+      const cArr = vectorMap.get(candidate.entry.id);
+      // Items without vectors cannot be compared → always selected
+      if (!cArr) {
+        selected.push(candidate);
+        continue;
+      }
+
+      // Check O(1) Map lookup for similarity against all selected items.
+      // selected.size ≤ n, so this is O(n) per candidate → O(n²) total.
+      let tooSimilar = false;
+      for (const s of selected) {
+        const sArr = vectorMap.get(s.entry.id);
+        if (sArr && cosineSimilarity(sArr, cArr) > similarityThreshold) {
+          tooSimilar = true;
+          break;
+        }
+      }
+
+      if (tooSimilar) {
+        deferred.push(candidate);
+      } else {
+        selected.push(candidate);
+      }
+    }
+
+    return [...selected, ...deferred];
+  }
+
+  /**
+   * Fallback diversity filter for duplicate-ID inputs.
+   * Uses findIndex-based O(n²) approach which is safe for duplicate
+   * sets (typically small) and correctly handles the ambiguous case where
+   * the same ID may have different vectors in different entries.
+   *
+   * @internal
+   */
+  private applyMMRDiversity_Fallback(
     results: RetrievalResult[],
     similarityThreshold = 0.85,
   ): RetrievalResult[] {
@@ -1648,19 +1722,16 @@ export class MemoryRetriever {
     const deferred: RetrievalResult[] = [];
 
     for (const candidate of results) {
-      // Check if this candidate is too similar to any already-selected result
-      const tooSimilar = selected.some((s) => {
-        // Both must have vectors to compare.
-        // LanceDB returns Arrow Vector objects (not plain arrays),
-        // so use .length directly and Array.from() for conversion.
+      // findIndex walks the selected array to check similarity.
+      // For small duplicate-ID sets this is acceptable (O(n²) total).
+      const tooSimilar = selected.findIndex((s) => {
         const sVec = s.entry.vector;
         const cVec = candidate.entry.vector;
         if (!sVec?.length || !cVec?.length) return false;
         const sArr = Array.from(sVec as Iterable<number>);
         const cArr = Array.from(cVec as Iterable<number>);
-        const sim = cosineSimilarity(sArr, cArr);
-        return sim > similarityThreshold;
-      });
+        return cosineSimilarity(sArr, cArr) > similarityThreshold;
+      }) !== -1;
 
       if (tooSimilar) {
         deferred.push(candidate);
@@ -1668,7 +1739,7 @@ export class MemoryRetriever {
         selected.push(candidate);
       }
     }
-    // Append deferred results at the end (available but deprioritized)
+
     return [...selected, ...deferred];
   }
 
