@@ -120,11 +120,52 @@ export function normalizeMemoryTimestamp(value: unknown, fallback = Date.now()):
   return timestamp < LEGACY_SECONDS_TIMESTAMP_MAX ? timestamp * 1000 : timestamp;
 }
 
+function normalizePredicateTimestamp(value: unknown): number | null {
+  const raw = value instanceof Date
+    ? value.getTime()
+    : typeof value === "number"
+      ? value
+      : Number(value);
+
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return null;
+  }
+
+  return normalizeMemoryTimestamp(raw);
+}
+
 function timestampBeforePredicate(column: string, value: unknown): string {
-  const maxTimestamp = normalizeMemoryTimestamp(value);
+  const maxTimestamp = normalizePredicateTimestamp(value);
+  if (maxTimestamp == null) {
+    return "(FALSE)";
+  }
   const legacySecondsCutoff = Math.floor(maxTimestamp / 1000);
   return `((${column} >= ${LEGACY_SECONDS_TIMESTAMP_MAX} AND ${column} < ${maxTimestamp}) OR ` +
     `(${column} > 0 AND ${column} < ${LEGACY_SECONDS_TIMESTAMP_MAX} AND ${column} < ${legacySecondsCutoff}))`;
+}
+
+function normalizeLegacyTimestampMetadata(value: unknown): string {
+  let metadata: Record<string, unknown>;
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      metadata = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : {};
+    } catch {
+      return value;
+    }
+  } else if (value && typeof value === "object" && !Array.isArray(value)) {
+    metadata = { ...(value as Record<string, unknown>) };
+  } else {
+    return "{}";
+  }
+
+  if (Object.prototype.hasOwnProperty.call(metadata, "last_accessed_at")) {
+    metadata.last_accessed_at = normalizeMemoryTimestamp(metadata.last_accessed_at, 0);
+  }
+
+  return JSON.stringify(metadata);
 }
 
 function escapeSqlLiteral(value: string): string {
@@ -546,7 +587,7 @@ export class MemoryStore {
         ...row,
         vector: Array.from(row.vector as Iterable<number>),
         scope: (row.scope as string | undefined) ?? "global",
-        metadata: (row.metadata as string) || "{}",
+        metadata: normalizeLegacyTimestampMetadata(row.metadata),
         timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
       }));
 
@@ -1568,7 +1609,7 @@ export class MemoryStore {
       conditions.push(`(${scopeConditions})`);
     }
 
-    if (beforeTimestamp) {
+    if (beforeTimestamp != null) {
       conditions.push(timestampBeforePredicate("timestamp", beforeTimestamp));
     }
 

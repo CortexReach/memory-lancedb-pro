@@ -104,4 +104,47 @@ describe("memory timestamp normalization", () => {
       .toArray();
     assert.equal(rawRows[0].timestamp, 1_700_000_000_000);
   });
+
+  it("backfills legacy last-access metadata during initialization", async () => {
+    const store = createStore();
+    await store.count();
+
+    await store.table.add([{
+      id: "persisted-legacy-last-access",
+      text: "persisted legacy last access row",
+      vector: [1, 0, 0, 0],
+      category: "fact",
+      scope: "global",
+      importance: 0.7,
+      timestamp: 1_700_000_000,
+      metadata: JSON.stringify({ last_accessed_at: 1_700_000_001 }),
+    }]);
+
+    const reopened = createStore();
+    const loaded = await reopened.getById("persisted-legacy-last-access");
+    const metadata = JSON.parse(loaded?.metadata ?? "{}");
+    assert.equal(metadata.last_accessed_at, 1_700_000_001_000);
+  });
+
+  it("does not treat nonpositive retention cutoffs as before-now predicates", async () => {
+    const store = createStore();
+
+    await store.importEntry({
+      id: "recent-memory",
+      text: "recent memory",
+      vector: [1, 0, 0, 0],
+      category: "fact",
+      scope: "global",
+      importance: 0.7,
+      timestamp: 1_700_000_000_000,
+      metadata: "{}",
+    });
+
+    assert.equal(await store.bulkDelete([], -1), 0);
+    assert.equal(await store.bulkDelete([], Number.NaN), 0);
+    assert.equal(await store.count(), 1);
+
+    const compactionRows = await store.fetchForCompaction(0);
+    assert.equal(compactionRows.length, 0);
+  });
 });
