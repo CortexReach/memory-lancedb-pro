@@ -58,6 +58,9 @@ function extractFailureStage(error) {
         ? error.retrievalFailureStage
         : undefined;
 }
+function formatErrorMessage(error) {
+    return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
 function buildDropSummary(diagnostics) {
     const stageDrops = [
         {
@@ -100,20 +103,20 @@ function buildDropSummary(diagnostics) {
         },
         {
             order: 6,
-            stage: "hardMinScore",
+            stage: "timeDecay",
             before: diagnostics.stageCounts.afterLengthNorm,
-            after: diagnostics.stageCounts.afterHardMinScore,
+            after: diagnostics.stageCounts.afterTimeDecay,
         },
         {
             order: 7,
-            stage: "timeDecay",
-            before: diagnostics.stageCounts.afterHardMinScore,
-            after: diagnostics.stageCounts.afterTimeDecay,
+            stage: "hardMinScore",
+            before: diagnostics.stageCounts.afterTimeDecay,
+            after: diagnostics.stageCounts.afterHardMinScore,
         },
         {
             order: 8,
             stage: "noiseFilter",
-            before: diagnostics.stageCounts.afterTimeDecay,
+            before: diagnostics.stageCounts.afterHardMinScore,
             after: diagnostics.stageCounts.afterNoiseFilter,
         },
         {
@@ -481,17 +484,17 @@ export class MemoryRetriever {
             const lengthNormalized = this.applyLengthNormalization(weighted);
             if (diagnostics)
                 diagnostics.stageCounts.afterLengthNorm = lengthNormalized.length;
-            const hardFiltered = lengthNormalized.filter((r) => r.score >= this.config.hardMinScore);
-            if (diagnostics)
-                diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
             const timeOrDecayRanked = this.decayEngine
-                ? this.applyDecayBoost(hardFiltered)
-                : this.applyTimeDecay(hardFiltered);
+                ? this.applyDecayBoost(lengthNormalized)
+                : this.applyTimeDecay(lengthNormalized);
             if (diagnostics)
                 diagnostics.stageCounts.afterTimeDecay = timeOrDecayRanked.length;
+            const hardFiltered = timeOrDecayRanked.filter((r) => r.score >= this.config.hardMinScore);
+            if (diagnostics)
+                diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
             const denoised = this.config.filterNoise
-                ? filterNoise(timeOrDecayRanked, (r) => r.entry.text)
-                : timeOrDecayRanked;
+                ? filterNoise(hardFiltered, (r) => r.entry.text)
+                : hardFiltered;
             if (diagnostics)
                 diagnostics.stageCounts.afterNoiseFilter = denoised.length;
             const deduplicated = this.applyMMRDiversity(denoised);
@@ -562,23 +565,23 @@ export class MemoryRetriever {
         trace?.endStage(lengthNormalized.map((r) => r.entry.id), lengthNormalized.map((r) => r.score));
         if (diagnostics)
             diagnostics.stageCounts.afterLengthNorm = lengthNormalized.length;
-        trace?.startStage("hard_cutoff", lengthNormalized.map((r) => r.entry.id));
-        const hardFiltered = lengthNormalized.filter((r) => r.score >= this.config.hardMinScore);
-        trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
-        if (diagnostics)
-            diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
         const decayStageName = this.decayEngine ? "decay_boost" : "time_decay";
-        trace?.startStage(decayStageName, hardFiltered.map((r) => r.entry.id));
+        trace?.startStage(decayStageName, lengthNormalized.map((r) => r.entry.id));
         const lifecycleRanked = this.decayEngine
-            ? this.applyDecayBoost(hardFiltered)
-            : this.applyTimeDecay(hardFiltered);
+            ? this.applyDecayBoost(lengthNormalized)
+            : this.applyTimeDecay(lengthNormalized);
         trace?.endStage(lifecycleRanked.map((r) => r.entry.id), lifecycleRanked.map((r) => r.score));
         if (diagnostics)
             diagnostics.stageCounts.afterTimeDecay = lifecycleRanked.length;
-        trace?.startStage("noise_filter", lifecycleRanked.map((r) => r.entry.id));
+        trace?.startStage("hard_cutoff", lifecycleRanked.map((r) => r.entry.id));
+        const hardFiltered = lifecycleRanked.filter((r) => r.score >= this.config.hardMinScore);
+        trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
+        if (diagnostics)
+            diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
+        trace?.startStage("noise_filter", hardFiltered.map((r) => r.entry.id));
         const denoised = this.config.filterNoise
-            ? filterNoise(lifecycleRanked, (r) => r.entry.text)
-            : lifecycleRanked;
+            ? filterNoise(hardFiltered, (r) => r.entry.text)
+            : hardFiltered;
         trace?.endStage(denoised.map((r) => r.entry.id), denoised.map((r) => r.score));
         if (diagnostics)
             diagnostics.stageCounts.afterNoiseFilter = denoised.length;
@@ -680,7 +683,7 @@ export class MemoryRetriever {
             failureStage = "hybrid.rerank";
             if (this.config.rerank !== "none") {
                 trace?.startStage("rerank", filtered.map((r) => r.entry.id));
-                reranked = await this.rerankResults(query, queryVector, rerankInput);
+                reranked = await this.rerankResults(query, queryVector, rerankInput, diagnostics);
                 trace?.endStage(reranked.map((r) => r.entry.id), reranked.map((r) => r.score));
             }
             else {
@@ -714,23 +717,23 @@ export class MemoryRetriever {
             trace?.endStage(lengthNormalized.map((r) => r.entry.id), lengthNormalized.map((r) => r.score));
             if (diagnostics)
                 diagnostics.stageCounts.afterLengthNorm = lengthNormalized.length;
-            trace?.startStage("hard_cutoff", lengthNormalized.map((r) => r.entry.id));
-            const hardFiltered = lengthNormalized.filter((r) => r.score >= this.config.hardMinScore);
-            trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
-            if (diagnostics)
-                diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
             const decayStageName = this.decayEngine ? "decay_boost" : "time_decay";
-            trace?.startStage(decayStageName, hardFiltered.map((r) => r.entry.id));
+            trace?.startStage(decayStageName, lengthNormalized.map((r) => r.entry.id));
             const lifecycleRanked = this.decayEngine
-                ? this.applyDecayBoost(hardFiltered)
-                : this.applyTimeDecay(hardFiltered);
+                ? this.applyDecayBoost(lengthNormalized)
+                : this.applyTimeDecay(lengthNormalized);
             trace?.endStage(lifecycleRanked.map((r) => r.entry.id), lifecycleRanked.map((r) => r.score));
             if (diagnostics)
                 diagnostics.stageCounts.afterTimeDecay = lifecycleRanked.length;
-            trace?.startStage("noise_filter", lifecycleRanked.map((r) => r.entry.id));
+            trace?.startStage("hard_cutoff", lifecycleRanked.map((r) => r.entry.id));
+            const hardFiltered = lifecycleRanked.filter((r) => r.score >= this.config.hardMinScore);
+            trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
+            if (diagnostics)
+                diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
+            trace?.startStage("noise_filter", hardFiltered.map((r) => r.entry.id));
             const denoised = this.config.filterNoise
-                ? filterNoise(lifecycleRanked, (r) => r.entry.text)
-                : lifecycleRanked;
+                ? filterNoise(hardFiltered, (r) => r.entry.text)
+                : hardFiltered;
             trace?.endStage(denoised.map((r) => r.entry.id), denoised.map((r) => r.score));
             if (diagnostics)
                 diagnostics.stageCounts.afterNoiseFilter = denoised.length;
@@ -843,13 +846,18 @@ export class MemoryRetriever {
      * Rerank results using cross-encoder API (Jina, Pinecone, or compatible).
      * Falls back to cosine similarity if API is unavailable or fails.
      */
-    async rerankResults(query, queryVector, results) {
+    async rerankResults(query, queryVector, results, diagnostics) {
         if (results.length === 0) {
             return results;
         }
         // Try cross-encoder rerank via configured provider API
         const provider = this.config.rerankProvider || "jina";
         const hasApiKey = !!this.config.rerankApiKey;
+        const recordFallback = (reason, message) => {
+            if (diagnostics) {
+                diagnostics.rerankFallback = { provider, reason, message };
+            }
+        };
         if (this.config.rerank === "cross-encoder" && hasApiKey) {
             try {
                 const model = this.config.rerankModel || "jina-reranker-v3";
@@ -877,6 +885,7 @@ export class MemoryRetriever {
                     // Parse provider-specific response into unified format
                     const parsed = parseRerankResponse(provider, data);
                     if (!parsed) {
+                        recordFallback("invalid_response", "Rerank API returned an invalid response shape");
                         console.warn("Rerank API: invalid response shape, falling back to cosine");
                     }
                     else {
@@ -910,14 +919,18 @@ export class MemoryRetriever {
                 }
                 else {
                     const errText = await response.text().catch(() => "");
+                    recordFallback("http_error", `Rerank API returned ${response.status}: ${errText.slice(0, 200)}`);
                     console.warn(`Rerank API returned ${response.status}: ${errText.slice(0, 200)}, falling back to cosine`);
                 }
             }
             catch (error) {
                 if (error instanceof Error && error.name === "AbortError") {
-                    console.warn(`Rerank API timed out (${this.config.rerankTimeoutMs ?? 5000}ms), falling back to cosine`);
+                    const message = `Rerank API timed out (${this.config.rerankTimeoutMs ?? 5000}ms)`;
+                    recordFallback("timeout", message);
+                    console.warn(`${message}, falling back to cosine`);
                 }
                 else {
+                    recordFallback("request_error", formatErrorMessage(error));
                     console.warn("Rerank API failed, falling back to cosine:", error);
                 }
             }
@@ -939,6 +952,7 @@ export class MemoryRetriever {
             return reranked.sort((a, b) => b.score - a.score);
         }
         catch (error) {
+            recordFallback("cosine_error", formatErrorMessage(error));
             console.warn("Reranking failed, returning original results:", error);
             return results;
         }
@@ -1146,33 +1160,61 @@ export class MemoryRetriever {
      * relevant (high score) and diverse (low similarity to already-selected).
      *
      * Uses cosine similarity between memory vectors. If two memories have
-     * cosine similarity > threshold (default 0.92), the lower-scored one
+     * cosine similarity > threshold (default 0.85), the lower-scored one
      * is demoted to the end rather than removed entirely.
      *
      * This prevents top-k from being filled with near-identical entries
      * (e.g. 3 similar "SVG style" memories) while keeping them available
      * if the pool is small.
+     *
+     * Complexity: O(n²) — pre-converts all vectors once at entry and uses
+     * Map-based O(1) id lookup, avoiding the O(n³) cost of repeated
+     * Array.from() calls inside the inner loop (original implementation).
+     *
+     * Duplicate IDs are detected upfront and routed to
+     * applyMMRDiversity_Fallback() which preserves original semantics using
+     * findIndex-based O(n²) approach (safe for small duplicate sets).
      */
     applyMMRDiversity(results, similarityThreshold = 0.85) {
         if (results.length <= 1)
             return results;
+        // Detect duplicate IDs and route to fallback (preserves original semantics)
+        const seenIds = new Set();
+        for (const r of results) {
+            if (seenIds.has(r.entry.id)) {
+                return this.applyMMRDiversity_Fallback(results, similarityThreshold);
+            }
+            seenIds.add(r.entry.id);
+        }
+        // Pre-convert all vectors once: O(n²) total for all conversions.
+        // This eliminates the O(n) Array.from() cost from the inner loop,
+        // reducing per-candidate similarity from O(n²) → O(n).
+        const vectorMap = new Map();
+        for (const r of results) {
+            const vec = r.entry.vector;
+            if (vec?.length) {
+                vectorMap.set(r.entry.id, Array.from(vec));
+            }
+        }
         const selected = [];
         const deferred = [];
         for (const candidate of results) {
-            // Check if this candidate is too similar to any already-selected result
-            const tooSimilar = selected.some((s) => {
-                // Both must have vectors to compare.
-                // LanceDB returns Arrow Vector objects (not plain arrays),
-                // so use .length directly and Array.from() for conversion.
-                const sVec = s.entry.vector;
-                const cVec = candidate.entry.vector;
-                if (!sVec?.length || !cVec?.length)
-                    return false;
-                const sArr = Array.from(sVec);
-                const cArr = Array.from(cVec);
-                const sim = cosineSimilarity(sArr, cArr);
-                return sim > similarityThreshold;
-            });
+            const cArr = vectorMap.get(candidate.entry.id);
+            // Items without vectors cannot be compared → always selected
+            if (!cArr) {
+                selected.push(candidate);
+                continue;
+            }
+            // Check O(1) Map lookup for similarity against all selected items.
+            // selected.size ≤ n, so this is O(n) per candidate → O(n²) total.
+            let tooSimilar = false;
+            for (const s of selected) {
+                const sArr = vectorMap.get(s.entry.id);
+                if (sArr && cosineSimilarity(sArr, cArr) > similarityThreshold) {
+                    tooSimilar = true;
+                    break;
+                }
+            }
             if (tooSimilar) {
                 deferred.push(candidate);
             }
@@ -1180,7 +1222,40 @@ export class MemoryRetriever {
                 selected.push(candidate);
             }
         }
-        // Append deferred results at the end (available but deprioritized)
+        return [...selected, ...deferred];
+    }
+    /**
+     * Fallback diversity filter for duplicate-ID inputs.
+     * Uses findIndex-based O(n²) approach which is safe for duplicate
+     * sets (typically small) and correctly handles the ambiguous case where
+     * the same ID may have different vectors in different entries.
+     *
+     * @internal
+     */
+    applyMMRDiversity_Fallback(results, similarityThreshold = 0.85) {
+        if (results.length <= 1)
+            return results;
+        const selected = [];
+        const deferred = [];
+        for (const candidate of results) {
+            // findIndex walks the selected array to check similarity.
+            // For small duplicate-ID sets this is acceptable (O(n²) total).
+            const tooSimilar = selected.findIndex((s) => {
+                const sVec = s.entry.vector;
+                const cVec = candidate.entry.vector;
+                if (!sVec?.length || !cVec?.length)
+                    return false;
+                const sArr = Array.from(sVec);
+                const cArr = Array.from(cVec);
+                return cosineSimilarity(sArr, cArr) > similarityThreshold;
+            }) !== -1;
+            if (tooSimilar) {
+                deferred.push(candidate);
+            }
+            else {
+                selected.push(candidate);
+            }
+        }
         return [...selected, ...deferred];
     }
     // Update configuration
@@ -1203,6 +1278,9 @@ export class MemoryRetriever {
             dropSummary: this.lastDiagnostics.dropSummary.map((drop) => ({
                 ...drop,
             })),
+            rerankFallback: this.lastDiagnostics.rerankFallback
+                ? { ...this.lastDiagnostics.rerankFallback }
+                : undefined,
         };
     }
     // Test retrieval system

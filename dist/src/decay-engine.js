@@ -111,8 +111,10 @@ export function createDecayEngine(config = DEFAULT_DECAY_CONFIG) {
         applySearchBoost(results, now = Date.now()) {
             for (const r of results) {
                 const ds = scoreOne(r.memory, now);
-                const tierFloor = Math.max(getTierFloor(r.memory.tier), ds.composite);
-                const multiplier = boostMin + ((1 - boostMin) * tierFloor);
+                // Fresh memories should not be penalized merely because access
+                // frequency starts at zero.
+                const searchFloor = Math.max(getTierFloor(r.memory.tier), ds.composite, ds.recency);
+                const multiplier = boostMin + ((1 - boostMin) * searchFloor);
                 r.score *= Math.min(1, Math.max(boostMin, multiplier));
             }
         },

@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync, statSync, unlinkSync, } from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 // ============================================================================
 // LanceDB Dynamic Import
@@ -75,13 +76,40 @@ function scoreLexicalHit(query, candidates) {
 // ============================================================================
 // Storage Path Validation
 // ============================================================================
+function fileUrlToWindowsPath(url) {
+    const host = url.hostname && url.hostname !== "localhost" ? url.hostname : "";
+    const pathname = decodeURIComponent(url.pathname);
+    if (host) {
+        return `\\\\${host}${pathname.replace(/\//g, "\\")}`;
+    }
+    const withoutDriveSlash = /^\/[a-zA-Z]:/.test(pathname)
+        ? pathname.slice(1)
+        : pathname;
+    return withoutDriveSlash.replace(/\//g, "\\");
+}
+export function normalizeStoragePath(dbPath, platform = process.platform) {
+    const trimmed = dbPath.trim();
+    if (!trimmed.startsWith("file://"))
+        return dbPath;
+    try {
+        const url = new URL(trimmed);
+        if (url.protocol !== "file:")
+            return dbPath;
+        return platform === "win32"
+            ? fileUrlToWindowsPath(url)
+            : fileURLToPath(url);
+    }
+    catch {
+        return dbPath;
+    }
+}
 /**
  * Validate and prepare the storage directory before LanceDB connection.
  * Resolves symlinks, creates missing directories, and checks write permissions.
  * Returns the resolved absolute path on success, or throws a descriptive error.
  */
 export function validateStoragePath(dbPath) {
-    let resolvedPath = dbPath;
+    let resolvedPath = normalizeStoragePath(dbPath);
     // Resolve symlinks (including dangling symlinks)
     try {
         const stats = lstatSync(dbPath);
@@ -138,7 +166,6 @@ export function validateStoragePath(dbPath) {
 // ============================================================================
 const TABLE_NAME = "memories";
 export class MemoryStore {
-    config;
     db = null;
     table = null;
     initPromise = null;
@@ -164,8 +191,12 @@ export class MemoryStore {
     // 【MR2 fix】pendingBatch 上限，防止高生產率時無限增長。
     // 當 pending callers 超過此值時，block 並同步 flush，確保 pendingBatch 不會無限膨胀。
     static MAX_PENDING_BATCH_SIZE = 1000;
+    config;
     constructor(config) {
-        this.config = config;
+        this.config = {
+            ...config,
+            dbPath: normalizeStoragePath(config.dbPath),
+        };
     }
     async runWithFileLock(fn) {
         const lockfile = await loadLockfile();

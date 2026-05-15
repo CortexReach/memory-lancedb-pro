@@ -9,6 +9,7 @@ import { buildOauthEndpoint, extractOutputTextFromSse, loadOAuthSession, needsRe
  * or contain surrounding text.
  */
 function extractJsonFromResponse(text) {
+    text = stripReasoningTrace(text);
     const fenceMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
     if (fenceMatch) {
         return fenceMatch[1].trim();
@@ -32,6 +33,15 @@ function extractJsonFromResponse(text) {
     if (lastBrace === -1)
         return null;
     return text.substring(firstBrace, lastBrace + 1);
+}
+function stripReasoningTrace(text) {
+    const closingThinkTag = text.toLowerCase().lastIndexOf("</think>");
+    if (closingThinkTag === -1)
+        return text;
+    return text.slice(closingThinkTag + "</think>".length).trim();
+}
+function shouldDisableReasoningForJson(model) {
+    return /qwen3|deepseek.*r1|qwq/i.test(model);
 }
 function previewText(value, maxLen = 200) {
     const normalized = value.replace(/\s+/g, " ").trim();
@@ -142,7 +152,7 @@ function createApiKeyClient(config, log, warnLog) {
         async completeJson(prompt, label = "generic") {
             lastError = null;
             try {
-                const response = await client.chat.completions.create({
+                const request = {
                     model: config.model,
                     messages: [
                         {
@@ -152,7 +162,11 @@ function createApiKeyClient(config, log, warnLog) {
                         { role: "user", content: prompt },
                     ],
                     temperature: 0.1,
-                });
+                    ...(shouldDisableReasoningForJson(config.model)
+                        ? { chat_template_kwargs: { enable_thinking: false } }
+                        : {}),
+                };
+                const response = await client.chat.completions.create(request);
                 const raw = response.choices?.[0]?.message?.content;
                 if (!raw) {
                     lastError =
@@ -355,4 +369,4 @@ export function createLlmClient(config) {
     }
     return createApiKeyClient(config, log, warnLog);
 }
-export { extractJsonFromResponse, repairCommonJson };
+export { extractJsonFromResponse, repairCommonJson, shouldDisableReasoningForJson, stripReasoningTrace };

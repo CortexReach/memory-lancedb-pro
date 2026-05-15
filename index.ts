@@ -456,22 +456,24 @@ function summarizeAgentEndMessages(messages: unknown[]): string {
   return `messages=${messages.length}, roles=[${roles}], stringContents=${stringContents}, arrayContents=${arrayContents}, textBlocks=${textBlocks}`;
 }
 
-const DEFAULT_SELF_IMPROVEMENT_REMINDER = `## Self-Improvement Reminder
-
-After completing tasks, evaluate if any learnings should be captured:
-
-**Log when:**
-- User corrects you -> .learnings/LEARNINGS.md
-- Command/operation fails -> .learnings/ERRORS.md
-- You discover your knowledge was wrong -> .learnings/LEARNINGS.md
-- You find a better approach -> .learnings/LEARNINGS.md
-
-**Promote when pattern is proven:**
-- Behavioral patterns -> SOUL.md
-- Workflow improvements -> AGENTS.md
-- Tool gotchas -> TOOLS.md
-
-Keep entries simple: date, title, what happened, what to do differently.`;
+const DEFAULT_SELF_IMPROVEMENT_REMINDER = [
+  "## Self-Improvement Reminder",
+  "",
+  "After completing tasks, evaluate if any learnings should be captured:",
+  "",
+  "**Log when:**",
+  "- User corrects you -> .learnings/LEARNINGS.md",
+  "- Command/operation fails -> .learnings/ERRORS.md",
+  "- You discover your knowledge was wrong -> .learnings/LEARNINGS.md",
+  "- You find a better approach -> .learnings/LEARNINGS.md",
+  "",
+  "**Promote when pattern is proven:**",
+  "- Behavioral patterns -> SOUL.md",
+  "- Workflow improvements -> AGENTS.md",
+  "- Tool gotchas -> TOOLS.md",
+  "",
+  "Keep entries simple: date, title, what happened, what to do differently.",
+].join("\n");
 
 const SELF_IMPROVEMENT_NOTE_PREFIX = "/note self-improvement (before reset):";
 const DEFAULT_REFLECTION_MESSAGE_COUNT = 120;

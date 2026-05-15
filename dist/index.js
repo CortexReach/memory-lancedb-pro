@@ -3,7 +3,7 @@
  * Enhanced LanceDB-backed long-term memory with hybrid retrieval and multi-scope isolation
  */
 import { homedir, tmpdir } from "node:os";
-import { join, dirname, basename } from "node:path";
+import { join, dirname, basename, win32 as winPath } from "node:path";
 import { readFile, readdir, writeFile, mkdir, appendFile, unlink, stat } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -16,7 +16,7 @@ import { spawn } from "node:child_process";
 // so we downgrade them to debug level when running in CLI mode.
 const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 // Import core components
-import { MemoryStore, validateStoragePath } from "./src/store.js";
+import { MemoryStore, normalizeStoragePath, validateStoragePath } from "./src/store.js";
 import { createEmbedder, getEffectiveVectorDimensions, } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
@@ -200,22 +200,24 @@ function summarizeAgentEndMessages(messages) {
         .join(", ") || "none";
     return `messages=${messages.length}, roles=[${roles}], stringContents=${stringContents}, arrayContents=${arrayContents}, textBlocks=${textBlocks}`;
 }
-const DEFAULT_SELF_IMPROVEMENT_REMINDER = `## Self-Improvement Reminder
-
-After completing tasks, evaluate if any learnings should be captured:
-
-**Log when:**
-- User corrects you -> .learnings/LEARNINGS.md
-- Command/operation fails -> .learnings/ERRORS.md
-- You discover your knowledge was wrong -> .learnings/LEARNINGS.md
-- You find a better approach -> .learnings/LEARNINGS.md
-
-**Promote when pattern is proven:**
-- Behavioral patterns -> SOUL.md
-- Workflow improvements -> AGENTS.md
-- Tool gotchas -> TOOLS.md
-
-Keep entries simple: date, title, what happened, what to do differently.`;
+const DEFAULT_SELF_IMPROVEMENT_REMINDER = [
+    "## Self-Improvement Reminder",
+    "",
+    "After completing tasks, evaluate if any learnings should be captured:",
+    "",
+    "**Log when:**",
+    "- User corrects you -> .learnings/LEARNINGS.md",
+    "- Command/operation fails -> .learnings/ERRORS.md",
+    "- You discover your knowledge was wrong -> .learnings/LEARNINGS.md",
+    "- You find a better approach -> .learnings/LEARNINGS.md",
+    "",
+    "**Promote when pattern is proven:**",
+    "- Behavioral patterns -> SOUL.md",
+    "- Workflow improvements -> AGENTS.md",
+    "- Tool gotchas -> TOOLS.md",
+    "",
+    "Keep entries simple: date, title, what happened, what to do differently.",
+].join("\n");
 const SELF_IMPROVEMENT_NOTE_PREFIX = "/note self-improvement (before reset):";
 const DEFAULT_REFLECTION_MESSAGE_COUNT = 120;
 const DEFAULT_REFLECTION_MAX_INPUT_CHARS = 24_000;
@@ -254,53 +256,69 @@ export function isLayer1CircuitOpen() {
     const recentFailures = layer1FailureTimestamps.filter((t) => t >= cutoff);
     return recentFailures.length >= LAYER1_FAILURE_THRESHOLD;
 }
-export function toImportSpecifier(value) {
+export function toImportSpecifier(value, platform = process.platform) {
     const trimmed = value.trim();
     if (!trimmed)
         return "";
     if (trimmed.startsWith("file://"))
         return trimmed;
     if (trimmed.startsWith("/"))
-        return pathToFileURL(trimmed).href;
+        return pathToFileURL(trimmed, { windows: false }).href;
     // Handle Windows absolute paths (e.g. C:\Users\... or D:/Program Files/...) — PR #593
-    if (process.platform === 'win32' && /^[a-zA-Z]:[/\\]/.test(trimmed))
-        return pathToFileURL(trimmed).href;
+    if (platform === 'win32' && /^[a-zA-Z]:[/\\]/.test(trimmed)) {
+        return pathToFileURL(trimmed, { windows: true }).href;
+    }
     // Handle UNC paths (\\server\share or \\?\UNC\\server\share) — PR #593
     // Regex breakdown: ^\\\\  = starts with \\
     //                  [^\\]+   = server name (one or more non-backslash chars)
     //                  \\[^\\]+ = \ + share name (one or more non-backslash chars)
     // Examples matched: \\server\share, \\fileserver\company-share, \\?\UNC\server\share
     // Examples NOT matched: C:\path (drive letter, handled above), /unix/path (POSIX)
-    if (process.platform === 'win32' && /^\\\\[^\\]+\\[^\\]+/.test(trimmed)) {
+    if (platform === 'win32' && /^\\\\[^\\]+\\[^\\]+/.test(trimmed)) {
         // Extended prefix \\?\UNC\\ means "long UNC name" — already normalized.
         // Pass directly so we don't double-normalize (e.g. avoid \\?\UNC\\?\UNC\\...).
-        if (trimmed.startsWith('\\\\?\\UNC\\'))
-            return pathToFileURL(trimmed).href;
+        if (trimmed.startsWith('\\\\?\\UNC\\')) {
+            return pathToFileURL(trimmed, { windows: true }).href;
+        }
         // Standard UNC: \\server\share -> \\?\UNC\\server\share -> file://server/share
         // strip leading \\ (2 chars) -> server\share, then prefix \\?\UNC\\
         const normalized = '\\\\?\\UNC\\' + trimmed.slice(2);
-        return pathToFileURL(normalized).href;
+        return pathToFileURL(normalized, { windows: true }).href;
     }
     return trimmed;
 }
-export function getExtensionApiImportSpecifiers() {
-    const envPath = process.env.OPENCLAW_EXTENSION_API_PATH?.trim();
+export function getExtensionApiImportSpecifiers(options = {}) {
+    const platform = options.platform ?? process.platform;
+    const env = options.env ?? process.env;
+    const envPath = env.OPENCLAW_EXTENSION_API_PATH?.trim();
+    const joinForPlatform = platform === "win32" ? winPath.join : join;
     const specifiers = [];
     if (envPath)
-        specifiers.push(toImportSpecifier(envPath));
+        specifiers.push(toImportSpecifier(envPath, platform));
     specifiers.push("openclaw/dist/extensionAPI.js");
     try {
-        specifiers.push(toImportSpecifier(requireFromHere.resolve("openclaw/dist/extensionAPI.js")));
+        const resolved = options.resolveOpenClawExtensionApi
+            ? options.resolveOpenClawExtensionApi()
+            : requireFromHere.resolve("openclaw/dist/extensionAPI.js");
+        specifiers.push(toImportSpecifier(resolved, platform));
     }
     catch {
         // ignore resolve failures and continue fallback probing
     }
-    specifiers.push(toImportSpecifier("/usr/lib/node_modules/openclaw/dist/extensionAPI.js"));
-    specifiers.push(toImportSpecifier("/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js"));
-    specifiers.push(toImportSpecifier("/opt/homebrew/lib/node_modules/openclaw/dist/extensionAPI.js"));
-    if (process.platform === "win32" && process.env.APPDATA) {
-        const windowsNpmPath = join(process.env.APPDATA, "npm", "node_modules", "openclaw", "dist", "extensionAPI.js");
-        specifiers.push(toImportSpecifier(windowsNpmPath));
+    if (platform === "win32") {
+        if (env.APPDATA) {
+            const windowsNpmPath = joinForPlatform(env.APPDATA, "npm", "node_modules", "openclaw", "dist", "extensionAPI.js");
+            specifiers.push(toImportSpecifier(windowsNpmPath, platform));
+        }
+        if (env.ProgramFiles) {
+            const windowsProgramFilesPath = joinForPlatform(env.ProgramFiles, "nodejs", "node_modules", "openclaw", "dist", "extensionAPI.js");
+            specifiers.push(toImportSpecifier(windowsProgramFilesPath, platform));
+        }
+    }
+    else {
+        specifiers.push(toImportSpecifier("/usr/lib/node_modules/openclaw/dist/extensionAPI.js", platform));
+        specifiers.push(toImportSpecifier("/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js", platform));
+        specifiers.push(toImportSpecifier("/opt/homebrew/lib/node_modules/openclaw/dist/extensionAPI.js", platform));
     }
     return [...new Set(specifiers.filter(Boolean))];
 }
@@ -435,7 +453,8 @@ async function runReflectionViaCli(params) {
         sessionId,
     ];
     return await new Promise((resolve, reject) => {
-        const child = spawn(cliBin, args, {
+        const spawnCommand = buildReflectionCliSpawnCommand(cliBin, args);
+        const child = spawn(spawnCommand.command, spawnCommand.args, {
             cwd: params.workspaceDir,
             env: { ...process.env, NO_COLOR: "1" },
             stdio: ["ignore", "pipe", "pipe"],
@@ -495,6 +514,15 @@ async function runReflectionViaCli(params) {
             }
         });
     });
+}
+export function buildReflectionCliSpawnCommand(cliBin, args, platform = process.platform, comSpec = process.env.ComSpec?.trim()) {
+    if (platform === "win32") {
+        return {
+            command: comSpec || "cmd.exe",
+            args: ["/c", cliBin, ...args],
+        };
+    }
+    return { command: cliBin, args };
 }
 async function loadSelfImprovementReminderContent(workspaceDir) {
     const baseDir = typeof workspaceDir === "string" && workspaceDir.trim().length ? workspaceDir.trim() : "";
@@ -1461,9 +1489,9 @@ function isSessionBoundaryReflectionAction(action) {
 let _singletonState = null;
 function _initPluginState(api) {
     const config = parsePluginConfig(api.pluginConfig);
-    const resolvedDbPath = api.resolvePath(config.dbPath || getDefaultDbPath());
+    let resolvedDbPath = normalizeStoragePath(api.resolvePath(config.dbPath || getDefaultDbPath()));
     try {
-        validateStoragePath(resolvedDbPath);
+        resolvedDbPath = validateStoragePath(resolvedDbPath);
     }
     catch (err) {
         api.logger.warn(`memory-lancedb-pro: storage path issue — ${String(err)}\n` +
