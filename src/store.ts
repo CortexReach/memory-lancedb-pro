@@ -105,6 +105,71 @@ function clampInt(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.floor(value)));
 }
 
+const LEGACY_SECONDS_TIMESTAMP_MAX = 1_000_000_000_000;
+
+export function normalizeMemoryTimestamp(value: unknown, fallback = Date.now()): number {
+  const raw = value instanceof Date
+    ? value.getTime()
+    : typeof value === "number"
+      ? value
+      : Number(value);
+
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return fallback;
+  }
+
+  const timestamp = Math.floor(raw);
+  return timestamp < LEGACY_SECONDS_TIMESTAMP_MAX ? timestamp * 1000 : timestamp;
+}
+
+function normalizePredicateTimestamp(value: unknown): number | null {
+  const raw = value instanceof Date
+    ? value.getTime()
+    : typeof value === "number"
+      ? value
+      : Number(value);
+
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return null;
+  }
+
+  return normalizeMemoryTimestamp(raw);
+}
+
+function timestampBeforePredicate(column: string, value: unknown): string {
+  const maxTimestamp = normalizePredicateTimestamp(value);
+  if (maxTimestamp == null) {
+    return "(FALSE)";
+  }
+  const legacySecondsCutoff = Math.floor(maxTimestamp / 1000);
+  return `((${column} >= ${LEGACY_SECONDS_TIMESTAMP_MAX} AND ${column} < ${maxTimestamp}) OR ` +
+    `(${column} > 0 AND ${column} < ${LEGACY_SECONDS_TIMESTAMP_MAX} AND ${column} < ${legacySecondsCutoff}))`;
+}
+
+function normalizeLegacyTimestampMetadata(value: unknown): string {
+  let metadata: Record<string, unknown>;
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      metadata = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : {};
+    } catch {
+      return value;
+    }
+  } else if (value && typeof value === "object" && !Array.isArray(value)) {
+    metadata = { ...(value as Record<string, unknown>) };
+  } else {
+    return "{}";
+  }
+
+  if (Object.prototype.hasOwnProperty.call(metadata, "last_accessed_at")) {
+    metadata.last_accessed_at = normalizeMemoryTimestamp(metadata.last_accessed_at, 0);
+  }
+
+  return JSON.stringify(metadata);
+}
+
 function escapeSqlLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
@@ -497,6 +562,8 @@ export class MemoryStore {
       }
     }
 
+    await this.backfillLegacySecondTimestamps(table);
+
     // Validate vector dimensions
     // Note: LanceDB returns Arrow Vector objects, not plain JS arrays.
     // Array.isArray() returns false for Arrow Vectors, so use .length instead.
@@ -524,6 +591,37 @@ export class MemoryStore {
 
     this.db = db;
     this.table = table;
+  }
+
+  private async backfillLegacySecondTimestamps(table: LanceDB.Table): Promise<void> {
+    try {
+      const legacyRows = await table.query()
+        .where(`timestamp > 0 AND timestamp < ${LEGACY_SECONDS_TIMESTAMP_MAX}`)
+        .toArray();
+
+      if (legacyRows.length === 0) return;
+
+      const normalizedRows = legacyRows.map((row: any) => ({
+        ...row,
+        vector: Array.from(row.vector as Iterable<number>),
+        scope: (row.scope as string | undefined) ?? "global",
+        metadata: normalizeLegacyTimestampMetadata(row.metadata),
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+      }));
+
+      await this.runWithFileLock(async () => {
+        for (const row of legacyRows) {
+          await table.delete(`id = '${escapeSqlLiteral(row.id as string)}'`);
+        }
+        for (let i = 0; i < normalizedRows.length; i += MemoryStore.MAX_BATCH_SIZE) {
+          await table.add(normalizedRows.slice(i, i + MemoryStore.MAX_BATCH_SIZE));
+        }
+      });
+
+      console.log(`memory-lancedb-pro: normalized ${legacyRows.length} legacy second timestamp row(s)`);
+    } catch (err) {
+      console.warn("memory-lancedb-pro: could not normalize legacy second timestamps:", err);
+    }
   }
 
   private async createFtsIndex(table: LanceDB.Table): Promise<void> {
@@ -917,9 +1015,7 @@ export class MemoryStore {
       ...entry,
       scope: entry.scope || "global",
       importance: Number.isFinite(entry.importance) ? entry.importance : 0.7,
-      timestamp: Number.isFinite(entry.timestamp)
-        ? entry.timestamp
-        : Date.now(),
+      timestamp: normalizeMemoryTimestamp(entry.timestamp),
       metadata: entry.metadata || "{}",
     };
 
@@ -973,7 +1069,7 @@ export class MemoryStore {
       category: row.category as MemoryEntry["category"],
       scope: rowScope,
       importance: Number(row.importance),
-      timestamp: Number(row.timestamp),
+      timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
       metadata: (row.metadata as string) || "{}",
     };
   }
@@ -1027,7 +1123,7 @@ export class MemoryStore {
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
         importance: Number(row.importance),
-        timestamp: Number(row.timestamp),
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
 
@@ -1105,7 +1201,7 @@ export class MemoryStore {
             category: row.category as MemoryEntry["category"],
             scope: rowScope,
             importance: Number(row.importance),
-            timestamp: Number(row.timestamp),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: (row.metadata as string) || "{}",
         };
 
@@ -1169,7 +1265,7 @@ export class MemoryStore {
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
         importance: Number(row.importance),
-        timestamp: Number(row.timestamp),
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
 
@@ -1307,7 +1403,7 @@ export class MemoryStore {
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
           importance: Number(row.importance),
-          timestamp: Number(row.timestamp),
+          timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),
       )
@@ -1439,7 +1535,7 @@ export class MemoryStore {
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
         importance: Number(row.importance),
-        timestamp: Number(row.timestamp),
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
 
@@ -1538,8 +1634,8 @@ export class MemoryStore {
       conditions.push(`(${scopeConditions})`);
     }
 
-    if (beforeTimestamp) {
-      conditions.push(`timestamp < ${beforeTimestamp}`);
+    if (beforeTimestamp != null) {
+      conditions.push(timestampBeforePredicate("timestamp", beforeTimestamp));
     }
 
     if (conditions.length === 0) {
@@ -1624,7 +1720,7 @@ export class MemoryStore {
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
 
-    const conditions: string[] = [`timestamp < ${maxTimestamp}`];
+    const conditions: string[] = [timestampBeforePredicate("timestamp", maxTimestamp)];
 
     if (scopeFilter && scopeFilter.length > 0) {
       const scopeConditions = scopeFilter
@@ -1650,7 +1746,7 @@ export class MemoryStore {
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
           importance: Number(row.importance),
-          timestamp: Number(row.timestamp),
+          timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),
       );
