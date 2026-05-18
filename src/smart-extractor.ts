@@ -25,6 +25,7 @@ import {
   type DedupDecision,
   type DedupResult,
   type ExtractionStats,
+  type ExtractionValidation,
   type MemoryCategory,
   ALWAYS_MERGE_CATEGORIES,
   MERGE_SUPPORTED_CATEGORIES,
@@ -288,6 +289,14 @@ export interface ExtractPersistOptions {
    * - pass a non-empty array to restrict reads to those scopes
    */
   scopeFilter?: string[];
+  /**
+   * Optional callback invoked when the number of entries actually written
+   * differs from the number of entries the pipeline attempted to write.
+   *
+   * Only triggered when `actual !== expected` (mismatch !== 0).
+   * If omitted, mismatches are silently ignored (fail-silent behavior).
+   */
+  onExtractionValidationFailed?: (validation: ExtractionValidation) => void;
 }
 
 export class SmartExtractor {
@@ -462,7 +471,20 @@ export class SmartExtractor {
     }
 
     if (createEntries.length > 0) {
+      const countBefore = await this.store.count();
       const bulkResults = await this.store.bulkStore(createEntries);
+      const countAfter = await this.store.count();
+      const actual = countAfter - countBefore;
+      const expected = createEntries.length;
+
+      if (actual !== expected && options.onExtractionValidationFailed) {
+        options.onExtractionValidationFailed({
+          expected,
+          actual,
+          mismatch: expected - actual,
+          sessionKey,
+        });
+      }
 
       // SECOND PASS: backfill superseded_by for superseded old entries.
       // bulkStore returns entries in the same order they were pushed.

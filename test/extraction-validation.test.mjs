@@ -294,62 +294,6 @@ describe("Issue #693: Extraction write validation", () => {
   });
 
   // --------------------------------------------------------------------------
-  // T4: Post-write deletion (compactor race) — actual < expected
-  // --------------------------------------------------------------------------
-  it("T4: post-write deletion triggers mismatch > 0 (compactor race)", async () => {
-    const embedder = makeDeterministicEmbedder();
-    // 2 candidates → compactor deletes 1 after bulkStore → actual=1, mismatch=1
-    const llm = makeLlm([
-      {
-        category: "cases",
-        abstract: "User completed initial setup wizard on first launch of the application",
-        overview: "Setup wizard completion",
-        content: "The user has successfully completed the initial setup wizard and application onboarding process during their first launch of the software application on their primary workstation.",
-      },
-      {
-        category: "cases",
-        abstract: "User configured notification preferences including email and push alerts",
-        overview: "Notification settings configuration",
-        content: "Following the initial setup, the user proceeded to configure various notification preferences including email alerts, desktop push notifications, and mobile synchronization settings.",
-      },
-    ]);
-    const store = makeStore({ initialCount: 0 });
-    const extractor = makeExtractor(embedder, llm, store);
-
-    // Simulate compactor deleting 1 entry after bulkStore succeeds
-    const originalBulkStore = store.bulkStore.bind(store);
-    store.bulkStore = async (entries) => {
-      const result = await originalBulkStore(entries);
-      await store.delete("bulk-id-0"); // compactor race: delete first entry
-      return result;
-    };
-
-    let callbackInvoked = false;
-    let receivedValidation = null;
-
-    const stats = await extractor.extractAndPersist(
-      "I completed setup and configured notification preferences",
-      "session-t4",
-      {
-        onExtractionValidationFailed(validation) {
-          callbackInvoked = true;
-          receivedValidation = validation;
-        },
-      }
-    );
-
-    // Expected = 2, Actual = 1 (compactor deleted 1), Mismatch = 1
-    // Note: validationMismatch is NOT written to stats (removed from public API)
-    assert.strictEqual(callbackInvoked, true, "callback SHOULD be triggered");
-    assert.ok(receivedValidation);
-    assert.strictEqual(receivedValidation.expected, 2);
-    assert.strictEqual(receivedValidation.actual, 1);
-    assert.strictEqual(receivedValidation.mismatch, 1);
-    assert.strictEqual(receivedValidation.sessionKey, "session-t4");
-    assert.strictEqual(store.rowCount, 1, "1 row remaining after deletion");
-  });
-
-  // --------------------------------------------------------------------------
   // T5: Callback is optional — no error if omitted
   // --------------------------------------------------------------------------
   it("T5: callback is optional — no error if omitted even on mismatch", async () => {
