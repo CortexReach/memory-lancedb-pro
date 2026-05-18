@@ -163,6 +163,7 @@ const EMBEDDING_DIMENSIONS: Record<string, number> = {
   "gemini-embedding-001": 3072,
   "nomic-embed-text": 768,
   "mxbai-embed-large": 1024,
+  "bge-m3": 1024,
   "BAAI/bge-m3": 1024,
   "all-MiniLM-L6-v2": 384,
   "all-mpnet-base-v2": 512,
@@ -633,7 +634,7 @@ export class Embedder {
         );
       }
 
-      const data = await response.json();
+      const data = await response.json() as any;
 
       // Validate response count and non-empty embeddings
       if (
@@ -673,7 +674,7 @@ export class Embedder {
       );
     }
 
-    const data = await response.json();
+    const data = await response.json() as any;
 
     // Ollama /api/embeddings returns { embedding: number[] },
     // convert to OpenAI-compatible shape { data: [{ embedding: number[] }] }

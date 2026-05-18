@@ -41,7 +41,7 @@ export interface ComputeTier1PatchOpts {
 // Patch shape produced by Tier 1 for an auto-recall injection. The keys are
 // a subset of SmartMemoryMetadata so the result can be passed directly to
 // store.patchMetadata().
-export interface Tier1Patch {
+export interface Tier1Patch extends Record<string, unknown> {
   access_count: number;
   last_accessed_at: number;
   injected_count: number;

@@ -4,7 +4,7 @@ import { afterEach, describe, it } from "node:test";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
-const { createLlmClient } = jiti("../src/llm-client.ts");
+const { createLlmClient, shouldDisableReasoningForJson, stripReasoningTrace } = jiti("../src/llm-client.ts");
 
 describe("LLM api-key client", () => {
   let server;
@@ -64,5 +64,48 @@ describe("LLM api-key client", () => {
       },
     ]);
     assert.equal(requestBody.temperature, 0.1);
+    assert.equal(requestBody.chat_template_kwargs, undefined);
+  });
+
+  it("disables thinking for reasoning models and strips reasoning traces before JSON parse", async () => {
+    let requestBody;
+
+    server = http.createServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      requestBody = JSON.parse(body);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: "<think>plan first</think>{\"memories\":[{\"text\":\"clean json\"}]}",
+            },
+          },
+        ],
+      }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+
+    const llm = createLlmClient({
+      auth: "api-key",
+      apiKey: "test-api-key",
+      model: "Qwen3.5-27B-FP8",
+      baseURL: `http://127.0.0.1:${port}/v1`,
+    });
+
+    const result = await llm.completeJson("extract", "reasoning-probe");
+    assert.deepEqual(result, { memories: [{ text: "clean json" }] });
+    assert.deepEqual(requestBody.chat_template_kwargs, { enable_thinking: false });
+  });
+
+  it("detects known reasoning model names", () => {
+    assert.equal(shouldDisableReasoningForJson("qwen3.5-27b-fp8"), true);
+    assert.equal(shouldDisableReasoningForJson("DeepSeek-R1-Distill-Qwen-32B"), true);
+    assert.equal(shouldDisableReasoningForJson("QwQ-32B"), true);
+    assert.equal(shouldDisableReasoningForJson("gpt-4o-mini"), false);
+    assert.equal(stripReasoningTrace("<think>{\"bad\":true}</think>{\"ok\":true}"), "{\"ok\":true}");
   });
 });

@@ -51,7 +51,7 @@ export interface CompactionEntry {
   scope: string;
   importance: number;
   timestamp: number;
-  metadata: string;
+  metadata?: string;
 }
 
 export interface ClusterPlan {
