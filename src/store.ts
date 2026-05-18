@@ -245,33 +245,45 @@ export class MemoryStore {
     // only a cross-process serialization guard that we can skip when the filesystem is racy.
     let release: (() => Promise<void>) | null = null;
     let usingFallbackLock = false;
-    try {
-      release = await lockfile.lock(lockPath, {
-        retries: {
-          retries: 10,
-          factor: 2,
-          minTimeout: 1000, // James 保守設定：避免高負載下過度密集重試
-          maxTimeout: 30000, // James 保守設定：支撐更久的 event loop 阻塞
-        },
-        stale: 10000, // 10 秒後視為 stale，觸發 ECOMPROMISED callback
-                       // 注意：ECOMPROMISED 是 ambiguous degradation 訊號，mtime 無法區分
-                       // "holder 崩潰" vs "holder event loop 阻塞"，所以不嘗試區分
-        onCompromised: (err: unknown) => {
-          // 【修復 #415 關鍵】必須是同步 callback
-          // setLockAsCompromised() 不等待 Promise，async throw 無法傳回 caller
-          isCompromised = true;
-          compromisedErr = err;
-        },
-      });
-    } catch (lockErr: unknown) {
-      const code = (lockErr as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT') {
-        // Lock subsystem threw ENOENT (e.g. graceful-fs race inside proper-lockfile).
-        // Fall back to lock-free — LanceDB writes are already atomic.
-        console.warn(`[memory-lancedb-pro] lock() returned ENOENT for ${lockPath}, falling back to lock-free (LanceDB writes are atomic anyway)`);
-        usingFallbackLock = true;
-      } else {
-        throw lockErr; // Re-throw unexpected errors
+    let lockAttempts = 0;
+    const maxLockAttempts = 3;
+    while (lockAttempts < maxLockAttempts) {
+      lockAttempts++;
+      try {
+        release = await lockfile.lock(lockPath, {
+          retries: {
+            retries: 5,
+            factor: 2,
+            minTimeout: 500,
+            maxTimeout: 5000,
+          },
+          stale: 10000,
+          onCompromised: (err: unknown) => {
+            isCompromised = true;
+            compromisedErr = err;
+          },
+        });
+        break; // Lock acquired successfully
+      } catch (lockErr: unknown) {
+        const code = (lockErr as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT' && lockAttempts < maxLockAttempts) {
+          // proper-lockfile ENOENT is a transient graceful-fs race; retry after jittered delay
+          // Fix: add random jitter (200-600ms) to break thundering-herd when 5+ concurrent
+          // calls hit the same lock ENOENT simultaneously (causes deadlock under heavy write load).
+          if (lockAttempts === 1) {
+            console.debug(`[memory-lancedb-pro] lock() ENOENT for ${lockPath}, retrying (attempt ${lockAttempts}/${maxLockAttempts})`);
+          }
+          const jitter = Math.random() * 400;
+          await new Promise(resolve => setTimeout(resolve, 200 + jitter));
+          continue;
+        }
+        if (code === 'ENOENT') {
+          // All retries exhausted — fall back to lock-free (LanceDB writes are atomic)
+          console.debug(`[memory-lancedb-pro] lock() ENOENT exhausted after ${maxLockAttempts} attempts, falling back to lock-free`);
+          usingFallbackLock = true;
+          break;
+        }
+        throw lockErr;
       }
     }
 
