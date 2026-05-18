@@ -25,6 +25,7 @@ import {
   type DedupDecision,
   type DedupResult,
   type ExtractionStats,
+  type ExtractionValidation,
   type MemoryCategory,
   ALWAYS_MERGE_CATEGORIES,
   MERGE_SUPPORTED_CATEGORIES,
@@ -53,6 +54,21 @@ import { inferAtomicBrandItemPreferenceSlot } from "./preference-slots.js";
 import { batchDedup } from "./batch-dedup.js";
 
 type StoreEntry = Omit<import("./store.js").MemoryEntry, "id" | "timestamp">;
+
+/**
+ * Interface for tracking old entries that need to be invalidated (marked as superseded).
+ * Used in batch mode to collect invalidation operations and execute them after bulkStore.
+ */
+interface InvalidateEntry {
+  id: string;
+  metadata: string;
+  /** Index into the bulkStore result array for backfilling superseded_by */
+  bulkIndex?: number;
+  /** Original metadata before invalidation, used for rollback on partial failures */
+  _origMetadata?: string;
+  /** ID of the new entry that supersedes this one (set during second pass) */
+  newEntryId?: string;
+}
 
 // ============================================================================
 // Envelope Metadata Stripping
@@ -273,6 +289,14 @@ export interface ExtractPersistOptions {
    * - pass a non-empty array to restrict reads to those scopes
    */
   scopeFilter?: string[];
+  /**
+   * Optional callback invoked when the number of entries actually written
+   * differs from the number of entries the pipeline attempted to write.
+   *
+   * Only triggered when `actual !== expected` (mismatch !== 0).
+   * If omitted, mismatches are silently ignored (fail-silent behavior).
+   */
+  onExtractionValidationFailed?: (validation: ExtractionValidation) => void;
 }
 
 export class SmartExtractor {
@@ -420,6 +444,10 @@ export class SmartExtractor {
     }
 
     const createEntries: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[] = [];
+    const invalidateEntries: InvalidateEntry[] = [];
+    // MR2: track matchIds already queued for supersession in this batch to prevent
+    // duplicate supersedes of the same entry (which would leave inconsistent superseded_by).
+    const queuedSupersedeMatchIds = new Set<string>();
 
     for (const { index, candidate } of processableCandidates) {
       try {
@@ -432,6 +460,8 @@ export class SmartExtractor {
           scopeFilter,
           precomputedVectors.get(index),
           createEntries,
+          invalidateEntries,
+          queuedSupersedeMatchIds,
         );
       } catch (err) {
         this.log(
@@ -441,7 +471,113 @@ export class SmartExtractor {
     }
 
     if (createEntries.length > 0) {
-      await this.store.bulkStore(createEntries);
+      const countBefore = await this.store.count();
+      const bulkResults = await this.store.bulkStore(createEntries);
+      const countAfter = await this.store.count();
+      const actual = countAfter - countBefore;
+      const expected = createEntries.length;
+
+      if (actual !== expected && options.onExtractionValidationFailed) {
+        options.onExtractionValidationFailed({
+          expected,
+          actual,
+          mismatch: expected - actual,
+          sessionKey,
+        });
+      }
+
+      // SECOND PASS: backfill superseded_by for superseded old entries.
+      // bulkStore returns entries in the same order they were pushed.
+      // For each invalidateEntry that came from a supersede (bulkIndex is set),
+      // the new entry's ID is at bulkResults[bulkIndex].id.
+      // We parse the stored metadata and update it with the new entry's ID.
+      if (invalidateEntries.length > 0) {
+        for (const inv of invalidateEntries) {
+          if (inv.bulkIndex !== undefined && inv.bulkIndex < bulkResults.length) {
+            const newEntryId = bulkResults[inv.bulkIndex].id;
+            inv.newEntryId = newEntryId; // persist for rollback
+            const oldMeta = parseSmartMetadata(inv.metadata, { id: inv.id });
+            const updatedMeta = buildSmartMetadata({ metadata: inv.metadata }, {
+              superseded_by: newEntryId,
+              relations: appendRelation(oldMeta.relations ?? [], {
+                type: "superseded_by",
+                targetId: newEntryId,
+              }),
+            });
+            inv.metadata = stringifySmartMetadata(updatedMeta);
+          }
+        }
+      }
+    }
+
+    // Invalidate old entries that were superseded (must happen after bulkStore).
+    // Each update() call acquires its own lock. This is unavoidable: LanceDB does not support
+    // atomic "bulk update with where clause".
+    if (invalidateEntries.length > 0) {
+      const results = await Promise.allSettled(
+        invalidateEntries.map((inv) =>
+          this.store.update(inv.id, { metadata: inv.metadata }, scopeFilter),
+        ),
+      );
+
+      const failed = results
+        .map((r, i) => ({ inv: invalidateEntries[i], result: r }))
+        .filter(({ result }) => result.status === 'rejected');
+
+
+      if (failed.length > 0) {
+        const failedIds = failed.map(({ inv }) => inv.id).join(', ');
+        const failedCount = failed.length;
+        const succeededCount = invalidateEntries.length - failedCount;
+
+        this.log(
+          `memory-pro: smart-extractor: ${failedCount}/${invalidateEntries.length} invalidation updates failed after bulkStore succeeded. Failed IDs: ${failedIds}. Rolling back ${succeededCount} succeeded update(s)…`,
+        );
+
+        // Rollback Phase 1: delete ALL new entries that bulkStore wrote.
+        const newEntryIdsToDelete = invalidateEntries
+          .map((inv) => inv.newEntryId)
+          .filter((id): id is string => !!id);
+
+
+        const succeeded = results
+          .map((r, i) => ({ inv: invalidateEntries[i], result: r }))
+          .filter(({ result }) => result.status === 'fulfilled');
+
+
+        const deleteResults = await Promise.allSettled(
+          newEntryIdsToDelete.map((id) => this.store.delete(id, scopeFilter)),
+        );
+        const deleteFailed = deleteResults.filter((r) => r.status === 'rejected');
+        if (deleteFailed.length > 0) {
+          this.log(
+            `memory-pro: smart-extractor: ROLLBACK FAILED — ${deleteFailed.length} new entry delete(s) failed. Partial rollback: old entries may still be superseded.`,
+          );
+        }
+
+        // Rollback Phase 2: restore old entries' metadata from _origMetadata.
+        const restoreResults = await Promise.allSettled(
+          succeeded.map(({ inv }) => {
+            const orig = inv._origMetadata;
+            if (!orig) return Promise.resolve();
+            return this.store.update(inv.id, { metadata: orig }, scopeFilter);
+          }),
+        );
+
+        const restoreFailed = restoreResults.filter((r) => r.status === 'rejected');
+        const totalFailed = deleteFailed.length + restoreFailed.length;
+        const deleteSucceeded = deleteResults.filter((r) => r.status === 'fulfilled').length;
+        if (totalFailed > 0) {
+          stats.rolledBack = (stats.rolledBack ?? 0) + deleteSucceeded;
+          this.log(
+            `memory-pro: smart-extractor: ROLLBACK FAILED — ${totalFailed} operations failed (${deleteFailed.length} deletes + ${restoreFailed.length} restores). Database may have inconsistent supersede state. Affected IDs: ${failedIds}`,
+          );
+        } else {
+          this.log(
+            `memory-pro: smart-extractor: Rollback complete — ${succeededCount} old entries restored, ${deleteSucceeded} new entries deleted. No partial state left.`,
+          );
+        }
+      }
     }
 
     return stats;
@@ -663,6 +799,8 @@ export class SmartExtractor {
     scopeFilter?: string[],
     precomputedVector?: number[],
     createEntries?: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[],
+    invalidateEntries?: InvalidateEntry[],
+    queuedSupersedeMatchIds?: Set<string>,
   ): Promise<void> {
     // Profile always merges (skip dedup — admission control still applies)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -764,18 +902,30 @@ export class SmartExtractor {
           dedupResult.matchId &&
           TEMPORAL_VERSIONED_CATEGORIES.has(candidate.category)
         ) {
-          await this.handleSupersede(
-            candidate,
-            vector,
-            dedupResult.matchId,
-            sessionKey,
-            targetScope,
-            scopeFilter,
-            admission?.audit,
-            createEntries,
-          );
-          stats.created++;
-          stats.superseded = (stats.superseded ?? 0) + 1;
+          // MR2: if this matchId is already queued for supersession by an earlier
+          // candidate in this batch, skip the supersede and create as a new entry.
+          if (queuedSupersedeMatchIds?.has(dedupResult.matchId)) {
+            this.log(
+              `memory-pro: smart-extractor: matchId ${dedupResult.matchId.slice(0, 8)} already queued for supersession — creating as new entry instead`,
+            );
+            createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
+            stats.created++;
+          } else {
+            queuedSupersedeMatchIds?.add(dedupResult.matchId);
+            await this.handleSupersede(
+              candidate,
+              vector,
+              dedupResult.matchId,
+              sessionKey,
+              targetScope,
+              scopeFilter,
+              admission?.audit,
+              createEntries,
+              invalidateEntries,
+            );
+            stats.created++;
+            stats.superseded = (stats.superseded ?? 0) + 1;
+          }
         } else {
           createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
           stats.created++;
@@ -808,18 +958,31 @@ export class SmartExtractor {
             TEMPORAL_VERSIONED_CATEGORIES.has(candidate.category) &&
             dedupResult.contextLabel === "general"
           ) {
-            await this.handleSupersede(
-              candidate,
-              vector,
-              dedupResult.matchId,
-              sessionKey,
-              targetScope,
-              scopeFilter,
-              admission?.audit,
-              createEntries,
-            );
-            stats.created++;
-            stats.superseded = (stats.superseded ?? 0) + 1;
+            // MR2: same deduplication guard as the regular supersede path —
+            // if this matchId is already queued for supersession, create as
+            // a new entry instead of double-superseding.
+            if (queuedSupersedeMatchIds?.has(dedupResult.matchId)) {
+              this.log(
+                `memory-pro: smart-extractor: CONTRADICT matchId ${dedupResult.matchId.slice(0, 8)} already queued — creating as new entry`,
+              );
+              createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
+              stats.created++;
+            } else {
+              queuedSupersedeMatchIds?.add(dedupResult.matchId);
+              await this.handleSupersede(
+                candidate,
+                vector,
+                dedupResult.matchId,
+                sessionKey,
+                targetScope,
+                scopeFilter,
+                admission?.audit,
+                createEntries,
+                invalidateEntries,
+              );
+              stats.created++;
+              stats.superseded = (stats.superseded ?? 0) + 1;
+            }
           } else {
             await this.handleContradict(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries);
             stats.created++;
@@ -1162,6 +1325,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
+    invalidateEntries?: InvalidateEntry[],
   ): Promise<void> {
     const existing = await this.store.getById(matchId, scopeFilter);
     if (!existing) {
@@ -1175,6 +1339,80 @@ export class SmartExtractor {
       existingMeta.fact_key ?? deriveFactKey(candidate.category, candidate.abstract);
     const storeCategory = this.mapToStoreCategory(candidate.category);
     const supersedeClassifyText = candidate.content || candidate.abstract;
+
+
+    // FIX #676: When createEntries is provided, push to batch instead of calling
+    // store.store() directly. The store.update() to invalidate the old record still
+    // runs individually (LanceDB does not support batch partial-updates by ID).
+    if (createEntries) {
+      // Capture position BEFORE pushing so we can find this new entry in bulkStore results
+      const bulkIndex = createEntries.length;
+
+      createEntries.push({
+        text: candidate.abstract,
+        vector,
+        category: storeCategory,
+        scope: targetScope,
+        importance: this.getDefaultImportance(candidate.category),
+        metadata: stringifySmartMetadata(
+          buildSmartMetadata(
+            {
+              text: candidate.abstract,
+              category: storeCategory,
+            },
+            {
+              l0_abstract: candidate.abstract,
+              l1_overview: candidate.overview,
+              l2_content: candidate.content,
+              memory_category: candidate.category,
+              tier: "working",
+              access_count: 0,
+              confidence: 0.7,
+              source_session: sessionKey,
+              source: "auto-capture",
+              state: "confirmed", // #350: write confirmed to unblock auto-recall
+              memory_layer: "working",
+              injected_count: 0,
+              bad_recall_count: 0,
+              suppressed_until_turn: 0,
+              valid_from: now,
+              fact_key: factKey,
+              supersedes: matchId,
+              relations: appendRelation([], {
+                type: "supersedes",
+                targetId: matchId,
+              }),
+              memory_temporal_type: classifyTemporal(supersedeClassifyText),
+              valid_until: inferExpiry(supersedeClassifyText),
+            },
+          ),
+        ),
+      });
+
+      // Invalidate the old entry. Must happen AFTER bulkStore completes.
+      // We store bulkIndex so the second pass can backfill superseded_by
+      // once bulkStore returns the generated IDs.
+      const invalidatedMetadata = buildSmartMetadata(existing, {
+        fact_key: factKey,
+        invalidated_at: now,
+        // NOTE: valid_from is deliberately NOT updated here — preserving the
+        // old entry's original valid_from maintains correct version-chain
+        // chronology.
+      });
+      invalidateEntries?.push({
+        id: matchId,
+        metadata: stringifySmartMetadata(invalidatedMetadata),
+        bulkIndex, // enables second-pass backfill of superseded_by
+        _origMetadata: existing.metadata,
+      });
+
+      this.log(
+        `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} (queued for batch + invalidate queued)`,
+      );
+      return;
+    }
+
+    // Standalone path (no createEntries — backward compatible)
     const created = await this.store.store({
       text: candidate.abstract,
       vector,
@@ -1225,6 +1463,7 @@ export class SmartExtractor {
         targetId: created.id,
       }),
     });
+
 
     await this.store.update(
       matchId,
@@ -1342,18 +1581,24 @@ export class SmartExtractor {
     createEntries?: StoreEntry[],
   ): Promise<void> {
     // 1. Record contradiction on the existing memory
+    // If matchId does not exist, skip contradiction entirely — do NOT create
+    // a new entry with a dangling contradicts reference.
     const existing = await this.store.getById(matchId, scopeFilter);
-    if (existing) {
-      const meta = parseSmartMetadata(existing.metadata, existing);
-      const supportInfo = parseSupportInfo(meta.support_info);
-      const updated = updateSupportStats(supportInfo, contextLabel, "contradict");
-      meta.support_info = updated;
-      await this.store.update(
-        matchId,
-        { metadata: stringifySmartMetadata(meta) },
-        scopeFilter,
+    if (!existing) {
+      this.log(
+        `memory-pro: smart-extractor: contradict target ${matchId.slice(0, 8)} not found — skipping, no entry created`,
       );
+      return;
     }
+    const meta = parseSmartMetadata(existing.metadata, existing);
+    const supportInfo = parseSupportInfo(meta.support_info);
+    const updated = updateSupportStats(supportInfo, contextLabel, "contradict");
+    meta.support_info = updated;
+    await this.store.update(
+      matchId,
+      { metadata: stringifySmartMetadata(meta) },
+      scopeFilter,
+    );
 
     // 2. Store the contradicting entry as a new memory
     const storeCategory = this.mapToStoreCategory(candidate.category);

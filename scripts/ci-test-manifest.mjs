@@ -76,6 +76,11 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/command-reflection-guard.test.mjs", args: ["--test"] },
   // Tier 1 memory counter fix
   { group: "core-regression", runner: "node", file: "test/tier1-counters.test.mjs", args: ["--test"] },
+  // Issue #693 extraction write validation tests
+  { group: "core-regression", runner: "node", file: "test/extraction-validation.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/dedup-false-alarm.test.mjs", args: ["--test"] },
+  // Issues #675 #676 batch mode implementation tests
+  { group: "core-regression", runner: "node", file: "test/pr678-pr723-batch-invalidation.test.mjs" },
 ];
 
 export function getEntriesForGroup(group) {
