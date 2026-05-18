@@ -209,16 +209,7 @@ export class MemoryStore {
 
   constructor(private readonly config: StoreConfig) { }
 
-  // Wrapper: serialize through in-process queue BEFORE attempting file lock.
-  // Without this, N concurrent writes all call proper-lockfile simultaneously,
-  // causing thundering-herd ENOENT on every lock acquisition. The in-process
-  // queue ensures only ONE caller hits the file lock at a time; the file lock
-  // then acts as a cross-process safety net (e.g. multiple OpenClaw instances).
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
-    return this.runSerializedUpdate(() => this.runWithFileLockInternal(fn));
-  }
-
-  private async runWithFileLockInternal<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
     // Ensure directory exists (atomic, no race — mkdirSync with recursive:true is idempotent-ish on Linux)
