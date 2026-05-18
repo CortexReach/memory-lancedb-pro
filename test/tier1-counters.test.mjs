@@ -75,10 +75,7 @@ describe("Tier 1: suppressed_until_ms field presence semantics", () => {
 
 describe("Tier 1: plugin config schema", () => {
   it("openclaw.plugin.json declares autoRecallBadRecallDecayMs and autoRecallSuppressionDurationMs", () => {
-    const pluginJsonPath = path.resolve(
-      path.dirname(new URL(import.meta.url).pathname),
-      "../openclaw.plugin.json",
-    );
+    const pluginJsonPath = path.resolve(testDir, "..", "openclaw.plugin.json");
     const raw = fs.readFileSync(pluginJsonPath, "utf8");
     const schema = JSON.parse(raw);
     // Tolerate either top-level "properties" or nested config object — search recursively.
