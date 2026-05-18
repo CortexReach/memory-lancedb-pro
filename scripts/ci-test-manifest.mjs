@@ -60,6 +60,7 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/issue-690-cross-call-batch.test.mjs", args: ["--test"] },
   // Issue #665 bulkStore tests (from upstream)
   { group: "storage-and-schema", runner: "node", file: "test/bulk-store.test.mjs", args: ["--test"] },
+  // Issue #665 bulkStore tests (from upstream)
   { group: "storage-and-schema", runner: "node", file: "test/bulk-store-edge-cases.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store-edge-cases.test.mjs", args: ["--test"] },
@@ -76,6 +77,9 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/command-reflection-guard.test.mjs", args: ["--test"] },
   // Tier 1 memory counter fix
   { group: "core-regression", runner: "node", file: "test/tier1-counters.test.mjs", args: ["--test"] },
+  // Issue #693 extraction write validation tests
+  { group: "core-regression", runner: "node", file: "test/extraction-validation.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/dedup-false-alarm.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

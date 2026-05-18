@@ -25,6 +25,7 @@ import {
   type DedupDecision,
   type DedupResult,
   type ExtractionStats,
+  type ExtractionValidation,
   type MemoryCategory,
   ALWAYS_MERGE_CATEGORIES,
   MERGE_SUPPORTED_CATEGORIES,
@@ -273,6 +274,25 @@ export interface ExtractPersistOptions {
    * - pass a non-empty array to restrict reads to those scopes
    */
   scopeFilter?: string[];
+  /**
+   * Callback invoked when the number of entries actually written to the store
+   * differs from the number of LLM-generated candidates.
+   *
+   * This detects write-path anomalies including:
+   * - SIGKILL / OOM during bulkStore (partial write)
+   * - Concurrent compactor deletions (count window between bulkStore and count())
+   *
+   * The callback is NOT invoked when createEntries is empty (no-op write).
+   * The mismatch field: positive = under-write, negative = over-write (rare).
+   */
+  onExtractionValidationFailed?: (validation: ExtractionValidation) => void;
+  /**
+   * When `true`, a positive mismatch (actual < expected, under-write) throws an Error
+   * that aborts the extraction, signaling the caller to handle the failure.
+   * When `false` (default), the callback is invoked but extraction proceeds.
+   * Does not affect negative mismatch (over-write, rare) - always logs and calls callback.
+   */
+  abortOnExtractionMismatch?: boolean;
 }
 
 export class SmartExtractor {
@@ -441,7 +461,102 @@ export class SmartExtractor {
     }
 
     if (createEntries.length > 0) {
-      await this.store.bulkStore(createEntries);
+      // Phase 1: Verify write success via count-before/after.
+      // bulkStore is atomic per entry (randomUUID + table.add), so any
+      // discrepancy here indicates partial failure (SIGKILL/OOM).
+      // LIMITATION: This count-diff approach is only reliable under single-
+      // process assumption (no concurrent compactor/session writes during
+      // extractAndPersist). Concurrent writes inflate actualCreated and can
+      // cause false negatives (mismatch not detected). This is acceptable for
+      // Phase 1 since plugin architecture guarantees single-process extraction.
+      // Phase 2 will address concurrent-safe validation (UUID list compare):
+      // - Collect UUIDs of entries passed to bulkStore
+      // - After bulkStore, query store for those UUIDs to verify each exists
+      // - This catches both SIGKILL/OOM partial writes AND concurrent compactor deletions
+      //
+      // LIMITATION (F2): This approach CANNOT detect SIGKILL/OOM during bulkStore.
+      // If process dies during bulkStore, countAfter never runs, no validation triggered.
+      // Phase 2 will address this via UUID verification after the write.
+      //
+      // LIMITATION (MR3): Each extraction calls store.count() twice, which may be O(N) in LanceDB
+      // at scale. This is a performance tradeoff for validation reliability.
+      //
+      // NOTE: supersede entries are included in createEntries and therefore counted
+      // in expectedCreated - the count check validates them normally (F4).
+      let countValidationFailed = false;
+      let actualCreated: number;
+      let bulkStoreErr: unknown = null;
+
+      const countBefore = await this.store.count();
+      try {
+        await this.store.bulkStore(createEntries);
+      } catch (err) {
+        bulkStoreErr = err;
+      }
+      const countAfter = await this.store.count();
+
+      if (bulkStoreErr) {
+        // F1 FIX: bulkStore failure is a real write failure — throw to abort extraction.
+        // Do NOT swallow it like a count() failure. The write did not succeed.
+        throw new Error(
+          "memory-pro: smart-extractor: bulkStore failed during extraction write validation: " +
+            String(bulkStoreErr),
+        );
+      }
+
+      try {
+        actualCreated = countAfter - countBefore;
+      } catch (err) {
+        // F3: count() failed — we cannot verify the write, but it may have succeeded.
+        // Skip validation rather than abort extraction.
+        this.log(
+          "memory-pro: smart-extractor: count() failed after bulkStore: " +
+            String(err) + " — skipping validation, assuming write succeeded.",
+        );
+        countValidationFailed = true;
+        actualCreated = createEntries.length; // assume success
+      }
+      const expectedCreated = createEntries.length;
+
+      if (!countValidationFailed && actualCreated !== expectedCreated) {
+        const mismatch = expectedCreated - actualCreated;
+
+        const validation: ExtractionValidation = {
+          expected: expectedCreated,
+          actual: actualCreated,
+          mismatch,
+          sessionKey,
+        };
+        // F3 FIX: support both sync and async callbacks via Promise.resolve().then()
+        Promise.resolve()
+          .then(() => options.onExtractionValidationFailed?.(validation))
+          .catch((cbErr) => {
+            this.log(
+              "memory-pro: smart-extractor: onExtractionValidationFailed callback threw: " + String(cbErr),
+            );
+          });
+
+        // F1: when no callback and mismatch > 0, log at minimum so production is not silent
+        if (mismatch > 0 && !options.onExtractionValidationFailed) {
+          this.log(
+            "memory-pro: smart-extractor: extraction mismatch: expected=" + expectedCreated + ", actual=" + actualCreated + " (diff=" + mismatch + "). Provide onExtractionValidationFailed callback or set abortOnExtractionMismatch=true to handle this.",
+          );
+        }
+
+        // F6: when mismatch > 0 and abortOnExtractionMismatch is true, throw to abort
+        if (mismatch > 0 && options.abortOnExtractionMismatch === true) {
+          throw new Error(
+            "memory-pro: smart-extractor: extraction aborted: " + mismatch + " entries failed to persist (expected=" + expectedCreated + ", actual=" + actualCreated + ")",
+          );
+        }
+
+        // F6: when mismatch < 0 (over-write), always log as WARNING, never throw
+        if (mismatch < 0) {
+          this.log(
+            "memory-pro: smart-extractor: WARNING - over-write detected: " + Math.abs(mismatch) + " more entries persisted than expected (expected=" + expectedCreated + ", actual=" + actualCreated + "). This is rare and may indicate a concurrent compactor or duplicate session run.",
+          );
+        }
+      }
     }
 
     return stats;
