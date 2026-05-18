@@ -76,6 +76,24 @@ export type ExtractionStats = {
   superseded?: number; // temporal fact replacements
 };
 
+/**
+ * Payload delivered to `ExtractPersistOptions.onExtractionValidationFailed`
+ * when the number of entries actually written to the store differs from
+ * the number of candidates produced by the LLM.
+ *
+ * @see ExtractPersistOptions.onExtractionValidationFailed
+ */
+export type ExtractionValidation = {
+  /** Number of candidates the LLM intended to create (createEntries.length) */
+  expected: number;
+  /** Number of rows actually written (countAfter - countBefore) */
+  actual: number;
+  /** expected - actual; positive = under-write, negative = over-write (concurrent delete) */
+  mismatch: number;
+  /** Session key passed to extractAndPersist */
+  sessionKey: string;
+};
+
 /** Validate and normalize a category string. */
 export function normalizeCategory(raw: string): MemoryCategory | null {
   const lower = raw.toLowerCase().trim();
