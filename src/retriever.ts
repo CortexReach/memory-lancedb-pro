@@ -105,6 +105,9 @@ export interface RetrievalContext {
   category?: string;
   /** Retrieval source: "manual" for user-triggered, "auto-recall" for system-initiated, "cli" for CLI commands. */
   source?: "manual" | "auto-recall" | "cli";
+  /** AbortSignal to cancel in-flight embedding HTTP calls when retrieval times out.
+   *  When aborted, retriever.reject() exits early instead of holding the session lock. */
+  signal?: AbortSignal;
 }
 
 export interface RetrievalResult extends MemorySearchResult {
@@ -358,7 +361,10 @@ interface RerankItem {
   score: number;
 }
 
-/** Build provider-specific request headers and body */
+/** Build provider-specific request headers and body
+ * Provider encoding: tei= texts, dashscope= input/documents, pinecone= {text}, voyage= top_k, jina= top_n
+ * Note: Documents already sliced BEFORE this call - all providers receive limited candidates.
+ */
 function buildRerankRequest(
   provider: RerankProvider,
   apiKey: string,
@@ -573,7 +579,7 @@ export class MemoryRetriever {
   }
 
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
-    const { query, limit, scopeFilter, category, source } = context;
+    const { query, limit, scopeFilter, category, source, signal } = context;
     const safeLimit = clampInt(limit, 1, 20);
     this.lastDiagnostics = null;
     const diagnostics: RetrievalDiagnostics = {
@@ -611,34 +617,22 @@ export class MemoryRetriever {
       // Check if query contains tag prefixes -> use BM25-only + mustContain
       const tagTokens = this.extractTagTokens(query);
       let results: RetrievalResult[];
+      let mode: "bm25" | "vector" | "hybrid";
+
       if (tagTokens.length > 0) {
+        mode = "bm25";
         results = await this.bm25OnlyRetrieval(
-          query,
-          tagTokens,
-          safeLimit,
-          scopeFilter,
-          category,
-          trace,
-          diagnostics,
+          query, tagTokens, safeLimit, scopeFilter, category, trace, diagnostics,
         );
       } else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
+        mode = "vector";
         results = await this.vectorOnlyRetrieval(
-          query,
-          safeLimit,
-          scopeFilter,
-          category,
-          trace,
-          diagnostics,
+          query, safeLimit, scopeFilter, category, trace, diagnostics, signal,
         );
       } else {
+        mode = "hybrid";
         results = await this.hybridRetrieval(
-          query,
-          safeLimit,
-          scopeFilter,
-          category,
-          trace,
-          source,
-          diagnostics,
+          query, safeLimit, scopeFilter, category, trace, source, diagnostics, signal,
         );
       }
 
@@ -647,11 +641,6 @@ export class MemoryRetriever {
       this.lastDiagnostics = diagnostics;
 
       if (trace && this._statsCollector) {
-        const mode = tagTokens.length > 0
-          ? "bm25"
-          : (this.config.mode === "vector" || !this.store.hasFtsSupport)
-            ? "vector"
-            : "hybrid";
         const finalTrace = trace.finalize(query, mode);
         this._statsCollector.recordQuery(finalTrace, source || "unknown");
       }
@@ -679,29 +668,58 @@ export class MemoryRetriever {
   async retrieveWithTrace(
     context: RetrievalContext,
   ): Promise<{ results: RetrievalResult[]; trace: RetrievalTrace }> {
-    const { query, limit, scopeFilter, category, source } = context;
+    const { query, limit, scopeFilter, category, source, signal } = context;
     const safeLimit = clampInt(limit, 1, 20);
     const trace = new TraceCollector();
+    const diagnostics: RetrievalDiagnostics = {
+      source,
+      mode: this.config.mode,
+      originalQuery: query,
+      bm25Query: this.config.mode === "vector" ? null : query,
+      queryExpanded: false,
+      limit: safeLimit,
+      scopeFilter: scopeFilter ? [...scopeFilter] : undefined,
+      category,
+      vectorResultCount: 0,
+      bm25ResultCount: 0,
+      fusedResultCount: 0,
+      finalResultCount: 0,
+      stageCounts: {
+        afterMinScore: 0,
+        rerankInput: 0,
+        afterRerank: 0,
+        afterRecency: 0,
+        afterImportance: 0,
+        afterLengthNorm: 0,
+        afterTimeDecay: 0,
+        afterHardMinScore: 0,
+        afterNoiseFilter: 0,
+        afterDiversity: 0,
+      },
+      dropSummary: [],
+    };
 
     const tagTokens = this.extractTagTokens(query);
     let results: RetrievalResult[];
+    let mode: "bm25" | "vector" | "hybrid";
 
     if (tagTokens.length > 0) {
+      mode = "bm25";
       results = await this.bm25OnlyRetrieval(
-        query, tagTokens, safeLimit, scopeFilter, category, trace,
+        query, tagTokens, safeLimit, scopeFilter, category, trace, diagnostics,
       );
     } else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
+      mode = "vector";
       results = await this.vectorOnlyRetrieval(
-        query, safeLimit, scopeFilter, category, trace,
+        query, safeLimit, scopeFilter, category, trace, diagnostics, signal,
       );
     } else {
+      mode = "hybrid";
       results = await this.hybridRetrieval(
-        query, safeLimit, scopeFilter, category, trace,
+        query, safeLimit, scopeFilter, category, trace, source, diagnostics, signal,
       );
     }
 
-    const mode = tagTokens.length > 0 ? "bm25"
-      : (this.config.mode === "vector" || !this.store.hasFtsSupport) ? "vector" : "hybrid";
     const finalTrace = trace.finalize(query, mode);
 
     if (this._statsCollector) {
@@ -731,11 +749,35 @@ export class MemoryRetriever {
     category?: string,
     trace?: TraceCollector,
     diagnostics?: RetrievalDiagnostics,
+    signal?: AbortSignal,
   ): Promise<RetrievalResult[]> {
     let failureStage: RetrievalDiagnostics["failureStage"] = "vector.embedQuery";
     try {
       const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
-      const queryVector = await this.embedder.embedQuery(query);
+      let queryVector: number[];
+      try {
+        queryVector = await this.embedder.embedQuery(query, signal);
+      } catch (embedError) {
+        // Only do BM25 fallback for non-abort errors (network/API failures).
+        // If the caller aborted the signal, re-throw immediately — we shouldn't
+        // waste resources doing fallback retrieval after a deliberate cancel.
+        if (signal?.aborted) {
+          throw embedError;
+        }
+        // Fallback to BM25 if embedding fails (e.g., network timeout, API error)
+        diagnostics.bm25Query = query;
+        queryVector = [];
+        const bm25Results = await this.bm25OnlyRetrieval(
+          query, [], limit, scopeFilter, category, trace, diagnostics,
+        );
+        if (bm25Results.length > 0) {
+          trace?.startStage("embed_fallback_bm25", bm25Results.map((r) => r.entry.id));
+          diagnostics.dropSummary = buildDropSummary(diagnostics);
+          this.lastDiagnostics = diagnostics;
+          return bm25Results;
+        }
+        throw embedError;
+      }
       failureStage = "vector.vectorSearch";
       const results = await this.store.vectorSearch(
         queryVector,
@@ -921,11 +963,35 @@ export class MemoryRetriever {
     trace?: TraceCollector,
     source?: RetrievalContext["source"],
     diagnostics?: RetrievalDiagnostics,
+    signal?: AbortSignal,
   ): Promise<RetrievalResult[]> {
     let failureStage: RetrievalDiagnostics["failureStage"] = "hybrid.embedQuery";
+    let queryVector: number[];
     try {
       const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
-      const queryVector = await this.embedder.embedQuery(query);
+      try {
+        queryVector = await this.embedder.embedQuery(query, signal);
+      } catch (embedError) {
+        // Only do BM25 fallback for non-abort errors (network/API failures).
+        // If the caller aborted the signal, re-throw immediately — we shouldn't
+        // waste resources doing fallback retrieval after a deliberate cancel.
+        if (signal?.aborted) {
+          throw embedError;
+        }
+        // Fallback to BM25 if embedding fails (e.g., network timeout, API error)
+        const bm25Query = this.buildBM25Query(query, source);
+        diagnostics.bm25Query = bm25Query;
+        const bm25Results = await this.bm25OnlyRetrieval(
+          bm25Query, [], limit, scopeFilter, category, trace, diagnostics,
+        );
+        if (bm25Results.length > 0) {
+          trace?.startStage("embed_fallback_bm25", bm25Results.map((r) => r.entry.id));
+          diagnostics.dropSummary = buildDropSummary(diagnostics);
+          this.lastDiagnostics = diagnostics;
+          return bm25Results;
+        }
+        throw embedError;
+      }
       const bm25Query = this.buildBM25Query(query, source);
       if (diagnostics) {
         diagnostics.bm25Query = bm25Query;
@@ -1266,16 +1332,20 @@ export class MemoryRetriever {
         const model = this.config.rerankModel || "jina-reranker-v3";
         const endpoint =
           this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
-        const documents = results.map((r) => r.entry.text);
+        // Limit documents to candidatePoolSize BEFORE passing to buildRerankRequest.
+        // This ensures ALL providers are limited, not just those that support topN in their API body.
+        // tei/dashscope ignore topN parameter but will now receive sliced documents.
+        const documents = results.slice(0, this.config.candidatePoolSize).map((r) => r.entry.text);
 
-        // Build provider-specific request
+        // cap topN for providers that support it (jina/pinecone/voyage)
+        const topN = Math.min(results.length, this.config.candidatePoolSize);
         const { headers, body } = buildRerankRequest(
           provider,
           this.config.rerankApiKey || "",
           model,
           query,
           documents,
-          results.length,
+          topN,
         );
 
         // Timeout: configurable via rerankTimeoutMs (default: 5000ms)
