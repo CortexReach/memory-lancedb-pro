@@ -3008,17 +3008,6 @@ const memoryLanceDBProPlugin = {
               config.autoRecallSuppressionDurationMs ?? TIER1_DEFAULT_SUPPRESSION_DURATION_MS,
             minRepeated,
           };
-          await Promise.allSettled(
-            selected.map(async (item) =>
-              store.patchMetadata(
-                item.id,
-                computeTier1Patch(item.meta, tier1PatchOpts),
-                accessibleScopes,
-              ),
-            ),
-          );
-
-          if (shouldDropLateAutoRecall("pre-context")) return;
 
           const memoryContext = selected.map((item) => item.line).join("\n");
 
@@ -3042,6 +3031,28 @@ const memoryLanceDBProPlugin = {
             responseText: "", // Will be populated by agent_end
             injectedAt: Date.now(),
           });
+
+          void Promise.allSettled(
+            selected.map(async (item) =>
+              store.patchMetadata(
+                item.id,
+                computeTier1Patch(item.meta, tier1PatchOpts),
+                accessibleScopes,
+              ),
+            ),
+          ).then((settled) => {
+            const rejected = settled.filter((result) => result.status === "rejected");
+            if (rejected.length > 0) {
+              api.logger.warn?.(
+                `memory-lancedb-pro: background auto-recall metadata patch failed for ${rejected.length}/${settled.length} memories`,
+              );
+            }
+          }).catch((err) => {
+            api.logger.warn?.(
+              `memory-lancedb-pro: background auto-recall metadata patch crashed: ${String(err)}`,
+            );
+          });
+
           return {
             prependContext:
               `<relevant-memories>\n` +

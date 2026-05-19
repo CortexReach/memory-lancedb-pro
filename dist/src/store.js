@@ -3,7 +3,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync, statSync, unlinkSync, } from "node:fs";
+import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync, statSync, unlinkSync, rmdirSync, } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
@@ -201,6 +201,7 @@ export class MemoryStore {
     async runWithFileLock(fn) {
         const lockfile = await loadLockfile();
         const lockPath = join(this.config.dbPath, ".memory-write.lock");
+        const lockArtifactPath = `${lockPath}.lock`;
         const ensureLockTargetExists = async () => {
             if (!existsSync(lockPath)) {
                 try {
@@ -222,20 +223,25 @@ export class MemoryStore {
         let compromisedErr = null;
         let fnSucceeded = false;
         let fnError = null;
-        // Proactive cleanup of stale lock artifacts（from PR #626）
-        // 根本避免 >5 分鐘的 lock artifact 導致 ECOMPROMISED
-        if (existsSync(lockPath)) {
+        // Proactive cleanup of stale proper-lockfile artifacts（from PR #626）.
+        // proper-lockfile locks the target by creating `${target}.lock`; the
+        // target file itself is expected to persist and must not be treated stale.
+        if (existsSync(lockArtifactPath)) {
             try {
-                const stat = statSync(lockPath);
+                const stat = statSync(lockArtifactPath);
                 const ageMs = Date.now() - stat.mtimeMs;
                 const staleThresholdMs = 5 * 60 * 1000;
                 if (ageMs > staleThresholdMs) {
                     try {
-                        unlinkSync(lockPath);
+                        if (stat.isDirectory()) {
+                            rmdirSync(lockArtifactPath);
+                        }
+                        else {
+                            unlinkSync(lockArtifactPath);
+                        }
+                        console.warn(`[memory-lancedb-pro] cleared stale lock artifact: ${lockArtifactPath} ageMs=${ageMs}`);
                     }
                     catch { }
-                    console.warn(`[memory-lancedb-pro] cleared stale lock: ${lockPath} ageMs=${ageMs}`);
-                    await ensureLockTargetExists();
                 }
             }
             catch { }
