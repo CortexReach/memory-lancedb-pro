@@ -137,6 +137,8 @@ describe("auto-recall timeout", () => {
     workspaceDir = mkdtempSync(path.join(tmpdir(), "auto-recall-timeout-"));
     activeCreateRetriever = origCreateRetriever;
     activeCreateEmbedder = origCreateEmbedder;
+    retrieverModuleForMock.createRetriever = (...args) => activeCreateRetriever(...args);
+    embedderModuleForMock.createEmbedder = (...args) => activeCreateEmbedder(...args);
     MemoryStore.prototype.patchMetadata = origPatchMetadata;
     resetRegistration();
   });
@@ -223,5 +225,86 @@ describe("auto-recall timeout", () => {
       false,
       "late recall should not log a context injection",
     );
+  });
+
+  it("returns context before auto-recall metadata patch settles", async () => {
+    const logs = { info: [], warn: [], debug: [] };
+    const patchResolvers = [];
+    let patchMetadataCalls = 0;
+    let patchMetadataSettled = 0;
+
+    activeCreateRetriever = function mockCreateRetriever() {
+      return {
+        async retrieve() {
+          return makeResults();
+        },
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+    activeCreateEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() {
+          return new Float32Array(384).fill(0);
+        },
+        async embedPassage() {
+          return new Float32Array(384).fill(0);
+        },
+      };
+    };
+
+    MemoryStore.prototype.patchMetadata = async () => {
+      patchMetadataCalls++;
+      await new Promise((resolve) => patchResolvers.push(resolve));
+      patchMetadataSettled++;
+      return null;
+    };
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      logs,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: true,
+        autoRecallMinLength: 1,
+        autoRecallTimeoutMs: 10000,
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+
+    const autoRecallHook = getAutoRecallHook(harness.eventHandlers);
+    const timeoutMarker = Symbol("timeout");
+    const output = await Promise.race([
+      autoRecallHook(
+        { prompt: "Please recall what I mentioned before about this task." },
+        { sessionId: "auto-patch-bg", sessionKey: "agent:main:session:auto-patch-bg", agentId: "main" },
+      ),
+      delay(500).then(() => timeoutMarker),
+    ]);
+
+    assert.notEqual(output, timeoutMarker, "metadata patch must not block context injection");
+    assert.match(
+      output?.prependContext ?? "",
+      /<relevant-memories>/,
+      `expected memory context; logs=${JSON.stringify(logs)}`,
+    );
+    assert.equal(patchMetadataCalls, 2, "background metadata patch should still start");
+    assert.equal(patchMetadataSettled, 0, "hook should return before background patch settles");
+    assert.ok(
+      logs.info.some((line) => /injecting \d+ memories into context/.test(line)),
+      "expected context injection log",
+    );
+
+    patchResolvers.forEach((resolve) => resolve());
+    await delay(0);
+    assert.equal(patchMetadataSettled, 2, "background metadata patch should settle after hook returns");
   });
 });

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import jitiFactory from "jiti";
@@ -113,6 +113,33 @@ describe("Cross-process file lock", () => {
       const all = await store.list(undefined, undefined, 20, 0);
       assert.strictEqual(all.length, 2, "should have 2 entries after store+store+delete+store");
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat persistent lock target file as stale lock artifact", async () => {
+    const { store, dir } = makeStore();
+    const lockTarget = join(dir, ".memory-write.lock");
+    const oldTime = new Date(Date.now() - 10 * 60 * 1000);
+    const warnings = [];
+    const originalWarn = console.warn;
+
+    try {
+      writeFileSync(lockTarget, "");
+      utimesSync(lockTarget, oldTime, oldTime);
+      console.warn = (...args) => {
+        warnings.push(args.join(" "));
+      };
+
+      await store.store(makeEntry(1));
+
+      assert.ok(existsSync(lockTarget), "persistent lock target file should remain");
+      assert.ok(
+        !warnings.some((message) => message.includes("cleared stale lock")),
+        "old lock target file should not emit stale-lock cleanup warnings",
+      );
+    } finally {
+      console.warn = originalWarn;
       rmSync(dir, { recursive: true, force: true });
     }
   });
