@@ -703,6 +703,12 @@
           "ensureLearningFiles": {
             "type": "boolean",
             "default": true
+          },
+          "maxEntries": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 500,
+            "description": "Maximum number of entries to retain per .learnings file before new appends are skipped."
           }
         }
       },
@@ -1353,6 +1359,11 @@
     "selfImprovement.ensureLearningFiles": {
       "label": "Ensure Learning Files",
       "help": "Auto-create .learnings files when missing",
+      "advanced": true
+    },
+    "selfImprovement.maxEntries": {
+      "label": "Max Learning Entries",
+      "help": "Maximum entries per .learnings file before new appends are skipped",
       "advanced": true
     },
     "memoryReflection.storeToLanceDB": {
