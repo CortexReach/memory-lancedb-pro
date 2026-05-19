@@ -14,6 +14,7 @@ Append structured entries:
 - Include symptom, context, probable cause, and prevention`;
 
 const fileWriteQueues = new Map<string, Promise<void>>();
+export const DEFAULT_SELF_IMPROVEMENT_MAX_ENTRIES = 500;
 
 async function withFileWriteQueue<T>(filePath: string, action: () => Promise<T>): Promise<T> {
   const previous = fileWriteQueues.get(filePath) ?? Promise.resolve();
@@ -39,17 +40,25 @@ function todayYmd(): string {
   return new Date().toISOString().slice(0, 10).replace(/-/g, "");
 }
 
-async function nextLearningId(filePath: string, prefix: "LRN" | "ERR"): Promise<string> {
-  const date = todayYmd();
-  let count = 0;
-  try {
-    const content = await readFile(filePath, "utf-8");
-    const matches = content.match(new RegExp(`\\[${prefix}-${date}-\\d{3}\\]`, "g"));
-    count = matches?.length ?? 0;
-  } catch {
-    // ignore
-  }
+function nextLearningIdFromContent(content: string, prefix: "LRN" | "ERR", date = todayYmd()): string {
+  const matches = content.match(new RegExp(`\\[${prefix}-${date}-\\d{3}\\]`, "g"));
+  const count = matches?.length ?? 0;
   return `${prefix}-${date}-${String(count + 1).padStart(3, "0")}`;
+}
+
+export function countSelfImprovementEntries(content: string, prefix?: "LRN" | "ERR"): number {
+  const pattern = prefix
+    ? new RegExp(`^## \\[${prefix}-\\d{8}-\\d{3}\\]`, "gm")
+    : /^## \[(?:LRN|ERR)-\d{8}-\d{3}\]/gm;
+  return (content.match(pattern) || []).length;
+}
+
+function normalizeMaxEntries(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return DEFAULT_SELF_IMPROVEMENT_MAX_ENTRIES;
+  }
+  return Math.floor(parsed);
 }
 
 export async function ensureSelfImprovementLearningFiles(baseDir: string): Promise<void> {
@@ -81,11 +90,15 @@ export interface AppendSelfImprovementEntryParams {
   priority?: string;
   status?: string;
   source?: string;
+  maxEntries?: number;
 }
 
 export async function appendSelfImprovementEntry(params: AppendSelfImprovementEntryParams): Promise<{
   id: string;
   filePath: string;
+  skipped: boolean;
+  entryCount: number;
+  maxEntries: number;
 }> {
   const {
     baseDir,
@@ -98,6 +111,7 @@ export async function appendSelfImprovementEntry(params: AppendSelfImprovementEn
     priority = "medium",
     status = "pending",
     source = "memory-lancedb-pro/self_improvement_log",
+    maxEntries,
   } = params;
 
   await ensureSelfImprovementLearningFiles(baseDir);
@@ -105,9 +119,20 @@ export async function appendSelfImprovementEntry(params: AppendSelfImprovementEn
   const fileName = type === "learning" ? "LEARNINGS.md" : "ERRORS.md";
   const filePath = join(learningsDir, fileName);
   const idPrefix = type === "learning" ? "LRN" : "ERR";
+  const effectiveMaxEntries = normalizeMaxEntries(maxEntries);
 
-  const id = await withFileWriteQueue(filePath, async () => {
-    const entryId = await nextLearningId(filePath, idPrefix);
+  const result = await withFileWriteQueue(filePath, async () => {
+    const prev = await readFile(filePath, "utf-8").catch(() => "");
+    const entryCount = countSelfImprovementEntries(prev, idPrefix);
+    if (entryCount >= effectiveMaxEntries) {
+      return {
+        id: "",
+        skipped: true,
+        entryCount,
+      };
+    }
+
+    const entryId = nextLearningIdFromContent(prev, idPrefix);
     const nowIso = new Date().toISOString();
     const titleSuffix = type === "learning" ? ` ${category}` : "";
     const entry = [
@@ -132,11 +157,14 @@ export async function appendSelfImprovementEntry(params: AppendSelfImprovementEn
       "---",
       "",
     ].join("\n");
-    const prev = await readFile(filePath, "utf-8").catch(() => "");
     const separator = prev.trimEnd().length > 0 ? "\n\n" : "";
     await appendFile(filePath, `${separator}${entry}`, "utf-8");
-    return entryId;
+    return {
+      id: entryId,
+      skipped: false,
+      entryCount: entryCount + 1,
+    };
   });
 
-  return { id, filePath };
+  return { ...result, filePath, maxEntries: effectiveMaxEntries };
 }

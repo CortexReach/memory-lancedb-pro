@@ -31,6 +31,7 @@ export const CI_TEST_MANIFEST = [
   { group: "packaging-and-workflow", runner: "node", file: "test/plugin-manifest-regression.mjs" },
   { group: "core-regression", runner: "node", file: "test/session-summary-before-reset.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/self-improvement-reset-note.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/self-improvement.test.mjs", args: ["--test"] },
   { group: "packaging-and-workflow", runner: "node", file: "test/sync-plugin-version.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-metadata-v2.mjs" },
   { group: "storage-and-schema", runner: "node", file: "test/vector-search-cosine.test.mjs" },
