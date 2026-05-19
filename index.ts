@@ -475,7 +475,15 @@ const DEFAULT_SELF_IMPROVEMENT_REMINDER = [
   "Keep entries simple: date, title, what happened, what to do differently.",
 ].join("\n");
 
-const SELF_IMPROVEMENT_NOTE_PREFIX = "/note self-improvement (before reset):";
+const SELF_IMPROVEMENT_RESET_REMINDER_CONTEXT = [
+  "<self-improvement-reminder>",
+  "If anything was learned/corrected in the previous session, log it now:",
+  "- .learnings/LEARNINGS.md (corrections/best practices)",
+  "- .learnings/ERRORS.md (failures/root causes)",
+  "- Distill reusable rules to AGENTS.md / SOUL.md / TOOLS.md.",
+  "- If reusable across tasks, extract a new skill from the learning.",
+  "</self-improvement-reminder>",
+].join("\n");
 const DEFAULT_REFLECTION_MESSAGE_COUNT = 120;
 const DEFAULT_REFLECTION_MAX_INPUT_CHARS = 24_000;
 const DEFAULT_REFLECTION_TIMEOUT_MS = 20_000;
@@ -3675,6 +3683,23 @@ const memoryLanceDBProPlugin = {
     // ========================================================================
 
     if (config.selfImprovement?.enabled !== false) {
+      const pendingSelfImprovementResetReminderBySession = new Set<string>();
+      const getSelfImprovementSessionKey = (event: any, ctx?: any): string => {
+        const candidates = [
+          event?.sessionKey,
+          ctx?.sessionKey,
+          event?.context?.sessionKey,
+          event?.context?.sessionId,
+          ctx?.sessionId,
+        ];
+        for (const candidate of candidates) {
+          if (typeof candidate === "string" && candidate.trim().length > 0) {
+            return candidate.trim();
+          }
+        }
+        return "";
+      };
+
       api.registerHook("agent:bootstrap", async (event) => {
         const context = (event.context || {}) as Record<string, unknown>;
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
@@ -3716,25 +3741,24 @@ const memoryLanceDBProPlugin = {
       });
 
       if (config.selfImprovement?.beforeResetNote !== false) {
-        const appendSelfImprovementNote = async (event: any) => {
-          // Basic validation BEFORE dedup — skip events that will legitimately return anyway
-          if (!Array.isArray(event.messages)) {
-            api.logger.warn(`self-improvement: command:${String(event?.action || "unknown")} missing event.messages array; skip note inject`);
+        const markSelfImprovementResetReminder = async (event: any) => {
+          const action = String(event?.action || "unknown");
+          const sessionKey = getSelfImprovementSessionKey(event);
+          if (!sessionKey) {
+            api.logger.warn(`self-improvement: command:${action} missing sessionKey; skip reminder mark`);
             return;
           }
 
           if (_dedupHookEvent("selfImprovement", event)) return;
 
           try {
-            const action = String(event?.action || "unknown");
-            const sessionKeyForLog = typeof event?.sessionKey === "string" ? event.sessionKey : "";
             const contextForLog = (event?.context && typeof event.context === "object")
               ? (event.context as Record<string, unknown>)
               : {};
             const commandSource = typeof contextForLog.commandSource === "string" ? contextForLog.commandSource : "";
             const contextKeys = Object.keys(contextForLog).slice(0, 8).join(",");
             api.logger.info(
-              `self-improvement: command:${action} hook start; sessionKey=${sessionKeyForLog || "(none)"}; source=${commandSource || "(unknown)"}; hasMessages=${Array.isArray(event?.messages)}; contextKeys=${contextKeys || "(none)"}`
+              `self-improvement: command:${action} hook start; sessionKey=${sessionKey}; source=${commandSource || "(unknown)"}; contextKeys=${contextKeys || "(none)"}`
             );
 
             // Skip self-improvement note on Discord channel (non-thread) resets
@@ -3753,38 +3777,39 @@ const memoryLanceDBProPlugin = {
               return;
             }
 
-            const exists = event.messages.some((m: unknown) => typeof m === "string" && m.includes(SELF_IMPROVEMENT_NOTE_PREFIX));
-            if (exists) {
-              api.logger.info(`self-improvement: command:${action} note already present; skip duplicate inject`);
-              return;
-            }
-
-            event.messages.push(
-              [
-                SELF_IMPROVEMENT_NOTE_PREFIX,
-                "- If anything was learned/corrected, log it now:",
-                "  - .learnings/LEARNINGS.md (corrections/best practices)",
-                "  - .learnings/ERRORS.md (failures/root causes)",
-                "- Distill reusable rules to AGENTS.md / SOUL.md / TOOLS.md.",
-                "- If reusable across tasks, extract a new skill from the learning.",
-                "- Then proceed with the new session.",
-              ].join("\n")
-            );
-            api.logger.info(
-              `self-improvement: command:${action} injected note; messages=${event.messages.length}`
-            );
+            pendingSelfImprovementResetReminderBySession.add(sessionKey);
+            api.logger.info(`self-improvement: command:${action} queued silent reminder for next prompt`);
           } catch (err) {
-            api.logger.warn(`self-improvement: note inject failed: ${String(err)}`);
+            api.logger.warn(`self-improvement: reminder mark failed: ${String(err)}`);
           }
         };
 
-        api.registerHook("command:new", appendSelfImprovementNote, {
-          name: "memory-lancedb-pro.self-improvement.command-new",
-          description: "Append self-improvement note before /new",
+        api.on("before_prompt_build", async (event: any, ctx: any) => {
+          const sessionKey = getSelfImprovementSessionKey(event, ctx);
+          if (!sessionKey || !pendingSelfImprovementResetReminderBySession.delete(sessionKey)) {
+            return;
+          }
+          return {
+            prependContext: SELF_IMPROVEMENT_RESET_REMINDER_CONTEXT,
+            ephemeral: true,
+          };
+        }, {
+          name: "memory-lancedb-pro.self-improvement.before-prompt-build",
+          description: "Inject self-improvement reminder silently after /new or /reset",
         });
-        api.registerHook("command:reset", appendSelfImprovementNote, {
+
+        api.on("session_end", (_event: any, ctx: any) => {
+          const sessionKey = getSelfImprovementSessionKey(_event, ctx);
+          if (sessionKey) pendingSelfImprovementResetReminderBySession.delete(sessionKey);
+        }, { priority: 20 });
+
+        api.registerHook("command:new", markSelfImprovementResetReminder, {
+          name: "memory-lancedb-pro.self-improvement.command-new",
+          description: "Queue self-improvement reminder before /new",
+        });
+        api.registerHook("command:reset", markSelfImprovementResetReminder, {
           name: "memory-lancedb-pro.self-improvement.command-reset",
-          description: "Append self-improvement note before /reset",
+          description: "Queue self-improvement reminder before /reset",
         });
       }
 
