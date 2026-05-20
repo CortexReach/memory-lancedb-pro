@@ -1168,6 +1168,9 @@ export class MemoryStore {
   }
 
   private async runSerializedUpdate<T>(action: () => Promise<T>): Promise<T> {
+    const id = ++this._queueSeq;
+    const qLen = ++this._queueLen;
+    console.warn(`[memory-lancedb-pro] queue: #${id} pos=${qLen} entering`);
     const previous = this.updateQueue;
     let release: (() => void) | undefined;
     const lock = new Promise<void>((resolve) => {
@@ -1176,12 +1179,17 @@ export class MemoryStore {
     this.updateQueue = previous.then(() => lock);
 
     await previous;
+    console.warn(`[memory-lancedb-pro] queue: #${id} proceeding (pos was ${qLen})`);
     try {
       return await action();
     } finally {
+      this._queueLen--;
+      console.warn(`[memory-lancedb-pro] queue: #${id} done (remaining=${this._queueLen})`);
       release?.();
     }
   }
+  private _queueSeq = 0;
+  private _queueLen = 0;
 
   async patchMetadata(
     id: string,
