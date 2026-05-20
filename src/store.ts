@@ -1049,7 +1049,7 @@ export class MemoryStore {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
-    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+    return this.runWithFileLock(async () => {
       // Support both full UUID and short prefix (8+ hex chars), same as delete()
       const uuidRegex =
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1164,7 +1164,7 @@ export class MemoryStore {
       }
 
       return updated;
-    }));
+    });
   }
 
   private async runSerializedUpdate<T>(action: () => Promise<T>): Promise<T> {
