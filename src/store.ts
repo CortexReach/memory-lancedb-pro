@@ -209,7 +209,22 @@ export class MemoryStore {
 
   constructor(private readonly config: StoreConfig) { }
 
+  // Queue wrapper: serialize through in-process Promise chain BEFORE attempting
+  // proper-lockfile.  Without this, N concurrent writes all hit proper-lockfile
+  // simultaneously, causing thundering-herd ENOENT on every lock acquisition and
+  // all callers fall back to lock-free → deadlock under heavy load.
+  //
+  // The in-process queue ensures only ONE caller hits the file lock at a time;
+  // the file lock then acts as a cross-process safety net (multi-instance).
+  //
+  // Embedding API calls happen OUTSIDE the lock (callers pass pre-computed
+  // vectors), so serialisation only gates fast LanceDB writes (~50ms each)
+  // and does NOT saturate the embedding API.
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
+    return this.runSerializedUpdate(() => this.runWithFileLockInternal(fn));
+  }
+
+  private async runWithFileLockInternal<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
     // Ensure directory exists (atomic, no race — mkdirSync with recursive:true is idempotent-ish on Linux)
