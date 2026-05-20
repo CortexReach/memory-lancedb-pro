@@ -2540,6 +2540,8 @@ const memoryLanceDBProPlugin = {
         // (embedding → rerank → lifecycle), which can silently drop messages on
         // channels like Telegram when subsequent requests hit lock timeouts.
         // See: https://github.com/CortexReach/memory-lancedb-pro/issues/253
+        let autoRecallTimedOut = false;
+        let lateAutoRecallLogged = false;
         const recallWork = async (): Promise<{ prependContext: string } | undefined> => {
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
@@ -2548,6 +2550,16 @@ const memoryLanceDBProPlugin = {
             return undefined;
           }
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
+          const shouldDropLateAutoRecall = (stage: string): boolean => {
+            if (!autoRecallTimedOut) return false;
+            if (!lateAutoRecallLogged) {
+              lateAutoRecallLogged = true;
+              api.logger.warn?.(
+                `memory-lancedb-pro: dropping late auto-recall result after timeout at ${stage} for agent ${agentId}`,
+              );
+            }
+            return true;
+          };
 
           // Use cached raw user message for the recall query to avoid channel
           // metadata noise (e.g. Conversation info JSON with message_id,
@@ -2601,6 +2613,8 @@ const memoryLanceDBProPlugin = {
             source: "auto-recall",
           }), config.workspaceBoundary);
 
+          if (shouldDropLateAutoRecall("post-retrieve")) return;
+
           if (results.length === 0) {
             return;
           }
@@ -2613,6 +2627,9 @@ const memoryLanceDBProPlugin = {
           let dedupFilteredCount = 0;
 
           // Only enable dedup logic when minRepeated > 0
+
+          if (shouldDropLateAutoRecall("pre-metadata")) return;
+
           let finalResults = rankedResults;
 
           if (minRepeated > 0) {
@@ -2810,6 +2827,8 @@ const memoryLanceDBProPlugin = {
             }),
           );
 
+          if (shouldDropLateAutoRecall("pre-context")) return;
+
           const memoryContext = selected.map((item) => item.line).join("\n");
 
           const injectedIds = selected.map((item) => item.id).join(",") || "(none)";
@@ -2842,6 +2861,7 @@ const memoryLanceDBProPlugin = {
             recallWork().then((r) => { clearTimeout(timeoutId); return r; }),
             new Promise<undefined>((resolve) => {
               timeoutId = setTimeout(() => {
+                autoRecallTimedOut = true;
                 api.logger.warn(
                   `memory-lancedb-pro: auto-recall timed out after ${AUTO_RECALL_TIMEOUT_MS}ms; skipping memory injection to avoid stalling agent startup`,
                 );

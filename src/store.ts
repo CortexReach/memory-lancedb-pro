@@ -266,6 +266,9 @@ export class MemoryStore {
       lockAttempts++;
       try {
         release = await lockfile.lock(lockPath, {
+          // PR #748: realpath:false — 防止 proactive stale lock cleanup 删除锁文件后
+          // proper-lockfile v4 的 realpath() 在已删除文件上调导致 ENOENT
+          realpath: false,
           retries: {
             retries: 5,
             factor: 2,
