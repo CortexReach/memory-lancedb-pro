@@ -27,6 +27,16 @@ describe("memory timestamp normalization", () => {
     });
   }
 
+  function wrapTableMethod(store, methodName, wrapper) {
+    const table = store.table;
+    assert.ok(table, `expected initialized table for ${methodName}`);
+    const original = table[methodName].bind(table);
+    table[methodName] = wrapper(original);
+    return () => {
+      table[methodName] = original;
+    };
+  }
+
   it("converts epoch seconds to epoch milliseconds", () => {
     assert.equal(normalizeMemoryTimestamp(1_234_567_890), 1_234_567_890_000);
     assert.equal(normalizeMemoryTimestamp("1234567890"), 1_234_567_890_000);
@@ -80,6 +90,26 @@ describe("memory timestamp normalization", () => {
     assert.equal(loaded?.timestamp, 1_700_000_000_000);
   });
 
+  it("deletes legacy second rows before millisecond cutoffs inside the same second", async () => {
+    const store = createStore();
+    await store.count();
+
+    await store.table.add([{
+      id: "raw-legacy-same-second",
+      text: "raw legacy same second row",
+      vector: [1, 0, 0, 0],
+      category: "fact",
+      scope: "global",
+      importance: 0.7,
+      timestamp: 1_700_000_000,
+      metadata: "{}",
+    }]);
+
+    const deleted = await store.bulkDelete([], 1_700_000_000_001);
+    assert.equal(deleted, 1);
+    assert.equal(await store.getById("raw-legacy-same-second"), null);
+  });
+
   it("backfills persisted legacy second timestamps during initialization", async () => {
     const store = createStore();
     await store.count();
@@ -103,6 +133,51 @@ describe("memory timestamp normalization", () => {
       .where("id = 'persisted-legacy-seconds'")
       .toArray();
     assert.equal(rawRows[0].timestamp, 1_700_000_000_000);
+  });
+
+  it("keeps legacy rows if timestamp backfill replacement writes fail", async () => {
+    const store = createStore();
+    await store.count();
+
+    await store.table.add([{
+      id: "legacy-backfill-write-failure",
+      text: "legacy row survives failed backfill",
+      vector: [1, 0, 0, 0],
+      category: "fact",
+      scope: "global",
+      importance: 0.7,
+      timestamp: 1_700_000_000,
+      metadata: "{}",
+    }]);
+
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(" "));
+
+    let failed = false;
+    const restoreAdd = wrapTableMethod(store, "add", (original) => async (...args) => {
+      if (!failed) {
+        failed = true;
+        throw new Error("injected backfill add failure");
+      }
+      return original(...args);
+    });
+
+    try {
+      await store.backfillLegacySecondTimestamps(store.table);
+    } finally {
+      restoreAdd();
+      console.warn = originalWarn;
+    }
+
+    assert.ok(warnings.some((message) => message.includes("could not normalize legacy second timestamps")));
+
+    const rawRows = await store.table.query()
+      .where("id = 'legacy-backfill-write-failure'")
+      .toArray();
+    assert.equal(rawRows.length, 1);
+    assert.equal(rawRows[0].timestamp, 1_700_000_000);
+    assert.equal((await store.getById("legacy-backfill-write-failure"))?.timestamp, 1_700_000_000_000);
   });
 
   it("backfills legacy last-access metadata during initialization", async () => {

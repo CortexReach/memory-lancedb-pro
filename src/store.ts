@@ -139,7 +139,7 @@ function timestampBeforePredicate(column: string, value: unknown): string {
   if (maxTimestamp == null) {
     return "(FALSE)";
   }
-  const legacySecondsCutoff = Math.floor(maxTimestamp / 1000);
+  const legacySecondsCutoff = Math.ceil(maxTimestamp / 1000);
   return `((${column} >= ${LEGACY_SECONDS_TIMESTAMP_MAX} AND ${column} < ${maxTimestamp}) OR ` +
     `(${column} > 0 AND ${column} < ${LEGACY_SECONDS_TIMESTAMP_MAX} AND ${column} < ${legacySecondsCutoff}))`;
 }
@@ -577,30 +577,63 @@ export class MemoryStore {
 
   private async backfillLegacySecondTimestamps(table: LanceDB.Table): Promise<void> {
     try {
-      const legacyRows = await table.query()
-        .where(`timestamp > 0 AND timestamp < ${LEGACY_SECONDS_TIMESTAMP_MAX}`)
-        .toArray();
-
-      if (legacyRows.length === 0) return;
-
-      const normalizedRows = legacyRows.map((row: any) => ({
-        ...row,
-        vector: Array.from(row.vector as Iterable<number>),
-        scope: (row.scope as string | undefined) ?? "global",
-        metadata: normalizeLegacyTimestampMetadata(row.metadata),
-        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-      }));
+      let normalizedCount = 0;
 
       await this.runWithFileLock(async () => {
+        const legacyRows = await table.query()
+          .where(`timestamp > 0 AND timestamp < ${LEGACY_SECONDS_TIMESTAMP_MAX}`)
+          .toArray();
+
+        if (legacyRows.length === 0) return;
+
         for (const row of legacyRows) {
-          await table.delete(`id = '${escapeSqlLiteral(row.id as string)}'`);
-        }
-        for (let i = 0; i < normalizedRows.length; i += MemoryStore.MAX_BATCH_SIZE) {
-          await table.add(normalizedRows.slice(i, i + MemoryStore.MAX_BATCH_SIZE));
+          const originalRow = {
+            ...row,
+            vector: Array.from(row.vector as Iterable<number>),
+            scope: (row.scope as string | undefined) ?? "global",
+            metadata: (row.metadata as string | undefined) || "{}",
+          };
+          const normalizedRow = {
+            ...originalRow,
+            metadata: normalizeLegacyTimestampMetadata(row.metadata),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+          };
+          const safeId = escapeSqlLiteral(row.id as string);
+
+          await table.delete(`id = '${safeId}'`);
+          try {
+            await table.add([normalizedRow]);
+            normalizedCount += 1;
+          } catch (addError) {
+            const currentRows = await table.query()
+              .where(`id = '${safeId}'`)
+              .limit(1)
+              .toArray()
+              .catch(() => []);
+
+            if (currentRows.length === 0) {
+              try {
+                await table.add([originalRow]);
+              } catch (rollbackError) {
+                throw new Error(
+                  `legacy timestamp normalization failed for ${row.id}: replacement write failed after delete, and rollback also failed. ` +
+                  `Write error: ${addError instanceof Error ? addError.message : String(addError)}. ` +
+                  `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+                );
+              }
+            }
+
+            throw new Error(
+              `legacy timestamp normalization failed for ${row.id}: replacement write failed after delete, original row restored. ` +
+              `Write error: ${addError instanceof Error ? addError.message : String(addError)}`,
+            );
+          }
         }
       });
 
-      console.log(`memory-lancedb-pro: normalized ${legacyRows.length} legacy second timestamp row(s)`);
+      if (normalizedCount > 0) {
+        console.log(`memory-lancedb-pro: normalized ${normalizedCount} legacy second timestamp row(s)`);
+      }
     } catch (err) {
       console.warn("memory-lancedb-pro: could not normalize legacy second timestamps:", err);
     }
