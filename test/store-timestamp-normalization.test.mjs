@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import jitiFactory from "jiti";
@@ -178,6 +178,59 @@ describe("memory timestamp normalization", () => {
     assert.equal(rawRows.length, 1);
     assert.equal(rawRows[0].timestamp, 1_700_000_000);
     assert.equal((await store.getById("legacy-backfill-write-failure"))?.timestamp, 1_700_000_000_000);
+  });
+
+  it("writes a durable backup if timestamp backfill replacement and rollback both fail", async () => {
+    const store = createStore();
+    await store.count();
+
+    await store.table.add([{
+      id: "legacy-backfill-double-write-failure",
+      text: "legacy row survives in backup",
+      vector: [1, 0, 0, 0],
+      category: "fact",
+      scope: "global",
+      importance: 0.7,
+      timestamp: 1_700_000_000,
+      metadata: "{}",
+    }]);
+
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(" "));
+
+    let failedAdds = 0;
+    const restoreAdd = wrapTableMethod(store, "add", (original) => async (...args) => {
+      if (failedAdds < 2) {
+        failedAdds += 1;
+        throw new Error("injected persistent add failure");
+      }
+      return original(...args);
+    });
+
+    try {
+      await assert.rejects(
+        store.backfillLegacySecondTimestamps(store.table),
+        /Durable backup saved at/,
+      );
+    } finally {
+      restoreAdd();
+      console.warn = originalWarn;
+    }
+
+    assert.ok(warnings.some((message) => message.includes("Durable backup saved at")));
+
+    const backupPath = path.join(
+      store.dbPath,
+      ".legacy-timestamp-backfill-backups",
+      "legacy-backfill-double-write-failure.json",
+    );
+    assert.equal(existsSync(backupPath), true);
+
+    const backup = JSON.parse(readFileSync(backupPath, "utf8"));
+    assert.equal(backup.row.id, "legacy-backfill-double-write-failure");
+    assert.equal(backup.row.text, "legacy row survives in backup");
+    assert.equal(backup.row.timestamp, 1_700_000_000);
   });
 
   it("backfills legacy last-access metadata during initialization", async () => {

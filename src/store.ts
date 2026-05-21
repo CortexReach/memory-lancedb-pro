@@ -14,6 +14,7 @@ import {
   lstatSync,
   statSync,
   unlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -599,10 +600,12 @@ export class MemoryStore {
             timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           };
           const safeId = escapeSqlLiteral(row.id as string);
+          const backupPath = this.writeLegacyTimestampBackfillBackup(originalRow);
 
           await table.delete(`id = '${safeId}'`);
           try {
             await table.add([normalizedRow]);
+            this.clearLegacyTimestampBackfillBackup(backupPath);
             normalizedCount += 1;
           } catch (addError) {
             const currentRows = await table.query()
@@ -611,12 +614,22 @@ export class MemoryStore {
               .toArray()
               .catch(() => []);
 
+            if (currentRows.length > 0) {
+              this.clearLegacyTimestampBackfillBackup(backupPath);
+              throw new Error(
+                `legacy timestamp normalization failed for ${row.id}: replacement write failed after delete, but an existing record was preserved. ` +
+                `Write error: ${addError instanceof Error ? addError.message : String(addError)}`,
+              );
+            }
+
             if (currentRows.length === 0) {
               try {
                 await table.add([originalRow]);
+                this.clearLegacyTimestampBackfillBackup(backupPath);
               } catch (rollbackError) {
                 throw new Error(
                   `legacy timestamp normalization failed for ${row.id}: replacement write failed after delete, and rollback also failed. ` +
+                  `Durable backup saved at ${backupPath}. ` +
                   `Write error: ${addError instanceof Error ? addError.message : String(addError)}. ` +
                   `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
                 );
@@ -636,6 +649,31 @@ export class MemoryStore {
       }
     } catch (err) {
       console.warn("memory-lancedb-pro: could not normalize legacy second timestamps:", err);
+      if (String(err).includes("Durable backup saved at")) {
+        throw err;
+      }
+    }
+  }
+
+  private writeLegacyTimestampBackfillBackup(row: Record<string, unknown>): string {
+    const backupDir = join(this.config.dbPath, ".legacy-timestamp-backfill-backups");
+    mkdirSync(backupDir, { recursive: true });
+    const backupPath = join(backupDir, `${encodeURIComponent(String(row.id))}.json`);
+    writeFileSync(
+      backupPath,
+      `${JSON.stringify({ version: 1, createdAt: new Date().toISOString(), row }, null, 2)}\n`,
+      "utf8",
+    );
+    return backupPath;
+  }
+
+  private clearLegacyTimestampBackfillBackup(backupPath: string): void {
+    try {
+      unlinkSync(backupPath);
+    } catch (err: any) {
+      if (err?.code !== "ENOENT") {
+        console.warn(`memory-lancedb-pro: could not remove legacy timestamp backup ${backupPath}:`, err);
+      }
     }
   }
 
