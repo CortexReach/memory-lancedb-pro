@@ -27,6 +27,7 @@ export interface AccessTrackerOptions {
   readonly logger: {
     warn: (...args: unknown[]) => void;
     info?: (...args: unknown[]) => void;
+    error?: (...args: unknown[]) => void;
   };
   readonly debounceMs?: number;
 }
@@ -223,6 +224,7 @@ export class AccessTracker {
   private readonly logger: {
     warn: (...args: unknown[]) => void;
     info?: (...args: unknown[]) => void;
+    error?: (...args: unknown[]) => void;
   };
 
   constructor(options: AccessTrackerOptions) {

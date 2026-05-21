@@ -370,7 +370,7 @@ export class MemoryUpgrader {
     await this.store.update(entry.id, {
       // Update text to L0 abstract for better search indexing
       text: enriched.l0_abstract,
-      metadata: stringifySmartMetadata(newMetadata),
+      metadata: stringifySmartMetadata(newMetadata as any),
     });
   }
 }

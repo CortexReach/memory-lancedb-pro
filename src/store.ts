@@ -14,6 +14,7 @@ import {
   lstatSync,
   statSync,
   unlinkSync,
+  rmdirSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -24,7 +25,7 @@ import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmar
 // Types
 // ============================================================================
 
-export interface MemoryEntry {
+export interface MemoryEntry extends Record<string, unknown> {
   id: string;
   text: string;
   vector: number[];
@@ -55,6 +56,7 @@ export interface MetadataPatch {
 
 let lancedbImportPromise: Promise<typeof import("@lancedb/lancedb")> | null =
   null;
+const requireCJS = createRequire(import.meta.url);
 
 // =========================================================================
 // Cross-Process File Lock (proper-lockfile)
@@ -78,12 +80,13 @@ export const loadLanceDB = async (): Promise<
   typeof import("@lancedb/lancedb")
 > => {
   if (!lancedbImportPromise) {
-    // createRequire builds a real CJS require() from an ESM context.
-    // This preserves native .node binding semantics on Windows (per #267)
-    // while working in pure-ESM Node where global require is undefined.
-    // Named `requireCJS` to prevent esbuild from rewriting it to __require.
-    const requireCJS = createRequire(import.meta.url);
-    lancedbImportPromise = Promise.resolve(requireCJS("@lancedb/lancedb"));
+    // Use a createRequire-built require() so LanceDB's CommonJS native bindings
+    // keep Windows-safe CJS semantics while still working in pure ESM runtimes.
+    // Do not name this binding "require": bundlers may rewrite bare require()
+    // calls to their ESM shim, which is what broke OpenClaw 2026.5+ loading.
+    lancedbImportPromise = Promise.resolve(
+      requireCJS("@lancedb/lancedb") as typeof import("@lancedb/lancedb"),
+    );
   }
   try {
     return await lancedbImportPromise;
@@ -350,10 +353,14 @@ export class MemoryStore {
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
-    if (!existsSync(lockPath)) {
-      try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
-      try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
-    }
+    const lockArtifactPath = `${lockPath}.lock`;
+    const ensureLockTargetExists = async () => {
+      if (!existsSync(lockPath)) {
+        try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
+        try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
+      }
+    };
+    await ensureLockTargetExists();
     // 【修復 #415】調整 retries：max wait 從 ~3100ms → ~151秒
     // 指數退避：1s, 2s, 4s, 8s, 16s, 30s×5，總計約 151 秒
     // ECOMPROMISED 透過 onCompromised callback 觸發（非 throw），使用 flag 機制正確處理
@@ -362,21 +369,28 @@ export class MemoryStore {
     let fnSucceeded = false;
     let fnError: unknown = null;
 
-    // Proactive cleanup of stale lock artifacts（from PR #626）
-    // 根本避免 >5 分鐘的 lock artifact 導致 ECOMPROMISED
-    if (existsSync(lockPath)) {
+    // Proactive cleanup of stale proper-lockfile artifacts（from PR #626）.
+    // proper-lockfile locks the target by creating `${target}.lock`; the
+    // target file itself is expected to persist and must not be treated stale.
+    if (existsSync(lockArtifactPath)) {
       try {
-        const stat = statSync(lockPath);
+        const stat = statSync(lockArtifactPath);
         const ageMs = Date.now() - stat.mtimeMs;
         const staleThresholdMs = 5 * 60 * 1000;
         if (ageMs > staleThresholdMs) {
-          try { unlinkSync(lockPath); } catch {}
-          console.warn(`[memory-lancedb-pro] cleared stale lock: ${lockPath} ageMs=${ageMs}`);
+          try {
+            if (stat.isDirectory()) {
+              rmdirSync(lockArtifactPath);
+            } else {
+              unlinkSync(lockArtifactPath);
+            }
+            console.warn(`[memory-lancedb-pro] cleared stale lock artifact: ${lockArtifactPath} ageMs=${ageMs}`);
+          } catch {}
         }
       } catch {}
     }
 
-    const release = await lockfile.lock(lockPath, {
+    const acquireLock = async () => lockfile.lock(lockPath, {
       // 【修復 #670】realpath:false — 避免 proactive cleanup 刪除 stale lock artifact 後，
       // proper-lockfile v4 的 realpath() 在已刪除檔案上被呼叫，導致 ENOENT。
       // 情境：T=0 proactive cleanup 刪除 stale lock → T=3ms lock() 的 realpath() → ENOENT
@@ -399,6 +413,18 @@ export class MemoryStore {
         compromisedErr = err;
       },
     });
+
+    let release: Awaited<ReturnType<typeof acquireLock>>;
+    try {
+      release = await acquireLock();
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        await ensureLockTargetExists();
+        release = await acquireLock();
+      } else {
+        throw err;
+      }
+    }
 
     try {
       const result = await fn();
@@ -739,9 +765,16 @@ export class MemoryStore {
     await this.ensureInitialized();
 
     // Filter out invalid entries（undefined, null, missing text/vector）
-    const validEntries = entries.filter(
-      (entry) => entry && entry.text && entry.text.length > 0 && entry.vector && entry.vector.length > 0
-    );
+    const validEntries = entries.filter((entry) => {
+      const candidate = entry as { text?: unknown; vector?: unknown };
+      return (
+        !!candidate &&
+        typeof candidate.text === "string" &&
+        candidate.text.length > 0 &&
+        Array.isArray(candidate.vector) &&
+        candidate.vector.length > 0
+      );
+    });
 
     // Early return for empty array（skip accumulation）
     if (validEntries.length === 0) {
@@ -754,7 +787,7 @@ export class MemoryStore {
       id: randomUUID(),
       timestamp: Date.now(),
       metadata: entry.metadata || "{}",
-    }));
+    }) as MemoryEntry);
 
     // 【MR2 fix】當 pendingBatch 達到上限時，等待前一個 flush 完成後再加入
     // 這確保 pendingBatch 有上限，不會无限增长

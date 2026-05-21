@@ -216,11 +216,11 @@ export function createDecayEngine(
     applySearchBoost(results, now = Date.now()) {
       for (const r of results) {
         const ds = scoreOne(r.memory, now);
+        // Fresh memories should not be penalized merely because access
+        // frequency starts at zero.
         const searchFloor = Math.max(
           getTierFloor(r.memory.tier),
           ds.composite,
-          // Fresh memories should not be penalized merely because access
-          // frequency starts at zero.
           ds.recency,
         );
         const multiplier = boostMin + ((1 - boostMin) * searchFloor);

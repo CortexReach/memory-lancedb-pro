@@ -174,6 +174,7 @@ async function retrieveWithRetry(
     limit: number;
     scopeFilter?: string[];
     category?: string;
+    source?: "manual" | "auto-recall" | "cli";
   },
   countStore?: () => Promise<number>,
 ): Promise<RetrievalResult[]> {
@@ -1912,7 +1913,7 @@ export function registerMemoryPromoteTool(
             memoryId ?? query ?? "",
             scopeFilter,
           );
-          if (!resolved.ok) {
+          if (resolved.ok === false) {
             return {
               content: [{ type: "text", text: resolved.message }],
               details: resolved.details ?? { error: "resolve_failed" },
@@ -2019,7 +2020,7 @@ export function registerMemoryArchiveTool(
             memoryId ?? query ?? "",
             scopeFilter,
           );
-          if (!resolved.ok) {
+          if (resolved.ok === false) {
             return {
               content: [{ type: "text", text: resolved.message }],
               details: resolved.details ?? { error: "resolve_failed" },

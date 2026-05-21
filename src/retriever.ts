@@ -236,7 +236,7 @@ function attachFailureStage(
   stage: NonNullable<RetrievalDiagnostics["failureStage"]>,
 ): TaggedRetrievalError {
   const tagged =
-    error instanceof Error ? (error as TaggedRetrievalError) : new Error(String(error));
+    error instanceof Error ? (error as TaggedRetrievalError) : (new Error(String(error)) as TaggedRetrievalError);
   tagged.retrievalFailureStage = stage;
   return tagged;
 }
@@ -952,8 +952,8 @@ export class MemoryRetriever {
       const vectorResult_ = settledResults[0];
       const bm25Result_ = settledResults[1];
 
-      let vectorResults: RetrievalResult[];
-      let bm25Results: RetrievalResult[];
+      let vectorResults: Array<MemorySearchResult & { rank: number }>;
+      let bm25Results: Array<MemorySearchResult & { rank: number }>;
 
       if (vectorResult_.status === "rejected") {
         const error = attachFailureStage(vectorResult_.reason, "hybrid.vectorSearch");

@@ -634,7 +634,7 @@ export class Embedder {
         );
       }
 
-      const data = await response.json();
+      const data = await response.json() as any;
 
       // Validate response count and non-empty embeddings
       if (
@@ -674,7 +674,7 @@ export class Embedder {
       );
     }
 
-    const data = await response.json();
+    const data = await response.json() as any;
 
     // Ollama /api/embeddings returns { embedding: number[] },
     // convert to OpenAI-compatible shape { data: [{ embedding: number[] }] }
