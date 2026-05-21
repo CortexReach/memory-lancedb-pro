@@ -3,7 +3,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync, statSync, unlinkSync, rmdirSync, } from "node:fs";
+import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync, statSync, unlinkSync, rmdirSync, writeFileSync, } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
@@ -48,6 +48,63 @@ function clampInt(value, min, max) {
     if (!Number.isFinite(value))
         return min;
     return Math.min(max, Math.max(min, Math.floor(value)));
+}
+const LEGACY_SECONDS_TIMESTAMP_MAX = 1_000_000_000_000;
+export function normalizeMemoryTimestamp(value, fallback = Date.now()) {
+    const raw = value instanceof Date
+        ? value.getTime()
+        : typeof value === "number"
+            ? value
+            : Number(value);
+    if (!Number.isFinite(raw) || raw <= 0) {
+        return fallback;
+    }
+    const timestamp = Math.floor(raw);
+    return timestamp < LEGACY_SECONDS_TIMESTAMP_MAX ? timestamp * 1000 : timestamp;
+}
+function normalizePredicateTimestamp(value) {
+    const raw = value instanceof Date
+        ? value.getTime()
+        : typeof value === "number"
+            ? value
+            : Number(value);
+    if (!Number.isFinite(raw) || raw <= 0) {
+        return null;
+    }
+    return normalizeMemoryTimestamp(raw);
+}
+function timestampBeforePredicate(column, value) {
+    const maxTimestamp = normalizePredicateTimestamp(value);
+    if (maxTimestamp == null) {
+        return "(FALSE)";
+    }
+    const legacySecondsCutoff = Math.ceil(maxTimestamp / 1000);
+    return `((${column} >= ${LEGACY_SECONDS_TIMESTAMP_MAX} AND ${column} < ${maxTimestamp}) OR ` +
+        `(${column} > 0 AND ${column} < ${LEGACY_SECONDS_TIMESTAMP_MAX} AND ${column} < ${legacySecondsCutoff}))`;
+}
+function normalizeLegacyTimestampMetadata(value) {
+    let metadata;
+    if (typeof value === "string" && value.trim()) {
+        try {
+            const parsed = JSON.parse(value);
+            metadata = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+                ? parsed
+                : {};
+        }
+        catch {
+            return value;
+        }
+    }
+    else if (value && typeof value === "object" && !Array.isArray(value)) {
+        metadata = { ...value };
+    }
+    else {
+        return "{}";
+    }
+    if (Object.prototype.hasOwnProperty.call(metadata, "last_accessed_at")) {
+        metadata.last_accessed_at = normalizeMemoryTimestamp(metadata.last_accessed_at, 0);
+    }
+    return JSON.stringify(metadata);
 }
 function escapeSqlLiteral(value) {
     return value.replace(/'/g, "''");
@@ -415,6 +472,7 @@ export class MemoryStore {
                 }
             }
         }
+        await this.backfillLegacySecondTimestamps(table);
         // Validate vector dimensions
         // Note: LanceDB returns Arrow Vector objects, not plain JS arrays.
         // Array.isArray() returns false for Arrow Vectors, so use .length instead.
@@ -436,6 +494,91 @@ export class MemoryStore {
         }
         this.db = db;
         this.table = table;
+    }
+    async backfillLegacySecondTimestamps(table) {
+        try {
+            let normalizedCount = 0;
+            await this.runWithFileLock(async () => {
+                const legacyRows = await table.query()
+                    .where(`timestamp > 0 AND timestamp < ${LEGACY_SECONDS_TIMESTAMP_MAX}`)
+                    .toArray();
+                if (legacyRows.length === 0)
+                    return;
+                for (const row of legacyRows) {
+                    const originalRow = {
+                        ...row,
+                        vector: Array.from(row.vector),
+                        scope: row.scope ?? "global",
+                        metadata: row.metadata || "{}",
+                    };
+                    const normalizedRow = {
+                        ...originalRow,
+                        metadata: normalizeLegacyTimestampMetadata(row.metadata),
+                        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+                    };
+                    const safeId = escapeSqlLiteral(row.id);
+                    const backupPath = this.writeLegacyTimestampBackfillBackup(originalRow);
+                    await table.delete(`id = '${safeId}'`);
+                    try {
+                        await table.add([normalizedRow]);
+                        this.clearLegacyTimestampBackfillBackup(backupPath);
+                        normalizedCount += 1;
+                    }
+                    catch (addError) {
+                        const currentRows = await table.query()
+                            .where(`id = '${safeId}'`)
+                            .limit(1)
+                            .toArray()
+                            .catch(() => []);
+                        if (currentRows.length > 0) {
+                            this.clearLegacyTimestampBackfillBackup(backupPath);
+                            throw new Error(`legacy timestamp normalization failed for ${row.id}: replacement write failed after delete, but an existing record was preserved. ` +
+                                `Write error: ${addError instanceof Error ? addError.message : String(addError)}`);
+                        }
+                        if (currentRows.length === 0) {
+                            try {
+                                await table.add([originalRow]);
+                                this.clearLegacyTimestampBackfillBackup(backupPath);
+                            }
+                            catch (rollbackError) {
+                                throw new Error(`legacy timestamp normalization failed for ${row.id}: replacement write failed after delete, and rollback also failed. ` +
+                                    `Durable backup saved at ${backupPath}. ` +
+                                    `Write error: ${addError instanceof Error ? addError.message : String(addError)}. ` +
+                                    `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+                            }
+                        }
+                        throw new Error(`legacy timestamp normalization failed for ${row.id}: replacement write failed after delete, original row restored. ` +
+                            `Write error: ${addError instanceof Error ? addError.message : String(addError)}`);
+                    }
+                }
+            });
+            if (normalizedCount > 0) {
+                console.log(`memory-lancedb-pro: normalized ${normalizedCount} legacy second timestamp row(s)`);
+            }
+        }
+        catch (err) {
+            console.warn("memory-lancedb-pro: could not normalize legacy second timestamps:", err);
+            if (String(err).includes("Durable backup saved at")) {
+                throw err;
+            }
+        }
+    }
+    writeLegacyTimestampBackfillBackup(row) {
+        const backupDir = join(this.config.dbPath, ".legacy-timestamp-backfill-backups");
+        mkdirSync(backupDir, { recursive: true });
+        const backupPath = join(backupDir, `${encodeURIComponent(String(row.id))}.json`);
+        writeFileSync(backupPath, `${JSON.stringify({ version: 1, createdAt: new Date().toISOString(), row }, null, 2)}\n`, "utf8");
+        return backupPath;
+    }
+    clearLegacyTimestampBackfillBackup(backupPath) {
+        try {
+            unlinkSync(backupPath);
+        }
+        catch (err) {
+            if (err?.code !== "ENOENT") {
+                console.warn(`memory-lancedb-pro: could not remove legacy timestamp backup ${backupPath}:`, err);
+            }
+        }
     }
     async createFtsIndex(table) {
         try {
@@ -787,9 +930,7 @@ export class MemoryStore {
             ...entry,
             scope: entry.scope || "global",
             importance: Number.isFinite(entry.importance) ? entry.importance : 0.7,
-            timestamp: Number.isFinite(entry.timestamp)
-                ? entry.timestamp
-                : Date.now(),
+            timestamp: normalizeMemoryTimestamp(entry.timestamp),
             metadata: entry.metadata || "{}",
         };
         return this.runWithFileLock(async () => {
@@ -836,7 +977,7 @@ export class MemoryStore {
             category: row.category,
             scope: rowScope,
             importance: Number(row.importance),
-            timestamp: Number(row.timestamp),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: row.metadata || "{}",
         };
     }
@@ -879,7 +1020,7 @@ export class MemoryStore {
                 category: row.category,
                 scope: rowScope,
                 importance: Number(row.importance),
-                timestamp: Number(row.timestamp),
+                timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
                 metadata: row.metadata || "{}",
             };
             // Skip inactive (superseded) records when requested
@@ -934,7 +1075,7 @@ export class MemoryStore {
                     category: row.category,
                     scope: rowScope,
                     importance: Number(row.importance),
-                    timestamp: Number(row.timestamp),
+                    timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
                     metadata: row.metadata || "{}",
                 };
                 // Skip inactive (superseded) records when requested
@@ -991,7 +1132,7 @@ export class MemoryStore {
                 category: row.category,
                 scope: rowScope,
                 importance: Number(row.importance),
-                timestamp: Number(row.timestamp),
+                timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
                 metadata: row.metadata || "{}",
             };
             const metadata = parseSmartMetadata(entry.metadata, entry);
@@ -1099,7 +1240,7 @@ export class MemoryStore {
             category: row.category,
             scope: row.scope ?? "global",
             importance: Number(row.importance),
-            timestamp: Number(row.timestamp),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: row.metadata || "{}",
         }))
             .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
@@ -1195,7 +1336,7 @@ export class MemoryStore {
                 category: row.category,
                 scope: rowScope,
                 importance: Number(row.importance),
-                timestamp: Number(row.timestamp),
+                timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
                 metadata: row.metadata || "{}",
             };
             // Build updated entry, preserving original timestamp
@@ -1270,8 +1411,8 @@ export class MemoryStore {
                 .join(" OR ");
             conditions.push(`(${scopeConditions})`);
         }
-        if (beforeTimestamp) {
-            conditions.push(`timestamp < ${beforeTimestamp}`);
+        if (beforeTimestamp != null) {
+            conditions.push(timestampBeforePredicate("timestamp", beforeTimestamp));
         }
         if (conditions.length === 0) {
             throw new Error("Bulk delete requires at least scope or timestamp filter for safety");
@@ -1340,7 +1481,7 @@ export class MemoryStore {
      */
     async fetchForCompaction(maxTimestamp, scopeFilter, limit = 200) {
         await this.ensureInitialized();
-        const conditions = [`timestamp < ${maxTimestamp}`];
+        const conditions = [timestampBeforePredicate("timestamp", maxTimestamp)];
         if (scopeFilter && scopeFilter.length > 0) {
             const scopeConditions = scopeFilter
                 .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
@@ -1361,7 +1502,7 @@ export class MemoryStore {
             category: row.category,
             scope: row.scope ?? "global",
             importance: Number(row.importance),
-            timestamp: Number(row.timestamp),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: row.metadata || "{}",
         }));
     }
