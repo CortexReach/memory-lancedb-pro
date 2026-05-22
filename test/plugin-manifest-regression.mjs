@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import http from "node:http";
 import Module from "node:module";
 import { tmpdir } from "node:os";
@@ -150,9 +150,10 @@ const services = [];
 const embeddingRequests = [];
 
 try {
+  const startupDbPath = path.join(workDir, "db");
   const api = createMockApi(
     {
-      dbPath: path.join(workDir, "db"),
+      dbPath: startupDbPath,
       autoRecall: false,
       embedding: {
         provider: "openai-compatible",
@@ -165,7 +166,13 @@ try {
     { services },
   );
   resetRegistration();
+  assert.equal(existsSync(startupDbPath), false, "test dbPath should start missing");
   plugin.register(api);
+  assert.equal(
+    existsSync(startupDbPath),
+    false,
+    "plugin registration should not synchronously create or validate dbPath",
+  );
   assert.equal(services.length, 1, "plugin should register its background service");
   assert.equal(typeof api.hooks.agent_end, "function", "autoCapture should remain enabled by default");
   assert.equal(typeof api.hooks["command:new"], "function", "selfImprovement command:new hook should be registered by default (#391)");

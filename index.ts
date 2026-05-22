@@ -20,7 +20,7 @@ import { spawn } from "node:child_process";
 const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 
 // Import core components
-import { MemoryStore, normalizeStoragePath, validateStoragePath, type MemoryEntry } from "./src/store.js";
+import { MemoryStore, normalizeStoragePath, type MemoryEntry } from "./src/store.js";
 import {
   createEmbedder,
   getEffectiveVectorDimensions,
@@ -1995,21 +1995,16 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const config = parsePluginConfig(api.pluginConfig);
   let resolvedDbPath = normalizeStoragePath(api.resolvePath(config.dbPath || getDefaultDbPath()));
 
-  try {
-    resolvedDbPath = validateStoragePath(resolvedDbPath);
-  } catch (err) {
-    api.logger.warn(
-      `memory-lancedb-pro: storage path issue — ${String(err)}\n` +
-      `  The plugin will still attempt to start, but writes may fail.`,
-    );
-  }
-
   const vectorDim = getEffectiveVectorDimensions(
     config.embedding.model || "text-embedding-3-small",
     config.embedding.dimensions,
     config.embedding.requestDimensions,
   );
-  const store = new MemoryStore({ dbPath: resolvedDbPath, vectorDim });
+  const store = new MemoryStore({
+    dbPath: resolvedDbPath,
+    vectorDim,
+    onStoragePathWarning: (message) => api.logger.warn(message),
+  });
   const embedder = createEmbedder({
     provider: "openai-compatible",
     apiKey: config.embedding.apiKey,

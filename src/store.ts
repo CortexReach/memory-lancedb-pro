@@ -16,6 +16,12 @@ import {
   unlinkSync,
   rmdirSync,
 } from "node:fs";
+import {
+  access as accessAsync,
+  lstat as lstatAsync,
+  mkdir as mkdirAsync,
+  realpath as realpathAsync,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
@@ -43,6 +49,7 @@ export interface MemorySearchResult {
 export interface StoreConfig {
   dbPath: string;
   vectorDim: number;
+  onStoragePathWarning?: (message: string) => void;
 }
 
 export interface MetadataPatch {
@@ -223,6 +230,78 @@ export function validateStoragePath(dbPath: string): string {
   // Check write permissions
   try {
     accessSync(resolvedPath, constants.W_OK);
+  } catch (err: any) {
+    throw new Error(
+      `dbPath directory "${resolvedPath}" is not writable.\n` +
+      `  Fix: Check permissions with: ls -la "${dirname(resolvedPath)}"\n` +
+      `       Or grant write access: chmod u+w "${resolvedPath}"\n` +
+      `  Details: ${err.code || ""} ${err.message}`,
+    );
+  }
+
+  return resolvedPath;
+}
+
+/**
+ * Async variant of {@link validateStoragePath}. Use this on runtime paths so
+ * slow filesystems do not block OpenClaw's event loop during startup.
+ */
+export async function validateStoragePathAsync(dbPath: string): Promise<string> {
+  let resolvedPath = normalizeStoragePath(dbPath);
+
+  // Resolve symlinks (including dangling symlinks)
+  try {
+    const stats = await lstatAsync(dbPath);
+    if (stats.isSymbolicLink()) {
+      try {
+        resolvedPath = await realpathAsync(dbPath);
+      } catch (err: any) {
+        throw new Error(
+          `dbPath "${dbPath}" is a symlink whose target does not exist.\n` +
+          `  Fix: Create the target directory, or update the symlink to point to a valid path.\n` +
+          `  Details: ${err.code || ""} ${err.message}`,
+        );
+      }
+    }
+  } catch (err: any) {
+    // Missing path is OK (it will be created below)
+    if (err?.code === "ENOENT") {
+      // no-op
+    } else if (
+      typeof err?.message === "string" &&
+      err.message.includes("symlink whose target does not exist")
+    ) {
+      throw err;
+    } else {
+      // Other lstat failures — continue with original path
+    }
+  }
+
+  // Create directory if it doesn't exist
+  let pathExists = false;
+  try {
+    await accessAsync(resolvedPath, constants.F_OK);
+    pathExists = true;
+  } catch {
+    pathExists = false;
+  }
+
+  if (!pathExists) {
+    try {
+      await mkdirAsync(resolvedPath, { recursive: true });
+    } catch (err: any) {
+      throw new Error(
+        `Failed to create dbPath directory "${resolvedPath}".\n` +
+        `  Fix: Ensure the parent directory "${dirname(resolvedPath)}" exists and is writable,\n` +
+        `       or create it manually: mkdir -p "${resolvedPath}"\n` +
+        `  Details: ${err.code || ""} ${err.message}`,
+      );
+    }
+  }
+
+  // Check write permissions
+  try {
+    await accessAsync(resolvedPath, constants.W_OK);
   } catch (err: any) {
     throw new Error(
       `dbPath directory "${resolvedPath}" is not writable.\n` +
@@ -420,6 +499,15 @@ export class MemoryStore {
   }
 
   private async doInitialize(): Promise<void> {
+    try {
+      this.config.dbPath = await validateStoragePathAsync(this.config.dbPath);
+    } catch (err) {
+      this.config.onStoragePathWarning?.(
+        `memory-lancedb-pro: storage path issue — ${String(err)}\n` +
+        `  The plugin will still attempt to start, but writes may fail.`,
+      );
+    }
+
     const lancedb = await loadLanceDB();
 
     let db: LanceDB.Connection;
