@@ -254,6 +254,36 @@ describe("memory timestamp normalization", () => {
     assert.equal(metadata.last_accessed_at, 1_700_000_001_000);
   });
 
+  it("backfills legacy last-access metadata when the main timestamp is already milliseconds", async () => {
+    const store = createStore();
+    await store.count();
+
+    await store.table.add([{
+      id: "persisted-ms-with-legacy-last-access",
+      text: "persisted millisecond timestamp with legacy last access",
+      vector: [1, 0, 0, 0],
+      category: "fact",
+      scope: "global",
+      importance: 0.7,
+      timestamp: 1_700_000_000_000,
+      metadata: JSON.stringify({ last_accessed_at: 1_700_000_001 }),
+    }]);
+
+    const reopened = createStore();
+    const loaded = await reopened.getById("persisted-ms-with-legacy-last-access");
+    const metadata = JSON.parse(loaded?.metadata ?? "{}");
+    assert.equal(loaded?.timestamp, 1_700_000_000_000);
+    assert.equal(metadata.last_accessed_at, 1_700_000_001_000);
+
+    const rawRows = await reopened.table
+      .query()
+      .where("id = 'persisted-ms-with-legacy-last-access'")
+      .limit(1)
+      .toArray();
+    assert.equal(Number(rawRows[0].timestamp), 1_700_000_000_000);
+    assert.equal(JSON.parse(rawRows[0].metadata).last_accessed_at, 1_700_000_001_000);
+  });
+
   it("does not treat nonpositive retention cutoffs as before-now predicates", async () => {
     const store = createStore();
 

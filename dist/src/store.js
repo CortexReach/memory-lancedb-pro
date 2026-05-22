@@ -73,6 +73,14 @@ function normalizePredicateTimestamp(value) {
     }
     return normalizeMemoryTimestamp(raw);
 }
+function isLegacySecondTimestamp(value) {
+    const raw = value instanceof Date
+        ? value.getTime()
+        : typeof value === "number"
+            ? value
+            : Number(value);
+    return Number.isFinite(raw) && raw > 0 && Math.floor(raw) < LEGACY_SECONDS_TIMESTAMP_MAX;
+}
 function timestampBeforePredicate(column, value) {
     const maxTimestamp = normalizePredicateTimestamp(value);
     if (maxTimestamp == null) {
@@ -82,24 +90,35 @@ function timestampBeforePredicate(column, value) {
     return `((${column} >= ${LEGACY_SECONDS_TIMESTAMP_MAX} AND ${column} < ${maxTimestamp}) OR ` +
         `(${column} > 0 AND ${column} < ${LEGACY_SECONDS_TIMESTAMP_MAX} AND ${column} < ${legacySecondsCutoff}))`;
 }
-function normalizeLegacyTimestampMetadata(value) {
-    let metadata;
+function parseMetadataObject(value) {
     if (typeof value === "string" && value.trim()) {
         try {
             const parsed = JSON.parse(value);
-            metadata = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+            return parsed && typeof parsed === "object" && !Array.isArray(parsed)
                 ? parsed
                 : {};
         }
         catch {
-            return value;
+            return null;
         }
     }
     else if (value && typeof value === "object" && !Array.isArray(value)) {
-        metadata = { ...value };
+        return { ...value };
     }
     else {
-        return "{}";
+        return {};
+    }
+}
+function metadataHasLegacySecondTimestamp(value) {
+    const metadata = parseMetadataObject(value);
+    return metadata != null &&
+        Object.prototype.hasOwnProperty.call(metadata, "last_accessed_at") &&
+        isLegacySecondTimestamp(metadata.last_accessed_at);
+}
+function normalizeLegacyTimestampMetadata(value) {
+    const metadata = parseMetadataObject(value);
+    if (metadata == null) {
+        return typeof value === "string" ? value : "{}";
     }
     if (Object.prototype.hasOwnProperty.call(metadata, "last_accessed_at")) {
         metadata.last_accessed_at = normalizeMemoryTimestamp(metadata.last_accessed_at, 0);
@@ -499,9 +518,14 @@ export class MemoryStore {
         try {
             let normalizedCount = 0;
             await this.runWithFileLock(async () => {
-                const legacyRows = await table.query()
-                    .where(`timestamp > 0 AND timestamp < ${LEGACY_SECONDS_TIMESTAMP_MAX}`)
+                const candidateRows = await table.query()
+                    .where(`(timestamp > 0 AND timestamp < ${LEGACY_SECONDS_TIMESTAMP_MAX}) OR ` +
+                    `(metadata IS NOT NULL AND metadata != '{}' AND metadata != '')`)
                     .toArray();
+                if (candidateRows.length === 0)
+                    return;
+                const legacyRows = candidateRows.filter((row) => isLegacySecondTimestamp(row.timestamp) ||
+                    metadataHasLegacySecondTimestamp(row.metadata));
                 if (legacyRows.length === 0)
                     return;
                 for (const row of legacyRows) {
