@@ -36,7 +36,7 @@ describe("legacy LanceDB migration", () => {
     });
   }
 
-  it("migrates legacy rows with Arrow vectors and preserves id/timestamp", async () => {
+  it("migrates legacy rows with Arrow vectors and normalizes legacy timestamps", async () => {
     const legacyPath = await createLegacyDb([
       {
         id: "legacy-1",
@@ -64,7 +64,7 @@ describe("legacy LanceDB migration", () => {
     const memories = await store.list(undefined, undefined, 10, 0);
     assert.equal(memories.length, 1);
     assert.equal(memories[0].id, "legacy-1");
-    assert.equal(memories[0].timestamp, 1234567890);
+    assert.equal(memories[0].timestamp, 1234567890000);
     assert.equal(memories[0].scope, "global");
 
     const metadata = JSON.parse(memories[0].metadata || "{}");
