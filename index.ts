@@ -214,6 +214,7 @@ interface PluginConfig {
     beforeResetNote?: boolean;
     skipSubagentBootstrap?: boolean;
     ensureLearningFiles?: boolean;
+    maxEntries?: number;
   };
   memoryReflection?: {
     enabled?: boolean;
@@ -2592,6 +2593,7 @@ const memoryLanceDBProPlugin = {
         workspaceDir: getDefaultWorkspaceDir(),
         mdMirror,
         workspaceBoundary: config.workspaceBoundary,
+        selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
       },
       {
         enableManagementTools: config.enableManagementTools,
@@ -4247,7 +4249,7 @@ const memoryLanceDBProPlugin = {
           const reflectionGovernanceCandidates = extractReflectionLearningGovernanceCandidates(reflectionText);
           if (config.selfImprovement?.enabled !== false && reflectionGovernanceCandidates.length > 0) {
             for (const candidate of reflectionGovernanceCandidates) {
-              await appendSelfImprovementEntry({
+              const appendResult = await appendSelfImprovementEntry({
                 baseDir: workspaceDir,
                 type: "learning",
                 summary: candidate.summary,
@@ -4258,7 +4260,13 @@ const memoryLanceDBProPlugin = {
                 priority: candidate.priority || "medium",
                 status: candidate.status || "pending",
                 source: `memory-lancedb-pro/reflection:${relPath}`,
+                maxEntries: config.selfImprovement?.maxEntries,
               });
+              if (appendResult.skipped) {
+                api.logger.warn(
+                  `self-improvement: skipped reflection learning candidate because .learnings limit was reached (${appendResult.entryCount}/${appendResult.maxEntries})`,
+                );
+              }
             }
           }
 
@@ -4901,12 +4909,14 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         beforeResetNote: (cfg.selfImprovement as Record<string, unknown>).beforeResetNote !== false,
         skipSubagentBootstrap: (cfg.selfImprovement as Record<string, unknown>).skipSubagentBootstrap !== false,
         ensureLearningFiles: (cfg.selfImprovement as Record<string, unknown>).ensureLearningFiles !== false,
+        maxEntries: parsePositiveInt((cfg.selfImprovement as Record<string, unknown>).maxEntries) ?? 500,
       }
       : {
         enabled: true,
         beforeResetNote: true,
         skipSubagentBootstrap: true,
         ensureLearningFiles: true,
+        maxEntries: 500,
       },
     memoryReflection: memoryReflectionRaw
       ? {
