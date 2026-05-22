@@ -1273,8 +1273,6 @@ export class MemoryStore {
 
     if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
-    let query = this.table!.query();
-
     // Build where conditions
     const conditions: string[] = [];
 
@@ -1289,13 +1287,13 @@ export class MemoryStore {
       conditions.push(`category = '${escapeSqlLiteral(category)}'`);
     }
 
-    if (conditions.length > 0) {
-      query = query.where(conditions.join(" AND "));
-    }
+    const applyConditions = (query: any) =>
+      conditions.length > 0 ? query.where(conditions.join(" AND ")) : query;
 
     // Fetch all matching rows (no pre-limit) so app-layer sort is correct across full dataset
-    const results = await query
-      .select([
+    const results = await this.queryRowsWithProjectionFallback(
+      applyConditions,
+      [
         "id",
         "text",
         "category",
@@ -1303,8 +1301,8 @@ export class MemoryStore {
         "importance",
         "timestamp",
         "metadata",
-      ])
-      .toArray();
+      ],
+    );
 
     return results
       .map(
@@ -1323,6 +1321,24 @@ export class MemoryStore {
       .slice(offset, offset + limit);
   }
 
+  private async queryRowsWithProjectionFallback(
+    applyFilters: (query: any) => any,
+    columns: string[],
+  ): Promise<any[]> {
+    const projectedRows = await applyFilters(this.table!.query())
+      .select(columns)
+      .toArray();
+
+    if (projectedRows.length > 0) {
+      return projectedRows;
+    }
+
+    // Some LanceDB upgrades have returned empty projected metadata reads while
+    // the underlying table still has rows. Retry the identical query without
+    // projection so list/stats stay aligned with recall/vector reads.
+    return await applyFilters(this.table!.query()).toArray();
+  }
+
   async stats(scopeFilter?: string[]): Promise<{
     totalCount: number;
     scopeCounts: Record<string, number>;
@@ -1338,16 +1354,21 @@ export class MemoryStore {
       };
     }
 
-    let query = this.table!.query();
-
+    const conditions: string[] = [];
     if (scopeFilter && scopeFilter.length > 0) {
       const scopeConditions = scopeFilter
         .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
         .join(" OR ");
-      query = query.where(`((${scopeConditions}) OR scope IS NULL)`);
+      conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
     }
 
-    const results = await query.select(["scope", "category"]).toArray();
+    const applyConditions = (query: any) =>
+      conditions.length > 0 ? query.where(conditions.join(" AND ")) : query;
+
+    const results = await this.queryRowsWithProjectionFallback(
+      applyConditions,
+      ["scope", "category"],
+    );
 
     const scopeCounts: Record<string, number> = {};
     const categoryCounts: Record<string, number> = {};
