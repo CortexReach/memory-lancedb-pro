@@ -92,6 +92,7 @@ import {
   type AdmissionRejectionAuditEntry,
 } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
+import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
 
 // ============================================================================
 // Configuration & Types
@@ -1968,6 +1969,7 @@ function isSessionBoundaryReflectionAction(action: unknown): boolean {
 interface PluginSingletonState {
   config: ReturnType<typeof parsePluginConfig>;
   resolvedDbPath: string;
+  vectorDim: number;
   store: MemoryStore;
   embedder: ReturnType<typeof createEmbedder>;
   decayEngine: ReturnType<typeof createDecayEngine>;
@@ -2137,6 +2139,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   return {
     config,
     resolvedDbPath,
+    vectorDim,
     store,
     embedder,
     decayEngine,
@@ -2235,6 +2238,7 @@ const memoryLanceDBProPlugin = {
     const {
       config,
       resolvedDbPath,
+      vectorDim,
       store,
       embedder,
       retriever,
@@ -2498,37 +2502,36 @@ const memoryLanceDBProPlugin = {
       `  - Use memory_store or auto-capture for recallable memories.\n`
     );
 
-    // Health status for memory runtime stub (reflects actual plugin health)
+    // Health status for OpenClaw memory runtime (reflects actual plugin health)
     // Updated by runStartupChecks after testing embedder and retriever
     let embedHealth: { ok: boolean; error?: string } = { ok: false, error: "startup not complete" };
     let retrievalHealth: boolean = false;
 
     // ========================================================================
-    // Stub Memory Runtime (satisfies openclaw doctor memory plugin check)
-    // memory-lancedb-pro uses a tool-based architecture, not the built-in memory-core
-    // runtime interface, so we register a minimal stub to satisfy the check.
-    // See: https://github.com/CortexReach/memory-lancedb-pro/issues/434
+    // OpenClaw Memory Capability
     // ========================================================================
-    if (typeof api.registerMemoryRuntime === "function") {
-      api.registerMemoryRuntime({
-        async getMemorySearchManager(_params: any) {
-          return {
-            manager: {
-              status: () => ({
-                backend: "builtin" as const,
-                provider: "memory-lancedb-pro",
-                embeddingAvailable: embedHealth.ok,
-                retrievalAvailable: retrievalHealth,
-              }),
-              probeEmbeddingAvailability: async () => ({ ...embedHealth }),
-              probeVectorAvailability: async () => retrievalHealth,
-            },
-          };
-        },
-        resolveMemoryBackendConfig() {
-          return { backend: "builtin" as const };
-        },
-      });
+    const memoryCapability = createOpenClawMemoryCapability({
+      dbPath: resolvedDbPath,
+      vectorDim,
+      embeddingProvider: config.embedding.provider,
+      embeddingModel: config.embedding.model || "text-embedding-3-small",
+      workspaceDir: getDefaultWorkspaceDir(),
+      getRuntimeStatus: () => ({
+        embeddingAvailable: embedHealth.ok,
+        retrievalAvailable: retrievalHealth,
+        embeddingError: embedHealth.error,
+      }),
+      probeEmbeddingAvailability: async () => ({ ...embedHealth }),
+      probeVectorAvailability: async () => retrievalHealth,
+    });
+
+    if (typeof api.registerMemoryCapability === "function") {
+      api.registerMemoryCapability(memoryCapability);
+    } else if (typeof api.registerMemoryRuntime === "function") {
+      api.registerMemoryRuntime(memoryCapability.runtime);
+      api.logger.debug("memory-lancedb-pro: host API lacks registerMemoryCapability; registered legacy memory runtime only");
+    } else {
+      api.logger.debug("memory-lancedb-pro: host API lacks memory capability registration APIs");
     }
 
     api.on("message_received", (event: any, ctx: any) => {
