@@ -159,6 +159,17 @@ assert.ok(
   "dreaming schema should declare phase config",
 );
 assert.ok(
+  Object.prototype.hasOwnProperty.call(
+    manifest.configSchema.properties.dreaming.properties.execution.properties.defaults.properties,
+    "speed",
+  ),
+  "dreaming execution defaults should expose memory-core speed/thinking/budget knobs",
+);
+assert.ok(
+  manifest.configSchema.properties.dreaming.properties.phases.properties.deep.properties.sources.items.enum.includes("logs"),
+  "deep dreaming sources should accept memory-core log source",
+);
+assert.ok(
   (manifest.commandAliases ?? []).some((entry) => entry?.name === "dreaming"),
   "manifest should expose the dreaming runtime slash command alias while owning the memory slot",
 );

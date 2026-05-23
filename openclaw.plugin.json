@@ -812,8 +812,45 @@
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
+                  "speed": {
+                    "type": "string",
+                    "enum": [
+                      "fast",
+                      "balanced",
+                      "slow"
+                    ]
+                  },
+                  "thinking": {
+                    "type": "string",
+                    "enum": [
+                      "low",
+                      "medium",
+                      "high"
+                    ]
+                  },
+                  "budget": {
+                    "type": "string",
+                    "enum": [
+                      "cheap",
+                      "medium",
+                      "expensive"
+                    ]
+                  },
                   "model": {
                     "type": "string"
+                  },
+                  "maxOutputTokens": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "temperature": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 2
+                  },
+                  "timeoutMs": {
+                    "type": "integer",
+                    "minimum": 1000
                   }
                 }
               }
@@ -846,15 +883,57 @@
                   "sources": {
                     "type": "array",
                     "items": {
-                      "type": "string"
+                      "type": "string",
+                      "enum": [
+                        "daily",
+                        "sessions",
+                        "recall"
+                      ]
                     }
                   },
                   "execution": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
+                      "speed": {
+                        "type": "string",
+                        "enum": [
+                          "fast",
+                          "balanced",
+                          "slow"
+                        ]
+                      },
+                      "thinking": {
+                        "type": "string",
+                        "enum": [
+                          "low",
+                          "medium",
+                          "high"
+                        ]
+                      },
+                      "budget": {
+                        "type": "string",
+                        "enum": [
+                          "cheap",
+                          "medium",
+                          "expensive"
+                        ]
+                      },
                       "model": {
                         "type": "string"
+                      },
+                      "maxOutputTokens": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "temperature": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 2
+                      },
+                      "timeoutMs": {
+                        "type": "integer",
+                        "minimum": 1000
                       }
                     }
                   }
@@ -895,7 +974,14 @@
                   "sources": {
                     "type": "array",
                     "items": {
-                      "type": "string"
+                      "type": "string",
+                      "enum": [
+                        "daily",
+                        "memory",
+                        "sessions",
+                        "logs",
+                        "recall"
+                      ]
                     }
                   },
                   "recovery": {
@@ -934,8 +1020,45 @@
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
+                      "speed": {
+                        "type": "string",
+                        "enum": [
+                          "fast",
+                          "balanced",
+                          "slow"
+                        ]
+                      },
+                      "thinking": {
+                        "type": "string",
+                        "enum": [
+                          "low",
+                          "medium",
+                          "high"
+                        ]
+                      },
+                      "budget": {
+                        "type": "string",
+                        "enum": [
+                          "cheap",
+                          "medium",
+                          "expensive"
+                        ]
+                      },
                       "model": {
                         "type": "string"
+                      },
+                      "maxOutputTokens": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "temperature": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 2
+                      },
+                      "timeoutMs": {
+                        "type": "integer",
+                        "minimum": 1000
                       }
                     }
                   }
@@ -964,15 +1087,57 @@
                   "sources": {
                     "type": "array",
                     "items": {
-                      "type": "string"
+                      "type": "string",
+                      "enum": [
+                        "memory",
+                        "daily",
+                        "deep"
+                      ]
                     }
                   },
                   "execution": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
+                      "speed": {
+                        "type": "string",
+                        "enum": [
+                          "fast",
+                          "balanced",
+                          "slow"
+                        ]
+                      },
+                      "thinking": {
+                        "type": "string",
+                        "enum": [
+                          "low",
+                          "medium",
+                          "high"
+                        ]
+                      },
+                      "budget": {
+                        "type": "string",
+                        "enum": [
+                          "cheap",
+                          "medium",
+                          "expensive"
+                        ]
+                      },
                       "model": {
                         "type": "string"
+                      },
+                      "maxOutputTokens": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "temperature": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 2
+                      },
+                      "timeoutMs": {
+                        "type": "integer",
+                        "minimum": 1000
                       }
                     }
                   }

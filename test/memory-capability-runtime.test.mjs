@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
-const { createOpenClawMemoryCapability } = jiti("../src/openclaw-memory-capability.ts");
+const {
+  createMemoryLancePublicArtifactsProvider,
+  createOpenClawMemoryCapability,
+} = jiti("../src/openclaw-memory-capability.ts");
 
 const entry = {
   id: "mem-runtime-1",
@@ -196,6 +202,28 @@ await manager.sync({ reason: "manual", force: true });
 assert.ok(
   corpusSyncCalls.some((call) => call?.reason === "manual" && call?.force === true),
   "runtime sync should delegate to canonical corpus indexer",
+);
+
+const artifactWorkspace = mkdtempSync(path.join(tmpdir(), "memory-capability-artifacts-"));
+mkdirSync(path.join(artifactWorkspace, "memory", "dreaming"), { recursive: true });
+mkdirSync(path.join(artifactWorkspace, "memory", ".dreams"), { recursive: true });
+writeFileSync(path.join(artifactWorkspace, "MEMORY.md"), "# Memory\n", "utf8");
+writeFileSync(path.join(artifactWorkspace, "memory", "dreaming", "nightly.md"), "# Dream\n", "utf8");
+writeFileSync(
+  path.join(artifactWorkspace, "memory", ".dreams", "events.jsonl"),
+  `${JSON.stringify({ type: "memory.dream.completed", phase: "light" })}\n`,
+  "utf8",
+);
+const artifacts = await createMemoryLancePublicArtifactsProvider().listArtifacts({
+  cfg: { agents: { defaults: { workspace: artifactWorkspace } } },
+});
+assert.ok(
+  artifacts.some((artifact) => artifact.kind === "dream-report" && artifact.relativePath === "memory/dreaming/nightly.md"),
+  "public artifacts should expose dream reports",
+);
+assert.ok(
+  artifacts.some((artifact) => artifact.kind === "event-log" && artifact.relativePath === "memory/.dreams/events.jsonl"),
+  "public artifacts should expose the memory dreaming event log",
 );
 
 await capability.runtime.closeAllMemorySearchManagers();

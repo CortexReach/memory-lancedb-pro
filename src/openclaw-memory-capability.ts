@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { readdir } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
 import {
   parseCanonicalCorpusMetadata,
   type CanonicalCorpusConfig,
@@ -146,6 +146,7 @@ const MEMORY_FLUSH_READ_ONLY_HINT =
   "Treat MEMORY.md, DREAMS.md, SOUL.md, TOOLS.md, and AGENTS.md as read-only reference files during this flush.";
 const MEMORY_FLUSH_APPEND_ONLY_HINT =
   "Do not overwrite or replace existing memory files; append new facts, decisions, preferences, and open loops only.";
+const MEMORY_HOST_EVENT_LOG_RELATIVE_PATH = "memory/.dreams/events.jsonl";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -321,6 +322,19 @@ async function collectPublicArtifactsForWorkspace(params: {
       absolutePath,
       agentIds: [...params.agentIds],
       contentType: "markdown",
+    });
+  }
+
+  const eventLogPath = join(params.workspaceDir, MEMORY_HOST_EVENT_LOG_RELATIVE_PATH);
+  const eventLogInfo = await stat(eventLogPath).catch(() => null);
+  if (eventLogInfo?.isFile()) {
+    artifacts.push({
+      kind: "event-log",
+      workspaceDir: params.workspaceDir,
+      relativePath: MEMORY_HOST_EVENT_LOG_RELATIVE_PATH,
+      absolutePath: eventLogPath,
+      agentIds: [...params.agentIds],
+      contentType: "json",
     });
   }
 
