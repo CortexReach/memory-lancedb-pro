@@ -125,6 +125,10 @@ function normalizeLegacyTimestampMetadata(value) {
     }
     return JSON.stringify(metadata);
 }
+function isCanonicalCorpusMetadata(value) {
+    const metadata = parseMetadataObject(value);
+    return metadata?.openclaw_corpus === true;
+}
 function escapeSqlLiteral(value) {
     return value.replace(/'/g, "''");
 }
@@ -628,6 +632,19 @@ export class MemoryStore {
         const results = await this.bulkStore([entry]);
         return results[0];
     }
+    async upsert(entry) {
+        await this.ensureInitialized();
+        return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+            const safeId = escapeSqlLiteral(entry.id);
+            await this.table.delete(`id = '${safeId}'`).catch(() => undefined);
+            const normalizedEntry = {
+                ...entry,
+                metadata: entry.metadata || "{}",
+            };
+            await this.table.add([normalizedEntry]);
+            return normalizedEntry;
+        }));
+    }
     /**
      * Store multiple memory entries in a single batch operation.
      *
@@ -1004,6 +1021,40 @@ export class MemoryStore {
             timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: row.metadata || "{}",
         };
+    }
+    async listCorpusEntryRefs() {
+        await this.ensureInitialized();
+        const rows = await this.table.query()
+            .select(["id", "scope", "metadata"])
+            .toArray();
+        return rows
+            .map((row) => ({
+            id: row.id,
+            scope: row.scope ?? "global",
+            metadata: row.metadata || "{}",
+        }))
+            .filter((row) => row.id.startsWith("corpus:") || isCanonicalCorpusMetadata(row.metadata));
+    }
+    async deleteExactId(id, scopeFilter) {
+        await this.ensureInitialized();
+        if (isExplicitDenyAllScopeFilter(scopeFilter))
+            return false;
+        const safeId = escapeSqlLiteral(id);
+        const rows = await this.table.query()
+            .select(["id", "scope"])
+            .where(`id = '${safeId}'`)
+            .limit(1)
+            .toArray();
+        if (rows.length === 0)
+            return false;
+        const rowScope = rows[0].scope ?? "global";
+        if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+            throw new Error(`Memory ${id} is outside accessible scopes`);
+        }
+        return this.runWithFileLock(async () => {
+            await this.table.delete(`id = '${safeId}'`);
+            return true;
+        });
     }
     async vectorSearch(vector, limit = 5, minScore = 0.3, scopeFilter, options) {
         await this.ensureInitialized();

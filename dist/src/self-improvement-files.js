@@ -11,6 +11,7 @@ Append structured entries:
 - ERR-YYYYMMDD-XXX for command/tool/integration failures
 - Include symptom, context, probable cause, and prevention`;
 const fileWriteQueues = new Map();
+export const DEFAULT_SELF_IMPROVEMENT_MAX_ENTRIES = 500;
 async function withFileWriteQueue(filePath, action) {
     const previous = fileWriteQueues.get(filePath) ?? Promise.resolve();
     let release;
@@ -33,18 +34,23 @@ async function withFileWriteQueue(filePath, action) {
 function todayYmd() {
     return new Date().toISOString().slice(0, 10).replace(/-/g, "");
 }
-async function nextLearningId(filePath, prefix) {
-    const date = todayYmd();
-    let count = 0;
-    try {
-        const content = await readFile(filePath, "utf-8");
-        const matches = content.match(new RegExp(`\\[${prefix}-${date}-\\d{3}\\]`, "g"));
-        count = matches?.length ?? 0;
-    }
-    catch {
-        // ignore
-    }
+function nextLearningIdFromContent(content, prefix, date = todayYmd()) {
+    const matches = content.match(new RegExp(`\\[${prefix}-${date}-\\d{3}\\]`, "g"));
+    const count = matches?.length ?? 0;
     return `${prefix}-${date}-${String(count + 1).padStart(3, "0")}`;
+}
+export function countSelfImprovementEntries(content, prefix) {
+    const pattern = prefix
+        ? new RegExp(`^## \\[${prefix}-\\d{8}-\\d{3}\\]`, "gm")
+        : /^## \[(?:LRN|ERR)-\d{8}-\d{3}\]/gm;
+    return (content.match(pattern) || []).length;
+}
+function normalizeMaxEntries(value) {
+    const parsed = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(parsed) || parsed < 1) {
+        return DEFAULT_SELF_IMPROVEMENT_MAX_ENTRIES;
+    }
+    return Math.floor(parsed);
 }
 export async function ensureSelfImprovementLearningFiles(baseDir) {
     const learningsDir = join(baseDir, ".learnings");
@@ -64,14 +70,24 @@ export async function ensureSelfImprovementLearningFiles(baseDir) {
     await ensureFile(join(learningsDir, "ERRORS.md"), DEFAULT_ERRORS_TEMPLATE);
 }
 export async function appendSelfImprovementEntry(params) {
-    const { baseDir, type, summary, details = "", suggestedAction = "", category = "best_practice", area = "config", priority = "medium", status = "pending", source = "memory-lancedb-pro/self_improvement_log", } = params;
+    const { baseDir, type, summary, details = "", suggestedAction = "", category = "best_practice", area = "config", priority = "medium", status = "pending", source = "memory-lancedb-pro/self_improvement_log", maxEntries, } = params;
     await ensureSelfImprovementLearningFiles(baseDir);
     const learningsDir = join(baseDir, ".learnings");
     const fileName = type === "learning" ? "LEARNINGS.md" : "ERRORS.md";
     const filePath = join(learningsDir, fileName);
     const idPrefix = type === "learning" ? "LRN" : "ERR";
-    const id = await withFileWriteQueue(filePath, async () => {
-        const entryId = await nextLearningId(filePath, idPrefix);
+    const effectiveMaxEntries = normalizeMaxEntries(maxEntries);
+    const result = await withFileWriteQueue(filePath, async () => {
+        const prev = await readFile(filePath, "utf-8").catch(() => "");
+        const entryCount = countSelfImprovementEntries(prev, idPrefix);
+        if (entryCount >= effectiveMaxEntries) {
+            return {
+                id: "",
+                skipped: true,
+                entryCount,
+            };
+        }
+        const entryId = nextLearningIdFromContent(prev, idPrefix);
         const nowIso = new Date().toISOString();
         const titleSuffix = type === "learning" ? ` ${category}` : "";
         const entry = [
@@ -96,10 +112,13 @@ export async function appendSelfImprovementEntry(params) {
             "---",
             "",
         ].join("\n");
-        const prev = await readFile(filePath, "utf-8").catch(() => "");
         const separator = prev.trimEnd().length > 0 ? "\n\n" : "";
         await appendFile(filePath, `${separator}${entry}`, "utf-8");
-        return entryId;
+        return {
+            id: entryId,
+            skipped: false,
+            entryCount: entryCount + 1,
+        };
     });
-    return { id, filePath };
+    return { ...result, filePath, maxEntries: effectiveMaxEntries };
 }
