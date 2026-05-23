@@ -40,8 +40,10 @@ export type CanonicalCorpusReadResult = {
 
 export type CorpusIndexStats = {
   documents: number;
+  chunks: number;
   indexed: number;
   skipped: number;
+  staleDeleted: number;
   errors: string[];
 };
 
@@ -50,8 +52,26 @@ type WorkspaceRef = {
   agentIds: string[];
 };
 
+type CorpusEntryRef = {
+  id: string;
+  scope?: string;
+  metadata?: string;
+};
+
+type CanonicalCorpusChunk = {
+  doc: CanonicalCorpusDocument;
+  chunkIndex: number;
+  chunkCount: number;
+  text: string;
+  startLine: number;
+  endLine: number;
+};
+
 const DEFAULT_MAX_FILE_BYTES = 1_000_000;
+const DEFAULT_CORPUS_CHUNK_MAX_CHARS = 4_000;
+const DEFAULT_CORPUS_CHUNK_MAX_LINES = 80;
 const SESSION_INDEX_PREFIX = "sessions";
+const CACHE_KEY_SEPARATOR = "\0";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -109,8 +129,31 @@ function memoryScopeForAgent(agentId: string): string {
   return agentId === "main" ? "global" : `agent:${agentId}`;
 }
 
-function buildCorpusId(doc: CanonicalCorpusDocument): string {
-  return `corpus:${sha256(`${doc.agentId}\0${doc.source}\0${doc.workspaceDir}\0${doc.relativePath}`).slice(0, 48)}`;
+function buildCorpusId(chunk: CanonicalCorpusChunk): string {
+  const doc = chunk.doc;
+  return `corpus:${sha256(`${doc.agentId}\0${doc.source}\0${doc.workspaceDir}\0${doc.relativePath}\0${chunk.chunkIndex}`).slice(0, 48)}`;
+}
+
+function buildWorkspaceAgentKey(workspaceDir: string, agentId: string): string {
+  return `${workspaceDir}${CACHE_KEY_SEPARATOR}${agentId}`;
+}
+
+function buildDocumentKey(params: {
+  workspaceDir: string;
+  agentId: string;
+  source: CanonicalCorpusSource;
+  relativePath: string;
+}): string {
+  return [
+    params.workspaceDir,
+    params.agentId,
+    params.source,
+    params.relativePath,
+  ].join(CACHE_KEY_SEPARATOR);
+}
+
+function buildPathCacheKey(workspaceDir: string, relativePath: string): string {
+  return `${workspaceDir}${CACHE_KEY_SEPARATOR}${relativePath}`;
 }
 
 export function parseCanonicalCorpusConfig(raw: unknown): CanonicalCorpusConfig {
@@ -298,11 +341,84 @@ async function discoverSessionDocuments(
   return docs;
 }
 
-function countLines(text: string): number {
-  return Math.max(1, text.split(/\r?\n/).length);
+function trimChunkLines(lines: string[], startLine: number): { text: string; startLine: number; endLine: number } | null {
+  let first = 0;
+  let last = lines.length - 1;
+  while (first <= last && lines[first].trim().length === 0) first++;
+  while (last >= first && lines[last].trim().length === 0) last--;
+  if (first > last) return null;
+  return {
+    text: lines.slice(first, last + 1).join("\n"),
+    startLine: startLine + first,
+    endLine: startLine + last,
+  };
 }
 
-function toMemoryEntry(doc: CanonicalCorpusDocument, vector: number[]): MemoryEntry {
+function splitLongLine(line: string, lineNumber: number, maxChars: number): Array<{ text: string; startLine: number; endLine: number }> {
+  const chunks: Array<{ text: string; startLine: number; endLine: number }> = [];
+  for (let start = 0; start < line.length; start += maxChars) {
+    const text = line.slice(start, start + maxChars).trim();
+    if (text) chunks.push({ text, startLine: lineNumber, endLine: lineNumber });
+  }
+  return chunks;
+}
+
+function chunkDocument(doc: CanonicalCorpusDocument): CanonicalCorpusChunk[] {
+  if (!doc.content.trim()) return [];
+
+  const ranges: Array<{ text: string; startLine: number; endLine: number }> = [];
+  const lines = doc.content.split(/\r?\n/);
+  let pendingLines: string[] = [];
+  let pendingStartLine = 1;
+  let pendingChars = 0;
+
+  const flushPending = () => {
+    if (pendingLines.length === 0) return;
+    const trimmed = trimChunkLines(pendingLines, pendingStartLine);
+    if (trimmed) ranges.push(trimmed);
+    pendingLines = [];
+    pendingChars = 0;
+  };
+
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    const lineNumber = index + 1;
+
+    if (line.length > DEFAULT_CORPUS_CHUNK_MAX_CHARS) {
+      flushPending();
+      ranges.push(...splitLongLine(line, lineNumber, DEFAULT_CORPUS_CHUNK_MAX_CHARS));
+      continue;
+    }
+
+    const nextChars = pendingLines.length === 0
+      ? line.length
+      : pendingChars + 1 + line.length;
+    if (
+      pendingLines.length > 0 &&
+      (nextChars > DEFAULT_CORPUS_CHUNK_MAX_CHARS || pendingLines.length >= DEFAULT_CORPUS_CHUNK_MAX_LINES)
+    ) {
+      flushPending();
+    }
+
+    if (pendingLines.length === 0) pendingStartLine = lineNumber;
+    pendingLines.push(line);
+    pendingChars = pendingLines.length === 1 ? line.length : pendingChars + 1 + line.length;
+  }
+
+  flushPending();
+
+  return ranges.map((range, chunkIndex): CanonicalCorpusChunk => ({
+    doc,
+    chunkIndex,
+    chunkCount: ranges.length,
+    text: range.text,
+    startLine: range.startLine,
+    endLine: range.endLine,
+  }));
+}
+
+function toMemoryEntry(chunk: CanonicalCorpusChunk, vector: number[]): MemoryEntry {
+  const doc = chunk.doc;
   const metadata = {
     openclaw_corpus: true,
     corpus_source: doc.source,
@@ -311,15 +427,19 @@ function toMemoryEntry(doc: CanonicalCorpusDocument, vector: number[]): MemoryEn
     corpus_absolute_path: doc.absolutePath,
     corpus_workspace_dir: doc.workspaceDir,
     corpus_agent_id: doc.agentId,
-    corpus_start_line: 1,
-    corpus_end_line: countLines(doc.content),
-    corpus_content_sha256: sha256(doc.content),
+    corpus_chunk_index: chunk.chunkIndex,
+    corpus_chunk_count: chunk.chunkCount,
+    corpus_start_line: chunk.startLine,
+    corpus_end_line: chunk.endLine,
+    corpus_snippet: chunk.text,
+    corpus_content_sha256: sha256(chunk.text),
+    corpus_document_sha256: sha256(doc.content),
     corpus_mtime_ms: doc.mtimeMs,
     corpus_indexed_at: Date.now(),
   };
   return {
-    id: buildCorpusId(doc),
-    text: doc.content,
+    id: buildCorpusId(chunk),
+    text: chunk.text,
     vector,
     category: doc.kind === "dream-report" ? "reflection" : "other",
     scope: memoryScopeForAgent(doc.agentId),
@@ -351,7 +471,10 @@ export class CanonicalCorpusIndexer {
 
   constructor(
     private readonly params: {
-      store: Pick<MemoryStore, "upsert">;
+      store: Pick<MemoryStore, "upsert"> & {
+        deleteExactId?: (id: string) => Promise<boolean>;
+        listCorpusEntryRefs?: () => Promise<CorpusEntryRef[]>;
+      };
       embedder: Pick<Embedder, "embedPassage">;
       getConfig: () => CanonicalCorpusConfig;
       getOpenClawConfig: () => unknown;
@@ -361,24 +484,46 @@ export class CanonicalCorpusIndexer {
     },
   ) {}
 
-  async discover(): Promise<CanonicalCorpusDocument[]> {
+  private resolveWorkspaces(): WorkspaceRef[] {
+    return resolveCanonicalCorpusWorkspaces(
+      this.params.getOpenClawConfig(),
+      this.params.homeDir ?? homedir(),
+    );
+  }
+
+  private setPathCache(workspaceDir: string, relativePath: string, value: { absolutePath: string; source: CanonicalCorpusSource }): void {
+    this.pathCache.set(buildPathCacheKey(workspaceDir, relativePath), value);
+  }
+
+  private getPathCache(relativePath: string, workspaceDir?: string): { absolutePath: string; source: CanonicalCorpusSource } | undefined {
+    if (!workspaceDir) return undefined;
+    return this.pathCache.get(buildPathCacheKey(resolvePath(workspaceDir), relativePath));
+  }
+
+  private async discoverForWorkspaces(workspaces: WorkspaceRef[]): Promise<CanonicalCorpusDocument[]> {
     const config = this.params.getConfig();
     if (!config.enabled) return [];
     const docs: CanonicalCorpusDocument[] = [];
     const homeDir = this.params.homeDir ?? homedir();
-    for (const workspace of resolveCanonicalCorpusWorkspaces(this.params.getOpenClawConfig(), homeDir)) {
+    for (const workspace of workspaces) {
       docs.push(...await discoverMemoryDocuments(workspace, config));
       docs.push(...await discoverSessionDocuments(workspace, config, homeDir));
     }
     return docs;
   }
 
+  async discover(): Promise<CanonicalCorpusDocument[]> {
+    const config = this.params.getConfig();
+    if (!config.enabled) return [];
+    return this.discoverForWorkspaces(this.resolveWorkspaces());
+  }
+
   async sync(options: { reason?: string; force?: boolean } = {}): Promise<CorpusIndexStats> {
     const config = this.params.getConfig();
-    if (!config.enabled) return { documents: 0, indexed: 0, skipped: 0, errors: [] };
+    if (!config.enabled) return { documents: 0, chunks: 0, indexed: 0, skipped: 0, staleDeleted: 0, errors: [] };
     const now = Date.now();
     if (!options.force && this.lastSyncAt > 0 && now - this.lastSyncAt < config.syncIntervalMs) {
-      return { documents: 0, indexed: 0, skipped: 0, errors: [] };
+      return { documents: 0, chunks: 0, indexed: 0, skipped: 0, staleDeleted: 0, errors: [] };
     }
     if (this.syncPromise) return this.syncPromise;
     this.syncPromise = this.runSync(options.reason ?? "manual").finally(() => {
@@ -388,54 +533,126 @@ export class CanonicalCorpusIndexer {
   }
 
   private async runSync(reason: string): Promise<CorpusIndexStats> {
-    const docs = await this.discover();
-    const stats: CorpusIndexStats = { documents: docs.length, indexed: 0, skipped: 0, errors: [] };
-    for (const doc of docs) {
+    const workspaces = this.resolveWorkspaces();
+    const activeWorkspaceAgents = new Set(
+      workspaces.flatMap((workspace) =>
+        workspace.agentIds.map((agentId) => buildWorkspaceAgentKey(workspace.workspaceDir, agentId)),
+      ),
+    );
+    const docs = await this.discoverForWorkspaces(workspaces);
+    const chunks = docs.flatMap((doc) => chunkDocument(doc));
+    const expectedIds = new Set(chunks.map((chunk) => buildCorpusId(chunk)));
+    const failedDocumentKeys = new Set<string>();
+    const stats: CorpusIndexStats = {
+      documents: docs.length,
+      chunks: chunks.length,
+      indexed: 0,
+      skipped: 0,
+      staleDeleted: 0,
+      errors: [],
+    };
+    for (const chunk of chunks) {
       try {
-        const vector = await this.params.embedder.embedPassage(doc.content);
-        await this.params.store.upsert(toMemoryEntry(doc, vector));
-        this.pathCache.set(doc.relativePath, { absolutePath: doc.absolutePath, source: doc.source });
+        const vector = await this.params.embedder.embedPassage(chunk.text);
+        await this.params.store.upsert(toMemoryEntry(chunk, vector));
+        this.setPathCache(chunk.doc.workspaceDir, chunk.doc.relativePath, {
+          absolutePath: chunk.doc.absolutePath,
+          source: chunk.doc.source,
+        });
         stats.indexed++;
       } catch (err) {
+        failedDocumentKeys.add(buildDocumentKey({
+          workspaceDir: chunk.doc.workspaceDir,
+          agentId: chunk.doc.agentId,
+          source: chunk.doc.source,
+          relativePath: chunk.doc.relativePath,
+        }));
         stats.skipped++;
-        stats.errors.push(`${doc.relativePath}: ${err instanceof Error ? err.message : String(err)}`);
+        stats.errors.push(`${chunk.doc.relativePath}#L${chunk.startLine}-L${chunk.endLine}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+    stats.staleDeleted = await this.cleanupStaleCorpusEntries({
+      activeWorkspaceAgents,
+      expectedIds,
+      failedDocumentKeys,
+      errors: stats.errors,
+    });
     this.lastSyncAt = Date.now();
-    if (stats.indexed > 0) {
-      this.params.log?.(`memory-lancedb-pro: indexed ${stats.indexed}/${stats.documents} canonical corpus document(s) (${reason})`);
+    if (stats.indexed > 0 || stats.staleDeleted > 0) {
+      this.params.log?.(
+        `memory-lancedb-pro: indexed ${stats.indexed}/${stats.chunks} canonical corpus chunk(s), deleted ${stats.staleDeleted} stale chunk(s) (${reason})`,
+      );
     }
     if (stats.errors.length > 0) {
-      this.params.warn?.(`memory-lancedb-pro: canonical corpus indexing skipped ${stats.skipped} document(s): ${stats.errors.slice(0, 3).join(" | ")}`);
+      this.params.warn?.(`memory-lancedb-pro: canonical corpus indexing skipped ${stats.skipped} chunk(s): ${stats.errors.slice(0, 3).join(" | ")}`);
     }
     return stats;
   }
 
-  async readFile(relPath: string, from?: number, lines?: number): Promise<CanonicalCorpusReadResult | null> {
-    const cached = this.pathCache.get(relPath);
+  private async cleanupStaleCorpusEntries(params: {
+    activeWorkspaceAgents: Set<string>;
+    expectedIds: Set<string>;
+    failedDocumentKeys: Set<string>;
+    errors: string[];
+  }): Promise<number> {
+    if (!this.params.store.listCorpusEntryRefs || !this.params.store.deleteExactId) return 0;
+    const refs = await this.params.store.listCorpusEntryRefs().catch((err) => {
+      params.errors.push(`stale cleanup list failed: ${err instanceof Error ? err.message : String(err)}`);
+      return [] as CorpusEntryRef[];
+    });
+    let deleted = 0;
+
+    for (const ref of refs) {
+      if (params.expectedIds.has(ref.id)) continue;
+      const metadata = parseCanonicalCorpusMetadata(ref.metadata);
+      if (!metadata?.workspaceDir || !metadata.agentId) continue;
+      if (!params.activeWorkspaceAgents.has(buildWorkspaceAgentKey(metadata.workspaceDir, metadata.agentId))) continue;
+
+      const documentKey = buildDocumentKey({
+        workspaceDir: metadata.workspaceDir,
+        agentId: metadata.agentId,
+        source: metadata.source,
+        relativePath: metadata.path,
+      });
+      if (params.failedDocumentKeys.has(documentKey)) continue;
+
+      try {
+        if (await this.params.store.deleteExactId(ref.id)) deleted++;
+      } catch (err) {
+        params.errors.push(`${metadata.path}: stale cleanup failed for ${ref.id}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    return deleted;
+  }
+
+  async readFile(relPath: string, from?: number, lines?: number, workspaceDir?: string): Promise<CanonicalCorpusReadResult | null> {
+    const normalizedWorkspaceDir = workspaceDir ? resolvePath(workspaceDir) : undefined;
+    const cached = this.getPathCache(relPath, normalizedWorkspaceDir);
     let absolutePath = cached?.absolutePath;
     let content: string | null = null;
 
     if (absolutePath) {
       if (cached?.source === "sessions") {
-        const raw = await readFile(absolutePath, "utf8").catch(() => "");
-        content = renderSessionTranscript(raw);
+        const raw = await readFile(absolutePath, "utf8").catch(() => null);
+        content = raw == null ? null : renderSessionTranscript(raw);
       } else {
-        content = await readFile(absolutePath, "utf8").catch(() => "");
+        content = await readFile(absolutePath, "utf8").catch(() => null);
       }
     } else if (relPath === "MEMORY.md" || relPath.startsWith("memory/")) {
-      for (const workspace of resolveCanonicalCorpusWorkspaces(
-        this.params.getOpenClawConfig(),
-        this.params.homeDir ?? homedir(),
-      )) {
+      const matches: Array<{ workspaceDir: string; absolutePath: string; content: string }> = [];
+      for (const workspace of this.resolveWorkspaces()) {
+        if (normalizedWorkspaceDir && workspace.workspaceDir !== normalizedWorkspaceDir) continue;
         const candidate = join(workspace.workspaceDir, relPath);
         const raw = await readFile(candidate, "utf8").catch(() => null);
         if (raw != null) {
-          absolutePath = candidate;
-          content = raw;
-          this.pathCache.set(relPath, { absolutePath, source: "memory" });
-          break;
+          matches.push({ workspaceDir: workspace.workspaceDir, absolutePath: candidate, content: raw });
         }
+      }
+      if (matches.length === 1) {
+        absolutePath = matches[0].absolutePath;
+        content = matches[0].content;
+        this.setPathCache(matches[0].workspaceDir, relPath, { absolutePath, source: "memory" });
       }
     } else if (relPath.startsWith(`${SESSION_INDEX_PREFIX}/`)) {
       const parts = relPath.split("/");
@@ -451,7 +668,9 @@ export class CanonicalCorpusIndexer {
         const raw = await readFile(absolutePath, "utf8").catch(() => null);
         if (raw != null) {
           content = renderSessionTranscript(raw);
-          this.pathCache.set(relPath, { absolutePath, source: "sessions" });
+          if (normalizedWorkspaceDir) {
+            this.setPathCache(normalizedWorkspaceDir, relPath, { absolutePath, source: "sessions" });
+          }
         }
       }
     }
@@ -469,9 +688,13 @@ export function parseCanonicalCorpusMetadata(value: unknown): null | {
   absolutePath?: string;
   workspaceDir?: string;
   agentId?: string;
+  chunkIndex?: number;
+  chunkCount?: number;
   startLine: number;
   endLine: number;
+  snippet?: string;
   contentSha256?: string;
+  documentSha256?: string;
   mtimeMs?: number;
 } {
   if (typeof value !== "string" || !value.trim()) return null;
@@ -488,9 +711,13 @@ export function parseCanonicalCorpusMetadata(value: unknown): null | {
       absolutePath: asString(parsed.corpus_absolute_path),
       workspaceDir: asString(parsed.corpus_workspace_dir),
       agentId: asString(parsed.corpus_agent_id),
+      chunkIndex: asNonNegativeInt(parsed.corpus_chunk_index, 0),
+      chunkCount: asPositiveInt(parsed.corpus_chunk_count, 1),
       startLine: asPositiveInt(parsed.corpus_start_line, 1),
       endLine: asPositiveInt(parsed.corpus_end_line, 1),
+      snippet: asString(parsed.corpus_snippet),
       contentSha256: asString(parsed.corpus_content_sha256),
+      documentSha256: asString(parsed.corpus_document_sha256),
       mtimeMs: typeof parsed.corpus_mtime_ms === "number" ? parsed.corpus_mtime_ms : undefined,
     };
   } catch {

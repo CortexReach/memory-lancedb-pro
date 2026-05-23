@@ -21,6 +21,7 @@ type MemoryEmbeddingProbeResult = {
 type MemoryReadResult = {
   text: string;
   path: string;
+  workspaceDir?: string;
   truncated?: boolean;
   from?: number;
   lines?: number;
@@ -29,6 +30,8 @@ type MemoryReadResult = {
 
 type MemorySearchResult = {
   path: string;
+  workspaceDir?: string;
+  agentId?: string;
   startLine: number;
   endLine: number;
   score: number;
@@ -49,7 +52,7 @@ type MemorySearchManager = {
       sources?: MemorySource[];
     },
   ): Promise<MemorySearchResult[]>;
-  readFile(params: { relPath: string; from?: number; lines?: number }): Promise<MemoryReadResult>;
+  readFile(params: { relPath: string; workspaceDir?: string; from?: number; lines?: number }): Promise<MemoryReadResult>;
   status(): Record<string, unknown>;
   sync?(params?: { reason?: string; force?: boolean; sessionFiles?: string[] }): Promise<void>;
   getCachedEmbeddingAvailability?(): MemoryEmbeddingProbeResult | null;
@@ -376,6 +379,8 @@ function toGroundedResult(result: RetrievalResultLike): MemorySearchResult {
   if (corpus) {
     return {
       path: corpus.path,
+      ...(corpus.workspaceDir ? { workspaceDir: corpus.workspaceDir } : {}),
+      ...(corpus.agentId ? { agentId: corpus.agentId } : {}),
       startLine: corpus.startLine,
       endLine: corpus.endLine,
       score: result.score,
@@ -460,12 +465,13 @@ async function createMemoryLanceSearchManager(params: MemoryCapabilityParams, ag
         .filter((result) => !requestedSources || requestedSources.has(result.source))
         .slice(0, clampResultLimit(opts?.maxResults));
     },
-    async readFile(readParams) {
+    async readFile(readParams: { relPath: string; workspaceDir?: string; from?: number; lines?: number }) {
       if (params.canonicalCorpus?.enabled) {
         const corpusRead = await params.canonicalCorpusIndexer?.readFile(
           readParams.relPath,
           readParams.from,
           readParams.lines,
+          readParams.workspaceDir,
         );
         if (corpusRead) return corpusRead;
       }

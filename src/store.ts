@@ -194,6 +194,11 @@ function normalizeLegacyTimestampMetadata(value: unknown): string {
   return JSON.stringify(metadata);
 }
 
+function isCanonicalCorpusMetadata(value: unknown): boolean {
+  const metadata = parseMetadataObject(value);
+  return metadata?.openclaw_corpus === true;
+}
+
 function escapeSqlLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
@@ -1198,6 +1203,47 @@ export class MemoryStore {
       timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
       metadata: (row.metadata as string) || "{}",
     };
+  }
+
+  async listCorpusEntryRefs(): Promise<Array<{ id: string; scope?: string; metadata?: string }>> {
+    await this.ensureInitialized();
+
+    const rows = await this.table!.query()
+      .select(["id", "scope", "metadata"])
+      .toArray();
+
+    return rows
+      .map((row) => ({
+        id: row.id as string,
+        scope: (row.scope as string | undefined) ?? "global",
+        metadata: (row.metadata as string | undefined) || "{}",
+      }))
+      .filter((row) => row.id.startsWith("corpus:") || isCanonicalCorpusMetadata(row.metadata));
+  }
+
+  async deleteExactId(id: string, scopeFilter?: string[]): Promise<boolean> {
+    await this.ensureInitialized();
+
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return false;
+
+    const safeId = escapeSqlLiteral(id);
+    const rows = await this.table!.query()
+      .select(["id", "scope"])
+      .where(`id = '${safeId}'`)
+      .limit(1)
+      .toArray();
+
+    if (rows.length === 0) return false;
+
+    const rowScope = (rows[0].scope as string | undefined) ?? "global";
+    if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+      throw new Error(`Memory ${id} is outside accessible scopes`);
+    }
+
+    return this.runWithFileLock(async () => {
+      await this.table!.delete(`id = '${safeId}'`);
+      return true;
+    });
   }
 
   async vectorSearch(vector: number[], limit = 5, minScore = 0.3, scopeFilter?: string[], options?: { excludeInactive?: boolean }): Promise<MemorySearchResult[]> {

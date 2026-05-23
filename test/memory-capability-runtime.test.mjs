@@ -31,14 +31,17 @@ const corpusEntry = {
     corpus_source: "sessions",
     corpus_kind: "session-transcript",
     corpus_path: "sessions/test/session-runtime-1.jsonl",
+    corpus_workspace_dir: "/tmp/openclaw-workspace",
     corpus_agent_id: "test",
     corpus_start_line: 1,
     corpus_end_line: 2,
+    corpus_snippet: "## user\nRemember grounded session results.",
   }),
 };
 
 const calls = [];
 const corpusSyncCalls = [];
+const corpusReadCalls = [];
 const capability = createOpenClawMemoryCapability({
   dbPath: "/tmp/memory-lancedb-pro-test",
   vectorDim: 4,
@@ -69,11 +72,13 @@ const capability = createOpenClawMemoryCapability({
     async sync(params) {
       corpusSyncCalls.push(params);
     },
-    async readFile(relPath, from, lines) {
+    async readFile(relPath, from, lines, workspaceDir) {
+      corpusReadCalls.push({ relPath, from, lines, workspaceDir });
       if (relPath !== "memory/2026-05-23.md") return null;
       return {
         text: "Daily memory note",
         path: relPath,
+        ...(workspaceDir ? { workspaceDir } : {}),
         from: from ?? 1,
         lines: lines ?? 1,
       };
@@ -138,6 +143,8 @@ assert.deepEqual(results[0], {
 });
 assert.deepEqual(results[1], {
   path: "sessions/test/session-runtime-1.jsonl",
+  workspaceDir: "/tmp/openclaw-workspace",
+  agentId: "test",
   startLine: 1,
   endLine: 2,
   score: 0.72,
@@ -160,15 +167,27 @@ assert.deepEqual(noSessionResults, [results[1]], "runtime should honor source fi
 
 const corpusRead = await manager.readFile({
   relPath: "memory/2026-05-23.md",
+  workspaceDir: "/tmp/openclaw-workspace",
   from: 1,
   lines: 1,
 });
 assert.deepEqual(corpusRead, {
   text: "Daily memory note",
   path: "memory/2026-05-23.md",
+  workspaceDir: "/tmp/openclaw-workspace",
   from: 1,
   lines: 1,
 });
+assert.deepEqual(
+  corpusReadCalls.at(-1),
+  {
+    relPath: "memory/2026-05-23.md",
+    from: 1,
+    lines: 1,
+    workspaceDir: "/tmp/openclaw-workspace",
+  },
+  "runtime readFile should pass workspaceDir through to the canonical corpus indexer",
+);
 
 const read = await manager.readFile({
   relPath: "memory-lancedb-pro/mem-runtime-1.md",
