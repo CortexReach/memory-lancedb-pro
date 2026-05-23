@@ -2516,6 +2516,9 @@ const memoryLanceDBProPlugin = {
       embeddingProvider: config.embedding.provider,
       embeddingModel: config.embedding.model || "text-embedding-3-small",
       workspaceDir: getDefaultWorkspaceDir(),
+      store,
+      retriever,
+      resolveScopeFilterForAgent: (agentId: string) => resolveScopeFilter(scopeManager, agentId),
       getRuntimeStatus: () => ({
         embeddingAvailable: embedHealth.ok,
         retrievalAvailable: retrievalHealth,

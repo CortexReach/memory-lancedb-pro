@@ -69,9 +69,43 @@ type MemoryCapabilityParams = {
   embeddingProvider: string;
   embeddingModel: string;
   workspaceDir: string;
+  store?: {
+    getById(id: string, scopeFilter?: string[]): Promise<MemoryEntryLike | null>;
+    stats(scopeFilter?: string[]): Promise<{ totalCount: number }>;
+  };
+  retriever?: {
+    retrieve(params: {
+      query: string;
+      limit: number;
+      scopeFilter?: string[];
+      source?: "manual" | "auto-recall" | "cli";
+    }): Promise<RetrievalResultLike[]>;
+  };
+  resolveScopeFilterForAgent?: (agentId: string) => string[] | undefined;
   getRuntimeStatus: () => MemoryRuntimeStatus;
   probeEmbeddingAvailability: () => Promise<MemoryEmbeddingProbeResult>;
   probeVectorAvailability: () => Promise<boolean>;
+};
+
+type MemoryEntryLike = {
+  id: string;
+  text: string;
+  category?: string;
+  scope?: string;
+  importance?: number;
+  timestamp?: number;
+  metadata?: string;
+};
+
+type RetrievalResultLike = {
+  entry: MemoryEntryLike;
+  score: number;
+  sources?: {
+    vector?: { score: number; rank?: number };
+    bm25?: { score: number; rank?: number };
+    fused?: { score: number };
+    reranked?: { score: number };
+  };
 };
 
 type MemoryPublicArtifact = {
@@ -286,13 +320,111 @@ async function collectPublicArtifactsForWorkspace(params: {
   return artifacts;
 }
 
-function createBootstrapMemoryManager(params: MemoryCapabilityParams): MemorySearchManager {
+const VIRTUAL_MEMORY_PATH_PREFIX = "memory-lancedb-pro/";
+
+function toVirtualMemoryPath(id: string): string {
+  return `${VIRTUAL_MEMORY_PATH_PREFIX}${id}.md`;
+}
+
+function fromVirtualMemoryPath(input: string): string {
+  const trimmed = input.trim();
+  if (trimmed.startsWith(VIRTUAL_MEMORY_PATH_PREFIX) && trimmed.endsWith(".md")) {
+    return trimmed.slice(VIRTUAL_MEMORY_PATH_PREFIX.length, -3);
+  }
+  return trimmed;
+}
+
+function splitLines(text: string): string[] {
+  return text.split(/\r?\n/);
+}
+
+function countLines(text: string): number {
+  return Math.max(1, splitLines(text).length);
+}
+
+function clampResultLimit(value: unknown): number {
+  return Math.max(1, Math.min(20, asPositiveInt(value) ?? 6));
+}
+
+function buildCitation(path: string, startLine: number, endLine: number): string {
+  return startLine === endLine ? `${path}#L${startLine}` : `${path}#L${startLine}-L${endLine}`;
+}
+
+function toGroundedResult(result: RetrievalResultLike): MemorySearchResult {
+  const path = toVirtualMemoryPath(result.entry.id);
+  const endLine = countLines(result.entry.text);
   return {
-    async search() {
-      return [];
+    path,
+    startLine: 1,
+    endLine,
+    score: result.score,
+    vectorScore: result.sources?.vector?.score,
+    textScore: result.sources?.bm25?.score,
+    snippet: result.entry.text,
+    source: "memory",
+    citation: buildCitation(path, 1, endLine),
+  };
+}
+
+function buildReadResult(entry: MemoryEntryLike | null, relPath: string, from?: number, lines?: number): MemoryReadResult {
+  if (!entry) return { text: "", path: relPath };
+
+  const fileLines = splitLines(entry.text);
+  const start = Math.max(1, Math.floor(from ?? 1));
+  const lineCount = Math.max(1, Math.floor(lines ?? fileLines.length));
+  const selected = fileLines.slice(start - 1, start - 1 + lineCount);
+  const moreRemain = start - 1 + lineCount < fileLines.length;
+  return {
+    text: selected.join("\n"),
+    path: relPath,
+    from: start,
+    lines: selected.length,
+    ...(moreRemain ? { truncated: true, nextFrom: start + selected.length } : {}),
+  };
+}
+
+async function createMemoryLanceSearchManager(params: MemoryCapabilityParams, agentId: string): Promise<MemorySearchManager> {
+  const scopeFilter = params.resolveScopeFilterForAgent?.(agentId);
+  let files: number | undefined;
+  let chunks: number | undefined;
+  let vectorAvailable: boolean | undefined;
+  let vectorError: string | undefined;
+  let embeddingProbe: MemoryEmbeddingProbeResult | null = null;
+
+  const refreshStats = async () => {
+    if (!params.store) return;
+    const stats = await params.store.stats(scopeFilter);
+    files = stats.totalCount;
+    chunks = stats.totalCount;
+  };
+
+  await refreshStats().catch(() => undefined);
+
+  return {
+    async search(query, opts) {
+      if (!params.retriever) return [];
+      const trimmed = query.trim();
+      if (!trimmed) return [];
+      if (opts?.sources?.length && !opts.sources.includes("memory")) return [];
+
+      const results = await params.retriever.retrieve({
+        query: trimmed,
+        limit: clampResultLimit(opts?.maxResults),
+        scopeFilter,
+        source: "manual",
+      });
+      const minScore = typeof opts?.minScore === "number" ? opts.minScore : undefined;
+      await refreshStats().catch(() => undefined);
+      return results
+        .filter((result) => minScore === undefined || result.score >= minScore)
+        .map(toGroundedResult);
     },
     async readFile(readParams) {
-      return { text: "", path: readParams.relPath };
+      if (!params.store) return { text: "", path: readParams.relPath };
+      const id = fromVirtualMemoryPath(readParams.relPath);
+      const virtualPath = toVirtualMemoryPath(id);
+      const entry = await params.store.getById(id, scopeFilter);
+      return buildReadResult(entry, virtualPath, readParams.from, readParams.lines);
     },
     status() {
       const status = params.getRuntimeStatus();
@@ -301,12 +433,19 @@ function createBootstrapMemoryManager(params: MemoryCapabilityParams): MemorySea
         provider: "memory-lancedb-pro",
         requestedProvider: params.embeddingProvider,
         model: params.embeddingModel,
-        files: status.files,
-        chunks: status.chunks,
+        files: files ?? status.files,
+        chunks: chunks ?? status.chunks,
         dirty: false,
         workspaceDir: params.workspaceDir,
         dbPath: params.dbPath,
         sources: ["memory"],
+        sourceCounts: [
+          {
+            source: "memory",
+            files: files ?? status.files ?? 0,
+            chunks: chunks ?? status.chunks ?? 0,
+          },
+        ],
         fts: {
           enabled: true,
           available: status.retrievalAvailable,
@@ -314,34 +453,45 @@ function createBootstrapMemoryManager(params: MemoryCapabilityParams): MemorySea
         },
         vector: {
           enabled: true,
-          available: status.retrievalAvailable,
+          available: vectorAvailable ?? status.retrievalAvailable,
+          storeAvailable: vectorAvailable ?? status.retrievalAvailable,
           semanticAvailable: status.embeddingAvailable,
           dims: params.vectorDim,
-          ...(status.retrievalError ? { loadError: status.retrievalError } : {}),
+          ...(vectorError ?? status.retrievalError ? { loadError: vectorError ?? status.retrievalError } : {}),
         },
         custom: {
           plugin: "memory-lancedb-pro",
           embeddingError: status.embeddingError,
-          capabilityPhase: "bootstrap",
+          virtualPathPrefix: VIRTUAL_MEMORY_PATH_PREFIX,
         },
       };
     },
     getCachedEmbeddingAvailability() {
+      if (embeddingProbe) return { ...embeddingProbe, cached: true };
       const status = params.getRuntimeStatus();
-      return {
-        ok: status.embeddingAvailable,
-        ...(status.embeddingError ? { error: status.embeddingError } : {}),
-        cached: true,
-      };
+      return { ok: status.embeddingAvailable, ...(status.embeddingError ? { error: status.embeddingError } : {}), cached: true };
     },
     async probeEmbeddingAvailability() {
-      return await params.probeEmbeddingAvailability();
+      embeddingProbe = await params.probeEmbeddingAvailability();
+      return embeddingProbe;
     },
     async probeVectorStoreAvailability() {
       return await params.probeVectorAvailability();
     },
     async probeVectorAvailability() {
-      return await params.probeVectorAvailability();
+      try {
+        vectorAvailable = await params.probeVectorAvailability();
+        vectorError = undefined;
+        await refreshStats().catch(() => undefined);
+        return vectorAvailable;
+      } catch (err) {
+        vectorAvailable = false;
+        vectorError = err instanceof Error ? err.message : String(err);
+        return false;
+      }
+    },
+    async sync() {
+      await refreshStats();
     },
     async close() {},
   };
@@ -448,19 +598,24 @@ export function createMemoryLancePublicArtifactsProvider() {
 }
 
 export function createOpenClawMemoryCapability(params: MemoryCapabilityParams) {
-  const manager = createBootstrapMemoryManager(params);
+  const managers = new Set<MemorySearchManager>();
   return {
     promptBuilder: buildMemoryLancePromptSection,
     flushPlanResolver: buildMemoryLanceFlushPlan,
     runtime: {
-      async getMemorySearchManager() {
+      async getMemorySearchManager(runtimeParams: { agentId?: string }) {
+        const manager = await createMemoryLanceSearchManager(params, runtimeParams.agentId ?? "main");
+        managers.add(manager);
         return { manager };
       },
       resolveMemoryBackendConfig() {
         return { backend: "builtin" as const };
       },
       async closeAllMemorySearchManagers() {
-        await manager.close?.();
+        await Promise.all([...managers].map(async (manager) => {
+          await manager.close?.();
+        }));
+        managers.clear();
       },
     },
     publicArtifacts: createMemoryLancePublicArtifactsProvider(),

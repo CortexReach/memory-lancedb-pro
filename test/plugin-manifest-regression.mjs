@@ -227,11 +227,6 @@ try {
     cfg: {},
     agentId: "main",
   });
-  assert.deepEqual(
-    await manager.search("bootstrap query", { maxResults: 2 }),
-    [],
-    "Phase 0 bootstrap manager should be callable before runtime parity lands",
-  );
   assert.equal(
     manager.status().provider,
     "memory-lancedb-pro",
