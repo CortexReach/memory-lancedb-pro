@@ -719,6 +719,55 @@
           }
         }
       },
+      "canonicalCorpus": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Index canonical OpenClaw memory files into LanceDB while keeping the files as source of truth."
+          },
+          "syncOnSearch": {
+            "type": "boolean",
+            "default": true,
+            "description": "Refresh canonical corpus entries opportunistically before memory runtime searches."
+          },
+          "syncIntervalMs": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 60000,
+            "description": "Minimum interval between opportunistic canonical corpus sync attempts."
+          },
+          "includeMemoryDir": {
+            "type": "boolean",
+            "default": true,
+            "description": "Index MEMORY.md and memory/**/*.md from configured OpenClaw workspaces."
+          },
+          "includeSessionTranscripts": {
+            "type": "boolean",
+            "default": true,
+            "description": "Index recent OpenClaw session JSONL transcripts as grounded session-source search results."
+          },
+          "includeDreamingArtifacts": {
+            "type": "boolean",
+            "default": true,
+            "description": "Index memory/dreaming/**/*.md as dream-report public artifacts."
+          },
+          "maxSessionFilesPerAgent": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 25,
+            "description": "Maximum recent session transcript files to index per agent."
+          },
+          "maxFileBytes": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1000000,
+            "description": "Skip canonical corpus files larger than this size."
+          }
+        }
+      },
       "dreaming": {
         "type": "object",
         "additionalProperties": false,
@@ -1728,6 +1777,20 @@
     "memoryCompaction.cooldownHours": {
       "label": "Cooldown (hours)",
       "help": "Minimum gap between automatic compaction runs",
+      "advanced": true
+    },
+    "canonicalCorpus.enabled": {
+      "label": "Canonical Corpus",
+      "help": "Index OpenClaw memory files and session transcripts into LanceDB while keeping files as source of truth."
+    },
+    "canonicalCorpus.syncOnSearch": {
+      "label": "Sync On Search",
+      "help": "Refresh canonical corpus entries before runtime memory searches, subject to the sync interval.",
+      "advanced": true
+    },
+    "canonicalCorpus.maxSessionFilesPerAgent": {
+      "label": "Session Files Per Agent",
+      "help": "Maximum recent session transcript files to index for each agent.",
       "advanced": true
     },
     "dreaming.frequency": {

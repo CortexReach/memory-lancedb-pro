@@ -767,6 +767,21 @@ export class MemoryStore {
     return results[0];
   }
 
+  async upsert(entry: MemoryEntry): Promise<MemoryEntry> {
+    await this.ensureInitialized();
+
+    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+      const safeId = escapeSqlLiteral(entry.id);
+      await this.table!.delete(`id = '${safeId}'`).catch(() => undefined);
+      const normalizedEntry: MemoryEntry = {
+        ...entry,
+        metadata: entry.metadata || "{}",
+      };
+      await this.table!.add([normalizedEntry]);
+      return normalizedEntry;
+    }));
+  }
+
   /**
    * Store multiple memory entries in a single batch operation.
    *

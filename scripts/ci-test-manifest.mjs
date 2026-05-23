@@ -30,6 +30,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/smart-extractor-branches.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-embed.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/memory-capability-runtime.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/corpus-indexer.test.mjs" },
   { group: "packaging-and-workflow", runner: "node", file: "test/plugin-manifest-regression.mjs" },
   { group: "core-regression", runner: "node", file: "test/session-summary-before-reset.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/self-improvement-reset-note.test.mjs", args: ["--test"] },

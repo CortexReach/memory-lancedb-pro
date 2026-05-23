@@ -136,6 +136,19 @@ assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties, "dreaming"),
   "configSchema should declare dreaming so the plugin can own the OpenClaw memory slot",
 );
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties, "canonicalCorpus"),
+  "configSchema should declare canonicalCorpus for file-backed memory indexing",
+);
+assert.equal(
+  manifest.configSchema.properties.canonicalCorpus.properties.includeSessionTranscripts.default,
+  true,
+  "canonical corpus should index session transcripts by default",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.uiHints, "canonicalCorpus.enabled"),
+  "uiHints should expose canonical corpus ownership",
+);
 assert.equal(
   manifest.configSchema.properties.dreaming.additionalProperties,
   false,

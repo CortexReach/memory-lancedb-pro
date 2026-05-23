@@ -93,6 +93,11 @@ import {
 } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
+import {
+  CanonicalCorpusIndexer,
+  parseCanonicalCorpusConfig,
+  type CanonicalCorpusConfig,
+} from "./src/corpus-indexer.js";
 
 // ============================================================================
 // Configuration & Types
@@ -217,6 +222,7 @@ interface PluginConfig {
     ensureLearningFiles?: boolean;
     maxEntries?: number;
   };
+  canonicalCorpus?: CanonicalCorpusConfig;
   memoryReflection?: {
     enabled?: boolean;
     storeToLanceDB?: boolean;
@@ -1975,6 +1981,7 @@ interface PluginSingletonState {
   decayEngine: ReturnType<typeof createDecayEngine>;
   tierManager: ReturnType<typeof createTierManager>;
   retriever: ReturnType<typeof createRetriever>;
+  canonicalCorpusIndexer: CanonicalCorpusIndexer;
   scopeManager: ReturnType<typeof createScopeManager>;
   migrator: ReturnType<typeof createMigrator>;
   smartExtractor: SmartExtractor | null;
@@ -2040,6 +2047,14 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     { decayEngine },
   );
   const scopeManager = createScopeManager(config.scopes);
+  const canonicalCorpusIndexer = new CanonicalCorpusIndexer({
+    store,
+    embedder,
+    getConfig: () => config.canonicalCorpus ?? parseCanonicalCorpusConfig(undefined),
+    getOpenClawConfig: () => (api as OpenClawPluginApi & { config?: unknown }).config ?? api.pluginConfig,
+    log: (message) => api.logger.info(message),
+    warn: (message) => api.logger.warn(message),
+  });
 
   const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
   if (clawteamScopes.length > 0) {
@@ -2145,6 +2160,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     decayEngine,
     tierManager,
     retriever,
+    canonicalCorpusIndexer,
     scopeManager,
     migrator,
     smartExtractor,
@@ -2242,6 +2258,7 @@ const memoryLanceDBProPlugin = {
       store,
       embedder,
       retriever,
+      canonicalCorpusIndexer,
       scopeManager,
       migrator,
       smartExtractor,
@@ -2518,6 +2535,8 @@ const memoryLanceDBProPlugin = {
       workspaceDir: getDefaultWorkspaceDir(),
       store,
       retriever,
+      canonicalCorpus: config.canonicalCorpus,
+      canonicalCorpusIndexer,
       resolveScopeFilterForAgent: (agentId: string) => resolveScopeFilter(scopeManager, agentId),
       getRuntimeStatus: () => ({
         embeddingAvailable: embedHealth.ok,
@@ -4924,6 +4943,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         ensureLearningFiles: true,
         maxEntries: 500,
       },
+    canonicalCorpus: parseCanonicalCorpusConfig(cfg.canonicalCorpus),
     memoryReflection: memoryReflectionRaw
       ? {
         enabled: sessionStrategy === "memoryReflection",

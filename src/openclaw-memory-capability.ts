@@ -1,6 +1,11 @@
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { readdir } from "node:fs/promises";
+import {
+  parseCanonicalCorpusMetadata,
+  type CanonicalCorpusConfig,
+  type CanonicalCorpusIndexer,
+} from "./corpus-indexer.js";
 
 type MemorySource = "memory" | "sessions";
 
@@ -73,6 +78,8 @@ type MemoryCapabilityParams = {
     getById(id: string, scopeFilter?: string[]): Promise<MemoryEntryLike | null>;
     stats(scopeFilter?: string[]): Promise<{ totalCount: number }>;
   };
+  canonicalCorpus?: CanonicalCorpusConfig;
+  canonicalCorpusIndexer?: Pick<CanonicalCorpusIndexer, "sync" | "readFile">;
   retriever?: {
     retrieve(params: {
       query: string;
@@ -351,6 +358,21 @@ function buildCitation(path: string, startLine: number, endLine: number): string
 }
 
 function toGroundedResult(result: RetrievalResultLike): MemorySearchResult {
+  const corpus = parseCanonicalCorpusMetadata(result.entry.metadata);
+  if (corpus) {
+    return {
+      path: corpus.path,
+      startLine: corpus.startLine,
+      endLine: corpus.endLine,
+      score: result.score,
+      vectorScore: result.sources?.vector?.score,
+      textScore: result.sources?.bm25?.score,
+      snippet: result.entry.text,
+      source: corpus.source,
+      citation: buildCitation(corpus.path, corpus.startLine, corpus.endLine),
+    };
+  }
+
   const path = toVirtualMemoryPath(result.entry.id);
   const endLine = countLines(result.entry.text);
   return {
@@ -405,11 +427,14 @@ async function createMemoryLanceSearchManager(params: MemoryCapabilityParams, ag
       if (!params.retriever) return [];
       const trimmed = query.trim();
       if (!trimmed) return [];
-      if (opts?.sources?.length && !opts.sources.includes("memory")) return [];
+      const requestedSources = opts?.sources?.length ? new Set(opts.sources) : null;
+      if (params.canonicalCorpus?.enabled && params.canonicalCorpus.syncOnSearch) {
+        await params.canonicalCorpusIndexer?.sync({ reason: "search" }).catch(() => undefined);
+      }
 
       const results = await params.retriever.retrieve({
         query: trimmed,
-        limit: clampResultLimit(opts?.maxResults),
+        limit: requestedSources ? clampResultLimit(opts?.maxResults) * 3 : clampResultLimit(opts?.maxResults),
         scopeFilter,
         source: "manual",
       });
@@ -417,9 +442,20 @@ async function createMemoryLanceSearchManager(params: MemoryCapabilityParams, ag
       await refreshStats().catch(() => undefined);
       return results
         .filter((result) => minScore === undefined || result.score >= minScore)
-        .map(toGroundedResult);
+        .map(toGroundedResult)
+        .filter((result) => !requestedSources || requestedSources.has(result.source))
+        .slice(0, clampResultLimit(opts?.maxResults));
     },
     async readFile(readParams) {
+      if (params.canonicalCorpus?.enabled) {
+        const corpusRead = await params.canonicalCorpusIndexer?.readFile(
+          readParams.relPath,
+          readParams.from,
+          readParams.lines,
+        );
+        if (corpusRead) return corpusRead;
+      }
+
       if (!params.store) return { text: "", path: readParams.relPath };
       const id = fromVirtualMemoryPath(readParams.relPath);
       const virtualPath = toVirtualMemoryPath(id);
@@ -438,7 +474,7 @@ async function createMemoryLanceSearchManager(params: MemoryCapabilityParams, ag
         dirty: false,
         workspaceDir: params.workspaceDir,
         dbPath: params.dbPath,
-        sources: ["memory"],
+        sources: params.canonicalCorpus?.includeSessionTranscripts ? ["memory", "sessions"] : ["memory"],
         sourceCounts: [
           {
             source: "memory",
@@ -463,6 +499,12 @@ async function createMemoryLanceSearchManager(params: MemoryCapabilityParams, ag
           plugin: "memory-lancedb-pro",
           embeddingError: status.embeddingError,
           virtualPathPrefix: VIRTUAL_MEMORY_PATH_PREFIX,
+          canonicalCorpus: {
+            enabled: params.canonicalCorpus?.enabled === true,
+            syncOnSearch: params.canonicalCorpus?.syncOnSearch === true,
+            includeSessionTranscripts: params.canonicalCorpus?.includeSessionTranscripts === true,
+            includeDreamingArtifacts: params.canonicalCorpus?.includeDreamingArtifacts === true,
+          },
         },
       };
     },
@@ -490,7 +532,13 @@ async function createMemoryLanceSearchManager(params: MemoryCapabilityParams, ag
         return false;
       }
     },
-    async sync() {
+    async sync(syncParams) {
+      if (params.canonicalCorpus?.enabled) {
+        await params.canonicalCorpusIndexer?.sync({
+          reason: syncParams?.reason ?? "runtime",
+          force: syncParams?.force,
+        });
+      }
       await refreshStats();
     },
     async close() {},
