@@ -7,7 +7,12 @@ import { pathToFileURL } from "node:url";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
-const { MemoryStore, normalizeStoragePath, validateStoragePath } = jiti("../src/store.ts");
+const {
+  MemoryStore,
+  normalizeStoragePath,
+  validateStoragePath,
+  validateStoragePathAsync,
+} = jiti("../src/store.ts");
 
 describe("storage path normalization", () => {
   it("converts Windows drive-letter file URLs to native paths", () => {
@@ -45,6 +50,15 @@ describe("storage path normalization", () => {
     const dir = mkdtempSync(join(tmpdir(), "memory-lancedb-pro-file-url-"));
     try {
       assert.equal(validateStoragePath(pathToFileURL(dir).href), dir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("validates local file URLs asynchronously using native filesystem paths", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "memory-lancedb-pro-file-url-async-"));
+    try {
+      assert.equal(await validateStoragePathAsync(pathToFileURL(dir).href), dir);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
