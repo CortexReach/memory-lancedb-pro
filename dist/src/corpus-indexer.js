@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, join, relative, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { readFile, readdir, stat } from "node:fs/promises";
 const DEFAULT_MAX_FILE_BYTES = 1_000_000;
 const DEFAULT_CORPUS_CHUNK_MAX_CHARS = 4_000;
@@ -80,6 +80,27 @@ function buildDocumentKey(params) {
 }
 function buildPathCacheKey(workspaceDir, relativePath) {
     return `${workspaceDir}${CACHE_KEY_SEPARATOR}${relativePath}`;
+}
+function parseCanonicalCorpusReadPath(relPath) {
+    if (!relPath || relPath.includes("\\") || isAbsolute(relPath))
+        return null;
+    const parts = relPath.split("/");
+    if (parts.some((part) => part.length === 0 || part === "." || part === ".."))
+        return null;
+    if (relPath === "MEMORY.md") {
+        return { source: "memory", relativePath: relPath };
+    }
+    if (parts[0] === "memory" && parts.length > 1) {
+        return { source: "memory", relativePath: parts.join("/") };
+    }
+    if (parts[0] === SESSION_INDEX_PREFIX && parts.length === 3 && parts[2].endsWith(".jsonl")) {
+        return { source: "sessions", relativePath: parts.join("/") };
+    }
+    return null;
+}
+function isInsideDirectory(rootDir, candidatePath) {
+    const childRelativePath = relative(rootDir, candidatePath);
+    return childRelativePath.length > 0 && !childRelativePath.startsWith("..") && !isAbsolute(childRelativePath);
 }
 export function parseCanonicalCorpusConfig(raw) {
     const cfg = isRecord(raw) ? raw : {};
@@ -515,8 +536,11 @@ export class CanonicalCorpusIndexer {
         return deleted;
     }
     async readFile(relPath, from, lines, workspaceDir) {
+        const readPath = parseCanonicalCorpusReadPath(relPath);
+        if (!readPath)
+            return null;
         const normalizedWorkspaceDir = workspaceDir ? resolvePath(workspaceDir) : undefined;
-        const cached = this.getPathCache(relPath, normalizedWorkspaceDir);
+        const cached = this.getPathCache(readPath.relativePath, normalizedWorkspaceDir);
         let absolutePath = cached?.absolutePath;
         let content = null;
         if (absolutePath) {
@@ -528,12 +552,16 @@ export class CanonicalCorpusIndexer {
                 content = await readFile(absolutePath, "utf8").catch(() => null);
             }
         }
-        else if (relPath === "MEMORY.md" || relPath.startsWith("memory/")) {
+        else if (readPath.source === "memory") {
             const matches = [];
             for (const workspace of this.resolveWorkspaces()) {
                 if (normalizedWorkspaceDir && workspace.workspaceDir !== normalizedWorkspaceDir)
                     continue;
-                const candidate = join(workspace.workspaceDir, relPath);
+                const candidate = resolve(workspace.workspaceDir, readPath.relativePath);
+                if (readPath.relativePath !== "MEMORY.md" &&
+                    !isInsideDirectory(resolve(workspace.workspaceDir, "memory"), candidate)) {
+                    continue;
+                }
                 const raw = await readFile(candidate, "utf8").catch(() => null);
                 if (raw != null) {
                     matches.push({ workspaceDir: workspace.workspaceDir, absolutePath: candidate, content: raw });
@@ -542,26 +570,24 @@ export class CanonicalCorpusIndexer {
             if (matches.length === 1) {
                 absolutePath = matches[0].absolutePath;
                 content = matches[0].content;
-                this.setPathCache(matches[0].workspaceDir, relPath, { absolutePath, source: "memory" });
+                this.setPathCache(matches[0].workspaceDir, readPath.relativePath, { absolutePath, source: "memory" });
             }
         }
-        else if (relPath.startsWith(`${SESSION_INDEX_PREFIX}/`)) {
-            const parts = relPath.split("/");
-            if (parts.length === 3 && parts.every((part) => part.length > 0 && part !== "." && part !== "..")) {
-                absolutePath = join(this.params.homeDir ?? homedir(), ".openclaw", "agents", parts[1], "sessions", parts[2]);
-                const raw = await readFile(absolutePath, "utf8").catch(() => null);
-                if (raw != null) {
-                    content = renderSessionTranscript(raw);
-                    if (normalizedWorkspaceDir) {
-                        this.setPathCache(normalizedWorkspaceDir, relPath, { absolutePath, source: "sessions" });
-                    }
+        else if (readPath.source === "sessions") {
+            const parts = readPath.relativePath.split("/");
+            absolutePath = join(this.params.homeDir ?? homedir(), ".openclaw", "agents", parts[1], "sessions", parts[2]);
+            const raw = await readFile(absolutePath, "utf8").catch(() => null);
+            if (raw != null) {
+                content = renderSessionTranscript(raw);
+                if (normalizedWorkspaceDir) {
+                    this.setPathCache(normalizedWorkspaceDir, readPath.relativePath, { absolutePath, source: "sessions" });
                 }
             }
         }
         if (content == null)
             return null;
         const result = sliceText(content, from, lines);
-        return { ...result, path: relPath };
+        return { ...result, path: readPath.relativePath };
     }
 }
 export function parseCanonicalCorpusMetadata(value) {

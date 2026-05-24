@@ -22,6 +22,7 @@ mkdirSync(dreamingDir, { recursive: true });
 mkdirSync(sessionsDir, { recursive: true });
 
 writeFileSync(path.join(workspaceDir, "MEMORY.md"), "# Memory\n\nThe user prefers grounded citations.\n", "utf8");
+writeFileSync(path.join(workspaceDir, "SECRET.md"), "secret outside memory dir\n", "utf8");
 writeFileSync(path.join(memoryDir, "2026-05-23.md"), "## Daily\n\nOpenClaw memory slot is LanceDB-owned.\n", "utf8");
 writeFileSync(path.join(dreamingDir, "nightly.md"), "## Dream\n\nPromote repeated TypeScript lessons.\n", "utf8");
 writeFileSync(
@@ -137,6 +138,26 @@ const coldIndexer = new CanonicalCorpusIndexer({
 const coldSessionRead = await coldIndexer.readFile("sessions/main/session-a.jsonl", 1, 1);
 assert.equal(coldSessionRead.path, "sessions/main/session-a.jsonl");
 assert.ok(coldSessionRead.text.includes("## user"));
+assert.equal(
+  await coldIndexer.readFile("memory/../SECRET.md", 1, 1),
+  null,
+  "readFile should reject memory path traversal above the memory directory",
+);
+assert.equal(
+  await coldIndexer.readFile("memory/dreaming/../../SECRET.md", 1, 1),
+  null,
+  "readFile should reject deeper traversal that resolves outside the memory directory",
+);
+assert.equal(
+  await coldIndexer.readFile(path.join(workspaceDir, "MEMORY.md"), 1, 1),
+  null,
+  "readFile should reject absolute filesystem paths",
+);
+assert.equal(
+  await coldIndexer.readFile("sessions/main/../session-a.jsonl", 1, 1),
+  null,
+  "readFile should reject traversal in virtual session paths",
+);
 
 const secondSync = await indexer.sync({ reason: "interval-check" });
 assert.deepEqual(
