@@ -1560,18 +1560,28 @@ export class MemoryStore {
     }
 
     // Support both full UUID and short prefix (8+ hex chars)
+    // Also support legacy mem-md-N format from older memory-lancedb-pro versions
     const uuidRegex =
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const prefixRegex = /^[0-9a-f]{8,}$/i;
+    const legacyRegex = /^mem-md-\d+$/i;
     const isFullId = uuidRegex.test(id);
     const isPrefix = !isFullId && prefixRegex.test(id);
+    const isLegacy = !isFullId && !isPrefix && legacyRegex.test(id);
 
-    if (!isFullId && !isPrefix) {
+    if (!isFullId && !isPrefix && !isLegacy) {
       throw new Error(`Invalid memory ID format: ${id}`);
     }
 
     let candidates: any[];
-    if (isFullId) {
+    if (isFullId || isLegacy) {
+      // Legacy IDs use exact string match like full UUIDs
+      const safeId = escapeSqlLiteral(id);
+      candidates = await this.table!.query()
+        .where(`id = '${safeId}'`)
+        .limit(1)
+        .toArray();
+    } else {
       candidates = await this.table!.query()
         .where(`id = '${id}'`)
         .limit(1)
@@ -1755,18 +1765,22 @@ export class MemoryStore {
 
     return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
       // Support both full UUID and short prefix (8+ hex chars), same as delete()
+      // Also support legacy mem-md-N format from older memory-lancedb-pro versions
       const uuidRegex =
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       const prefixRegex = /^[0-9a-f]{8,}$/i;
+      const legacyRegex = /^mem-md-\d+$/i;
       const isFullId = uuidRegex.test(id);
       const isPrefix = !isFullId && prefixRegex.test(id);
+      const isLegacy = !isFullId && !isPrefix && legacyRegex.test(id);
 
-      if (!isFullId && !isPrefix) {
+      if (!isFullId && !isPrefix && !isLegacy) {
         throw new Error(`Invalid memory ID format: ${id}`);
       }
 
       let rows: any[];
-      if (isFullId) {
+      if (isFullId || isLegacy) {
+        // Legacy IDs use exact string match like full UUIDs
         const safeId = escapeSqlLiteral(id);
         rows = await this.table!.query()
           .where(`id = '${safeId}'`)
