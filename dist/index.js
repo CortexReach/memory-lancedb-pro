@@ -16,7 +16,7 @@ import { spawn } from "node:child_process";
 // so we downgrade them to debug level when running in CLI mode.
 const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 // Import core components
-import { MemoryStore, normalizeStoragePath, validateStoragePath } from "./src/store.js";
+import { MemoryStore, normalizeStoragePath } from "./src/store.js";
 import { createEmbedder, getEffectiveVectorDimensions, } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
@@ -1500,15 +1500,12 @@ let _singletonState = null;
 function _initPluginState(api) {
     const config = parsePluginConfig(api.pluginConfig);
     let resolvedDbPath = normalizeStoragePath(api.resolvePath(config.dbPath || getDefaultDbPath()));
-    try {
-        resolvedDbPath = validateStoragePath(resolvedDbPath);
-    }
-    catch (err) {
-        api.logger.warn(`memory-lancedb-pro: storage path issue — ${String(err)}\n` +
-            `  The plugin will still attempt to start, but writes may fail.`);
-    }
     const vectorDim = getEffectiveVectorDimensions(config.embedding.model || "text-embedding-3-small", config.embedding.dimensions, config.embedding.requestDimensions);
-    const store = new MemoryStore({ dbPath: resolvedDbPath, vectorDim });
+    const store = new MemoryStore({
+        dbPath: resolvedDbPath,
+        vectorDim,
+        onStoragePathWarning: (message) => api.logger.warn(message),
+    });
     const embedder = createEmbedder({
         provider: "openai-compatible",
         apiKey: config.embedding.apiKey,
