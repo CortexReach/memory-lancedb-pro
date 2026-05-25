@@ -1582,11 +1582,6 @@ export class MemoryStore {
         .limit(1)
         .toArray();
     } else {
-      candidates = await this.table!.query()
-        .where(`id = '${id}'`)
-        .limit(1)
-        .toArray();
-    } else {
       // Prefix match: fetch candidates and filter in app layer
       const all = await this.table!.query()
         .select(["id", "scope"])
