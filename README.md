@@ -115,6 +115,13 @@ Add to your `openclaw.json`:
           "autoCapture": true,
           "autoRecall": true,
           "smartExtraction": true,
+          "canonicalCorpus": {
+            "enabled": true,
+            "syncOnSearch": true
+          },
+          "dreaming": {
+            "enabled": false
+          },
           "extractMinMessages": 2,
           "extractMaxChars": 8000,
           "sessionMemory": { "enabled": false }
@@ -133,23 +140,33 @@ Add to your `openclaw.json`:
 
 ---
 
-## ⚠️ Dual-Memory Architecture (Important)
+## ⚠️ Memory Architecture (Important)
 
-When `memory-lancedb-pro` is active, your system has **two independent memory layers** that do **not** auto-sync:
+When `memory-lancedb-pro` owns the OpenClaw memory slot, it now exposes one memory capability with two coordinated stores:
 
 | Memory Layer | Storage | What it's for | Recallable? |
 |---|---|---|---|
 | **Plugin Memory** | LanceDB (vector store) | Semantic recall via `memory_recall` / auto-recall | ✅ Yes |
-| **Markdown Memory** | `MEMORY.md`, `memory/YYYY-MM-DD.md` | Startup context, human-readable journal | ❌ Not auto-recalled |
+| **Canonical Corpus** | `MEMORY.md`, `memory/**/*.md`, recent session transcripts, `memory/dreaming/**/*.md` | Source-of-truth files and public artifacts | ✅ Via LanceDB semantic index when `canonicalCorpus.enabled` is true |
 
 **Key principle:**
-> A fact written into `memory/YYYY-MM-DD.md` is visible in startup context, but `memory_recall` **will not find it** unless it was also written via `memory_store` (or auto-captured by the plugin).
+> Canonical files remain the source of truth. LanceDB is the semantic index used to retrieve them with grounded paths, line spans, snippets, and citations.
 
 **What this means for you:**
 - Need semantic recall? → Use `memory_store` or let auto-capture do it
-- `memory/YYYY-MM-DD.md` → treat as a **daily journal / log**, not a recall source
-- `MEMORY.md` → curated human-readable reference, not a recall source
-- Plugin memory → **primary recall source** for `memory_recall` and auto-recall
+- `memory/YYYY-MM-DD.md` → treat as a **daily journal / log** that can also be indexed for semantic lookup
+- `MEMORY.md` → curated human-readable reference that can be indexed as canonical context
+- `memory/dreaming/**/*.md` → dream reports exposed as public artifacts and indexed as reflection context
+- Session JSONL transcripts → indexed as `source: "sessions"` when `canonicalCorpus.includeSessionTranscripts` is enabled
+- Plugin memory → primary write path for durable facts, preferences, decisions, and auto-captured memories
+
+OpenClaw hosts receive:
+
+- `api.registerMemoryCapability({ runtime, promptBuilder, flushPlanResolver, publicArtifacts })`
+- runtime search results shaped as `path`, `startLine`, `endLine`, `snippet`, `source`, and `citation`
+- public artifacts for `MEMORY.md`, `memory/**/*.md`, dream reports, and the dreaming event log at `memory/.dreams/events.jsonl`
+
+Dreaming compatibility is configured under the same plugin entry. If `dreaming.enabled` is true while this plugin owns `plugins.slots.memory`, OpenClaw can use the memory-core dreaming sidecar against this plugin's memory capability and public artifacts.
 
 Validate & restart:
 

@@ -12,7 +12,7 @@ import { isSystemBypassId, resolveScopeFilter, parseAgentIdFromSessionKey } from
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, } from "./smart-metadata.js";
 import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
 import { TEMPORAL_VERSIONED_CATEGORIES } from "./memory-categories.js";
-import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./self-improvement-files.js";
+import { appendSelfImprovementEntry, countSelfImprovementEntries, DEFAULT_SELF_IMPROVEMENT_MAX_ENTRIES, ensureSelfImprovementLearningFiles, } from "./self-improvement-files.js";
 import { getDisplayCategoryTag } from "./reflection-metadata.js";
 import { filterUserMdExclusiveRecallResults, isUserMdExclusiveMemory, } from "./workspace-boundary.js";
 // ============================================================================
@@ -198,7 +198,7 @@ export function registerSelfImprovementLogTool(api, context) {
             const { type, summary, details = "", suggestedAction = "", category = "best_practice", area = "config", priority = "medium", } = params;
             try {
                 const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
-                const { id: entryId, filePath } = await appendSelfImprovementEntry({
+                const result = await appendSelfImprovementEntry({
                     baseDir: workspaceDir,
                     type,
                     summary,
@@ -208,11 +208,35 @@ export function registerSelfImprovementLogTool(api, context) {
                     area,
                     priority,
                     source: "memory-lancedb-pro/self_improvement_log",
+                    maxEntries: context.selfImprovementMaxEntries,
                 });
                 const fileName = type === "learning" ? "LEARNINGS.md" : "ERRORS.md";
+                if (result.skipped) {
+                    return {
+                        content: [{
+                                type: "text",
+                                text: `Skipped ${type} entry: .learnings/${fileName} already has ` +
+                                    `${result.entryCount}/${result.maxEntries} entries. Review, archive, or raise selfImprovement.maxEntries.`,
+                            }],
+                        details: {
+                            action: "skipped_limit",
+                            type,
+                            filePath: result.filePath,
+                            entryCount: result.entryCount,
+                            maxEntries: result.maxEntries,
+                        },
+                    };
+                }
                 return {
-                    content: [{ type: "text", text: `Logged ${type} entry ${entryId} to .learnings/${fileName}` }],
-                    details: { action: "logged", type, id: entryId, filePath },
+                    content: [{ type: "text", text: `Logged ${type} entry ${result.id} to .learnings/${fileName}` }],
+                    details: {
+                        action: "logged",
+                        type,
+                        id: result.id,
+                        filePath: result.filePath,
+                        entryCount: result.entryCount,
+                        maxEntries: result.maxEntries,
+                    },
                 };
             }
             catch (error) {
@@ -343,10 +367,23 @@ export function registerSelfImprovementReviewTool(api, context) {
                 await ensureSelfImprovementLearningFiles(workspaceDir);
                 const learningsDir = join(workspaceDir, ".learnings");
                 const files = ["LEARNINGS.md", "ERRORS.md"];
-                const stats = { pending: 0, high: 0, promoted: 0, total: 0 };
+                const maxEntries = context.selfImprovementMaxEntries ?? DEFAULT_SELF_IMPROVEMENT_MAX_ENTRIES;
+                const stats = {
+                    pending: 0,
+                    high: 0,
+                    promoted: 0,
+                    total: 0,
+                    files: {},
+                };
                 for (const f of files) {
                     const content = await readFile(join(learningsDir, f), "utf-8").catch(() => "");
-                    stats.total += (content.match(/^## \[/gm) || []).length;
+                    const entries = countSelfImprovementEntries(content);
+                    stats.files[f] = {
+                        entries,
+                        maxEntries,
+                        atLimit: entries >= maxEntries,
+                    };
+                    stats.total += entries;
                     stats.pending += (content.match(/\*\*Status\*\*:\s*pending/gi) || []).length;
                     stats.high += (content.match(/\*\*Priority\*\*:\s*(high|critical)/gi) || []).length;
                     stats.promoted += (content.match(/\*\*Status\*\*:\s*promoted(_to_skill)?/gi) || []).length;
@@ -357,6 +394,8 @@ export function registerSelfImprovementReviewTool(api, context) {
                     `- Pending: ${stats.pending}`,
                     `- High/Critical: ${stats.high}`,
                     `- Promoted: ${stats.promoted}`,
+                    `- LEARNINGS.md: ${stats.files["LEARNINGS.md"].entries}/${maxEntries}`,
+                    `- ERRORS.md: ${stats.files["ERRORS.md"].entries}/${maxEntries}`,
                     "",
                     "Recommended loop:",
                     "1) Resolve high-priority pending entries",

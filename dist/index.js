@@ -49,6 +49,8 @@ import { computeTier1Patch, isSuppressed as isTier1Suppressed, TIER1_DEFAULT_BAD
 import { filterUserMdExclusiveRecallResults, isUserMdExclusiveMemory, } from "./src/workspace-boundary.js";
 import { normalizeAdmissionControlConfig, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
+import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
+import { CanonicalCorpusIndexer, parseCanonicalCorpusConfig, } from "./src/corpus-indexer.js";
 // ============================================================================
 // Default Configuration
 // ============================================================================
@@ -218,7 +220,15 @@ const DEFAULT_SELF_IMPROVEMENT_REMINDER = [
     "",
     "Keep entries simple: date, title, what happened, what to do differently.",
 ].join("\n");
-const SELF_IMPROVEMENT_NOTE_PREFIX = "/note self-improvement (before reset):";
+const SELF_IMPROVEMENT_RESET_REMINDER_CONTEXT = [
+    "<self-improvement-reminder>",
+    "If anything was learned/corrected in the previous session, log it now:",
+    "- .learnings/LEARNINGS.md (corrections/best practices)",
+    "- .learnings/ERRORS.md (failures/root causes)",
+    "- Distill reusable rules to AGENTS.md / SOUL.md / TOOLS.md.",
+    "- If reusable across tasks, extract a new skill from the learning.",
+    "</self-improvement-reminder>",
+].join("\n");
 const DEFAULT_REFLECTION_MESSAGE_COUNT = 120;
 const DEFAULT_REFLECTION_MAX_INPUT_CHARS = 24_000;
 const DEFAULT_REFLECTION_TIMEOUT_MS = 20_000;
@@ -1522,6 +1532,14 @@ function _initPluginState(api) {
     });
     const retriever = createRetriever(store, embedder, { ...DEFAULT_RETRIEVAL_CONFIG, ...config.retrieval }, { decayEngine });
     const scopeManager = createScopeManager(config.scopes);
+    const canonicalCorpusIndexer = new CanonicalCorpusIndexer({
+        store,
+        embedder,
+        getConfig: () => config.canonicalCorpus ?? parseCanonicalCorpusConfig(undefined),
+        getOpenClawConfig: () => api.config ?? api.pluginConfig,
+        log: (message) => api.logger.info(message),
+        warn: (message) => api.logger.warn(message),
+    });
     const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
     if (clawteamScopes.length > 0) {
         applyClawteamScopes(scopeManager, clawteamScopes);
@@ -1604,11 +1622,13 @@ function _initPluginState(api) {
     return {
         config,
         resolvedDbPath,
+        vectorDim,
         store,
         embedder,
         decayEngine,
         tierManager,
         retriever,
+        canonicalCorpusIndexer,
         scopeManager,
         migrator,
         smartExtractor,
@@ -1693,7 +1713,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, store, embedder, retriever, scopeManager, migrator, smartExtractor, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, scopeManager, migrator, smartExtractor, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
         async function sleep(ms) {
             await new Promise(resolve => setTimeout(resolve, ms));
         }
@@ -1881,36 +1901,41 @@ const memoryLanceDBProPlugin = {
             `  - Plugin memory (LanceDB) = primary recall source for semantic search\n` +
             `  - MEMORY.md / memory/YYYY-MM-DD.md = startup context / journal only\n` +
             `  - Use memory_store or auto-capture for recallable memories.\n`);
-        // Health status for memory runtime stub (reflects actual plugin health)
+        // Health status for OpenClaw memory runtime (reflects actual plugin health)
         // Updated by runStartupChecks after testing embedder and retriever
         let embedHealth = { ok: false, error: "startup not complete" };
         let retrievalHealth = false;
         // ========================================================================
-        // Stub Memory Runtime (satisfies openclaw doctor memory plugin check)
-        // memory-lancedb-pro uses a tool-based architecture, not the built-in memory-core
-        // runtime interface, so we register a minimal stub to satisfy the check.
-        // See: https://github.com/CortexReach/memory-lancedb-pro/issues/434
+        // OpenClaw Memory Capability
         // ========================================================================
-        if (typeof api.registerMemoryRuntime === "function") {
-            api.registerMemoryRuntime({
-                async getMemorySearchManager(_params) {
-                    return {
-                        manager: {
-                            status: () => ({
-                                backend: "builtin",
-                                provider: "memory-lancedb-pro",
-                                embeddingAvailable: embedHealth.ok,
-                                retrievalAvailable: retrievalHealth,
-                            }),
-                            probeEmbeddingAvailability: async () => ({ ...embedHealth }),
-                            probeVectorAvailability: async () => retrievalHealth,
-                        },
-                    };
-                },
-                resolveMemoryBackendConfig() {
-                    return { backend: "builtin" };
-                },
-            });
+        const memoryCapability = createOpenClawMemoryCapability({
+            dbPath: resolvedDbPath,
+            vectorDim,
+            embeddingProvider: config.embedding.provider,
+            embeddingModel: config.embedding.model || "text-embedding-3-small",
+            workspaceDir: getDefaultWorkspaceDir(),
+            store,
+            retriever,
+            canonicalCorpus: config.canonicalCorpus,
+            canonicalCorpusIndexer,
+            resolveScopeFilterForAgent: (agentId) => resolveScopeFilter(scopeManager, agentId),
+            getRuntimeStatus: () => ({
+                embeddingAvailable: embedHealth.ok,
+                retrievalAvailable: retrievalHealth,
+                embeddingError: embedHealth.error,
+            }),
+            probeEmbeddingAvailability: async () => ({ ...embedHealth }),
+            probeVectorAvailability: async () => retrievalHealth,
+        });
+        if (typeof api.registerMemoryCapability === "function") {
+            api.registerMemoryCapability(memoryCapability);
+        }
+        else if (typeof api.registerMemoryRuntime === "function") {
+            api.registerMemoryRuntime(memoryCapability.runtime);
+            api.logger.debug("memory-lancedb-pro: host API lacks registerMemoryCapability; registered legacy memory runtime only");
+        }
+        else {
+            api.logger.debug("memory-lancedb-pro: host API lacks memory capability registration APIs");
         }
         api.on("message_received", (event, ctx) => {
             try {
@@ -1959,6 +1984,7 @@ const memoryLanceDBProPlugin = {
             workspaceDir: getDefaultWorkspaceDir(),
             mdMirror,
             workspaceBoundary: config.workspaceBoundary,
+            selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
         }, {
             enableManagementTools: config.enableManagementTools,
             enableSelfImprovementTools: config.selfImprovement?.enabled !== false,
@@ -2851,6 +2877,22 @@ const memoryLanceDBProPlugin = {
         // Integrated Self-Improvement (inheritance + derived)
         // ========================================================================
         if (config.selfImprovement?.enabled !== false) {
+            const pendingSelfImprovementResetReminderBySession = new Set();
+            const getSelfImprovementSessionKey = (event, ctx) => {
+                const candidates = [
+                    event?.sessionKey,
+                    ctx?.sessionKey,
+                    event?.context?.sessionKey,
+                    event?.context?.sessionId,
+                    ctx?.sessionId,
+                ];
+                for (const candidate of candidates) {
+                    if (typeof candidate === "string" && candidate.trim().length > 0) {
+                        return candidate.trim();
+                    }
+                }
+                return "";
+            };
             api.registerHook("agent:bootstrap", async (event) => {
                 const context = (event.context || {});
                 const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
@@ -2894,23 +2936,22 @@ const memoryLanceDBProPlugin = {
                 description: "Inject self-improvement reminder on agent bootstrap",
             });
             if (config.selfImprovement?.beforeResetNote !== false) {
-                const appendSelfImprovementNote = async (event) => {
-                    // Basic validation BEFORE dedup — skip events that will legitimately return anyway
-                    if (!Array.isArray(event.messages)) {
-                        api.logger.warn(`self-improvement: command:${String(event?.action || "unknown")} missing event.messages array; skip note inject`);
+                const markSelfImprovementResetReminder = async (event) => {
+                    const action = String(event?.action || "unknown");
+                    const sessionKey = getSelfImprovementSessionKey(event);
+                    if (!sessionKey) {
+                        api.logger.warn(`self-improvement: command:${action} missing sessionKey; skip reminder mark`);
                         return;
                     }
                     if (_dedupHookEvent("selfImprovement", event))
                         return;
                     try {
-                        const action = String(event?.action || "unknown");
-                        const sessionKeyForLog = typeof event?.sessionKey === "string" ? event.sessionKey : "";
                         const contextForLog = (event?.context && typeof event.context === "object")
                             ? event.context
                             : {};
                         const commandSource = typeof contextForLog.commandSource === "string" ? contextForLog.commandSource : "";
                         const contextKeys = Object.keys(contextForLog).slice(0, 8).join(",");
-                        api.logger.info(`self-improvement: command:${action} hook start; sessionKey=${sessionKeyForLog || "(none)"}; source=${commandSource || "(unknown)"}; hasMessages=${Array.isArray(event?.messages)}; contextKeys=${contextKeys || "(none)"}`);
+                        api.logger.info(`self-improvement: command:${action} hook start; sessionKey=${sessionKey}; source=${commandSource || "(unknown)"}; contextKeys=${contextKeys || "(none)"}`);
                         // Skip self-improvement note on Discord channel (non-thread) resets
                         // to avoid contributing to the post-reset startup race on Discord channels.
                         // Discord thread resets are handled separately by the OpenClaw core's
@@ -2924,33 +2965,38 @@ const memoryLanceDBProPlugin = {
                             api.logger.info(`self-improvement: command:${action} skipped on Discord channel (non-thread) reset to avoid startup race; use /new in thread or restart gateway if startup is incomplete`);
                             return;
                         }
-                        const exists = event.messages.some((m) => typeof m === "string" && m.includes(SELF_IMPROVEMENT_NOTE_PREFIX));
-                        if (exists) {
-                            api.logger.info(`self-improvement: command:${action} note already present; skip duplicate inject`);
-                            return;
-                        }
-                        event.messages.push([
-                            SELF_IMPROVEMENT_NOTE_PREFIX,
-                            "- If anything was learned/corrected, log it now:",
-                            "  - .learnings/LEARNINGS.md (corrections/best practices)",
-                            "  - .learnings/ERRORS.md (failures/root causes)",
-                            "- Distill reusable rules to AGENTS.md / SOUL.md / TOOLS.md.",
-                            "- If reusable across tasks, extract a new skill from the learning.",
-                            "- Then proceed with the new session.",
-                        ].join("\n"));
-                        api.logger.info(`self-improvement: command:${action} injected note; messages=${event.messages.length}`);
+                        pendingSelfImprovementResetReminderBySession.add(sessionKey);
+                        api.logger.info(`self-improvement: command:${action} queued silent reminder for next prompt`);
                     }
                     catch (err) {
-                        api.logger.warn(`self-improvement: note inject failed: ${String(err)}`);
+                        api.logger.warn(`self-improvement: reminder mark failed: ${String(err)}`);
                     }
                 };
-                api.registerHook("command:new", appendSelfImprovementNote, {
-                    name: "memory-lancedb-pro.self-improvement.command-new",
-                    description: "Append self-improvement note before /new",
+                api.on("before_prompt_build", async (event, ctx) => {
+                    const sessionKey = getSelfImprovementSessionKey(event, ctx);
+                    if (!sessionKey || !pendingSelfImprovementResetReminderBySession.delete(sessionKey)) {
+                        return;
+                    }
+                    return {
+                        prependContext: SELF_IMPROVEMENT_RESET_REMINDER_CONTEXT,
+                        ephemeral: true,
+                    };
+                }, {
+                    name: "memory-lancedb-pro.self-improvement.before-prompt-build",
+                    description: "Inject self-improvement reminder silently after /new or /reset",
                 });
-                api.registerHook("command:reset", appendSelfImprovementNote, {
+                api.on("session_end", (_event, ctx) => {
+                    const sessionKey = getSelfImprovementSessionKey(_event, ctx);
+                    if (sessionKey)
+                        pendingSelfImprovementResetReminderBySession.delete(sessionKey);
+                }, { priority: 20 });
+                api.registerHook("command:new", markSelfImprovementResetReminder, {
+                    name: "memory-lancedb-pro.self-improvement.command-new",
+                    description: "Queue self-improvement reminder before /new",
+                });
+                api.registerHook("command:reset", markSelfImprovementResetReminder, {
                     name: "memory-lancedb-pro.self-improvement.command-reset",
-                    description: "Append self-improvement note before /reset",
+                    description: "Queue self-improvement reminder before /reset",
                 });
             }
             (isCliMode() ? api.logger.debug : api.logger.info)("self-improvement: integrated hooks registered (agent:bootstrap, command:new, command:reset)");
@@ -3330,7 +3376,7 @@ const memoryLanceDBProPlugin = {
                     const reflectionGovernanceCandidates = extractReflectionLearningGovernanceCandidates(reflectionText);
                     if (config.selfImprovement?.enabled !== false && reflectionGovernanceCandidates.length > 0) {
                         for (const candidate of reflectionGovernanceCandidates) {
-                            await appendSelfImprovementEntry({
+                            const appendResult = await appendSelfImprovementEntry({
                                 baseDir: workspaceDir,
                                 type: "learning",
                                 summary: candidate.summary,
@@ -3341,7 +3387,11 @@ const memoryLanceDBProPlugin = {
                                 priority: candidate.priority || "medium",
                                 status: candidate.status || "pending",
                                 source: `memory-lancedb-pro/reflection:${relPath}`,
+                                maxEntries: config.selfImprovement?.maxEntries,
                             });
+                            if (appendResult.skipped) {
+                                api.logger.warn(`self-improvement: skipped reflection learning candidate because .learnings limit was reached (${appendResult.entryCount}/${appendResult.maxEntries})`);
+                            }
                         }
                     }
                     const reflectionEventId = createReflectionEventId({
@@ -3884,13 +3934,16 @@ export function parsePluginConfig(value) {
                 beforeResetNote: cfg.selfImprovement.beforeResetNote !== false,
                 skipSubagentBootstrap: cfg.selfImprovement.skipSubagentBootstrap !== false,
                 ensureLearningFiles: cfg.selfImprovement.ensureLearningFiles !== false,
+                maxEntries: parsePositiveInt(cfg.selfImprovement.maxEntries) ?? 500,
             }
             : {
                 enabled: true,
                 beforeResetNote: true,
                 skipSubagentBootstrap: true,
                 ensureLearningFiles: true,
+                maxEntries: 500,
             },
+        canonicalCorpus: parseCanonicalCorpusConfig(cfg.canonicalCorpus),
         memoryReflection: memoryReflectionRaw
             ? {
                 enabled: sessionStrategy === "memoryReflection",

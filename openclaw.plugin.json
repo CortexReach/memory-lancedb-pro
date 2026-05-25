@@ -25,6 +25,13 @@
   "skills": [
     "./skills"
   ],
+  "commandAliases": [
+    {
+      "name": "dreaming",
+      "kind": "runtime-slash",
+      "cliCommand": "memory"
+    }
+  ],
   "hooks": {
     "allowConversationAccess": true
   },
@@ -709,6 +716,434 @@
             "minimum": 1,
             "default": 500,
             "description": "Maximum number of entries to retain per .learnings file before new appends are skipped."
+          }
+        }
+      },
+      "canonicalCorpus": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Index canonical OpenClaw memory files into LanceDB while keeping the files as source of truth."
+          },
+          "syncOnSearch": {
+            "type": "boolean",
+            "default": true,
+            "description": "Refresh canonical corpus entries opportunistically before memory runtime searches."
+          },
+          "syncIntervalMs": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 60000,
+            "description": "Minimum interval between opportunistic canonical corpus sync attempts."
+          },
+          "includeMemoryDir": {
+            "type": "boolean",
+            "default": true,
+            "description": "Index MEMORY.md and memory/**/*.md from configured OpenClaw workspaces."
+          },
+          "includeSessionTranscripts": {
+            "type": "boolean",
+            "default": true,
+            "description": "Index recent OpenClaw session JSONL transcripts as grounded session-source search results."
+          },
+          "includeDreamingArtifacts": {
+            "type": "boolean",
+            "default": true,
+            "description": "Index memory/dreaming/**/*.md as dream-report public artifacts."
+          },
+          "maxSessionFilesPerAgent": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 25,
+            "description": "Maximum recent session transcript files to index per agent."
+          },
+          "maxFileBytes": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1000000,
+            "description": "Skip canonical corpus files larger than this size."
+          }
+        }
+      },
+      "dreaming": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "frequency": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "timezone": {
+            "type": "string"
+          },
+          "verboseLogging": {
+            "type": "boolean"
+          },
+          "storage": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "inline",
+                  "separate",
+                  "both"
+                ]
+              },
+              "separateReports": {
+                "type": "boolean"
+              }
+            }
+          },
+          "execution": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "defaults": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "speed": {
+                    "type": "string",
+                    "enum": [
+                      "fast",
+                      "balanced",
+                      "slow"
+                    ]
+                  },
+                  "thinking": {
+                    "type": "string",
+                    "enum": [
+                      "low",
+                      "medium",
+                      "high"
+                    ]
+                  },
+                  "budget": {
+                    "type": "string",
+                    "enum": [
+                      "cheap",
+                      "medium",
+                      "expensive"
+                    ]
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "maxOutputTokens": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "temperature": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 2
+                  },
+                  "timeoutMs": {
+                    "type": "integer",
+                    "minimum": 1000
+                  }
+                }
+              }
+            }
+          },
+          "phases": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "light": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "lookbackDays": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "dedupeSimilarity": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "sources": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "daily",
+                        "sessions",
+                        "recall"
+                      ]
+                    }
+                  },
+                  "execution": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "speed": {
+                        "type": "string",
+                        "enum": [
+                          "fast",
+                          "balanced",
+                          "slow"
+                        ]
+                      },
+                      "thinking": {
+                        "type": "string",
+                        "enum": [
+                          "low",
+                          "medium",
+                          "high"
+                        ]
+                      },
+                      "budget": {
+                        "type": "string",
+                        "enum": [
+                          "cheap",
+                          "medium",
+                          "expensive"
+                        ]
+                      },
+                      "model": {
+                        "type": "string"
+                      },
+                      "maxOutputTokens": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "temperature": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 2
+                      },
+                      "timeoutMs": {
+                        "type": "integer",
+                        "minimum": 1000
+                      }
+                    }
+                  }
+                }
+              },
+              "deep": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "minScore": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minRecallCount": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "minUniqueQueries": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "recencyHalfLifeDays": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "maxAgeDays": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "sources": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "daily",
+                        "memory",
+                        "sessions",
+                        "logs",
+                        "recall"
+                      ]
+                    }
+                  },
+                  "recovery": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "enabled": {
+                        "type": "boolean"
+                      },
+                      "triggerBelowHealth": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "lookbackDays": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "maxRecoveredCandidates": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "minRecoveryConfidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "autoWriteMinConfidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      }
+                    }
+                  },
+                  "execution": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "speed": {
+                        "type": "string",
+                        "enum": [
+                          "fast",
+                          "balanced",
+                          "slow"
+                        ]
+                      },
+                      "thinking": {
+                        "type": "string",
+                        "enum": [
+                          "low",
+                          "medium",
+                          "high"
+                        ]
+                      },
+                      "budget": {
+                        "type": "string",
+                        "enum": [
+                          "cheap",
+                          "medium",
+                          "expensive"
+                        ]
+                      },
+                      "model": {
+                        "type": "string"
+                      },
+                      "maxOutputTokens": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "temperature": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 2
+                      },
+                      "timeoutMs": {
+                        "type": "integer",
+                        "minimum": 1000
+                      }
+                    }
+                  }
+                }
+              },
+              "rem": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "lookbackDays": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "minPatternStrength": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "sources": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "memory",
+                        "daily",
+                        "deep"
+                      ]
+                    }
+                  },
+                  "execution": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "speed": {
+                        "type": "string",
+                        "enum": [
+                          "fast",
+                          "balanced",
+                          "slow"
+                        ]
+                      },
+                      "thinking": {
+                        "type": "string",
+                        "enum": [
+                          "low",
+                          "medium",
+                          "high"
+                        ]
+                      },
+                      "budget": {
+                        "type": "string",
+                        "enum": [
+                          "cheap",
+                          "medium",
+                          "expensive"
+                        ]
+                      },
+                      "model": {
+                        "type": "string"
+                      },
+                      "maxOutputTokens": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "temperature": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 2
+                      },
+                      "timeoutMs": {
+                        "type": "integer",
+                        "minimum": 1000
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       },
@@ -1507,6 +1942,36 @@
     "memoryCompaction.cooldownHours": {
       "label": "Cooldown (hours)",
       "help": "Minimum gap between automatic compaction runs",
+      "advanced": true
+    },
+    "canonicalCorpus.enabled": {
+      "label": "Canonical Corpus",
+      "help": "Index OpenClaw memory files and session transcripts into LanceDB while keeping files as source of truth."
+    },
+    "canonicalCorpus.syncOnSearch": {
+      "label": "Sync On Search",
+      "help": "Refresh canonical corpus entries before runtime memory searches, subject to the sync interval.",
+      "advanced": true
+    },
+    "canonicalCorpus.maxSessionFilesPerAgent": {
+      "label": "Session Files Per Agent",
+      "help": "Maximum recent session transcript files to index for each agent.",
+      "advanced": true
+    },
+    "dreaming.frequency": {
+      "label": "Dreaming Frequency",
+      "placeholder": "0 3 * * *",
+      "help": "Optional cron cadence for the full dreaming sweep when this plugin owns the memory slot."
+    },
+    "dreaming.model": {
+      "label": "Dreaming Model",
+      "placeholder": "anthropic/claude-sonnet-4-6",
+      "help": "Optional provider/model override for dream narration runs.",
+      "advanced": true
+    },
+    "dreaming.storage.mode": {
+      "label": "Dream Storage Mode",
+      "help": "Choose whether dream reports are stored inline, separately, or both.",
       "advanced": true
     },
     "sessionCompression.enabled": {

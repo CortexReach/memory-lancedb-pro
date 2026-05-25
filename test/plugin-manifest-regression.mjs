@@ -31,6 +31,7 @@ function createMockApi(pluginConfig, options = {}) {
     pluginConfig,
     hooks: {},
     toolFactories: {},
+    memoryCapability: null,
     logger: {
       info() {},
       warn() {},
@@ -47,6 +48,9 @@ function createMockApi(pluginConfig, options = {}) {
     registerCli() {},
     registerService(service) {
       options.services?.push(service);
+    },
+    registerMemoryCapability(capability) {
+      this.memoryCapability = capability;
     },
     on(name, handler) {
       this.hooks[name] = handler;
@@ -128,6 +132,47 @@ assert.ok(
   manifest.configSchema.properties.retrieval.properties.rerankProvider.enum.includes("tei"),
   "rerankProvider schema should include tei",
 );
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties, "dreaming"),
+  "configSchema should declare dreaming so the plugin can own the OpenClaw memory slot",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties, "canonicalCorpus"),
+  "configSchema should declare canonicalCorpus for file-backed memory indexing",
+);
+assert.equal(
+  manifest.configSchema.properties.canonicalCorpus.properties.includeSessionTranscripts.default,
+  true,
+  "canonical corpus should index session transcripts by default",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.uiHints, "canonicalCorpus.enabled"),
+  "uiHints should expose canonical corpus ownership",
+);
+assert.equal(
+  manifest.configSchema.properties.dreaming.additionalProperties,
+  false,
+  "dreaming schema should reject unknown keys consistently with memory-core",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.dreaming.properties, "phases"),
+  "dreaming schema should declare phase config",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(
+    manifest.configSchema.properties.dreaming.properties.execution.properties.defaults.properties,
+    "speed",
+  ),
+  "dreaming execution defaults should expose memory-core speed/thinking/budget knobs",
+);
+assert.ok(
+  manifest.configSchema.properties.dreaming.properties.phases.properties.deep.properties.sources.items.enum.includes("logs"),
+  "deep dreaming sources should accept memory-core log source",
+);
+assert.ok(
+  (manifest.commandAliases ?? []).some((entry) => entry?.name === "dreaming"),
+  "manifest should expose the dreaming runtime slash command alias while owning the memory slot",
+);
 
 assert.equal(
   manifest.version,
@@ -172,6 +217,51 @@ try {
     existsSync(startupDbPath),
     false,
     "plugin registration should not synchronously create or validate dbPath",
+  );
+  assert.equal(
+    typeof api.memoryCapability?.runtime?.getMemorySearchManager,
+    "function",
+    "plugin should register an OpenClaw memory capability runtime",
+  );
+  assert.equal(
+    typeof api.memoryCapability?.promptBuilder,
+    "function",
+    "plugin should register an OpenClaw memory prompt builder",
+  );
+  assert.equal(
+    typeof api.memoryCapability?.flushPlanResolver,
+    "function",
+    "plugin should register an OpenClaw memory flush plan resolver",
+  );
+  assert.equal(
+    typeof api.memoryCapability?.publicArtifacts?.listArtifacts,
+    "function",
+    "plugin should register an OpenClaw public artifacts provider",
+  );
+  const promptLines = api.memoryCapability.promptBuilder({
+    availableTools: new Set(["memory_recall", "memory_store"]),
+  });
+  assert.ok(
+    promptLines.some((line) => /Memory Recall/.test(line)),
+    "memory prompt builder should provide recall guidance",
+  );
+  const flushPlan = api.memoryCapability.flushPlanResolver({
+    cfg: { agents: { defaults: { userTimezone: "UTC" } } },
+    nowMs: Date.UTC(2026, 4, 23),
+  });
+  assert.equal(
+    flushPlan.relativePath,
+    "memory/2026-05-23.md",
+    "memory flush plan should target canonical daily memory files",
+  );
+  const { manager } = await api.memoryCapability.runtime.getMemorySearchManager({
+    cfg: {},
+    agentId: "main",
+  });
+  assert.equal(
+    manager.status().provider,
+    "memory-lancedb-pro",
+    "memory capability runtime status should identify this provider",
   );
   assert.equal(services.length, 1, "plugin should register its background service");
   assert.equal(typeof api.hooks.agent_end, "function", "autoCapture should remain enabled by default");
