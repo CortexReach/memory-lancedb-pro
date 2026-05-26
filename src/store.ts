@@ -175,6 +175,28 @@ export function normalizeMemoryTimestamp(value: unknown, fallback = Date.now()):
   return timestamp < LEGACY_SECONDS_TIMESTAMP_MAX ? timestamp * 1000 : timestamp;
 }
 
+/**
+ * Normalize legacy v1.x importance scale (1-5 integers) to v2+ scale (0~1 floats)
+ *
+ * Mapping:
+ *   1 → 0.20   2 → 0.40   3 → 0.60   4 → 0.80   5 → 0.95
+ *
+ * Values already in 0~1 range pass through unchanged.
+ * Function is idempotent (safe to call multiple times on same value).
+ */
+export function normalizeImportance(value: number): number {
+  // Guard against NaN / Infinity / -Infinity from corrupted data
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0.5;
+
+  // Legacy v1.x integer scale (1-5) → v2+ 0~1
+  if (Number.isInteger(value) && value >= 1 && value <= 5) {
+    return [null, 0.20, 0.40, 0.60, 0.80, 0.95][value];
+  }
+
+  // v2+ 0~1 float: clamp outliers (1.0 is the legitimate max)
+  return Math.max(0.0, Math.min(1.0, value));
+}
+
 function normalizePredicateTimestamp(value: unknown): number | null {
   const raw = value instanceof Date
     ? value.getTime()
@@ -1425,7 +1447,7 @@ export class MemoryStore {
     const full: MemoryEntry = {
       ...entry,
       scope: entry.scope || "global",
-      importance: Number.isFinite(entry.importance) ? entry.importance : 0.7,
+      importance: Number.isFinite(entry.importance) ? normalizeImportance(entry.importance) : 0.7,
       timestamp: normalizeMemoryTimestamp(entry.timestamp),
       metadata: entry.metadata || "{}",
     };
@@ -1479,7 +1501,7 @@ export class MemoryStore {
       vector: Array.from(row.vector as Iterable<number>),
       category: row.category as MemoryEntry["category"],
       scope: rowScope,
-      importance: Number(row.importance),
+      importance: normalizeImportance(Number(row.importance)),
       timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
       metadata: (row.metadata as string) || "{}",
     };
@@ -1595,7 +1617,7 @@ export class MemoryStore {
         vector: rowVector,
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
+        importance: normalizeImportance(Number(row.importance)),
         timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
@@ -1677,7 +1699,7 @@ export class MemoryStore {
             vector: row.vector as number[],
             category: row.category as MemoryEntry["category"],
             scope: rowScope,
-            importance: Number(row.importance),
+            importance: normalizeImportance(Number(row.importance)),
             timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: (row.metadata as string) || "{}",
         };
@@ -1741,7 +1763,7 @@ export class MemoryStore {
         vector: row.vector as number[],
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
+        importance: normalizeImportance(Number(row.importance)),
         timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
@@ -1885,7 +1907,7 @@ export class MemoryStore {
           vector: [], // Don't include vectors in list results for performance
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
-          importance: Number(row.importance),
+          importance: normalizeImportance(Number(row.importance)),
           timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),
@@ -2245,7 +2267,7 @@ export class MemoryStore {
         vector: Array.from(row.vector as Iterable<number>),
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
+        importance: normalizeImportance(Number(row.importance)),
         timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
@@ -2475,7 +2497,7 @@ export class MemoryStore {
           vector: Array.isArray(row.vector) ? (row.vector as number[]) : [],
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
-          importance: Number(row.importance),
+          importance: normalizeImportance(Number(row.importance)),
           timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),

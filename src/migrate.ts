@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import fs from "node:fs/promises";
 import type { MemoryStore, MemoryEntry } from "./store.js";
-import { loadLanceDB } from "./store.js";
+import { loadLanceDB, normalizeImportance } from "./store.js";
 
 // ============================================================================
 // Types
@@ -169,7 +169,7 @@ export class MemoryMigrator {
         id: row.id as string,
         text: row.text as string,
         vector: normalizeLegacyVector(row.vector),
-        importance: Number(row.importance),
+        importance: normalizeImportance(Number(row.importance)),
         category: (row.category as LegacyMemoryEntry["category"]) || "other",
         createdAt: Number(row.createdAt),
         scope: row.scope as string | undefined,
@@ -215,7 +215,7 @@ export class MemoryMigrator {
           vector: legacy.vector,
           category: legacy.category,
           scope: legacy.scope || defaultScope,
-          importance: legacy.importance,
+          importance: normalizeImportance(legacy.importance),
           timestamp: Number.isFinite(legacy.createdAt) ? legacy.createdAt : Date.now(),
           metadata: JSON.stringify({
             migratedFrom: "memory-lancedb",
