@@ -12,8 +12,8 @@ import {
   realpathSync,
   lstatSync,
   statSync,
-  unlinkSync,
 } from "node:fs";
+import { unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 
@@ -75,8 +75,8 @@ export const loadLanceDB = async (): Promise<
   typeof import("@lancedb/lancedb")
 > => {
   if (!lancedbImportPromise) {
-    // Use require() for CommonJS modules on Windows to avoid ESM URL scheme issues
-    lancedbImportPromise = Promise.resolve(require("@lancedb/lancedb"));
+    // Use dynamic import() for ESM compatibility
+    lancedbImportPromise = import("@lancedb/lancedb");
   }
   try {
     return await lancedbImportPromise;
@@ -248,7 +248,8 @@ export class MemoryStore {
         const ageMs = Date.now() - stat.mtimeMs;
         const staleThresholdMs = 5 * 60 * 1000;
         if (ageMs > staleThresholdMs) {
-          try { unlinkSync(lockPath); } catch {}
+          try { await unlink(lockPath); } catch { /* file may not exist */ }
+          // Log via console since this is an early-boot path with no log function available
           console.warn(`[memory-lancedb-pro] cleared stale lock: ${lockPath} ageMs=${ageMs}`);
         }
       } catch {}

@@ -220,11 +220,24 @@ export function deriveFactKey(
     topic = arrowMatch[1];
   }
 
-  const normalized = topic
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[。.!?]+$/g, "")
-    .trim();
+  // Detect CJK characters: if present, use character-level processing that
+  // preserves the text (\s does not match CJK whitespace/fullwidth spaces)
+  const hasCJK = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(topic);
+  let normalized: string;
+  if (hasCJK) {
+    // For CJK: collapse ASCII + fullwidth spaces, trim punctuation from end
+    normalized = topic
+      .toLowerCase()
+      .replace(/[\s\u3000]+/g, " ")
+      .replace(/[。.!?！?？]+$/g, "")
+      .trim();
+  } else {
+    normalized = topic
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/[。.!?]+$/g, "")
+      .trim();
+  }
 
   return normalized ? `${category}:${normalized}` : undefined;
 }

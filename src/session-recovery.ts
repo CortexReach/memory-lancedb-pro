@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 function asNonEmptyString(value: unknown): string | undefined {
@@ -60,6 +61,8 @@ export function resolveReflectionSessionSearchDirs(params: {
   const addDir = (value: string | undefined) => {
     const dir = asNonEmptyString(value);
     if (!dir || seen.has(dir)) return;
+    // Filter out non-existent directories to reduce unnecessary I/O
+    if (!existsSync(dir)) return;
     seen.add(dir);
     out.push(dir);
   };

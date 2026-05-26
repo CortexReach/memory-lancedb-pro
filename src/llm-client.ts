@@ -339,8 +339,54 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
           });
 
           if (!response.ok) {
-            const detail = await response.text().catch(() => "");
-            throw new Error(`HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 500)}`);
+            // M2 fix: on 401 (token expired), force-refresh and retry once
+            if (response.status === 401) {
+              session = await refreshOAuthSession(session, config.timeoutMs);
+              await saveOAuthSession(config.oauthPath!, session);
+              cachedSessionPromise = Promise.resolve(session);
+              // Retry once with the fresh token
+              const retryResponse = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${session.accessToken}`,
+                  "Content-Type": "application/json",
+                  Accept: "text/event-stream",
+                  "OpenAI-Beta": "responses=experimental",
+                  "chatgpt-account-id": session.accountId,
+                  originator: "codex_cli_rs",
+                },
+                signal,
+                body: JSON.stringify({
+                  model: normalizeOauthModel(config.model),
+                  instructions:
+                    "You are a memory extraction assistant. Always respond with valid JSON only.",
+                  input: [
+                    {
+                      role: "user",
+                      content: [
+                        {
+                          type: "input_text",
+                          text: prompt,
+                        },
+                      ],
+                    },
+                  ],
+                  store: false,
+                  stream: true,
+                  text: {
+                    format: { type: "text" },
+                  },
+                }),
+              });
+              if (!retryResponse.ok) {
+                const detail = await retryResponse.text().catch(() => "");
+                throw new Error(`HTTP ${retryResponse.status} ${retryResponse.statusText}: ${detail.slice(0, 500)}`);
+              }
+              response = retryResponse;
+            } else {
+              const detail = await response.text().catch(() => "");
+              throw new Error(`HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 500)}`);
+            }
           }
 
           const bodyText = await response.text();

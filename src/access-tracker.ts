@@ -168,6 +168,9 @@ export function computeEffectiveHalfLife(
   reinforcementFactor: number,
   maxMultiplier: number,
 ): number {
+  // Boundary check: invalid half-life should not produce negative/zero scores
+  if (baseHalfLife <= 0) return baseHalfLife;
+
   // Short-circuit: no reinforcement or no accesses
   if (reinforcementFactor === 0 || accessCount <= 0) {
     return baseHalfLife;

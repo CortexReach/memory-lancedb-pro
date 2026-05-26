@@ -49,7 +49,7 @@ export function createReflectionEventId(params: {
 }): string {
   const safeRunAt = Number.isFinite(params.runAt) ? Math.max(0, Math.floor(params.runAt)) : Date.now();
   const datePart = new Date(safeRunAt).toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
-  const digest = createHash("sha1")
+  const digest = createHash("sha256")
     .update(`${safeRunAt}|${params.sessionKey}|${params.sessionId}|${params.agentId}|${params.command}`)
     .digest("hex")
     .slice(0, 8);

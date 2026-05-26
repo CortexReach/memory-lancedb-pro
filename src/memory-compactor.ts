@@ -140,11 +140,16 @@ export function buildClusters(
   for (const seedIdx of order) {
     if (assigned[seedIdx]) continue;
 
+    // M8 fix: check vector existence BEFORE marking as assigned to avoid
+    // creating single-entry "ghost clusters" for entries without vectors
+    const seedVec = entries[seedIdx].vector;
+    if (seedVec.length === 0) {
+      assigned[seedIdx] = 1; // mark to skip in future iterations
+      continue;
+    }
+
     const cluster: number[] = [seedIdx];
     assigned[seedIdx] = 1;
-
-    const seedVec = entries[seedIdx].vector;
-    if (seedVec.length === 0) continue; // skip entries without vectors
 
     for (let j = 0; j < entries.length; j++) {
       if (assigned[j]) continue;

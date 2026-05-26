@@ -2226,7 +2226,7 @@ const memoryLanceDBProPlugin = {
         : "<NO_SCOPE_FILTER>";
       const cacheKey = `${agentId}::${scopeKey}`;
       const cached = reflectionByAgentCache.get(cacheKey);
-      if (cached && Date.now() - cached.updatedAt < 15_000) return cached;
+      if (cached && Date.now() - cached.updatedAt < 60_000) return cached;
 
       // Prefer reflection-category rows to avoid full-table reads on bypass callers.
       // Fall back to an uncategorized scan only when the category query produced no
@@ -2605,7 +2605,6 @@ const memoryLanceDBProPlugin = {
             );
           }
 
-          const fs_recall = await import('fs'); fs_recall.appendFileSync('/tmp/rerank.log', `[RECALL] query="${recallQuery.slice(0,50)}" limit=${retrieveLimit}\n`);
           const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry({
             query: recallQuery,
             limit: retrieveLimit,

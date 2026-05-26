@@ -24,11 +24,23 @@ async function withFileWriteQueue<T>(filePath: string, action: () => Promise<T>)
   const next = previous.then(() => lock);
   fileWriteQueues.set(filePath, next);
 
-  await previous;
+  // 30-second timeout to prevent indefinite waiting on stalled queue members
+  const timeout = setTimeout(() => {
+    reject(new Error(`File write lock timeout after 30s for: ${filePath}`));
+  }, 30000);
+  let reject: (err: Error) => void = () => {};
+  const racePromise = Promise.race([
+    previous.then(() => lock),
+    new Promise<void>((_, rj) => { reject = rj; }),
+  ]);
+
   try {
+    await racePromise;
+    clearTimeout(timeout);
     return await action();
   } finally {
     release?.();
+    clearTimeout(timeout);
     if (fileWriteQueues.get(filePath) === next) {
       fileWriteQueues.delete(filePath);
     }

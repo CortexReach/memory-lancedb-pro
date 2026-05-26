@@ -33,6 +33,7 @@ const REFLECTION_TRANSIENT_PATTERNS: RegExp[] = [
   /unexpected eof/i,
   /\beconnreset\b/i,
   /\beconnaborted\b/i,
+  /\beconnrefused\b/i,
   /\betimedout\b/i,
   /\bepipe\b/i,
   /connection reset/i,
