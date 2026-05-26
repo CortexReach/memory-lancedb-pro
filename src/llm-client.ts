@@ -304,7 +304,7 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
         const { signal, dispose } = createTimeoutSignal(config.timeoutMs);
         const endpoint = buildOauthEndpoint(config.baseURL, config.oauthProvider);
         try {
-          const response = await fetch(endpoint, {
+          let response = await fetch(endpoint, {
             method: "POST",
             headers: {
               Authorization: `Bearer ${session.accessToken}`,

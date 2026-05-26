@@ -2899,10 +2899,13 @@ const memoryLanceDBProPlugin = {
         __lastRun?: Promise<void>;
       };
 
-      const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = (event, ctx) => {
+      const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = async (event, ctx) => {
         if (!event.success || !event.messages || event.messages.length === 0) {
           return;
         }
+
+        // Serialize: wait for previous capture to finish before starting new one
+        if (agentEndAutoCaptureHook.__lastRun) await agentEndAutoCaptureHook.__lastRun;
 
         // Fire-and-forget: run capture work in the background so the hook
         // returns immediately and does not hold the session lock.  Blocking
