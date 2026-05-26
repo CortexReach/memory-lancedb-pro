@@ -218,6 +218,13 @@ function isExplicitDenyAllScopeFilter(scopeFilter?: string[]): boolean {
   return Array.isArray(scopeFilter) && scopeFilter.length === 0;
 }
 
+function hasFtsIndex(indices: unknown): boolean {
+  return Array.isArray(indices) && indices.some((idx: any) =>
+    idx?.indexType === "FTS" ||
+    (Array.isArray(idx?.columns) && idx.columns.includes("text")),
+  );
+}
+
 function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight: number }>): number {
   const normalizedQuery = normalizeSearchText(query);
   if (!normalizedQuery) return 0;
@@ -418,6 +425,7 @@ export class MemoryStore {
   private table: LanceDB.Table | null = null;
   private initPromise: Promise<void> | null = null;
   private ftsIndexCreated = false;
+  private _lastFtsError: string | null = null;
   private updateQueue: Promise<void> = Promise.resolve();
 
   // Cross-call batch accumulator（Issue #690）
@@ -705,12 +713,14 @@ export class MemoryStore {
     try {
       await this.createFtsIndex(table);
       this.ftsIndexCreated = true;
+      this._lastFtsError = null;
     } catch (err) {
       console.warn(
         "Failed to create FTS index, falling back to vector-only search:",
         err,
       );
       this.ftsIndexCreated = false;
+      this._lastFtsError = err instanceof Error ? err.message : String(err);
     }
 
     this.db = db;
@@ -832,11 +842,8 @@ export class MemoryStore {
     try {
       // Check if FTS index already exists
       const indices = await table.listIndices();
-      const hasFtsIndex = indices?.some(
-        (idx: any) => idx.indexType === "FTS" || idx.columns?.includes("text"),
-      );
 
-      if (!hasFtsIndex) {
+      if (!hasFtsIndex(indices)) {
         // LanceDB @lancedb/lancedb >=0.26: use Index.fts() config
         const lancedb = await loadLanceDB();
         await table.createIndex("text", {
@@ -1415,7 +1422,7 @@ export class MemoryStore {
     // Over-fetch when filtering inactive records to avoid crowding
     const fetchLimit = inactiveFilter ? Math.min(safeLimit * 20, 200) : safeLimit;
 
-    if (!this.ftsIndexCreated) {
+    if (!this.ftsIndexCreated && !(await this.refreshFtsSupportFromTable())) {
       return this.lexicalFallbackSearch(query, safeLimit, scopeFilter, options);
     }
 
@@ -1693,6 +1700,7 @@ export class MemoryStore {
     categoryCounts: Record<string, number>;
   }> {
     await this.ensureInitialized();
+    await this.refreshFtsSupportFromTable();
 
     if (isExplicitDenyAllScopeFilter(scopeFilter)) {
       return {
@@ -1945,11 +1953,29 @@ export class MemoryStore {
     return this.ftsIndexCreated;
   }
 
-  /** Last FTS error for diagnostics */
-  private _lastFtsError: string | null = null;
-
   get lastFtsError(): string | null {
     return this._lastFtsError;
+  }
+
+  private async refreshFtsSupportFromTable(): Promise<boolean> {
+    if (!this.table) return this.ftsIndexCreated;
+
+    try {
+      const indices = await this.table.listIndices();
+      const available = hasFtsIndex(indices);
+      this.ftsIndexCreated = available;
+      if (available) this._lastFtsError = null;
+      return available;
+    } catch (err) {
+      this.ftsIndexCreated = false;
+      this._lastFtsError = err instanceof Error ? err.message : String(err);
+      return false;
+    }
+  }
+
+  async refreshFtsSupport(): Promise<boolean> {
+    await this.ensureInitialized();
+    return this.refreshFtsSupportFromTable();
   }
 
   /** Get FTS index health status */

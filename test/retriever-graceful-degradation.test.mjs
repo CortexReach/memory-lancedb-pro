@@ -17,7 +17,7 @@ function buildResult(id = "memory-1", text = "test result") {
       category: "other",
       scope: "global",
       importance: 0.7,
-      timestamp: 1700000000000,
+      timestamp: Date.now(),
       metadata: "{}",
     },
     score: 0.9,
@@ -100,6 +100,39 @@ describe("Retriever Graceful Degradation (Promise.allSettled)", () => {
       retriever.getLastDiagnostics()?.bm25ResultCount,
       0,
     );
+  });
+
+  it("refreshes FTS support before choosing the retrieval mode", async () => {
+    let refreshCalls = 0;
+    const { retriever, bm25Queries } = createRetrieverHarness(
+      { rerank: "none", hardMinScore: 0, filterNoise: false },
+      {
+        hasFtsSupport: false,
+        async refreshFtsSupport() {
+          refreshCalls += 1;
+          return true;
+        },
+        async vectorSearch() {
+          return [];
+        },
+        async bm25Search(query) {
+          bm25Queries.push(query);
+          return [buildResult("memory-fts", "literal token recovered through BM25")];
+        },
+      },
+    );
+
+    const results = await retriever.retrieve({
+      query: "literal token",
+      limit: 1,
+      source: "manual",
+    });
+
+    assert.equal(refreshCalls, 1);
+    assert.equal(bm25Queries.length, 1);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].entry.id, "memory-fts");
+    assert.equal(results[0].sources.bm25?.rank, 1);
   });
 
   it("uses vector-only results when BM25 fails", async () => {

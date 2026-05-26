@@ -5,11 +5,14 @@ import jitiFactory from "jiti";
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { MemoryStore } = jiti("../src/store.ts");
 
-function makeProjectionEmptyTable(rows) {
+function makeProjectionEmptyTable(rows, getIndices = () => []) {
   const calls = { projected: 0, unprojected: 0 };
 
   return {
     calls,
+    async listIndices() {
+      return getIndices();
+    },
     query() {
       const builder = {
         where() {
@@ -71,5 +74,24 @@ describe("MemoryStore list/stats projection fallback", () => {
 
     assert.equal(fakeTable.calls.projected, 2);
     assert.equal(fakeTable.calls.unprojected, 2);
+  });
+
+  it("refreshes cached FTS support during stats", async () => {
+    let indices = [];
+    const fakeTable = makeProjectionEmptyTable([], () => indices);
+    const store = new MemoryStore({ dbPath: "/unused", vectorDim: 3 });
+    store.table = fakeTable;
+    store.ftsIndexCreated = false;
+
+    assert.equal(store.hasFtsSupport, false);
+
+    indices = [{ indexType: "FTS", columns: ["text"] }];
+
+    assert.deepEqual(await store.stats(), {
+      totalCount: 0,
+      scopeCounts: {},
+      categoryCounts: {},
+    });
+    assert.equal(store.hasFtsSupport, true);
   });
 });
