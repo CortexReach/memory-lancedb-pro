@@ -176,6 +176,44 @@ describe("systemSessionMemory before_reset", { concurrency: false }, () => {
     );
   });
 
+  it("stores only one session-summary row for concurrent /new events for the same session", async () => {
+    const dbPath = path.join(workDir, "db-concurrent-idempotent");
+    const logs = [];
+    const api = createApiHarness({ dbPath, embeddingBaseURL });
+    api.logger.debug = (message) => logs.push(["debug", message]);
+    api.logger.warn = (message) => logs.push(["warn", message]);
+
+    memoryLanceDBProPlugin.register(api);
+
+    const event = {
+      reason: "new",
+      messages: [
+        { role: "user", content: "Concurrent reset hooks should not duplicate this." },
+        { role: "assistant", content: "Only one summary should survive." },
+      ],
+    };
+    const ctx = {
+      agentId: "main",
+      sessionKey: "agent:main:telegram:group:-100123:topic:100",
+      sessionId: "session-concurrent-idempotent",
+      workspaceDir: workDir,
+    };
+
+    await Promise.all([
+      api.hooks.before_reset(event, ctx),
+      api.hooks.before_reset(event, ctx),
+      api.hooks.before_reset(event, ctx),
+    ]);
+
+    const store = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const entries = await store.list(undefined, undefined, 10, 0);
+    assert.equal(entries.length, 1, JSON.stringify(logs));
+    assert.equal(
+      logs.filter(([, message]) => message.includes("duplicate session summary skipped")).length,
+      2,
+    );
+  });
+
   it("skips writes for /reset", async () => {
     const dbPath = path.join(workDir, "db-reset");
     const api = createApiHarness({ dbPath, embeddingBaseURL });
