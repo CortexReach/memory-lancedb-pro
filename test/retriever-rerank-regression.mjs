@@ -132,6 +132,69 @@ await runTeiScenario();
 
 console.log("OK: rerank regression test passed");
 
+async function runRerankTopNCapScenario() {
+  const entries = Array.from({ length: 6 }, (_, index) => ({
+    ...entry,
+    id: `rerank-topn-${index}`,
+    text: `candidate ${index}`,
+  }));
+  const store = {
+    hasFtsSupport: true,
+    async vectorSearch() {
+      return entries.map((candidate, index) => ({
+        entry: candidate,
+        score: 0.9 - index * 0.05,
+      }));
+    },
+    async bm25Search() {
+      return [];
+    },
+    async hasId(id) {
+      return entries.some((candidate) => candidate.id === id);
+    },
+  };
+  const originalFetch = globalThis.fetch;
+  let capturedBody;
+
+  globalThis.fetch = async (_url, init) => {
+    capturedBody = JSON.parse(init.body);
+    return {
+      ok: true,
+      async json() {
+        return {
+          results: [
+            { index: 0, relevance_score: 0.99 },
+            { index: 1, relevance_score: 0.98 },
+          ],
+        };
+      },
+    };
+  };
+
+  try {
+    const retriever = createRetriever(store, fakeEmbedder, {
+      ...retrieverConfig,
+      candidatePoolSize: 2,
+      minScore: 0,
+      hardMinScore: 0,
+    });
+    await retriever.retrieve({
+      query: "topN cap",
+      limit: 5,
+      scopeFilter: ["global"],
+    });
+
+    assert.equal(capturedBody.documents.length, entries.length);
+    assert.equal(capturedBody.top_n, 2, "rerank top_n should be capped by candidatePoolSize");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+await runRerankTopNCapScenario();
+
+console.log("OK: rerank topN cap test passed");
+
 async function runRerankFallbackDiagnosticsScenario() {
   const originalFetch = globalThis.fetch;
   const originalWarn = console.warn;

@@ -1283,6 +1283,10 @@ export class MemoryRetriever {
         const endpoint =
           this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
         const documents = results.map((r) => r.entry.text);
+        const rerankTopN = Math.min(
+          results.length,
+          Math.max(1, this.config.candidatePoolSize),
+        );
 
         // Build provider-specific request
         const { headers, body } = buildRerankRequest(
@@ -1291,7 +1295,7 @@ export class MemoryRetriever {
           model,
           query,
           documents,
-          results.length,
+          rerankTopN,
         );
 
         // Timeout: configurable via rerankTimeoutMs (default: 5000ms)
