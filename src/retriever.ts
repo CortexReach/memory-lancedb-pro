@@ -1282,6 +1282,7 @@ export class MemoryRetriever {
               "Rerank API: invalid response shape, falling back to cosine",
             );
           } else {
+            const fs = await import('fs'); fs.appendFileSync('/tmp/rerank.log', `[RERANK CALLED] provider=${provider} model=${model} endpoint=${endpoint} docs=${results.length} score=${parsed[0]?.score?.toFixed(4)}\n`);
             // Build a Set of returned indices to identify unreturned candidates
             const returnedIndices = new Set(parsed.map((r) => r.index));
 
@@ -1322,12 +1323,11 @@ export class MemoryRetriever {
           }
         } else {
           const errText = await response.text().catch(() => "");
-          console.warn(
-            `Rerank API returned ${response.status}: ${errText.slice(0, 200)}, falling back to cosine`,
-          );
+          const fs2 = await import('fs'); fs2.appendFileSync('/tmp/rerank.log', `[RERANK FAILED] provider=${provider} endpoint=${endpoint} status=${response.status} err=${errText.slice(0,100)}\n`);
         }
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
+          const fs3 = await import('fs'); fs3.appendFileSync('/tmp/rerank.log', `[RERANK TIMEOUT] provider=${provider} endpoint=${endpoint}\n`);
           console.warn(`Rerank API timed out (${this.config.rerankTimeoutMs ?? 5000}ms), falling back to cosine`);
         } else {
           console.warn("Rerank API failed, falling back to cosine:", error);

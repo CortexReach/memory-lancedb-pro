@@ -157,6 +157,7 @@ interface EmbeddingCapabilities {
 
 // Known embedding model dimensions
 const EMBEDDING_DIMENSIONS: Record<string, number> = {
+  "text-embedding-v4": 2048,
   "text-embedding-3-small": 1536,
   "text-embedding-3-large": 3072,
   "text-embedding-004": 768,
@@ -584,6 +585,8 @@ export class Embedder {
     return /localhost:11434|127\.0\.0\.1:11434|\/ollama\b/i.test(this._baseURL);
   }
 
+
+
   /**
    * Call embeddings.create using native fetch (bypasses OpenAI SDK).
    * Used exclusively for Ollama endpoints where AbortController must work
@@ -698,10 +701,11 @@ export class Embedder {
         if (error instanceof Error && error.name === 'AbortError') {
           throw error;
         }
-        // Ollama errors bubble up without retry (Ollama doesn't rate-limit locally)
         throw error;
       }
     }
+
+
 
     const maxAttempts = this.clients.length;
     let lastError: Error | undefined;

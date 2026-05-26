@@ -1195,7 +1195,7 @@ export class SmartExtractor {
             tier: "working",
             access_count: 0,
             confidence: 0.7,
-            source_session: sessionKey,
+            source_session: sessionKey.replace(/:ou_[a-zA-Z0-9_-]+/, ""),
             source: "auto-capture",
             state: "confirmed", // #350: write confirmed to unblock auto-recall
             memory_layer: "working",
@@ -1295,8 +1295,8 @@ export class SmartExtractor {
       tier: "working" as const,
       access_count: 0,
       confidence: 0.7,
+      source_session: sessionKey.replace(/:ou_[a-zA-Z0-9_-]+/, ""),
       last_accessed_at: Date.now(),
-      source_session: sessionKey,
       source: "auto-capture" as const,
       state: "confirmed" as const, // #350: write confirmed to unblock auto-recall
       memory_layer: "working" as const,
@@ -1365,8 +1365,8 @@ export class SmartExtractor {
       tier: "working" as const,
       access_count: 0,
       confidence: 0.7,
+      source_session: sessionKey.replace(/:ou_[a-zA-Z0-9_-]+/, ""),
       last_accessed_at: Date.now(),
-      source_session: sessionKey,
       source: "auto-capture" as const,
       state: "confirmed" as const, // #350: write confirmed to unblock auto-recall
       memory_layer: "working" as const,
@@ -1427,8 +1427,7 @@ export class SmartExtractor {
           tier: "working",
           access_count: 0,
           confidence: 0.7,
-          source_session: sessionKey,
-          source: "auto-capture",
+          source_session: sessionKey.replace(/:ou_[a-zA-Z0-9_-]+/, ""),
           state: "confirmed", // #350: write confirmed to unblock auto-recall
           memory_layer: "working",
           injected_count: 0,

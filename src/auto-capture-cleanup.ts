@@ -1,3 +1,7 @@
+// Feishu inbound format: [message_id: xxx]\nou_xxx: actual content
+const FEISHU_MESSAGE_ID_LINE_RE = /^\[message_id:\s*[a-z0-9_]+\]\s*\n?/im;
+const FEISHU_SENDER_ID_LINE_RE = /^[a-zA-Z0-9_-]{10,50}:\s*/;
+
 const AUTO_CAPTURE_INBOUND_META_SENTINELS = [
   "Conversation info (untrusted metadata):",
   "Sender (untrusted metadata):",
@@ -134,6 +138,16 @@ export function stripAutoCaptureInjectedPrefix(role: string, text: string): stri
   normalized = stripAutoCaptureSessionResetPrefix(normalized);
   normalized = stripLeadingInboundMetadata(normalized);
   normalized = stripAutoCaptureAddressingPrefix(normalized);
+  // Strip Feishu message_id prefix line and bare sender ID prefix
+  const before = normalized;
+  normalized = normalized.replace(FEISHU_MESSAGE_ID_LINE_RE, "");
+  const firstLine = normalized.split("\n")[0];
+  if (FEISHU_SENDER_ID_LINE_RE.test(firstLine)) {
+    normalized = normalized.replace(FEISHU_SENDER_ID_LINE_RE, "").trimStart();
+  }
+  if (normalized !== before) {
+    normalized = normalized.replace(/\n{3,}/g, "\n\n").trim();
+  }
   normalized = stripLeadingRuntimeWrappers(normalized);
   normalized = stripLeadingInboundMetadata(normalized);
   normalized = normalized.replace(/\n{3,}/g, "\n\n");

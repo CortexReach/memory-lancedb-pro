@@ -189,6 +189,8 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
   return {
     async completeJson<T>(prompt: string, label = "generic"): Promise<T | null> {
       lastError = null;
+      // Retry up to 2 times on timeout
+      for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const response = await client.chat.completions.create({
           model: config.model,
@@ -249,11 +251,20 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
           return null;
         }
       } catch (err) {
+        const isTimeout = err instanceof Error && (err.message.includes('timed out') || err.message.includes('aborted'));
+        if (isTimeout && attempt < 1) {
+          // Retry once on timeout with a fresh client
+          log(`memory-lancedb-pro: llm-client [${label}] timed out, retrying (attempt ${attempt + 1}/2)`);
+          continue;
+        }
         lastError =
           `memory-lancedb-pro: llm-client [${label}] request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
         (warnLog ?? log)(lastError);
         return null;
       }
+      break; // Success — exit retry loop
+      }
+      return null; // All retries exhausted
     },
     getLastError(): string | null {
       return lastError;

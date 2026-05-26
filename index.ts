@@ -4194,6 +4194,7 @@ const memoryLanceDBProPlugin = {
         // Storage Maintenance (LanceDB version snapshot auto-cleanup)
         // ====================================================================
         let maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+        /* Module-level timer for shutdown access */
 
         async function runStorageMaintenance() {
           try {
