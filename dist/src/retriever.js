@@ -329,6 +329,13 @@ export class MemoryRetriever {
     getStatsCollector() {
         return this._statsCollector;
     }
+    async resolveFtsSupport() {
+        const storeWithRefresh = this.store;
+        if (typeof storeWithRefresh.refreshFtsSupport === "function") {
+            return await storeWithRefresh.refreshFtsSupport();
+        }
+        return this.store.hasFtsSupport;
+    }
     async retrieve(context) {
         const { query, limit, scopeFilter, category, source } = context;
         const safeLimit = clampInt(limit, 1, 20);
@@ -363,13 +370,16 @@ export class MemoryRetriever {
         try {
             // Create trace only when stats collector is active (zero overhead otherwise)
             const trace = this._statsCollector ? new TraceCollector() : undefined;
+            const hasFtsSupport = this.config.mode === "vector"
+                ? this.store.hasFtsSupport
+                : await this.resolveFtsSupport();
             // Check if query contains tag prefixes -> use BM25-only + mustContain
             const tagTokens = this.extractTagTokens(query);
             let results;
             if (tagTokens.length > 0) {
                 results = await this.bm25OnlyRetrieval(query, tagTokens, safeLimit, scopeFilter, category, trace, diagnostics);
             }
-            else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
+            else if (this.config.mode === "vector" || !hasFtsSupport) {
                 results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, trace, diagnostics);
             }
             else {
@@ -381,7 +391,7 @@ export class MemoryRetriever {
             if (trace && this._statsCollector) {
                 const mode = tagTokens.length > 0
                     ? "bm25"
-                    : (this.config.mode === "vector" || !this.store.hasFtsSupport)
+                    : (this.config.mode === "vector" || !hasFtsSupport)
                         ? "vector"
                         : "hybrid";
                 const finalTrace = trace.finalize(query, mode);
@@ -412,17 +422,20 @@ export class MemoryRetriever {
         const trace = new TraceCollector();
         const tagTokens = this.extractTagTokens(query);
         let results;
+        const hasFtsSupport = this.config.mode === "vector"
+            ? this.store.hasFtsSupport
+            : await this.resolveFtsSupport();
         if (tagTokens.length > 0) {
             results = await this.bm25OnlyRetrieval(query, tagTokens, safeLimit, scopeFilter, category, trace);
         }
-        else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
+        else if (this.config.mode === "vector" || !hasFtsSupport) {
             results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, trace);
         }
         else {
             results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, trace);
         }
         const mode = tagTokens.length > 0 ? "bm25"
-            : (this.config.mode === "vector" || !this.store.hasFtsSupport) ? "vector" : "hybrid";
+            : (this.config.mode === "vector" || !hasFtsSupport) ? "vector" : "hybrid";
         const finalTrace = trace.finalize(query, mode);
         if (this._statsCollector) {
             this._statsCollector.recordQuery(finalTrace, source || "debug");
@@ -1293,14 +1306,14 @@ export class MemoryRetriever {
             return {
                 success: true,
                 mode: this.config.mode,
-                hasFtsSupport: this.store.hasFtsSupport,
+                hasFtsSupport: await this.resolveFtsSupport(),
             };
         }
         catch (error) {
             return {
                 success: false,
                 mode: this.config.mode,
-                hasFtsSupport: this.store.hasFtsSupport,
+                hasFtsSupport: await this.resolveFtsSupport(),
                 error: error instanceof Error ? error.message : String(error),
             };
         }

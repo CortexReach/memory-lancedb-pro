@@ -16,7 +16,7 @@ import { spawn } from "node:child_process";
 // so we downgrade them to debug level when running in CLI mode.
 const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 // Import core components
-import { MemoryStore, normalizeStoragePath, validateStoragePath } from "./src/store.js";
+import { MemoryStore, normalizeStoragePath } from "./src/store.js";
 import { createEmbedder, getEffectiveVectorDimensions, } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
@@ -1004,16 +1004,7 @@ function buildReflectionFallbackText() {
         "- (none captured)",
         "",
         "## Learning governance candidates (.learnings / promotion / skill extraction)",
-        "### Entry 1",
-        "**Priority**: medium",
-        "**Status**: triage",
-        "**Area**: config",
-        "### Summary",
-        "Investigate last failed tool execution and decide whether it belongs in .learnings/ERRORS.md.",
-        "### Details",
-        "The reflection pipeline fell back; confirm the failure is reproducible before treating it as a durable error record.",
-        "### Suggested Action",
-        "Reproduce the latest failed tool execution, classify it as triage or error, and then log it with the appropriate tool/file path evidence.",
+        "- (none captured)",
         "",
         "## Open loops / next actions",
         "- Investigate why embedded reflection generation failed.",
@@ -1500,15 +1491,13 @@ let _singletonState = null;
 function _initPluginState(api) {
     const config = parsePluginConfig(api.pluginConfig);
     let resolvedDbPath = normalizeStoragePath(api.resolvePath(config.dbPath || getDefaultDbPath()));
-    try {
-        resolvedDbPath = validateStoragePath(resolvedDbPath);
-    }
-    catch (err) {
-        api.logger.warn(`memory-lancedb-pro: storage path issue — ${String(err)}\n` +
-            `  The plugin will still attempt to start, but writes may fail.`);
-    }
     const vectorDim = getEffectiveVectorDimensions(config.embedding.model || "text-embedding-3-small", config.embedding.dimensions, config.embedding.requestDimensions);
-    const store = new MemoryStore({ dbPath: resolvedDbPath, vectorDim });
+    const store = new MemoryStore({
+        dbPath: resolvedDbPath,
+        vectorDim,
+        disableNativeCosine: config.retrieval?.disableNativeCosine === true,
+        onStoragePathWarning: (message) => api.logger.warn(message),
+    });
     const embedder = createEmbedder({
         provider: "openai-compatible",
         apiKey: config.embedding.apiKey,
@@ -1521,6 +1510,7 @@ function _initPluginState(api) {
         taskPassage: config.embedding.taskPassage,
         normalized: config.embedding.normalized,
         chunking: config.embedding.chunking,
+        clientTimeoutMs: config.embedding.clientTimeoutMs,
     });
     const decayEngine = createDecayEngine({
         ...DEFAULT_DECAY_CONFIG,
@@ -3373,7 +3363,9 @@ const memoryLanceDBProPlugin = {
                     if (!writeOk) {
                         throw new Error(`Failed to allocate unique reflection file for ${dateStr} ${timeCompact}`);
                     }
-                    const reflectionGovernanceCandidates = extractReflectionLearningGovernanceCandidates(reflectionText);
+                    const reflectionGovernanceCandidates = reflectionGenerated.usedFallback
+                        ? []
+                        : extractReflectionLearningGovernanceCandidates(reflectionText);
                     if (config.selfImprovement?.enabled !== false && reflectionGovernanceCandidates.length > 0) {
                         for (const candidate of reflectionGovernanceCandidates) {
                             const appendResult = await appendSelfImprovementEntry({
@@ -3705,7 +3697,7 @@ const memoryLanceDBProPlugin = {
                 const runStartupChecks = async () => {
                     try {
                         // Test components (bounded time)
-                        const embedTest = await withTimeout(embedder.test(), 8_000, "embedder.test()");
+                        const embedTest = await withTimeout(embedder.test({ timeoutMs: 7_500 }), 8_000, "embedder.test()");
                         const retrievalTest = await withTimeout(retriever.test(), 8_000, "retriever.test()");
                         api.logger.info(`memory-lancedb-pro: initialized successfully ` +
                             `(embedding: ${embedTest.success ? "OK" : "FAIL"}, ` +
@@ -3846,6 +3838,7 @@ export function parsePluginConfig(value) {
             chunking: typeof embedding.chunking === "boolean"
                 ? embedding.chunking
                 : undefined,
+            clientTimeoutMs: parsePositiveInt(embedding.clientTimeoutMs),
         },
         dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
         autoCapture: cfg.autoCapture !== false,
