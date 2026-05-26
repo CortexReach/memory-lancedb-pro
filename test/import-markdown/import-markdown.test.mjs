@@ -14,6 +14,7 @@ const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 // ────────────────────────────────────────────────────────────────────────────── Mock implementations ──────────────────────────────────────────────────────────────────────────────
 
 let storedRecords = [];
+let bulkStoreCalls = [];
 
 const mockEmbedder = {
   embedQuery: async (text) => {
@@ -38,14 +39,27 @@ const mockEmbedder = {
     }
     return vec;
   },
+  embedBatchPassage: async (texts) => Promise.all(texts.map((text) => mockEmbedder.embedPassage(text))),
 };
 
 const mockStore = {
   get storedRecords() {
     return storedRecords;
   },
+  get bulkStoreCalls() {
+    return bulkStoreCalls;
+  },
   async store(entry) {
     storedRecords.push({ ...entry });
+  },
+  async bulkStore(entries) {
+    bulkStoreCalls.push(entries.map((entry) => ({ ...entry })));
+    storedRecords.push(...entries.map((entry) => ({ ...entry })));
+    return entries.map((entry, index) => ({
+      ...entry,
+      id: `bulk-${bulkStoreCalls.length}-${index}`,
+      timestamp: Date.now(),
+    }));
   },
   async bm25Search(query, limit = 1, scopeFilter = []) {
     const q = query.toLowerCase();
@@ -59,6 +73,7 @@ const mockStore = {
   },
   reset() {
     storedRecords.length = 0; // Mutate in place to preserve the array reference
+    bulkStoreCalls.length = 0;
   },
 };
 
@@ -249,6 +264,79 @@ describe("import-markdown CLI", () => {
 
       assert.strictEqual(imported, 1);
       assert.strictEqual(mockStore.storedRecords.length, 2); // Two entries, different scopes
+    });
+
+    it("batch imports mixed valid, short, duplicate, and cross-scope bullets", async () => {
+      const isolatedHome = join(tmpdir(), "import-markdown-batch-dedup-test-" + Date.now());
+      const workspaceA = join(isolatedHome, "workspace", "workspace-a");
+      const workspaceB = join(isolatedHome, "workspace", "workspace-b");
+      await mkdir(workspaceA, { recursive: true });
+      await mkdir(workspaceB, { recursive: true });
+      await writeFile(
+        join(workspaceA, "MEMORY.md"),
+        "- Duplicate scoped memory\n- no\n- Fresh workspace A memory\n",
+        "utf-8",
+      );
+      await writeFile(
+        join(workspaceB, "MEMORY.md"),
+        "- Duplicate scoped memory\n- Fresh workspace B memory\n",
+        "utf-8",
+      );
+
+      mockStore.storedRecords.push({
+        text: "Duplicate scoped memory",
+        scope: "workspace-a",
+        category: "other",
+        importance: 0.7,
+        vector: [0.1],
+        metadata: "{}",
+      });
+
+      const batchEmbedder = {
+        batchInputs: [],
+        embedPassageCalls: 0,
+        embedQuery: mockEmbedder.embedQuery,
+        async embedPassage(text) {
+          this.embedPassageCalls++;
+          return mockEmbedder.embedPassage(text);
+        },
+        async embedBatchPassage(texts) {
+          this.batchInputs.push([...texts]);
+          return Promise.all(texts.map((text) => mockEmbedder.embedPassage(text)));
+        },
+      };
+
+      const { imported, skipped, foundFiles } = await runImportMarkdown(
+        { embedder: batchEmbedder, store: mockStore },
+        {
+          openclawHome: isolatedHome,
+          dedup: true,
+        },
+      );
+
+      assert.strictEqual(foundFiles, 2);
+      assert.strictEqual(imported, 3);
+      assert.strictEqual(skipped, 2);
+      assert.deepStrictEqual(batchEmbedder.batchInputs, [
+        ["Fresh workspace A memory"],
+        ["Duplicate scoped memory", "Fresh workspace B memory"],
+      ]);
+      assert.strictEqual(batchEmbedder.embedPassageCalls, 0);
+      assert.strictEqual(mockStore.bulkStoreCalls.length, 2);
+
+      const importedRecords = mockStore.storedRecords.slice(1);
+      assert.deepStrictEqual(
+        importedRecords.map((record) => [record.text, record.scope]),
+        [
+          ["Fresh workspace A memory", "workspace-a"],
+          ["Duplicate scoped memory", "workspace-b"],
+          ["Fresh workspace B memory", "workspace-b"],
+        ],
+      );
+      assert.deepStrictEqual(
+        importedRecords.map((record) => JSON.parse(record.metadata).sourceScope),
+        ["workspace-a", "workspace-b", "workspace-b"],
+      );
     });
   });
 

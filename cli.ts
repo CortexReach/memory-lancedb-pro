@@ -660,6 +660,106 @@ export async function runImportMarkdown(
     ? Math.max(0, Math.min(1, parseFloat(options.importance ?? "0.7")))
     : 0.7;
   const dedupEnabled = !!options.dedup;
+  type PendingMarkdownEntry = {
+    text: string;
+    scope: string;
+    sourceScope: string;
+    filePath: string;
+  };
+  type MarkdownImportEntry = Omit<MemoryEntry, "id" | "timestamp">;
+
+  const buildMarkdownImportEntry = (
+    pending: PendingMarkdownEntry,
+    vector: number[],
+  ): MarkdownImportEntry => ({
+    text: pending.text,
+    vector,
+    importance: importanceDefault,
+    category: "other",
+    scope: pending.scope,
+    metadata: JSON.stringify({ importedFrom: pending.filePath, sourceScope: pending.sourceScope }),
+  });
+
+  const importEntriesIndividually = async (
+    entries: MarkdownImportEntry[],
+  ): Promise<{ imported: number; skipped: number }> => {
+    let importedCount = 0;
+    let skippedCount = 0;
+    for (const entry of entries) {
+      try {
+        await ctx.store.store(entry);
+        importedCount++;
+      } catch (err) {
+        console.warn(`  Failed to import: ${String(entry.text).slice(0, 60)}... — ${err}`);
+        skippedCount++;
+      }
+    }
+    return { imported: importedCount, skipped: skippedCount };
+  };
+
+  const importPendingEntries = async (
+    pendingEntries: PendingMarkdownEntry[],
+  ): Promise<{ imported: number; skipped: number }> => {
+    if (pendingEntries.length === 0) return { imported: 0, skipped: 0 };
+
+    let vectors: number[][];
+    try {
+      vectors = typeof ctx.embedder!.embedBatchPassage === "function"
+        ? await ctx.embedder!.embedBatchPassage(pendingEntries.map((entry) => entry.text))
+        : await Promise.all(pendingEntries.map((entry) => ctx.embedder!.embedPassage(entry.text)));
+    } catch (err) {
+      console.warn(`  [import-markdown] batch embedding failed (${err}); retrying entries individually`);
+      let importedCount = 0;
+      let skippedCount = 0;
+      for (const pending of pendingEntries) {
+        try {
+          const vector = await ctx.embedder!.embedPassage(pending.text);
+          const result = await importEntriesIndividually([buildMarkdownImportEntry(pending, vector)]);
+          importedCount += result.imported;
+          skippedCount += result.skipped;
+        } catch (entryErr) {
+          console.warn(`  Failed to import: ${pending.text.slice(0, 60)}... — ${entryErr}`);
+          skippedCount++;
+        }
+      }
+      return { imported: importedCount, skipped: skippedCount };
+    }
+
+    if (vectors.length !== pendingEntries.length) {
+      console.warn(
+        `  [import-markdown] batch embedding returned ${vectors.length}/${pendingEntries.length} vector(s); retrying entries individually`,
+      );
+      let importedCount = 0;
+      let skippedCount = 0;
+      for (const pending of pendingEntries) {
+        try {
+          const vector = await ctx.embedder!.embedPassage(pending.text);
+          const result = await importEntriesIndividually([buildMarkdownImportEntry(pending, vector)]);
+          importedCount += result.imported;
+          skippedCount += result.skipped;
+        } catch (entryErr) {
+          console.warn(`  Failed to import: ${pending.text.slice(0, 60)}... — ${entryErr}`);
+          skippedCount++;
+        }
+      }
+      return { imported: importedCount, skipped: skippedCount };
+    }
+
+    const entries = pendingEntries.map((pending, index) =>
+      buildMarkdownImportEntry(pending, vectors[index]),
+    );
+
+    if (typeof ctx.store.bulkStore === "function") {
+      try {
+        await ctx.store.bulkStore(entries);
+        return { imported: entries.length, skipped: 0 };
+      } catch (err) {
+        console.warn(`  [import-markdown] batch store failed (${err}); retrying entries individually`);
+      }
+    }
+
+    return importEntriesIndividually(entries);
+  };
 
   // Parse each file for memory entries (lines starting with "- ")
   for (const { filePath, scope: discoveredScope } of mdFiles) {
@@ -679,13 +779,15 @@ export async function runImportMarkdown(
     content = content.replace(/^\uFEFF/, "");
     // Normalize line endings: handle both CRLF (\r\n) and LF (\n)
     const lines = content.split(/\r?\n/);
+    const pendingEntries: PendingMarkdownEntry[] = [];
+    let fileSkipped = 0;
 
     for (const line of lines) {
       // Skip non-memory lines
       // Supports: "- text", "* text", "+ text" (standard Markdown bullet formats)
       if (!/^[-*+]\s/.test(line)) continue;
       const text = line.slice(2).trim();
-      if (text.length < minTextLength) { skipped++; continue; }
+      if (text.length < minTextLength) { skipped++; fileSkipped++; continue; }
 
       // Use --scope if provided, otherwise fall back to per-file discovered scope.
       // This prevents cross-workspace leakage: without --scope, each workspace
@@ -699,6 +801,7 @@ export async function runImportMarkdown(
           const existing = await ctx.store.bm25Search(text, 5, [effectiveScope]);
           if (existing.length > 0 && existing[0].entry.text === text) {
             skipped++;
+            fileSkipped++;
             if (!options.dryRun) {
               console.log(`  [skip] already imported: ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`);
             }
@@ -716,20 +819,19 @@ export async function runImportMarkdown(
         continue;
       }
 
-      try {
-        const vector = await ctx.embedder!.embedPassage(text);
-        await ctx.store.store({
-          text,
-          vector,
-          importance: importanceDefault,
-          category: "other",
-          scope: effectiveScope,
-          metadata: JSON.stringify({ importedFrom: filePath, sourceScope: discoveredScope }),
-        });
-        imported++;
-      } catch (err) {
-        console.warn(`  Failed to import: ${text.slice(0, 60)}... — ${err}`);
-        skipped++;
+      pendingEntries.push({ text, scope: effectiveScope, sourceScope: discoveredScope, filePath });
+    }
+
+    if (!options.dryRun) {
+      const result = await importPendingEntries(pendingEntries);
+      imported += result.imported;
+      skipped += result.skipped;
+      fileSkipped += result.skipped;
+      if (pendingEntries.length > 0 || fileSkipped > 0) {
+        console.log(
+          `  [import-markdown] ${path.basename(filePath)}: ` +
+          `${result.imported} imported, ${fileSkipped} skipped`,
+        );
       }
     }
   }
