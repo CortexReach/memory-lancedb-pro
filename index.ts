@@ -2899,20 +2899,20 @@ const memoryLanceDBProPlugin = {
         __lastRun?: Promise<void>;
       };
 
-      const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = async (event, ctx) => {
+      const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = (event, ctx) => {
         if (!event.success || !event.messages || event.messages.length === 0) {
           return;
         }
-
-        // Serialize: wait for previous capture to finish before starting new one
-        if (agentEndAutoCaptureHook.__lastRun) await agentEndAutoCaptureHook.__lastRun;
 
         // Fire-and-forget: run capture work in the background so the hook
         // returns immediately and does not hold the session lock.  Blocking
         // here causes downstream channel deliveries (e.g. Telegram) to be
         // silently dropped when the session store lock times out.
         // See: https://github.com/CortexReach/memory-lancedb-pro/issues/260
+        // Serialization: chain after previous run to prevent concurrent extraction
+        const prev = agentEndAutoCaptureHook.__lastRun ?? Promise.resolve();
         const backgroundRun = (async () => {
+        await prev;
         try {
           // Feature 7: Check extraction rate limit before any work
           if (extractionRateLimiter.isRateLimited()) {
