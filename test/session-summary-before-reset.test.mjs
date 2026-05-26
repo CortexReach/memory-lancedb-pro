@@ -9,6 +9,7 @@ import jitiFactory from "jiti";
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const pluginModule = jiti("../index.ts");
 const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
+const resetRegistration = pluginModule.resetRegistration ?? (() => {});
 const { MemoryStore } = jiti("../src/store.ts");
 
 const EMBEDDING_DIMENSIONS = 4;
@@ -79,12 +80,13 @@ function createApiHarness({ dbPath, embeddingBaseURL }) {
   };
 }
 
-describe("systemSessionMemory before_reset", () => {
+describe("systemSessionMemory before_reset", { concurrency: false }, () => {
   let workDir;
   let embeddingServer;
   let embeddingBaseURL;
 
   beforeEach(async () => {
+    resetRegistration();
     workDir = mkdtempSync(path.join(tmpdir(), "memory-session-summary-"));
     embeddingServer = createEmbeddingServer();
     await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
@@ -136,6 +138,42 @@ describe("systemSessionMemory before_reset", () => {
     assert.match(entry.text, /Conversation Summary:/);
     assert.match(entry.text, /user: Need to fix the OAuth endpoint\./);
     assert.match(entry.text, /assistant: Patched the endpoint and verified the login flow\./);
+  });
+
+  it("stores only one session-summary row for repeated /new events for the same session", async () => {
+    const dbPath = path.join(workDir, "db-idempotent");
+    const logs = [];
+    const api = createApiHarness({ dbPath, embeddingBaseURL });
+    api.logger.debug = (message) => logs.push(["debug", message]);
+    api.logger.warn = (message) => logs.push(["warn", message]);
+
+    memoryLanceDBProPlugin.register(api);
+
+    const event = {
+      reason: "new",
+      messages: [
+        { role: "user", content: "Summarize this session exactly once." },
+        { role: "assistant", content: "I will write one summary." },
+      ],
+    };
+    const ctx = {
+      agentId: "main",
+      sessionKey: "agent:main:telegram:group:-100123:topic:99",
+      sessionId: "session-idempotent",
+      workspaceDir: workDir,
+    };
+
+    await api.hooks.before_reset(event, ctx);
+    await api.hooks.before_reset(event, ctx);
+    await api.hooks.before_reset(event, ctx);
+
+    const store = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const entries = await store.list(undefined, undefined, 10, 0);
+    assert.equal(entries.length, 1, JSON.stringify(logs));
+    assert.equal(
+      logs.filter(([, message]) => message.includes("duplicate session summary skipped")).length,
+      2,
+    );
   });
 
   it("skips writes for /reset", async () => {

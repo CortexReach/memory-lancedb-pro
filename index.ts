@@ -4444,6 +4444,21 @@ const memoryLanceDBProPlugin = {
 
     if (config.sessionStrategy === "systemSessionMemory") {
       const sessionMessageCount = config.sessionMemory?.messageCount ?? 15;
+      const SESSION_SUMMARY_GUARD = Symbol.for("openclaw.memory-lancedb-pro.session-summary-guard");
+      const SESSION_SUMMARY_GUARD_TTL_MS = 24 * 60 * 60 * 1000;
+      const getSessionSummaryGuard = (): Map<string, number> => {
+        const g = globalThis as Record<symbol, unknown>;
+        if (!g[SESSION_SUMMARY_GUARD]) g[SESSION_SUMMARY_GUARD] = new Map<string, number>();
+        return g[SESSION_SUMMARY_GUARD] as Map<string, number>;
+      };
+      const pruneSessionSummaryGuard = (now: number) => {
+        const guard = getSessionSummaryGuard();
+        for (const [key, storedAt] of guard) {
+          if (now - storedAt > SESSION_SUMMARY_GUARD_TTL_MS) {
+            guard.delete(key);
+          }
+        }
+      };
 
       const storeSystemSessionSummary = async (params: {
         agentId: string;
@@ -4526,6 +4541,18 @@ const memoryLanceDBProPlugin = {
               ? ctx.sessionId
               : "unknown";
           const source = resolveSourceFromSessionKey(sessionKey);
+          const guardKey = `${defaultScope}::${sessionKey || "(none)"}::${currentSessionId}`;
+          const guard = getSessionSummaryGuard();
+          const now = Date.now();
+          pruneSessionSummaryGuard(now);
+          if (guard.has(guardKey)) {
+            api.logger.debug?.(
+              `session-memory: duplicate session summary skipped for ${currentSessionId} (agent: ${agentId}, scope: ${defaultScope})`,
+            );
+            return;
+          }
+          guard.set(guardKey, now);
+
           const sessionContent =
             summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount) ??
             (typeof event.sessionFile === "string"
@@ -4533,6 +4560,7 @@ const memoryLanceDBProPlugin = {
               : null);
 
           if (!sessionContent) {
+            guard.delete(guardKey);
             api.logger.debug("session-memory: no session content found, skipping");
             return;
           }
@@ -4546,6 +4574,19 @@ const memoryLanceDBProPlugin = {
             sessionContent,
           });
         } catch (err) {
+          const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
+          const agentId = resolveHookAgentId(
+            typeof ctx.agentId === "string" ? ctx.agentId : undefined,
+            sessionKey,
+          );
+          const defaultScope = isSystemBypassId(agentId)
+            ? config.scopes?.default ?? "global"
+            : scopeManager.getDefaultScope(agentId);
+          const currentSessionId =
+            typeof ctx.sessionId === "string" && ctx.sessionId.trim().length > 0
+              ? ctx.sessionId
+              : "unknown";
+          getSessionSummaryGuard().delete(`${defaultScope}::${sessionKey || "(none)"}::${currentSessionId}`);
           api.logger.warn(`session-memory: failed to save: ${String(err)}`);
         }
       });
