@@ -503,6 +503,11 @@
             "default": true,
             "description": "Filter out noise memories (agent denials, meta-questions, boilerplate)"
           },
+          "disableNativeCosine": {
+            "type": "boolean",
+            "default": false,
+            "description": "Disable LanceDB native vector search and rank scoped rows with JavaScript cosine. Enable on AVX-only Linux x64 CPUs that crash with SIGILL in LanceDB native vector search."
+          },
           "lengthNormAnchor": {
             "type": "integer",
             "minimum": 0,
@@ -1695,6 +1700,11 @@
     "retrieval.candidatePoolSize": {
       "label": "Candidate Pool Size",
       "help": "Number of candidates to fetch before fusion and reranking",
+      "advanced": true
+    },
+    "retrieval.disableNativeCosine": {
+      "label": "Disable Native Cosine",
+      "help": "Use a scoped row scan plus JS cosine ranking instead of LanceDB native vector search. Enable on AVX-only Linux x64 CPUs that crash with SIGILL.",
       "advanced": true
     },
     "retrieval.lengthNormAnchor": {

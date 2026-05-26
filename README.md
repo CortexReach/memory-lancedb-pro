@@ -71,7 +71,7 @@ That's the difference an **AI Memory Assistant** makes — it learns your style,
 
 ## Quick Start
 
-> **CPU Requirement:** Your CPU must support **AVX/AVX2** instructions (Intel Sandy Bridge 2011+ / AMD Bulldozer 2011+). LanceDB's native vector engine requires these — on unsupported CPUs the plugin will crash with `SIGILL` (Illegal Instruction). Check with: `grep -o 'avx[^ ]*' /proc/cpuinfo | head -1` (no output = not supported). See [#419](https://github.com/CortexReach/memory-lancedb-pro/issues/419) for details.
+> **CPU Requirement:** Your CPU must support **AVX** instructions. LanceDB native vector search may require **AVX2** on some Linux x64 builds and can crash AVX-only CPUs with `SIGILL`; set `retrieval.disableNativeCosine: true` or `MEMORY_LANCEDB_DISABLE_NATIVE_COSINE=1` to use a scoped row scan plus JavaScript cosine ranking. Check CPU flags with: `grep -o 'avx[^ ]*' /proc/cpuinfo | head -1` (no output = not supported). See [#419](https://github.com/CortexReach/memory-lancedb-pro/issues/419) and [#644](https://github.com/CortexReach/memory-lancedb-pro/issues/644) for details.
 
 ### Option A: One-Click Install Script (Recommended)
 
@@ -478,6 +478,7 @@ Query → BM25 FTS ─────┘
     "recencyHalfLifeDays": 14,
     "recencyWeight": 0.1,
     "filterNoise": true,
+    "disableNativeCosine": false,
     "lengthNormAnchor": 500,
     "hardMinScore": 0.35,
     "timeDecayHalfLifeDays": 60,
@@ -583,6 +584,23 @@ Notes for `llm.auth: "oauth"`:
 - You can set `llm.oauthPath` if you want to store that file somewhere else.
 - `auth login` snapshots the previous api-key `llm` config next to the OAuth file, and `auth logout` restores that snapshot when available.
 - Switching from `api-key` to `oauth` does not automatically carry over `llm.baseURL`. Set it manually in OAuth mode only when you intentionally want a custom ChatGPT/Codex-compatible backend.
+
+</details>
+
+<details>
+<summary><strong>Legacy CPU Fallback</strong></summary>
+
+If an AVX-only Linux x64 host crashes inside LanceDB native vector search with `SIGILL`, disable native cosine and let memory-lancedb-pro scan scoped rows and rank them in JavaScript:
+
+```json
+{
+  "retrieval": {
+    "disableNativeCosine": true
+  }
+}
+```
+
+You can also set `MEMORY_LANCEDB_DISABLE_NATIVE_COSINE=1` for the same behavior.
 
 </details>
 

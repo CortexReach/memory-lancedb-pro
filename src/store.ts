@@ -50,6 +50,8 @@ export interface MemorySearchResult {
 export interface StoreConfig {
   dbPath: string;
   vectorDim: number;
+  /** Disable LanceDB native vector search and rank scanned rows with JS cosine. */
+  disableNativeCosine?: boolean;
   onStoragePathWarning?: (message: string) => void;
 }
 
@@ -232,6 +234,42 @@ function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight
   }
 
   return score;
+}
+
+function parseBooleanEnvFlag(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test((value ?? "").trim());
+}
+
+function toNumberVector(value: unknown): number[] {
+  if (!value || typeof value !== "object") return [];
+
+  const maybeArrayLike = value as ArrayLike<unknown>;
+  if (typeof maybeArrayLike.length !== "number" || maybeArrayLike.length < 0) {
+    return [];
+  }
+
+  const vector = Array.from(maybeArrayLike, (item) => Number(item));
+  return vector.every(Number.isFinite) ? vector : [];
+}
+
+function cosineSimilarity(left: number[], right: number[]): number {
+  if (!Array.isArray(left) || left.length === 0 || right.length !== left.length) return 0;
+
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < left.length; index++) {
+    const l = Number(left[index]);
+    const r = Number(right[index]);
+    if (!Number.isFinite(l) || !Number.isFinite(r)) return 0;
+    dot += l * r;
+    leftNorm += l * l;
+    rightNorm += r * r;
+  }
+
+  const denominator = Math.sqrt(leftNorm) * Math.sqrt(rightNorm);
+  if (denominator <= 0) return 0;
+  return Math.max(-1, Math.min(1, dot / denominator));
 }
 
 // ============================================================================
@@ -419,6 +457,7 @@ export class MemoryStore {
   private initPromise: Promise<void> | null = null;
   private ftsIndexCreated = false;
   private updateQueue: Promise<void> = Promise.resolve();
+  private nativeCosineFallbackLogged = false;
 
   // Cross-call batch accumulator（Issue #690）
   // 多個 concurrent bulkStore() 會先累積在這裡，每 100ms flush 一次，
@@ -448,12 +487,15 @@ export class MemoryStore {
   private static readonly MAX_PENDING_BATCH_SIZE = 1000;
 
   private readonly config: StoreConfig;
+  private readonly disableNativeCosine: boolean;
 
   constructor(config: StoreConfig) {
+    const envDisablesNativeCosine = parseBooleanEnvFlag(process.env.MEMORY_LANCEDB_DISABLE_NATIVE_COSINE);
     this.config = {
       ...config,
       dbPath: normalizeStoragePath(config.dbPath),
     };
+    this.disableNativeCosine = config.disableNativeCosine === true || envDisablesNativeCosine;
   }
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -1346,7 +1388,24 @@ export class MemoryStore {
     const overFetchMultiplier = inactiveFilter ? 20 : 10;
     const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
 
-    let query = this.table!.vectorSearch(vector).distanceType('cosine').limit(fetchLimit);
+    if (this.disableNativeCosine && !this.nativeCosineFallbackLogged) {
+      console.warn(
+        "memory-lancedb-pro: LanceDB native vector cosine disabled; scanning candidates and using JS cosine rerank fallback",
+      );
+      this.nativeCosineFallbackLogged = true;
+    }
+    let query = this.disableNativeCosine
+      ? this.table!.query().select([
+        "id",
+        "text",
+        "vector",
+        "category",
+        "scope",
+        "importance",
+        "timestamp",
+        "metadata",
+      ])
+      : this.table!.vectorSearch(vector).distanceType("cosine").limit(fetchLimit);
 
     // Apply scope filter if provided
     if (scopeFilter && scopeFilter.length > 0) {
@@ -1360,7 +1419,11 @@ export class MemoryStore {
     const mapped: MemorySearchResult[] = [];
 
     for (const row of results) {
-      const distance = Number(row._distance ?? 0);
+      const rowVector = toNumberVector(row.vector);
+      if (rowVector.length !== vector.length) continue;
+      const distance = this.disableNativeCosine
+        ? 1 - cosineSimilarity(vector, rowVector)
+        : Number(row._distance ?? 0);
       const score = 1 / (1 + distance);
 
       if (score < minScore) continue;
@@ -1379,7 +1442,7 @@ export class MemoryStore {
       const entry: MemoryEntry = {
         id: row.id as string,
         text: row.text as string,
-        vector: row.vector as number[],
+        vector: rowVector,
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
         importance: Number(row.importance),
@@ -1394,10 +1457,14 @@ export class MemoryStore {
 
       mapped.push({ entry, score });
 
-      if (mapped.length >= safeLimit) break;
+      if (!this.disableNativeCosine && mapped.length >= safeLimit) break;
     }
 
-    return mapped;
+    if (this.disableNativeCosine) {
+      mapped.sort((a, b) => b.score - a.score);
+    }
+
+    return mapped.slice(0, safeLimit);
   }
 
   async bm25Search(

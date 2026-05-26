@@ -82,6 +82,69 @@ try {
     assert.ok(l2Score < 0.3, `L2 score ${l2Score.toFixed(4)} should be below minScore=0.3`);
     console.log(`  ✅ L2 score = ${l2Score.toFixed(4)} (would drop all results, confirming cosine is needed)`);
 
+    // Test 5: Legacy CPU fallback skips native vector search and reranks with JS cosine.
+    console.log("Test 5: Native cosine fallback reranks candidates in JavaScript...");
+    const fallbackStore = new MemoryStore({
+        dbPath: path.join(workDir, "unused-fallback-db"),
+        vectorDim: 2,
+        disableNativeCosine: true,
+    });
+    const calls = [];
+    const fakeRows = [
+        {
+            id: "orthogonal",
+            text: "orthogonal fallback memory",
+            vector: { 0: 0, 1: 1, length: 2 },
+            category: "fact",
+            scope: "test",
+            importance: 0.5,
+            timestamp: Date.now(),
+            metadata: "{}",
+            _distance: 0,
+        },
+        {
+            id: "similar",
+            text: "similar fallback memory",
+            vector: { 0: 1, 1: 0, length: 2 },
+            category: "fact",
+            scope: "test",
+            importance: 0.5,
+            timestamp: Date.now(),
+            metadata: "{}",
+            _distance: 999,
+        },
+    ];
+    const fakeScanQuery = {
+        select(columns) {
+            calls.push(`select:${columns.join(",")}`);
+            return this;
+        },
+        where(value) {
+            calls.push(`where:${value}`);
+            return this;
+        },
+        async toArray() {
+            return fakeRows;
+        },
+    };
+    fallbackStore.table = {
+        vectorSearch() {
+            calls.push("vectorSearch");
+            throw new Error("native vector search should not be called");
+        },
+        query() {
+            calls.push("query");
+            return fakeScanQuery;
+        },
+    };
+
+    const fallbackResults = await fallbackStore.vectorSearch([1, 0], 2, 0, ["test"]);
+    assert.equal(calls.includes("vectorSearch"), false, "fallback must not call LanceDB native vector search");
+    assert.equal(fallbackResults[0].entry.id, "similar", "JS cosine rerank should move the similar row first");
+    assert.deepEqual(fallbackResults[0].entry.vector, [1, 0], "fallback should normalize LanceDB vector-like values");
+    assert.ok(fallbackResults[0].score > fallbackResults[1].score, "similar row should score above orthogonal row");
+    console.log("  ✅ Native cosine fallback skipped vectorSearch and reranked by JS cosine");
+
     console.log("\n=== All vector-search-cosine tests passed! ===");
 
 } finally {

@@ -169,6 +169,8 @@ interface PluginConfig {
     timeDecayHalfLifeDays?: number;
     reinforcementFactor?: number;
     maxHalfLifeMultiplier?: number;
+    /** Disable LanceDB native vector search and rank scanned rows with JS cosine. */
+    disableNativeCosine?: boolean;
   };
   decay?: {
     recencyHalfLifeDays?: number;
@@ -2012,6 +2014,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const store = new MemoryStore({
     dbPath: resolvedDbPath,
     vectorDim,
+    disableNativeCosine: config.retrieval?.disableNativeCosine === true,
     onStoragePathWarning: (message) => api.logger.warn(message),
   });
   const embedder = createEmbedder({
