@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -242,5 +242,82 @@ describe("reflection hooks tolerate bypass scope filters", () => {
       harness.logs.some(([, msg]) => msg.includes("derived injection suppressed after command:new")),
       "expected derived suppression to be logged",
     );
+  });
+
+  it("does not append learning governance entries when reflection generation falls back", async () => {
+    const pluginConfig = {
+      ...makePluginConfig(workDir),
+      selfImprovement: { enabled: true, beforeResetNote: false, ensureLearningFiles: false },
+      memoryReflection: {
+        storeToLanceDB: false,
+        writeLegacyCombined: false,
+        timeoutMs: 1,
+      },
+    };
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workDir,
+      pluginConfig,
+    });
+    harness.api.runtime = {
+      agent: {
+        async runEmbeddedPiAgent() {
+          throw new Error("forced embedded fallback");
+        },
+      },
+    };
+
+    memoryLanceDBProPlugin.register(harness.api);
+
+    const sessionFile = path.join(workDir, "session.jsonl");
+    writeFileSync(
+      sessionFile,
+      [
+        JSON.stringify({ type: "message", message: { role: "user", content: "Please remember this fallback test." } }),
+        JSON.stringify({ type: "message", message: { role: "assistant", content: "I will reflect on it." } }),
+      ].join("\n"),
+      "utf-8",
+    );
+
+    const originalCliBin = process.env.OPENCLAW_CLI_BIN;
+    process.env.OPENCLAW_CLI_BIN = "/usr/bin/false";
+    try {
+      const commandHooks = harness.eventHandlers.get("command:new") || [];
+      const reflectionCommandHook = commandHooks.find((hook) =>
+        hook.meta?.name === "memory-lancedb-pro.memory-reflection.command-new"
+      );
+      assert.ok(reflectionCommandHook, "expected memory reflection command:new hook");
+
+      await reflectionCommandHook.handler({
+        sessionKey: "agent:main:fallback-learning-noise",
+        timestamp: 1_800_000_000_000,
+        action: "command:new",
+        context: {
+          cfg: pluginConfig,
+          workspaceDir: workDir,
+          sessionEntry: {
+            sessionId: "fallback-session",
+            sessionFile,
+          },
+        },
+      }, { sessionKey: "agent:main:fallback-learning-noise", agentId: "main" });
+    } finally {
+      if (originalCliBin === undefined) delete process.env.OPENCLAW_CLI_BIN;
+      else process.env.OPENCLAW_CLI_BIN = originalCliBin;
+    }
+
+    const learningsPath = path.join(workDir, ".learnings", "LEARNINGS.md");
+    assert.equal(existsSync(learningsPath), false, "fallback reflection should not append .learnings entries");
+
+    const reflectionPath = path.join(
+      workDir,
+      "memory",
+      "reflections",
+      "2027-01-15",
+      "080000000-main-fallback-session.md",
+    );
+    const reflectionBody = readFileSync(reflectionPath, "utf-8");
+    assert.match(reflectionBody, /## Learning governance candidates \(\.learnings \/ promotion \/ skill extraction\)\n- \(none captured\)/);
+    assert.doesNotMatch(reflectionBody, /Investigate last failed tool execution/);
   });
 });

@@ -1355,16 +1355,7 @@ function buildReflectionFallbackText(): string {
     "- (none captured)",
     "",
     "## Learning governance candidates (.learnings / promotion / skill extraction)",
-    "### Entry 1",
-    "**Priority**: medium",
-    "**Status**: triage",
-    "**Area**: config",
-    "### Summary",
-    "Investigate last failed tool execution and decide whether it belongs in .learnings/ERRORS.md.",
-    "### Details",
-    "The reflection pipeline fell back; confirm the failure is reproducible before treating it as a durable error record.",
-    "### Suggested Action",
-    "Reproduce the latest failed tool execution, classify it as triage or error, and then log it with the appropriate tool/file path evidence.",
+    "- (none captured)",
     "",
     "## Open loops / next actions",
     "- Investigate why embedded reflection generation failed.",
@@ -4266,7 +4257,9 @@ const memoryLanceDBProPlugin = {
             throw new Error(`Failed to allocate unique reflection file for ${dateStr} ${timeCompact}`);
           }
 
-          const reflectionGovernanceCandidates = extractReflectionLearningGovernanceCandidates(reflectionText);
+          const reflectionGovernanceCandidates = reflectionGenerated.usedFallback
+            ? []
+            : extractReflectionLearningGovernanceCandidates(reflectionText);
           if (config.selfImprovement?.enabled !== false && reflectionGovernanceCandidates.length > 0) {
             for (const candidate of reflectionGovernanceCandidates) {
               const appendResult = await appendSelfImprovementEntry({
