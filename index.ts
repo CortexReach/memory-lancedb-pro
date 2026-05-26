@@ -4044,6 +4044,7 @@ const memoryLanceDBProPlugin = {
     // ========================================================================
 
     let backupTimer: ReturnType<typeof setInterval> | null = null;
+    let maintenanceTimer: ReturnType<typeof setInterval> | null = null;
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
     async function runBackup() {
@@ -4192,9 +4193,6 @@ const memoryLanceDBProPlugin = {
         // ====================================================================
         // Storage Maintenance (LanceDB version snapshot auto-cleanup)
         // ====================================================================
-        let maintenanceTimer: ReturnType<typeof setInterval> | null = null;
-        /* Module-level timer for shutdown access */
-
         async function runStorageMaintenance() {
           try {
             if (!config.storageMaintenance?.autoCleanup?.enabled) return;
