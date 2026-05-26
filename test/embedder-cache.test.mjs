@@ -67,16 +67,61 @@ async function testCacheSmoke() {
   return true;
 }
 
+async function testOpenAiClientTimeout() {
+  console.log("Testing OpenAI client HTTP timeout and retry policy...");
+
+  const embedder = createEmbedder({
+    provider: "openai-compatible",
+    baseURL: "http://127.0.0.1:9/v1",
+    model: "mxbai-embed-large",
+    apiKey: "test",
+    dimensions: 1024,
+  });
+
+  const timeout = embedder.clients?.[0]?.timeout;
+  if (timeout !== 30_000) {
+    console.error(`FAIL: expected OpenAI client timeout 30000ms, got ${timeout}`);
+    process.exit(1);
+  }
+
+  const maxRetries = embedder.clients?.[0]?.maxRetries;
+  if (maxRetries !== 0) {
+    console.error(`FAIL: expected OpenAI client maxRetries 0, got ${maxRetries}`);
+    process.exit(1);
+  }
+
+  const customTimeoutEmbedder = createEmbedder({
+    provider: "openai-compatible",
+    baseURL: "http://127.0.0.1:9/v1",
+    model: "mxbai-embed-large",
+    apiKey: "test",
+    dimensions: 1024,
+    clientTimeoutMs: 12_000,
+  });
+
+  const customTimeout = customTimeoutEmbedder.clients?.[0]?.timeout;
+  if (customTimeout !== 12_000) {
+    console.error(`FAIL: expected custom OpenAI client timeout 12000ms, got ${customTimeout}`);
+    process.exit(1);
+  }
+
+  console.log("PASS  OpenAI client timeout: " + timeout + "ms");
+  console.log("PASS  OpenAI client maxRetries: " + maxRetries);
+  return true;
+}
+
 async function main() {
   console.log("Running embedder-cache smoke tests...\n");
   
   try {
     await testEmbedderCreation();
     await testCacheSmoke();
+    await testOpenAiClientTimeout();
     
     console.log("\n=== ALL TESTS PASSED ===");
     console.log("embedder creation: OK");
     console.log("cache smoke: OK");
+    console.log("client timeout: OK");
     console.log("Note: Full _evictExpired() on set() requires OLLAMA server");
     process.exit(0);
   } catch (err) {

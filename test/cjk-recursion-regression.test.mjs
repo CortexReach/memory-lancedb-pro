@@ -209,6 +209,40 @@ async function testTimeoutAbortPropagation() {
   console.log("  PASSED\n");
 }
 
+async function testEmbedderHealthCheckTimeout() {
+  console.log("Test 6b: embedder health check aborts before startup gate");
+
+  await withServer(async (_payload, req, res) => {
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    if (req.aborted || req.destroyed) {
+      return;
+    }
+    const dims = 1024;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ data: [{ embedding: Array.from({ length: dims }, () => 0), index: 0 }] }));
+  }, async ({ baseURL }) => {
+    const embedder = new Embedder({
+      provider: "openai-compatible",
+      apiKey: "test-key",
+      model: "mxbai-embed-large",
+      baseURL,
+      dimensions: 1024,
+    });
+
+    const start = Date.now();
+    const result = await embedder.test({ timeoutMs: 150 });
+    const elapsed = Date.now() - start;
+
+    assert.equal(result.success, false, "health check should report failure after abort");
+    assert.ok(
+      elapsed < 1_000,
+      `health check should abort promptly, elapsed=${elapsed}ms`,
+    );
+  });
+
+  console.log("  PASSED\n");
+}
+
 async function testBatchEmbeddingStillWorks() {
   console.log("Test 7: batch embedding still works without withTimeout wrapper");
 
@@ -327,6 +361,7 @@ async function run() {
   await testChunkErrorSurfaced();
   await testSmallContextChunking();
   await testTimeoutAbortPropagation();
+  await testEmbedderHealthCheckTimeout();
   await testBatchEmbeddingStillWorks();
   await testOllamaAbortWithNativeFetch();
   console.log("All regression tests passed!");

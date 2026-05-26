@@ -459,7 +459,8 @@ Query → BM25 FTS ─────┘
     "dimensions": 1024,
     "taskQuery": "retrieval.query",
     "taskPassage": "retrieval.passage",
-    "normalized": true
+    "normalized": true,
+    "clientTimeoutMs": 30000
   },
   "dbPath": "~/.openclaw/memory/lancedb-pro",
   "autoCapture": true,

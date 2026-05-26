@@ -116,6 +116,7 @@ interface PluginConfig {
     taskPassage?: string;
     normalized?: boolean;
     chunking?: boolean;
+    clientTimeoutMs?: number;
   };
   dbPath?: string;
   autoCapture?: boolean;
@@ -2026,6 +2027,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     taskPassage: config.embedding.taskPassage,
     normalized: config.embedding.normalized,
     chunking: config.embedding.chunking,
+    clientTimeoutMs: config.embedding.clientTimeoutMs,
   });
   const decayEngine = createDecayEngine({
     ...DEFAULT_DECAY_CONFIG,
@@ -4662,7 +4664,7 @@ const memoryLanceDBProPlugin = {
           try {
             // Test components (bounded time)
             const embedTest = await withTimeout(
-              embedder.test(),
+              embedder.test({ timeoutMs: 7_500 }),
               8_000,
               "embedder.test()",
             );
@@ -4841,6 +4843,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         typeof embedding.chunking === "boolean"
           ? embedding.chunking
           : undefined,
+      clientTimeoutMs: parsePositiveInt(embedding.clientTimeoutMs),
     },
     dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
     autoCapture: cfg.autoCapture !== false,
