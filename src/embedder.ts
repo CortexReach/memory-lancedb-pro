@@ -94,6 +94,8 @@ export interface EmbeddingConfig {
   taskPassage?: string;
   /** Optional flag to request normalized embeddings (provider-dependent, e.g. Jina v5) */
   normalized?: boolean;
+  /** Optional max chars per embedding input; protects small local embedding servers. */
+  maxInputChars?: number;
 }
 
 // Known embedding model dimensions
@@ -116,6 +118,23 @@ const EMBEDDING_DIMENSIONS: Record<string, number> = {
 // ============================================================================
 // Utility Functions
 // ============================================================================
+
+function defaultMaxInputChars(model: string): number | undefined {
+  // Local llama.cpp embedding servers commonly run with small physical batch
+  // sizes; nomic-embed-text in particular can reject prompts just over 512
+  // tokens. Keep the default conservative for known local models while leaving
+  // hosted/OpenAI models unconstrained unless configured.
+  const normalized = model.toLowerCase();
+  if (normalized.includes("nomic-embed-text")) return 1400;
+  return undefined;
+}
+
+function truncateForEmbedding(text: string, maxChars?: number): string {
+  const trimmed = text.trim();
+  if (!maxChars || trimmed.length <= maxChars) return trimmed;
+  if (maxChars <= 1) return trimmed.slice(0, maxChars);
+  return trimmed.slice(0, maxChars - 1).trimEnd() + "…";
+}
 
 function resolveEnvVars(value: string): string {
   return value.replace(/\$\{([^}]+)\}/g, (_, envVar) => {
@@ -158,6 +177,7 @@ export class Embedder {
 
   /** Optional requested dimensions to pass through to the embedding provider (OpenAI-compatible). */
   private readonly _requestDimensions?: number;
+  private readonly _maxInputChars?: number;
 
   constructor(config: EmbeddingConfig) {
     // Resolve environment variables in API key
@@ -168,6 +188,9 @@ export class Embedder {
     this._taskPassage = config.taskPassage;
     this._normalized = config.normalized;
     this._requestDimensions = config.dimensions;
+    this._maxInputChars = typeof config.maxInputChars === "number" && config.maxInputChars > 0
+      ? Math.floor(config.maxInputChars)
+      : defaultMaxInputChars(config.model);
 
     this.client = new OpenAI({
       apiKey: resolvedApiKey,
@@ -233,9 +256,13 @@ export class Embedder {
   }
 
   private buildPayload(input: string | string[], task?: string): any {
+    const safeInput = Array.isArray(input)
+      ? input.map((item) => truncateForEmbedding(item, this._maxInputChars))
+      : truncateForEmbedding(input, this._maxInputChars);
+
     const payload: any = {
       model: this.model,
-      input,
+      input: safeInput,
       // Force float output to avoid SDK default base64 decoding path.
       encoding_format: "float",
     };
@@ -259,18 +286,20 @@ export class Embedder {
     }
 
     // Check cache first
-    const cached = this._cache.get(text, task);
+    const inputText = truncateForEmbedding(text, this._maxInputChars);
+
+    const cached = this._cache.get(inputText, task);
     if (cached) return cached;
 
     try {
-      const response = await this.client.embeddings.create(this.buildPayload(text, task) as any);
+      const response = await this.client.embeddings.create(this.buildPayload(inputText, task) as any);
       const embedding = response.data[0]?.embedding as number[] | undefined;
       if (!embedding) {
         throw new Error("No embedding returned from provider");
       }
 
       this.validateEmbedding(embedding);
-      this._cache.set(text, task, embedding);
+      this._cache.set(inputText, task, embedding);
       return embedding;
     } catch (error) {
       if (error instanceof Error) {

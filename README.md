@@ -331,7 +331,8 @@ openclaw config get plugins.slots.memory
     "dimensions": 1024,
     "taskQuery": "retrieval.query",
     "taskPassage": "retrieval.passage",
-    "normalized": true
+    "normalized": true,
+    "maxInputChars": 1400
   },
   "dbPath": "~/.openclaw/memory/lancedb-pro",
   "autoCapture": true,
@@ -373,6 +374,28 @@ openclaw config get plugins.slots.memory
 ```
 
 </details>
+
+### OpenClaw hook permissions
+
+Auto-capture uses OpenClaw's conversation hook surface. For non-bundled plugin installs, enable conversation access in your OpenClaw config:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "memory-lancedb-pro": {
+        "hooks": {
+          "allowConversationAccess": true
+        }
+      }
+    }
+  }
+}
+```
+
+Without this, OpenClaw will load recall but block the `agent_end` hook, so new memories will not be captured.
+
+`embedding.maxInputChars` can be set for local embedding servers with small token/batch limits. The plugin applies a conservative default for `nomic-embed-text`.
 
 ### Embedding Providers
 

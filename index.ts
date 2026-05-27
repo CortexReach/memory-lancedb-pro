@@ -30,6 +30,7 @@ interface PluginConfig {
     model?: string;
     baseURL?: string;
     dimensions?: number;
+    maxInputChars?: number;
     taskQuery?: string;
     taskPassage?: string;
     normalized?: boolean;
@@ -310,6 +311,7 @@ const memoryLanceDBProPlugin = {
       model: config.embedding.model || "text-embedding-3-small",
       baseURL: config.embedding.baseURL,
       dimensions: config.embedding.dimensions,
+      maxInputChars: config.embedding.maxInputChars,
       taskQuery: config.embedding.taskQuery,
       taskPassage: config.embedding.taskPassage,
       normalized: config.embedding.normalized,
@@ -598,7 +600,7 @@ const memoryLanceDBProPlugin = {
 
     async function runBackup() {
       try {
-        const backupDir = api.resolvePath(join(resolvedDbPath, "..", "backups"));
+        const backupDir = join(resolvedDbPath, "..", "backups");
         await mkdir(backupDir, { recursive: true });
 
         const allMemories = await store.list(undefined, undefined, 10000, 0);
@@ -729,6 +731,7 @@ function parsePluginConfig(value: unknown): PluginConfig {
       // Accept number, numeric string, or env-var string (e.g. "${EMBED_DIM}").
       // Also accept legacy top-level `dimensions` for convenience.
       dimensions: parsePositiveInt(embedding.dimensions ?? cfg.dimensions),
+      maxInputChars: parsePositiveInt(embedding.maxInputChars ?? cfg.maxInputChars),
       taskQuery: typeof embedding.taskQuery === "string" ? embedding.taskQuery : undefined,
       taskPassage: typeof embedding.taskPassage === "string" ? embedding.taskPassage : undefined,
       normalized: typeof embedding.normalized === "boolean" ? embedding.normalized : undefined,

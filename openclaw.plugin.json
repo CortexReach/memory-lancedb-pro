@@ -40,6 +40,11 @@
           "normalized": {
             "type": "boolean",
             "description": "Request normalized embeddings when supported by the provider (e.g. Jina v5)"
+          },
+          "maxInputChars": {
+            "type": "integer",
+            "minimum": 100,
+            "description": "Maximum characters sent to the embedding provider per input. Useful for local embedding servers with small context/batch limits; omitted uses a model-specific safe default when known."
           }
         },
         "required": [
@@ -230,6 +235,11 @@
             }
           }
         }
+      },
+      "maxInputChars": {
+        "type": "integer",
+        "minimum": 100,
+        "description": "Legacy top-level alias for embedding.maxInputChars."
       }
     },
     "required": [
@@ -398,6 +408,26 @@
       "label": "Normalized Embeddings",
       "help": "Request normalized embeddings when the provider supports it (Jina v5). If unset, the field is not sent.",
       "advanced": true
+    },
+    "embedding.maxInputChars": {
+      "label": "Max Input Characters",
+      "help": "Maximum characters sent to the embedding provider per input. Set lower for local embedding servers with small context/batch limits.",
+      "advanced": true
+    },
+    "maxInputChars": {
+      "label": "Max Input Characters",
+      "help": "Legacy top-level alias for embedding.maxInputChars.",
+      "advanced": true
     }
+  },
+  "contracts": {
+    "tools": [
+      "memory_recall",
+      "memory_store",
+      "memory_forget",
+      "memory_update",
+      "memory_stats",
+      "memory_list"
+    ]
   }
 }
