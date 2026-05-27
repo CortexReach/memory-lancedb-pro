@@ -527,7 +527,7 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
             if (dedupEnabled) {
                 try {
                     const existing = await ctx.store.bm25Search(text, 5, [effectiveScope]);
-                    if (existing.length > 0 && existing[0].entry.text === text) {
+                    if (existing.some((result) => result.entry.text === text)) {
                         skipped++;
                         if (!options.dryRun) {
                             console.log(`  [skip] already imported: ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`);

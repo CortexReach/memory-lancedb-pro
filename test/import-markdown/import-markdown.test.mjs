@@ -266,6 +266,48 @@ describe("import-markdown CLI", () => {
       assert.strictEqual(mockStore.storedRecords.length, 2); // Two entries, different scopes
     });
 
+    it("skips an exact duplicate even when BM25 ranks it below a similar result", async () => {
+      const wsDir = await setupWorkspace("dedup-rank-test");
+      await writeFile(join(wsDir, "MEMORY.md"), "- Exact duplicate memory\n", "utf-8");
+
+      const rankedStore = {
+        ...mockStore,
+        async bm25Search(query, limit = 1, scopeFilter = []) {
+          assert.strictEqual(query, "Exact duplicate memory");
+          assert.deepStrictEqual(scopeFilter, ["dedup-rank-test"]);
+          return [
+            {
+              entry: {
+                text: "Similar but not exact duplicate memory",
+                scope: "dedup-rank-test",
+              },
+              score: 1.0,
+            },
+            {
+              entry: {
+                text: "Exact duplicate memory",
+                scope: "dedup-rank-test",
+              },
+              score: 0.95,
+            },
+          ].slice(0, limit);
+        },
+      };
+
+      const { imported, skipped } = await runImportMarkdown(
+        { embedder: mockEmbedder, store: rankedStore },
+        {
+          openclawHome: testWorkspaceDir,
+          workspaceGlob: "dedup-rank-test",
+          dedup: true,
+        },
+      );
+
+      assert.strictEqual(imported, 0);
+      assert.strictEqual(skipped, 1);
+      assert.strictEqual(mockStore.storedRecords.length, 0);
+    });
+
     it("batch imports mixed valid, short, duplicate, and cross-scope bullets", async () => {
       const isolatedHome = join(tmpdir(), "import-markdown-batch-dedup-test-" + Date.now());
       const workspaceA = join(isolatedHome, "workspace", "workspace-a");
