@@ -710,6 +710,17 @@ If auto-recall consistently times out, check your embedding API latency first. T
 </details>
 
 <details>
+<summary><strong>Auto-recall rerank cost model</strong></summary>
+
+When `autoRecall=true` and `retrieval.rerank="cross-encoder"` with an external rerank API such as Jina, every eligible prompt can make a rerank request. The number of documents sent to that request is governed by `retrieval.candidatePoolSize` (and the retrieval safety minimum), not by the final `autoRecallMaxItems` injection cap.
+
+For example, with `autoRecallMaxItems: 3` and the default `candidatePoolSize: 20`, the plugin may rerank up to 20 candidates before injecting at most 3 memories. To reduce external rerank usage, lower `retrieval.candidatePoolSize`, switch `retrieval.rerank` to `"lightweight"` or `"none"`, increase `autoRecallMinLength`, or keep auto-recall disabled and use manual `memory_recall` where appropriate.
+
+Startup logs warn when auto-recall plus cross-encoder rerank is configured with a large candidate pool, and debug auto-recall stats include the effective `candidatePoolSize`, `retrieveLimit`, `rerank`, and `rerankProvider`.
+
+</details>
+
+<details>
 <summary><strong>Session Memory</strong></summary>
 
 - Triggered on `/new` command — saves previous session summary to LanceDB
