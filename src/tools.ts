@@ -542,45 +542,47 @@ export function registerSelfImprovementReviewTool(api: OpenClawPluginApi, contex
 // Core Tools (Backward Compatible)
 // ============================================================================
 
-export function registerMemoryRecallTool(
-  api: OpenClawPluginApi,
-  context: ToolContext,
+const MEMORY_RECALL_PARAMETERS = Type.Object({
+  query: Type.String({
+    description: "Search query for finding relevant memories",
+  }),
+  limit: Type.Optional(
+    Type.Number({
+      description: "Max results to return (default: 3, max: 20; summary mode soft max: 6)",
+    }),
+  ),
+  includeFullText: Type.Optional(
+    Type.Boolean({
+      description: "Return full memory text when true (default: false returns summary previews)",
+    }),
+  ),
+  maxCharsPerItem: Type.Optional(
+    Type.Number({
+      description: "Maximum characters per returned memory in summary mode (default: 180)",
+    }),
+  ),
+  scope: Type.Optional(
+    Type.String({
+      description: "Specific memory scope to search in (optional)",
+    }),
+  ),
+  category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
+});
+
+function createMemoryRecallTool(
+  runtimeContext: ToolContext,
+  options: {
+    name: string;
+    label: string;
+    description: string;
+  },
 ) {
-  api.registerTool(
-    (toolCtx) => {
-      const runtimeContext = resolveToolContext(context, toolCtx);
-      return {
-      name: "memory_recall",
-      label: "Memory Recall",
-      description:
-        "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
-      parameters: Type.Object({
-        query: Type.String({
-          description: "Search query for finding relevant memories",
-        }),
-        limit: Type.Optional(
-          Type.Number({
-            description: "Max results to return (default: 3, max: 20; summary mode soft max: 6)",
-          }),
-        ),
-        includeFullText: Type.Optional(
-          Type.Boolean({
-            description: "Return full memory text when true (default: false returns summary previews)",
-          }),
-        ),
-        maxCharsPerItem: Type.Optional(
-          Type.Number({
-            description: "Maximum characters per returned memory in summary mode (default: 180)",
-          }),
-        ),
-        scope: Type.Optional(
-          Type.String({
-            description: "Specific memory scope to search in (optional)",
-          }),
-        ),
-        category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
-      }),
-      async execute(_toolCallId, params) {
+  return {
+    name: options.name,
+    label: options.label,
+    description: options.description,
+    parameters: MEMORY_RECALL_PARAMETERS,
+    async execute(_toolCallId: unknown, params: unknown) {
         const {
           query,
           limit = 3,
@@ -712,10 +714,48 @@ export function registerMemoryRecallTool(
             details: { error: "recall_failed", message: String(error) },
           };
         }
-      },
-    };
+    },
+  };
+}
+
+export function registerMemoryRecallTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return createMemoryRecallTool(runtimeContext, {
+        name: "memory_recall",
+        label: "Memory Recall",
+        description:
+          "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
+      });
     },
     { name: "memory_recall" },
+  );
+}
+
+export function registerMemoryRecallAliasTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+  alias: "memory_search" | "memory_get",
+) {
+  const label = alias === "memory_get" ? "Memory Get" : "Memory Search";
+  const description = alias === "memory_get"
+    ? "Compatibility alias for memory_recall. Search and return relevant long-term memories for OpenClaw profiles that request memory_get."
+    : "Compatibility alias for memory_recall. Search through long-term memories for OpenClaw profiles that request memory_search.";
+
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return createMemoryRecallTool(runtimeContext, {
+        name: alias,
+        label,
+        description,
+      });
+    },
+    { name: alias },
   );
 }
 
@@ -2290,6 +2330,8 @@ export function registerAllMemoryTools(
 ) {
   // Core tools (always enabled)
   registerMemoryRecallTool(api, context);
+  registerMemoryRecallAliasTool(api, context, "memory_search");
+  registerMemoryRecallAliasTool(api, context, "memory_get");
   registerMemoryStoreTool(api, context);
   registerMemoryForgetTool(api, context);
   registerMemoryUpdateTool(api, context);

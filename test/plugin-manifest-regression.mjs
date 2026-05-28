@@ -80,6 +80,12 @@ assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "auth"),
   "configSchema should declare llm.auth",
 );
+for (const toolName of ["memory_recall", "memory_search", "memory_get", "memory_store"]) {
+  assert.ok(
+    manifest.contracts.tools.includes(toolName),
+    `contracts.tools should declare ${toolName}`,
+  );
+}
 assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "oauthPath"),
   "configSchema should declare llm.oauthPath",
@@ -223,6 +229,13 @@ try {
     "function",
     "plugin should register an OpenClaw memory capability runtime",
   );
+  for (const toolName of ["memory_recall", "memory_search", "memory_get"]) {
+    assert.equal(
+      typeof api.toolFactories[toolName],
+      "function",
+      `plugin should register ${toolName}`,
+    );
+  }
   assert.equal(
     typeof api.memoryCapability?.promptBuilder,
     "function",
