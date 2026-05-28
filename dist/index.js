@@ -3757,13 +3757,19 @@ const memoryLanceDBProPlugin = {
     },
 };
 export function parsePluginConfig(value) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new Error("memory-lancedb-pro config required");
+    if (value === undefined || value === null) {
+        throw new Error("memory-lancedb-pro: no plugin config supplied; top-level config.embedding is required when the plugin is activated. " +
+            "If this happens during OpenClaw CLI/preflight loading, the loader should skip validation when entry.config is undefined.");
+    }
+    if (typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("memory-lancedb-pro: plugin config must be an object with a top-level embedding block at " +
+            "plugins.entries.memory-lancedb-pro.config.embedding.");
     }
     const cfg = value;
     const embedding = cfg.embedding;
     if (!embedding) {
-        throw new Error("embedding config is required");
+        throw new Error("memory-lancedb-pro: missing top-level config.embedding block. " +
+            "Set plugins.entries.memory-lancedb-pro.config.embedding; do not nest it as config.embedding.embedding.");
     }
     // Accept single key (string) or array of keys for round-robin rotation
     let apiKey;

@@ -23,6 +23,27 @@ function baseConfig() {
 }
 
 describe("sessionStrategy legacy compatibility mapping", () => {
+  it("explains undefined config as a preflight/activation mismatch", () => {
+    assert.throws(
+      () => parsePluginConfig(undefined),
+      /no plugin config supplied.*top-level config\.embedding.*preflight/i,
+    );
+  });
+
+  it("explains non-object config shape clearly", () => {
+    assert.throws(
+      () => parsePluginConfig("not-json"),
+      /plugin config must be an object.*plugins\.entries\.memory-lancedb-pro\.config\.embedding/i,
+    );
+  });
+
+  it("explains missing embedding as a top-level config shape issue", () => {
+    assert.throws(
+      () => parsePluginConfig({ enabled: true }),
+      /missing top-level config\.embedding.*do not nest it as config\.embedding\.embedding/i,
+    );
+  });
+
   it("maps legacy sessionMemory.enabled=true to systemSessionMemory", () => {
     const parsed = parsePluginConfig({
       ...baseConfig(),
