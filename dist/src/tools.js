@@ -568,9 +568,12 @@ export function registerMemoryStoreTool(api, context) {
                 scope: Type.Optional(Type.String({
                     description: "Memory scope (optional, defaults to agent scope)",
                 })),
+                force: Type.Optional(Type.Boolean({
+                    description: "Store even when the duplicate pre-check finds a very similar existing memory",
+                })),
             }),
             async execute(_toolCallId, params) {
-                const { text, importance = 0.7, category = "other", scope, } = params;
+                const { text, importance = 0.7, category = "other", scope, force = false, } = params;
                 try {
                     // Guard: strip envelope metadata first, reject only if nothing remains (P2 fix)
                     const stripped = stripEnvelopeMetadata(text);
@@ -670,20 +673,21 @@ export function registerMemoryStoreTool(api, context) {
                     catch (err) {
                         console.warn(`memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`);
                     }
-                    if (existing.length > 0 && existing[0].score > 0.98) {
+                    const duplicateCandidate = existing[0]?.score > 0.98 ? existing[0] : undefined;
+                    if (duplicateCandidate && !force) {
                         return {
                             content: [
                                 {
                                     type: "text",
-                                    text: `Similar memory already exists: "${existing[0].entry.text}"`,
+                                    text: `Similar memory already exists: "${duplicateCandidate.entry.text}"`,
                                 },
                             ],
                             details: {
                                 action: "duplicate",
-                                existingId: existing[0].entry.id,
-                                existingText: existing[0].entry.text,
-                                existingScope: existing[0].entry.scope,
-                                similarity: existing[0].score,
+                                existingId: duplicateCandidate.entry.id,
+                                existingText: duplicateCandidate.entry.text,
+                                existingScope: duplicateCandidate.entry.scope,
+                                similarity: duplicateCandidate.score,
                             },
                         };
                     }
@@ -808,6 +812,14 @@ export function registerMemoryStoreTool(api, context) {
                             scope: entry.scope,
                             category: entry.category,
                             importance: entry.importance,
+                            ...(duplicateCandidate && force
+                                ? { duplicateOverride: {
+                                        existingId: duplicateCandidate.entry.id,
+                                        existingText: duplicateCandidate.entry.text,
+                                        existingScope: duplicateCandidate.entry.scope,
+                                        similarity: duplicateCandidate.score,
+                                    } }
+                                : {}),
                         },
                     };
                 }
