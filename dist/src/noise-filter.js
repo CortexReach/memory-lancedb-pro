@@ -32,6 +32,13 @@ const META_QUESTION_PATTERNS = [
     /你[知晓]道.+吗/,
     /我(?:之前|上次|以前)(?:说|提|讲).*(?:吗|呢|？|\?)/,
 ];
+const META_FRUSTRATION_PATTERNS = [
+    /\byou (never|don'?t|do not|can'?t|cannot) (remember|recall|get|understand)\b/i,
+    /\bwhy (do|can) you (keep )?(forget|not remember|never remember)\b/i,
+    /\bdid you (get|understand) what i (said|told you|meant)\b/i,
+    /^\s*what (just )?changed\??\s*$/i,
+    /\bwhy (is|are) (my|the) memor(y|ies) (wrong|missing|broken|not working)\b/i,
+];
 // Session boilerplate
 const BOILERPLATE_PATTERNS = [
     /^(hi|hello|hey|good morning|good evening|greetings)/i,
@@ -65,6 +72,10 @@ const DEFAULT_OPTIONS = {
     filterMetaQuestions: true,
     filterBoilerplate: true,
 };
+export function isMetaFrustrationNoise(text) {
+    const trimmed = text.trim();
+    return META_FRUSTRATION_PATTERNS.some(p => p.test(trimmed));
+}
 /**
  * Check if a memory text is noise that should be filtered out.
  * Returns true if the text is noise.
@@ -76,7 +87,7 @@ export function isNoise(text, options = {}) {
         return true;
     if (opts.filterDenials && DENIAL_PATTERNS.some(p => p.test(trimmed)))
         return true;
-    if (opts.filterMetaQuestions && META_QUESTION_PATTERNS.some(p => p.test(trimmed)))
+    if (opts.filterMetaQuestions && (META_QUESTION_PATTERNS.some(p => p.test(trimmed)) || isMetaFrustrationNoise(trimmed)))
         return true;
     if (opts.filterBoilerplate && BOILERPLATE_PATTERNS.some(p => p.test(trimmed)))
         return true;
