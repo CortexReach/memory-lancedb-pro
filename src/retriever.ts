@@ -758,12 +758,27 @@ export class MemoryRetriever {
           }) as RetrievalResult,
       );
 
+      // Reranker stage: apply cross-encoder reranking to vector-only results
+      // (same reranker as hybridRetrieval, without requiring BM25/FTS)
+      let reranked = mapped;
+      if (this.config.rerank !== "none") {
+        try {
+          reranked = await this.rerankResults(query, queryVector, mapped.slice(0, this.config.candidatePoolSize));
+          if (diagnostics) diagnostics.stageCounts.afterRerank = reranked.length;
+        } catch (err) {
+          if (diagnostics) diagnostics.stageCounts.afterRerank = mapped.length;
+          console.warn("Rerank in vector-only mode failed, continuing without rerank:", err);
+        }
+      } else {
+        if (diagnostics) diagnostics.stageCounts.afterRerank = mapped.length;
+      }
+
       failureStage = "vector.postProcess";
       // Bug 7 fix: when decayEngine is active, skip applyRecencyBoost here because
       // decayEngine already handles temporal scoring; avoid double-boost.
       const recencyBoosted = this.decayEngine
-        ? mapped
-        : this.applyRecencyBoost(mapped);
+        ? reranked
+        : this.applyRecencyBoost(reranked);
       if (diagnostics) diagnostics.stageCounts.afterRecency = recencyBoosted.length;
       const weighted = this.decayEngine
         ? recencyBoosted
@@ -783,7 +798,7 @@ export class MemoryRetriever {
       if (diagnostics) diagnostics.stageCounts.afterNoiseFilter = denoised.length;
       const deduplicated = this.applyMMRDiversity(denoised);
       if (diagnostics) {
-        diagnostics.stageCounts.afterRerank = mapped.length;
+        diagnostics.stageCounts.afterRerank = diagnostics.stageCounts.afterRerank ?? mapped.length;
         diagnostics.stageCounts.afterDiversity = deduplicated.length;
       }
 
