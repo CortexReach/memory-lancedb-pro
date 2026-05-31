@@ -14,6 +14,12 @@ const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { createMemoryUpgrader } = jiti("../src/memory-upgrader.ts");
 
 async function runTest() {
+  await testLegacyUpgradeFallbackDiagnostic();
+  await testReflectionRowsAreNotLegacy();
+  console.log("memory-upgrader diagnostics test passed");
+}
+
+async function testLegacyUpgradeFallbackDiagnostic() {
   const logs = [];
   const updates = [];
   const legacyEntry = {
@@ -61,8 +67,72 @@ async function runTest() {
   );
   assert.equal(typeof updates[0].patch.text, "string");
   assert.ok(updates[0].patch.metadata.includes("upgraded_at"));
+}
 
-  console.log("memory-upgrader diagnostics test passed");
+async function testReflectionRowsAreNotLegacy() {
+  const updates = [];
+  const reflectionRows = [
+    {
+      id: "reflection-event-1",
+      text: "reflection-event · global",
+      category: "reflection",
+      scope: "global",
+      importance: 0.55,
+      timestamp: Date.now(),
+      metadata: JSON.stringify({
+        type: "memory-reflection-event",
+        reflectionVersion: 4,
+        eventId: "refl-1",
+      }),
+    },
+    {
+      id: "reflection-item-1",
+      text: "Always verify migration banners before upgrading.",
+      category: "reflection",
+      scope: "global",
+      importance: 0.82,
+      timestamp: Date.now(),
+      metadata: JSON.stringify({
+        type: "memory-reflection-item",
+        reflectionVersion: 4,
+        itemKind: "invariant",
+      }),
+    },
+    {
+      id: "reflection-mapped-1",
+      text: "User prefers release-ready validation notes.",
+      category: "reflection",
+      scope: "global",
+      importance: 0.75,
+      timestamp: Date.now(),
+      metadata: JSON.stringify({
+        type: "memory-reflection-mapped",
+        reflectionVersion: 4,
+        mappedKind: "user-model",
+      }),
+    },
+  ];
+
+  const store = {
+    async list() {
+      return reflectionRows;
+    },
+    async update(id, patch) {
+      updates.push({ id, patch });
+      return true;
+    },
+  };
+
+  const upgrader = createMemoryUpgrader(store, null, { log: () => {} });
+  const count = await upgrader.countLegacy();
+  const dryRun = await upgrader.upgrade({ dryRun: true });
+
+  assert.equal(count.total, 3);
+  assert.equal(count.legacy, 0);
+  assert.deepEqual(count.byCategory, {});
+  assert.equal(dryRun.totalLegacy, 0);
+  assert.equal(dryRun.skipped, 3);
+  assert.equal(updates.length, 0);
 }
 
 runTest().catch((err) => {

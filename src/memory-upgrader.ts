@@ -62,6 +62,29 @@ interface EnrichedMetadata {
   upgraded_at: number;   // timestamp of upgrade
 }
 
+const CURRENT_REFLECTION_METADATA_TYPES = new Set([
+  "memory-reflection",
+  "memory-reflection-event",
+  "memory-reflection-item",
+  "memory-reflection-mapped",
+]);
+
+function parseMetadata(metadata: string | undefined): Record<string, unknown> | null {
+  if (!metadata) return null;
+  try {
+    const parsed = JSON.parse(metadata);
+    return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function isCurrentReflectionMemory(entry: MemoryEntry): boolean {
+  if (entry.category === "reflection") return true;
+  const meta = parseMetadata(entry.metadata);
+  return typeof meta?.type === "string" && CURRENT_REFLECTION_METADATA_TYPES.has(meta.type);
+}
+
 // ============================================================================
 // Reverse Category Mapping
 // ============================================================================
@@ -171,16 +194,17 @@ export class MemoryUpgrader {
   /**
    * Check if a memory entry is in legacy format (needs upgrade).
    * Legacy = no metadata, or metadata lacks `memory_category`.
+   * Reflection rows are first-class current-format memories with their own
+   * metadata schema and read path, so they intentionally do not carry
+   * SmartExtractor `memory_category`.
    */
   isLegacyMemory(entry: MemoryEntry): boolean {
+    if (isCurrentReflectionMemory(entry)) return false;
     if (!entry.metadata) return true;
-    try {
-      const meta = JSON.parse(entry.metadata);
-      // If it has memory_category, it was created by SmartExtractor → new format
-      return !meta.memory_category;
-    } catch {
-      return true;
-    }
+    const meta = parseMetadata(entry.metadata);
+    if (!meta) return true;
+    // If it has memory_category, it was created by SmartExtractor → new format
+    return !meta.memory_category;
   }
 
   /**
