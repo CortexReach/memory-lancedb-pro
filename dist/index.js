@@ -16,7 +16,7 @@ import { spawn } from "node:child_process";
 // so we downgrade them to debug level when running in CLI mode.
 const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 // Import core components
-import { MemoryStore, normalizeStoragePath, validateStoragePath } from "./src/store.js";
+import { MemoryStore, normalizeStoragePath } from "./src/store.js";
 import { createEmbedder, getEffectiveVectorDimensions, } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
@@ -673,7 +673,7 @@ function shouldSkipReflectionMessage(role, text) {
 const AUTO_CAPTURE_MAP_MAX_ENTRIES = 2000;
 // Guard: skip texts > 5000 chars to prevent embedding API errors (issue #417 Fix #3)
 const MAX_MESSAGE_LENGTH = 5000;
-const AUTO_CAPTURE_EXPLICIT_REMEMBER_RE = /^(?:请|請)?(?:记住|記住|记一下|記一下|别忘了|別忘了)[。.!?？!]*$/u;
+const AUTO_CAPTURE_EXPLICIT_REMEMBER_RE = /^(?:请|請)?(?:remember(?:\s+this)?|merke?\s+dir|vergiss\s+(?:das\s+)?nicht|记住|記住|记一下|記一下|别忘了|別忘了)[。.!?？!]*$/iu;
 /**
  * Prune a Map to stay within the given maximum number of entries.
  * Deletes the oldest (earliest-inserted) keys when over the limit.
@@ -1004,16 +1004,7 @@ function buildReflectionFallbackText() {
         "- (none captured)",
         "",
         "## Learning governance candidates (.learnings / promotion / skill extraction)",
-        "### Entry 1",
-        "**Priority**: medium",
-        "**Status**: triage",
-        "**Area**: config",
-        "### Summary",
-        "Investigate last failed tool execution and decide whether it belongs in .learnings/ERRORS.md.",
-        "### Details",
-        "The reflection pipeline fell back; confirm the failure is reproducible before treating it as a durable error record.",
-        "### Suggested Action",
-        "Reproduce the latest failed tool execution, classify it as triage or error, and then log it with the appropriate tool/file path evidence.",
+        "- (none captured)",
         "",
         "## Open loops / next actions",
         "- Investigate why embedded reflection generation failed.",
@@ -1157,6 +1148,12 @@ const MEMORY_TRIGGERS = [
     /my\s+\w+\s+is|is\s+my/i,
     /i (like|prefer|hate|love|want|need|care)/i,
     /always|never|important/i,
+    // German triggers
+    /merk dir|merke dir|erinner dich|vergiss nicht|nicht vergessen/i,
+    /ich bevorzuge|ich mag|ich hasse|ich will|ich brauche/i,
+    /wir haben entschieden|ab jetzt|ab sofort|in zukunft/i,
+    /mein\s+\w+\s+ist|heißt|wohne|arbeite/i,
+    /immer|niemals|wichtig/i,
     // Chinese triggers (Traditional & Simplified)
     /記住|记住|記一下|记一下|別忘了|别忘了|備註|备注/,
     /偏好|喜好|喜歡|喜欢|討厭|讨厌|不喜歡|不喜欢|愛用|爱用|習慣|习惯/,
@@ -1210,16 +1207,16 @@ export function shouldCapture(text) {
 }
 export function detectCategory(text) {
     const lower = text.toLowerCase();
-    if (/prefer|radši|like|love|hate|want|偏好|喜歡|喜欢|討厭|讨厌|不喜歡|不喜欢|愛用|爱用|習慣|习惯/i.test(lower)) {
+    if (/prefer|radši|like|love|hate|want|bevorzuge|mag|hasse|will|brauche|偏好|喜歡|喜欢|討厭|讨厌|不喜歡|不喜欢|愛用|爱用|習慣|习惯/i.test(lower)) {
         return "preference";
     }
-    if (/rozhodli|decided|we decided|will use|we will use|we'?ll use|switch(ed)? to|migrate(d)? to|going forward|from now on|budeme|決定|决定|選擇了|选择了|改用|換成|换成|以後用|以后用|規則|流程|SOP/i.test(lower)) {
+    if (/rozhodli|decided|we decided|will use|we will use|we'?ll use|switch(ed)? to|migrate(d)? to|going forward|from now on|budeme|haben entschieden|ab jetzt|ab sofort|in zukunft|決定|决定|選擇了|选择了|改用|換成|换成|以後用|以后用|規則|流程|SOP/i.test(lower)) {
         return "decision";
     }
-    if (/\+\d{10,}|@[\w.-]+\.\w+|is called|jmenuje se|我的\S+是|叫我|稱呼|称呼/i.test(lower)) {
+    if (/\+\d{10,}|@[\w.-]+\.\w+|is called|jmenuje se|mein\s+\w+\s+ist|heißt|我的\S+是|叫我|稱呼|称呼/i.test(lower)) {
         return "entity";
     }
-    if (/\b(is|are|has|have|je|má|jsou)\b|總是|总是|從不|从不|一直|每次都|老是/i.test(lower)) {
+    if (/\b(is|are|has|have|je|má|jsou|ist|sind|hat|habe|wohne|arbeite)\b|immer|niemals|wichtig|總是|总是|從不|从不|一直|每次都|老是/i.test(lower)) {
         return "fact";
     }
     return "other";
@@ -1500,15 +1497,13 @@ let _singletonState = null;
 function _initPluginState(api) {
     const config = parsePluginConfig(api.pluginConfig);
     let resolvedDbPath = normalizeStoragePath(api.resolvePath(config.dbPath || getDefaultDbPath()));
-    try {
-        resolvedDbPath = validateStoragePath(resolvedDbPath);
-    }
-    catch (err) {
-        api.logger.warn(`memory-lancedb-pro: storage path issue — ${String(err)}\n` +
-            `  The plugin will still attempt to start, but writes may fail.`);
-    }
     const vectorDim = getEffectiveVectorDimensions(config.embedding.model || "text-embedding-3-small", config.embedding.dimensions, config.embedding.requestDimensions);
-    const store = new MemoryStore({ dbPath: resolvedDbPath, vectorDim });
+    const store = new MemoryStore({
+        dbPath: resolvedDbPath,
+        vectorDim,
+        disableNativeCosine: config.retrieval?.disableNativeCosine === true,
+        onStoragePathWarning: (message) => api.logger.warn(message),
+    });
     const embedder = createEmbedder({
         provider: "openai-compatible",
         apiKey: config.embedding.apiKey,
@@ -1521,6 +1516,7 @@ function _initPluginState(api) {
         taskPassage: config.embedding.taskPassage,
         normalized: config.embedding.normalized,
         chunking: config.embedding.chunking,
+        clientTimeoutMs: config.embedding.clientTimeoutMs,
     });
     const decayEngine = createDecayEngine({
         ...DEFAULT_DECAY_CONFIG,
@@ -3373,7 +3369,9 @@ const memoryLanceDBProPlugin = {
                     if (!writeOk) {
                         throw new Error(`Failed to allocate unique reflection file for ${dateStr} ${timeCompact}`);
                     }
-                    const reflectionGovernanceCandidates = extractReflectionLearningGovernanceCandidates(reflectionText);
+                    const reflectionGovernanceCandidates = reflectionGenerated.usedFallback
+                        ? []
+                        : extractReflectionLearningGovernanceCandidates(reflectionText);
                     if (config.selfImprovement?.enabled !== false && reflectionGovernanceCandidates.length > 0) {
                         for (const candidate of reflectionGovernanceCandidates) {
                             const appendResult = await appendSelfImprovementEntry({
@@ -3540,6 +3538,22 @@ const memoryLanceDBProPlugin = {
         }
         if (config.sessionStrategy === "systemSessionMemory") {
             const sessionMessageCount = config.sessionMemory?.messageCount ?? 15;
+            const SESSION_SUMMARY_GUARD = Symbol.for("openclaw.memory-lancedb-pro.session-summary-guard");
+            const SESSION_SUMMARY_GUARD_TTL_MS = 24 * 60 * 60 * 1000;
+            const getSessionSummaryGuard = () => {
+                const g = globalThis;
+                if (!g[SESSION_SUMMARY_GUARD])
+                    g[SESSION_SUMMARY_GUARD] = new Map();
+                return g[SESSION_SUMMARY_GUARD];
+            };
+            const pruneSessionSummaryGuard = (now) => {
+                const guard = getSessionSummaryGuard();
+                for (const [key, storedAt] of guard) {
+                    if (now - storedAt > SESSION_SUMMARY_GUARD_TTL_MS) {
+                        guard.delete(key);
+                    }
+                }
+            };
             const storeSystemSessionSummary = async (params) => {
                 const now = new Date(params.timestampMs ?? Date.now());
                 const dateStr = now.toISOString().split("T")[0];
@@ -3599,11 +3613,21 @@ const memoryLanceDBProPlugin = {
                         ? ctx.sessionId
                         : "unknown";
                     const source = resolveSourceFromSessionKey(sessionKey);
+                    const guardKey = `${defaultScope}::${sessionKey || "(none)"}::${currentSessionId}`;
+                    const guard = getSessionSummaryGuard();
+                    const now = Date.now();
+                    pruneSessionSummaryGuard(now);
+                    if (guard.has(guardKey)) {
+                        api.logger.debug?.(`session-memory: duplicate session summary skipped for ${currentSessionId} (agent: ${agentId}, scope: ${defaultScope})`);
+                        return;
+                    }
+                    guard.set(guardKey, now);
                     const sessionContent = summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount) ??
                         (typeof event.sessionFile === "string"
                             ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount)
                             : null);
                     if (!sessionContent) {
+                        guard.delete(guardKey);
                         api.logger.debug("session-memory: no session content found, skipping");
                         return;
                     }
@@ -3617,6 +3641,15 @@ const memoryLanceDBProPlugin = {
                     });
                 }
                 catch (err) {
+                    const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
+                    const agentId = resolveHookAgentId(typeof ctx.agentId === "string" ? ctx.agentId : undefined, sessionKey);
+                    const defaultScope = isSystemBypassId(agentId)
+                        ? config.scopes?.default ?? "global"
+                        : scopeManager.getDefaultScope(agentId);
+                    const currentSessionId = typeof ctx.sessionId === "string" && ctx.sessionId.trim().length > 0
+                        ? ctx.sessionId
+                        : "unknown";
+                    getSessionSummaryGuard().delete(`${defaultScope}::${sessionKey || "(none)"}::${currentSessionId}`);
                     api.logger.warn(`session-memory: failed to save: ${String(err)}`);
                 }
             });
@@ -3705,7 +3738,7 @@ const memoryLanceDBProPlugin = {
                 const runStartupChecks = async () => {
                     try {
                         // Test components (bounded time)
-                        const embedTest = await withTimeout(embedder.test(), 8_000, "embedder.test()");
+                        const embedTest = await withTimeout(embedder.test({ timeoutMs: 7_500 }), 8_000, "embedder.test()");
                         const retrievalTest = await withTimeout(retriever.test(), 8_000, "retriever.test()");
                         api.logger.info(`memory-lancedb-pro: initialized successfully ` +
                             `(embedding: ${embedTest.success ? "OK" : "FAIL"}, ` +
@@ -3846,6 +3879,7 @@ export function parsePluginConfig(value) {
             chunking: typeof embedding.chunking === "boolean"
                 ? embedding.chunking
                 : undefined,
+            clientTimeoutMs: parsePositiveInt(embedding.clientTimeoutMs),
         },
         dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
         autoCapture: cfg.autoCapture !== false,

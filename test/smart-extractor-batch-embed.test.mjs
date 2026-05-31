@@ -195,6 +195,28 @@ describe("SmartExtractor batch embedding paths", () => {
       `Expected 0 embed calls (batch path), got ${calls.embed}`);
   });
 
+  it("filters meta-frustration text before smart extraction embedding", async () => {
+    const { embedder, calls } = makeCountingEmbedder();
+    const llm = makeLlm([]);
+    const store = makeStore();
+    const extractor = makeExtractor(embedder, llm, store);
+
+    const inputTexts = [
+      "you never remember anything I say",
+      "did you get what i said",
+      "what just changed?",
+      "My favorite editor is Zed because it keeps the interface quiet.",
+    ];
+
+    const result = await extractor.filterNoiseByEmbedding(inputTexts);
+
+    assert.deepStrictEqual(result, [
+      "My favorite editor is Zed because it keeps the interface quiet.",
+    ]);
+    assert.strictEqual(calls.embedBatch, 0, "static filter should not call embedBatch without a noise bank");
+    assert.strictEqual(calls.embed, 0, "static filter should not call embed without a noise bank");
+  });
+
   // --------------------------------------------------------------------------
   // Test 3: Batch pre-compute for non-profile candidates uses embedBatch
   // --------------------------------------------------------------------------

@@ -2,6 +2,8 @@
   "contracts": {
     "tools": [
       "memory_recall",
+      "memory_search",
+      "memory_get",
       "memory_store",
       "memory_forget",
       "memory_update",
@@ -2028,6 +2030,8 @@
   "contracts": {
     "tools": [
       "memory_recall",
+      "memory_search",
+      "memory_get",
       "memory_store",
       "memory_update",
       "memory_forget",

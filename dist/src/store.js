@@ -4,6 +4,7 @@
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync, statSync, unlinkSync, rmdirSync, writeFileSync, } from "node:fs";
+import { access as accessAsync, lstat as lstatAsync, mkdir as mkdirAsync, realpath as realpathAsync, } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
@@ -138,6 +139,10 @@ function normalizeSearchText(value) {
 function isExplicitDenyAllScopeFilter(scopeFilter) {
     return Array.isArray(scopeFilter) && scopeFilter.length === 0;
 }
+function hasFtsIndex(indices) {
+    return Array.isArray(indices) && indices.some((idx) => idx?.indexType === "FTS" ||
+        (Array.isArray(idx?.columns) && idx.columns.includes("text")));
+}
 function scoreLexicalHit(query, candidates) {
     const normalizedQuery = normalizeSearchText(query);
     if (!normalizedQuery)
@@ -152,6 +157,39 @@ function scoreLexicalHit(query, candidates) {
         }
     }
     return score;
+}
+function parseBooleanEnvFlag(value) {
+    return /^(1|true|yes|on)$/i.test((value ?? "").trim());
+}
+function toNumberVector(value) {
+    if (!value || typeof value !== "object")
+        return [];
+    const maybeArrayLike = value;
+    if (typeof maybeArrayLike.length !== "number" || maybeArrayLike.length < 0) {
+        return [];
+    }
+    const vector = Array.from(maybeArrayLike, (item) => Number(item));
+    return vector.every(Number.isFinite) ? vector : [];
+}
+function cosineSimilarity(left, right) {
+    if (!Array.isArray(left) || left.length === 0 || right.length !== left.length)
+        return 0;
+    let dot = 0;
+    let leftNorm = 0;
+    let rightNorm = 0;
+    for (let index = 0; index < left.length; index++) {
+        const l = Number(left[index]);
+        const r = Number(right[index]);
+        if (!Number.isFinite(l) || !Number.isFinite(r))
+            return 0;
+        dot += l * r;
+        leftNorm += l * l;
+        rightNorm += r * r;
+    }
+    const denominator = Math.sqrt(leftNorm) * Math.sqrt(rightNorm);
+    if (denominator <= 0)
+        return 0;
+    return Math.max(-1, Math.min(1, dot / denominator));
 }
 // ============================================================================
 // Storage Path Validation
@@ -241,6 +279,71 @@ export function validateStoragePath(dbPath) {
     }
     return resolvedPath;
 }
+/**
+ * Async variant of {@link validateStoragePath}. Use this on runtime paths so
+ * slow filesystems do not block OpenClaw's event loop during startup.
+ */
+export async function validateStoragePathAsync(dbPath) {
+    let resolvedPath = normalizeStoragePath(dbPath);
+    // Resolve symlinks (including dangling symlinks)
+    try {
+        const stats = await lstatAsync(dbPath);
+        if (stats.isSymbolicLink()) {
+            try {
+                resolvedPath = await realpathAsync(dbPath);
+            }
+            catch (err) {
+                throw new Error(`dbPath "${dbPath}" is a symlink whose target does not exist.\n` +
+                    `  Fix: Create the target directory, or update the symlink to point to a valid path.\n` +
+                    `  Details: ${err.code || ""} ${err.message}`);
+            }
+        }
+    }
+    catch (err) {
+        // Missing path is OK (it will be created below)
+        if (err?.code === "ENOENT") {
+            // no-op
+        }
+        else if (typeof err?.message === "string" &&
+            err.message.includes("symlink whose target does not exist")) {
+            throw err;
+        }
+        else {
+            // Other lstat failures — continue with original path
+        }
+    }
+    // Create directory if it doesn't exist
+    let pathExists = false;
+    try {
+        await accessAsync(resolvedPath, constants.F_OK);
+        pathExists = true;
+    }
+    catch {
+        pathExists = false;
+    }
+    if (!pathExists) {
+        try {
+            await mkdirAsync(resolvedPath, { recursive: true });
+        }
+        catch (err) {
+            throw new Error(`Failed to create dbPath directory "${resolvedPath}".\n` +
+                `  Fix: Ensure the parent directory "${dirname(resolvedPath)}" exists and is writable,\n` +
+                `       or create it manually: mkdir -p "${resolvedPath}"\n` +
+                `  Details: ${err.code || ""} ${err.message}`);
+        }
+    }
+    // Check write permissions
+    try {
+        await accessAsync(resolvedPath, constants.W_OK);
+    }
+    catch (err) {
+        throw new Error(`dbPath directory "${resolvedPath}" is not writable.\n` +
+            `  Fix: Check permissions with: ls -la "${dirname(resolvedPath)}"\n` +
+            `       Or grant write access: chmod u+w "${resolvedPath}"\n` +
+            `  Details: ${err.code || ""} ${err.message}`);
+    }
+    return resolvedPath;
+}
 // ============================================================================
 // Memory Store
 // ============================================================================
@@ -250,7 +353,9 @@ export class MemoryStore {
     table = null;
     initPromise = null;
     ftsIndexCreated = false;
+    _lastFtsError = null;
     updateQueue = Promise.resolve();
+    nativeCosineFallbackLogged = false;
     // Cross-call batch accumulator（Issue #690）
     // 多個 concurrent bulkStore() 會先累積在這裡，每 100ms flush 一次，
     // 合併成一個 lock acquisition，大幅降低 lock contention。
@@ -272,11 +377,14 @@ export class MemoryStore {
     // 當 pending callers 超過此值時，block 並同步 flush，確保 pendingBatch 不會無限膨胀。
     static MAX_PENDING_BATCH_SIZE = 1000;
     config;
+    disableNativeCosine;
     constructor(config) {
+        const envDisablesNativeCosine = parseBooleanEnvFlag(process.env.MEMORY_LANCEDB_DISABLE_NATIVE_COSINE);
         this.config = {
             ...config,
             dbPath: normalizeStoragePath(config.dbPath),
         };
+        this.disableNativeCosine = config.disableNativeCosine === true || envDisablesNativeCosine;
     }
     async runWithFileLock(fn) {
         const lockfile = await loadLockfile();
@@ -420,6 +528,13 @@ export class MemoryStore {
         return this.initPromise;
     }
     async doInitialize() {
+        try {
+            this.config.dbPath = await validateStoragePathAsync(this.config.dbPath);
+        }
+        catch (err) {
+            this.config.onStoragePathWarning?.(`memory-lancedb-pro: storage path issue — ${String(err)}\n` +
+                `  The plugin will still attempt to start, but writes may fail.`);
+        }
         const lancedb = await loadLanceDB();
         let db;
         try {
@@ -510,10 +625,12 @@ export class MemoryStore {
         try {
             await this.createFtsIndex(table);
             this.ftsIndexCreated = true;
+            this._lastFtsError = null;
         }
         catch (err) {
             console.warn("Failed to create FTS index, falling back to vector-only search:", err);
             this.ftsIndexCreated = false;
+            this._lastFtsError = err instanceof Error ? err.message : String(err);
         }
         this.db = db;
         this.table = table;
@@ -612,8 +729,7 @@ export class MemoryStore {
         try {
             // Check if FTS index already exists
             const indices = await table.listIndices();
-            const hasFtsIndex = indices?.some((idx) => idx.indexType === "FTS" || idx.columns?.includes("text"));
-            if (!hasFtsIndex) {
+            if (!hasFtsIndex(indices)) {
                 // LanceDB @lancedb/lancedb >=0.26: use Index.fts() config
                 const lancedb = await loadLanceDB();
                 await table.createIndex("text", {
@@ -1066,7 +1182,22 @@ export class MemoryStore {
         const inactiveFilter = options?.excludeInactive ?? false;
         const overFetchMultiplier = inactiveFilter ? 20 : 10;
         const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
-        let query = this.table.vectorSearch(vector).distanceType('cosine').limit(fetchLimit);
+        if (this.disableNativeCosine && !this.nativeCosineFallbackLogged) {
+            console.warn("memory-lancedb-pro: LanceDB native vector cosine disabled; scanning candidates and using JS cosine rerank fallback");
+            this.nativeCosineFallbackLogged = true;
+        }
+        let query = this.disableNativeCosine
+            ? this.table.query().select([
+                "id",
+                "text",
+                "vector",
+                "category",
+                "scope",
+                "importance",
+                "timestamp",
+                "metadata",
+            ])
+            : this.table.vectorSearch(vector).distanceType("cosine").limit(fetchLimit);
         // Apply scope filter if provided
         if (scopeFilter && scopeFilter.length > 0) {
             const scopeConditions = scopeFilter
@@ -1077,7 +1208,12 @@ export class MemoryStore {
         const results = await query.toArray();
         const mapped = [];
         for (const row of results) {
-            const distance = Number(row._distance ?? 0);
+            const rowVector = toNumberVector(row.vector);
+            if (rowVector.length !== vector.length)
+                continue;
+            const distance = this.disableNativeCosine
+                ? 1 - cosineSimilarity(vector, rowVector)
+                : Number(row._distance ?? 0);
             const score = 1 / (1 + distance);
             if (score < minScore)
                 continue;
@@ -1091,7 +1227,7 @@ export class MemoryStore {
             const entry = {
                 id: row.id,
                 text: row.text,
-                vector: row.vector,
+                vector: rowVector,
                 category: row.category,
                 scope: rowScope,
                 importance: Number(row.importance),
@@ -1103,10 +1239,13 @@ export class MemoryStore {
                 continue;
             }
             mapped.push({ entry, score });
-            if (mapped.length >= safeLimit)
+            if (!this.disableNativeCosine && mapped.length >= safeLimit)
                 break;
         }
-        return mapped;
+        if (this.disableNativeCosine) {
+            mapped.sort((a, b) => b.score - a.score);
+        }
+        return mapped.slice(0, safeLimit);
     }
     async bm25Search(query, limit = 5, scopeFilter, options) {
         await this.ensureInitialized();
@@ -1116,7 +1255,7 @@ export class MemoryStore {
         const inactiveFilter = options?.excludeInactive ?? false;
         // Over-fetch when filtering inactive records to avoid crowding
         const fetchLimit = inactiveFilter ? Math.min(safeLimit * 20, 200) : safeLimit;
-        if (!this.ftsIndexCreated) {
+        if (!this.ftsIndexCreated && !(await this.refreshFtsSupportFromTable())) {
             return this.lexicalFallbackSearch(query, safeLimit, scopeFilter, options);
         }
         try {
@@ -1235,17 +1374,22 @@ export class MemoryStore {
             throw new Error(`Memory ${id} is outside accessible scopes`);
         }
         // Support both full UUID and short prefix (8+ hex chars)
+        // Also support legacy mem-md-N format from older memory-lancedb-pro versions
         const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
         const prefixRegex = /^[0-9a-f]{8,}$/i;
+        const legacyRegex = /^mem-md-\d+$/i;
         const isFullId = uuidRegex.test(id);
         const isPrefix = !isFullId && prefixRegex.test(id);
-        if (!isFullId && !isPrefix) {
+        const isLegacy = !isFullId && !isPrefix && legacyRegex.test(id);
+        if (!isFullId && !isPrefix && !isLegacy) {
             throw new Error(`Invalid memory ID format: ${id}`);
         }
         let candidates;
-        if (isFullId) {
+        if (isFullId || isLegacy) {
+            // Legacy IDs use exact string match like full UUIDs
+            const safeId = escapeSqlLiteral(id);
             candidates = await this.table.query()
-                .where(`id = '${id}'`)
+                .where(`id = '${safeId}'`)
                 .limit(1)
                 .toArray();
         }
@@ -1280,7 +1424,6 @@ export class MemoryStore {
         await this.ensureInitialized();
         if (isExplicitDenyAllScopeFilter(scopeFilter))
             return [];
-        let query = this.table.query();
         // Build where conditions
         const conditions = [];
         if (scopeFilter && scopeFilter.length > 0) {
@@ -1292,12 +1435,9 @@ export class MemoryStore {
         if (category) {
             conditions.push(`category = '${escapeSqlLiteral(category)}'`);
         }
-        if (conditions.length > 0) {
-            query = query.where(conditions.join(" AND "));
-        }
+        const applyConditions = (query) => conditions.length > 0 ? query.where(conditions.join(" AND ")) : query;
         // Fetch all matching rows (no pre-limit) so app-layer sort is correct across full dataset
-        const results = await query
-            .select([
+        const results = await this.queryRowsWithProjectionFallback(applyConditions, [
             "id",
             "text",
             "category",
@@ -1305,8 +1445,7 @@ export class MemoryStore {
             "importance",
             "timestamp",
             "metadata",
-        ])
-            .toArray();
+        ]);
         return results
             .map((row) => ({
             id: row.id,
@@ -1321,8 +1460,21 @@ export class MemoryStore {
             .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
             .slice(offset, offset + limit);
     }
+    async queryRowsWithProjectionFallback(applyFilters, columns) {
+        const projectedRows = await applyFilters(this.table.query())
+            .select(columns)
+            .toArray();
+        if (projectedRows.length > 0) {
+            return projectedRows;
+        }
+        // Some LanceDB upgrades have returned empty projected metadata reads while
+        // the underlying table still has rows. Retry the identical query without
+        // projection so list/stats stay aligned with recall/vector reads.
+        return await applyFilters(this.table.query()).toArray();
+    }
     async stats(scopeFilter) {
         await this.ensureInitialized();
+        await this.refreshFtsSupportFromTable();
         if (isExplicitDenyAllScopeFilter(scopeFilter)) {
             return {
                 totalCount: 0,
@@ -1330,14 +1482,15 @@ export class MemoryStore {
                 categoryCounts: {},
             };
         }
-        let query = this.table.query();
+        const conditions = [];
         if (scopeFilter && scopeFilter.length > 0) {
             const scopeConditions = scopeFilter
                 .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
                 .join(" OR ");
-            query = query.where(`((${scopeConditions}) OR scope IS NULL)`);
+            conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
         }
-        const results = await query.select(["scope", "category"]).toArray();
+        const applyConditions = (query) => conditions.length > 0 ? query.where(conditions.join(" AND ")) : query;
+        const results = await this.queryRowsWithProjectionFallback(applyConditions, ["scope", "category"]);
         const scopeCounts = {};
         const categoryCounts = {};
         for (const row of results) {
@@ -1359,15 +1512,19 @@ export class MemoryStore {
         }
         return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
             // Support both full UUID and short prefix (8+ hex chars), same as delete()
+            // Also support legacy mem-md-N format from older memory-lancedb-pro versions
             const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
             const prefixRegex = /^[0-9a-f]{8,}$/i;
+            const legacyRegex = /^mem-md-\d+$/i;
             const isFullId = uuidRegex.test(id);
             const isPrefix = !isFullId && prefixRegex.test(id);
-            if (!isFullId && !isPrefix) {
+            const isLegacy = !isFullId && !isPrefix && legacyRegex.test(id);
+            if (!isFullId && !isPrefix && !isLegacy) {
                 throw new Error(`Invalid memory ID format: ${id}`);
             }
             let rows;
-            if (isFullId) {
+            if (isFullId || isLegacy) {
+                // Legacy IDs use exact string match like full UUIDs
                 const safeId = escapeSqlLiteral(id);
                 rows = await this.table.query()
                     .where(`id = '${safeId}'`)
@@ -1507,10 +1664,29 @@ export class MemoryStore {
     get hasFtsSupport() {
         return this.ftsIndexCreated;
     }
-    /** Last FTS error for diagnostics */
-    _lastFtsError = null;
     get lastFtsError() {
         return this._lastFtsError;
+    }
+    async refreshFtsSupportFromTable() {
+        if (!this.table)
+            return this.ftsIndexCreated;
+        try {
+            const indices = await this.table.listIndices();
+            const available = hasFtsIndex(indices);
+            this.ftsIndexCreated = available;
+            if (available)
+                this._lastFtsError = null;
+            return available;
+        }
+        catch (err) {
+            this.ftsIndexCreated = false;
+            this._lastFtsError = err instanceof Error ? err.message : String(err);
+            return false;
+        }
+    }
+    async refreshFtsSupport() {
+        await this.ensureInitialized();
+        return this.refreshFtsSupportFromTable();
     }
     /** Get FTS index health status */
     getFtsStatus() {

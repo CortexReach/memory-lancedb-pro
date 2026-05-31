@@ -8,7 +8,7 @@
 import { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt, } from "./extraction-prompts.js";
 import { AdmissionController, } from "./admission-control.js";
 import { ALWAYS_MERGE_CATEGORIES, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
-import { isNoise } from "./noise-filter.js";
+import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats, } from "./smart-metadata.js";
 import { isUserMdExclusiveMemory, } from "./workspace-boundary.js";
 import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
@@ -302,26 +302,34 @@ export class SmartExtractor {
     // Embedding Noise Pre-Filter
     // --------------------------------------------------------------------------
     /**
-     * Filter out texts that match noise prototypes by embedding similarity.
-     * Long texts (>300 chars) are passed through without checking.
-     * Only active when noiseBank is configured and initialized.
+     * Filter out texts that match cheap static noise patterns first, then
+     * filter remaining texts that match noise prototypes by embedding similarity.
+     * Long texts (>300 chars) are passed through without embedding checks.
+     * Embedding checks are only active when noiseBank is configured and initialized.
      *
      * Uses batch embedding to reduce API round-trips from N to 1.
      */
     async filterNoiseByEmbedding(texts) {
+        const staticFiltered = texts.filter((text) => {
+            const noisy = isMetaFrustrationNoise(text);
+            if (noisy) {
+                this.debugLog(`memory-lancedb-pro: smart-extractor: static noise filtered: ${text.slice(0, 80)}`);
+            }
+            return !noisy;
+        });
         const noiseBank = this.config.noiseBank;
         if (!noiseBank || !noiseBank.initialized)
-            return texts;
+            return staticFiltered;
         // Partition: short/long texts bypass noise check; mid-length need embedding
         const SHORT_THRESHOLD = 8;
         const LONG_THRESHOLD = 300;
-        const bypassFlags = texts.map((t) => t.length <= SHORT_THRESHOLD || t.length > LONG_THRESHOLD);
+        const bypassFlags = staticFiltered.map((t) => t.length <= SHORT_THRESHOLD || t.length > LONG_THRESHOLD);
         const needsEmbedIndices = [];
         const needsEmbedTexts = [];
-        for (let i = 0; i < texts.length; i++) {
+        for (let i = 0; i < staticFiltered.length; i++) {
             if (!bypassFlags[i]) {
                 needsEmbedIndices.push(i);
-                needsEmbedTexts.push(texts[i]);
+                needsEmbedTexts.push(staticFiltered[i]);
             }
         }
         // Batch embed all mid-length texts in a single API call
@@ -332,14 +340,14 @@ export class SmartExtractor {
             }
             catch {
                 // Batch failed — pass all through
-                return texts.slice();
+                return staticFiltered.slice();
             }
         }
-        const result = new Array(texts.length);
+        const result = new Array(staticFiltered.length);
         // First, fill in bypass texts (always kept)
-        for (let i = 0; i < texts.length; i++) {
+        for (let i = 0; i < staticFiltered.length; i++) {
             if (bypassFlags[i]) {
-                result[i] = texts[i];
+                result[i] = staticFiltered[i];
             }
         }
         // Then, check noise for embedded texts
@@ -347,15 +355,15 @@ export class SmartExtractor {
             const idx = needsEmbedIndices[j];
             const vec = vectors[j];
             if (!vec || vec.length === 0) {
-                result[idx] = texts[idx];
+                result[idx] = staticFiltered[idx];
                 continue;
             }
             if (noiseBank.isNoise(vec)) {
-                this.debugLog(`memory-lancedb-pro: smart-extractor: embedding noise filtered: ${texts[idx].slice(0, 80)}`);
+                this.debugLog(`memory-lancedb-pro: smart-extractor: embedding noise filtered: ${staticFiltered[idx].slice(0, 80)}`);
                 // Leave result[idx] as undefined — will be compacted below
             }
             else {
-                result[idx] = texts[idx];
+                result[idx] = staticFiltered[idx];
             }
         }
         // Compact: remove undefined slots (filtered-out entries).

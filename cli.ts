@@ -799,7 +799,7 @@ export async function runImportMarkdown(
       if (dedupEnabled) {
         try {
           const existing = await ctx.store.bm25Search(text, 5, [effectiveScope]);
-          if (existing.length > 0 && existing[0].entry.text === text) {
+          if (existing.some((result) => result.entry.text === text)) {
             skipped++;
             fileSkipped++;
             if (!options.dryRun) {

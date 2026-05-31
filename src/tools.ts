@@ -29,7 +29,7 @@ import {
   DEFAULT_SELF_IMPROVEMENT_MAX_ENTRIES,
   ensureSelfImprovementLearningFiles,
 } from "./self-improvement-files.js";
-import { getDisplayCategoryTag } from "./reflection-metadata.js";
+import { getDisplayCategoryTag, parseReflectionMetadata } from "./reflection-metadata.js";
 import type { RetrievalTrace } from "./retrieval-trace.js";
 import {
   filterUserMdExclusiveRecallResults,
@@ -121,6 +121,38 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
     score: r.score,
     sources: r.sources,
   }));
+}
+
+function isUnresolvedReflectionItem(entry: MemoryEntry): boolean {
+  const metadata = parseReflectionMetadata(entry.metadata);
+  return metadata.type === "memory-reflection-item" && metadata.resolvedAt === undefined;
+}
+
+function formatReflectionResolveCandidate(result: {
+  entry: MemoryEntry;
+  score?: number;
+}): Record<string, unknown> {
+  const metadata = parseReflectionMetadata(result.entry.metadata);
+  return {
+    id: result.entry.id,
+    text: truncateText(normalizeInlineText(result.entry.text), 220),
+    itemKind: metadata.itemKind,
+    agentId: metadata.agentId,
+    score: result.score,
+  };
+}
+
+function formatReflectionResolvePreview(candidates: Array<{ entry: MemoryEntry; score?: number }>): string {
+  const lines = candidates.map((candidate, idx) => {
+    const metadata = parseReflectionMetadata(candidate.entry.metadata);
+    const itemKind = typeof metadata.itemKind === "string" ? metadata.itemKind : "item";
+    const scoreText = typeof candidate.score === "number" ? ` score=${candidate.score.toFixed(3)}` : "";
+    return `${idx + 1}. [${candidate.entry.id}] ${itemKind}${scoreText}: ${truncateText(normalizeInlineText(candidate.entry.text), 180)}`;
+  });
+  return [
+    `Reflection resolve preview: ${candidates.length} candidate(s). No changes made.`,
+    ...lines,
+  ].join("\n");
 }
 
 const _warnedMissingAgentId = new Set<string>();
@@ -542,45 +574,47 @@ export function registerSelfImprovementReviewTool(api: OpenClawPluginApi, contex
 // Core Tools (Backward Compatible)
 // ============================================================================
 
-export function registerMemoryRecallTool(
-  api: OpenClawPluginApi,
-  context: ToolContext,
+const MEMORY_RECALL_PARAMETERS = Type.Object({
+  query: Type.String({
+    description: "Search query for finding relevant memories",
+  }),
+  limit: Type.Optional(
+    Type.Number({
+      description: "Max results to return (default: 3, max: 20; summary mode soft max: 6)",
+    }),
+  ),
+  includeFullText: Type.Optional(
+    Type.Boolean({
+      description: "Return full memory text when true (default: false returns summary previews)",
+    }),
+  ),
+  maxCharsPerItem: Type.Optional(
+    Type.Number({
+      description: "Maximum characters per returned memory in summary mode (default: 180)",
+    }),
+  ),
+  scope: Type.Optional(
+    Type.String({
+      description: "Specific memory scope to search in (optional)",
+    }),
+  ),
+  category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
+});
+
+function createMemoryRecallTool(
+  runtimeContext: ToolContext,
+  options: {
+    name: string;
+    label: string;
+    description: string;
+  },
 ) {
-  api.registerTool(
-    (toolCtx) => {
-      const runtimeContext = resolveToolContext(context, toolCtx);
-      return {
-      name: "memory_recall",
-      label: "Memory Recall",
-      description:
-        "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
-      parameters: Type.Object({
-        query: Type.String({
-          description: "Search query for finding relevant memories",
-        }),
-        limit: Type.Optional(
-          Type.Number({
-            description: "Max results to return (default: 3, max: 20; summary mode soft max: 6)",
-          }),
-        ),
-        includeFullText: Type.Optional(
-          Type.Boolean({
-            description: "Return full memory text when true (default: false returns summary previews)",
-          }),
-        ),
-        maxCharsPerItem: Type.Optional(
-          Type.Number({
-            description: "Maximum characters per returned memory in summary mode (default: 180)",
-          }),
-        ),
-        scope: Type.Optional(
-          Type.String({
-            description: "Specific memory scope to search in (optional)",
-          }),
-        ),
-        category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
-      }),
-      async execute(_toolCallId, params) {
+  return {
+    name: options.name,
+    label: options.label,
+    description: options.description,
+    parameters: MEMORY_RECALL_PARAMETERS,
+    async execute(_toolCallId: unknown, params: unknown) {
         const {
           query,
           limit = 3,
@@ -712,10 +746,48 @@ export function registerMemoryRecallTool(
             details: { error: "recall_failed", message: String(error) },
           };
         }
-      },
-    };
+    },
+  };
+}
+
+export function registerMemoryRecallTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return createMemoryRecallTool(runtimeContext, {
+        name: "memory_recall",
+        label: "Memory Recall",
+        description:
+          "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
+      });
     },
     { name: "memory_recall" },
+  );
+}
+
+export function registerMemoryRecallAliasTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+  alias: "memory_search" | "memory_get",
+) {
+  const label = alias === "memory_get" ? "Memory Get" : "Memory Search";
+  const description = alias === "memory_get"
+    ? "Compatibility alias for memory_recall. Search and return relevant long-term memories for OpenClaw profiles that request memory_get."
+    : "Compatibility alias for memory_recall. Search through long-term memories for OpenClaw profiles that request memory_search.";
+
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return createMemoryRecallTool(runtimeContext, {
+        name: alias,
+        label,
+        description,
+      });
+    },
+    { name: alias },
   );
 }
 
@@ -742,6 +814,11 @@ export function registerMemoryStoreTool(
             description: "Memory scope (optional, defaults to agent scope)",
           }),
         ),
+        force: Type.Optional(
+          Type.Boolean({
+            description: "Store even when the duplicate pre-check finds a very similar existing memory",
+          }),
+        ),
       }),
       async execute(_toolCallId, params) {
         const {
@@ -749,11 +826,13 @@ export function registerMemoryStoreTool(
           importance = 0.7,
           category = "other",
           scope,
+          force = false,
         } = params as {
           text: string;
           importance?: number;
           category?: string;
           scope?: string;
+          force?: boolean;
         };
 
         try {
@@ -868,20 +947,21 @@ export function registerMemoryStoreTool(
             );
           }
 
-          if (existing.length > 0 && existing[0].score > 0.98) {
+          const duplicateCandidate = existing[0]?.score > 0.98 ? existing[0] : undefined;
+          if (duplicateCandidate && !force) {
             return {
               content: [
                 {
                   type: "text",
-                  text: `Similar memory already exists: "${existing[0].entry.text}"`,
+                  text: `Similar memory already exists: "${duplicateCandidate.entry.text}"`,
                 },
               ],
               details: {
                 action: "duplicate",
-                existingId: existing[0].entry.id,
-                existingText: existing[0].entry.text,
-                existingScope: existing[0].entry.scope,
-                similarity: existing[0].score,
+                existingId: duplicateCandidate.entry.id,
+                existingText: duplicateCandidate.entry.text,
+                existingScope: duplicateCandidate.entry.scope,
+                similarity: duplicateCandidate.score,
               },
             };
           }
@@ -1039,6 +1119,14 @@ export function registerMemoryStoreTool(
               scope: entry.scope,
               category: entry.category,
               importance: entry.importance,
+              ...(duplicateCandidate && force
+                ? { duplicateOverride: {
+                  existingId: duplicateCandidate.entry.id,
+                  existingText: duplicateCandidate.entry.text,
+                  existingScope: duplicateCandidate.entry.scope,
+                  similarity: duplicateCandidate.score,
+                } }
+                : {}),
             },
           };
         } catch (error) {
@@ -2098,6 +2186,209 @@ export function registerMemoryArchiveTool(
   );
 }
 
+export function registerMemoryReflectionResolveTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return {
+        name: "memory_reflection_resolve",
+        label: "Memory Reflection Resolve",
+        description:
+          "Mark a single memory-reflection item resolved so it stops participating in reflection recall.",
+        parameters: Type.Object({
+          memoryId: Type.Optional(Type.String({ description: "Reflection item id or id prefix." })),
+          query: Type.Optional(Type.String({ description: "Search query to preview matching unresolved reflection items." })),
+          scope: Type.Optional(Type.String({ description: "Optional scope filter." })),
+          dryRun: Type.Optional(Type.Boolean({ description: "Preview only. Defaults to true for query mode and false for memoryId mode." })),
+          note: Type.Optional(Type.String({ description: "Optional resolution note for audit trail." })),
+          limit: Type.Optional(Type.Number({ description: "Maximum query candidates to preview (default 5, max 20)." })),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
+          const {
+            memoryId,
+            query,
+            scope,
+            dryRun,
+            note,
+            limit = 5,
+          } = params as {
+            memoryId?: string;
+            query?: string;
+            scope?: string;
+            dryRun?: boolean;
+            note?: string;
+            limit?: number;
+          };
+
+          const trimmedMemoryId = memoryId?.trim();
+          const trimmedQuery = query?.trim();
+          if (!trimmedMemoryId && !trimmedQuery) {
+            return {
+              content: [{ type: "text", text: "Provide memoryId or query." }],
+              details: { error: "missing_selector" },
+            };
+          }
+          if (trimmedMemoryId && trimmedQuery) {
+            return {
+              content: [{ type: "text", text: "Provide only one of memoryId or query." }],
+              details: { error: "ambiguous_selector" },
+            };
+          }
+
+          const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
+          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+          if (scope) {
+            if (!context.scopeManager.isAccessible(scope, agentId)) {
+              return {
+                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
+                details: { error: "scope_access_denied", requestedScope: scope },
+              };
+            }
+            scopeFilter = [scope];
+          }
+
+          const shouldDryRun = dryRun ?? Boolean(trimmedQuery);
+          const safeLimit = clampInt(limit, 1, 20);
+          let candidates: Array<{ entry: MemoryEntry; score?: number }> = [];
+
+          if (trimmedMemoryId) {
+            const exactMatch = await runtimeContext.store.getById(trimmedMemoryId, scopeFilter);
+            if (exactMatch) {
+              const metadata = parseReflectionMetadata(exactMatch.metadata);
+              if (metadata.type !== "memory-reflection-item") {
+                return {
+                  content: [{ type: "text", text: `Memory ${trimmedMemoryId.slice(0, 8)} is not a reflection item.` }],
+                  details: { error: "not_reflection_item", memoryId: trimmedMemoryId },
+                };
+              }
+              if (metadata.resolvedAt !== undefined) {
+                return {
+                  content: [{ type: "text", text: `Reflection item ${trimmedMemoryId.slice(0, 8)} is already resolved.` }],
+                  details: { error: "already_resolved", memoryId: trimmedMemoryId, resolvedAt: metadata.resolvedAt },
+                };
+              }
+              candidates = [{ entry: exactMatch }];
+            } else {
+              const entries = await runtimeContext.store.list(scopeFilter, "reflection", 1000, 0);
+              const reflectionItemMatches = entries
+                .filter((entry) => entry.id.startsWith(trimmedMemoryId))
+                .filter((entry) => parseReflectionMetadata(entry.metadata).type === "memory-reflection-item");
+              const matches = reflectionItemMatches
+                .filter(isUnresolvedReflectionItem);
+              if (matches.length === 0) {
+                const alreadyResolved = reflectionItemMatches[0];
+                if (alreadyResolved) {
+                  return {
+                    content: [{ type: "text", text: `Reflection item ${trimmedMemoryId.slice(0, 8)} is already resolved.` }],
+                    details: {
+                      error: "already_resolved",
+                      memoryId: trimmedMemoryId,
+                      resolvedAt: parseReflectionMetadata(alreadyResolved.metadata).resolvedAt,
+                    },
+                  };
+                }
+                return {
+                  content: [{ type: "text", text: `Unresolved reflection item ${trimmedMemoryId.slice(0, 8)} not found.` }],
+                  details: { error: "not_found", memoryId: trimmedMemoryId },
+                };
+              }
+              if (matches.length > 1) {
+                return {
+                  content: [{ type: "text", text: `Reflection item prefix ${trimmedMemoryId} is ambiguous; use a longer id.` }],
+                  details: {
+                    error: "ambiguous_memory_id",
+                    memoryId: trimmedMemoryId,
+                    matches: matches.map((entry) => entry.id).slice(0, 20),
+                  },
+                };
+              }
+              candidates = [{ entry: matches[0] }];
+            }
+          } else if (trimmedQuery) {
+            const results = await retrieveWithRetry(runtimeContext.retriever, {
+              query: trimmedQuery,
+              limit: safeLimit,
+              scopeFilter,
+              category: "reflection",
+              source: "cli",
+            }, () => runtimeContext.store.count());
+            candidates = results
+              .filter((result) => isUnresolvedReflectionItem(result.entry))
+              .map((result) => ({ entry: result.entry, score: result.score }));
+            if (candidates.length === 0) {
+              return {
+                content: [{ type: "text", text: "No unresolved reflection items matched." }],
+                details: { action: "empty", query: trimmedQuery, scopeFilter },
+              };
+            }
+          }
+
+          if (shouldDryRun) {
+            return {
+              content: [{ type: "text", text: formatReflectionResolvePreview(candidates) }],
+              details: {
+                action: "preview",
+                query: trimmedQuery,
+                memoryId: trimmedMemoryId,
+                candidates: candidates.map(formatReflectionResolveCandidate),
+              },
+            };
+          }
+
+          if (trimmedQuery && candidates.length !== 1) {
+            return {
+              content: [{
+                type: "text",
+                text: `Query matched ${candidates.length} unresolved reflection items. Preview first, then resolve a specific memoryId.`,
+              }],
+              details: {
+                error: "ambiguous_query",
+                query: trimmedQuery,
+                candidates: candidates.map(formatReflectionResolveCandidate),
+              },
+            };
+          }
+
+          const target = candidates[0]?.entry;
+          if (!target) {
+            return {
+              content: [{ type: "text", text: "No unresolved reflection item selected." }],
+              details: { error: "not_found" },
+            };
+          }
+
+          const patch = {
+            resolvedAt: Date.now(),
+            resolvedBy: agentId,
+            ...(typeof note === "string" && note.trim() ? { resolutionNote: note.trim() } : {}),
+          };
+          const updated = await runtimeContext.store.patchMetadata(target.id, patch, scopeFilter);
+          if (!updated) {
+            return {
+              content: [{ type: "text", text: `Failed to resolve reflection item ${target.id.slice(0, 8)}.` }],
+              details: { error: "resolve_failed", id: target.id },
+            };
+          }
+
+          return {
+            content: [{ type: "text", text: `Resolved reflection item ${target.id.slice(0, 8)}.` }],
+            details: {
+              action: "resolved",
+              id: target.id,
+              resolvedBy: agentId,
+              note: patch.resolutionNote,
+            },
+          };
+        },
+      };
+    },
+    { name: "memory_reflection_resolve" },
+  );
+}
+
 export function registerMemoryCompactTool(
   api: OpenClawPluginApi,
   context: ToolContext,
@@ -2290,6 +2581,8 @@ export function registerAllMemoryTools(
 ) {
   // Core tools (always enabled)
   registerMemoryRecallTool(api, context);
+  registerMemoryRecallAliasTool(api, context, "memory_search");
+  registerMemoryRecallAliasTool(api, context, "memory_get");
   registerMemoryStoreTool(api, context);
   registerMemoryForgetTool(api, context);
   registerMemoryUpdateTool(api, context);
@@ -2301,6 +2594,7 @@ export function registerAllMemoryTools(
     registerMemoryListTool(api, context);
     registerMemoryPromoteTool(api, context);
     registerMemoryArchiveTool(api, context);
+    registerMemoryReflectionResolveTool(api, context);
     registerMemoryCompactTool(api, context);
     registerMemoryExplainRankTool(api, context);
   }

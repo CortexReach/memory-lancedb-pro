@@ -292,6 +292,29 @@ async function runTests() {
     console.log("  ✅ facts are not auto-superseded (only preference/entity)");
   }
 
+  // Test 10: exact duplicate is skipped unless force=true
+  {
+    console.log("Test 10: force=true overrides exact duplicate skip...");
+    const duplicateText = "Remember that the dashboard runs on port 5173";
+    const store = makeMockStore();
+    const oldId = "old-duplicate-1";
+    const oldEntry = makeOldEntry(oldId, duplicateText, "fact");
+    store.seed(oldEntry);
+
+    store.setNextSearchResults([{ entry: oldEntry, score: 0.99 }]);
+    const tool = createTool(registerMemoryStoreTool, makeContext(store));
+    const skipped = await tool.execute(null, { text: duplicateText, category: "fact" });
+    assert.equal(skipped.details.action, "duplicate", "duplicates should still skip by default");
+    assert.equal(skipped.details.existingId, oldId);
+
+    store.setNextSearchResults([{ entry: oldEntry, score: 0.99 }]);
+    const forced = await tool.execute(null, { text: duplicateText, category: "fact", force: true });
+    assert.equal(forced.details.action, "created", "force=true should store despite duplicate");
+    assert.equal(forced.details.duplicateOverride.existingId, oldId);
+    assert.equal(store._entries.size, 2, "forced duplicate should add a new entry");
+    console.log("  ✅ force=true stores despite exact duplicate");
+  }
+
   console.log("\n✅ All is-latest auto-supersede tests passed!");
 }
 
