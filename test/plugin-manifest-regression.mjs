@@ -109,6 +109,14 @@ assert.equal(
   true,
   "embedding.chunking schema default should match runtime default",
 );
+assert.ok(
+  !(manifest.configSchema.required ?? []).includes("embedding"),
+  "root configSchema should not require embedding because OpenClaw preflight validates undefined plugin config as {} before runtime parsePluginConfig can emit the clearer activation error",
+);
+assert.ok(
+  manifest.configSchema.properties.embedding.required.includes("apiKey"),
+  "embedding.apiKey should remain schema-required when an embedding block is supplied",
+);
 assert.equal(
   manifest.configSchema.properties.embedding.properties.omitDimensions?.type,
   "boolean",

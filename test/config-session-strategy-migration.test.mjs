@@ -22,7 +22,7 @@ function baseConfig() {
   };
 }
 
-describe("sessionStrategy legacy compatibility mapping", () => {
+describe("plugin config error hints", () => {
   it("explains undefined config as a preflight/activation mismatch", () => {
     assert.throws(
       () => parsePluginConfig(undefined),
@@ -43,7 +43,9 @@ describe("sessionStrategy legacy compatibility mapping", () => {
       /missing top-level config\.embedding.*do not nest it as config\.embedding\.embedding/i,
     );
   });
+});
 
+describe("sessionStrategy legacy compatibility mapping", () => {
   it("maps legacy sessionMemory.enabled=true to systemSessionMemory", () => {
     const parsed = parsePluginConfig({
       ...baseConfig(),
