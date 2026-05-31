@@ -2392,7 +2392,9 @@ const memoryLanceDBProPlugin = {
                     };
                     const memoryContext = selected.map((item) => item.line).join("\n");
                     const injectedIds = selected.map((item) => item.id).join(",") || "(none)";
-                    const retrievalDiagnostics = retriever.getLastDiagnostics();
+                    const retrievalDiagnostics = typeof retriever.getLastDiagnostics === "function"
+                        ? retriever.getLastDiagnostics()
+                        : undefined;
                     const rerankInputCount = retrievalDiagnostics?.stageCounts.rerankInput;
                     api.logger.debug?.(`memory-lancedb-pro: auto-recall stats hits=${results.length}, dedupFiltered=${dedupFilteredCount}, stateFiltered=${stateFilteredCount}, suppressedFiltered=${suppressedFilteredCount}, preBudgetItems=${preBudgetItems}, preBudgetChars=${preBudgetChars}, postBudgetItems=${selected.length}, postBudgetChars=${usedChars}, maxItems=${autoRecallMaxItems}, maxChars=${autoRecallMaxChars}, perItemMaxChars=${autoRecallPerItemMaxChars}, retrieveLimit=${retrieveLimit}, rerank=${retrievalConfig.rerank}, rerankProvider=${retrievalConfig.rerankProvider || "default"}, rerankInput=${rerankInputCount ?? "(unknown)"}, rerankInputLimit=${rerankInputLimit}, retrievalCandidatePoolSize=${retrievalConfig.candidatePoolSize}, injectedIds=${injectedIds}`);
                     api.logger.info?.(`memory-lancedb-pro: injecting ${selected.length} memories into context for agent ${agentId}`);
