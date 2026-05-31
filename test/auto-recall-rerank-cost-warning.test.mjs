@@ -34,11 +34,12 @@ function makeConfig(overrides = {}) {
 
 {
   const warning = buildAutoRecallRerankCostWarning(makeConfig());
-  assert.ok(warning, "high candidatePoolSize cross-encoder auto-recall should warn");
-  assert.match(warning, /candidatePoolSize/);
+  assert.ok(warning, "hybrid cross-encoder auto-recall should warn when rerank input exceeds injected items");
+  assert.match(warning, /rerank input window/);
   assert.match(warning, /autoRecallMaxItems/);
-  assert.match(warning, /20 candidates/);
+  assert.match(warning, /12 candidates/);
   assert.match(warning, /3 memories/);
+  assert.doesNotMatch(warning, /cost follows retrieval\.candidatePoolSize/);
 }
 
 {
@@ -64,7 +65,19 @@ function makeConfig(overrides = {}) {
       candidatePoolSize: 6,
     },
   }));
-  assert.equal(warning, null, "small candidate pools should not warn");
+  assert.match(warning, /12 candidates/, "configured candidatePoolSize below the rerank window should not hide the warning");
+}
+
+{
+  const warning = buildAutoRecallRerankCostWarning(makeConfig({
+    retrieval: {
+      mode: "vector",
+      rerank: "cross-encoder",
+      rerankApiKey: "dummy",
+      candidatePoolSize: 20,
+    },
+  }));
+  assert.equal(warning, null, "vector-only retrieval should not warn because it does not call cross-encoder rerank");
 }
 
 console.log("OK: auto-recall rerank cost warning test passed");

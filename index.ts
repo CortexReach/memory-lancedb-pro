@@ -385,11 +385,8 @@ function getAutoRecallRetrieveLimit(autoRecallMaxItems: number): number {
   return clampInt(Math.max(autoRecallMaxItems * 2, autoRecallMaxItems), 1, 20);
 }
 
-function getEffectiveRerankCandidatePoolSize(
-  retrievalConfig: RetrievalConfig,
-  retrieveLimit: number,
-): number {
-  return Math.max(retrievalConfig.candidatePoolSize, retrieveLimit * 2);
+function getAutoRecallRerankInputLimit(retrieveLimit: number): number {
+  return clampInt(retrieveLimit, 1, 20) * 2;
 }
 
 export function buildAutoRecallRerankCostWarning(
@@ -397,20 +394,22 @@ export function buildAutoRecallRerankCostWarning(
   retrievalConfig: RetrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...(config.retrieval || {}) },
 ): string | null {
   if (config.autoRecall !== true || config.recallMode === "off") return null;
+  if (retrievalConfig.mode === "vector") return null;
   if (retrievalConfig.rerank !== "cross-encoder" || !retrievalConfig.rerankApiKey) return null;
 
   const autoRecallMaxItems = getEffectiveAutoRecallMaxItems(config);
   const retrieveLimit = getAutoRecallRetrieveLimit(autoRecallMaxItems);
-  const candidatePoolSize = getEffectiveRerankCandidatePoolSize(retrievalConfig, retrieveLimit);
-  if (candidatePoolSize <= autoRecallMaxItems * 4) return null;
+  const rerankInputLimit = getAutoRecallRerankInputLimit(retrieveLimit);
+  if (rerankInputLimit <= autoRecallMaxItems) return null;
 
   const provider = retrievalConfig.rerankProvider || "jina";
   return (
-    `[memory-lancedb-pro] autoRecall=true with cross-encoder rerank (${provider}) can send up to ` +
-    `${candidatePoolSize} candidates to the reranker for each prompt while injecting at most ` +
-    `${autoRecallMaxItems} memories. External rerank cost follows retrieval.candidatePoolSize, not ` +
-    `autoRecallMaxItems. Lower retrieval.candidatePoolSize, set retrieval.rerank to "lightweight" ` +
-    `or "none", or raise autoRecallMinLength to reduce calls.`
+    `[memory-lancedb-pro] autoRecall=true with hybrid cross-encoder rerank (${provider}) can send up to ` +
+    `${rerankInputLimit} candidates to the reranker for each prompt while injecting at most ` +
+    `${autoRecallMaxItems} memories. External rerank cost follows the auto-recall rerank input window ` +
+    `(${retrieveLimit} retrieved items x2), not retrieval.candidatePoolSize or the final ` +
+    `autoRecallMaxItems injection cap. Lower autoRecallMaxItems or maxRecallPerTurn, set ` +
+    `retrieval.rerank to "lightweight" or "none", or raise autoRecallMinLength to reduce calls.`
   );
 }
 
@@ -2869,7 +2868,7 @@ const memoryLanceDBProPlugin = {
           const autoRecallPerItemMaxChars = clampInt(config.autoRecallPerItemMaxChars ?? 180, 32, 1000);
           const retrieveLimit = getAutoRecallRetrieveLimit(autoRecallMaxItems);
           const retrievalConfig = retriever.getConfig();
-          const rerankCandidatePoolSize = getEffectiveRerankCandidatePoolSize(retrievalConfig, retrieveLimit);
+          const rerankInputLimit = getAutoRecallRerankInputLimit(retrieveLimit);
 
           // Adaptive intent analysis (zero-LLM-cost pattern matching)
           const intent = recallMode === "adaptive" ? analyzeIntent(recallQuery) : undefined;
@@ -3082,8 +3081,10 @@ const memoryLanceDBProPlugin = {
           const memoryContext = selected.map((item) => item.line).join("\n");
 
           const injectedIds = selected.map((item) => item.id).join(",") || "(none)";
+          const retrievalDiagnostics = retriever.getLastDiagnostics();
+          const rerankInputCount = retrievalDiagnostics?.stageCounts.rerankInput;
           api.logger.debug?.(
-            `memory-lancedb-pro: auto-recall stats hits=${results.length}, dedupFiltered=${dedupFilteredCount}, stateFiltered=${stateFilteredCount}, suppressedFiltered=${suppressedFilteredCount}, preBudgetItems=${preBudgetItems}, preBudgetChars=${preBudgetChars}, postBudgetItems=${selected.length}, postBudgetChars=${usedChars}, maxItems=${autoRecallMaxItems}, maxChars=${autoRecallMaxChars}, perItemMaxChars=${autoRecallPerItemMaxChars}, retrieveLimit=${retrieveLimit}, rerank=${retrievalConfig.rerank}, rerankProvider=${retrievalConfig.rerankProvider || "default"}, candidatePoolSize=${rerankCandidatePoolSize}, injectedIds=${injectedIds}`,
+            `memory-lancedb-pro: auto-recall stats hits=${results.length}, dedupFiltered=${dedupFilteredCount}, stateFiltered=${stateFilteredCount}, suppressedFiltered=${suppressedFilteredCount}, preBudgetItems=${preBudgetItems}, preBudgetChars=${preBudgetChars}, postBudgetItems=${selected.length}, postBudgetChars=${usedChars}, maxItems=${autoRecallMaxItems}, maxChars=${autoRecallMaxChars}, perItemMaxChars=${autoRecallPerItemMaxChars}, retrieveLimit=${retrieveLimit}, rerank=${retrievalConfig.rerank}, rerankProvider=${retrievalConfig.rerankProvider || "default"}, rerankInput=${rerankInputCount ?? "(unknown)"}, rerankInputLimit=${rerankInputLimit}, retrievalCandidatePoolSize=${retrievalConfig.candidatePoolSize}, injectedIds=${injectedIds}`,
           );
 
           api.logger.info?.(

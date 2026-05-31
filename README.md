@@ -712,11 +712,11 @@ If auto-recall consistently times out, check your embedding API latency first. T
 <details>
 <summary><strong>Auto-recall rerank cost model</strong></summary>
 
-When `autoRecall=true` and `retrieval.rerank="cross-encoder"` with an external rerank API such as Jina, every eligible prompt can make a rerank request. The number of documents sent to that request is governed by `retrieval.candidatePoolSize` (and the retrieval safety minimum), not by the final `autoRecallMaxItems` injection cap.
+When `autoRecall=true` and hybrid retrieval uses `retrieval.rerank="cross-encoder"` with an external rerank API such as Jina, every eligible prompt can make a rerank request. The number of documents sent to that request is governed by auto-recall's retrieve limit and the retriever's rerank input window, not directly by `retrieval.candidatePoolSize` or by the final `autoRecallMaxItems` injection cap.
 
-For example, with `autoRecallMaxItems: 3` and the default `candidatePoolSize: 20`, the plugin may rerank up to 20 candidates before injecting at most 3 memories. To reduce external rerank usage, lower `retrieval.candidatePoolSize`, switch `retrieval.rerank` to `"lightweight"` or `"none"`, increase `autoRecallMinLength`, or keep auto-recall disabled and use manual `memory_recall` where appropriate.
+For example, with `autoRecallMaxItems: 3`, auto-recall asks retrieval for 6 items and hybrid retrieval may send up to 12 candidates to the external reranker before injecting at most 3 memories. To reduce external rerank usage, lower `autoRecallMaxItems` or `maxRecallPerTurn`, switch `retrieval.rerank` to `"lightweight"` or `"none"`, increase `autoRecallMinLength`, or keep auto-recall disabled and use manual `memory_recall` where appropriate.
 
-Startup logs warn when auto-recall plus cross-encoder rerank is configured with a large candidate pool, and debug auto-recall stats include the effective `candidatePoolSize`, `retrieveLimit`, `rerank`, and `rerankProvider`.
+Startup logs warn when auto-recall plus hybrid cross-encoder rerank can send more items to the reranker than it will inject. Debug auto-recall stats include the actual `rerankInput`, `rerankInputLimit`, `retrieveLimit`, `rerank`, `rerankProvider`, and configured `retrievalCandidatePoolSize`.
 
 </details>
 
