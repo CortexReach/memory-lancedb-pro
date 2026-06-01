@@ -81,6 +81,14 @@ function getAutoRecallHook(eventHandlers) {
   return autoRecallHook;
 }
 
+function confirmedMetadata(overrides = {}) {
+  return JSON.stringify({
+    state: "confirmed",
+    memory_layer: "durable",
+    ...overrides,
+  });
+}
+
 function makeResults() {
   return [
     {
@@ -91,6 +99,7 @@ function makeResults() {
         scope: "global",
         importance: 0.7,
         timestamp: Date.now(),
+        metadata: confirmedMetadata(),
       },
       score: 0.82,
       sources: {
@@ -107,6 +116,7 @@ function makeResults() {
         scope: "global",
         importance: 0.8,
         timestamp: Date.now(),
+        metadata: confirmedMetadata(),
       },
       score: 0.77,
       sources: {
@@ -128,6 +138,7 @@ function makeExpandedResults() {
         scope: "project",
         importance: 0.5,
         timestamp: Date.now(),
+        metadata: confirmedMetadata(),
       },
       score: 0.65,
       sources: {
@@ -216,6 +227,7 @@ function makeManyResults(count = 7) {
         scope: "global",
         importance: 0.5,
         timestamp: Date.now(),
+        metadata: confirmedMetadata(),
       },
       score: 0.9 - i * 0.05,
       sources: {
@@ -973,7 +985,7 @@ describe("recall text cleanup", () => {
           scope: "global",
           importance: 0.8,
           timestamp: ts,
-          metadata: JSON.stringify({ folder: "Goals", source: "manual" }),
+          metadata: confirmedMetadata({ folder: "Goals", source: "manual" }),
         },
         score: 0.9,
         sources: { vector: { score: 0.9, rank: 1 } },
@@ -1005,6 +1017,7 @@ describe("recall text cleanup", () => {
           scope: "global",
           importance: 0.7,
           timestamp: Date.now(),
+          metadata: confirmedMetadata(),
         },
         score: 0.85,
         sources: { vector: { score: 0.85, rank: 1 } },
@@ -1033,7 +1046,7 @@ describe("recall text cleanup", () => {
           scope: "global",
           importance: 0.7,
           timestamp: Date.now(),
-          metadata: JSON.stringify({ folder: "Preferences", source: "manual" }),
+          metadata: confirmedMetadata({ folder: "Preferences", source: "manual" }),
         },
         score: 0.85,
         sources: { vector: { score: 0.85, rank: 1 } },
@@ -1062,7 +1075,7 @@ describe("recall text cleanup", () => {
           scope: "global",
           importance: 0.9,
           timestamp: Date.now(),
-          metadata: JSON.stringify({ tier: "l1" }),
+          metadata: confirmedMetadata({ tier: "l1" }),
         },
         score: 0.88,
         sources: { vector: { score: 0.88, rank: 1 } },
@@ -1075,7 +1088,7 @@ describe("recall text cleanup", () => {
           scope: "global",
           importance: 0.85,
           timestamp: Date.now(),
-          metadata: JSON.stringify({ tier: "l2" }),
+          metadata: confirmedMetadata({ tier: "l2" }),
         },
         score: 0.82,
         sources: { vector: { score: 0.82, rank: 2 } },
