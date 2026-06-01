@@ -24,6 +24,72 @@ function createToolSet(context) {
 }
 
 describe("memory governance tools", () => {
+  it("defaults stats and list to the caller's accessible scopes", async () => {
+    const statsScopeFilters = [];
+    const listScopeFilters = [];
+    const context = {
+      agentId: "main",
+      workspaceDir: "/tmp",
+      mdMirror: null,
+      scopeManager: {
+        getAccessibleScopes: (agentId) => ["global", `agent:${agentId}`, `reflection:agent:${agentId}`],
+        getScopeFilter: (agentId) => ["global", `agent:${agentId}`, `reflection:agent:${agentId}`],
+        isAccessible: (scope, agentId) => ["global", `agent:${agentId}`, `reflection:agent:${agentId}`].includes(scope),
+        getDefaultScope: (agentId) => `agent:${agentId}`,
+        getStats: () => ({ totalScopes: 3, agentsWithCustomAccess: 0, scopesByType: {} }),
+      },
+      retriever: {
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+        getStatsCollector() {
+          return { count: 0 };
+        },
+      },
+      store: {
+        hasFtsSupport: true,
+        async stats(scopeFilter) {
+          statsScopeFilters.push(scopeFilter);
+          return {
+            totalCount: scopeFilter.includes("agent:main") ? 1 : 0,
+            scopeCounts: { "agent:main": 1 },
+            categoryCounts: { fact: 1 },
+          };
+        },
+        async list(scopeFilter) {
+          listScopeFilters.push(scopeFilter);
+          return scopeFilter.includes("agent:main")
+            ? [{
+              id: "agent-memory-1",
+              text: "agent private preference",
+              category: "fact",
+              scope: "agent:main",
+              importance: 0.7,
+              timestamp: Date.now(),
+              metadata: "{}",
+            }]
+            : [];
+        },
+      },
+      embedder: { async embedPassage() { return [0.1, 0.2, 0.3]; } },
+    };
+
+    const tools = createToolSet(context);
+    const stats = tools.get("memory_stats");
+    const list = tools.get("memory_list");
+
+    const statsRes = await stats.execute(null, {});
+    const listRes = await list.execute(null, {});
+
+    const expectedScopes = ["global", "agent:main", "reflection:agent:main"];
+    assert.deepEqual(statsScopeFilters[0], expectedScopes);
+    assert.deepEqual(listScopeFilters[0], expectedScopes);
+    assert.deepEqual(statsRes.details.scopes, expectedScopes);
+    assert.deepEqual(listRes.details.filters.scopes, expectedScopes);
+    assert.equal(statsRes.details.stats.totalCount, 1);
+    assert.equal(listRes.details.count, 1);
+  });
+
   it("promotes and archives memory entries", async () => {
     const entries = [
       {

@@ -154,6 +154,23 @@ async function retrieveWithRetry(retriever, params, countStore) {
     }
     return results;
 }
+function resolveReadableToolScopeFilter(scopeManager, agentId, scope) {
+    if (scope) {
+        if (scopeManager.isAccessible(scope, agentId)) {
+            return { scopeFilter: [scope] };
+        }
+        return {
+            error: {
+                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
+                details: {
+                    error: "scope_access_denied",
+                    requestedScope: scope,
+                },
+            },
+        };
+    }
+    return { scopeFilter: resolveScopeFilter(scopeManager, agentId) };
+}
 async function resolveMemoryId(context, memoryRef, scopeFilter) {
     const trimmed = memoryRef.trim();
     if (!trimmed) {
@@ -1273,7 +1290,7 @@ export function registerMemoryStatsTool(api, context) {
         return {
             name: "memory_stats",
             label: "Memory Statistics",
-            description: "Get statistics about memory usage, scopes, and categories.",
+            description: "Get statistics about memory usage, scopes, and categories. Defaults to the caller's accessible scopes when scope is omitted.",
             parameters: Type.Object({
                 scope: Type.Optional(Type.String({
                     description: "Specific scope to get stats for (optional)",
@@ -1283,24 +1300,10 @@ export function registerMemoryStatsTool(api, context) {
                 const { scope } = params;
                 try {
                     const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
-                    // Determine accessible scopes
-                    let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-                    if (scope) {
-                        if (context.scopeManager.isAccessible(scope, agentId)) {
-                            scopeFilter = [scope];
-                        }
-                        else {
-                            return {
-                                content: [
-                                    { type: "text", text: `Access denied to scope: ${scope}` },
-                                ],
-                                details: {
-                                    error: "scope_access_denied",
-                                    requestedScope: scope,
-                                },
-                            };
-                        }
-                    }
+                    const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
+                    if ("error" in resolvedScopes)
+                        return resolvedScopes.error;
+                    const { scopeFilter } = resolvedScopes;
                     const stats = await context.store.stats(scopeFilter);
                     const scopeManagerStats = context.scopeManager.getStats();
                     const retrievalConfig = context.retriever.getConfig();
@@ -1336,6 +1339,7 @@ export function registerMemoryStatsTool(api, context) {
                         details: {
                             stats,
                             scopeManagerStats,
+                            scopes: scopeFilter,
                             retrievalConfig: {
                                 ...retrievalConfig,
                                 rerankApiKey: retrievalConfig.rerankApiKey ? "***" : undefined,
@@ -1462,7 +1466,7 @@ export function registerMemoryListTool(api, context) {
         return {
             name: "memory_list",
             label: "Memory List",
-            description: "List recent memories with optional filtering by scope and category.",
+            description: "List recent memories with optional filtering by scope and category. Defaults to the caller's accessible scopes when scope is omitted.",
             parameters: Type.Object({
                 limit: Type.Optional(Type.Number({
                     description: "Max memories to list (default: 10, max: 50)",
@@ -1479,24 +1483,10 @@ export function registerMemoryListTool(api, context) {
                     const safeLimit = clampInt(limit, 1, 50);
                     const safeOffset = clampInt(offset, 0, 1000);
                     const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
-                    // Determine accessible scopes
-                    let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-                    if (scope) {
-                        if (context.scopeManager.isAccessible(scope, agentId)) {
-                            scopeFilter = [scope];
-                        }
-                        else {
-                            return {
-                                content: [
-                                    { type: "text", text: `Access denied to scope: ${scope}` },
-                                ],
-                                details: {
-                                    error: "scope_access_denied",
-                                    requestedScope: scope,
-                                },
-                            };
-                        }
-                    }
+                    const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
+                    if ("error" in resolvedScopes)
+                        return resolvedScopes.error;
+                    const { scopeFilter } = resolvedScopes;
                     const entries = await context.store.list(scopeFilter, category, safeLimit, safeOffset);
                     if (entries.length === 0) {
                         return {
@@ -1505,6 +1495,7 @@ export function registerMemoryListTool(api, context) {
                                 count: 0,
                                 filters: {
                                     scope,
+                                    scopes: scopeFilter,
                                     category,
                                     limit: safeLimit,
                                     offset: safeOffset,
@@ -1541,6 +1532,7 @@ export function registerMemoryListTool(api, context) {
                             })),
                             filters: {
                                 scope,
+                                scopes: scopeFilter,
                                 category,
                                 limit: safeLimit,
                                 offset: safeOffset,

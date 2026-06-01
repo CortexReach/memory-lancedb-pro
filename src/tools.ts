@@ -229,6 +229,34 @@ async function retrieveWithRetry(
   return results;
 }
 
+function resolveReadableToolScopeFilter(
+  scopeManager: MemoryScopeManager,
+  agentId: string | undefined,
+  scope?: string,
+): { scopeFilter: string[] | undefined } | {
+  error: {
+    content: Array<{ type: "text"; text: string }>;
+    details: { error: "scope_access_denied"; requestedScope: string };
+  };
+} {
+  if (scope) {
+    if (scopeManager.isAccessible(scope, agentId)) {
+      return { scopeFilter: [scope] };
+    }
+    return {
+      error: {
+        content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
+        details: {
+          error: "scope_access_denied",
+          requestedScope: scope,
+        },
+      },
+    };
+  }
+
+  return { scopeFilter: resolveScopeFilter(scopeManager, agentId) };
+}
+
 async function resolveMemoryId(
   context: ToolContext,
   memoryRef: string,
@@ -1614,7 +1642,7 @@ export function registerMemoryStatsTool(
       return {
         name: "memory_stats",
       label: "Memory Statistics",
-      description: "Get statistics about memory usage, scopes, and categories.",
+      description: "Get statistics about memory usage, scopes, and categories. Defaults to the caller's accessible scopes when scope is omitted.",
       parameters: Type.Object({
         scope: Type.Optional(
           Type.String({
@@ -1627,23 +1655,9 @@ export function registerMemoryStatsTool(
 
         try {
           const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
-          // Determine accessible scopes
-          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-          if (scope) {
-            if (context.scopeManager.isAccessible(scope, agentId)) {
-              scopeFilter = [scope];
-            } else {
-              return {
-                content: [
-                  { type: "text", text: `Access denied to scope: ${scope}` },
-                ],
-                details: {
-                  error: "scope_access_denied",
-                  requestedScope: scope,
-                },
-              };
-            }
-          }
+          const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
+          if ("error" in resolvedScopes) return resolvedScopes.error;
+          const { scopeFilter } = resolvedScopes;
 
           const stats = await context.store.stats(scopeFilter);
           const scopeManagerStats = context.scopeManager.getStats();
@@ -1697,6 +1711,7 @@ export function registerMemoryStatsTool(
             details: {
               stats,
               scopeManagerStats,
+              scopes: scopeFilter,
               retrievalConfig: {
                 ...retrievalConfig,
                 rerankApiKey: retrievalConfig.rerankApiKey ? "***" : undefined,
@@ -1847,7 +1862,7 @@ export function registerMemoryListTool(
         name: "memory_list",
       label: "Memory List",
       description:
-        "List recent memories with optional filtering by scope and category.",
+        "List recent memories with optional filtering by scope and category. Defaults to the caller's accessible scopes when scope is omitted.",
       parameters: Type.Object({
         limit: Type.Optional(
           Type.Number({
@@ -1882,23 +1897,9 @@ export function registerMemoryListTool(
           const safeOffset = clampInt(offset, 0, 1000);
           const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
 
-          // Determine accessible scopes
-          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-          if (scope) {
-            if (context.scopeManager.isAccessible(scope, agentId)) {
-              scopeFilter = [scope];
-            } else {
-              return {
-                content: [
-                  { type: "text", text: `Access denied to scope: ${scope}` },
-                ],
-                details: {
-                  error: "scope_access_denied",
-                  requestedScope: scope,
-                },
-              };
-            }
-          }
+          const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
+          if ("error" in resolvedScopes) return resolvedScopes.error;
+          const { scopeFilter } = resolvedScopes;
 
           const entries = await context.store.list(
             scopeFilter,
@@ -1914,6 +1915,7 @@ export function registerMemoryListTool(
                 count: 0,
                 filters: {
                   scope,
+                  scopes: scopeFilter,
                   category,
                   limit: safeLimit,
                   offset: safeOffset,
@@ -1952,6 +1954,7 @@ export function registerMemoryListTool(
               })),
               filters: {
                 scope,
+                scopes: scopeFilter,
                 category,
                 limit: safeLimit,
                 offset: safeOffset,
