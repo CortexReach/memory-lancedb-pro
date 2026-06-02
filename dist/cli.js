@@ -294,6 +294,71 @@ function formatMemory(memory, index) {
     const text = fullText.slice(0, 100) + (fullText.length > 100 ? "..." : "");
     return `${prefix}[${id}] [${memory.category}:${memory.scope}] ${text} (${date})`;
 }
+const OBSIDIAN_CATEGORY_DIRS = {
+    preference: "00-Preferences",
+    fact: "01-Facts",
+    decision: "02-Decisions",
+    entity: "03-People",
+    reflection: "04-Reflections",
+    other: "05-Other",
+};
+function safeObsidianSlug(value, fallback = "memory") {
+    const slug = value
+        .normalize("NFKD")
+        .replace(/[\\/:*?"<>|#^[\]]+/g, " ")
+        .replace(/\s+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 80)
+        .toLowerCase();
+    return slug || fallback;
+}
+function yamlScalar(value) {
+    const text = String(value ?? "");
+    return JSON.stringify(text);
+}
+function memoryDate(memory) {
+    const timestamp = Number(memory.timestamp);
+    const date = Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp) : new Date();
+    return date.toISOString().split("T")[0];
+}
+function memoryTitle(memory) {
+    const firstLine = String(memory.text || "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find(Boolean);
+    if (firstLine) {
+        return firstLine.slice(0, 80);
+    }
+    return `Memory ${memory.id}`;
+}
+function formatObsidianMemory(memory) {
+    const created = memoryDate(memory);
+    const title = memoryTitle(memory);
+    const metadata = (() => {
+        try {
+            return memory.metadata ? JSON.parse(memory.metadata) : {};
+        }
+        catch {
+            return {};
+        }
+    })();
+    const tags = Array.isArray(metadata?.tags)
+        ? metadata.tags.filter((tag) => typeof tag === "string")
+        : [];
+    const frontmatter = [
+        "---",
+        `id: ${yamlScalar(memory.id)}`,
+        `category: ${yamlScalar(memory.category)}`,
+        `scope: ${yamlScalar(memory.scope || "global")}`,
+        `importance: ${Number.isFinite(Number(memory.importance)) ? Number(memory.importance) : 0}`,
+        `created: ${yamlScalar(created)}`,
+        `source: ${yamlScalar("memory-lancedb-pro")}`,
+        `tags: [${tags.map(yamlScalar).join(", ")}]`,
+        "---",
+        "",
+    ];
+    return `${frontmatter.join("\n")}# ${title}\n\n${String(memory.text || "").trim()}\n`;
+}
 function formatJson(obj) {
     return JSON.stringify(obj, null, 2);
 }
@@ -1135,6 +1200,68 @@ export function registerMemoryCLI(program, context) {
         }
         catch (error) {
             console.error("Export failed:", error);
+            process.exit(1);
+        }
+    });
+    const sync = memory
+        .command("sync")
+        .description("Sync memories to external local formats");
+    sync
+        .command("obsidian")
+        .description("Export memories to Markdown notes in an Obsidian vault")
+        .requiredOption("--vault <path>", "Obsidian vault path")
+        .option("--scope <scope>", "Export specific scope")
+        .option("--category <category>", "Export specific category")
+        .option("--limit <number>", "Maximum memories to export", "1000")
+        .option("--dry-run", "Show what would be written without creating files")
+        .action(async (options) => {
+        try {
+            const limit = clampInt(Number(options.limit), 1, 10000);
+            const scopeFilter = options.scope ? [String(options.scope)] : undefined;
+            const memories = await context.store.list(scopeFilter, options.category, limit);
+            const vault = path.resolve(String(options.vault));
+            const root = path.join(vault, "00-AI-Memory");
+            let created = 0;
+            let updated = 0;
+            let skipped = 0;
+            for (const memory of memories) {
+                const category = String(memory.category || "other");
+                const dirName = OBSIDIAN_CATEGORY_DIRS[category] || OBSIDIAN_CATEGORY_DIRS.other;
+                const title = memoryTitle(memory);
+                const shortId = safeObsidianSlug(String(memory.id || "memory")).slice(0, 12);
+                const fileName = `${memoryDate(memory)}-${safeObsidianSlug(title)}-${shortId}.md`;
+                const filePath = path.join(root, dirName, fileName);
+                const body = formatObsidianMemory(memory);
+                if (options.dryRun) {
+                    console.log(`[dry-run] ${filePath}`);
+                    created++;
+                    continue;
+                }
+                await mkdir(path.dirname(filePath), { recursive: true });
+                let existing = null;
+                try {
+                    existing = await readFile(filePath, "utf8");
+                }
+                catch {
+                    existing = null;
+                }
+                if (existing === body) {
+                    skipped++;
+                    continue;
+                }
+                await writeFile(filePath, body, "utf8");
+                if (existing == null) {
+                    created++;
+                }
+                else {
+                    updated++;
+                }
+            }
+            console.log(`Obsidian sync ${options.dryRun ? "dry-run" : "completed"}: ${created} created, ${updated} updated, ${skipped} skipped`);
+            console.log(`Vault: ${vault}`);
+        }
+        catch (error) {
+            console.error("Obsidian sync failed:", error);
             process.exit(1);
         }
     });

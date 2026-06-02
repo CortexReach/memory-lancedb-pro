@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import Module from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -162,6 +162,30 @@ async function runCliSmoke() {
     "agent:smoke",
   ]);
   assert.match(out2, /Import completed: 0 imported, 1 skipped/, out2);
+
+  const vaultPath = path.join(workDir, "obsidian-vault");
+  const outObsidian = await captureLogs([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "sync",
+    "obsidian",
+    "--vault",
+    vaultPath,
+    "--scope",
+    "agent:smoke",
+    "--limit",
+    "10",
+  ]);
+  assert.match(outObsidian, /Obsidian sync completed: 1 created, 0 updated, 0 skipped/, outObsidian);
+
+  const exportedDir = path.join(vaultPath, "00-AI-Memory", "05-Other");
+  const exportedFiles = readdirSync(exportedDir);
+  assert.equal(exportedFiles.length, 1);
+  const exportedMarkdown = readFileSync(path.join(exportedDir, exportedFiles[0]), "utf8");
+  assert.match(exportedMarkdown, /id: "smoke_import_id_1"/);
+  assert.match(exportedMarkdown, /category: "other"/);
+  assert.match(exportedMarkdown, new RegExp(importPhrase));
 
   const { parseAccessMetadata, buildUpdatedMetadata, computeEffectiveHalfLife } =
     jiti("../src/access-tracker.ts");
