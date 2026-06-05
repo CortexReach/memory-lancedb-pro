@@ -258,6 +258,11 @@ export class MemoryUpgrader {
         else {
             enriched = simpleEnrich(entry.text, newCategory);
         }
+        const fullSearchableText = enriched.l2_content.trim() || entry.text;
+        enriched = {
+            ...enriched,
+            l2_content: fullSearchableText,
+        };
         // Step 3: Build enriched metadata
         const existingMeta = entry.metadata ? (() => {
             try {
@@ -283,9 +288,10 @@ export class MemoryUpgrader {
         return {
             entry,
             updates: {
-                // Keep the existing upgrader behavior in this PR: the primary text
-                // column is updated to L0, while L2 remains in smart metadata.
-                text: enriched.l0_abstract,
+                // Keep the full searchable layer in the primary text column. Search also
+                // scores L0/L1/L2 metadata, so replacing text with L0 would discard recall
+                // terms that only appear in the original content.
+                text: fullSearchableText,
                 metadata: stringifySmartMetadata(newMetadata),
             },
         };

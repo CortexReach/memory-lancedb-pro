@@ -21,6 +21,13 @@
  */
 
 import type { MemoryEntry } from "./store.js";
+import {
+  buildSmartMetadata,
+  parseSmartMetadata,
+  reverseMapLegacyCategory,
+  stringifySmartMetadata,
+  type SmartMemoryMetadata,
+} from "./smart-metadata.js";
 
 // ============================================================================
 // Types
@@ -189,7 +196,7 @@ export function buildMergedEntry(
   const seen = new Set<string>();
   const lines: string[] = [];
   for (const m of members) {
-    for (const line of m.text.split("\n")) {
+    for (const line of getFullSearchableContent(m).split("\n")) {
       const trimmed = line.trim();
       if (trimmed && !seen.has(trimmed.toLowerCase())) {
         seen.add(trimmed.toLowerCase());
@@ -223,13 +230,93 @@ export function buildMergedEntry(
   const scope = members[0].scope;
 
   // --- metadata ---
-  const metadata = JSON.stringify({
-    compacted: true,
-    sourceCount: members.length,
-    compactedAt: Date.now(),
-  });
+  const compactedAt = Date.now();
+  const metadata = stringifySmartMetadata(buildSmartMetadata(
+    {
+      text,
+      category,
+      importance,
+      timestamp: compactedAt,
+      metadata: "{}",
+    },
+    {
+      l0_abstract: buildCompactedAbstract(members, text),
+      l1_overview: buildCompactedOverview(members, text),
+      l2_content: text,
+      memory_category: reverseMapLegacyCategory(category, text),
+      tier: strongestTier(members),
+      access_count: maxAccessCount(members),
+      confidence: maxConfidence(members),
+      last_accessed_at: Math.max(...members.map((m) => m.timestamp), compactedAt),
+      compacted: true,
+      sourceCount: members.length,
+      compactedAt,
+    } as Partial<SmartMemoryMetadata> & Record<string, unknown>,
+  ));
 
   return { text, importance, category, scope, metadata };
+}
+
+function metadataFor(entry: CompactionEntry): SmartMemoryMetadata {
+  return parseSmartMetadata(entry.metadata, entry);
+}
+
+function getFullSearchableContent(entry: CompactionEntry): string {
+  return metadataFor(entry).l2_content || entry.text;
+}
+
+function stripBulletPrefix(text: string): string {
+  return text.replace(/^\s*[-*]\s+/, "").trim();
+}
+
+function dedupeNonEmpty(values: string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const value of values) {
+    const trimmed = stripBulletPrefix(value);
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(trimmed);
+  }
+  return deduped;
+}
+
+function buildCompactedAbstract(members: CompactionEntry[], fallbackText: string): string {
+  const highestImportance = [...members].sort((a, b) => b.importance - a.importance)[0];
+  const candidate = highestImportance ? metadataFor(highestImportance).l0_abstract : "";
+  const fallback = fallbackText.match(/^[^.!?。！？\n]+[.!?。！？]?/)?.[0] || fallbackText;
+  return (candidate || fallback).slice(0, 180).trim();
+}
+
+function buildCompactedOverview(members: CompactionEntry[], fallbackText: string): string {
+  const summaries = dedupeNonEmpty(
+    members.map((member) => metadataFor(member).l0_abstract),
+  ).slice(0, 8);
+  if (summaries.length > 0) {
+    return summaries.map((summary) => `- ${summary}`).join("\n");
+  }
+  return `- ${buildCompactedAbstract(members, fallbackText)}`;
+}
+
+function strongestTier(members: CompactionEntry[]): SmartMemoryMetadata["tier"] {
+  const rank: Record<SmartMemoryMetadata["tier"], number> = {
+    peripheral: 0,
+    working: 1,
+    core: 2,
+  };
+  return members
+    .map((member) => metadataFor(member).tier)
+    .sort((a, b) => rank[b] - rank[a])[0] ?? "working";
+}
+
+function maxAccessCount(members: CompactionEntry[]): number {
+  return Math.max(0, ...members.map((member) => metadataFor(member).access_count));
+}
+
+function maxConfidence(members: CompactionEntry[]): number {
+  return Math.max(0.7, ...members.map((member) => metadataFor(member).confidence));
 }
 
 // ============================================================================

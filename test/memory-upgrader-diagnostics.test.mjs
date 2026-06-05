@@ -15,6 +15,7 @@ const { createMemoryUpgrader } = jiti("../src/memory-upgrader.ts");
 
 async function runTest() {
   await testLegacyUpgradeFallbackDiagnostic();
+  await testUpgradeKeepsFullTextWhenLlmReturnsConciseL0();
   await testReflectionRowsAreNotLegacy();
   await testBatchPreparationCompletesBeforeWrites();
   console.log("memory-upgrader diagnostics test passed");
@@ -68,6 +69,55 @@ async function testLegacyUpgradeFallbackDiagnostic() {
   );
   assert.equal(typeof updates[0].patch.text, "string");
   assert.ok(updates[0].patch.metadata.includes("upgraded_at"));
+}
+
+async function testUpgradeKeepsFullTextWhenLlmReturnsConciseL0() {
+  const updates = [];
+  const legacyEntry = {
+    id: "legacy-structured-1",
+    text: "OpenClaw incident 786: keep rare-token CalypsoTicket-786 in searchable memory content.",
+    category: "fact",
+    scope: "test",
+    importance: 0.8,
+    timestamp: Date.now(),
+    metadata: "{}",
+  };
+
+  const store = {
+    async list() {
+      return [legacyEntry];
+    },
+    async update(id, patch) {
+      updates.push({ id, patch });
+      return true;
+    },
+  };
+
+  const llm = {
+    async completeJson() {
+      return {
+        l0_abstract: "OpenClaw incident 786 retrieval structure.",
+        l1_overview: "- Preserve the full searchable layer",
+        l2_content: legacyEntry.text,
+        resolved_category: "cases",
+      };
+    },
+    getLastError() {
+      return null;
+    },
+  };
+
+  const upgrader = createMemoryUpgrader(store, llm, { log: () => {} });
+  const result = await upgrader.upgrade({ batchSize: 1 });
+
+  assert.equal(result.upgraded, 1);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].patch.text, legacyEntry.text);
+
+  const meta = JSON.parse(updates[0].patch.metadata);
+  assert.equal(meta.l0_abstract, "OpenClaw incident 786 retrieval structure.");
+  assert.equal(meta.l2_content, legacyEntry.text);
+  assert.equal(meta.memory_category, "cases");
 }
 
 async function testReflectionRowsAreNotLegacy() {

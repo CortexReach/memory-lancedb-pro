@@ -10,6 +10,7 @@ const {
   buildMergedEntry,
   runCompaction,
 } = jiti("../src/memory-compactor.ts");
+const { parseSmartMetadata, stringifySmartMetadata, buildSmartMetadata } = jiti("../src/smart-metadata.ts");
 
 // ============================================================================
 // Helpers
@@ -220,6 +221,64 @@ describe("buildMergedEntry", () => {
     assert.equal(meta.compacted, true);
     assert.equal(meta.sourceCount, 3);
     assert.ok(typeof meta.compactedAt === "number");
+  });
+
+  it("builds searchable L0/L1/L2 metadata from source full content", () => {
+    const a = entry({
+      text: "OpenClaw incident 786 retrieval structure.",
+      metadata: stringifySmartMetadata(buildSmartMetadata(
+        {
+          text: "OpenClaw incident 786 retrieval structure.",
+          category: "fact",
+          importance: 0.8,
+          timestamp: Date.now(),
+          metadata: "{}",
+        },
+        {
+          l0_abstract: "OpenClaw incident 786 retrieval structure.",
+          l1_overview: "- Preserve retrieval structure",
+          l2_content: "OpenClaw incident 786 keeps rare-token CalypsoTicket-786 in full memory content.",
+          memory_category: "cases",
+          tier: "core",
+          access_count: 4,
+          confidence: 0.91,
+        },
+      )),
+    });
+    const b = entry({
+      text: "OpenClaw issue 786 compacted metadata.",
+      metadata: stringifySmartMetadata(buildSmartMetadata(
+        {
+          text: "OpenClaw issue 786 compacted metadata.",
+          category: "fact",
+          importance: 0.7,
+          timestamp: Date.now(),
+          metadata: "{}",
+        },
+        {
+          l0_abstract: "Compacted entries keep L0 L1 L2 metadata.",
+          l1_overview: "- Carry useful metadata after compaction",
+          l2_content: "Compacted issue 786 entries keep searchable LayerTwoOnlyNeedle metadata.",
+          memory_category: "cases",
+          tier: "working",
+          access_count: 2,
+          confidence: 0.82,
+        },
+      )),
+    });
+
+    const merged = buildMergedEntry([a, b]);
+    const meta = parseSmartMetadata(merged.metadata, merged);
+
+    assert.ok(merged.text.includes("CalypsoTicket-786"));
+    assert.ok(merged.text.includes("LayerTwoOnlyNeedle"));
+    assert.equal(meta.l2_content, merged.text);
+    assert.match(meta.l1_overview, /OpenClaw incident 786 retrieval structure/);
+    assert.equal(meta.memory_category, "cases");
+    assert.equal(meta.tier, "core");
+    assert.equal(meta.access_count, 4);
+    assert.equal(meta.compacted, true);
+    assert.equal(meta.sourceCount, 2);
   });
 });
 
