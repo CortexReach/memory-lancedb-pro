@@ -6,7 +6,7 @@
  *
  */
 
-import type { MemoryStore, MemorySearchResult } from "./store.js";
+import type { MemoryStore, MemoryEntry, MemorySearchResult } from "./store.js";
 import type { Embedder } from "./embedder.js";
 import type { LlmClient } from "./llm-client.js";
 import {
@@ -53,6 +53,13 @@ import { inferAtomicBrandItemPreferenceSlot } from "./preference-slots.js";
 import { batchDedup } from "./batch-dedup.js";
 
 type StoreEntry = Omit<import("./store.js").MemoryEntry, "id" | "timestamp">;
+type PendingSupersedeInvalidation = {
+  entryIndex: number;
+  matchId: string;
+  existing: MemoryEntry;
+  factKey: string;
+  scopeFilter?: string[];
+};
 
 // ============================================================================
 // Envelope Metadata Stripping
@@ -419,7 +426,8 @@ export class SmartExtractor {
       }
     }
 
-    const createEntries: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[] = [];
+    const createEntries: StoreEntry[] = [];
+    const pendingSupersedeInvalidations: PendingSupersedeInvalidation[] = [];
 
     for (const { index, candidate } of processableCandidates) {
       try {
@@ -432,6 +440,7 @@ export class SmartExtractor {
           scopeFilter,
           precomputedVectors.get(index),
           createEntries,
+          pendingSupersedeInvalidations,
         );
       } catch (err) {
         this.log(
@@ -441,7 +450,17 @@ export class SmartExtractor {
     }
 
     if (createEntries.length > 0) {
-      await this.bulkStoreAndValidate(createEntries);
+      const createdEntries = await this.bulkStoreAndValidate(createEntries);
+      if (createdEntries) {
+        await this.applyPendingSupersedeInvalidations(
+          createdEntries,
+          pendingSupersedeInvalidations,
+        );
+      } else if (pendingSupersedeInvalidations.length > 0) {
+        this.log(
+          "memory-pro: smart-extractor: supersede invalidation skipped because bulkStore() did not return created entries",
+        );
+      }
     }
 
     return stats;
@@ -451,7 +470,7 @@ export class SmartExtractor {
   // Embedding Noise Pre-Filter
   // --------------------------------------------------------------------------
 
-  private async bulkStoreAndValidate(entries: StoreEntry[]): Promise<void> {
+  private async bulkStoreAndValidate(entries: StoreEntry[]): Promise<MemoryEntry[] | undefined> {
     const beforeCount = await this.readStoreCount("before bulkStore");
     const storedEntries = await this.store.bulkStore(entries);
 
@@ -459,7 +478,7 @@ export class SmartExtractor {
       this.debugLog(
         "memory-pro: smart-extractor: skipping bulkStore persistence validation: bulkStore() did not return stored entries",
       );
-      return;
+      return undefined;
     }
 
     if (storedEntries.length !== entries.length) {
@@ -469,17 +488,17 @@ export class SmartExtractor {
     }
 
     if (storedEntries.length === 0) {
-      return;
+      return storedEntries;
     }
 
     const afterCount = await this.readStoreCount("after bulkStore");
     if (beforeCount === null || afterCount === null) {
-      return;
+      return storedEntries;
     }
 
     const observedDelta = afterCount - beforeCount;
     if (observedDelta >= storedEntries.length) {
-      return;
+      return storedEntries;
     }
 
     const missingIds = await this.findMissingStoredIds(storedEntries);
@@ -487,13 +506,14 @@ export class SmartExtractor {
       this.debugLog(
         `memory-pro: smart-extractor: bulkStore row-count delta ${observedDelta}/${storedEntries.length} but all returned IDs are readable; likely concurrent delete/compaction`,
       );
-      return;
+      return storedEntries;
     }
 
     const sample = missingIds.slice(0, 3).map((id) => id.slice(0, 8)).join(", ");
     this.log(
       `memory-pro: smart-extractor: bulkStore validation warning: expected row delta >= ${storedEntries.length}, observed ${observedDelta} (before=${beforeCount}, after=${afterCount}); missing returned IDs=${missingIds.length}${sample ? ` sample=${sample}` : ""}`,
     );
+    return storedEntries;
   }
 
   private async readStoreCount(context: string): Promise<number | null> {
@@ -763,6 +783,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     precomputedVector?: number[],
     createEntries?: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[],
+    pendingSupersedeInvalidations?: PendingSupersedeInvalidation[],
   ): Promise<void> {
     // Profile always merges (skip dedup — admission control still applies)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -873,6 +894,7 @@ export class SmartExtractor {
             scopeFilter,
             admission?.audit,
             createEntries,
+            pendingSupersedeInvalidations,
           );
           stats.created++;
           stats.superseded = (stats.superseded ?? 0) + 1;
@@ -917,6 +939,7 @@ export class SmartExtractor {
               scopeFilter,
               admission?.audit,
               createEntries,
+              pendingSupersedeInvalidations,
             );
             stats.created++;
             stats.superseded = (stats.superseded ?? 0) + 1;
@@ -1262,6 +1285,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
+    pendingSupersedeInvalidations?: PendingSupersedeInvalidation[],
   ): Promise<void> {
     const existing = await this.store.getById(matchId, scopeFilter);
     if (!existing) {
@@ -1275,7 +1299,7 @@ export class SmartExtractor {
       existingMeta.fact_key ?? deriveFactKey(candidate.category, candidate.abstract);
     const storeCategory = this.mapToStoreCategory(candidate.category);
     const supersedeClassifyText = candidate.content || candidate.abstract;
-    const created = await this.store.store({
+    const entry: StoreEntry = {
       text: candidate.abstract,
       vector,
       category: storeCategory,
@@ -1314,15 +1338,75 @@ export class SmartExtractor {
           },
         ),
       ),
-    });
+    };
 
+    if (createEntries && pendingSupersedeInvalidations) {
+      const entryIndex = createEntries.length;
+      createEntries.push(entry);
+      pendingSupersedeInvalidations.push({
+        entryIndex,
+        matchId,
+        existing,
+        factKey,
+        scopeFilter,
+      });
+      return;
+    }
+
+    const created = await this.store.store(entry);
+    await this.invalidateSupersededMemory(
+      matchId,
+      existing,
+      factKey,
+      created.id,
+      scopeFilter,
+    );
+
+    this.log(
+      `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`,
+    );
+  }
+
+  private async applyPendingSupersedeInvalidations(
+    createdEntries: MemoryEntry[],
+    pendingSupersedeInvalidations: PendingSupersedeInvalidation[],
+  ): Promise<void> {
+    for (const pending of pendingSupersedeInvalidations) {
+      const created = createdEntries[pending.entryIndex];
+      if (!created) {
+        this.log(
+          `memory-pro: smart-extractor: supersede invalidation skipped for ${pending.matchId.slice(0, 8)} because batch create returned no matching entry`,
+        );
+        continue;
+      }
+      await this.invalidateSupersededMemory(
+        pending.matchId,
+        pending.existing,
+        pending.factKey,
+        created.id,
+        pending.scopeFilter,
+      );
+      this.log(
+        `memory-pro: smart-extractor: superseded ${pending.matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`,
+      );
+    }
+  }
+
+  private async invalidateSupersededMemory(
+    matchId: string,
+    existing: MemoryEntry,
+    factKey: string,
+    createdId: string,
+    scopeFilter?: string[],
+  ): Promise<void> {
+    const existingMeta = parseSmartMetadata(existing.metadata, existing);
     const invalidatedMetadata = buildSmartMetadata(existing, {
       fact_key: factKey,
-      invalidated_at: now,
-      superseded_by: created.id,
+      invalidated_at: Date.now(),
+      superseded_by: createdId,
       relations: appendRelation(existingMeta.relations, {
         type: "superseded_by",
-        targetId: created.id,
+        targetId: createdId,
       }),
     });
 
@@ -1330,10 +1414,6 @@ export class SmartExtractor {
       matchId,
       { metadata: stringifySmartMetadata(invalidatedMetadata) },
       scopeFilter,
-    );
-
-    this.log(
-      `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`,
     );
   }
 

@@ -285,16 +285,23 @@ export class SmartExtractor {
             }
         }
         const createEntries = [];
+        const pendingSupersedeInvalidations = [];
         for (const { index, candidate } of processableCandidates) {
             try {
-                await this.processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVectors.get(index), createEntries);
+                await this.processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVectors.get(index), createEntries, pendingSupersedeInvalidations);
             }
             catch (err) {
                 this.log(`memory-pro: smart-extractor: failed to process candidate [${candidate.category}]: ${String(err)}`);
             }
         }
         if (createEntries.length > 0) {
-            await this.bulkStoreAndValidate(createEntries);
+            const createdEntries = await this.bulkStoreAndValidate(createEntries);
+            if (createdEntries) {
+                await this.applyPendingSupersedeInvalidations(createdEntries, pendingSupersedeInvalidations);
+            }
+            else if (pendingSupersedeInvalidations.length > 0) {
+                this.log("memory-pro: smart-extractor: supersede invalidation skipped because bulkStore() did not return created entries");
+            }
         }
         return stats;
     }
@@ -306,29 +313,30 @@ export class SmartExtractor {
         const storedEntries = await this.store.bulkStore(entries);
         if (!Array.isArray(storedEntries)) {
             this.debugLog("memory-pro: smart-extractor: skipping bulkStore persistence validation: bulkStore() did not return stored entries");
-            return;
+            return undefined;
         }
         if (storedEntries.length !== entries.length) {
             this.log(`memory-pro: smart-extractor: bulkStore validation warning: queued ${entries.length} create(s) but bulkStore accepted ${storedEntries.length}`);
         }
         if (storedEntries.length === 0) {
-            return;
+            return storedEntries;
         }
         const afterCount = await this.readStoreCount("after bulkStore");
         if (beforeCount === null || afterCount === null) {
-            return;
+            return storedEntries;
         }
         const observedDelta = afterCount - beforeCount;
         if (observedDelta >= storedEntries.length) {
-            return;
+            return storedEntries;
         }
         const missingIds = await this.findMissingStoredIds(storedEntries);
         if (missingIds.length === 0) {
             this.debugLog(`memory-pro: smart-extractor: bulkStore row-count delta ${observedDelta}/${storedEntries.length} but all returned IDs are readable; likely concurrent delete/compaction`);
-            return;
+            return storedEntries;
         }
         const sample = missingIds.slice(0, 3).map((id) => id.slice(0, 8)).join(", ");
         this.log(`memory-pro: smart-extractor: bulkStore validation warning: expected row delta >= ${storedEntries.length}, observed ${observedDelta} (before=${beforeCount}, after=${afterCount}); missing returned IDs=${missingIds.length}${sample ? ` sample=${sample}` : ""}`);
+        return storedEntries;
     }
     async readStoreCount(context) {
         const count = this.store.count;
@@ -529,7 +537,7 @@ export class SmartExtractor {
      *   When provided (from batch pre-embedding), skips the per-candidate embed
      *   call to reduce API round-trips.
      */
-    async processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVector, createEntries) {
+    async processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVector, createEntries, pendingSupersedeInvalidations) {
         // Profile always merges (skip dedup — admission control still applies)
         if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
             const profileResult = await this.handleProfileMerge(candidate, conversationText, sessionKey, targetScope, scopeFilter, undefined, createEntries);
@@ -594,7 +602,7 @@ export class SmartExtractor {
             case "supersede":
                 if (dedupResult.matchId &&
                     TEMPORAL_VERSIONED_CATEGORIES.has(candidate.category)) {
-                    await this.handleSupersede(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, admission?.audit, createEntries);
+                    await this.handleSupersede(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, admission?.audit, createEntries, pendingSupersedeInvalidations);
                     stats.created++;
                     stats.superseded = (stats.superseded ?? 0) + 1;
                 }
@@ -627,7 +635,7 @@ export class SmartExtractor {
                 if (dedupResult.matchId) {
                     if (TEMPORAL_VERSIONED_CATEGORIES.has(candidate.category) &&
                         dedupResult.contextLabel === "general") {
-                        await this.handleSupersede(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, admission?.audit, createEntries);
+                        await this.handleSupersede(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, admission?.audit, createEntries, pendingSupersedeInvalidations);
                         stats.created++;
                         stats.superseded = (stats.superseded ?? 0) + 1;
                     }
@@ -852,7 +860,7 @@ export class SmartExtractor {
      * Handle SUPERSEDE: preserve the old record as historical but mark it as no
      * longer current, then create the new active fact.
      */
-    async handleSupersede(candidate, vector, matchId, sessionKey, targetScope, scopeFilter, admissionAudit, createEntries) {
+    async handleSupersede(candidate, vector, matchId, sessionKey, targetScope, scopeFilter, admissionAudit, createEntries, pendingSupersedeInvalidations) {
         const existing = await this.store.getById(matchId, scopeFilter);
         if (!existing) {
             createEntries?.push(this.buildStoreEntry(candidate, vector || [], sessionKey, targetScope));
@@ -863,7 +871,7 @@ export class SmartExtractor {
         const factKey = existingMeta.fact_key ?? deriveFactKey(candidate.category, candidate.abstract);
         const storeCategory = this.mapToStoreCategory(candidate.category);
         const supersedeClassifyText = candidate.content || candidate.abstract;
-        const created = await this.store.store({
+        const entry = {
             text: candidate.abstract,
             vector,
             category: storeCategory,
@@ -897,18 +905,46 @@ export class SmartExtractor {
                 memory_temporal_type: classifyTemporal(supersedeClassifyText),
                 valid_until: inferExpiry(supersedeClassifyText),
             })),
-        });
+        };
+        if (createEntries && pendingSupersedeInvalidations) {
+            const entryIndex = createEntries.length;
+            createEntries.push(entry);
+            pendingSupersedeInvalidations.push({
+                entryIndex,
+                matchId,
+                existing,
+                factKey,
+                scopeFilter,
+            });
+            return;
+        }
+        const created = await this.store.store(entry);
+        await this.invalidateSupersededMemory(matchId, existing, factKey, created.id, scopeFilter);
+        this.log(`memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`);
+    }
+    async applyPendingSupersedeInvalidations(createdEntries, pendingSupersedeInvalidations) {
+        for (const pending of pendingSupersedeInvalidations) {
+            const created = createdEntries[pending.entryIndex];
+            if (!created) {
+                this.log(`memory-pro: smart-extractor: supersede invalidation skipped for ${pending.matchId.slice(0, 8)} because batch create returned no matching entry`);
+                continue;
+            }
+            await this.invalidateSupersededMemory(pending.matchId, pending.existing, pending.factKey, created.id, pending.scopeFilter);
+            this.log(`memory-pro: smart-extractor: superseded ${pending.matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`);
+        }
+    }
+    async invalidateSupersededMemory(matchId, existing, factKey, createdId, scopeFilter) {
+        const existingMeta = parseSmartMetadata(existing.metadata, existing);
         const invalidatedMetadata = buildSmartMetadata(existing, {
             fact_key: factKey,
-            invalidated_at: now,
-            superseded_by: created.id,
+            invalidated_at: Date.now(),
+            superseded_by: createdId,
             relations: appendRelation(existingMeta.relations, {
                 type: "superseded_by",
-                targetId: created.id,
+                targetId: createdId,
             }),
         });
         await this.store.update(matchId, { metadata: stringifySmartMetadata(invalidatedMetadata) }, scopeFilter);
-        this.log(`memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`);
     }
     // --------------------------------------------------------------------------
     // Context-Aware Handlers (support / contextualize / contradict)
