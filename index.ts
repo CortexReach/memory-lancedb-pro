@@ -1476,6 +1476,7 @@ async function generateReflectionText(params: {
             workspaceDir: params.workspaceDir,
             config: params.cfg,
             prompt,
+            promptMode: "minimal",
             disableTools: true,
             disableMessageTool: true,
             timeoutMs: params.timeoutMs,
