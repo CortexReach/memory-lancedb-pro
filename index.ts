@@ -2561,8 +2561,18 @@ const memoryLanceDBProPlugin = {
 
     // Health status for OpenClaw memory runtime (reflects actual plugin health)
     // Updated by runStartupChecks after testing embedder and retriever
-    let embedHealth: { ok: boolean; error?: string } = { ok: false, error: "startup not complete" };
-    let retrievalHealth: boolean = false;
+    let embedHealth: { ok: boolean; error?: string; checkedAtMs?: number } = {
+      ok: false,
+      error: "startup not complete",
+    };
+    let retrievalHealth: {
+      ok: boolean;
+      error?: string;
+      mode?: string;
+      hasFtsSupport?: boolean;
+      failureStage?: string;
+      checkedAtMs?: number;
+    } = { ok: false, error: "startup not complete" };
 
     // ========================================================================
     // OpenClaw Memory Capability
@@ -2580,11 +2590,12 @@ const memoryLanceDBProPlugin = {
       resolveScopeFilterForAgent: (agentId: string) => resolveScopeFilter(scopeManager, agentId),
       getRuntimeStatus: () => ({
         embeddingAvailable: embedHealth.ok,
-        retrievalAvailable: retrievalHealth,
+        retrievalAvailable: retrievalHealth.ok,
         embeddingError: embedHealth.error,
+        retrievalError: retrievalHealth.error,
       }),
       probeEmbeddingAvailability: async () => ({ ...embedHealth }),
-      probeVectorAvailability: async () => retrievalHealth,
+      probeVectorAvailability: async () => retrievalHealth.ok,
     });
 
     if (typeof api.registerMemoryCapability === "function") {
@@ -4750,18 +4761,48 @@ const memoryLanceDBProPlugin = {
           }
         };
 
+        const runStartupPhase = async <T extends { success: boolean; error?: string }>(
+          label: string,
+          check: () => Promise<T>,
+        ): Promise<T> => {
+          const startedAt = Date.now();
+          api.logger.info(`memory-lancedb-pro: startup check ${label} started`);
+          try {
+            const result = await withTimeout(check(), 8_000, `${label} startup check`);
+            const elapsedMs = Date.now() - startedAt;
+            if (result.success) {
+              api.logger.info(
+                `memory-lancedb-pro: startup check ${label} OK (${elapsedMs}ms)`,
+              );
+            } else {
+              api.logger.warn(
+                `memory-lancedb-pro: startup check ${label} failed (${elapsedMs}ms): ${result.error ?? "unknown error"}`,
+              );
+            }
+            return result;
+          } catch (error) {
+            const elapsedMs = Date.now() - startedAt;
+            const message = error instanceof Error ? error.message : String(error);
+            api.logger.warn(
+              `memory-lancedb-pro: startup check ${label} failed (${elapsedMs}ms): ${message}`,
+            );
+            return { success: false, error: message } as T;
+          }
+        };
+
         const runStartupChecks = async () => {
           try {
-            // Test components (bounded time)
-            const embedTest = await withTimeout(
-              embedder.test({ timeoutMs: 7_500 }),
-              8_000,
-              "embedder.test()",
+            api.logger.info(
+              `memory-lancedb-pro: startup checks started (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`,
             );
-            const retrievalTest = await withTimeout(
-              retriever.test(),
-              8_000,
-              "retriever.test()",
+
+            const embedTest = await runStartupPhase(
+              "embedding",
+              () => embedder.test({ timeoutMs: 7_500 }),
+            );
+            const retrievalTest = await runStartupPhase(
+              "retrieval",
+              () => retriever.test(),
             );
 
             api.logger.info(
@@ -4779,16 +4820,31 @@ const memoryLanceDBProPlugin = {
             }
             if (!retrievalTest.success) {
               api.logger.warn(
-                `memory-lancedb-pro: retrieval test failed: ${retrievalTest.error}`,
+                `memory-lancedb-pro: retrieval test failed: ${retrievalTest.error}` +
+                `${retrievalTest.failureStage ? ` (stage: ${retrievalTest.failureStage})` : ""}`,
               );
             }
 
             // Update stub health status so openclaw doctor reflects real state
-            embedHealth = { ok: !!embedTest.success, error: embedTest.error };
-            retrievalHealth = !!retrievalTest.success;
+            embedHealth = {
+              ok: !!embedTest.success,
+              error: embedTest.error,
+              checkedAtMs: Date.now(),
+            };
+            retrievalHealth = {
+              ok: !!retrievalTest.success,
+              error: retrievalTest.error,
+              mode: retrievalTest.mode,
+              hasFtsSupport: retrievalTest.hasFtsSupport,
+              failureStage: retrievalTest.failureStage,
+              checkedAtMs: Date.now(),
+            };
           } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            embedHealth = { ok: false, error: message, checkedAtMs: Date.now() };
+            retrievalHealth = { ok: false, error: message, checkedAtMs: Date.now() };
             api.logger.warn(
-              `memory-lancedb-pro: startup checks failed: ${String(error)}`,
+              `memory-lancedb-pro: startup checks failed: ${message}`,
             );
           }
         };

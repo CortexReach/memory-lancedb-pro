@@ -1298,23 +1298,41 @@ export class MemoryRetriever {
     }
     // Test retrieval system
     async test(query = "test query") {
+        const resolveHealthFtsSupport = async () => {
+            try {
+                return { hasFtsSupport: await this.resolveFtsSupport() };
+            }
+            catch (error) {
+                return {
+                    hasFtsSupport: false,
+                    error: formatErrorMessage(error),
+                };
+            }
+        };
         try {
-            const results = await this.retrieve({
+            await this.retrieve({
                 query,
                 limit: 1,
             });
+            const fts = await resolveHealthFtsSupport();
             return {
                 success: true,
                 mode: this.config.mode,
-                hasFtsSupport: await this.resolveFtsSupport(),
+                hasFtsSupport: fts.hasFtsSupport,
+                ...(fts.error ? { error: `FTS status check failed: ${fts.error}` } : {}),
             };
         }
         catch (error) {
+            const fts = await resolveHealthFtsSupport();
+            const retrievalError = formatErrorMessage(error);
             return {
                 success: false,
                 mode: this.config.mode,
-                hasFtsSupport: await this.resolveFtsSupport(),
-                error: error instanceof Error ? error.message : String(error),
+                hasFtsSupport: fts.hasFtsSupport,
+                failureStage: this.lastDiagnostics?.failureStage,
+                error: fts.error
+                    ? `${retrievalError}; FTS status check failed: ${fts.error}`
+                    : retrievalError,
             };
         }
     }

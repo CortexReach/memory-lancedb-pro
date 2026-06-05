@@ -348,6 +348,17 @@ async function createMemoryLanceSearchManager(params, agentId) {
                 custom: {
                     plugin: "memory-lancedb-pro",
                     embeddingError: status.embeddingError,
+                    retrievalError: status.retrievalError,
+                    startupHealth: {
+                        embedding: {
+                            available: status.embeddingAvailable,
+                            ...(status.embeddingError ? { error: status.embeddingError } : {}),
+                        },
+                        retrieval: {
+                            available: status.retrievalAvailable,
+                            ...(status.retrievalError ? { error: status.retrievalError } : {}),
+                        },
+                    },
                     virtualPathPrefix: VIRTUAL_MEMORY_PATH_PREFIX,
                     canonicalCorpus: {
                         enabled: params.canonicalCorpus?.enabled === true,
