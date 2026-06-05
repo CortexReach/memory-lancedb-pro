@@ -1746,13 +1746,30 @@ const memoryLanceDBProPlugin = {
             throw err;
         }
         const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, scopeManager, migrator, smartExtractor, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
-        async function sleep(ms) {
-            await new Promise(resolve => setTimeout(resolve, ms));
+        async function sleep(ms, signal) {
+            if (signal?.aborted) {
+                throw signal.reason ?? new Error("aborted");
+            }
+            await new Promise((resolve, reject) => {
+                const timeoutId = setTimeout(() => {
+                    cleanup();
+                    resolve();
+                }, ms);
+                const onAbort = () => {
+                    cleanup();
+                    reject(signal?.reason ?? new Error("aborted"));
+                };
+                const cleanup = () => {
+                    clearTimeout(timeoutId);
+                    signal?.removeEventListener("abort", onAbort);
+                };
+                signal?.addEventListener("abort", onAbort, { once: true });
+            });
         }
         async function retrieveWithRetry(params) {
             let results = await retriever.retrieve(params);
             if (results.length === 0) {
-                await sleep(75);
+                await sleep(75, params.signal);
                 results = await retriever.retrieve(params);
             }
             return results;
@@ -2213,6 +2230,7 @@ const memoryLanceDBProPlugin = {
                         limit: retrieveLimit,
                         scopeFilter: accessibleScopes,
                         source: "auto-recall",
+                        signal: autoRecallAbortController.signal,
                     }), config.workspaceBoundary);
                     if (shouldDropLateAutoRecall("post-retrieve"))
                         return;
@@ -2426,13 +2444,24 @@ const memoryLanceDBProPlugin = {
                         ephemeral: true,
                     };
                 };
+                const autoRecallAbortController = new AbortController();
                 let timeoutId;
                 try {
+                    const recallPromise = recallWork().then((r) => {
+                        clearTimeout(timeoutId);
+                        return r;
+                    }).catch((err) => {
+                        if (autoRecallTimedOut && autoRecallAbortController.signal.aborted) {
+                            return undefined;
+                        }
+                        throw err;
+                    });
                     const result = await Promise.race([
-                        recallWork().then((r) => { clearTimeout(timeoutId); return r; }),
+                        recallPromise,
                         new Promise((resolve) => {
                             timeoutId = setTimeout(() => {
                                 autoRecallTimedOut = true;
+                                autoRecallAbortController.abort(new Error(`auto-recall timed out after ${AUTO_RECALL_TIMEOUT_MS}ms`));
                                 api.logger.warn(`memory-lancedb-pro: auto-recall timed out after ${AUTO_RECALL_TIMEOUT_MS}ms; skipping memory injection to avoid stalling agent startup`);
                                 resolve(undefined);
                             }, AUTO_RECALL_TIMEOUT_MS);

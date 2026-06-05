@@ -337,7 +337,7 @@ export class MemoryRetriever {
         return this.store.hasFtsSupport;
     }
     async retrieve(context) {
-        const { query, limit, scopeFilter, category, source } = context;
+        const { query, limit, scopeFilter, category, source, signal } = context;
         const safeLimit = clampInt(limit, 1, 20);
         this.lastDiagnostics = null;
         const diagnostics = {
@@ -380,10 +380,10 @@ export class MemoryRetriever {
                 results = await this.bm25OnlyRetrieval(query, tagTokens, safeLimit, scopeFilter, category, trace, diagnostics);
             }
             else if (this.config.mode === "vector" || !hasFtsSupport) {
-                results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, trace, diagnostics);
+                results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, trace, diagnostics, signal);
             }
             else {
-                results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, trace, source, diagnostics);
+                results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, trace, source, diagnostics, signal);
             }
             diagnostics.finalResultCount = results.length;
             diagnostics.dropSummary = buildDropSummary(diagnostics);
@@ -453,11 +453,11 @@ export class MemoryRetriever {
         const matches = query.match(regex);
         return matches || [];
     }
-    async vectorOnlyRetrieval(query, limit, scopeFilter, category, trace, diagnostics) {
+    async vectorOnlyRetrieval(query, limit, scopeFilter, category, trace, diagnostics, signal) {
         let failureStage = "vector.embedQuery";
         try {
             const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
-            const queryVector = await this.embedder.embedQuery(query);
+            const queryVector = await this.embedder.embedQuery(query, signal);
             failureStage = "vector.vectorSearch";
             const results = await this.store.vectorSearch(queryVector, candidatePoolSize, this.config.minScore, scopeFilter, { excludeInactive: true });
             const filtered = category
@@ -606,11 +606,11 @@ export class MemoryRetriever {
             diagnostics.stageCounts.afterDiversity = deduplicated.length;
         return finalResults;
     }
-    async hybridRetrieval(query, limit, scopeFilter, category, trace, source, diagnostics) {
+    async hybridRetrieval(query, limit, scopeFilter, category, trace, source, diagnostics, signal) {
         let failureStage = "hybrid.embedQuery";
         try {
             const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
-            const queryVector = await this.embedder.embedQuery(query);
+            const queryVector = await this.embedder.embedQuery(query, signal);
             const bm25Query = this.buildBM25Query(query, source);
             if (diagnostics) {
                 diagnostics.bm25Query = bm25Query;
