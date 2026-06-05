@@ -518,7 +518,7 @@ Query → BM25 FTS ─────┘
 <details>
 <summary><strong>Embedding Providers</strong></summary>
 
-Works with **any OpenAI-compatible embedding API**:
+Works with **OpenAI-compatible embedding APIs**, including provider-specific payload adapters for services such as Jina and Voyage:
 
 | Provider | Model | Base URL | Dimensions |
 | --- | --- | --- | --- |
@@ -527,6 +527,8 @@ Works with **any OpenAI-compatible embedding API**:
 | **Voyage** | `voyage-4-lite` / `voyage-4` | `https://api.voyageai.com/v1` | 1024 / 1024 |
 | **Google Gemini** | `gemini-embedding-001` | `https://generativelanguage.googleapis.com/v1beta/openai/` | 3072 |
 | **Ollama** (local) | `nomic-embed-text` | `http://localhost:11434/v1` | provider-specific |
+
+Voyage embedding requests use Voyage's `model` + `input` payload shape. When `requestDimensions` is configured it is sent as `output_dimension`; OpenAI-only fields such as `encoding_format` are omitted.
 
 </details>
 

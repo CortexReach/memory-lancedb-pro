@@ -240,6 +240,7 @@ function getEmbeddingCapabilities(profile) {
                     "retrieval.query": "query",
                     "retrieval.passage": "document",
                     "query": "query",
+                    "passage": "document",
                     "document": "document",
                 },
                 dimensionsField: "output_dimension",
@@ -371,7 +372,9 @@ export class Embedder {
     _taskQuery;
     _taskPassage;
     _normalized;
+    _providerProfile;
     _capabilities;
+    _apiKeys;
     /** Optional requested dimensions to pass through to the embedding provider (OpenAI-compatible). */
     _requestDimensions;
     /** When true, omit the dimensions parameter even if _requestDimensions is set. */
@@ -382,6 +385,7 @@ export class Embedder {
         // Normalize apiKey to array and resolve environment variables
         const apiKeys = Array.isArray(config.apiKey) ? config.apiKey : [config.apiKey];
         const resolvedKeys = apiKeys.map(k => resolveEnvVars(k));
+        this._apiKeys = resolvedKeys;
         this._model = config.model;
         this._baseURL = config.baseURL;
         this._taskQuery = config.taskQuery;
@@ -392,6 +396,7 @@ export class Embedder {
         // Enable auto-chunking by default for better handling of long documents
         this._autoChunk = config.chunking !== false;
         const profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
+        this._providerProfile = profile;
         this._capabilities = getEmbeddingCapabilities(profile);
         const clientTimeoutMs = Number.isFinite(config.clientTimeoutMs) && config.clientTimeoutMs > 0
             ? Math.floor(config.clientTimeoutMs)
@@ -438,6 +443,12 @@ export class Embedder {
         this._clientIndex = (this._clientIndex + 1) % this.clients.length;
         return client;
     }
+    /** Return the next raw API key in the same round-robin order as clients. */
+    nextApiKey() {
+        const key = this._apiKeys[this._clientIndex % this._apiKeys.length];
+        this._clientIndex = (this._clientIndex + 1) % this._apiKeys.length;
+        return key;
+    }
     /** Check whether an error is a rate-limit / quota-exceeded / overload error. */
     isRateLimitError(error) {
         if (!error || typeof error !== "object")
@@ -471,6 +482,14 @@ export class Embedder {
         if (!this._baseURL)
             return false;
         return /localhost:11434|127\.0\.0\.1:11434|\/ollama\b/i.test(this._baseURL);
+    }
+    /**
+     * Voyage's embeddings endpoint rejects OpenAI SDK-injected request fields such
+     * as encoding_format. Use native fetch for Voyage so buildPayload() remains
+     * the exact serialized request body.
+     */
+    isVoyageProvider() {
+        return this._providerProfile === "voyage-compatible";
     }
     /**
      * Call embeddings.create using native fetch (bypasses OpenAI SDK).
@@ -549,6 +568,27 @@ export class Embedder {
         // convert to OpenAI-compatible shape { data: [{ embedding: number[] }] }
         return { data: [{ embedding: data.embedding }] };
     }
+    async embedWithVoyageFetch(payload, apiKey, signal) {
+        if (!this._baseURL) {
+            throw new Error("Voyage embedding provider requires embedding.baseURL, e.g. https://api.voyageai.com/v1");
+        }
+        const base = this._baseURL.replace(/\/$/, "");
+        const endpoint = base.endsWith("/embeddings") ? base : `${base}/embeddings`;
+        const response = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify(payload),
+            signal,
+        });
+        if (!response.ok) {
+            const body = await response.text().catch(() => "");
+            throw new Error(`Voyage embedding failed: ${response.status} ${response.statusText} ${body.slice(0, 200)}`);
+        }
+        return response.json();
+    }
     /**
      * Call embeddings.create with automatic key rotation on rate-limit errors.
      * Tries each key in the pool at most once before giving up.
@@ -575,8 +615,12 @@ export class Embedder {
         const maxAttempts = this.clients.length;
         let lastError;
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            const client = this.nextClient();
             try {
+                if (this.isVoyageProvider()) {
+                    const key = this.nextApiKey();
+                    return await this.embedWithVoyageFetch(payload, key, signal);
+                }
+                const client = this.nextClient();
                 // Pass signal to OpenAI SDK if provided (SDK v6+ supports this)
                 return await client.embeddings.create(payload, signal ? { signal } : undefined);
             }
