@@ -126,7 +126,8 @@ describe("runWithFileLock recovery", () => {
       await store.store(makeEntry(1));
 
       const lockPath = join(dir, ".memory-write.lock");
-      assert.strictEqual(existsSync(lockPath), false);
+      assert.strictEqual(existsSync(lockPath), true);
+      assert.strictEqual(existsSync(`${lockPath}.lock`), false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
