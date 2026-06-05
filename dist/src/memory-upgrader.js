@@ -6,11 +6,11 @@
  * to enable unified memory lifecycle management (decay, tier promotion,
  * smart dedup).
  *
- * Pipeline per memory:
+ * Pipeline per batch:
  *   1. Detect legacy format (missing `memory_category` in metadata)
- *   2. Reverse-map 5-category → 6-category
- *   3. Generate L0/L1/L2 via LLM (or fallback to simple rules)
- *   4. Write enriched metadata back via store.update()
+ *   2. Reverse-map 5-category → 6-category and generate L0/L1/L2
+ *   3. Prepare update patches without holding the DB write lock
+ *   4. Write prepared patches in a batch where the store supports it
  */
 import { buildSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 const CURRENT_REFLECTION_METADATA_TYPES = new Set([
@@ -201,17 +201,18 @@ export class MemoryUpgrader {
         for (let i = 0; i < toProcess.length; i += batchSize) {
             const batch = toProcess.slice(i, i + batchSize);
             this.log(`memory-upgrader: processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(toProcess.length / batchSize)} (${batch.length} memories)`);
+            const prepared = [];
             for (const entry of batch) {
                 try {
-                    await this.upgradeEntry(entry, noLlm);
-                    result.upgraded++;
+                    prepared.push(await this.prepareUpgradeEntry(entry, noLlm));
                 }
                 catch (err) {
-                    const errMsg = `Failed to upgrade ${entry.id}: ${String(err)}`;
+                    const errMsg = `Failed to prepare upgrade ${entry.id}: ${String(err)}`;
                     result.errors.push(errMsg);
                     this.log(`memory-upgrader: ERROR — ${errMsg}`);
                 }
             }
+            await this.writePreparedBatch(prepared, result, options.scopeFilter ?? this.options.scopeFilter);
             // Progress report
             this.log(`memory-upgrader: progress — ${result.upgraded} upgraded, ${result.errors.length} errors`);
         }
@@ -219,9 +220,9 @@ export class MemoryUpgrader {
         return result;
     }
     /**
-     * Upgrade a single legacy memory entry.
+     * Prepare a single legacy memory entry without writing to the store.
      */
-    async upgradeEntry(entry, noLlm) {
+    async prepareUpgradeEntry(entry, noLlm) {
         // Step 1: Reverse-map category
         let newCategory = reverseMapCategory(entry.category, entry.text);
         // Step 2: Generate L0/L1/L2
@@ -279,12 +280,63 @@ export class MemoryUpgrader {
             upgraded_from: entry.category,
             upgraded_at: Date.now(),
         };
-        // Step 4: Update the memory entry
-        await this.store.update(entry.id, {
-            // Update text to L0 abstract for better search indexing
-            text: enriched.l0_abstract,
-            metadata: stringifySmartMetadata(newMetadata),
-        });
+        return {
+            entry,
+            updates: {
+                // Keep the existing upgrader behavior in this PR: the primary text
+                // column is updated to L0, while L2 remains in smart metadata.
+                text: enriched.l0_abstract,
+                metadata: stringifySmartMetadata(newMetadata),
+            },
+        };
+    }
+    /**
+     * Persist a prepared batch with one store-level batch call when available.
+     */
+    async writePreparedBatch(prepared, result, scopeFilter) {
+        if (prepared.length === 0)
+            return;
+        const store = this.store;
+        if (typeof store.bulkUpdateExact === "function") {
+            let writeResults;
+            try {
+                writeResults = await store.bulkUpdateExact(prepared.map(({ entry, updates }) => ({ id: entry.id, updates })), scopeFilter);
+            }
+            catch (err) {
+                for (const { entry } of prepared) {
+                    const errMsg = `Failed to write upgrade ${entry.id}: ${String(err)}`;
+                    result.errors.push(errMsg);
+                    this.log(`memory-upgrader: ERROR — ${errMsg}`);
+                }
+                return;
+            }
+            for (let index = 0; index < writeResults.length; index++) {
+                const writeResult = writeResults[index];
+                const fallbackEntry = prepared[index]?.entry;
+                if (writeResult.entry) {
+                    result.upgraded++;
+                }
+                else {
+                    const id = writeResult.id ?? fallbackEntry?.id ?? "unknown";
+                    const detail = writeResult.error ? `: ${writeResult.error}` : "";
+                    const errMsg = `Failed to write upgrade ${id}${detail}`;
+                    result.errors.push(errMsg);
+                    this.log(`memory-upgrader: ERROR — ${errMsg}`);
+                }
+            }
+            return;
+        }
+        for (const { entry, updates } of prepared) {
+            try {
+                await this.store.update(entry.id, updates, scopeFilter);
+                result.upgraded++;
+            }
+            catch (err) {
+                const errMsg = `Failed to write upgrade ${entry.id}: ${String(err)}`;
+                result.errors.push(errMsg);
+                this.log(`memory-upgrader: ERROR — ${errMsg}`);
+            }
+        }
     }
 }
 // ============================================================================

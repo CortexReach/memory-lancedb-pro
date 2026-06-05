@@ -59,6 +59,20 @@ export interface MetadataPatch {
   [key: string]: unknown;
 }
 
+export interface MemoryUpdatePatch {
+  text?: string;
+  vector?: number[];
+  importance?: number;
+  category?: MemoryEntry["category"];
+  metadata?: string;
+}
+
+export interface MemoryBulkUpdateResult {
+  id: string;
+  entry: MemoryEntry | null;
+  error?: string;
+}
+
 // ============================================================================
 // LanceDB Dynamic Import
 // ============================================================================
@@ -1816,15 +1830,209 @@ export class MemoryStore {
     };
   }
 
+  /**
+   * Update multiple already-resolved memory IDs under one write lock.
+   *
+   * This intentionally accepts exact IDs only. Interactive callers that rely on
+   * short-prefix resolution should keep using update(), while bulk maintenance
+   * jobs can avoid repeated file-lock churn once they already have full row IDs.
+   */
+  async bulkUpdateExact(
+    updates: Array<{ id: string; updates: MemoryUpdatePatch }>,
+    scopeFilter?: string[],
+  ): Promise<MemoryBulkUpdateResult[]> {
+    await this.ensureInitialized();
+
+    if (updates.length === 0) return [];
+
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+      return updates.map(({ id }) => ({
+        id,
+        entry: null,
+        error: `Memory ${id} is outside accessible scopes`,
+      }));
+    }
+
+    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+      const results = new Map<number, MemoryBulkUpdateResult>();
+      const pending: Array<{ inputIndex: number; id: string; updates: MemoryUpdatePatch }> = [];
+      const seenIds = new Set<string>();
+
+      updates.forEach((candidate, inputIndex) => {
+        const id = candidate.id;
+        if (typeof id !== "string" || id.length === 0) {
+          results.set(inputIndex, {
+            id: String(id),
+            entry: null,
+            error: `Invalid memory ID format: ${String(id)}`,
+          });
+          return;
+        }
+        if (seenIds.has(id)) {
+          results.set(inputIndex, {
+            id,
+            entry: null,
+            error: `Duplicate memory ID in bulk update: ${id}`,
+          });
+          return;
+        }
+        seenIds.add(id);
+        pending.push({ inputIndex, id, updates: candidate.updates });
+      });
+
+      for (let i = 0; i < pending.length; i += MemoryStore.MAX_BATCH_SIZE) {
+        const chunk = pending.slice(i, i + MemoryStore.MAX_BATCH_SIZE);
+        const whereClause = chunk
+          .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
+          .join(" OR ");
+        const rows = whereClause.length > 0
+          ? await this.table!.query().where(`(${whereClause})`).toArray()
+          : [];
+        const rowsById = new Map<string, any>();
+        for (const row of rows) {
+          rowsById.set(row.id as string, row);
+        }
+
+        const originals: MemoryEntry[] = [];
+        const updatedEntries: MemoryEntry[] = [];
+        const updatedInputIndices: number[] = [];
+
+        for (const candidate of chunk) {
+          const row = rowsById.get(candidate.id);
+          if (!row) {
+            results.set(candidate.inputIndex, { id: candidate.id, entry: null });
+            continue;
+          }
+
+          const rowScope = (row.scope as string | undefined) ?? "global";
+          if (
+            scopeFilter &&
+            scopeFilter.length > 0 &&
+            !scopeFilter.includes(rowScope)
+          ) {
+            results.set(candidate.inputIndex, {
+              id: candidate.id,
+              entry: null,
+              error: `Memory ${candidate.id} is outside accessible scopes`,
+            });
+            continue;
+          }
+
+          const original: MemoryEntry = {
+            id: row.id as string,
+            text: row.text as string,
+            vector: Array.from(row.vector as Iterable<number>),
+            category: row.category as MemoryEntry["category"],
+            scope: rowScope,
+            importance: Number(row.importance),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+            metadata: (row.metadata as string) || "{}",
+          };
+          const updated: MemoryEntry = {
+            ...original,
+            text: candidate.updates.text ?? original.text,
+            vector: candidate.updates.vector ?? original.vector,
+            category: candidate.updates.category ?? original.category,
+            scope: rowScope,
+            importance: candidate.updates.importance ?? original.importance,
+            timestamp: original.timestamp,
+            metadata: candidate.updates.metadata ?? original.metadata,
+          };
+
+          originals.push(original);
+          updatedEntries.push(updated);
+          updatedInputIndices.push(candidate.inputIndex);
+        }
+
+        if (updatedEntries.length === 0) {
+          continue;
+        }
+
+        const deleteWhereClause = updatedEntries
+          .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
+          .join(" OR ");
+        let deleted = false;
+        try {
+          await this.table!.delete(`(${deleteWhereClause})`);
+          deleted = true;
+          await this.table!.add(updatedEntries);
+          for (let index = 0; index < updatedEntries.length; index++) {
+            results.set(updatedInputIndices[index], {
+              id: updatedEntries[index].id,
+              entry: updatedEntries[index],
+            });
+          }
+        } catch (writeError) {
+          const writeMessage = writeError instanceof Error ? writeError.message : String(writeError);
+          if (!deleted) {
+            for (let index = 0; index < updatedEntries.length; index++) {
+              results.set(updatedInputIndices[index], {
+                id: updatedEntries[index].id,
+                entry: null,
+                error:
+                  `Failed to bulk update memory ${updatedEntries[index].id}: delete failed before replacement write. ` +
+                  `Write error: ${writeMessage}`,
+              });
+            }
+            continue;
+          }
+
+          const existingAfterFailure = await this.table!.query()
+            .where(`(${deleteWhereClause})`)
+            .toArray()
+            .catch(() => []);
+          const preservedIds = new Set(
+            existingAfterFailure.map((row: any) => row.id as string),
+          );
+          const originalsToRestore = originals.filter((entry) => !preservedIds.has(entry.id));
+
+          try {
+            if (originalsToRestore.length > 0) {
+              await this.table!.add(originalsToRestore);
+            }
+          } catch (rollbackError) {
+            const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+            for (let index = 0; index < updatedEntries.length; index++) {
+              results.set(updatedInputIndices[index], {
+                id: updatedEntries[index].id,
+                entry: null,
+                error:
+                  `Failed to bulk update memory ${updatedEntries[index].id}: write failed and rollback also failed. ` +
+                  `Write error: ${writeMessage}. Rollback error: ${rollbackMessage}`,
+              });
+            }
+            continue;
+          }
+
+          for (let index = 0; index < updatedEntries.length; index++) {
+            const preserved = preservedIds.has(updatedEntries[index].id);
+            results.set(updatedInputIndices[index], {
+              id: updatedEntries[index].id,
+              entry: null,
+              error:
+                `Failed to bulk update memory ${updatedEntries[index].id}: ` +
+                (preserved
+                  ? "write failed after delete, but an existing row was preserved. "
+                  : "write failed, original row restored. ") +
+                `Write error: ${writeMessage}`,
+            });
+          }
+        }
+      }
+
+      return updates.map((candidate, inputIndex) =>
+        results.get(inputIndex) ?? {
+          id: candidate.id,
+          entry: null,
+          error: `Memory ${candidate.id} was not processed`,
+        },
+      );
+    }));
+  }
+
   async update(
     id: string,
-    updates: {
-      text?: string;
-      vector?: number[];
-      importance?: number;
-      category?: MemoryEntry["category"];
-      metadata?: string;
-    },
+    updates: MemoryUpdatePatch,
     scopeFilter?: string[],
   ): Promise<MemoryEntry | null> {
     await this.ensureInitialized();

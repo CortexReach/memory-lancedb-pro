@@ -26,6 +26,16 @@ function makeEntry(i) {
   };
 }
 
+function assertVectorClose(actual, expected) {
+  assert.equal(actual?.length, expected.length);
+  for (let index = 0; index < expected.length; index++) {
+    assert.ok(
+      Math.abs(actual[index] - expected[index]) < 1e-6,
+      `vector[${index}] expected ${expected[index]}, got ${actual[index]}`,
+    );
+  }
+}
+
 describe("MemoryStore write queue", () => {
   it("serializes concurrent writes within the same store instance", async () => {
     const { store, dir } = makeStore();
@@ -111,6 +121,34 @@ describe("MemoryStore write queue", () => {
       const fetchedC = await store.getById(c.id);
       assert.ok(fetchedC);
       assert.strictEqual(fetchedC.text, "memory-3");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("bulkUpdateExact updates multiple exact IDs while preserving vectors", async () => {
+    const { store, dir } = makeStore();
+    try {
+      const a = await store.store(makeEntry(1));
+      const b = await store.store(makeEntry(2));
+
+      const results = await store.bulkUpdateExact([
+        { id: a.id, updates: { text: "memory-1-upgraded", metadata: "{\"upgraded\":true}" } },
+        { id: b.id, updates: { text: "memory-2-upgraded", importance: 0.95 } },
+      ]);
+
+      assert.strictEqual(results.length, 2);
+      assert.ok(results.every((result) => result.entry), "all exact updates should succeed");
+
+      const fetchedA = await store.getById(a.id);
+      const fetchedB = await store.getById(b.id);
+
+      assertVectorClose(fetchedA?.vector, a.vector);
+      assertVectorClose(fetchedB?.vector, b.vector);
+      assert.strictEqual(fetchedA?.text, "memory-1-upgraded");
+      assert.strictEqual(fetchedA?.metadata, "{\"upgraded\":true}");
+      assert.strictEqual(fetchedB?.text, "memory-2-upgraded");
+      assert.strictEqual(fetchedB?.importance, 0.95);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -16,6 +16,7 @@ const { createMemoryUpgrader } = jiti("../src/memory-upgrader.ts");
 async function runTest() {
   await testLegacyUpgradeFallbackDiagnostic();
   await testReflectionRowsAreNotLegacy();
+  await testBatchPreparationCompletesBeforeWrites();
   console.log("memory-upgrader diagnostics test passed");
 }
 
@@ -133,6 +134,75 @@ async function testReflectionRowsAreNotLegacy() {
   assert.equal(dryRun.totalLegacy, 0);
   assert.equal(dryRun.skipped, 3);
   assert.equal(updates.length, 0);
+}
+
+async function testBatchPreparationCompletesBeforeWrites() {
+  const logs = [];
+  let llmCalls = 0;
+  const legacyRows = [
+    {
+      id: "legacy-batch-1",
+      text: "Legacy memory about reducing updater lock contention.",
+      category: "fact",
+      scope: "test",
+      importance: 0.8,
+      timestamp: Date.now(),
+      metadata: "{}",
+    },
+    {
+      id: "legacy-batch-2",
+      text: "Legacy memory about keeping DB writes short.",
+      category: "decision",
+      scope: "test",
+      importance: 0.7,
+      timestamp: Date.now(),
+      metadata: "{}",
+    },
+  ];
+
+  const store = {
+    async list() {
+      return legacyRows;
+    },
+    async bulkUpdateExact(updates) {
+      assert.equal(llmCalls, 2, "all enrichment should finish before the batch write");
+      assert.equal(updates.length, 2);
+      return updates.map(({ id, updates: patch }) => ({
+        id,
+        entry: { ...legacyRows.find((row) => row.id === id), ...patch },
+      }));
+    },
+    async update() {
+      throw new Error("single-entry update should not be used when bulkUpdateExact exists");
+    },
+  };
+
+  const llm = {
+    async completeJson() {
+      llmCalls += 1;
+      return {
+        l0_abstract: `Batch summary ${llmCalls}`,
+        l1_overview: `- Batch summary ${llmCalls}`,
+        l2_content: legacyRows[llmCalls - 1].text,
+        resolved_category: "cases",
+      };
+    },
+    getLastError() {
+      return null;
+    },
+  };
+
+  const upgrader = createMemoryUpgrader(store, llm, {
+    log: (msg) => logs.push(msg),
+  });
+
+  const result = await upgrader.upgrade({ batchSize: 2 });
+
+  assert.equal(result.totalLegacy, 2);
+  assert.equal(result.upgraded, 2);
+  assert.equal(result.errors.length, 0);
+  assert.equal(llmCalls, 2);
+  assert.ok(logs.some((msg) => msg.includes("processing batch 1/1")));
 }
 
 runTest().catch((err) => {
