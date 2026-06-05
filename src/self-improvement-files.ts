@@ -75,8 +75,10 @@ export async function ensureSelfImprovementLearningFiles(baseDir: string): Promi
     await writeFile(filePath, `${content.trim()}\n`, "utf-8");
   };
 
-  await ensureFile(join(learningsDir, "LEARNINGS.md"), DEFAULT_LEARNINGS_TEMPLATE);
-  await ensureFile(join(learningsDir, "ERRORS.md"), DEFAULT_ERRORS_TEMPLATE);
+  await Promise.all([
+    ensureFile(join(learningsDir, "LEARNINGS.md"), DEFAULT_LEARNINGS_TEMPLATE),
+    ensureFile(join(learningsDir, "ERRORS.md"), DEFAULT_ERRORS_TEMPLATE),
+  ]);
 }
 
 export interface AppendSelfImprovementEntryParams {

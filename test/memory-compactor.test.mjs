@@ -67,6 +67,10 @@ function makeEmbedder(dim = 4) {
   };
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const defaultConfig = {
   enabled: true,
   minAgeDays: 7,
@@ -288,5 +292,109 @@ describe("runCompaction", () => {
     });
 
     assert.ok(result.scanned <= 3);
+  });
+
+  it("processes independent clusters with bounded parallelism", async () => {
+    const entries = [
+      entry({ id: "a1", text: "alpha 1", vector: vec(4, 1, 0.01, 0, 0), importance: 0.9 }),
+      entry({ id: "a2", text: "alpha 2", vector: vec(4, 1, 0.02, 0, 0), importance: 0.8 }),
+      entry({ id: "b1", text: "bravo 1", vector: vec(4, 0, 1, 0.01, 0), importance: 0.7 }),
+      entry({ id: "b2", text: "bravo 2", vector: vec(4, 0, 1, 0.02, 0), importance: 0.6 }),
+      entry({ id: "c1", text: "charlie 1", vector: vec(4, 0, 0, 1, 0.01), importance: 0.5 }),
+      entry({ id: "c2", text: "charlie 2", vector: vec(4, 0, 0, 1, 0.02), importance: 0.4 }),
+      entry({ id: "d1", text: "delta 1", vector: vec(4, 0.01, 0, 0, 1), importance: 0.3 }),
+      entry({ id: "d2", text: "delta 2", vector: vec(4, 0.02, 0, 0, 1), importance: 0.2 }),
+    ];
+    const store = makeStore(entries);
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const embedder = {
+      async embedPassage() {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await delay(15);
+        inFlight--;
+        return vec(4, 1, 0, 0, 0);
+      },
+    };
+
+    const result = await runCompaction(store, embedder, defaultConfig);
+
+    assert.equal(result.clustersFound, 4);
+    assert.equal(result.memoriesCreated, 4);
+    assert.equal(result.memoriesDeleted, 8);
+    assert.ok(maxInFlight > 1, `expected cluster work to overlap, max=${maxInFlight}`);
+    assert.ok(maxInFlight < 4, `expected cluster work to be bounded below all clusters, max=${maxInFlight}`);
+  });
+
+  it("continues compacting other clusters when one merge fails", async () => {
+    const entries = [
+      entry({ id: "good-1", text: "good cluster one", vector: vec(4, 1, 0.01, 0, 0), importance: 0.9 }),
+      entry({ id: "good-2", text: "good cluster two", vector: vec(4, 1, 0.02, 0, 0), importance: 0.8 }),
+      entry({ id: "bad-1", text: "bad cluster one", vector: vec(4, 0, 1, 0.01, 0), importance: 0.7 }),
+      entry({ id: "bad-2", text: "bad cluster two", vector: vec(4, 0, 1, 0.02, 0), importance: 0.6 }),
+    ];
+    const store = makeStore(entries);
+    const warnings = [];
+    const logger = { info() {}, warn(msg) { warnings.push(msg); } };
+    const embedder = {
+      async embedPassage(text) {
+        if (text.includes("bad cluster")) {
+          throw new Error("synthetic embed failure");
+        }
+        return vec(4, 1, 0, 0, 0);
+      },
+    };
+
+    const result = await runCompaction(store, embedder, defaultConfig, undefined, logger);
+
+    assert.equal(result.clustersFound, 2);
+    assert.equal(result.memoriesCreated, 1);
+    assert.equal(result.memoriesDeleted, 2);
+    assert.equal(store.stored.length, 1);
+    assert.deepEqual(store.deleted.sort(), ["good-1", "good-2"]);
+    assert.ok(warnings.some((msg) => msg.includes("failed to merge cluster of 2")));
+  });
+
+  it("continues deleting remaining source members when one delete fails", async () => {
+    const entries = [
+      entry({ id: "delete-a", text: "same topic a", vector: vec(4, 1, 0.01, 0, 0), importance: 0.9 }),
+      entry({ id: "delete-b", text: "same topic b", vector: vec(4, 1, 0.02, 0, 0), importance: 0.8 }),
+      entry({ id: "delete-c", text: "same topic c", vector: vec(4, 1, 0.03, 0, 0), importance: 0.7 }),
+    ];
+    const db = new Map(entries.map((e) => [e.id, { ...e }]));
+    const store = {
+      stored: [],
+      deleted: [],
+      async fetchForCompaction() {
+        return [...db.values()];
+      },
+      async store(e) {
+        const newEntry = { id: "merged-delete-test", ...e };
+        this.stored.push(newEntry);
+        return newEntry;
+      },
+      async delete(id) {
+        if (id === "delete-b") {
+          throw new Error("synthetic delete failure");
+        }
+        if (db.has(id)) {
+          db.delete(id);
+          this.deleted.push(id);
+          return true;
+        }
+        return false;
+      },
+    };
+    const warnings = [];
+    const logger = { info() {}, warn(msg) { warnings.push(msg); } };
+
+    const result = await runCompaction(store, makeEmbedder(), defaultConfig, undefined, logger);
+
+    assert.equal(result.clustersFound, 1);
+    assert.equal(result.memoriesCreated, 1);
+    assert.equal(result.memoriesDeleted, 2);
+    assert.deepEqual(store.deleted.sort(), ["delete-a", "delete-c"]);
+    assert.ok(warnings.some((msg) => msg.includes("failed to delete source memory delete-b")));
   });
 });
