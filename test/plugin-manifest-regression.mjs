@@ -115,6 +115,20 @@ assert.equal(
   true,
   "embedding.chunking schema default should match runtime default",
 );
+assert.equal(
+  manifest.configSchema.properties.embedding.properties.astChunking.properties.enabled.default,
+  false,
+  "embedding.astChunking.enabled should default off",
+);
+assert.deepEqual(
+  manifest.configSchema.properties.embedding.properties.astChunking.properties.languages.default,
+  ["javascript", "typescript", "python"],
+  "embedding.astChunking.languages should default to Phase 1 languages",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.uiHints, "embedding.astChunking.enabled"),
+  "uiHints should expose embedding.astChunking.enabled",
+);
 assert.ok(
   !(manifest.configSchema.required ?? []).includes("embedding"),
   "root configSchema should not require embedding because OpenClaw preflight validates undefined plugin config as {} before runtime parsePluginConfig can emit the clearer activation error",
@@ -202,6 +216,24 @@ assert.equal(
   pkg.dependencies["apache-arrow"],
   "18.1.0",
   "package.json should declare apache-arrow directly so OpenClaw plugin installs do not miss the LanceDB runtime dependency",
+);
+
+assert.deepEqual(
+  plugin.parsePluginConfig({
+    embedding: {
+      provider: "openai-compatible",
+      apiKey: "dummy",
+      astChunking: {
+        enabled: true,
+        languages: ["typescript", "python", "ruby"],
+      },
+    },
+  }).embedding.astChunking,
+  {
+    enabled: true,
+    languages: ["typescript", "python"],
+  },
+  "parsePluginConfig should wire supported AST chunking settings and discard unsupported language names",
 );
 
 const workDir = mkdtempSync(path.join(tmpdir(), "memory-plugin-regression-"));

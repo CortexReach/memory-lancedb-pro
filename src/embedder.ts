@@ -10,7 +10,7 @@
 
 import OpenAI from "openai";
 import { createHash } from "node:crypto";
-import { smartChunk } from "./chunker.js";
+import { smartChunk, type ChunkerAstConfig } from "./chunker.js";
 
 // ============================================================================
 // Embedding Cache (LRU with TTL)
@@ -125,6 +125,8 @@ export interface EmbeddingConfig {
   omitDimensions?: boolean;
   /** Enable automatic chunking for documents exceeding context limits (default: true) */
   chunking?: boolean;
+  /** Enable code-boundary-aware chunking for supported code blocks. Default: disabled. */
+  astChunking?: ChunkerAstConfig;
   /** OpenAI SDK per-request timeout in ms. Defaults to 30000. */
   clientTimeoutMs?: number;
 }
@@ -484,8 +486,10 @@ export class Embedder {
   private readonly _omitDimensions: boolean;
   /** Enable automatic chunking for long documents (default: true) */
   private readonly _autoChunk: boolean;
+  /** Optional code-boundary-aware chunking configuration */
+  private readonly _astChunking?: ChunkerAstConfig;
 
-  constructor(config: EmbeddingConfig & { chunking?: boolean }) {
+  constructor(config: EmbeddingConfig & { chunking?: boolean; astChunking?: ChunkerAstConfig }) {
     // Normalize apiKey to array and resolve environment variables
     const apiKeys = Array.isArray(config.apiKey) ? config.apiKey : [config.apiKey];
     const resolvedKeys = apiKeys.map(k => resolveEnvVars(k));
@@ -499,6 +503,7 @@ export class Embedder {
     this._omitDimensions = config.omitDimensions === true;
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
+    this._astChunking = config.astChunking;
     const profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
     this._capabilities = getEmbeddingCapabilities(profile);
     const clientTimeoutMs = Number.isFinite(config.clientTimeoutMs) && config.clientTimeoutMs! > 0
@@ -922,7 +927,7 @@ export class Embedder {
       if (isContextError && this._autoChunk) {
         try {
           console.log(`Document exceeded context limit (${errorMsg}), attempting chunking...`);
-          const chunkResult = smartChunk(text, this._model);
+          const chunkResult = smartChunk(text, this._model, this._astChunking);
 
           if (chunkResult.chunks.length === 0) {
             throw new Error(`Failed to chunk document: ${errorMsg}`);
@@ -1056,7 +1061,7 @@ export class Embedder {
 
           const chunkResults = await Promise.all(
             validTexts.map(async (text, idx) => {
-              const chunkResult = smartChunk(text, this._model);
+              const chunkResult = smartChunk(text, this._model, this._astChunking);
               if (chunkResult.chunks.length === 0) {
                 throw new Error("Chunker produced no chunks");
               }

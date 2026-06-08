@@ -105,6 +105,25 @@ function parsePositiveInt(value) {
     }
     return undefined;
 }
+function parseAstChunkingConfig(value) {
+    if (value === undefined || value === null)
+        return undefined;
+    if (typeof value !== "object" || Array.isArray(value))
+        return undefined;
+    const raw = value;
+    const config = {};
+    if (typeof raw.enabled === "boolean") {
+        config.enabled = raw.enabled;
+    }
+    if (Array.isArray(raw.languages)) {
+        const allowed = new Set(["javascript", "typescript", "python"]);
+        const languages = raw.languages.filter((item) => typeof item === "string" && allowed.has(item));
+        if (languages.length > 0) {
+            config.languages = languages;
+        }
+    }
+    return config;
+}
 // Like parsePositiveInt but allows 0. Used for fields where 0 is a meaningful
 // "disabled" sentinel (e.g. autoRecallBadRecallDecayMs=0 disables decay).
 function parseNonNegativeInt(value) {
@@ -1547,6 +1566,7 @@ function _initPluginState(api) {
         taskPassage: config.embedding.taskPassage,
         normalized: config.embedding.normalized,
         chunking: config.embedding.chunking,
+        astChunking: config.embedding.astChunking,
         clientTimeoutMs: config.embedding.clientTimeoutMs,
     });
     const decayEngine = createDecayEngine({
@@ -3925,6 +3945,7 @@ export function parsePluginConfig(value) {
             chunking: typeof embedding.chunking === "boolean"
                 ? embedding.chunking
                 : undefined,
+            astChunking: parseAstChunkingConfig(embedding.astChunking),
             clientTimeoutMs: parsePositiveInt(embedding.clientTimeoutMs),
         },
         dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,

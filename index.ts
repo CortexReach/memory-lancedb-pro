@@ -25,6 +25,7 @@ import {
   createEmbedder,
   getEffectiveVectorDimensions,
 } from "./src/embedder.js";
+import type { ChunkerAstConfig, CodeChunkLanguage } from "./src/chunker.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG, type RetrievalConfig } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
@@ -116,6 +117,7 @@ interface PluginConfig {
     taskPassage?: string;
     normalized?: boolean;
     chunking?: boolean;
+    astChunking?: ChunkerAstConfig;
     clientTimeoutMs?: number;
   };
   dbPath?: string;
@@ -352,6 +354,30 @@ function parsePositiveInt(value: unknown): number | undefined {
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
   }
   return undefined;
+}
+
+function parseAstChunkingConfig(value: unknown): ChunkerAstConfig | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) return undefined;
+
+  const raw = value as Record<string, unknown>;
+  const config: ChunkerAstConfig = {};
+
+  if (typeof raw.enabled === "boolean") {
+    config.enabled = raw.enabled;
+  }
+
+  if (Array.isArray(raw.languages)) {
+    const allowed = new Set<CodeChunkLanguage>(["javascript", "typescript", "python"]);
+    const languages = raw.languages.filter((item): item is CodeChunkLanguage =>
+      typeof item === "string" && allowed.has(item as CodeChunkLanguage),
+    );
+    if (languages.length > 0) {
+      config.languages = languages;
+    }
+  }
+
+  return config;
 }
 
 // Like parsePositiveInt but allows 0. Used for fields where 0 is a meaningful
@@ -2065,6 +2091,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     taskPassage: config.embedding.taskPassage,
     normalized: config.embedding.normalized,
     chunking: config.embedding.chunking,
+    astChunking: config.embedding.astChunking,
     clientTimeoutMs: config.embedding.clientTimeoutMs,
   });
   const decayEngine = createDecayEngine({
@@ -4945,6 +4972,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         typeof embedding.chunking === "boolean"
           ? embedding.chunking
           : undefined,
+      astChunking: parseAstChunkingConfig(embedding.astChunking),
       clientTimeoutMs: parsePositiveInt(embedding.clientTimeoutMs),
     },
     dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
