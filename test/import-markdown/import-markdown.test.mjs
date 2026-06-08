@@ -105,6 +105,18 @@ async function setupWorkspace(name) {
   return wsDir;
 }
 
+async function captureConsoleLogs(run) {
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => logs.push(args.join(" "));
+  try {
+    const result = await run();
+    return { result, output: logs.join("\n") };
+  } finally {
+    console.log = originalLog;
+  }
+}
+
 // ────────────────────────────────────────────────────────────────────────────── Setup / Teardown ──────────────────────────────────────────────────────────────────────────────
 
 before(async () => {
@@ -209,6 +221,66 @@ describe("import-markdown CLI", () => {
       });
 
       assert.strictEqual(mockStore.storedRecords[0].importance, 0.9);
+    });
+  });
+
+  describe("process logging", () => {
+    it("prints default process logs and detailed summary counters", async () => {
+      const wsDir = await setupWorkspace("logging-summary-test");
+      await writeFile(
+        join(wsDir, "MEMORY.md"),
+        "- no\n- Duplicate log entry\n- Fresh visible import entry\n",
+        "utf-8",
+      );
+
+      mockStore.storedRecords.push({
+        text: "Duplicate log entry",
+        scope: "logging-summary-test",
+        category: "other",
+        importance: 0.7,
+        vector: [0.1],
+        metadata: "{}",
+      });
+
+      const { result, output } = await captureConsoleLogs(() =>
+        runImportMarkdown(
+          { embedder: mockEmbedder, store: mockStore },
+          {
+            openclawHome: testWorkspaceDir,
+            workspaceGlob: "logging-summary-test",
+            dedup: true,
+          },
+        ),
+      );
+
+      assert.strictEqual(result.foundFiles, 1);
+      assert.strictEqual(result.entriesProcessed, 3);
+      assert.strictEqual(result.imported, 1);
+      assert.strictEqual(result.skipped, 2);
+      assert.strictEqual(result.skippedShort, 1);
+      assert.strictEqual(result.skippedDedup, 1);
+      assert.strictEqual(result.errorCount, 0);
+      assert.strictEqual(result.embedBatches, 1);
+      assert.strictEqual(result.bulkStoreCalls, 1);
+
+      assert.match(output, /\[scan\] found 1 markdown file\(s\) across 1 workspace\(s\):/);
+      assert.match(output, /\[scan\] \[logging-summary-test\].*MEMORY\.md/);
+      assert.match(output, /\[scan\] reading: .*MEMORY\.md/);
+      assert.match(output, /\[import\] dedup check: enabled/);
+      assert.match(output, /\[skip\] too short \[logging-summary-test\]: no/);
+      assert.match(output, /\[skip\] dedup \[logging-summary-test\]: Duplicate log entry/);
+      assert.match(output, /\[import\] embedded batch 1 \(1 entries\)/);
+      assert.match(output, /\[import\] stored batch 1 \(1 entries, total: 1\)/);
+      assert.match(output, /Memory Import Status:/);
+      assert.match(output, /• Files found: 1/);
+      assert.match(output, /• Entries processed: 3/);
+      assert.match(output, /• Imported: 1/);
+      assert.match(output, /• Skipped \(too short\): 1/);
+      assert.match(output, /• Skipped \(dedup\): 1/);
+      assert.match(output, /• Errors: 0/);
+      assert.match(output, /• Embed batches: 1/);
+      assert.match(output, /• bulkStore calls: 1/);
+      assert.match(output, /• Elapsed: \d+ms/);
     });
   });
 

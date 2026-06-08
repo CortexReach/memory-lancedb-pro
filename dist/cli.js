@@ -403,6 +403,7 @@ async function sleep(ms) {
 // CLI Command Implementations
 // ============================================================================
 export async function runImportMarkdown(ctx, workspaceGlob, options) {
+    const startMs = Date.now();
     const openclawHome = options.openclawHome
         ? path.resolve(options.openclawHome)
         : path.join(homedir(), ".openclaw");
@@ -410,6 +411,12 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
     let imported = 0;
     let skipped = 0;
     let foundFiles = 0;
+    let entriesProcessed = 0;
+    let skippedShort = 0;
+    let skippedDedup = 0;
+    let errorCount = 0;
+    let embedBatches = 0;
+    let bulkStoreCalls = 0;
     if (!ctx.embedder) {
         // [FIXED P1] Throw instead of process.exit(1) so CLI handler can catch it
         throw new Error("import-markdown requires an embedder. Use via plugin CLI or ensure embedder is configured.");
@@ -543,8 +550,45 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
         }
         catch { /* not found */ }
     }
+    const scopesFound = new Set(mdFiles.map((file) => file.scope));
+    console.log(`[scan] found ${mdFiles.length} markdown file(s) across ${scopesFound.size} workspace(s):`);
+    for (const { filePath, scope } of mdFiles) {
+        console.log(`  [scan] [${scope}] ${filePath}`);
+    }
+    const printSummary = () => {
+        const elapsedMs = Date.now() - startMs;
+        console.log("");
+        console.log("Memory Import Status:");
+        console.log(`• Files found: ${foundFiles}`);
+        console.log(`• Entries processed: ${entriesProcessed}`);
+        console.log(`• Imported: ${options.dryRun ? 0 : imported}`);
+        if (options.dryRun) {
+            console.log(`• Would import: ${imported}`);
+        }
+        console.log(`• Skipped (too short): ${skippedShort}`);
+        console.log(`• Skipped (dedup): ${skippedDedup}`);
+        console.log(`• Errors: ${errorCount}`);
+        console.log(`• Embed batches: ${embedBatches}`);
+        console.log(`• bulkStore calls: ${bulkStoreCalls}`);
+        console.log(`• Elapsed: ${elapsedMs}ms`);
+        if (options.dryRun) {
+            console.log("[DRY-RUN] No entries were actually imported.");
+        }
+    };
     if (mdFiles.length === 0) {
-        return { imported: 0, skipped: 0, foundFiles: 0 };
+        printSummary();
+        return {
+            imported: 0,
+            skipped: 0,
+            foundFiles: 0,
+            entriesProcessed: 0,
+            skippedShort: 0,
+            skippedDedup: 0,
+            errorCount: 0,
+            elapsedMs: Date.now() - startMs,
+            embedBatches: 0,
+            bulkStoreCalls: 0,
+        };
     }
     // NaN-safe parsing with bounds — invalid input falls back to defaults instead of
     // silently passing NaN (e.g. "--min-text-length abc" would otherwise make every
@@ -554,6 +598,7 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
         ? Math.max(0, Math.min(1, parseFloat(options.importance ?? "0.7")))
         : 0.7;
     const dedupEnabled = !!options.dedup;
+    console.log(`[import] dedup check: ${dedupEnabled ? "enabled" : "disabled"}`);
     const buildMarkdownImportEntry = (pending, vector) => ({
         text: pending.text,
         vector,
@@ -572,6 +617,7 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
             }
             catch (err) {
                 console.warn(`  Failed to import: ${String(entry.text).slice(0, 60)}... — ${err}`);
+                errorCount++;
                 skippedCount++;
             }
         }
@@ -582,12 +628,15 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
             return { imported: 0, skipped: 0 };
         let vectors;
         try {
+            embedBatches++;
             vectors = typeof ctx.embedder.embedBatchPassage === "function"
                 ? await ctx.embedder.embedBatchPassage(pendingEntries.map((entry) => entry.text))
                 : await Promise.all(pendingEntries.map((entry) => ctx.embedder.embedPassage(entry.text)));
+            console.log(`  [import] embedded batch ${embedBatches} (${pendingEntries.length} entries)`);
         }
         catch (err) {
             console.warn(`  [import-markdown] batch embedding failed (${err}); retrying entries individually`);
+            errorCount++;
             let importedCount = 0;
             let skippedCount = 0;
             for (const pending of pendingEntries) {
@@ -599,6 +648,7 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
                 }
                 catch (entryErr) {
                     console.warn(`  Failed to import: ${pending.text.slice(0, 60)}... — ${entryErr}`);
+                    errorCount++;
                     skippedCount++;
                 }
             }
@@ -617,6 +667,7 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
                 }
                 catch (entryErr) {
                     console.warn(`  Failed to import: ${pending.text.slice(0, 60)}... — ${entryErr}`);
+                    errorCount++;
                     skippedCount++;
                 }
             }
@@ -625,11 +676,14 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
         const entries = pendingEntries.map((pending, index) => buildMarkdownImportEntry(pending, vectors[index]));
         if (typeof ctx.store.bulkStore === "function") {
             try {
+                bulkStoreCalls++;
                 await ctx.store.bulkStore(entries);
+                console.log(`  [import] stored batch ${bulkStoreCalls} (${entries.length} entries, total: ${imported + entries.length})`);
                 return { imported: entries.length, skipped: 0 };
             }
             catch (err) {
                 console.warn(`  [import-markdown] batch store failed (${err}); retrying entries individually`);
+                errorCount++;
             }
         }
         return importEntriesIndividually(entries);
@@ -639,6 +693,7 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
         let content;
         try {
             // 已在收集時用 withFileTypes: true 過濾，直接讀取
+            console.log(`[scan] reading: ${filePath}`);
             foundFiles++;
             content = await fsPromises.readFile(filePath, "utf-8");
         }
@@ -646,6 +701,7 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
             // I/O errors (permissions, corruption, etc.)
             console.warn(`  [skip] read failed: ${filePath}: ${err.message}`);
             skipped++;
+            errorCount++;
             continue;
         }
         // (fix(import-markdown): CI測試登記 + .md目錄skip保護)
@@ -661,9 +717,12 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
             if (!/^[-*+]\s/.test(line))
                 continue;
             const text = line.slice(2).trim();
+            entriesProcessed++;
             if (text.length < minTextLength) {
                 skipped++;
+                skippedShort++;
                 fileSkipped++;
+                console.log(`  [skip] too short [${options.scope || discoveredScope}]: ${text}`);
                 continue;
             }
             // Use --scope if provided, otherwise fall back to per-file discovered scope.
@@ -677,16 +736,16 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
                     const existing = await ctx.store.bm25Search(text, 5, [effectiveScope]);
                     if (existing.some((result) => result.entry.text === text)) {
                         skipped++;
+                        skippedDedup++;
                         fileSkipped++;
-                        if (!options.dryRun) {
-                            console.log(`  [skip] already imported: ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`);
-                        }
+                        console.log(`  [skip] dedup [${effectiveScope}]: ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`);
                         continue;
                     }
                 }
                 catch (err) {
                     // [FIXED P2] Log warning so dedup failure is visible instead of silent
                     console.warn(`  [import-markdown] dedup check failed (${err}), proceeding with import: ${text.slice(0, 60)}...`);
+                    errorCount++;
                 }
             }
             if (options.dryRun) {
@@ -697,6 +756,10 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
             pendingEntries.push({ text, scope: effectiveScope, sourceScope: discoveredScope, filePath });
         }
         if (!options.dryRun) {
+            if (pendingEntries.length > 0) {
+                console.log(`  [import] ${pendingEntries.length} entries need embedding from ${path.basename(filePath)} ` +
+                    `(${skippedDedup} dedup hit${skippedDedup === 1 ? "" : "s"} so far)`);
+            }
             const result = await importPendingEntries(pendingEntries);
             imported += result.imported;
             skipped += result.skipped;
@@ -707,13 +770,20 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
             }
         }
     }
-    if (options.dryRun) {
-        console.log(`\nDRY RUN — found ${foundFiles} files, ${imported} entries would be imported, ${skipped} skipped${dedupEnabled ? " [dedup enabled]" : ""}`);
-    }
-    else {
-        console.log(`\nImport complete: ${imported} imported, ${skipped} skipped (scanned ${foundFiles} files)${dedupEnabled ? " [dedup enabled]" : ""}`);
-    }
-    return { imported, skipped, foundFiles };
+    console.log(`[import] parsed ${entriesProcessed} entr${entriesProcessed === 1 ? "y" : "ies"} from ${foundFiles} file(s)`);
+    printSummary();
+    return {
+        imported,
+        skipped,
+        foundFiles,
+        entriesProcessed,
+        skippedShort,
+        skippedDedup,
+        errorCount,
+        elapsedMs: Date.now() - startMs,
+        embedBatches,
+        bulkStoreCalls,
+    };
 }
 export function registerMemoryCLI(program, context) {
     let lastSearchDiagnostics = null;
