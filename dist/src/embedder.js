@@ -338,6 +338,7 @@ const EMBED_TIMEOUT_MS = 10_000;
 const DEFAULT_EMBED_CLIENT_TIMEOUT_MS = 30_000;
 /** Bounded startup health probe timeout; normal embeddings keep the larger client timeout. */
 const EMBED_HEALTH_CHECK_TIMEOUT_MS = 7_500;
+const DEFAULT_QWEN3_QUERY_TASK = "Given a memory search query, retrieve relevant stored knowledge entries that match the query";
 /**
  * Strictly decreasing character limit for forced truncation.
  * Each recursion level MUST reduce input by this factor to guarantee progress.
@@ -400,7 +401,7 @@ export class Embedder {
         if (config.normalized !== undefined && !this._capabilities.normalized) {
             console.debug(`[memory-lancedb-pro] embedding.normalized is set but provider profile "${profile}" does not support it — value will be ignored`);
         }
-        if ((config.taskQuery || config.taskPassage) && !this._capabilities.taskField) {
+        if ((config.taskPassage || (config.taskQuery && !this.isQwen3EmbeddingModel())) && !this._capabilities.taskField) {
             console.debug(`[memory-lancedb-pro] embedding.taskQuery/taskPassage is set but provider profile "${profile}" does not support task hints — values will be ignored`);
         }
         // Create a client pool — one OpenAI client per key
@@ -647,7 +648,7 @@ export class Embedder {
     // Task-aware API
     // --------------------------------------------------------------------------
     async embedQuery(text, signal) {
-        return this.withTimeout((sig) => this.embedSingle(text, this._taskQuery, 0, sig), "embedQuery", signal);
+        return this.withTimeout((sig) => this.embedSingle(this.wrapQueryText(text), this._taskQuery, 0, sig), "embedQuery", signal);
     }
     async embedPassage(text, signal) {
         return this.withTimeout((sig) => this.embedSingle(text, this._taskPassage, 0, sig), "embedPassage", signal);
@@ -657,7 +658,7 @@ export class Embedder {
     // EMBED_TIMEOUT_MS regardless of how many texts succeed. Individual text embedding
     // within the batch is protected by the SDK's own timeout handling.
     async embedBatchQuery(texts, signal) {
-        return this.embedMany(texts, this._taskQuery, signal);
+        return this.embedMany(texts.map((text) => this.wrapQueryText(text)), this._taskQuery, signal);
     }
     async embedBatchPassage(texts, signal) {
         return this.embedMany(texts, this._taskPassage, signal);
@@ -665,6 +666,18 @@ export class Embedder {
     // --------------------------------------------------------------------------
     // Internals
     // --------------------------------------------------------------------------
+    isQwen3EmbeddingModel() {
+        return /qwen3[-_]embedding/i.test(this._model);
+    }
+    wrapQueryText(text) {
+        if (!this.isQwen3EmbeddingModel() || !text || text.trim().length === 0) {
+            return text;
+        }
+        const task = this._taskQuery && this._taskQuery.trim().length > 0
+            ? this._taskQuery
+            : DEFAULT_QWEN3_QUERY_TASK;
+        return `Instruct: ${task}\nQuery:${text}`;
+    }
     validateEmbedding(embedding) {
         if (!Array.isArray(embedding)) {
             throw new Error(`Embedding is not an array (got ${typeof embedding})`);

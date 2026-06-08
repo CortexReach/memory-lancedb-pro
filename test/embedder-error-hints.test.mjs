@@ -151,6 +151,56 @@ async function run() {
   });
   await genericEmbedder.embedPassage("hello");
 
+  const qwen3DefaultQueryTask =
+    "Given a memory search query, retrieve relevant stored knowledge entries that match the query";
+  const qwen3Embedder = new Embedder({
+    provider: "openai-compatible",
+    apiKey: "test-key",
+    model: "/models/Qwen3-Embedding-8B",
+    baseURL: "https://vllm.example.invalid/v1",
+    dimensions: 4096,
+  });
+
+  installMockEmbeddingClient(qwen3Embedder, async (payload) => {
+    assert.equal(
+      payload.input,
+      `Instruct: ${qwen3DefaultQueryTask}\nQuery:PlayerAction`,
+      "Qwen3 query embeddings should use the recommended query instruction prefix",
+    );
+    assert.equal(payload.task, undefined, "generic Qwen3 endpoints should not receive a task payload field");
+    return createEmbeddingResponse(4096);
+  });
+  await qwen3Embedder.embedQuery("PlayerAction");
+
+  installMockEmbeddingClient(qwen3Embedder, async (payload) => {
+    assert.equal(payload.input, "PlayerAction schema", "Qwen3 passage embeddings should remain raw");
+    return createEmbeddingResponse(4096);
+  });
+  await qwen3Embedder.embedPassage("PlayerAction schema");
+
+  const qwen3CustomTaskEmbedder = new Embedder({
+    provider: "openai-compatible",
+    apiKey: "test-key",
+    model: "Qwen3_Embedding_8B",
+    baseURL: "https://vllm.example.invalid/v1",
+    dimensions: 4096,
+    taskQuery: "Retrieve relevant project memories.",
+  });
+  installMockEmbeddingClient(qwen3CustomTaskEmbedder, async (payload) => {
+    assert.deepEqual(payload.input, [
+      "Instruct: Retrieve relevant project memories.\nQuery:PlayerAction",
+      "Instruct: Retrieve relevant project memories.\nQuery:DimPlayerAction",
+    ]);
+    assert.equal(payload.task, undefined, "taskQuery should be used as prefix text, not sent as a generic task field");
+    return {
+      data: [
+        { object: "embedding", index: 0, embedding: new Array(4096).fill(0.1) },
+        { object: "embedding", index: 1, embedding: new Array(4096).fill(0.2) },
+      ],
+    };
+  });
+  await qwen3CustomTaskEmbedder.embedBatchQuery(["PlayerAction", "DimPlayerAction"]);
+
   // voyage-4 should be detected as voyage-compatible via model name prefix,
   // even when baseURL is NOT api.voyageai.com (e.g. behind a proxy).
   const voyageProxyEmbedder = new Embedder({
