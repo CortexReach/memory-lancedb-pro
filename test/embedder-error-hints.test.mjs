@@ -271,6 +271,64 @@ async function run() {
     },
   );
 
+  // Voyage native fetch must preserve the configured client timeout for batch
+  // calls, since batch embeddings are intentionally not wrapped by the global
+  // per-text timeout.
+  await withEmbeddingCaptureServer(
+    async () => {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return { body: createEmbeddingResponse(1024) };
+    },
+    async ({ baseURL }) => {
+      const embedder = new Embedder({
+        provider: "openai-compatible",
+        apiKey: "test-key",
+        model: "voyage-4",
+        baseURL,
+        clientTimeoutMs: 25,
+      });
+
+      await expectReject(
+        () => embedder.embedBatchPassage(["timeout voyage"]),
+        /aborted|abort/i,
+      );
+    },
+  );
+
+  // Voyage native fetch should use the same retry/key-rotation behavior as the
+  // SDK path when providers respond with overload/rate-limit statuses.
+  {
+    const authorizations = [];
+    await withEmbeddingCaptureServer(
+      (payload, req) => {
+        authorizations.push(req.headers.authorization);
+        if (authorizations.length === 1) {
+          return {
+            status: 503,
+            body: { error: { message: "provider overloaded" } },
+          };
+        }
+
+        assert.deepEqual(payload.input, ["rotate voyage"]);
+        return { body: createEmbeddingResponse(1024, 0.3) };
+      },
+      async ({ baseURL }) => {
+        const embedder = new Embedder({
+          provider: "openai-compatible",
+          apiKey: ["voyage-key-a", "voyage-key-b"],
+          model: "voyage-4",
+          baseURL,
+        });
+
+        const embeddings = await embedder.embedBatchPassage(["rotate voyage"]);
+        assert.equal(embeddings.length, 1);
+        assert.equal(embeddings[0].length, 1024);
+      },
+    );
+
+    assert.deepEqual(authorizations, ["Bearer voyage-key-a", "Bearer voyage-key-b"]);
+  }
+
   // End-to-end HTTP payload verification for generic-openai-compatible profile.
   // Unlike the mock tests above, this spins up a real HTTP server and verifies
   // the actual request body sent by the OpenAI SDK.

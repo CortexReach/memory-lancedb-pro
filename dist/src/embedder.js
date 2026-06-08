@@ -81,6 +81,17 @@ class EmbeddingCache {
         };
     }
 }
+class EmbeddingHttpError extends Error {
+    status;
+    statusCode;
+    constructor(provider, status, statusText, body) {
+        const detail = body.trim().slice(0, 200);
+        super(`${provider} embedding failed: ${status} ${statusText}${detail ? ` ${detail}` : ""}`);
+        this.name = "EmbeddingHttpError";
+        this.status = status;
+        this.statusCode = status;
+    }
+}
 // Known embedding model dimensions
 const EMBEDDING_DIMENSIONS = {
     "text-embedding-3-small": 1536,
@@ -129,10 +140,11 @@ function getErrorStatus(error) {
     if (typeof err.statusCode === "number")
         return err.statusCode;
     if (err.error && typeof err.error === "object") {
-        if (typeof err.error.status === "number")
-            return err.error.status;
-        if (typeof err.error.statusCode === "number")
-            return err.error.statusCode;
+        const nested = err.error;
+        if (typeof nested.status === "number")
+            return nested.status;
+        if (typeof nested.statusCode === "number")
+            return nested.statusCode;
     }
     return undefined;
 }
@@ -142,8 +154,10 @@ function getErrorCode(error) {
     const err = error;
     if (typeof err.code === "string")
         return err.code;
-    if (err.error && typeof err.error === "object" && typeof err.error.code === "string") {
-        return err.error.code;
+    if (err.error && typeof err.error === "object") {
+        const nested = err.error;
+        if (typeof nested.code === "string")
+            return nested.code;
     }
     return undefined;
 }
@@ -375,6 +389,7 @@ export class Embedder {
     _providerProfile;
     _capabilities;
     _apiKeys;
+    _clientTimeoutMs;
     /** Optional requested dimensions to pass through to the embedding provider (OpenAI-compatible). */
     _requestDimensions;
     /** When true, omit the dimensions parameter even if _requestDimensions is set. */
@@ -401,6 +416,7 @@ export class Embedder {
         const clientTimeoutMs = Number.isFinite(config.clientTimeoutMs) && config.clientTimeoutMs > 0
             ? Math.floor(config.clientTimeoutMs)
             : DEFAULT_EMBED_CLIENT_TIMEOUT_MS;
+        this._clientTimeoutMs = clientTimeoutMs;
         // Warn if configured fields will be silently ignored by this provider profile
         if (config.normalized !== undefined && !this._capabilities.normalized) {
             console.debug(`[memory-lancedb-pro] embedding.normalized is set but provider profile "${profile}" does not support it — value will be ignored`);
@@ -463,9 +479,10 @@ export class Embedder {
         // Nested error object (some providers)
         const nested = err.error;
         if (nested && typeof nested === "object") {
-            if (nested.type === "rate_limit_exceeded" || nested.type === "insufficient_quota")
+            const nestedError = nested;
+            if (nestedError.type === "rate_limit_exceeded" || nestedError.type === "insufficient_quota")
                 return true;
-            if (nested.code === "rate_limit_exceeded" || nested.code === "insufficient_quota")
+            if (nestedError.code === "rate_limit_exceeded" || nestedError.code === "insufficient_quota")
                 return true;
         }
         // Fallback: message text matching
@@ -491,6 +508,30 @@ export class Embedder {
     isVoyageProvider() {
         return this._providerProfile === "voyage-compatible";
     }
+    async fetchWithClientTimeout(input, init, options) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), options.timeoutMs);
+        let unsubscribe;
+        if (options.signal) {
+            if (options.signal.aborted) {
+                clearTimeout(timeoutId);
+                throw new DOMException("The operation was aborted.", "AbortError");
+            }
+            const handler = () => controller.abort();
+            options.signal.addEventListener("abort", handler, { once: true });
+            unsubscribe = () => options.signal?.removeEventListener("abort", handler);
+        }
+        try {
+            return await fetch(input, {
+                ...init,
+                signal: controller.signal,
+            });
+        }
+        finally {
+            clearTimeout(timeoutId);
+            unsubscribe?.();
+        }
+    }
     /**
      * Call embeddings.create using native fetch (bypasses OpenAI SDK).
      * Used exclusively for Ollama endpoints where AbortController must work
@@ -515,7 +556,7 @@ export class Embedder {
         // If a model doesn't support that endpoint, failure will be silent from the user's perspective.
         // This is acceptable because most Ollama embedding models support /v1/embeddings.
         if (Array.isArray(payload.input)) {
-            const response = await fetch(base + "/v1/embeddings", {
+            const response = await this.fetchWithClientTimeout(base + "/v1/embeddings", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
@@ -528,11 +569,13 @@ export class Embedder {
                     // from buildPayload() are intentionally not included. Ollama embedding models
                     // do not support these parameters, so omitting them is correct.
                 }),
+            }, {
                 signal,
+                timeoutMs: this._clientTimeoutMs,
             });
             if (!response.ok) {
                 const body = await response.text().catch(() => "");
-                throw new Error(`Ollama batch embedding failed: ${response.status} ${response.statusText} ??${body.slice(0, 200)}`);
+                throw new EmbeddingHttpError("Ollama batch", response.status, response.statusText, body);
             }
             const data = await response.json();
             // Validate response count and non-empty embeddings
@@ -547,7 +590,7 @@ export class Embedder {
             return data;
         }
         // Single request: use /api/embeddings + prompt (PR #621 fix)
-        const response = await fetch(base + "/api/embeddings", {
+        const response = await this.fetchWithClientTimeout(base + "/api/embeddings", {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
@@ -557,11 +600,13 @@ export class Embedder {
                 model: payload.model,
                 prompt: payload.input,
             }),
+        }, {
             signal,
+            timeoutMs: this._clientTimeoutMs,
         });
         if (!response.ok) {
             const body = await response.text().catch(() => "");
-            throw new Error(`Ollama embedding failed: ${response.status} ${response.statusText} ??${body.slice(0, 200)}`);
+            throw new EmbeddingHttpError("Ollama", response.status, response.statusText, body);
         }
         const data = await response.json();
         // Ollama /api/embeddings returns { embedding: number[] },
@@ -574,18 +619,20 @@ export class Embedder {
         }
         const base = this._baseURL.replace(/\/$/, "");
         const endpoint = base.endsWith("/embeddings") ? base : `${base}/embeddings`;
-        const response = await fetch(endpoint, {
+        const response = await this.fetchWithClientTimeout(endpoint, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
                 "Authorization": `Bearer ${apiKey}`,
             },
             body: JSON.stringify(payload),
+        }, {
             signal,
+            timeoutMs: this._clientTimeoutMs,
         });
         if (!response.ok) {
             const body = await response.text().catch(() => "");
-            throw new Error(`Voyage embedding failed: ${response.status} ${response.statusText} ${body.slice(0, 200)}`);
+            throw new EmbeddingHttpError("Voyage", response.status, response.statusText, body);
         }
         return response.json();
     }
