@@ -9,7 +9,7 @@
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "os";
 import path from "path";
 import { fileURLToPath } from "node:url";
@@ -216,6 +216,98 @@ describe("runMemoryReflection — invalid agentId guard", () => {
       assert.ok(
         startLogs.length >= 0, // not asserting >0 since DB might not be initialized
         `expect no crash for valid agentId=main; got: ${JSON.stringify(startLogs)}`,
+      );
+    });
+  });
+
+  describe("Empty command boundary sessions", () => {
+    it("skips repeated empty command:new events for the same fresh session without suppressing a different old session", async () => {
+      const pluginConfig = makePluginConfig(workDir);
+      pluginConfig.memoryReflection.serialCooldownMs = 1;
+
+      const harness = createPluginApiHarness({
+        resolveRoot: workDir,
+        pluginConfig,
+      });
+      memoryLanceDBProPlugin.register(harness.api);
+
+      const hooks = harness.eventHandlers.get("command:new") || [];
+      const reflectionHook = hooks.find((hook) =>
+        hook.meta?.name === "memory-lancedb-pro.memory-reflection.command-new"
+      );
+      assert.ok(reflectionHook, "expected memory reflection command:new hook");
+
+      const emptySessionFile = path.join(workDir, "fresh-empty.jsonl");
+      writeFileSync(emptySessionFile, "", "utf-8");
+
+      const originalDateNow = Date.now;
+      let now = 1_800_000_000_000;
+      Date.now = () => now;
+      try {
+        for (const timestamp of [1000, 2000, 3000]) {
+          await reflectionHook.handler({
+            sessionKey: "agent:main:session:fresh",
+            timestamp,
+            action: "command:new",
+            context: {
+              cfg: pluginConfig,
+              workspaceDir: workDir,
+              sessionEntry: {
+                sessionId: "fresh-empty",
+                sessionFile: emptySessionFile,
+              },
+            },
+          }, { sessionKey: "agent:main:session:fresh", agentId: "main" });
+          now += 10;
+        }
+      } finally {
+        Date.now = originalDateNow;
+      }
+
+      const emptyLogs = harness.logs.filter(([, msg]) => msg.includes("conversation empty/unusable"));
+      assert.equal(emptyLogs.length, 1, `only the first empty event should read the session; got ${JSON.stringify(emptyLogs)}`);
+
+      const skippedLogs = harness.logs.filter(([, msg]) => msg.includes("skipped repeated empty/unusable session"));
+      assert.equal(skippedLogs.length, 2, `expected repeated empty events to hit the guard; got ${JSON.stringify(harness.logs)}`);
+
+      const oldSessionFile = path.join(workDir, "old-session.jsonl");
+      writeFileSync(
+        oldSessionFile,
+        [
+          JSON.stringify({ type: "message", message: { role: "user", content: "Please remember the old session." } }),
+          JSON.stringify({ type: "message", message: { role: "assistant", content: "I will reflect on the old session." } }),
+        ].join("\n") + "\n",
+        "utf-8",
+      );
+
+      const originalOpenClawCliBin = process.env.OPENCLAW_CLI_BIN;
+      process.env.OPENCLAW_CLI_BIN = "/usr/bin/false";
+      const originalDateNowSecond = Date.now;
+      now = 1_800_000_001_000;
+      Date.now = () => now;
+      try {
+        await reflectionHook.handler({
+          sessionKey: "agent:main:session:fresh",
+          timestamp: 4000,
+          action: "command:new",
+          context: {
+            cfg: pluginConfig,
+            workspaceDir: workDir,
+            previousSessionEntry: {
+              sessionId: "old-session",
+              sessionFile: oldSessionFile,
+            },
+          },
+        }, { sessionKey: "agent:main:session:fresh", agentId: "main" });
+      } finally {
+        Date.now = originalDateNowSecond;
+        if (originalOpenClawCliBin === undefined) delete process.env.OPENCLAW_CLI_BIN;
+        else process.env.OPENCLAW_CLI_BIN = originalOpenClawCliBin;
+      }
+
+      assert.ok(
+        harness.logs.some(([, msg]) => msg.includes("reflection generation start for session old-session")),
+        `old-session reflection should not be suppressed by the fresh empty-session guard; got ${JSON.stringify(harness.logs)}`,
       );
     });
   });

@@ -270,6 +270,8 @@ const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
+const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS = 120_000;
+const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_MAX_ENTRIES = 200;
 // After /new or /reset, the just-closed session may have generated fresh
 // derived deltas. Keep those out of the immediately opened prompt window.
 const DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS = 120_000;
@@ -1523,6 +1525,45 @@ function getCommandActionName(action) {
 function isSessionBoundaryReflectionAction(action) {
     const name = getCommandActionName(action);
     return name === "new" || name === "reset";
+}
+const REFLECTION_EMPTY_EVENT_GUARD = Symbol.for("openclaw.memory-lancedb-pro.reflection-empty-event-guard");
+function getReflectionEmptyEventGuardMap() {
+    const g = globalThis;
+    if (!g[REFLECTION_EMPTY_EVENT_GUARD])
+        g[REFLECTION_EMPTY_EVENT_GUARD] = new Map();
+    return g[REFLECTION_EMPTY_EVENT_GUARD];
+}
+function pruneReflectionEmptyEventGuard(now = Date.now()) {
+    const guard = getReflectionEmptyEventGuardMap();
+    for (const [key, entry] of guard) {
+        if (now - entry.updatedAt > DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS) {
+            guard.delete(key);
+        }
+    }
+    if (guard.size > DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_MAX_ENTRIES) {
+        const newest = Array.from(guard.entries()).slice(-DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_MAX_ENTRIES);
+        guard.clear();
+        for (const [key, entry] of newest)
+            guard.set(key, entry);
+    }
+}
+async function getReflectionEmptyEventGuardKey(params) {
+    let fileFingerprint = "file=(none)";
+    if (params.sessionFile) {
+        try {
+            const st = await stat(params.sessionFile);
+            fileFingerprint = `file=${params.sessionFile};size=${st.size};mtime=${Math.trunc(st.mtimeMs)}`;
+        }
+        catch (err) {
+            fileFingerprint = `file=${params.sessionFile};missing=${String(err?.code || err?.name || "unknown")}`;
+        }
+    }
+    return [
+        getCommandActionName(params.action) || "unknown",
+        params.sessionKey,
+        params.sessionId || "unknown",
+        fileFingerprint,
+    ].join("|");
 }
 let _singletonState = null;
 function _initPluginState(api) {
@@ -3241,6 +3282,13 @@ const memoryLanceDBProPlugin = {
                 }
                 if (_dedupHookEvent("reflection", event))
                     return;
+                const context = (event.context || {});
+                const cfg = context.cfg;
+                const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {});
+                const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
+                let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
+                const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
+                const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
                 if (isSessionBoundaryReflectionAction(action)) {
                     const now = Date.now();
                     reflectionDerivedBySession.delete(sessionKey);
@@ -3250,6 +3298,55 @@ const memoryLanceDBProPlugin = {
                         reason: action,
                     });
                 }
+                if (!cfg) {
+                    api.logger.warn(`memory-reflection: command:${action} missing cfg in hook context; skip reflection`);
+                    return;
+                }
+                // Guard: skip reflection for invalid agentId formats (numeric chat_id, etc.)
+                if (isInvalidAgentIdFormat(sourceAgentId, config.declaredAgents)) {
+                    api.logger.debug?.(`memory-reflection: command hook skipped (invalid agentId=${sourceAgentId}, sessionKey=${sessionKey ?? "(none)"})`);
+                    return;
+                }
+                // Exclude agents/sessions listed in memoryReflection.excludeAgents (supports wildcards)
+                const excludePatterns = config.memoryReflection?.excludeAgents;
+                if (excludePatterns && isAgentOrSessionExcluded(sourceAgentId, sessionKey, excludePatterns)) {
+                    api.logger.debug?.(`memory-reflection: command hook skipped (excluded agent=${sourceAgentId}, sessionKey=${sessionKey ?? "(none)"})`);
+                    return;
+                }
+                let emptyEventGuardKey;
+                const isBoundaryAction = isSessionBoundaryReflectionAction(action);
+                if (isBoundaryAction) {
+                    pruneReflectionEmptyEventGuard();
+                    emptyEventGuardKey = await getReflectionEmptyEventGuardKey({
+                        action,
+                        sessionKey,
+                        sessionId: currentSessionId,
+                        sessionFile: currentSessionFile,
+                    });
+                    const guarded = getReflectionEmptyEventGuardMap().get(emptyEventGuardKey);
+                    if (guarded && Date.now() - guarded.updatedAt <= DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS) {
+                        api.logger.info(`memory-reflection: command:${action} skipped repeated empty/unusable session; sessionKey=${sessionKey}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}; reason=${guarded.reason}`);
+                        return;
+                    }
+                }
+                const rememberEmptyReflectionEvent = async (reason) => {
+                    if (!isBoundaryAction)
+                        return;
+                    const guard = getReflectionEmptyEventGuardMap();
+                    const now = Date.now();
+                    const finalKey = await getReflectionEmptyEventGuardKey({
+                        action,
+                        sessionKey,
+                        sessionId: currentSessionId,
+                        sessionFile: currentSessionFile,
+                    });
+                    guard.set(finalKey, { updatedAt: now, reason });
+                    if (emptyEventGuardKey && emptyEventGuardKey === finalKey) {
+                        guard.set(emptyEventGuardKey, { updatedAt: now, reason });
+                    }
+                    pruneReflectionEmptyEventGuard(now);
+                    api.logger.info(`memory-reflection: command:${action} empty/unusable guard recorded; sessionKey=${sessionKey}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}; reason=${reason}`);
+                };
                 // Guard against re-entrant calls for the same session (e.g. file-write triggering another command:new)
                 // Uses global lock shared across all plugin instances to prevent loop amplification.
                 const globalLock = getGlobalReflectionLock();
@@ -3257,9 +3354,6 @@ const memoryLanceDBProPlugin = {
                     api.logger.info(`memory-reflection: skipping re-entrant call for sessionKey=${sessionKey}; already running (global guard)`);
                     return;
                 }
-                // Parse context before guards so cfg is available for serialCooldownMs
-                const context = (event.context || {});
-                const cfg = context.cfg;
                 // Serial loop guard: skip if a reflection for this sessionKey completed recently
                 if (sessionKey) {
                     const serialGuard = getSerialGuardMap();
@@ -3278,26 +3372,6 @@ const memoryLanceDBProPlugin = {
                 try {
                     pruneReflectionSessionState();
                     const workspaceDir = resolveWorkspaceDirFromContext(context);
-                    if (!cfg) {
-                        api.logger.warn(`memory-reflection: command:${action} missing cfg in hook context; skip reflection`);
-                        return;
-                    }
-                    const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {});
-                    const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
-                    let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
-                    const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
-                    // Guard: skip reflection for invalid agentId formats (numeric chat_id, etc.)
-                    if (isInvalidAgentIdFormat(sourceAgentId, config.declaredAgents)) {
-                        api.logger.debug?.(`memory-reflection: command hook skipped (invalid agentId=${sourceAgentId}, sessionKey=${sessionKey ?? "(none)"})`);
-                        return;
-                    }
-                    // Exclude agents/sessions listed in memoryReflection.excludeAgents (supports wildcards)
-                    const excludePatterns = config.memoryReflection?.excludeAgents;
-                    if (excludePatterns && isAgentOrSessionExcluded(sourceAgentId, sessionKey, excludePatterns)) {
-                        api.logger.debug?.(`memory-reflection: command hook skipped (excluded agent=${sourceAgentId}, sessionKey=${sessionKey ?? "(none)"})`);
-                        return;
-                    }
-                    const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
                     api.logger.info(`memory-reflection: command:${action} hook start; sessionKey=${sessionKey || "(none)"}; source=${commandSource || "(unknown)"}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`);
                     if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
                         const searchDirs = resolveReflectionSessionSearchDirs({
@@ -3326,11 +3400,13 @@ const memoryLanceDBProPlugin = {
                             sourceAgentId,
                         });
                         api.logger.warn(`memory-reflection: command:${action} missing session file after recovery for session ${currentSessionId}; dirs=${searchDirs.join(" | ") || "(none)"}`);
+                        await rememberEmptyReflectionEvent("missing-session-file");
                         return;
                     }
                     const conversation = await readSessionConversationWithResetFallback(currentSessionFile, reflectionMessageCount);
                     if (!conversation) {
                         api.logger.warn(`memory-reflection: command:${action} conversation empty/unusable for session ${currentSessionId}; file=${currentSessionFile}`);
+                        await rememberEmptyReflectionEvent("empty-conversation");
                         return;
                     }
                     // Mark that reflection will actually run — cooldown is only recorded
@@ -4147,5 +4223,6 @@ export function resetRegistration() {
     _registeredApisMap.clear(); // dual-track: clear Map alongside WeakSet
     _singletonState = null;
     _hookEventDedup.clear();
+    getReflectionEmptyEventGuardMap().clear();
 }
 export default memoryLanceDBProPlugin;
