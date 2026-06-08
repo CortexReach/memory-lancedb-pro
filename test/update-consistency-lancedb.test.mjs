@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import jitiFactory from "jiti";
@@ -8,6 +8,10 @@ import jitiFactory from "jiti";
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { MemoryStore } = jiti("../src/store.ts");
 const { AccessTracker } = jiti("../src/access-tracker.ts");
+const legacySlugMemory = JSON.parse(
+  readFileSync(new URL("./fixtures/legacy-slug-memory.json", import.meta.url), "utf8"),
+);
+const upgradedLegacyMetadata = JSON.stringify({ memory_category: "cases" });
 
 function deferred() {
   let resolve;
@@ -197,5 +201,60 @@ describe("MemoryStore update rollback (real LanceDB backend)", () => {
     const listed = await store.list(["global"]);
     assert.equal(listed.length, 1);
     assert.equal(listed[0].text, "updated memory");
+  });
+
+  it("updates imported legacy records with stable slug IDs", async () => {
+    const store = new MemoryStore({
+      dbPath: path.join(workDir, "db"),
+      vectorDim: 4,
+    });
+
+    await store.importEntry(legacySlugMemory);
+    await store.importEntry({
+      ...legacySlugMemory,
+      id: "working-sessions-canonical-path-v2",
+      text: "Another imported legacy memory with a stable slug ID.",
+    });
+
+    const updated = await store.update(legacySlugMemory.id, {
+      text: "upgraded legacy memory",
+      metadata: upgradedLegacyMetadata,
+    });
+
+    assert.equal(updated?.id, legacySlugMemory.id);
+    assert.equal(updated?.text, "upgraded legacy memory");
+
+    const byId = await store.getById(legacySlugMemory.id);
+    assert.equal(byId?.text, "upgraded legacy memory");
+    assert.equal(byId?.metadata, upgradedLegacyMetadata);
+
+    const updatedV2 = await store.update("working-sessions-canonical-path-v2", {
+      text: "upgraded v2 legacy memory",
+      metadata: upgradedLegacyMetadata,
+    });
+
+    assert.equal(updatedV2?.id, "working-sessions-canonical-path-v2");
+    assert.equal(updatedV2?.text, "upgraded v2 legacy memory");
+  });
+
+  it("rejects clearly invalid memory IDs instead of treating them as exact legacy IDs", async () => {
+    const { store } = await createStoreWithEntry();
+    const invalidIds = [
+      "",
+      "not an id",
+      "bad/id",
+      "bad'id",
+      "bad\nid",
+      "-starts-with-symbol",
+      "ab",
+    ];
+
+    for (const invalidId of invalidIds) {
+      await assert.rejects(
+        () => store.update(invalidId, { text: "should not update" }),
+        /Invalid memory ID format/,
+        `expected invalid ID to be rejected: ${JSON.stringify(invalidId)}`,
+      );
+    }
   });
 });

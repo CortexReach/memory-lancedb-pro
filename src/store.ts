@@ -116,7 +116,12 @@ function clampInt(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.floor(value)));
 }
 
+const LEGACY_STABLE_MEMORY_ID_REGEX = /^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$/;
 const LEGACY_SECONDS_TIMESTAMP_MAX = 1_000_000_000_000;
+
+function isLegacyStableMemoryId(id: string): boolean {
+  return LEGACY_STABLE_MEMORY_ID_REGEX.test(id);
+}
 
 export function normalizeMemoryTimestamp(value: unknown, fallback = Date.now()): number {
   const raw = value instanceof Date
@@ -1834,23 +1839,22 @@ export class MemoryStore {
     }
 
     return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
-      // Support both full UUID and short prefix (8+ hex chars), same as delete()
-      // Also support legacy mem-md-N format from older memory-lancedb-pro versions
+      // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
+      // from older stores (for example "mem-md-..." or "data-pointer-...").
       const uuidRegex =
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       const prefixRegex = /^[0-9a-f]{8,}$/i;
-      const legacyRegex = /^mem-md-\d+$/i;
       const isFullId = uuidRegex.test(id);
       const isPrefix = !isFullId && prefixRegex.test(id);
-      const isLegacy = !isFullId && !isPrefix && legacyRegex.test(id);
+      const isLegacyStableId = !isFullId && !isPrefix && isLegacyStableMemoryId(id);
 
-      if (!isFullId && !isPrefix && !isLegacy) {
+      if (!isFullId && !isPrefix && !isLegacyStableId) {
         throw new Error(`Invalid memory ID format: ${id}`);
       }
 
       let rows: any[];
-      if (isFullId || isLegacy) {
-        // Legacy IDs use exact string match like full UUIDs
+      if (isFullId || isLegacyStableId) {
+        // Legacy IDs use exact string match like full UUIDs.
         const safeId = escapeSqlLiteral(id);
         rows = await this.table!.query()
           .where(`id = '${safeId}'`)
