@@ -2662,7 +2662,7 @@ const memoryLanceDBProPlugin = {
       },
       {
         enableManagementTools: config.enableManagementTools,
-        enableSelfImprovementTools: config.selfImprovement?.enabled !== false,
+        enableSelfImprovementTools: config.selfImprovement?.enabled === true,
       }
     );
 
@@ -3764,7 +3764,7 @@ const memoryLanceDBProPlugin = {
     // Integrated Self-Improvement (inheritance + derived)
     // ========================================================================
 
-    if (config.selfImprovement?.enabled !== false) {
+    if (config.selfImprovement?.enabled === true) {
       const pendingSelfImprovementResetReminderBySession = new Set<string>();
       const getSelfImprovementSessionKey = (event: any, ctx?: any): string => {
         const candidates = [
@@ -4318,7 +4318,7 @@ const memoryLanceDBProPlugin = {
           const reflectionGovernanceCandidates = reflectionGenerated.usedFallback
             ? []
             : extractReflectionLearningGovernanceCandidates(reflectionText);
-          if (config.selfImprovement?.enabled !== false && reflectionGovernanceCandidates.length > 0) {
+          if (config.selfImprovement?.enabled === true && reflectionGovernanceCandidates.length > 0) {
             for (const candidate of reflectionGovernanceCandidates) {
               const appendResult = await appendSelfImprovementEntry({
                 baseDir: workspaceDir,
@@ -5030,19 +5030,13 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     sessionStrategy,
     selfImprovement: typeof cfg.selfImprovement === "object" && cfg.selfImprovement !== null
       ? {
-        enabled: (cfg.selfImprovement as Record<string, unknown>).enabled !== false,
+        enabled: (cfg.selfImprovement as Record<string, unknown>).enabled === true,
         beforeResetNote: (cfg.selfImprovement as Record<string, unknown>).beforeResetNote !== false,
         skipSubagentBootstrap: (cfg.selfImprovement as Record<string, unknown>).skipSubagentBootstrap !== false,
         ensureLearningFiles: (cfg.selfImprovement as Record<string, unknown>).ensureLearningFiles !== false,
         maxEntries: parsePositiveInt((cfg.selfImprovement as Record<string, unknown>).maxEntries) ?? 500,
       }
-      : {
-        enabled: true,
-        beforeResetNote: true,
-        skipSubagentBootstrap: true,
-        ensureLearningFiles: true,
-        maxEntries: 500,
-      },
+      : undefined,
     canonicalCorpus: parseCanonicalCorpusConfig(cfg.canonicalCorpus),
     memoryReflection: memoryReflectionRaw
       ? {

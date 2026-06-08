@@ -286,7 +286,7 @@ try {
   );
   assert.equal(services.length, 1, "plugin should register its background service");
   assert.equal(typeof api.hooks.agent_end, "function", "autoCapture should remain enabled by default");
-  assert.equal(typeof api.hooks["command:new"], "function", "selfImprovement command:new hook should be registered by default (#391)");
+  assert.equal(api.hooks["command:new"], undefined, "selfImprovement command:new hook should stay disabled without selfImprovement config (#405)");
   await assert.doesNotReject(
     services[0].stop(),
     "service stop should not throw when no access tracker is configured",
@@ -307,11 +307,10 @@ try {
   });
   resetRegistration();
   plugin.register(sessionDefaultApi);
-  // selfImprovement registers command:new by default (#391), independent of sessionMemory config
   assert.equal(
-    typeof sessionDefaultApi.hooks["command:new"],
-    "function",
-    "command:new hook should be registered (selfImprovement default-on since #391)",
+    sessionDefaultApi.hooks["command:new"],
+    undefined,
+    "sessionMemory config should not implicitly enable selfImprovement command:new hook (#405)",
   );
 
   const sessionEnabledApi = createMockApi({
@@ -334,11 +333,35 @@ try {
     "function",
     "sessionMemory.enabled=true should register the async before_reset hook",
   );
-  // selfImprovement registers command:new by default (#391), independent of sessionMemory config
   assert.equal(
-    typeof sessionEnabledApi.hooks["command:new"],
+    sessionEnabledApi.hooks["command:new"],
+    undefined,
+    "sessionMemory.enabled=true should not implicitly enable selfImprovement command:new hook (#405)",
+  );
+
+  const selfImprovementEnabledApi = createMockApi({
+    dbPath: path.join(workDir, "db-self-improvement-enabled"),
+    autoCapture: false,
+    autoRecall: false,
+    sessionStrategy: "none",
+    selfImprovement: {
+      enabled: true,
+      ensureLearningFiles: false,
+    },
+    embedding: {
+      provider: "openai-compatible",
+      apiKey: "dummy",
+      model: "text-embedding-3-small",
+      baseURL: "http://127.0.0.1:9/v1",
+      dimensions: 1536,
+    },
+  });
+  resetRegistration();
+  plugin.register(selfImprovementEnabledApi);
+  assert.equal(
+    typeof selfImprovementEnabledApi.hooks["command:new"],
     "function",
-    "command:new hook should be registered (selfImprovement default-on since #391)",
+    "selfImprovement.enabled=true should register command:new hook (#405)",
   );
 
   const longText = `${"Long embedding payload. ".repeat(420)}tail`;
