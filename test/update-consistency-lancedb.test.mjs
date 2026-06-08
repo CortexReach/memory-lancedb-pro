@@ -198,4 +198,34 @@ describe("MemoryStore update rollback (real LanceDB backend)", () => {
     assert.equal(listed.length, 1);
     assert.equal(listed[0].text, "updated memory");
   });
+
+  it("updates imported legacy records with stable slug IDs", async () => {
+    const store = new MemoryStore({
+      dbPath: path.join(workDir, "db"),
+      vectorDim: 4,
+    });
+
+    await store.importEntry({
+      id: "data-pointer-openclaw-paths-20260527",
+      text: "legacy imported memory",
+      vector: [0, 0, 0, 0],
+      category: "fact",
+      scope: "global",
+      importance: 0.7,
+      timestamp: 1234567890,
+      metadata: "{}",
+    });
+
+    const updated = await store.update("data-pointer-openclaw-paths-20260527", {
+      text: "upgraded legacy memory",
+      metadata: "{\"memory_category\":\"cases\"}",
+    });
+
+    assert.equal(updated?.id, "data-pointer-openclaw-paths-20260527");
+    assert.equal(updated?.text, "upgraded legacy memory");
+
+    const byId = await store.getById("data-pointer-openclaw-paths-20260527");
+    assert.equal(byId?.text, "upgraded legacy memory");
+    assert.equal(byId?.metadata, "{\"memory_category\":\"cases\"}");
+  });
 });

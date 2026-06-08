@@ -875,16 +875,13 @@ export class MemoryStore {
     }
 
     return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
-      // Support both full UUID and short prefix (8+ hex chars), same as delete()
+      // Support full UUID, short hex prefixes, and exact legacy IDs imported
+      // from older stores (for example "data-pointer-...").
       const uuidRegex =
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       const prefixRegex = /^[0-9a-f]{8,}$/i;
       const isFullId = uuidRegex.test(id);
       const isPrefix = !isFullId && prefixRegex.test(id);
-
-      if (!isFullId && !isPrefix) {
-        throw new Error(`Invalid memory ID format: ${id}`);
-      }
 
       let rows: any[];
       if (isFullId) {
@@ -893,7 +890,7 @@ export class MemoryStore {
           .where(`id = '${safeId}'`)
           .limit(1)
           .toArray();
-      } else {
+      } else if (isPrefix) {
         // Prefix match
         const all = await this.table!.query()
           .select([
@@ -914,6 +911,12 @@ export class MemoryStore {
             `Ambiguous prefix "${id}" matches ${rows.length} memories. Use a longer prefix or full ID.`,
           );
         }
+      } else {
+        const safeId = escapeSqlLiteral(id);
+        rows = await this.table!.query()
+          .where(`id = '${safeId}'`)
+          .limit(1)
+          .toArray();
       }
 
       if (rows.length === 0) return null;
