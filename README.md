@@ -667,6 +667,20 @@ OAuth login flow:
 ## Advanced Topics
 
 <details>
+<summary><strong>Locking and concurrent writers</strong></summary>
+
+`memory-lancedb-pro` uses a cross-process file lock for LanceDB writes. This is
+enough for one gateway process, multiple agents through that gateway, and local
+processes that share the same database directory.
+
+Redis is not required for those deployments, and the current plugin does not
+automatically enable Redis locking. For multi-machine or multi-container
+writers, read [Lock Management](docs/lock-management.md) before sharing a
+LanceDB directory across processes.
+
+</details>
+
+<details>
 <summary><strong>If injected memories show up in replies</strong></summary>
 
 Sometimes the model may echo the injected `<relevant-memories>` block.

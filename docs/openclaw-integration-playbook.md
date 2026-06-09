@@ -134,6 +134,8 @@ Confirm:
 - the plugin registers a memory capability, not only legacy hooks/tools
 - the expected hooks are enabled
 - the gateway has been restarted after config changes
+- for multi-agent or multi-process write tests, the deployment matches the
+  [lock-management requirements](lock-management.md)
 
 If you use plugin session memory, `openclaw hooks list --json` should show the plugin hook:
 
