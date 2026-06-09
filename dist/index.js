@@ -1767,6 +1767,41 @@ export function isAgentOrSessionExcluded(agentId, sessionKey, patterns) {
     }
     return false;
 }
+const _channelPluginDiagnosticWarnings = new Set();
+function readRecord(value) {
+    return value && typeof value === "object" && !Array.isArray(value)
+        ? value
+        : undefined;
+}
+function isChannelEnabled(config, channelName) {
+    const channels = readRecord(config.channels);
+    const channelConfig = readRecord(channels?.[channelName]);
+    return channelConfig?.enabled === true;
+}
+function isPluginExplicitlyDisabled(config, pluginName) {
+    const plugins = readRecord(config.plugins);
+    const entries = readRecord(plugins?.entries);
+    const entry = readRecord(entries?.[pluginName]);
+    if (entry?.enabled === false)
+        return true;
+    const disabled = plugins?.disabled;
+    return Array.isArray(disabled) && disabled.includes(pluginName);
+}
+export function warnForDisabledChannelPlugin(openclawConfig, logger) {
+    const config = readRecord(openclawConfig);
+    if (!config)
+        return;
+    const affectedChannels = ["telegram"].filter((channelName) => isChannelEnabled(config, channelName) &&
+        isPluginExplicitlyDisabled(config, channelName));
+    for (const channelName of affectedChannels) {
+        if (_channelPluginDiagnosticWarnings.has(channelName))
+            continue;
+        _channelPluginDiagnosticWarnings.add(channelName);
+        logger.warn(`memory-lancedb-pro: ${channelName} channel config is enabled but the ${channelName} plugin is disabled; ` +
+            `OpenClaw will not start ${channelName} providers until the plugin is re-enabled. ` +
+            `Run "openclaw plugin enable ${channelName}" and restart the gateway.`);
+    }
+}
 const memoryLanceDBProPlugin = {
     id: "memory-lancedb-pro",
     name: "Memory (LanceDB Pro)",
@@ -1808,6 +1843,7 @@ const memoryLanceDBProPlugin = {
             throw err;
         }
         const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, scopeManager, migrator, smartExtractor, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
                 throw signal.reason ?? new Error("aborted");
@@ -4306,6 +4342,7 @@ export { getDefaultMdMirrorDir };
 export function resetRegistration() {
     _registeredApis = new WeakSet();
     _registeredApisMap.clear(); // dual-track: clear Map alongside WeakSet
+    _channelPluginDiagnosticWarnings.clear();
     _singletonState = null;
     _hookEventDedup.clear();
     getReflectionEmptyEventGuardMap().clear();

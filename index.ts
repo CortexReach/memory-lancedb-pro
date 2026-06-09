@@ -2332,6 +2332,53 @@ export function isAgentOrSessionExcluded(
   return false;
 }
 
+const _channelPluginDiagnosticWarnings = new Set<string>();
+
+function readRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function isChannelEnabled(config: Record<string, unknown>, channelName: string): boolean {
+  const channels = readRecord(config.channels);
+  const channelConfig = readRecord(channels?.[channelName]);
+  return channelConfig?.enabled === true;
+}
+
+function isPluginExplicitlyDisabled(config: Record<string, unknown>, pluginName: string): boolean {
+  const plugins = readRecord(config.plugins);
+  const entries = readRecord(plugins?.entries);
+  const entry = readRecord(entries?.[pluginName]);
+  if (entry?.enabled === false) return true;
+
+  const disabled = plugins?.disabled;
+  return Array.isArray(disabled) && disabled.includes(pluginName);
+}
+
+export function warnForDisabledChannelPlugin(
+  openclawConfig: unknown,
+  logger: Pick<OpenClawPluginApi["logger"], "warn">,
+): void {
+  const config = readRecord(openclawConfig);
+  if (!config) return;
+
+  const affectedChannels = ["telegram"].filter((channelName) =>
+    isChannelEnabled(config, channelName) &&
+    isPluginExplicitlyDisabled(config, channelName),
+  );
+
+  for (const channelName of affectedChannels) {
+    if (_channelPluginDiagnosticWarnings.has(channelName)) continue;
+    _channelPluginDiagnosticWarnings.add(channelName);
+    logger.warn(
+      `memory-lancedb-pro: ${channelName} channel config is enabled but the ${channelName} plugin is disabled; ` +
+      `OpenClaw will not start ${channelName} providers until the plugin is re-enabled. ` +
+      `Run "openclaw plugin enable ${channelName}" and restart the gateway.`,
+    );
+  }
+}
+
 const memoryLanceDBProPlugin = {
   id: "memory-lancedb-pro",
   name: "Memory (LanceDB Pro)",
@@ -2397,6 +2444,10 @@ const memoryLanceDBProPlugin = {
       autoCaptureRecentTexts,
     } = singleton;
 
+    warnForDisabledChannelPlugin(
+      (api as OpenClawPluginApi & { config?: unknown }).config,
+      api.logger,
+    );
 
     async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
       if (signal?.aborted) {
@@ -5385,6 +5436,7 @@ export { getDefaultMdMirrorDir };
 export function resetRegistration() {
   _registeredApis = new WeakSet<OpenClawPluginApi>();
   _registeredApisMap.clear();  // dual-track: clear Map alongside WeakSet
+  _channelPluginDiagnosticWarnings.clear();
   _singletonState = null;
   _hookEventDedup.clear();
   getReflectionEmptyEventGuardMap().clear();
