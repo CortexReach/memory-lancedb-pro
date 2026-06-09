@@ -5048,7 +5048,13 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       "plugins.entries.memory-lancedb-pro.config.embedding.",
     );
   }
-  const cfg = value as Record<string, unknown>;
+  const initialCfg = value as Record<string, unknown>;
+  const cfg = !initialCfg.embedding &&
+    initialCfg.config &&
+    typeof initialCfg.config === "object" &&
+    !Array.isArray(initialCfg.config)
+    ? initialCfg.config as Record<string, unknown>
+    : initialCfg;
 
   const embedding = cfg.embedding as Record<string, unknown> | undefined;
   if (!embedding) {

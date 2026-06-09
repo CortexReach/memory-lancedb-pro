@@ -4004,7 +4004,13 @@ export function parsePluginConfig(value) {
         throw new Error("memory-lancedb-pro: plugin config must be an object with a top-level embedding block at " +
             "plugins.entries.memory-lancedb-pro.config.embedding.");
     }
-    const cfg = value;
+    const initialCfg = value;
+    const cfg = !initialCfg.embedding &&
+        initialCfg.config &&
+        typeof initialCfg.config === "object" &&
+        !Array.isArray(initialCfg.config)
+        ? initialCfg.config
+        : initialCfg;
     const embedding = cfg.embedding;
     if (!embedding) {
         throw new Error("memory-lancedb-pro: missing top-level config.embedding block. " +
