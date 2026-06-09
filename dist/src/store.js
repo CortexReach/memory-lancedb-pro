@@ -3,8 +3,8 @@
  */
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync, statSync, unlinkSync, rmdirSync, writeFileSync, } from "node:fs";
-import { access as accessAsync, lstat as lstatAsync, mkdir as mkdirAsync, realpath as realpathAsync, } from "node:fs/promises";
+import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync, unlinkSync, writeFileSync, } from "node:fs";
+import { access as accessAsync, lstat as lstatAsync, mkdir as mkdirAsync, realpath as realpathAsync, rmdir as rmdirAsync, stat as statAsync, unlink as unlinkAsync, writeFile as writeFileAsync, } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
@@ -391,17 +391,19 @@ export class MemoryStore {
         const lockPath = join(this.config.dbPath, ".memory-write.lock");
         const lockArtifactPath = `${lockPath}.lock`;
         const ensureLockTargetExists = async () => {
-            if (!existsSync(lockPath)) {
-                try {
-                    mkdirSync(dirname(lockPath), { recursive: true });
-                }
-                catch { }
-                try {
-                    const { writeFileSync } = await import("node:fs");
-                    writeFileSync(lockPath, "", { flag: "wx" });
-                }
-                catch { }
+            try {
+                await accessAsync(lockPath);
+                return;
             }
+            catch { }
+            try {
+                await mkdirAsync(dirname(lockPath), { recursive: true });
+            }
+            catch { }
+            try {
+                await writeFileAsync(lockPath, "", { flag: "wx" });
+            }
+            catch { }
         };
         await ensureLockTargetExists();
         // 【修復 #415】調整 retries：max wait 從 ~3100ms → ~151秒
@@ -414,26 +416,24 @@ export class MemoryStore {
         // Proactive cleanup of stale proper-lockfile artifacts（from PR #626）.
         // proper-lockfile locks the target by creating `${target}.lock`; the
         // target file itself is expected to persist and must not be treated stale.
-        if (existsSync(lockArtifactPath)) {
-            try {
-                const stat = statSync(lockArtifactPath);
-                const ageMs = Date.now() - stat.mtimeMs;
-                const staleThresholdMs = 5 * 60 * 1000;
-                if (ageMs > staleThresholdMs) {
-                    try {
-                        if (stat.isDirectory()) {
-                            rmdirSync(lockArtifactPath);
-                        }
-                        else {
-                            unlinkSync(lockArtifactPath);
-                        }
-                        console.warn(`[memory-lancedb-pro] cleared stale lock artifact: ${lockArtifactPath} ageMs=${ageMs}`);
+        try {
+            const stat = await statAsync(lockArtifactPath);
+            const ageMs = Date.now() - stat.mtimeMs;
+            const staleThresholdMs = 5 * 60 * 1000;
+            if (ageMs > staleThresholdMs) {
+                try {
+                    if (stat.isDirectory()) {
+                        await rmdirAsync(lockArtifactPath);
                     }
-                    catch { }
+                    else {
+                        await unlinkAsync(lockArtifactPath);
+                    }
+                    console.warn(`[memory-lancedb-pro] cleared stale lock artifact: ${lockArtifactPath} ageMs=${ageMs}`);
                 }
+                catch { }
             }
-            catch { }
         }
+        catch { }
         const acquireLock = async () => lockfile.lock(lockPath, {
             // 【修復 #670】realpath:false — 避免 proactive cleanup 刪除 stale lock artifact 後，
             // proper-lockfile v4 的 realpath() 在已刪除檔案上被呼叫，導致 ENOENT。

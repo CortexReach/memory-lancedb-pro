@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, existsSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import jitiFactory from "jiti";
@@ -137,6 +137,35 @@ describe("Cross-process file lock", () => {
       assert.ok(
         !warnings.some((message) => message.includes("cleared stale lock")),
         "old lock target file should not emit stale-lock cleanup warnings",
+      );
+    } finally {
+      console.warn = originalWarn;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans stale proper-lockfile artifact without deleting lock target", async () => {
+    const { store, dir } = makeStore();
+    const lockTarget = join(dir, ".memory-write.lock");
+    const lockArtifact = `${lockTarget}.lock`;
+    const oldTime = new Date(Date.now() - 10 * 60 * 1000);
+    const warnings = [];
+    const originalWarn = console.warn;
+
+    try {
+      mkdirSync(lockArtifact, { recursive: true });
+      utimesSync(lockArtifact, oldTime, oldTime);
+      console.warn = (...args) => {
+        warnings.push(args.join(" "));
+      };
+
+      await store.store(makeEntry(1));
+
+      assert.ok(existsSync(lockTarget), "persistent lock target file should remain");
+      assert.strictEqual(existsSync(lockArtifact), false, "stale lock artifact should be removed");
+      assert.ok(
+        warnings.some((message) => message.includes("cleared stale lock artifact")),
+        "stale lock artifact cleanup should emit a warning",
       );
     } finally {
       console.warn = originalWarn;
