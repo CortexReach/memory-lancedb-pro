@@ -441,7 +441,7 @@ export class SmartExtractor {
     }
 
     if (createEntries.length > 0) {
-      await this.store.bulkStore(createEntries);
+      await this.bulkStoreAndValidate(createEntries);
     }
 
     return stats;
@@ -450,6 +450,95 @@ export class SmartExtractor {
   // --------------------------------------------------------------------------
   // Embedding Noise Pre-Filter
   // --------------------------------------------------------------------------
+
+  private async bulkStoreAndValidate(entries: StoreEntry[]): Promise<void> {
+    const beforeCount = await this.readStoreCount("before bulkStore");
+    const storedEntries = await this.store.bulkStore(entries);
+
+    if (!Array.isArray(storedEntries)) {
+      this.debugLog(
+        "memory-pro: smart-extractor: skipping bulkStore persistence validation: bulkStore() did not return stored entries",
+      );
+      return;
+    }
+
+    if (storedEntries.length !== entries.length) {
+      this.log(
+        `memory-pro: smart-extractor: bulkStore validation warning: queued ${entries.length} create(s) but bulkStore accepted ${storedEntries.length}`,
+      );
+    }
+
+    if (storedEntries.length === 0) {
+      return;
+    }
+
+    const afterCount = await this.readStoreCount("after bulkStore");
+    if (beforeCount === null || afterCount === null) {
+      return;
+    }
+
+    const observedDelta = afterCount - beforeCount;
+    if (observedDelta >= storedEntries.length) {
+      return;
+    }
+
+    const missingIds = await this.findMissingStoredIds(storedEntries);
+    if (missingIds.length === 0) {
+      this.debugLog(
+        `memory-pro: smart-extractor: bulkStore row-count delta ${observedDelta}/${storedEntries.length} but all returned IDs are readable; likely concurrent delete/compaction`,
+      );
+      return;
+    }
+
+    const sample = missingIds.slice(0, 3).map((id) => id.slice(0, 8)).join(", ");
+    this.log(
+      `memory-pro: smart-extractor: bulkStore validation warning: expected row delta >= ${storedEntries.length}, observed ${observedDelta} (before=${beforeCount}, after=${afterCount}); missing returned IDs=${missingIds.length}${sample ? ` sample=${sample}` : ""}`,
+    );
+  }
+
+  private async readStoreCount(context: string): Promise<number | null> {
+    const count = (this.store as unknown as { count?: () => Promise<number> }).count;
+    if (typeof count !== "function") {
+      this.debugLog(
+        `memory-pro: smart-extractor: skipping bulkStore row-count validation (${context}): count() unavailable`,
+      );
+      return null;
+    }
+
+    try {
+      const value = await count.call(this.store);
+      if (Number.isFinite(value)) {
+        return value;
+      }
+      this.debugLog(
+        `memory-pro: smart-extractor: skipping bulkStore row-count validation (${context}): non-finite count ${String(value)}`,
+      );
+    } catch (err) {
+      this.debugLog(
+        `memory-pro: smart-extractor: skipping bulkStore row-count validation (${context}): ${String(err)}`,
+      );
+    }
+    return null;
+  }
+
+  private async findMissingStoredIds(entries: import("./store.js").MemoryEntry[]): Promise<string[]> {
+    const hasId = (this.store as unknown as { hasId?: (id: string) => Promise<boolean> }).hasId;
+    if (typeof hasId !== "function") {
+      return entries.map((entry) => entry.id);
+    }
+
+    const missing: string[] = [];
+    for (const entry of entries) {
+      try {
+        if (!await hasId.call(this.store, entry.id)) {
+          missing.push(entry.id);
+        }
+      } catch {
+        missing.push(entry.id);
+      }
+    }
+    return missing;
+  }
 
   /**
    * Filter out texts that match cheap static noise patterns first, then
