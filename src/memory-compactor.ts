@@ -262,6 +262,32 @@ export interface CompactorLogger {
   warn(msg: string): void;
 }
 
+const MAX_CLUSTER_COMPACTION_CONCURRENCY = 3;
+const MAX_CLUSTER_DELETE_CONCURRENCY = 8;
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex++;
+        results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+      }
+    }),
+  );
+
+  return results;
+}
+
 // ============================================================================
 // Main runner
 // ============================================================================
@@ -322,38 +348,63 @@ export async function runCompaction(
     };
   }
 
-  let memoriesDeleted = 0;
-  let memoriesCreated = 0;
+  const outcomes = await mapWithConcurrency(
+    plans,
+    MAX_CLUSTER_COMPACTION_CONCURRENCY,
+    async (plan) => {
+      const members = plan.memberIndices.map((i) => valid[i]);
 
-  for (const plan of plans) {
-    const members = plan.memberIndices.map((i) => valid[i]);
+      try {
+        // Embed the merged text
+        const vector = await embedder.embedPassage(plan.merged.text);
 
-    try {
-      // Embed the merged text
-      const vector = await embedder.embedPassage(plan.merged.text);
+        // Store merged entry
+        await store.store({
+          text: plan.merged.text,
+          vector,
+          importance: plan.merged.importance,
+          category: plan.merged.category,
+          scope: plan.merged.scope,
+          metadata: plan.merged.metadata,
+        });
 
-      // Store merged entry
-      await store.store({
-        text: plan.merged.text,
-        vector,
-        importance: plan.merged.importance,
-        category: plan.merged.category,
-        scope: plan.merged.scope,
-        metadata: plan.merged.metadata,
-      });
-      memoriesCreated++;
+        // Delete source entries
+        const deleteResults = await mapWithConcurrency(
+          members,
+          MAX_CLUSTER_DELETE_CONCURRENCY,
+          async (m) => {
+            try {
+              return (await store.delete(m.id)) ? 1 : 0;
+            } catch (err) {
+              logger?.warn(
+                `memory-compactor: failed to delete source memory ${m.id}: ${String(err)}`,
+              );
+              return 0;
+            }
+          },
+        );
 
-      // Delete source entries
-      for (const m of members) {
-        const deleted = await store.delete(m.id);
-        if (deleted) memoriesDeleted++;
+        return {
+          memoriesDeleted: deleteResults.reduce((sum, deleted) => sum + deleted, 0),
+          memoriesCreated: 1,
+        };
+      } catch (err) {
+        logger?.warn(
+          `memory-compactor: failed to merge cluster of ${members.length}: ${String(err)}`,
+        );
+        return { memoriesDeleted: 0, memoriesCreated: 0 };
       }
-    } catch (err) {
-      logger?.warn(
-        `memory-compactor: failed to merge cluster of ${members.length}: ${String(err)}`,
-      );
-    }
-  }
+    },
+  );
+
+  const memoriesDeleted = outcomes.reduce(
+    (sum, outcome) => sum + outcome.memoriesDeleted,
+    0,
+  );
+  const memoriesCreated = outcomes.reduce(
+    (sum, outcome) => sum + outcome.memoriesCreated,
+    0,
+  );
 
   logger?.info(
     `memory-compactor: scanned=${valid.length} clusters=${plans.length} ` +

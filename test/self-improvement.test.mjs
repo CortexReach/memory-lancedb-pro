@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,7 +19,11 @@ const {
   registerSelfImprovementExtractSkillTool,
   registerSelfImprovementReviewTool,
 } = jiti("../src/tools.ts");
-const { appendSelfImprovementEntry, countSelfImprovementEntries } = jiti("../src/self-improvement-files.ts");
+const {
+  appendSelfImprovementEntry,
+  countSelfImprovementEntries,
+  ensureSelfImprovementLearningFiles,
+} = jiti("../src/self-improvement-files.ts");
 const {
   extractReflectionLearningGovernanceCandidates,
   extractInjectableReflectionMappedMemories,
@@ -68,6 +72,25 @@ describe("self-improvement", () => {
 
     afterEach(() => {
       rmSync(workspaceDir, { recursive: true, force: true });
+    });
+
+    it("ensures learning files idempotently under concurrent calls", async () => {
+      const learningsDir = path.join(workspaceDir, ".learnings");
+      mkdirSync(learningsDir, { recursive: true });
+      writeFileSync(path.join(learningsDir, "LEARNINGS.md"), "# Custom Learnings\n", "utf-8");
+      writeFileSync(path.join(learningsDir, "ERRORS.md"), "\n", "utf-8");
+
+      await Promise.all([
+        ensureSelfImprovementLearningFiles(workspaceDir),
+        ensureSelfImprovementLearningFiles(workspaceDir),
+        ensureSelfImprovementLearningFiles(workspaceDir),
+      ]);
+
+      const learningsBody = readFileSync(path.join(learningsDir, "LEARNINGS.md"), "utf-8");
+      const errorsBody = readFileSync(path.join(learningsDir, "ERRORS.md"), "utf-8");
+      assert.equal(learningsBody, "# Custom Learnings\n");
+      assert.match(errorsBody, /^# Errors/);
+      assert.match(errorsBody, /ERR-YYYYMMDD-XXX/);
     });
 
     it("extracts mapped reflection sections into preference/fact/decision memories", async () => {
