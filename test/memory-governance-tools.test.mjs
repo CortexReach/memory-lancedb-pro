@@ -24,6 +24,101 @@ function createToolSet(context) {
 }
 
 describe("memory governance tools", () => {
+  it("fails soft for inaccessible read-only recall scopes", async () => {
+    const recallScopeFilters = [];
+    const patchCalls = [];
+    const context = {
+      agentId: "main",
+      workspaceDir: "/tmp",
+      mdMirror: null,
+      scopeManager: {
+        getAccessibleScopes: (agentId) => ["global", `agent:${agentId}`, `reflection:agent:${agentId}`],
+        getScopeFilter: (agentId) => ["global", `agent:${agentId}`, `reflection:agent:${agentId}`],
+        isAccessible: (scope, agentId) => ["global", `agent:${agentId}`, `reflection:agent:${agentId}`].includes(scope),
+        getDefaultScope: (agentId) => `agent:${agentId}`,
+      },
+      retriever: {
+        async retrieve({ scopeFilter }) {
+          recallScopeFilters.push(scopeFilter);
+          return [{
+            entry: {
+              id: "recall-memory-1",
+              text: "coffee preference",
+              category: "preference",
+              scope: "agent:main",
+              importance: 0.7,
+              timestamp: Date.now(),
+              metadata: "{}",
+            },
+            score: 0.91,
+            sources: { vector: { score: 0.91, rank: 1 } },
+          }];
+        },
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+      },
+      store: {
+        async count() {
+          return 1;
+        },
+        async patchMetadata(id, patch, scopeFilter) {
+          patchCalls.push({ id, patch, scopeFilter });
+          return null;
+        },
+      },
+      embedder: { async embedPassage() { return [0.1, 0.2, 0.3]; } },
+    };
+
+    const tools = createToolSet(context);
+    const recall = tools.get("memory_recall");
+
+    const res = await recall.execute(null, {
+      query: "coffee",
+      scope: "current_conversation",
+    });
+
+    const expectedScopes = ["global", "agent:main", "reflection:agent:main"];
+    assert.deepEqual(recallScopeFilters[0], expectedScopes);
+    assert.match(res.content[0].text, /Ignored inaccessible scope "current_conversation"/);
+    assert.equal(res.details.ignoredScope, "current_conversation");
+    assert.deepEqual(res.details.accessibleScopes, expectedScopes);
+    assert.equal(res.details.count, 1);
+    assert.deepEqual(patchCalls[0].scopeFilter, expectedScopes);
+  });
+
+  it("keeps inaccessible write scopes hard-denied", async () => {
+    const context = {
+      agentId: "main",
+      workspaceDir: "/tmp",
+      mdMirror: null,
+      scopeManager: {
+        getAccessibleScopes: (agentId) => ["global", `agent:${agentId}`],
+        getScopeFilter: (agentId) => ["global", `agent:${agentId}`],
+        isAccessible: (scope, agentId) => ["global", `agent:${agentId}`].includes(scope),
+        getDefaultScope: (agentId) => `agent:${agentId}`,
+      },
+      retriever: {
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+      },
+      store: {},
+      embedder: { async embedPassage() { return [0.1, 0.2, 0.3]; } },
+    };
+
+    const tools = createToolSet(context);
+    const store = tools.get("memory_store");
+
+    const res = await store.execute(null, {
+      text: "remember this",
+      scope: "current_conversation",
+    });
+
+    assert.equal(res.details.error, "scope_access_denied");
+    assert.equal(res.details.requestedScope, "current_conversation");
+  });
+
   it("defaults stats and list to the caller's accessible scopes", async () => {
     const statsScopeFilters = [];
     const listScopeFilters = [];

@@ -159,17 +159,22 @@ function resolveReadableToolScopeFilter(scopeManager, agentId, scope) {
         if (scopeManager.isAccessible(scope, agentId)) {
             return { scopeFilter: [scope] };
         }
+        const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
         return {
-            error: {
-                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
-                details: {
-                    error: "scope_access_denied",
-                    requestedScope: scope,
-                },
-            },
+            scopeFilter: resolveScopeFilter(scopeManager, agentId),
+            ignoredScope: scope,
+            accessibleScopes,
         };
     }
     return { scopeFilter: resolveScopeFilter(scopeManager, agentId) };
+}
+function formatIgnoredScopeNotice(resolvedScopes) {
+    if (!resolvedScopes.ignoredScope)
+        return undefined;
+    const scopes = resolvedScopes.accessibleScopes?.length
+        ? resolvedScopes.accessibleScopes.join(", ")
+        : "(none)";
+    return `Ignored inaccessible scope "${resolvedScopes.ignoredScope}" and searched accessible scopes instead: ${scopes}.`;
 }
 async function resolveMemoryId(context, memoryRef, scopeFilter) {
     const trimmed = memoryRef.trim();
@@ -494,24 +499,9 @@ function createMemoryRecallTool(runtimeContext, options) {
                     : clampInt(limit, 1, 6);
                 const safeCharsPerItem = clampInt(maxCharsPerItem, 60, 1000);
                 const agentId = runtimeContext.agentId;
-                // Determine accessible scopes
-                let scopeFilter = resolveScopeFilter(runtimeContext.scopeManager, agentId);
-                if (scope) {
-                    if (runtimeContext.scopeManager.isAccessible(scope, agentId)) {
-                        scopeFilter = [scope];
-                    }
-                    else {
-                        return {
-                            content: [
-                                { type: "text", text: `Access denied to scope: ${scope}` },
-                            ],
-                            details: {
-                                error: "scope_access_denied",
-                                requestedScope: scope,
-                            },
-                        };
-                    }
-                }
+                const resolvedScopes = resolveReadableToolScopeFilter(runtimeContext.scopeManager, agentId, scope);
+                const { scopeFilter } = resolvedScopes;
+                const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
                 const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry(runtimeContext.retriever, {
                     query,
                     limit: safeLimit,
@@ -521,8 +511,14 @@ function createMemoryRecallTool(runtimeContext, options) {
                 }, () => runtimeContext.store.count()), runtimeContext.workspaceBoundary);
                 if (results.length === 0) {
                     return {
-                        content: [{ type: "text", text: "No relevant memories found." }],
-                        details: { count: 0, query, scopes: scopeFilter },
+                        content: [{ type: "text", text: [ignoredScopeNotice, "No relevant memories found."].filter(Boolean).join("\n") }],
+                        details: {
+                            count: 0,
+                            query,
+                            scopes: scopeFilter,
+                            ignoredScope: resolvedScopes.ignoredScope,
+                            accessibleScopes: resolvedScopes.accessibleScopes,
+                        },
                     };
                 }
                 const now = Date.now();
@@ -568,7 +564,10 @@ function createMemoryRecallTool(runtimeContext, options) {
                     content: [
                         {
                             type: "text",
-                            text: `<relevant-memories>\n<mode:${includeFullText ? "full" : "summary"}>\nFound ${results.length} memories:\n\n${text}\n</relevant-memories>`,
+                            text: [
+                                ignoredScopeNotice,
+                                `<relevant-memories>\n<mode:${includeFullText ? "full" : "summary"}>\nFound ${results.length} memories:\n\n${text}\n</relevant-memories>`,
+                            ].filter(Boolean).join("\n"),
                         },
                     ],
                     details: {
@@ -576,6 +575,8 @@ function createMemoryRecallTool(runtimeContext, options) {
                         memories: serializedMemories,
                         query,
                         scopes: scopeFilter,
+                        ignoredScope: resolvedScopes.ignoredScope,
+                        accessibleScopes: resolvedScopes.accessibleScopes,
                         retrievalMode: runtimeContext.retriever.getConfig().mode,
                         recallMode: includeFullText ? "full" : "summary",
                     },
@@ -1301,9 +1302,8 @@ export function registerMemoryStatsTool(api, context) {
                 try {
                     const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
                     const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
-                    if ("error" in resolvedScopes)
-                        return resolvedScopes.error;
                     const { scopeFilter } = resolvedScopes;
+                    const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
                     const stats = await context.store.stats(scopeFilter);
                     const scopeManagerStats = context.scopeManager.getStats();
                     const retrievalConfig = context.retriever.getConfig();
@@ -1333,13 +1333,15 @@ export function registerMemoryStatsTool(api, context) {
                             }
                         }
                     }
-                    const text = textLines.join("\n");
+                    const text = [ignoredScopeNotice, textLines.join("\n")].filter(Boolean).join("\n");
                     return {
                         content: [{ type: "text", text }],
                         details: {
                             stats,
                             scopeManagerStats,
                             scopes: scopeFilter,
+                            ignoredScope: resolvedScopes.ignoredScope,
+                            accessibleScopes: resolvedScopes.accessibleScopes,
                             retrievalConfig: {
                                 ...retrievalConfig,
                                 rerankApiKey: retrievalConfig.rerankApiKey ? "***" : undefined,
@@ -1380,22 +1382,14 @@ export function registerMemoryDebugTool(api, context) {
                 const { query, limit = 5, scope } = params;
                 try {
                     const safeLimit = clampInt(limit, 1, 20);
-                    let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-                    if (scope) {
-                        if (context.scopeManager.isAccessible(scope, agentId)) {
-                            scopeFilter = [scope];
-                        }
-                        else {
-                            return {
-                                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
-                                details: { error: "scope_access_denied", requestedScope: scope },
-                            };
-                        }
-                    }
+                    const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
+                    const { scopeFilter } = resolvedScopes;
+                    const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
                     const { results, trace } = await context.retriever.retrieveWithTrace({
                         query, limit: safeLimit, scopeFilter, source: "manual",
                     });
                     const traceLines = [
+                        ...(ignoredScopeNotice ? [ignoredScopeNotice, ""] : []),
                         `Retrieval Debug Trace:`,
                         `  Mode: ${trace.mode}`,
                         `  Total: ${trace.totalMs}ms`,
@@ -1422,7 +1416,13 @@ export function registerMemoryDebugTool(api, context) {
                         traceLines.push(``, `No results survived the pipeline.`);
                         return {
                             content: [{ type: "text", text: traceLines.join("\n") }],
-                            details: { count: 0, query, trace },
+                            details: {
+                                count: 0,
+                                query,
+                                trace,
+                                ignoredScope: resolvedScopes.ignoredScope,
+                                accessibleScopes: resolvedScopes.accessibleScopes,
+                            },
                         };
                     }
                     const resultLines = results.map((r, i) => {
@@ -1444,6 +1444,8 @@ export function registerMemoryDebugTool(api, context) {
                             memories: sanitizeMemoryForSerialization(results),
                             query,
                             trace,
+                            ignoredScope: resolvedScopes.ignoredScope,
+                            accessibleScopes: resolvedScopes.accessibleScopes,
                         },
                     };
                 }
@@ -1484,18 +1486,19 @@ export function registerMemoryListTool(api, context) {
                     const safeOffset = clampInt(offset, 0, 1000);
                     const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
                     const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
-                    if ("error" in resolvedScopes)
-                        return resolvedScopes.error;
                     const { scopeFilter } = resolvedScopes;
+                    const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
                     const entries = await context.store.list(scopeFilter, category, safeLimit, safeOffset);
                     if (entries.length === 0) {
                         return {
-                            content: [{ type: "text", text: "No memories found." }],
+                            content: [{ type: "text", text: [ignoredScopeNotice, "No memories found."].filter(Boolean).join("\n") }],
                             details: {
                                 count: 0,
                                 filters: {
                                     scope,
                                     scopes: scopeFilter,
+                                    ignoredScope: resolvedScopes.ignoredScope,
+                                    accessibleScopes: resolvedScopes.accessibleScopes,
                                     category,
                                     limit: safeLimit,
                                     offset: safeOffset,
@@ -1516,7 +1519,7 @@ export function registerMemoryListTool(api, context) {
                         content: [
                             {
                                 type: "text",
-                                text: `Recent memories (showing ${entries.length}):\n\n${text}`,
+                                text: [ignoredScopeNotice, `Recent memories (showing ${entries.length}):\n\n${text}`].filter(Boolean).join("\n"),
                             },
                         ],
                         details: {
@@ -1533,6 +1536,8 @@ export function registerMemoryListTool(api, context) {
                             filters: {
                                 scope,
                                 scopes: scopeFilter,
+                                ignoredScope: resolvedScopes.ignoredScope,
+                                accessibleScopes: resolvedScopes.accessibleScopes,
                                 category,
                                 limit: safeLimit,
                                 offset: safeOffset,
@@ -1972,16 +1977,9 @@ export function registerMemoryExplainRankTool(api, context) {
                 const { query, limit = 5, scope } = params;
                 const safeLimit = clampInt(limit, 1, 20);
                 const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
-                let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-                if (scope) {
-                    if (!context.scopeManager.isAccessible(scope, agentId)) {
-                        return {
-                            content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
-                            details: { error: "scope_access_denied", requestedScope: scope },
-                        };
-                    }
-                    scopeFilter = [scope];
-                }
+                const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
+                const { scopeFilter } = resolvedScopes;
+                const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
                 const results = await retrieveWithRetry(runtimeContext.retriever, {
                     query,
                     limit: safeLimit,
@@ -1990,8 +1988,14 @@ export function registerMemoryExplainRankTool(api, context) {
                 }, () => runtimeContext.store.count());
                 if (results.length === 0) {
                     return {
-                        content: [{ type: "text", text: "No relevant memories found." }],
-                        details: { action: "empty", query, scopeFilter },
+                        content: [{ type: "text", text: [ignoredScopeNotice, "No relevant memories found."].filter(Boolean).join("\n") }],
+                        details: {
+                            action: "empty",
+                            query,
+                            scopeFilter,
+                            ignoredScope: resolvedScopes.ignoredScope,
+                            accessibleScopes: resolvedScopes.accessibleScopes,
+                        },
                     };
                 }
                 const lines = results.map((r, idx) => {
@@ -2011,11 +2015,13 @@ export function registerMemoryExplainRankTool(api, context) {
                     ].join("\n");
                 });
                 return {
-                    content: [{ type: "text", text: lines.join("\n") }],
+                    content: [{ type: "text", text: [ignoredScopeNotice, lines.join("\n")].filter(Boolean).join("\n") }],
                     details: {
                         action: "explain_rank",
                         query,
                         count: results.length,
+                        ignoredScope: resolvedScopes.ignoredScope,
+                        accessibleScopes: resolvedScopes.accessibleScopes,
                         results: sanitizeMemoryForSerialization(results),
                     },
                 };
