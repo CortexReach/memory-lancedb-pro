@@ -11,21 +11,14 @@ import { stripEnvelopeMetadata } from "./smart-extractor.js";
 import { isSystemBypassId, resolveScopeFilter, parseAgentIdFromSessionKey } from "./scopes.js";
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, } from "./smart-metadata.js";
 import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
-import { TEMPORAL_VERSIONED_CATEGORIES } from "./memory-categories.js";
+import { TEMPORAL_VERSIONED_CATEGORIES, TOOL_MEMORY_CATEGORIES, } from "./memory-categories.js";
 import { appendSelfImprovementEntry, countSelfImprovementEntries, DEFAULT_SELF_IMPROVEMENT_MAX_ENTRIES, ensureSelfImprovementLearningFiles, } from "./self-improvement-files.js";
 import { getDisplayCategoryTag, parseReflectionMetadata } from "./reflection-metadata.js";
 import { filterUserMdExclusiveRecallResults, isUserMdExclusiveMemory, } from "./workspace-boundary.js";
 // ============================================================================
 // Types
 // ============================================================================
-export const MEMORY_CATEGORIES = [
-    "preference",
-    "fact",
-    "decision",
-    "entity",
-    "reflection",
-    "other",
-];
+export const MEMORY_CATEGORIES = TOOL_MEMORY_CATEGORIES;
 function stringEnum(values) {
     return Type.Unsafe({
         type: "string",

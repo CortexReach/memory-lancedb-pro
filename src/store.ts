@@ -27,6 +27,7 @@ import {
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveCategoryFilterCandidates } from "./memory-categories.js";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 
 // ============================================================================
@@ -1733,7 +1734,10 @@ export class MemoryStore {
     }
 
     if (category) {
-      conditions.push(`category = '${escapeSqlLiteral(category)}'`);
+      const categoryConditions = resolveCategoryFilterCandidates(category)
+        .map((candidate) => `category = '${escapeSqlLiteral(candidate)}'`)
+        .join(" OR ");
+      conditions.push(`(${categoryConditions})`);
     }
 
     const applyConditions = (query: any) =>

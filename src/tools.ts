@@ -22,7 +22,10 @@ import {
   stringifySmartMetadata,
 } from "./smart-metadata.js";
 import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
-import { TEMPORAL_VERSIONED_CATEGORIES } from "./memory-categories.js";
+import {
+  TEMPORAL_VERSIONED_CATEGORIES,
+  TOOL_MEMORY_CATEGORIES,
+} from "./memory-categories.js";
 import {
   appendSelfImprovementEntry,
   countSelfImprovementEntries,
@@ -41,14 +44,7 @@ import {
 // Types
 // ============================================================================
 
-export const MEMORY_CATEGORIES = [
-  "preference",
-  "fact",
-  "decision",
-  "entity",
-  "reflection",
-  "other",
-] as const;
+export const MEMORY_CATEGORIES = TOOL_MEMORY_CATEGORIES;
 
 function stringEnum<T extends readonly [string, ...string[]]>(values: T) {
   return Type.Unsafe<T[number]>({

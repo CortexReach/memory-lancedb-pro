@@ -7,6 +7,7 @@ import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync, 
 import { access as accessAsync, lstat as lstatAsync, mkdir as mkdirAsync, realpath as realpathAsync, rmdir as rmdirAsync, stat as statAsync, unlink as unlinkAsync, writeFile as writeFileAsync, } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveCategoryFilterCandidates } from "./memory-categories.js";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 // ============================================================================
 // LanceDB Dynamic Import
@@ -1433,7 +1434,10 @@ export class MemoryStore {
             conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
         }
         if (category) {
-            conditions.push(`category = '${escapeSqlLiteral(category)}'`);
+            const categoryConditions = resolveCategoryFilterCandidates(category)
+                .map((candidate) => `category = '${escapeSqlLiteral(candidate)}'`)
+                .join(" OR ");
+            conditions.push(`(${categoryConditions})`);
         }
         const applyConditions = (query) => conditions.length > 0 ? query.where(conditions.join(" AND ")) : query;
         // Fetch all matching rows (no pre-limit) so app-layer sort is correct across full dataset

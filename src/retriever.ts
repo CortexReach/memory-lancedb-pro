@@ -20,6 +20,7 @@ import {
   parseSmartMetadata,
   toLifecycleMemory,
 } from "./smart-metadata.js";
+import { matchesMemoryCategoryFilter } from "./memory-categories.js";
 import { TraceCollector, type RetrievalTrace } from "./retrieval-trace.js";
 import { RetrievalStatsCollector } from "./retrieval-stats.js";
 
@@ -767,7 +768,7 @@ export class MemoryRetriever {
       );
 
       const filtered = category
-        ? results.filter((r) => r.entry.category === category)
+        ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
         : results;
 
       // Filter expired memories early — before scoring — so they don't
@@ -850,7 +851,7 @@ export class MemoryRetriever {
       { excludeInactive: true },
     );
     const categoryFiltered = category
-      ? bm25Results.filter((r) => r.entry.category === category)
+      ? bm25Results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
       : bm25Results;
     const mustContainFiltered = categoryFiltered.filter((r) => {
       const textLower = r.entry.text.toLowerCase();
@@ -1141,7 +1142,7 @@ export class MemoryRetriever {
 
     // Filter by category if specified
     const filtered = category
-      ? results.filter((r) => r.entry.category === category)
+      ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
       : results;
 
     return filtered.map((result, index) => ({
@@ -1160,7 +1161,7 @@ export class MemoryRetriever {
 
     // Filter by category if specified
     const filtered = category
-      ? results.filter((r) => r.entry.category === category)
+      ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
       : results;
 
     return filtered.map((result, index) => ({

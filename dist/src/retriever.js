@@ -6,6 +6,7 @@ import { computeEffectiveHalfLife, parseAccessMetadata, } from "./access-tracker
 import { filterNoise } from "./noise-filter.js";
 import { expandQuery } from "./query-expander.js";
 import { getDecayableFromEntry, isMemoryExpired, parseSmartMetadata, toLifecycleMemory, } from "./smart-metadata.js";
+import { matchesMemoryCategoryFilter } from "./memory-categories.js";
 import { TraceCollector } from "./retrieval-trace.js";
 // ============================================================================
 // Default Configuration
@@ -461,7 +462,7 @@ export class MemoryRetriever {
             failureStage = "vector.vectorSearch";
             const results = await this.store.vectorSearch(queryVector, candidatePoolSize, this.config.minScore, scopeFilter, { excludeInactive: true });
             const filtered = category
-                ? results.filter((r) => r.entry.category === category)
+                ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
                 : results;
             // Filter expired memories early — before scoring — so they don't
             // occupy candidate slots that should go to live memories.
@@ -529,7 +530,7 @@ export class MemoryRetriever {
         trace?.startStage("bm25_search", []);
         const bm25Results = await this.store.bm25Search(query, candidatePoolSize, scopeFilter, { excludeInactive: true });
         const categoryFiltered = category
-            ? bm25Results.filter((r) => r.entry.category === category)
+            ? bm25Results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
             : bm25Results;
         const mustContainFiltered = categoryFiltered.filter((r) => {
             const textLower = r.entry.text.toLowerCase();
@@ -769,7 +770,7 @@ export class MemoryRetriever {
         const results = await this.store.vectorSearch(queryVector, limit, 0.1, scopeFilter, { excludeInactive: true });
         // Filter by category if specified
         const filtered = category
-            ? results.filter((r) => r.entry.category === category)
+            ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
             : results;
         return filtered.map((result, index) => ({
             ...result,
@@ -780,7 +781,7 @@ export class MemoryRetriever {
         const results = await this.store.bm25Search(query, limit, scopeFilter, { excludeInactive: true });
         // Filter by category if specified
         const filtered = category
-            ? results.filter((r) => r.entry.category === category)
+            ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
             : results;
         return filtered.map((result, index) => ({
             ...result,
