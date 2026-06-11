@@ -238,6 +238,45 @@ For session transcript coverage, verify a recent `~/.openclaw/agents/<agentId>/s
 
 For dreaming coverage, verify that `memory/dreaming/*.md` appears as a `dream-report` public artifact and that `memory/.dreams/events.jsonl` appears as an `event-log` public artifact when present.
 
+### Public X/Twitter source capture
+
+Use this optional recipe when an OpenClaw agent gathers public X/Twitter context through TweetClaw and you want a reviewed source summary to become searchable memory.
+
+Allowed source actions:
+
+- search public tweets or replies
+- look up a public user profile
+- export public follower or media metadata when the workflow needs it
+- consume monitors or webhooks that report public tweet events
+
+Before calling `memory_store`, review the source result and keep only durable research context:
+
+- tweet URL
+- author handle
+- published timestamp
+- short text excerpt or human-written summary
+- relevant metrics, if needed for the research task
+- query or monitor that found the source
+- capture date
+
+Store the reviewed summary as `category: "fact"` for source evidence or `category: "decision"` when the team has made a decision from that evidence. Include the public source URL and capture date in the memory text or metadata so later recall can cite where the information came from.
+
+Never store secrets or private account material from this flow:
+
+- API keys, cookies, bearer tokens, or account credentials
+- direct-message content
+- draft post or reply text
+- non-public profile, follower, or media data
+
+Keep visible X/Twitter actions outside the memory plugin. Posting tweets, posting replies, sending direct messages, uploading media, and downloading media require explicit user approval in the tool workflow that performs the action. `memory-lancedb-pro` should only persist the reviewed summary after that workflow has produced safe public source context.
+
+Verification checklist:
+
+- the stored memory contains the public URL and capture date
+- the text is a summary or short excerpt, not a raw transcript dump
+- no credentials, cookies, direct messages, or draft text appear in the memory
+- any visible action on X/Twitter was approved outside the memory plugin
+
 ### Scope isolation
 
 Validate at least:
