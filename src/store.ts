@@ -105,6 +105,20 @@ export const loadLanceDB = async (): Promise<
   typeof import("@lancedb/lancedb")
 > => {
   if (!lancedbImportPromise) {
+    // @lancedb/lancedb's napi-rs loader (dist/native.js) detects musl via
+    // process.report.getReport(). The report's network section performs
+    // reverse-DNS lookups for every network interface, synchronously on the
+    // calling thread; on hosts with several interfaces and a slow or flaky
+    // DNS path (measured on WSL2 + Tailscale) this blocks the event loop for
+    // 110-250s on the FIRST LanceDB load — the host app's HTTP server and
+    // pollers freeze with CPU at 0% (main thread stuck in poll()). Excluding
+    // the network section turns the measured 235s hang into ~3ms and loses
+    // nothing: isMusl() only reads report.header.glibcVersionRuntime.
+    try {
+      (process.report as { excludeNetwork?: boolean }).excludeNetwork = true;
+    } catch {
+      /* Node < 22 without the flag — keep the previous behavior */
+    }
     // Use a createRequire-built require() so LanceDB's CommonJS native bindings
     // keep Windows-safe CJS semantics while still working in pure ESM runtimes.
     // Do not name this binding "require": bundlers may rewrite bare require()
