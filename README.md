@@ -896,6 +896,7 @@ openclaw doctor --fix # resolve any stale config after upgrade
 | [OpenClaw Integration Playbook](docs/openclaw-integration-playbook.md) | Deployment modes, verification, regression matrix |
 | [Memory Architecture Analysis](docs/memory_architecture_analysis.md) | Full architecture deep-dive |
 | [CHANGELOG v1.1.0](docs/CHANGELOG-v1.1.0.md) | v1.1.0 behavior changes and upgrade rationale |
+| [Release Checklist](docs/release-checklist.md) | Package preflight, publish dry run, and post-publish smoke checks |
 | [Long-Context Chunking](docs/long-context-chunking.md) | Chunking strategy for long documents |
 
 ---
