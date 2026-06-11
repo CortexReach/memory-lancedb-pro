@@ -514,6 +514,25 @@ export class MemoryStore {
     get dbPath() {
         return this.config.dbPath;
     }
+    async runStorageMaintenance(retentionDays = 7) {
+        if (this.destroyed) {
+            throw new Error("MemoryStore instance has been destroyed");
+        }
+        await this.ensureInitialized();
+        const safeRetentionDays = clampInt(retentionDays, 1, 3650);
+        const cleanupOlderThan = new Date(Date.now() - safeRetentionDays * 24 * 60 * 60 * 1000);
+        return this.runWithFileLock(async () => {
+            if (!this.table || typeof this.table.optimize !== "function") {
+                throw new Error("LanceDB table.optimize() is not available in this runtime");
+            }
+            const stats = await this.table.optimize({ cleanupOlderThan });
+            return {
+                retentionDays: safeRetentionDays,
+                cleanupOlderThan: cleanupOlderThan.toISOString(),
+                stats,
+            };
+        });
+    }
     async ensureInitialized() {
         if (this.table) {
             return;

@@ -133,6 +133,42 @@
       "dbPath": {
         "type": "string"
       },
+      "storageMaintenance": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Optional LanceDB table maintenance for pruning old version snapshots with table.optimize(). Disabled by default.",
+        "properties": {
+          "autoCleanup": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Enable scheduled LanceDB table.optimize() cleanup."
+              },
+              "intervalHours": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 24,
+                "description": "Hours between scheduled storage maintenance runs."
+              },
+              "retentionDays": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 7,
+                "description": "Keep LanceDB table versions newer than this many days."
+              },
+              "initialDelayMs": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 300000,
+                "description": "Delay before the first storage maintenance run after service start."
+              }
+            }
+          }
+        }
+      },
       "enableManagementTools": {
         "type": "boolean",
         "default": false,
@@ -1521,6 +1557,29 @@
       "label": "Database Path",
       "placeholder": "~/.openclaw/memory/lancedb-pro",
       "help": "Directory path for the LanceDB database files",
+      "advanced": true
+    },
+    "storageMaintenance.autoCleanup.enabled": {
+      "label": "Storage Auto-Cleanup",
+      "help": "Run scheduled LanceDB table maintenance to remove old version snapshots. Disabled by default.",
+      "advanced": true
+    },
+    "storageMaintenance.autoCleanup.intervalHours": {
+      "label": "Storage Cleanup Interval",
+      "placeholder": "24",
+      "help": "Hours between scheduled LanceDB table.optimize() cleanup runs.",
+      "advanced": true
+    },
+    "storageMaintenance.autoCleanup.retentionDays": {
+      "label": "Storage Retention Days",
+      "placeholder": "7",
+      "help": "Keep LanceDB table versions newer than this many days.",
+      "advanced": true
+    },
+    "storageMaintenance.autoCleanup.initialDelayMs": {
+      "label": "Storage Cleanup Initial Delay",
+      "placeholder": "300000",
+      "help": "Milliseconds to wait after startup before the first storage cleanup run.",
       "advanced": true
     },
     "smartExtraction": {

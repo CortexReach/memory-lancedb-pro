@@ -121,6 +121,14 @@ interface PluginConfig {
     clientTimeoutMs?: number;
   };
   dbPath?: string;
+  storageMaintenance?: {
+    autoCleanup?: {
+      enabled?: boolean;
+      intervalHours?: number;
+      retentionDays?: number;
+      initialDelayMs?: number;
+    };
+  };
   autoCapture?: boolean;
   autoRecall?: boolean;
   autoRecallMinLength?: number;
@@ -4870,6 +4878,10 @@ const memoryLanceDBProPlugin = {
 
     let backupTimer: ReturnType<typeof setInterval> | null = null;
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+    let storageMaintenanceInitialTimer: ReturnType<typeof setTimeout> | null = null;
+    let storageMaintenanceTimer: ReturnType<typeof setInterval> | null = null;
+    let storageMaintenanceRunning = false;
+    const storageAutoCleanup = config.storageMaintenance?.autoCleanup;
 
     async function runBackup() {
       try {
@@ -4931,6 +4943,32 @@ const memoryLanceDBProPlugin = {
         );
       } catch (err) {
         api.logger.warn(`memory-lancedb-pro: backup failed: ${String(err)}`);
+      }
+    }
+
+    async function runStorageMaintenance() {
+      if (storageAutoCleanup?.enabled !== true) return;
+      if (storageMaintenanceRunning) {
+        api.logger.debug("memory-lancedb-pro: storage maintenance skipped because a prior run is still active");
+        return;
+      }
+
+      storageMaintenanceRunning = true;
+      const startedAt = Date.now();
+      const retentionDays = storageAutoCleanup.retentionDays ?? 7;
+      try {
+        const result = await store.runStorageMaintenance(retentionDays);
+        api.logger.info(
+          `memory-lancedb-pro: storage maintenance completed ` +
+          `(retentionDays=${result.retentionDays}, cleanupOlderThan=${result.cleanupOlderThan}, elapsedMs=${Date.now() - startedAt})`,
+        );
+      } catch (err) {
+        api.logger.warn(
+          `memory-lancedb-pro: storage maintenance failed ` +
+          `(retentionDays=${retentionDays}, elapsedMs=${Date.now() - startedAt}): ${String(err)}`,
+        );
+      } finally {
+        storageMaintenanceRunning = false;
       }
     }
 
@@ -5074,11 +5112,36 @@ const memoryLanceDBProPlugin = {
         // Run initial backup after a short delay, then schedule daily
         setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+
+        if (storageAutoCleanup?.enabled === true) {
+          const intervalMs = (storageAutoCleanup.intervalHours ?? 24) * 60 * 60 * 1000;
+          const initialDelayMs = storageAutoCleanup.initialDelayMs ?? 300_000;
+          api.logger.info(
+            `memory-lancedb-pro: storage maintenance scheduled ` +
+            `(intervalHours=${storageAutoCleanup.intervalHours ?? 24}, retentionDays=${storageAutoCleanup.retentionDays ?? 7})`,
+          );
+          storageMaintenanceInitialTimer = setTimeout(
+            () => void runStorageMaintenance(),
+            initialDelayMs,
+          );
+          storageMaintenanceTimer = setInterval(
+            () => void runStorageMaintenance(),
+            intervalMs,
+          );
+        }
       },
       stop: async () => {
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
+        }
+        if (storageMaintenanceInitialTimer) {
+          clearTimeout(storageMaintenanceInitialTimer);
+          storageMaintenanceInitialTimer = null;
+        }
+        if (storageMaintenanceTimer) {
+          clearInterval(storageMaintenanceTimer);
+          storageMaintenanceTimer = null;
         }
         api.logger.info("memory-lancedb-pro: stopped");
       },
@@ -5150,6 +5213,12 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   const workspaceBoundaryRaw = typeof cfg.workspaceBoundary === "object" && cfg.workspaceBoundary !== null
     ? cfg.workspaceBoundary as Record<string, unknown>
     : null;
+  const storageMaintenanceRaw = typeof cfg.storageMaintenance === "object" && cfg.storageMaintenance !== null
+    ? cfg.storageMaintenance as Record<string, unknown>
+    : null;
+  const storageAutoCleanupRaw = typeof storageMaintenanceRaw?.autoCleanup === "object" && storageMaintenanceRaw.autoCleanup !== null
+    ? storageMaintenanceRaw.autoCleanup as Record<string, unknown>
+    : null;
   const userMdExclusiveRaw = typeof workspaceBoundaryRaw?.userMdExclusive === "object" && workspaceBoundaryRaw.userMdExclusive !== null
     ? workspaceBoundaryRaw.userMdExclusive as Record<string, unknown>
     : null;
@@ -5214,6 +5283,16 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       clientTimeoutMs: parsePositiveInt(embedding.clientTimeoutMs),
     },
     dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
+    storageMaintenance: storageAutoCleanupRaw
+      ? {
+        autoCleanup: {
+          enabled: storageAutoCleanupRaw.enabled === true,
+          intervalHours: parsePositiveInt(storageAutoCleanupRaw.intervalHours) ?? 24,
+          retentionDays: parsePositiveInt(storageAutoCleanupRaw.retentionDays) ?? 7,
+          initialDelayMs: parseNonNegativeInt(storageAutoCleanupRaw.initialDelayMs) ?? 300_000,
+        },
+      }
+      : undefined,
     autoCapture: cfg.autoCapture !== false,
     // Default OFF: only enable when explicitly set to true.
     autoRecall: cfg.autoRecall === true,
