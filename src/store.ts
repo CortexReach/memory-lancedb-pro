@@ -735,7 +735,7 @@ export class MemoryStore {
     const safeRetentionDays = clampInt(retentionDays, 1, 3650);
     const cleanupOlderThan = new Date(Date.now() - safeRetentionDays * 24 * 60 * 60 * 1000);
 
-    return this.runWithFileLock(async () => {
+    return this.runWithWriteLock(async () => {
       if (!this.table || typeof this.table.optimize !== "function") {
         throw new Error("LanceDB table.optimize() is not available in this runtime");
       }

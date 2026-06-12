@@ -17,6 +17,7 @@ Module._initPaths();
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const plugin = jiti("../index.ts");
+const { MemoryStore } = jiti("../src/store.ts");
 const resetRegistration = plugin.resetRegistration ?? (() => {});
 
 const manifest = JSON.parse(
@@ -347,6 +348,37 @@ try {
     services[0].stop(),
     "service stop should not throw when no access tracker is configured",
   );
+
+  const originalDestroy = MemoryStore.prototype.destroy;
+  let destroyCalls = 0;
+  try {
+    MemoryStore.prototype.destroy = async function () {
+      destroyCalls += 1;
+    };
+    const stopCleanupServices = [];
+    const stopCleanupApi = createMockApi(
+      {
+        dbPath: path.join(workDir, "db-stop-cleanup"),
+        autoCapture: false,
+        autoRecall: false,
+        embedding: {
+          provider: "openai-compatible",
+          apiKey: "dummy",
+          model: "text-embedding-3-small",
+          baseURL: "http://127.0.0.1:9/v1",
+          dimensions: 1536,
+        },
+      },
+      { services: stopCleanupServices },
+    );
+    resetRegistration();
+    plugin.register(stopCleanupApi);
+    assert.equal(stopCleanupServices.length, 1, "plugin should register a service for cleanup coverage");
+    await stopCleanupServices[0].stop();
+    assert.equal(destroyCalls, 1, "service stop should destroy the store and close lock resources");
+  } finally {
+    MemoryStore.prototype.destroy = originalDestroy;
+  }
 
   const sessionDefaultApi = createMockApi({
     dbPath: path.join(workDir, "db-session-default"),

@@ -258,7 +258,7 @@
                 "type": "integer",
                 "minimum": 1,
                 "default": 5000,
-                "description": "Maximum time to wait for the Redis lock before falling back to the file lock."
+                "description": "Maximum time to wait for the Redis lock before failing the write so the caller can retry later."
               },
               "retryDelayMs": {
                 "type": "integer",
@@ -1781,7 +1781,7 @@
     "locking.redis.acquireTimeoutMs": {
       "label": "Redis Lock Acquire Timeout",
       "placeholder": "5000",
-      "help": "Maximum time to wait for Redis lock acquisition before falling back to the file lock.",
+      "help": "Maximum time to wait for Redis lock acquisition before failing the write so the caller can retry later.",
       "advanced": true
     },
     "locking.redis.retryDelayMs": {

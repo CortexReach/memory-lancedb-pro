@@ -19,7 +19,7 @@ const jiti = jitiFactory(import.meta.url, {
 const {
   RedisLockManager,
   RedisLockAcquisitionError,
-  RedisLockLeaseLostError,
+  RedisLockLeaseIntegrityError,
   RedisLockUnavailableError,
 } = jiti("../src/redis-lock.ts");
 const {
@@ -231,7 +231,8 @@ describe("RedisLockManager", () => {
     assert.ok(overlaps >= 1);
   });
 
-  it("fails the write if Redis lease renewal loses ownership", async () => {
+  it("waits for the active write before reporting Redis lease integrity loss", async () => {
+    const events = [];
     const manager = new RedisLockManager({
       url: "redis://localhost:6379",
       ttlMs: 5,
@@ -242,17 +243,62 @@ describe("RedisLockManager", () => {
         return "OK";
       },
       async eval(script) {
-        if (script.includes("pexpire")) return 0;
+        if (script.includes("pexpire")) {
+          events.push("lease-lost");
+          return 0;
+        }
         return 0;
       },
     });
 
     await assert.rejects(
       () => manager.withLock("/tmp/db", async () => {
+        events.push("write-started");
         await sleep(20);
+        events.push("write-settled");
       }),
-      RedisLockLeaseLostError,
+      RedisLockLeaseIntegrityError,
     );
+    assert.deepEqual(events.at(-1), "write-settled");
+    assert.ok(events.includes("lease-lost"));
+  });
+
+  it("does not lose the lease after a single transient renewal failure", async () => {
+    const warnings = [];
+    let renewAttempts = 0;
+    const manager = new RedisLockManager({
+      url: "redis://localhost:6379",
+      ttlMs: 100,
+      acquireTimeoutMs: 20,
+      retryDelayMs: 1,
+      onWarning: (message) => warnings.push(message),
+    }, {
+      async set() {
+        return "OK";
+      },
+      async eval(script) {
+        if (script.includes("pexpire")) {
+          renewAttempts += 1;
+          if (renewAttempts === 1) {
+            throw new Error("temporary Redis timeout");
+          }
+          return 1;
+        }
+        return 1;
+      },
+    });
+
+    const result = await manager.withLock("/tmp/db", async () => {
+      const deadline = Date.now() + 90;
+      while (renewAttempts < 2 && Date.now() < deadline) {
+        await sleep(5);
+      }
+      return "committed";
+    });
+
+    assert.equal(result, "committed");
+    assert.ok(renewAttempts >= 2);
+    assert.match(warnings.join("\n"), /transient Redis lock renewal failure/);
   });
 
   it("does not mask a successful write when Redis release fails", async () => {

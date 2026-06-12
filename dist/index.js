@@ -4155,6 +4155,12 @@ const memoryLanceDBProPlugin = {
                     clearInterval(storageMaintenanceTimer);
                     storageMaintenanceTimer = null;
                 }
+                try {
+                    await store.destroy();
+                }
+                catch (err) {
+                    api.logger.warn(`memory-lancedb-pro: stop cleanup failed: ${String(err)}`);
+                }
                 api.logger.info("memory-lancedb-pro: stopped");
             },
         });

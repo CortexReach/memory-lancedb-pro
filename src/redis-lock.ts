@@ -40,6 +40,13 @@ export class RedisLockLeaseLostError extends Error {
   }
 }
 
+export class RedisLockLeaseIntegrityError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "RedisLockLeaseIntegrityError";
+  }
+}
+
 const DEFAULT_KEY_PREFIX = "memory-lancedb-pro:write-lock";
 const DEFAULT_TTL_MS = 60_000;
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 5_000;
@@ -93,38 +100,55 @@ export class RedisLockManager {
     await this.acquire(client, key, token);
 
     let leaseLost: RedisLockLeaseLostError | null = null;
-    let rejectLeaseLost: (error: RedisLockLeaseLostError) => void = () => {};
-    const leaseLostPromise = new Promise<never>((_resolve, reject) => {
-      rejectLeaseLost = reject;
-    });
+    let leaseExpiresAt = Date.now() + this.config.ttlMs;
     const markLeaseLost = (error: RedisLockLeaseLostError) => {
       if (leaseLost) return;
       leaseLost = error;
-      rejectLeaseLost(error);
     };
-    const renewIntervalMs = Math.max(1, Math.floor(this.config.ttlMs / 2));
+    const throwPostWriteLeaseError = (error: RedisLockLeaseLostError): never => {
+      throw new RedisLockLeaseIntegrityError(
+        `Redis lock ${key} was lost before the write settled; the write outcome is ambiguous and must not be retried automatically`,
+        { cause: error },
+      );
+    };
+    const renewIntervalMs = Math.max(1, Math.floor(this.config.ttlMs / 3));
     const renewTimer = setInterval(() => {
-      void this.renew(client, key, token).catch((err) => {
-        markLeaseLost(
-          new RedisLockLeaseLostError(
-            `Redis lock renewal failed for ${key}: ${err instanceof Error ? err.message : String(err)}`,
-            { cause: err as Error },
-          ),
-        );
-      }).then((renewed) => {
+      void this.renew(client, key, token).then((renewed) => {
         if (renewed === false) {
           markLeaseLost(
             new RedisLockLeaseLostError(`Redis lock ${key} is no longer owned by this writer`),
           );
+          return;
         }
+        leaseExpiresAt = Date.now() + this.config.ttlMs;
+      }).catch((err) => {
+        if (Date.now() >= leaseExpiresAt) {
+          markLeaseLost(
+            new RedisLockLeaseLostError(
+              `Redis lock renewal failed for ${key} before the lease could be extended: ${err instanceof Error ? err.message : String(err)}`,
+              { cause: err as Error },
+            ),
+          );
+          return;
+        }
+        this.config.onWarning?.(
+          `memory-lancedb-pro: transient Redis lock renewal failure for ${key}; retrying before TTL expiry: ${String(err)}`,
+        );
       });
     }, renewIntervalMs);
     if (typeof renewTimer.unref === "function") renewTimer.unref();
 
     try {
-      const operation = fn();
-      operation.catch(() => {});
-      return await Promise.race([operation, leaseLostPromise]);
+      const result = await fn();
+      if (leaseLost) {
+        throwPostWriteLeaseError(leaseLost);
+      }
+      if (Date.now() >= leaseExpiresAt) {
+        throwPostWriteLeaseError(
+          new RedisLockLeaseLostError(`Redis lock ${key} expired before the write settled`),
+        );
+      }
+      return result;
     } finally {
       clearInterval(renewTimer);
       try {
