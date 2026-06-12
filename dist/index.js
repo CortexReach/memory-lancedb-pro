@@ -139,6 +139,10 @@ function resolveFirstApiKey(api, apiKey) {
     }
     return resolveSecretCredential(api, key, "embedding.apiKey");
 }
+function resolveOptionalEnvString(value) {
+    const raw = asNonEmptyString(value);
+    return raw ? resolveEnvVars(raw) : undefined;
+}
 function resolveOptionalPathWithEnv(api, value, fallback) {
     const raw = typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback;
     return api.resolvePath(resolveEnvVars(raw));
@@ -1662,7 +1666,9 @@ function _initPluginState(api) {
         dbPath: resolvedDbPath,
         vectorDim,
         disableNativeCosine: config.retrieval?.disableNativeCosine === true,
+        redisLock: config.locking?.redis,
         onStoragePathWarning: (message) => api.logger.warn(message),
+        onLockWarning: (message) => api.logger.warn(message),
     });
     const embedder = createEmbedder({
         provider: "openai-compatible",
@@ -4220,6 +4226,18 @@ export function parsePluginConfig(value) {
     const storageAutoCleanupRaw = typeof storageMaintenanceRaw?.autoCleanup === "object" && storageMaintenanceRaw.autoCleanup !== null
         ? storageMaintenanceRaw.autoCleanup
         : null;
+    const lockingRaw = typeof cfg.locking === "object" && cfg.locking !== null
+        ? cfg.locking
+        : null;
+    const redisLockRaw = typeof lockingRaw?.redis === "object" && lockingRaw.redis !== null
+        ? lockingRaw.redis
+        : null;
+    const redisLockUrl = resolveOptionalEnvString(redisLockRaw?.url) ??
+        resolveOptionalEnvString(cfg.redisUrl) ??
+        asNonEmptyString(process.env.MEMORY_LANCEDB_REDIS_URL);
+    const redisLockExplicitlyDisabled = redisLockRaw?.enabled === false;
+    const redisLockEnabled = !redisLockExplicitlyDisabled &&
+        (redisLockRaw?.enabled === true || Boolean(redisLockUrl));
     const userMdExclusiveRaw = typeof workspaceBoundaryRaw?.userMdExclusive === "object" && workspaceBoundaryRaw.userMdExclusive !== null
         ? workspaceBoundaryRaw.userMdExclusive
         : null;
@@ -4280,6 +4298,20 @@ export function parsePluginConfig(value) {
                     intervalHours: parsePositiveInt(storageAutoCleanupRaw.intervalHours) ?? 24,
                     retentionDays: parsePositiveInt(storageAutoCleanupRaw.retentionDays) ?? 7,
                     initialDelayMs: parseNonNegativeInt(storageAutoCleanupRaw.initialDelayMs) ?? 300_000,
+                },
+            }
+            : undefined,
+        redisUrl: resolveOptionalEnvString(cfg.redisUrl),
+        locking: redisLockRaw || redisLockUrl
+            ? {
+                redis: {
+                    enabled: redisLockEnabled,
+                    url: redisLockUrl,
+                    keyPrefix: asNonEmptyString(redisLockRaw?.keyPrefix),
+                    ttlMs: parsePositiveInt(redisLockRaw?.ttlMs) ?? 60_000,
+                    acquireTimeoutMs: parsePositiveInt(redisLockRaw?.acquireTimeoutMs) ?? 5_000,
+                    retryDelayMs: parsePositiveInt(redisLockRaw?.retryDelayMs) ?? 50,
+                    connectTimeoutMs: parsePositiveInt(redisLockRaw?.connectTimeoutMs) ?? 1_000,
                 },
             }
             : undefined,

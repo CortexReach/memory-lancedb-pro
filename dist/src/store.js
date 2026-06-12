@@ -8,6 +8,7 @@ import { access as accessAsync, lstat as lstatAsync, mkdir as mkdirAsync, realpa
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchesMemoryCategoryFilter, resolveCategoryFilterCandidates } from "./memory-categories.js";
+import { RedisLockManager, RedisLockUnavailableError, } from "./redis-lock.js";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 // ============================================================================
 // LanceDB Dynamic Import
@@ -404,6 +405,7 @@ export class MemoryStore {
     static INDEX_FOLD_OP_THRESHOLD = 20;
     config;
     disableNativeCosine;
+    redisLock = null;
     constructor(config) {
         const envDisablesNativeCosine = parseBooleanEnvFlag(process.env.MEMORY_LANCEDB_DISABLE_NATIVE_COSINE);
         this.config = {
@@ -411,6 +413,17 @@ export class MemoryStore {
             dbPath: normalizeStoragePath(config.dbPath),
         };
         this.disableNativeCosine = config.disableNativeCosine === true || envDisablesNativeCosine;
+        if (config.redisLock?.enabled === true) {
+            if (config.redisLock.url) {
+                this.redisLock = new RedisLockManager({
+                    ...config.redisLock,
+                    onWarning: config.onLockWarning,
+                });
+            }
+            else {
+                config.onLockWarning?.("memory-lancedb-pro: Redis lock is enabled but no Redis URL is configured; using file lock");
+            }
+        }
     }
     async runWithFileLock(fn) {
         const lockfile = await loadLockfile();
@@ -535,6 +548,31 @@ export class MemoryStore {
                 console.warn(`[memory-lancedb-pro] Returning successful result despite compromised lock at "${lockPath}". ` +
                     `Callers must not retry this operation automatically.`);
             }
+        }
+    }
+    async runWithWriteLock(fn) {
+        if (!this.redisLock) {
+            return this.runWithFileLock(fn);
+        }
+        try {
+            return await this.redisLock.withLock(this.config.dbPath, fn);
+        }
+        catch (err) {
+            if (!(err instanceof RedisLockUnavailableError)) {
+                throw err;
+            }
+            this.config.onLockWarning?.(`memory-lancedb-pro: Redis write lock unavailable; falling back to file lock: ${err.message}`);
+            return this.runWithFileLock(fn);
+        }
+    }
+    async closeLockResources() {
+        if (!this.redisLock)
+            return;
+        try {
+            await this.redisLock.close();
+        }
+        catch (err) {
+            this.config.onLockWarning?.(`memory-lancedb-pro: failed to close Redis lock client: ${String(err)}`);
         }
     }
     get dbPath() {
@@ -743,7 +781,7 @@ export class MemoryStore {
     async backfillLegacySecondTimestamps(table) {
         try {
             let normalizedCount = 0;
-            await this.runWithFileLock(async () => {
+            await this.runWithWriteLock(async () => {
                 const candidateRows = await table.query()
                     .where(`(timestamp > 0 AND timestamp < ${LEGACY_SECONDS_TIMESTAMP_MAX}) OR ` +
                     `(metadata IS NOT NULL AND metadata != '{}' AND metadata != '')`)
@@ -855,7 +893,7 @@ export class MemoryStore {
     }
     async upsert(entry) {
         await this.ensureInitialized();
-        const result = await this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+        const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
             const safeId = escapeSqlLiteral(entry.id);
             await this.table.delete(`id = '${safeId}'`).catch(() => undefined);
             const normalizedEntry = {
@@ -1008,7 +1046,7 @@ export class MemoryStore {
                 const chunk = allEntries.slice(i, i + MemoryStore.MAX_BATCH_SIZE);
                 const chunkIdx = Math.floor(i / MemoryStore.MAX_BATCH_SIZE);
                 try {
-                    await this.runWithFileLock(async () => {
+                    await this.runWithWriteLock(async () => {
                         await this.table.add(chunk);
                     });
                     this.noteDataModification();
@@ -1156,6 +1194,7 @@ export class MemoryStore {
         // 1. destroy() 自己有錯 + lastBackgroundError 也有值 → composite error（兩個都保留）
         // 2. 只有 destroy() 自己有錯 → 只 throw destroy 的錯誤
         // 3. 只有 lastBackgroundError 有值 → throw timer 歷史錯誤
+        let destroyError = null;
         if (result.hasError && result.lastError) {
             if (this.lastBackgroundError?.hasError) {
                 // 情境 1：兩個錯誤都保留，包成 composite error
@@ -1164,17 +1203,23 @@ export class MemoryStore {
                 // throw destroy 自己錯誤，因為更新、更直接
                 // timer 歷史錯誤放在 message 裡讓 caller 知道（cause chain 保留）
                 const compositeError = new Error(`destroy flush failed (${result.lastError.message}); background flush also failed: ${timerError.message}`, { cause: result.lastError });
-                throw compositeError;
+                destroyError = compositeError;
             }
-            // 情境 2：只有 destroy 自己有錯
-            throw result.lastError;
+            else {
+                // 情境 2：只有 destroy 自己有錯
+                destroyError = result.lastError;
+            }
         }
         // 【F1 fix】檢查 lastBackgroundError（timers 錯誤的最後堡壘）
         // 情境 3：只有 lastBackgroundError 有值
-        if (this.lastBackgroundError?.hasError) {
+        if (!destroyError && this.lastBackgroundError?.hasError) {
             const err = this.lastBackgroundError.lastError ?? new Error("background flush failed");
             this.lastBackgroundError = null;
-            throw err;
+            destroyError = err;
+        }
+        await this.closeLockResources();
+        if (destroyError) {
+            throw destroyError;
         }
     }
     /**
@@ -1198,7 +1243,7 @@ export class MemoryStore {
             timestamp: normalizeMemoryTimestamp(entry.timestamp),
             metadata: entry.metadata || "{}",
         };
-        return this.runWithFileLock(async () => {
+        return this.runWithWriteLock(async () => {
             await this.table.add([full]);
             return full;
         });
@@ -1275,7 +1320,7 @@ export class MemoryStore {
         if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
             throw new Error(`Memory ${id} is outside accessible scopes`);
         }
-        return this.runWithFileLock(async () => {
+        return this.runWithWriteLock(async () => {
             await this.table.delete(`id = '${safeId}'`);
             return true;
         });
@@ -1523,7 +1568,7 @@ export class MemoryStore {
             !scopeFilter.includes(rowScope)) {
             throw new Error(`Memory ${resolvedId} is outside accessible scopes`);
         }
-        return this.runWithFileLock(async () => {
+        return this.runWithWriteLock(async () => {
             await this.table.delete(`id = '${resolvedId}'`);
             return true;
         });
@@ -1637,7 +1682,7 @@ export class MemoryStore {
                 error: `Memory ${id} is outside accessible scopes`,
             }));
         }
-        return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+        return this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
             const results = new Map();
             const pending = [];
             const seenIds = new Set();
@@ -1799,7 +1844,7 @@ export class MemoryStore {
         if (isExplicitDenyAllScopeFilter(scopeFilter)) {
             throw new Error(`Memory ${id} is outside accessible scopes`);
         }
-        return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+        return this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
             // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
             // from older stores (for example "mem-md-..." or "data-pointer-...").
             const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1939,7 +1984,7 @@ export class MemoryStore {
             throw new Error("Bulk delete requires at least scope or timestamp filter for safety");
         }
         const whereClause = conditions.join(" AND ");
-        return this.runWithFileLock(async () => {
+        return this.runWithWriteLock(async () => {
             // Count first
             const countResults = await this.table.query().where(whereClause).toArray();
             const deleteCount = countResults.length;

@@ -57,6 +57,7 @@ export const CI_TEST_MANIFEST = [
   { group: "packaging-and-workflow", runner: "node", file: "test/workflow-fork-guards.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/clawteam-scope.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/cross-process-lock.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/redis-lock.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/lock-stress-test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/lock-release-on-error.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/preference-slots.test.mjs", args: ["--test"] },

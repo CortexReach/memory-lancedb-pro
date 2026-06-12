@@ -129,6 +129,18 @@ interface PluginConfig {
       initialDelayMs?: number;
     };
   };
+  redisUrl?: string;
+  locking?: {
+    redis?: {
+      enabled?: boolean;
+      url?: string;
+      keyPrefix?: string;
+      ttlMs?: number;
+      acquireTimeoutMs?: number;
+      retryDelayMs?: number;
+      connectTimeoutMs?: number;
+    };
+  };
   autoCapture?: boolean;
   autoRecall?: boolean;
   autoRecallMinLength?: number;
@@ -416,6 +428,11 @@ function resolveFirstApiKey(api: Pick<OpenClawPluginApi, "resolvePath">, apiKey:
     throw new Error("embedding.apiKey is empty");
   }
   return resolveSecretCredential(api, key, "embedding.apiKey");
+}
+
+function resolveOptionalEnvString(value: unknown): string | undefined {
+  const raw = asNonEmptyString(value);
+  return raw ? resolveEnvVars(raw) : undefined;
 }
 
 function resolveOptionalPathWithEnv(
@@ -2232,7 +2249,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     dbPath: resolvedDbPath,
     vectorDim,
     disableNativeCosine: config.retrieval?.disableNativeCosine === true,
+    redisLock: config.locking?.redis,
     onStoragePathWarning: (message) => api.logger.warn(message),
+    onLockWarning: (message) => api.logger.warn(message),
   });
   const embedder = createEmbedder({
     provider: "openai-compatible",
@@ -5344,6 +5363,20 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   const storageAutoCleanupRaw = typeof storageMaintenanceRaw?.autoCleanup === "object" && storageMaintenanceRaw.autoCleanup !== null
     ? storageMaintenanceRaw.autoCleanup as Record<string, unknown>
     : null;
+  const lockingRaw = typeof cfg.locking === "object" && cfg.locking !== null
+    ? cfg.locking as Record<string, unknown>
+    : null;
+  const redisLockRaw = typeof lockingRaw?.redis === "object" && lockingRaw.redis !== null
+    ? lockingRaw.redis as Record<string, unknown>
+    : null;
+  const redisLockUrl =
+    resolveOptionalEnvString(redisLockRaw?.url) ??
+    resolveOptionalEnvString(cfg.redisUrl) ??
+    asNonEmptyString(process.env.MEMORY_LANCEDB_REDIS_URL);
+  const redisLockExplicitlyDisabled = redisLockRaw?.enabled === false;
+  const redisLockEnabled =
+    !redisLockExplicitlyDisabled &&
+    (redisLockRaw?.enabled === true || Boolean(redisLockUrl));
   const userMdExclusiveRaw = typeof workspaceBoundaryRaw?.userMdExclusive === "object" && workspaceBoundaryRaw.userMdExclusive !== null
     ? workspaceBoundaryRaw.userMdExclusive as Record<string, unknown>
     : null;
@@ -5415,6 +5448,20 @@ export function parsePluginConfig(value: unknown): PluginConfig {
           intervalHours: parsePositiveInt(storageAutoCleanupRaw.intervalHours) ?? 24,
           retentionDays: parsePositiveInt(storageAutoCleanupRaw.retentionDays) ?? 7,
           initialDelayMs: parseNonNegativeInt(storageAutoCleanupRaw.initialDelayMs) ?? 300_000,
+        },
+      }
+      : undefined,
+    redisUrl: resolveOptionalEnvString(cfg.redisUrl),
+    locking: redisLockRaw || redisLockUrl
+      ? {
+        redis: {
+          enabled: redisLockEnabled,
+          url: redisLockUrl,
+          keyPrefix: asNonEmptyString(redisLockRaw?.keyPrefix),
+          ttlMs: parsePositiveInt(redisLockRaw?.ttlMs) ?? 60_000,
+          acquireTimeoutMs: parsePositiveInt(redisLockRaw?.acquireTimeoutMs) ?? 5_000,
+          retryDelayMs: parsePositiveInt(redisLockRaw?.retryDelayMs) ?? 50,
+          connectTimeoutMs: parsePositiveInt(redisLockRaw?.connectTimeoutMs) ?? 1_000,
         },
       }
       : undefined,
