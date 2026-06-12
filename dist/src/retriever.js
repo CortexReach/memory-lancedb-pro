@@ -462,7 +462,7 @@ export class MemoryRetriever {
             failureStage = "vector.vectorSearch";
             const results = await this.store.vectorSearch(queryVector, candidatePoolSize, this.config.minScore, scopeFilter, { excludeInactive: true });
             const filtered = category
-                ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
+                ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category, r.entry.metadata))
                 : results;
             // Filter expired memories early — before scoring — so they don't
             // occupy candidate slots that should go to live memories.
@@ -530,7 +530,7 @@ export class MemoryRetriever {
         trace?.startStage("bm25_search", []);
         const bm25Results = await this.store.bm25Search(query, candidatePoolSize, scopeFilter, { excludeInactive: true });
         const categoryFiltered = category
-            ? bm25Results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
+            ? bm25Results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category, r.entry.metadata))
             : bm25Results;
         const mustContainFiltered = categoryFiltered.filter((r) => {
             const textLower = r.entry.text.toLowerCase();
@@ -770,7 +770,7 @@ export class MemoryRetriever {
         const results = await this.store.vectorSearch(queryVector, limit, 0.1, scopeFilter, { excludeInactive: true });
         // Filter by category if specified
         const filtered = category
-            ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
+            ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category, r.entry.metadata))
             : results;
         return filtered.map((result, index) => ({
             ...result,
@@ -781,7 +781,7 @@ export class MemoryRetriever {
         const results = await this.store.bm25Search(query, limit, scopeFilter, { excludeInactive: true });
         // Filter by category if specified
         const filtered = category
-            ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
+            ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category, r.entry.metadata))
             : results;
         return filtered.map((result, index) => ({
             ...result,
@@ -877,8 +877,9 @@ export class MemoryRetriever {
                 const model = this.config.rerankModel || "jina-reranker-v3";
                 const endpoint = this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
                 const documents = results.map((r) => r.entry.text);
+                const rerankTopN = Math.min(results.length, Math.max(1, this.config.candidatePoolSize));
                 // Build provider-specific request
-                const { headers, body } = buildRerankRequest(provider, this.config.rerankApiKey || "", model, query, documents, results.length);
+                const { headers, body } = buildRerankRequest(provider, this.config.rerankApiKey || "", model, query, documents, rerankTopN);
                 // Timeout: configurable via rerankTimeoutMs (default: 5000ms)
                 const controller = new AbortController();
                 const timeout = setTimeout(() => controller.abort(), this.config.rerankTimeoutMs ?? 5000);

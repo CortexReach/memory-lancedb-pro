@@ -24,6 +24,22 @@ export const TOOL_MEMORY_CATEGORIES = [
     ...MEMORY_CATEGORIES,
     ...LEGACY_MEMORY_CATEGORIES,
 ];
+const SMART_TO_STORAGE_CATEGORY = {
+    profile: "fact",
+    preferences: "preference",
+    entities: "entity",
+    events: "decision",
+    cases: "fact",
+    patterns: "other",
+};
+const LEGACY_TO_SMART_CATEGORY = {
+    preference: "preferences",
+    fact: "cases",
+    decision: "events",
+    entity: "entities",
+    reflection: "patterns",
+    other: "patterns",
+};
 /** Categories that always merge (skip dedup entirely). */
 export const ALWAYS_MERGE_CATEGORIES = new Set(["profile"]);
 /** Categories that support MERGE decision from LLM dedup. */
@@ -58,16 +74,24 @@ export function normalizeCategory(raw) {
     }
     return null;
 }
-export function matchesMemoryCategoryFilter(entryCategory, requestedCategory) {
+export function matchesMemoryCategoryFilter(entryCategory, requestedCategory, entryMetadata) {
     const rawEntryCategory = entryCategory.toLowerCase().trim();
     const rawRequestedCategory = requestedCategory.toLowerCase().trim();
     if (rawEntryCategory === rawRequestedCategory)
         return true;
+    const metadataCategory = extractMetadataMemoryCategory(entryMetadata);
     const normalizedEntryCategory = normalizeCategory(rawEntryCategory);
     const normalizedRequestedCategory = normalizeCategory(rawRequestedCategory);
-    return normalizedEntryCategory !== null &&
-        normalizedRequestedCategory !== null &&
-        normalizedEntryCategory === normalizedRequestedCategory;
+    if (metadataCategory && normalizedRequestedCategory) {
+        return metadataCategory === normalizedRequestedCategory;
+    }
+    if (normalizedEntryCategory && normalizedRequestedCategory) {
+        return normalizedEntryCategory === normalizedRequestedCategory;
+    }
+    if (normalizedRequestedCategory && isLegacyMemoryCategory(rawEntryCategory)) {
+        return LEGACY_TO_SMART_CATEGORY[rawEntryCategory] === normalizedRequestedCategory;
+    }
+    return false;
 }
 export function resolveCategoryFilterCandidates(requestedCategory) {
     const rawRequestedCategory = requestedCategory.toLowerCase().trim();
@@ -75,6 +99,7 @@ export function resolveCategoryFilterCandidates(requestedCategory) {
     const candidates = new Set([rawRequestedCategory]);
     if (normalizedRequestedCategory) {
         candidates.add(normalizedRequestedCategory);
+        candidates.add(SMART_TO_STORAGE_CATEGORY[normalizedRequestedCategory]);
         for (const category of TOOL_MEMORY_CATEGORIES) {
             if (normalizeCategory(category) === normalizedRequestedCategory) {
                 candidates.add(category);
@@ -82,4 +107,43 @@ export function resolveCategoryFilterCandidates(requestedCategory) {
         }
     }
     return [...candidates];
+}
+export function getStorageCategoryForMemoryCategory(category) {
+    return SMART_TO_STORAGE_CATEGORY[category];
+}
+export function resolveToolMemoryCategory(rawCategory) {
+    const raw = rawCategory.toLowerCase().trim();
+    const normalized = normalizeCategory(raw);
+    if (normalized) {
+        return {
+            memoryCategory: normalized,
+            storageCategory: SMART_TO_STORAGE_CATEGORY[normalized],
+        };
+    }
+    if (isLegacyMemoryCategory(raw)) {
+        return {
+            memoryCategory: LEGACY_TO_SMART_CATEGORY[raw],
+            storageCategory: raw,
+        };
+    }
+    return {
+        memoryCategory: "patterns",
+        storageCategory: "other",
+    };
+}
+function isLegacyMemoryCategory(value) {
+    return LEGACY_MEMORY_CATEGORIES.includes(value);
+}
+function extractMetadataMemoryCategory(rawMetadata) {
+    if (!rawMetadata)
+        return null;
+    try {
+        const parsed = JSON.parse(rawMetadata);
+        if (typeof parsed.memory_category !== "string")
+            return null;
+        return normalizeCategory(parsed.memory_category);
+    }
+    catch {
+        return null;
+    }
 }

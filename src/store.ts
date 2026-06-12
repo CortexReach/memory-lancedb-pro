@@ -27,7 +27,7 @@ import {
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveCategoryFilterCandidates } from "./memory-categories.js";
+import { matchesMemoryCategoryFilter, resolveCategoryFilterCandidates } from "./memory-categories.js";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 
 // ============================================================================
@@ -1757,7 +1757,7 @@ export class MemoryStore {
       ],
     );
 
-    return results
+    const entries = results
       .map(
         (row): MemoryEntry => ({
           id: row.id as string,
@@ -1769,7 +1769,13 @@ export class MemoryStore {
           timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),
-      )
+      );
+
+    return (category
+      ? entries.filter((entry) =>
+          matchesMemoryCategoryFilter(entry.category, category, entry.metadata),
+        )
+      : entries)
       .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
       .slice(offset, offset + limit);
   }

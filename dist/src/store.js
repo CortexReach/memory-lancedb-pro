@@ -7,7 +7,7 @@ import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync, 
 import { access as accessAsync, lstat as lstatAsync, mkdir as mkdirAsync, realpath as realpathAsync, rmdir as rmdirAsync, stat as statAsync, unlink as unlinkAsync, writeFile as writeFileAsync, } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveCategoryFilterCandidates } from "./memory-categories.js";
+import { matchesMemoryCategoryFilter, resolveCategoryFilterCandidates } from "./memory-categories.js";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 // ============================================================================
 // LanceDB Dynamic Import
@@ -51,7 +51,11 @@ function clampInt(value, min, max) {
         return min;
     return Math.min(max, Math.max(min, Math.floor(value)));
 }
+const LEGACY_STABLE_MEMORY_ID_REGEX = /^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$/;
 const LEGACY_SECONDS_TIMESTAMP_MAX = 1_000_000_000_000;
+function isLegacyStableMemoryId(id) {
+    return LEGACY_STABLE_MEMORY_ID_REGEX.test(id);
+}
 export function normalizeMemoryTimestamp(value, fallback = Date.now()) {
     const raw = value instanceof Date
         ? value.getTime()
@@ -1450,7 +1454,7 @@ export class MemoryStore {
             "timestamp",
             "metadata",
         ]);
-        return results
+        const entries = results
             .map((row) => ({
             id: row.id,
             text: row.text,
@@ -1460,7 +1464,10 @@ export class MemoryStore {
             importance: Number(row.importance),
             timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: row.metadata || "{}",
-        }))
+        }));
+        return (category
+            ? entries.filter((entry) => matchesMemoryCategoryFilter(entry.category, category, entry.metadata))
+            : entries)
             .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
             .slice(offset, offset + limit);
     }
@@ -1689,20 +1696,19 @@ export class MemoryStore {
             throw new Error(`Memory ${id} is outside accessible scopes`);
         }
         return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
-            // Support both full UUID and short prefix (8+ hex chars), same as delete()
-            // Also support legacy mem-md-N format from older memory-lancedb-pro versions
+            // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
+            // from older stores (for example "mem-md-..." or "data-pointer-...").
             const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
             const prefixRegex = /^[0-9a-f]{8,}$/i;
-            const legacyRegex = /^mem-md-\d+$/i;
             const isFullId = uuidRegex.test(id);
             const isPrefix = !isFullId && prefixRegex.test(id);
-            const isLegacy = !isFullId && !isPrefix && legacyRegex.test(id);
-            if (!isFullId && !isPrefix && !isLegacy) {
+            const isLegacyStableId = !isFullId && !isPrefix && isLegacyStableMemoryId(id);
+            if (!isFullId && !isPrefix && !isLegacyStableId) {
                 throw new Error(`Invalid memory ID format: ${id}`);
             }
             let rows;
-            if (isFullId || isLegacy) {
-                // Legacy IDs use exact string match like full UUIDs
+            if (isFullId || isLegacyStableId) {
+                // Legacy IDs use exact string match like full UUIDs.
                 const safeId = escapeSqlLiteral(id);
                 rows = await this.table.query()
                     .where(`id = '${safeId}'`)
