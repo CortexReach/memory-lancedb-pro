@@ -77,6 +77,7 @@ function sleep(ms: number): Promise<void> {
 export class RedisLockManager {
   private readonly config: Required<Omit<RedisLockConfig, "url" | "onWarning">> & Pick<RedisLockConfig, "url" | "onWarning">;
   private clientPromise: Promise<RedisClientLike> | null = null;
+  private isClosed = false;
 
   constructor(config: RedisLockConfig, private readonly injectedClient?: RedisClientLike) {
     this.config = {
@@ -92,9 +93,9 @@ export class RedisLockManager {
   }
 
   async withLock<T>(resource: string, fn: () => Promise<T>): Promise<T> {
+    const key = this.makeKey(resource);
     const client = await this.getClient();
     this.assertClientSupportsLocking(client);
-    const key = this.makeKey(resource);
     const token = randomUUID();
 
     await this.acquire(client, key, token);
@@ -111,7 +112,7 @@ export class RedisLockManager {
         { cause: error },
       );
     };
-    const renewIntervalMs = Math.max(1, Math.floor(this.config.ttlMs / 3));
+    const renewIntervalMs = Math.max(100, Math.floor(this.config.ttlMs / 5));
     const renewTimer = setInterval(() => {
       void this.renew(client, key, token).then((renewed) => {
         if (renewed === false) {
@@ -162,6 +163,7 @@ export class RedisLockManager {
   }
 
   async close(): Promise<void> {
+    this.isClosed = true;
     if (!this.clientPromise) return;
 
     const client = await this.clientPromise.catch(() => null);
@@ -178,6 +180,9 @@ export class RedisLockManager {
   }
 
   private async getClient(): Promise<RedisClientLike> {
+    if (this.isClosed) {
+      throw new RedisLockUnavailableError("Redis lock manager has been closed");
+    }
     if (this.injectedClient) return this.injectedClient;
     if (!this.config.url) {
       throw new RedisLockUnavailableError("Redis lock is enabled but no Redis URL was configured");
@@ -212,6 +217,9 @@ export class RedisLockManager {
       return client;
     } catch (err) {
       this.clientPromise = null;
+      this.config.onWarning?.(
+        `memory-lancedb-pro: Redis lock connection failed; using file lock when available: ${String(err)}`,
+      );
       throw new RedisLockUnavailableError(
         `Redis lock connection failed: ${err instanceof Error ? err.message : String(err)}`,
         { cause: err as Error },
@@ -220,7 +228,10 @@ export class RedisLockManager {
   }
 
   private makeKey(resource: string): string {
-    const digest = createHash("sha256").update(resource || "default").digest("hex");
+    if (typeof resource !== "string" || resource.length === 0) {
+      throw new RedisLockAcquisitionError("Redis lock resource must be a non-empty string");
+    }
+    const digest = createHash("sha256").update(resource).digest("hex");
     return `${this.config.keyPrefix}:${digest}`;
   }
 
@@ -245,10 +256,8 @@ export class RedisLockManager {
         lastError = err;
       }
 
-      const delayMs = Math.min(
-        this.config.retryDelayMs * 2 ** attempt,
-        Math.max(this.config.retryDelayMs, 1_000),
-      );
+      const maxDelayMs = Math.max(this.config.retryDelayMs, 100);
+      const delayMs = Math.min(this.config.retryDelayMs * 2 ** attempt, maxDelayMs);
       attempt += 1;
       await sleep(Math.min(delayMs, Math.max(0, deadline - Date.now())));
     }

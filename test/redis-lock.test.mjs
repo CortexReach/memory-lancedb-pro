@@ -114,6 +114,54 @@ describe("RedisLockManager", () => {
     assert.equal(attempts, 3);
   });
 
+  it("rejects new writes after the lock manager is closed", async () => {
+    let setCalls = 0;
+    const manager = new RedisLockManager({
+      url: "redis://localhost:6379",
+      acquireTimeoutMs: 20,
+      retryDelayMs: 1,
+    }, {
+      async set() {
+        setCalls += 1;
+        return "OK";
+      },
+      async eval() {
+        return 1;
+      },
+    });
+
+    await manager.close();
+
+    await assert.rejects(
+      () => manager.withLock("/tmp/db", async () => "should not run"),
+      RedisLockUnavailableError,
+    );
+    assert.equal(setCalls, 0);
+  });
+
+  it("rejects empty Redis lock resources without acquiring a client", async () => {
+    let setCalls = 0;
+    const manager = new RedisLockManager({
+      url: "redis://localhost:6379",
+      acquireTimeoutMs: 20,
+      retryDelayMs: 1,
+    }, {
+      async set() {
+        setCalls += 1;
+        return "OK";
+      },
+      async eval() {
+        return 1;
+      },
+    });
+
+    await assert.rejects(
+      () => manager.withLock("", async () => "should not run"),
+      RedisLockAcquisitionError,
+    );
+    assert.equal(setCalls, 0);
+  });
+
   it("throws RedisLockAcquisitionError when Redis SET keeps failing after protocol starts", async () => {
     const manager = new RedisLockManager({
       url: "redis://localhost:6379",
@@ -205,19 +253,19 @@ describe("RedisLockManager", () => {
     };
     const first = new RedisLockManager({
       url: "redis://localhost:6379",
-      ttlMs: 20,
+      ttlMs: 200,
       acquireTimeoutMs: 20,
       retryDelayMs: 1,
     }, client);
     const second = new RedisLockManager({
       url: "redis://localhost:6379",
-      ttlMs: 20,
+      ttlMs: 200,
       acquireTimeoutMs: 5,
       retryDelayMs: 1,
     }, client);
 
     await first.withLock("/tmp/db", async () => {
-      await sleep(45);
+      await sleep(130);
       await assert.rejects(
         () => second.withLock("/tmp/db", async () => {
           throw new Error("second writer should not enter");
@@ -235,7 +283,7 @@ describe("RedisLockManager", () => {
     const events = [];
     const manager = new RedisLockManager({
       url: "redis://localhost:6379",
-      ttlMs: 5,
+      ttlMs: 120,
       acquireTimeoutMs: 20,
       retryDelayMs: 1,
     }, {
@@ -254,7 +302,7 @@ describe("RedisLockManager", () => {
     await assert.rejects(
       () => manager.withLock("/tmp/db", async () => {
         events.push("write-started");
-        await sleep(20);
+        await sleep(150);
         events.push("write-settled");
       }),
       RedisLockLeaseIntegrityError,
@@ -268,7 +316,7 @@ describe("RedisLockManager", () => {
     let renewAttempts = 0;
     const manager = new RedisLockManager({
       url: "redis://localhost:6379",
-      ttlMs: 100,
+      ttlMs: 700,
       acquireTimeoutMs: 20,
       retryDelayMs: 1,
       onWarning: (message) => warnings.push(message),
@@ -289,7 +337,7 @@ describe("RedisLockManager", () => {
     });
 
     const result = await manager.withLock("/tmp/db", async () => {
-      const deadline = Date.now() + 90;
+      const deadline = Date.now() + 350;
       while (renewAttempts < 2 && Date.now() < deadline) {
         await sleep(5);
       }
@@ -299,6 +347,35 @@ describe("RedisLockManager", () => {
     assert.equal(result, "committed");
     assert.ok(renewAttempts >= 2);
     assert.match(warnings.join("\n"), /transient Redis lock renewal failure/);
+  });
+
+  it("does not renew sub-second leases more aggressively than every 100ms", async () => {
+    let renewAttempts = 0;
+    const manager = new RedisLockManager({
+      url: "redis://localhost:6379",
+      ttlMs: 1_000,
+      acquireTimeoutMs: 20,
+      retryDelayMs: 1,
+    }, {
+      async set() {
+        return "OK";
+      },
+      async eval(script) {
+        if (script.includes("pexpire")) {
+          renewAttempts += 1;
+          return 1;
+        }
+        return 1;
+      },
+    });
+
+    const result = await manager.withLock("/tmp/db", async () => {
+      await sleep(90);
+      return "committed";
+    });
+
+    assert.equal(result, "committed");
+    assert.equal(renewAttempts, 0);
   });
 
   it("does not mask a successful write when Redis release fails", async () => {
