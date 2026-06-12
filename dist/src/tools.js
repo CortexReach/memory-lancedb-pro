@@ -1368,7 +1368,7 @@ export function registerMemoryStatsTool(api, context) {
 }
 export function registerMemoryDebugTool(api, context) {
     api.registerTool((toolCtx) => {
-        const agentId = resolveAgentId(toolCtx?.agentId, context.agentId) ?? "main";
+        const staticAgentId = resolveAgentId(toolCtx?.agentId, context.agentId);
         return {
             name: "memory_debug",
             label: "Memory Debug",
@@ -1378,10 +1378,11 @@ export function registerMemoryDebugTool(api, context) {
                 limit: Type.Optional(Type.Number({ description: "Max results to return (default: 5, max: 20)" })),
                 scope: Type.Optional(Type.String({ description: "Specific memory scope to search in (optional)" })),
             }),
-            async execute(_toolCallId, params) {
+            async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
                 const { query, limit = 5, scope } = params;
                 try {
                     const safeLimit = clampInt(limit, 1, 20);
+                    const agentId = resolveRuntimeAgentId(staticAgentId, runtimeCtx);
                     const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
                     const { scopeFilter } = resolvedScopes;
                     const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);

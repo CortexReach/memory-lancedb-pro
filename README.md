@@ -402,6 +402,7 @@ Query → BM25 FTS ─────┘
 - Built-in scopes: `global`, `agent:<id>`, `custom:<name>`, `project:<id>`, `user:<id>`
 - Agent-level access control via `scopes.agentAccess`
 - Default: each agent accesses `global` + its own `agent:<id>` scope
+- Read-only tools such as `memory_recall`, `memory_search`, `memory_list`, and `memory_debug` fail soft when a requested scope is inaccessible: they search the caller's accessible scopes instead and return `ignoredScope` plus `accessibleScopes` in details. Write and mutation tools still return `scope_access_denied` for inaccessible scopes.
 
 ### Auto-Capture & Auto-Recall
 
