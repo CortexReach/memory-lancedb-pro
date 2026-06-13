@@ -25,5 +25,5 @@ const result = spawnSync(process.execPath, ["scripts/verify-package-runtime.mjs"
 assert.equal(
   result.status,
   0,
-  result.stderr || result.stdout || "verify-package-runtime.mjs should pass",
+  result.stderr || result.stdout || "verify-package-runtime.mjs should pass and dist should be fresh",
 );

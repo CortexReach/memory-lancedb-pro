@@ -876,8 +876,9 @@ export class MemoryRetriever {
                 const model = this.config.rerankModel || "jina-reranker-v3";
                 const endpoint = this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
                 const documents = results.map((r) => r.entry.text);
+                const rerankTopN = Math.min(results.length, Math.max(1, this.config.candidatePoolSize));
                 // Build provider-specific request
-                const { headers, body } = buildRerankRequest(provider, this.config.rerankApiKey || "", model, query, documents, results.length);
+                const { headers, body } = buildRerankRequest(provider, this.config.rerankApiKey || "", model, query, documents, rerankTopN);
                 // Timeout: configurable via rerankTimeoutMs (default: 5000ms)
                 const controller = new AbortController();
                 const timeout = setTimeout(() => controller.abort(), this.config.rerankTimeoutMs ?? 5000);
