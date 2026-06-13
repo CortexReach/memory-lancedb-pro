@@ -108,6 +108,8 @@ export interface RetrievalContext {
   source?: "manual" | "auto-recall" | "cli";
   /** Optional cancellation signal for callers with an outer timeout budget. */
   signal?: AbortSignal;
+  /** Optional per-call rerank timeout. Lets callers reserve time for fallback work inside an outer budget. */
+  rerankTimeoutMs?: number;
 }
 
 export interface RetrievalResult extends MemorySearchResult {
@@ -586,7 +588,7 @@ export class MemoryRetriever {
   }
 
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
-    const { query, limit, scopeFilter, category, source, signal } = context;
+    const { query, limit, scopeFilter, category, source, signal, rerankTimeoutMs } = context;
     const safeLimit = clampInt(limit, 1, 20);
     this.lastDiagnostics = null;
     const diagnostics: RetrievalDiagnostics = {
@@ -657,6 +659,7 @@ export class MemoryRetriever {
           source,
           diagnostics,
           signal,
+          rerankTimeoutMs,
         );
       }
 
@@ -944,6 +947,7 @@ export class MemoryRetriever {
     source?: RetrievalContext["source"],
     diagnostics?: RetrievalDiagnostics,
     signal?: AbortSignal,
+    rerankTimeoutMs?: number,
   ): Promise<RetrievalResult[]> {
     let failureStage: RetrievalDiagnostics["failureStage"] = "hybrid.embedQuery";
     try {
@@ -1056,7 +1060,7 @@ export class MemoryRetriever {
       failureStage = "hybrid.rerank";
       if (this.config.rerank !== "none") {
         trace?.startStage("rerank", filtered.map((r) => r.entry.id));
-        reranked = await this.rerankResults(query, queryVector, rerankInput, diagnostics);
+        reranked = await this.rerankResults(query, queryVector, rerankInput, diagnostics, rerankTimeoutMs);
         trace?.endStage(reranked.map((r) => r.entry.id), reranked.map((r) => r.score));
       } else {
         reranked = filtered;
@@ -1267,6 +1271,7 @@ export class MemoryRetriever {
     queryVector: number[],
     results: RetrievalResult[],
     diagnostics?: RetrievalDiagnostics,
+    timeoutOverrideMs?: number,
   ): Promise<RetrievalResult[]> {
     if (results.length === 0) {
       return results;
@@ -1305,9 +1310,11 @@ export class MemoryRetriever {
           rerankTopN,
         );
 
+        const effectiveTimeoutMs = timeoutOverrideMs ?? this.config.rerankTimeoutMs ?? 5000;
+
         // Timeout: configurable via rerankTimeoutMs (default: 5000ms)
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), this.config.rerankTimeoutMs ?? 5000);
+        const timeout = setTimeout(() => controller.abort(), effectiveTimeoutMs);
 
         let response: Response;
         try {
@@ -1383,7 +1390,7 @@ export class MemoryRetriever {
         }
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
-          const message = `Rerank API timed out (${this.config.rerankTimeoutMs ?? 5000}ms)`;
+          const message = `Rerank API timed out (${timeoutOverrideMs ?? this.config.rerankTimeoutMs ?? 5000}ms)`;
           recordFallback("timeout", message);
           console.warn(`${message}, falling back to cosine`);
         } else {

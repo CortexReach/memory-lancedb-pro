@@ -157,6 +157,18 @@ function getAutoRecallRetrieveLimit(autoRecallMaxItems) {
 function getAutoRecallRerankInputLimit(retrieveLimit) {
     return clampInt(retrieveLimit, 1, 20) * 2;
 }
+function getAutoRecallRerankTimeoutMs(config, retrievalConfig, autoRecallTimeoutMs) {
+    if (retrievalConfig.rerank !== "cross-encoder" || !retrievalConfig.rerankApiKey)
+        return undefined;
+    if (typeof config.retrieval?.rerankTimeoutMs === "number")
+        return undefined;
+    if (!Number.isFinite(autoRecallTimeoutMs) || autoRecallTimeoutMs <= 0)
+        return undefined;
+    const halfBudget = Math.floor(autoRecallTimeoutMs / 2);
+    if (autoRecallTimeoutMs <= 1_000)
+        return Math.max(100, halfBudget);
+    return clampInt(halfBudget, 500, 2_500);
+}
 export function buildAutoRecallRerankCostWarning(config, retrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...(config.retrieval || {}) }) {
     if (config.autoRecall !== true || config.recallMode === "off")
         return null;
@@ -2322,6 +2334,7 @@ const memoryLanceDBProPlugin = {
                     const retrieveLimit = getAutoRecallRetrieveLimit(autoRecallMaxItems);
                     const retrievalConfig = retriever.getConfig();
                     const rerankInputLimit = getAutoRecallRerankInputLimit(retrieveLimit);
+                    const autoRecallRerankTimeoutMs = getAutoRecallRerankTimeoutMs(config, retrievalConfig, AUTO_RECALL_TIMEOUT_MS);
                     // Adaptive intent analysis (zero-LLM-cost pattern matching)
                     const intent = recallMode === "adaptive" ? analyzeIntent(recallQuery) : undefined;
                     if (intent) {
@@ -2333,6 +2346,9 @@ const memoryLanceDBProPlugin = {
                         scopeFilter: accessibleScopes,
                         source: "auto-recall",
                         signal: autoRecallAbortController.signal,
+                        ...(autoRecallRerankTimeoutMs !== undefined
+                            ? { rerankTimeoutMs: autoRecallRerankTimeoutMs }
+                            : {}),
                     }), config.workspaceBoundary);
                     if (shouldDropLateAutoRecall("post-retrieve"))
                         return;
