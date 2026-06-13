@@ -5,9 +5,9 @@
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { homedir, tmpdir } from "node:os";
-import { join, dirname, basename, win32 as winPath } from "node:path";
+import { join, dirname, basename, resolve, win32 as winPath } from "node:path";
 import { readFile, readdir, writeFile, mkdir, appendFile, unlink, stat } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { readFileSync, appendFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
@@ -3232,6 +3232,39 @@ const memoryLanceDBProPlugin = {
               `memory-lancedb-pro: auto-recall skipped injection after budgeting (hits=${results.length}, dedupFiltered=${dedupFilteredCount}, maxItems=${autoRecallMaxItems}, maxChars=${autoRecallMaxChars})`,
             );
             return;
+          }
+
+          // [PATCH 2026-06-10] emit memory.recall.recorded for memory-core dreaming pipeline.
+          // Append a JSONL record per injected recall turn to memory/.dreams/events.jsonl so
+          // memory-core's dreaming short-term promotion can count recalls per entry. Failures
+          // here must never break the recall path, so wrap in try/catch and downgrade to debug.
+          try {
+            const selectedIds = new Set(selected.map((it) => it.id));
+            const emittedResults = results
+              .filter((r) => selectedIds.has(r.entry.id))
+              .map((r) => ({
+                path: typeof r.entry.path === "string" ? r.entry.path : "",
+                startLine: Number(r.entry.startLine) || 0,
+                endLine: Number(r.entry.endLine) || 0,
+                score: Number(r.score) || 0,
+              }));
+            const emittedEvent = {
+              type: "memory.recall.recorded",
+              timestamp: new Date().toISOString(),
+              query: String(recallQuery || ""),
+              resultCount: emittedResults.length,
+              results: emittedResults,
+            };
+            const workspaceRoot =
+              typeof api.resolvePath === "function"
+                ? api.resolvePath(".")
+                : resolve(process.cwd());
+            const eventLogPath = join(workspaceRoot, "memory", ".dreams", "events.jsonl");
+            appendFileSync(eventLogPath, JSON.stringify(emittedEvent) + "\n", "utf8");
+          } catch (emitErr) {
+            api.logger.debug?.(
+              "memory-lancedb-pro: failed to emit memory.recall.recorded: " + String(emitErr),
+            );
           }
 
           if (shouldDropLateAutoRecall("pre-metadata")) return;

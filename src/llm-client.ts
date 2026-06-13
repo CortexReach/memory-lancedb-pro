@@ -208,7 +208,7 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
             {
               role: "system",
               content:
-                "You are a memory extraction assistant. Always respond with valid JSON only.",
+                "You are a memory extraction assistant. Always respond with valid JSON only. /no_think",
             },
             { role: "user", content: prompt },
           ],

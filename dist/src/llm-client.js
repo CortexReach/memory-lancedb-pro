@@ -157,7 +157,7 @@ function createApiKeyClient(config, log, warnLog) {
                     messages: [
                         {
                             role: "system",
-                            content: "You are a memory extraction assistant. Always respond with valid JSON only.",
+                            content: "You are a memory extraction assistant. Always respond with valid JSON only. /no_think",
                         },
                         { role: "user", content: prompt },
                     ],

@@ -29,6 +29,21 @@ export function __setLockfileModuleForTests(module) {
 }
 export const loadLanceDB = async () => {
     if (!lancedbImportPromise) {
+        // @lancedb/lancedb's napi-rs loader (dist/native.js) detects musl via
+        // process.report.getReport(). The report's network section performs
+        // reverse-DNS lookups for every network interface, synchronously on the
+        // calling thread; on hosts with several interfaces and a slow or flaky
+        // DNS path (measured on WSL2 + Tailscale) this blocks the event loop for
+        // 110-250s on the FIRST LanceDB load — the host app's HTTP server and
+        // pollers freeze with CPU at 0% (main thread stuck in poll()). Excluding
+        // the network section turns the measured 235s hang into ~3ms and loses
+        // nothing: isMusl() only reads report.header.glibcVersionRuntime.
+        try {
+            process.report.excludeNetwork = true;
+        }
+        catch {
+            /* Node < 22 without the flag — keep the previous behavior */
+        }
         // Use a createRequire-built require() so LanceDB's CommonJS native bindings
         // keep Windows-safe CJS semantics while still working in pure ESM runtimes.
         // Do not name this binding "require": bundlers may rewrite bare require()
@@ -50,7 +65,11 @@ function clampInt(value, min, max) {
         return min;
     return Math.min(max, Math.max(min, Math.floor(value)));
 }
+const LEGACY_STABLE_MEMORY_ID_REGEX = /^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$/;
 const LEGACY_SECONDS_TIMESTAMP_MAX = 1_000_000_000_000;
+function isLegacyStableMemoryId(id) {
+    return LEGACY_STABLE_MEMORY_ID_REGEX.test(id);
+}
 export function normalizeMemoryTimestamp(value, fallback = Date.now()) {
     const raw = value instanceof Date
         ? value.getTime()
@@ -1704,20 +1723,19 @@ export class MemoryStore {
             throw new Error(`Memory ${id} is outside accessible scopes`);
         }
         return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
-            // Support both full UUID and short prefix (8+ hex chars), same as delete()
-            // Also support legacy mem-md-N format from older memory-lancedb-pro versions
+            // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
+            // from older stores (for example "mem-md-..." or "data-pointer-...").
             const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
             const prefixRegex = /^[0-9a-f]{8,}$/i;
-            const legacyRegex = /^mem-md-\d+$/i;
             const isFullId = uuidRegex.test(id);
             const isPrefix = !isFullId && prefixRegex.test(id);
-            const isLegacy = !isFullId && !isPrefix && legacyRegex.test(id);
-            if (!isFullId && !isPrefix && !isLegacy) {
+            const isLegacyStableId = !isFullId && !isPrefix && isLegacyStableMemoryId(id);
+            if (!isFullId && !isPrefix && !isLegacyStableId) {
                 throw new Error(`Invalid memory ID format: ${id}`);
             }
             let rows;
-            if (isFullId || isLegacy) {
-                // Legacy IDs use exact string match like full UUIDs
+            if (isFullId || isLegacyStableId) {
+                // Legacy IDs use exact string match like full UUIDs.
                 const safeId = escapeSqlLiteral(id);
                 rows = await this.table.query()
                     .where(`id = '${safeId}'`)
