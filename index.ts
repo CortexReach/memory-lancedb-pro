@@ -26,7 +26,12 @@ import {
   getEffectiveVectorDimensions,
 } from "./src/embedder.js";
 import type { ChunkerAstConfig, CodeChunkLanguage } from "./src/chunker.js";
-import { createRetriever, DEFAULT_RETRIEVAL_CONFIG, type RetrievalConfig } from "./src/retriever.js";
+import {
+  createRetriever,
+  normalizeRetrievalConfig,
+  type RetrievalConfig,
+  type RetrievalConfigInput,
+} from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
@@ -180,6 +185,10 @@ interface PluginConfig {
     timeDecayHalfLifeDays?: number;
     reinforcementFactor?: number;
     maxHalfLifeMultiplier?: number;
+    neighborEnrichment?: {
+      enabled?: boolean;
+      maxPerResult?: number;
+    };
     /** Disable LanceDB native vector search and rank scanned rows with JS cosine. */
     disableNativeCosine?: boolean;
   };
@@ -517,7 +526,9 @@ function getAutoRecallRerankTimeoutMs(
 
 export function buildAutoRecallRerankCostWarning(
   config: PluginConfig,
-  retrievalConfig: RetrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...(config.retrieval || {}) } as RetrievalConfig,
+  retrievalConfig: RetrievalConfig = normalizeRetrievalConfig(
+    config.retrieval as RetrievalConfigInput | undefined,
+  ),
 ): string | null {
   if (config.autoRecall !== true || config.recallMode === "off") return null;
   if (retrievalConfig.mode === "vector") return null;
@@ -2257,7 +2268,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     ...DEFAULT_TIER_CONFIG,
     ...(config.tier || {}),
   });
-  const retrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config.retrieval } as RetrievalConfig & {
+  const retrievalConfig = normalizeRetrievalConfig(
+    config.retrieval as RetrievalConfigInput | undefined,
+  ) as RetrievalConfig & {
     rerankApiKey?: SecretCredential;
   };
   if (retrievalConfig.rerank === "cross-encoder" && retrievalConfig.rerankApiKey) {
@@ -3273,7 +3286,13 @@ const memoryLanceDBProPlugin = {
               : intent?.depth === "full"
                 ? (r.entry.text) // full text for deep queries
                 : (metaObj.l0_abstract || r.entry.text); // L0/L1 default
-            const summary = sanitizeForContext(contentText).slice(0, effectivePerItemMaxChars);
+            const neighborContext = r.neighbors && r.neighbors.length > 0
+              ? ` Related: ${r.neighbors
+                .map((neighbor) => sanitizeForContext(neighbor.entry.text).slice(0, 80))
+                .filter(Boolean)
+                .join(" | ")}`
+              : "";
+            const summary = sanitizeForContext(`${contentText}${neighborContext}`).slice(0, effectivePerItemMaxChars);
             return {
               id: r.entry.id,
               prefix: (() => {

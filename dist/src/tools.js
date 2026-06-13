@@ -70,6 +70,20 @@ function sanitizeMemoryForSerialization(results) {
         importance: r.entry.importance,
         score: r.score,
         sources: r.sources,
+        ...(r.neighbors && r.neighbors.length > 0
+            ? {
+                neighbors: r.neighbors.map((neighbor) => ({
+                    id: neighbor.entry.id,
+                    text: neighbor.entry.text,
+                    category: getDisplayCategoryTag(neighbor.entry),
+                    rawCategory: neighbor.entry.category,
+                    scope: neighbor.entry.scope,
+                    importance: neighbor.entry.importance,
+                    score: neighbor.score,
+                    sources: neighbor.sources,
+                })),
+            }
+            : {}),
     }));
 }
 function isUnresolvedReflectionItem(entry) {
@@ -656,7 +670,12 @@ function createMemoryRecallTool(runtimeContext, options) {
                     const rendered = includeFullText
                         ? inline
                         : truncateText(inline, safeCharsPerItem);
-                    return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${rendered}`;
+                    const neighborText = r.neighbors && r.neighbors.length > 0
+                        ? `\n   Neighbors: ${r.neighbors
+                            .map((neighbor) => `[${neighbor.entry.id}] ${truncateText(normalizeInlineText(neighbor.entry.text), 120)}`)
+                            .join("; ")}`
+                        : "";
+                    return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${rendered}${neighborText}`;
                 })
                     .join("\n");
                 const serializedMemories = sanitizeMemoryForSerialization(results);
@@ -1637,7 +1656,10 @@ export function registerMemoryDebugTool(api, context) {
                         if (r.sources.reranked)
                             sources.push("reranked");
                         const categoryTag = getDisplayCategoryTag(r.entry);
-                        return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text.slice(0, 120)}${r.entry.text.length > 120 ? "..." : ""} (${(r.score * 100).toFixed(1)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
+                        const neighborText = r.neighbors && r.neighbors.length > 0
+                            ? ` neighbors=${r.neighbors.map((neighbor) => neighbor.entry.id).join(",")}`
+                            : "";
+                        return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text.slice(0, 120)}${r.entry.text.length > 120 ? "..." : ""} (${(r.score * 100).toFixed(1)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""}${neighborText})`;
                     });
                     const text = [...traceLines, ``, `Results (${results.length}):`, ...resultLines].join("\n");
                     return {
@@ -2210,6 +2232,8 @@ export function registerMemoryExplainRankTool(api, context) {
                         sourceBreakdown.push(`bm25=${r.sources.bm25.score.toFixed(3)}`);
                     if (r.sources.reranked)
                         sourceBreakdown.push(`rerank=${r.sources.reranked.score.toFixed(3)}`);
+                    if (r.neighbors && r.neighbors.length > 0)
+                        sourceBreakdown.push(`neighbors=${r.neighbors.length}`);
                     return [
                         `${idx + 1}. [${r.entry.id}] score=${r.score.toFixed(3)} ${sourceBreakdown.join(" ")}`.trim(),
                         `   state=${meta.state} layer=${meta.memory_layer} source=${meta.source} tier=${meta.tier}`,

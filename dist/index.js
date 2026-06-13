@@ -18,7 +18,7 @@ const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 // Import core components
 import { MemoryStore, normalizeStoragePath } from "./src/store.js";
 import { createEmbedder, getEffectiveVectorDimensions, } from "./src/embedder.js";
-import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
+import { createRetriever, normalizeRetrievalConfig, } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
@@ -224,7 +224,7 @@ function getAutoRecallRerankTimeoutMs(config, retrievalConfig, autoRecallTimeout
         return halfBudget;
     return clampInt(halfBudget, 500, 2_500);
 }
-export function buildAutoRecallRerankCostWarning(config, retrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...(config.retrieval || {}) }) {
+export function buildAutoRecallRerankCostWarning(config, retrievalConfig = normalizeRetrievalConfig(config.retrieval)) {
     if (config.autoRecall !== true || config.recallMode === "off")
         return null;
     if (retrievalConfig.mode === "vector")
@@ -1687,7 +1687,7 @@ function _initPluginState(api) {
         ...DEFAULT_TIER_CONFIG,
         ...(config.tier || {}),
     });
-    const retrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config.retrieval };
+    const retrievalConfig = normalizeRetrievalConfig(config.retrieval);
     if (retrievalConfig.rerank === "cross-encoder" && retrievalConfig.rerankApiKey) {
         retrievalConfig.rerankApiKey = resolveSecretCredential(api, retrievalConfig.rerankApiKey, "retrieval.rerankApiKey");
     }
@@ -2495,7 +2495,13 @@ const memoryLanceDBProPlugin = {
                             : intent?.depth === "full"
                                 ? (r.entry.text) // full text for deep queries
                                 : (metaObj.l0_abstract || r.entry.text); // L0/L1 default
-                        const summary = sanitizeForContext(contentText).slice(0, effectivePerItemMaxChars);
+                        const neighborContext = r.neighbors && r.neighbors.length > 0
+                            ? ` Related: ${r.neighbors
+                                .map((neighbor) => sanitizeForContext(neighbor.entry.text).slice(0, 80))
+                                .filter(Boolean)
+                                .join(" | ")}`
+                            : "";
+                        const summary = sanitizeForContext(`${contentText}${neighborContext}`).slice(0, effectivePerItemMaxChars);
                         return {
                             id: r.entry.id,
                             prefix: (() => {
