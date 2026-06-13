@@ -8,6 +8,7 @@ intended for the release tracked in #812 and future beta/stable cuts.
 - Current package version: `1.1.0-beta.11`
 - Recommended first publish: beta dist-tag
 - Stable channel decision: maintainer-owned after beta smoke testing
+- Current public package snapshot: see [release-status.md](release-status.md)
 
 The current release driver is that npm users are still behind repository
 `master`: merged fixes are not available from the published `latest` package,

@@ -18,6 +18,7 @@ function escapeRegExp(value) {
 const pkg = readJson("package.json");
 const manifest = readJson("openclaw.plugin.json");
 const releaseChecklist = readText("docs/release-checklist.md");
+const releaseStatus = readText("docs/release-status.md");
 
 assert.equal(pkg.version, manifest.version, "package and plugin manifest versions must match before release");
 assert.match(pkg.version, /^1\.1\.0-beta\.\d+$/, "current release target should remain an explicit v1.1.0 beta");
@@ -40,6 +41,10 @@ assert.match(releaseChecklist, /npm run test:packaging-and-workflow/);
 assert.match(releaseChecklist, /npm pack --dry-run/);
 assert.match(releaseChecklist, /npm publish --tag beta --dry-run/);
 assert.match(releaseChecklist, /npm view memory-lancedb-pro@beta version main openclaw files --json/);
+assert.match(releaseChecklist, /release-status\.md/);
+assert.match(releaseStatus, new RegExp(`repository package version is \`${escapeRegExp(pkg.version)}\``));
+assert.match(releaseStatus, /npm view memory-lancedb-pro@beta version/);
+assert.match(releaseStatus, /dist\/index\.js/);
 
 assert.ok(
   CI_TEST_MANIFEST.some((entry) => entry.file === "test/release-readiness.test.mjs"),
