@@ -39,15 +39,67 @@
                 "minLength": 1
               },
               {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "source",
+                  "id"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "env",
+                      "file"
+                    ]
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              },
+              {
                 "type": "array",
                 "items": {
-                  "type": "string",
-                  "minLength": 1
+                  "oneOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "required": [
+                        "source",
+                        "id"
+                      ],
+                      "properties": {
+                        "source": {
+                          "type": "string",
+                          "enum": [
+                            "env",
+                            "file"
+                          ]
+                        },
+                        "provider": {
+                          "type": "string"
+                        },
+                        "id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      }
+                    }
+                  ]
                 },
                 "minItems": 1
               }
             ],
-            "description": "Single API key or array of keys for round-robin rotation"
+            "description": "Single API key, SecretRef, or array of keys/SecretRefs for round-robin rotation"
           },
           "model": {
             "type": "string"
@@ -499,7 +551,36 @@
             "default": "cross-encoder"
           },
           "rerankApiKey": {
-            "type": "string",
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "source",
+                  "id"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "env",
+                      "file"
+                    ]
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            ],
             "description": "API key for reranker service (enables cross-encoder reranking)"
           },
           "rerankModel": {
@@ -1326,7 +1407,36 @@
             "description": "LLM authentication mode. oauth uses the local Codex/ChatGPT login cache instead of llm.apiKey."
           },
           "apiKey": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "source",
+                  "id"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "env",
+                      "file"
+                    ]
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            ]
           },
           "model": {
             "type": "string",

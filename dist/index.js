@@ -79,12 +79,56 @@ function resolveEnvVars(value) {
         return envValue;
     });
 }
-function resolveFirstApiKey(apiKey) {
+function isSecretRefConfig(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        return false;
+    const raw = value;
+    return typeof raw.source === "string" && raw.source.trim().length > 0 &&
+        typeof raw.id === "string" && raw.id.trim().length > 0;
+}
+function describeSecretRef(ref) {
+    return `source=${ref.source}, id=${ref.id}`;
+}
+function resolveSecretRef(api, ref, label) {
+    const source = ref.source.trim();
+    const id = ref.id.trim();
+    try {
+        if (source === "env") {
+            const value = process.env[id];
+            if (!value)
+                throw new Error(`environment variable ${id} is not set`);
+            return value;
+        }
+        if (source === "file") {
+            const filePath = api.resolvePath(id);
+            const value = readFileSync(filePath, "utf8").trimEnd();
+            if (!value)
+                throw new Error(`file ${filePath} is empty`);
+            return value;
+        }
+        throw new Error(`unsupported SecretRef source "${source}"`);
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Failed to resolve SecretRef for ${label} (${describeSecretRef(ref)}): ${message}`);
+    }
+}
+function resolveSecretCredential(api, value, label) {
+    return typeof value === "string"
+        ? resolveEnvVars(value)
+        : resolveSecretRef(api, value, label);
+}
+function resolveSecretCredentialArray(api, value, label) {
+    if (!Array.isArray(value))
+        return resolveSecretCredential(api, value, label);
+    return value.map((entry, index) => resolveSecretCredential(api, entry, `${label}[${index}]`));
+}
+function resolveFirstApiKey(api, apiKey) {
     const key = Array.isArray(apiKey) ? apiKey[0] : apiKey;
     if (!key) {
         throw new Error("embedding.apiKey is empty");
     }
-    return resolveEnvVars(key);
+    return resolveSecretCredential(api, key, "embedding.apiKey");
 }
 function resolveOptionalPathWithEnv(api, value, fallback) {
     const raw = typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback;
@@ -1590,6 +1634,7 @@ function _initPluginState(api) {
     const config = parsePluginConfig(api.pluginConfig);
     let resolvedDbPath = normalizeStoragePath(api.resolvePath(config.dbPath || getDefaultDbPath()));
     const vectorDim = getEffectiveVectorDimensions(config.embedding.model || "text-embedding-3-small", config.embedding.dimensions, config.embedding.requestDimensions);
+    const embeddingApiKey = resolveSecretCredentialArray(api, config.embedding.apiKey, "embedding.apiKey");
     const store = new MemoryStore({
         dbPath: resolvedDbPath,
         vectorDim,
@@ -1598,7 +1643,7 @@ function _initPluginState(api) {
     });
     const embedder = createEmbedder({
         provider: "openai-compatible",
-        apiKey: config.embedding.apiKey,
+        apiKey: embeddingApiKey,
         model: config.embedding.model || "text-embedding-3-small",
         baseURL: config.embedding.baseURL,
         dimensions: config.embedding.dimensions,
@@ -1620,8 +1665,12 @@ function _initPluginState(api) {
         ...(config.tier || {}),
     });
     const retrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config.retrieval };
-    const retriever = createRetriever(store, embedder, retrievalConfig, { decayEngine });
-    const rerankCostWarning = buildAutoRecallRerankCostWarning(config, retrievalConfig);
+    if (retrievalConfig.rerankApiKey) {
+        retrievalConfig.rerankApiKey = resolveSecretCredential(api, retrievalConfig.rerankApiKey, "retrieval.rerankApiKey");
+    }
+    const resolvedRetrievalConfig = retrievalConfig;
+    const retriever = createRetriever(store, embedder, resolvedRetrievalConfig, { decayEngine });
+    const rerankCostWarning = buildAutoRecallRerankCostWarning(config, resolvedRetrievalConfig);
     if (rerankCostWarning) {
         api.logger.warn(rerankCostWarning);
     }
@@ -1647,8 +1696,8 @@ function _initPluginState(api) {
             const llmApiKey = llmAuth === "oauth"
                 ? undefined
                 : config.llm?.apiKey
-                    ? resolveEnvVars(config.llm.apiKey)
-                    : resolveFirstApiKey(config.embedding.apiKey);
+                    ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
+                    : resolveFirstApiKey(api, config.embedding.apiKey);
             const llmBaseURL = llmAuth === "oauth"
                 ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
                 : config.llm?.baseURL
@@ -2183,8 +2232,8 @@ const memoryLanceDBProPlugin = {
                     const llmApiKey = llmAuth === "oauth"
                         ? undefined
                         : config.llm?.apiKey
-                            ? resolveEnvVars(config.llm.apiKey)
-                            : resolveFirstApiKey(config.embedding.apiKey);
+                            ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
+                            : resolveFirstApiKey(api, config.embedding.apiKey);
                     const llmBaseURL = llmAuth === "oauth"
                         ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
                         : config.llm?.baseURL
@@ -4095,22 +4144,26 @@ export function parsePluginConfig(value) {
         throw new Error("memory-lancedb-pro: missing top-level config.embedding block. " +
             "Set plugins.entries.memory-lancedb-pro.config.embedding; do not nest it as config.embedding.embedding.");
     }
-    // Accept single key (string) or array of keys for round-robin rotation
+    // Accept single key (string or SecretRef) or array of keys for round-robin rotation
     let apiKey;
     if (typeof embedding.apiKey === "string") {
         apiKey = embedding.apiKey;
     }
+    else if (isSecretRefConfig(embedding.apiKey)) {
+        apiKey = embedding.apiKey;
+    }
     else if (Array.isArray(embedding.apiKey) && embedding.apiKey.length > 0) {
-        // Validate every element is a non-empty string
-        const invalid = embedding.apiKey.findIndex((k) => typeof k !== "string" || k.trim().length === 0);
+        // Validate every element is a non-empty string or SecretRef
+        const invalid = embedding.apiKey.findIndex((k) => !((typeof k === "string" && k.trim().length > 0) ||
+            isSecretRefConfig(k)));
         if (invalid !== -1) {
-            throw new Error(`embedding.apiKey[${invalid}] is invalid: expected non-empty string`);
+            throw new Error(`embedding.apiKey[${invalid}] is invalid: expected non-empty string or SecretRef`);
         }
         apiKey = embedding.apiKey;
     }
     else if (embedding.apiKey !== undefined) {
         // apiKey is present but wrong type — throw, don't silently fall back
-        throw new Error("embedding.apiKey must be a string or non-empty array of strings");
+        throw new Error("embedding.apiKey must be a string, SecretRef, or non-empty array of strings/SecretRefs");
     }
     else {
         apiKey = process.env.OPENAI_API_KEY || "";
