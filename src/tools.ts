@@ -18,6 +18,8 @@ import {
   appendRelation,
   buildSmartMetadata,
   deriveFactKey,
+  isMemoryActiveAt,
+  isMemoryExpired,
   parseSmartMetadata,
   stringifySmartMetadata,
 } from "./smart-metadata.js";
@@ -153,6 +155,68 @@ function formatReflectionResolvePreview(candidates: Array<{ entry: MemoryEntry; 
     `Reflection resolve preview: ${candidates.length} candidate(s). No changes made.`,
     ...lines,
   ].join("\n");
+}
+
+function parseFactQueryTimestamp(value: unknown): number {
+  if (typeof value !== "string" || value.trim().length === 0) return Date.now();
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid at timestamp: ${value}`);
+  }
+  return parsed;
+}
+
+function formatFactTimestamp(value: number | undefined): string | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? new Date(value).toISOString()
+    : undefined;
+}
+
+function factQueryMatches(entry: MemoryEntry, query: string | undefined, factKey: string | undefined): boolean {
+  const meta = parseSmartMetadata(entry.metadata, entry);
+  const normalizedFactKey = factKey?.trim().toLowerCase();
+  if (normalizedFactKey && meta.fact_key?.toLowerCase() !== normalizedFactKey) return false;
+
+  const normalizedQuery = query?.trim().toLowerCase();
+  if (!normalizedQuery) return true;
+
+  return [
+    meta.fact_key,
+    meta.memory_category,
+    meta.l0_abstract,
+    meta.l1_overview,
+    entry.text,
+  ].some((value) => typeof value === "string" && value.toLowerCase().includes(normalizedQuery));
+}
+
+function isTemporalFactEntry(entry: MemoryEntry): boolean {
+  const meta = parseSmartMetadata(entry.metadata, entry);
+  return Boolean(
+    meta.fact_key ||
+    meta.supersedes ||
+    meta.superseded_by ||
+    meta.invalidated_at ||
+    meta.valid_until,
+  );
+}
+
+function serializeFactEntry(entry: MemoryEntry, atMs: number) {
+  const meta = parseSmartMetadata(entry.metadata, entry);
+  const activeAt = isMemoryActiveAt(meta, atMs) && !isMemoryExpired(meta, atMs);
+  return {
+    id: entry.id,
+    text: entry.text,
+    scope: entry.scope,
+    category: entry.category,
+    memoryCategory: meta.memory_category,
+    factKey: meta.fact_key,
+    activeAt,
+    validFrom: formatFactTimestamp(meta.valid_from),
+    validUntil: formatFactTimestamp(meta.valid_until),
+    invalidatedAt: formatFactTimestamp(meta.invalidated_at),
+    supersedes: meta.supersedes,
+    supersededBy: meta.superseded_by,
+  };
 }
 
 const _warnedMissingAgentId = new Set<string>();
@@ -824,6 +888,114 @@ export function registerMemoryRecallAliasTool(
       });
     },
     { name: alias },
+  );
+}
+
+export function registerMemoryFactQueryTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return {
+        name: "memory_fact_query",
+        label: "Memory Fact Query",
+        description:
+          "Deterministically query current or historical temporal facts by fact key or text without semantic reranking.",
+        parameters: Type.Object({
+          query: Type.Optional(Type.String({ description: "Text to match against fact keys and fact summaries." })),
+          factKey: Type.Optional(Type.String({ description: "Exact temporal fact key, such as preferences:drink." })),
+          at: Type.Optional(Type.String({ description: "ISO timestamp/date for as-of lookup. Defaults to now." })),
+          scope: Type.Optional(Type.String({ description: "Optional scope filter." })),
+          includeHistory: Type.Optional(Type.Boolean({ description: "Include inactive superseded/expired facts (default false)." })),
+          limit: Type.Optional(Type.Number({ description: "Maximum facts to return (default 10, max 100)." })),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
+          const {
+            query,
+            factKey,
+            at,
+            scope,
+            includeHistory = false,
+            limit = 10,
+          } = params as {
+            query?: string;
+            factKey?: string;
+            at?: string;
+            scope?: string;
+            includeHistory?: boolean;
+            limit?: number;
+          };
+
+          try {
+            const safeLimit = clampInt(limit, 1, 100);
+            const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
+            const resolvedScopes = resolveReadableToolScopeFilter(runtimeContext.scopeManager, agentId, scope);
+            const atMs = parseFactQueryTimestamp(at);
+            const entries = await runtimeContext.store.list(
+              resolvedScopes.scopeFilter,
+              undefined,
+              Math.max(safeLimit * 10, 100),
+              0,
+            );
+
+            const facts = entries
+              .filter(isTemporalFactEntry)
+              .filter((entry) => factQueryMatches(entry, query, factKey))
+              .map((entry) => ({ entry, fact: serializeFactEntry(entry, atMs) }))
+              .filter(({ fact }) => includeHistory || fact.activeAt)
+              .sort((a, b) => {
+                if (a.fact.activeAt !== b.fact.activeAt) return a.fact.activeAt ? -1 : 1;
+                return (b.entry.timestamp || 0) - (a.entry.timestamp || 0);
+              })
+              .slice(0, safeLimit)
+              .map(({ fact }) => fact);
+
+            const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
+            const lines = facts.map((fact, index) => {
+              const status = fact.activeAt ? "active" : "historical";
+              const datePart = [fact.validFrom ? `from=${fact.validFrom}` : undefined, fact.validUntil ? `until=${fact.validUntil}` : undefined]
+                .filter(Boolean)
+                .join(" ");
+              return `${index + 1}. [${status}] ${fact.factKey ?? fact.memoryCategory ?? fact.category} ${datePart} ${truncateText(normalizeInlineText(fact.text), 180)}`.trim();
+            });
+
+            return {
+              content: [{
+                type: "text",
+                text: [
+                  ignoredScopeNotice,
+                  lines.length > 0
+                    ? `Fact query returned ${facts.length} result(s) as of ${new Date(atMs).toISOString()}:\n${lines.join("\n")}`
+                    : `Fact query returned 0 result(s) as of ${new Date(atMs).toISOString()}.`,
+                ].filter(Boolean).join("\n"),
+              }],
+              details: {
+                action: "fact_query",
+                query,
+                factKey,
+                asOf: new Date(atMs).toISOString(),
+                includeHistory,
+                count: facts.length,
+                ignoredScope: resolvedScopes.ignoredScope,
+                accessibleScopes: resolvedScopes.accessibleScopes,
+                facts,
+              },
+            };
+          } catch (error) {
+            return {
+              content: [{
+                type: "text",
+                text: `Fact query failed: ${error instanceof Error ? error.message : String(error)}`,
+              }],
+              details: { error: "fact_query_failed", message: String(error) },
+            };
+          }
+        },
+      };
+    },
+    { name: "memory_fact_query" },
   );
 }
 
@@ -2602,6 +2774,7 @@ export function registerAllMemoryTools(
   registerMemoryRecallTool(api, context);
   registerMemoryRecallAliasTool(api, context, "memory_search");
   registerMemoryRecallAliasTool(api, context, "memory_get");
+  registerMemoryFactQueryTool(api, context);
   registerMemoryStoreTool(api, context);
   registerMemoryForgetTool(api, context);
   registerMemoryUpdateTool(api, context);
