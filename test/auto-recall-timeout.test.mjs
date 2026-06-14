@@ -351,6 +351,7 @@ describe("auto-recall timeout", () => {
     memoryLanceDBProPlugin.register(harness.api);
 
     const autoRecallHook = getAutoRecallHook(harness.eventHandlers);
+    const beforeHookMs = Date.now();
     await autoRecallHook(
       { prompt: "Please recall what I mentioned before about this task." },
       { sessionId: "auto-rerank-budget", sessionKey: "agent:main:session:auto-rerank-budget", agentId: "main" },
@@ -358,6 +359,9 @@ describe("auto-recall timeout", () => {
 
     assert.equal(capturedContext?.source, "auto-recall");
     assert.equal(capturedContext?.rerankTimeoutMs, 2500);
+    assert.equal(typeof capturedContext?.rerankDeadlineMs, "number");
+    assert.ok(capturedContext.rerankDeadlineMs > beforeHookMs);
+    assert.ok(capturedContext.rerankDeadlineMs <= beforeHookMs + 5100);
   });
 
   it("skips remote rerank timeout budget for very small auto-recall budgets", async () => {

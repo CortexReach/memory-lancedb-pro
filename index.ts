@@ -2500,6 +2500,8 @@ const memoryLanceDBProPlugin = {
       category?: string;
       source?: "manual" | "auto-recall" | "cli";
       signal?: AbortSignal;
+      rerankTimeoutMs?: number;
+      rerankDeadlineMs?: number;
     }) {
       let results = await retriever.retrieve(params);
       if (results.length === 0) {
@@ -2958,6 +2960,7 @@ const memoryLanceDBProPlugin = {
 
       const AUTO_RECALL_TIMEOUT_MS = parsePositiveInt(config.autoRecallTimeoutMs) ?? 5_000; // configurable; default raised from 3s to 5s for remote embedding APIs behind proxies
       api.on("before_prompt_build", async (event: any, ctx: any) => {
+        const autoRecallDeadlineMs = Date.now() + AUTO_RECALL_TIMEOUT_MS;
         // Skip auto-recall for sub-agent sessions — their context comes from the parent.
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (sessionKey.includes(":subagent:")) return;
@@ -3080,7 +3083,10 @@ const memoryLanceDBProPlugin = {
             source: "auto-recall",
             signal: autoRecallAbortController.signal,
             ...(autoRecallRerankTimeoutMs !== undefined
-              ? { rerankTimeoutMs: autoRecallRerankTimeoutMs }
+              ? {
+                rerankTimeoutMs: autoRecallRerankTimeoutMs,
+                rerankDeadlineMs: autoRecallDeadlineMs,
+              }
               : {}),
           }), config.workspaceBoundary);
 

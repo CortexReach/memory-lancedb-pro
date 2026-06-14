@@ -110,6 +110,8 @@ export interface RetrievalContext {
   signal?: AbortSignal;
   /** Optional per-call rerank timeout. Lets callers reserve time for fallback work inside an outer budget. */
   rerankTimeoutMs?: number;
+  /** Optional absolute deadline for remote rerank. Caps timeout after embedding/search consume caller budget. */
+  rerankDeadlineMs?: number;
 }
 
 export interface RetrievalResult extends MemorySearchResult {
@@ -588,7 +590,7 @@ export class MemoryRetriever {
   }
 
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
-    const { query, limit, scopeFilter, category, source, signal, rerankTimeoutMs } = context;
+    const { query, limit, scopeFilter, category, source, signal, rerankTimeoutMs, rerankDeadlineMs } = context;
     const safeLimit = clampInt(limit, 1, 20);
     this.lastDiagnostics = null;
     const diagnostics: RetrievalDiagnostics = {
@@ -660,6 +662,7 @@ export class MemoryRetriever {
           diagnostics,
           signal,
           rerankTimeoutMs,
+          rerankDeadlineMs,
         );
       }
 
@@ -948,6 +951,7 @@ export class MemoryRetriever {
     diagnostics?: RetrievalDiagnostics,
     signal?: AbortSignal,
     rerankTimeoutMs?: number,
+    rerankDeadlineMs?: number,
   ): Promise<RetrievalResult[]> {
     let failureStage: RetrievalDiagnostics["failureStage"] = "hybrid.embedQuery";
     try {
@@ -1060,7 +1064,7 @@ export class MemoryRetriever {
       failureStage = "hybrid.rerank";
       if (this.config.rerank !== "none") {
         trace?.startStage("rerank", filtered.map((r) => r.entry.id));
-        reranked = await this.rerankResults(query, queryVector, rerankInput, diagnostics, rerankTimeoutMs);
+        reranked = await this.rerankResults(query, queryVector, rerankInput, diagnostics, rerankTimeoutMs, rerankDeadlineMs);
         trace?.endStage(reranked.map((r) => r.entry.id), reranked.map((r) => r.score));
       } else {
         reranked = filtered;
@@ -1272,6 +1276,7 @@ export class MemoryRetriever {
     results: RetrievalResult[],
     diagnostics?: RetrievalDiagnostics,
     timeoutOverrideMs?: number,
+    deadlineMs?: number,
   ): Promise<RetrievalResult[]> {
     if (results.length === 0) {
       return results;
@@ -1291,7 +1296,14 @@ export class MemoryRetriever {
 
     if (this.config.rerank === "cross-encoder" && hasApiKey) {
       try {
+        const remainingDeadlineMs = deadlineMs !== undefined
+          ? Math.floor(deadlineMs - Date.now())
+          : undefined;
         if (timeoutOverrideMs !== undefined && timeoutOverrideMs <= 0) {
+          recordFallback("timeout", "Rerank API skipped because caller timeout budget is exhausted");
+          throw new Error("skip-remote-rerank-timeout-budget");
+        }
+        if (remainingDeadlineMs !== undefined && remainingDeadlineMs < 100) {
           recordFallback("timeout", "Rerank API skipped because caller timeout budget is exhausted");
           throw new Error("skip-remote-rerank-timeout-budget");
         }
@@ -1315,7 +1327,10 @@ export class MemoryRetriever {
           rerankTopN,
         );
 
-        const effectiveTimeoutMs = timeoutOverrideMs ?? this.config.rerankTimeoutMs ?? 5000;
+        const configuredTimeoutMs = timeoutOverrideMs ?? this.config.rerankTimeoutMs ?? 5000;
+        const effectiveTimeoutMs = remainingDeadlineMs !== undefined
+          ? Math.min(configuredTimeoutMs, remainingDeadlineMs)
+          : configuredTimeoutMs;
 
         // Timeout: configurable via rerankTimeoutMs (default: 5000ms)
         const controller = new AbortController();
