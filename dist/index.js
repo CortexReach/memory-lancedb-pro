@@ -51,6 +51,7 @@ import { normalizeAdmissionControlConfig, resolveRejectedAuditFilePath, } from "
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
 import { CanonicalCorpusIndexer, parseCanonicalCorpusConfig, } from "./src/corpus-indexer.js";
+const SUPPORTED_SECRET_REF_SOURCES = ["env", "file"];
 // ============================================================================
 // Default Configuration
 // ============================================================================
@@ -83,8 +84,15 @@ function isSecretRefConfig(value) {
     if (!value || typeof value !== "object" || Array.isArray(value))
         return false;
     const raw = value;
-    return typeof raw.source === "string" && raw.source.trim().length > 0 &&
+    return isSupportedSecretRefSource(raw.source) &&
         typeof raw.id === "string" && raw.id.trim().length > 0;
+}
+function isSupportedSecretRefSource(value) {
+    return typeof value === "string" &&
+        SUPPORTED_SECRET_REF_SOURCES.includes(value.trim());
+}
+function isSecretCredential(value) {
+    return (typeof value === "string" && value.trim().length > 0) || isSecretRefConfig(value);
 }
 function describeSecretRef(ref) {
     return `source=${ref.source}, id=${ref.id}`;
@@ -106,7 +114,8 @@ function resolveSecretRef(api, ref, label) {
                 throw new Error(`file ${filePath} is empty`);
             return value;
         }
-        throw new Error(`unsupported SecretRef source "${source}"`);
+        const exhaustive = source;
+        throw new Error(`unsupported SecretRef source "${exhaustive}"`);
     }
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1665,7 +1674,7 @@ function _initPluginState(api) {
         ...(config.tier || {}),
     });
     const retrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config.retrieval };
-    if (retrievalConfig.rerankApiKey) {
+    if (retrievalConfig.rerank === "cross-encoder" && retrievalConfig.rerankApiKey) {
         retrievalConfig.rerankApiKey = resolveSecretCredential(api, retrievalConfig.rerankApiKey, "retrieval.rerankApiKey");
     }
     const resolvedRetrievalConfig = retrievalConfig;
@@ -4183,6 +4192,9 @@ export function parsePluginConfig(value) {
     const storageMaintenanceRaw = typeof cfg.storageMaintenance === "object" && cfg.storageMaintenance !== null
         ? cfg.storageMaintenance
         : null;
+    const llmRaw = typeof cfg.llm === "object" && cfg.llm !== null
+        ? cfg.llm
+        : null;
     const storageAutoCleanupRaw = typeof storageMaintenanceRaw?.autoCleanup === "object" && storageMaintenanceRaw.autoCleanup !== null
         ? storageMaintenanceRaw.autoCleanup
         : null;
@@ -4304,6 +4316,9 @@ export function parsePluginConfig(value) {
                 // This prevents startup failures when reranking is disabled and rerankApiKey
                 // is left as an unresolved placeholder.
                 const rerankEnabled = retrieval.rerank !== "none";
+                if (retrieval.rerankApiKey !== undefined && !isSecretCredential(retrieval.rerankApiKey)) {
+                    throw new Error("retrieval.rerankApiKey must be a non-empty string or SecretRef with source env/file");
+                }
                 if (rerankEnabled && typeof retrieval.rerankApiKey === "string" && retrieval.rerankApiKey.includes("${")) {
                     retrieval.rerankApiKey = resolveEnvVars(retrieval.rerankApiKey);
                 }
@@ -4323,7 +4338,15 @@ export function parsePluginConfig(value) {
         tier: typeof cfg.tier === "object" && cfg.tier !== null ? cfg.tier : undefined,
         // Smart extraction config (Phase 1)
         smartExtraction: cfg.smartExtraction !== false, // Default ON
-        llm: typeof cfg.llm === "object" && cfg.llm !== null ? cfg.llm : undefined,
+        llm: llmRaw
+            ? (() => {
+                const llm = { ...llmRaw };
+                if (llm.apiKey !== undefined && !isSecretCredential(llm.apiKey)) {
+                    throw new Error("llm.apiKey must be a non-empty string or SecretRef with source env/file");
+                }
+                return llm;
+            })()
+            : undefined,
         extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
         extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
         scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes : undefined,

@@ -295,8 +295,11 @@ interface PluginConfig {
   declaredAgents?: Set<string>;
 }
 
+const SUPPORTED_SECRET_REF_SOURCES = ["env", "file"] as const;
+type SecretRefSource = (typeof SUPPORTED_SECRET_REF_SOURCES)[number];
+
 type SecretRefConfig = {
-  source: string;
+  source: SecretRefSource;
   provider?: string;
   id: string;
 };
@@ -344,8 +347,17 @@ function resolveEnvVars(value: string): string {
 function isSecretRefConfig(value: unknown): value is SecretRefConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const raw = value as Record<string, unknown>;
-  return typeof raw.source === "string" && raw.source.trim().length > 0 &&
+  return isSupportedSecretRefSource(raw.source) &&
     typeof raw.id === "string" && raw.id.trim().length > 0;
+}
+
+function isSupportedSecretRefSource(value: unknown): value is SecretRefSource {
+  return typeof value === "string" &&
+    (SUPPORTED_SECRET_REF_SOURCES as readonly string[]).includes(value.trim());
+}
+
+function isSecretCredential(value: unknown): value is SecretCredential {
+  return (typeof value === "string" && value.trim().length > 0) || isSecretRefConfig(value);
 }
 
 function describeSecretRef(ref: SecretRefConfig): string {
@@ -357,7 +369,7 @@ function resolveSecretRef(
   ref: SecretRefConfig,
   label: string,
 ): string {
-  const source = ref.source.trim();
+  const source = ref.source.trim() as SecretRefSource;
   const id = ref.id.trim();
   try {
     if (source === "env") {
@@ -371,7 +383,8 @@ function resolveSecretRef(
       if (!value) throw new Error(`file ${filePath} is empty`);
       return value;
     }
-    throw new Error(`unsupported SecretRef source "${source}"`);
+    const exhaustive: never = source;
+    throw new Error(`unsupported SecretRef source "${exhaustive}"`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to resolve SecretRef for ${label} (${describeSecretRef(ref)}): ${message}`);
@@ -2232,7 +2245,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const retrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config.retrieval } as RetrievalConfig & {
     rerankApiKey?: SecretCredential;
   };
-  if (retrievalConfig.rerankApiKey) {
+  if (retrievalConfig.rerank === "cross-encoder" && retrievalConfig.rerankApiKey) {
     retrievalConfig.rerankApiKey = resolveSecretCredential(
       api,
       retrievalConfig.rerankApiKey,
@@ -5296,6 +5309,9 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   const storageMaintenanceRaw = typeof cfg.storageMaintenance === "object" && cfg.storageMaintenance !== null
     ? cfg.storageMaintenance as Record<string, unknown>
     : null;
+  const llmRaw = typeof cfg.llm === "object" && cfg.llm !== null
+    ? cfg.llm as Record<string, unknown>
+    : null;
   const storageAutoCleanupRaw = typeof storageMaintenanceRaw?.autoCleanup === "object" && storageMaintenanceRaw.autoCleanup !== null
     ? storageMaintenanceRaw.autoCleanup as Record<string, unknown>
     : null;
@@ -5428,6 +5444,9 @@ export function parsePluginConfig(value: unknown): PluginConfig {
           // This prevents startup failures when reranking is disabled and rerankApiKey
           // is left as an unresolved placeholder.
           const rerankEnabled = retrieval.rerank !== "none";
+          if (retrieval.rerankApiKey !== undefined && !isSecretCredential(retrieval.rerankApiKey)) {
+            throw new Error("retrieval.rerankApiKey must be a non-empty string or SecretRef with source env/file");
+          }
           if (rerankEnabled && typeof retrieval.rerankApiKey === "string" && retrieval.rerankApiKey.includes("${")) {
             retrieval.rerankApiKey = resolveEnvVars(retrieval.rerankApiKey);
           }
@@ -5447,7 +5466,15 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     tier: typeof cfg.tier === "object" && cfg.tier !== null ? cfg.tier as any : undefined,
     // Smart extraction config (Phase 1)
     smartExtraction: cfg.smartExtraction !== false, // Default ON
-    llm: typeof cfg.llm === "object" && cfg.llm !== null ? cfg.llm as any : undefined,
+    llm: llmRaw
+      ? (() => {
+        const llm = { ...llmRaw };
+        if (llm.apiKey !== undefined && !isSecretCredential(llm.apiKey)) {
+          throw new Error("llm.apiKey must be a non-empty string or SecretRef with source env/file");
+        }
+        return llm as any;
+      })()
+      : undefined,
     extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
     extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
     scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,

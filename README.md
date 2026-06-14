@@ -447,6 +447,21 @@ Query → BM25 FTS ─────┘
 
 ## Configuration
 
+API-key fields (`embedding.apiKey`, `retrieval.rerankApiKey`, and `llm.apiKey`) accept plain strings, `${ENV_VAR}` placeholders, or SecretRef objects. This plugin supports the `env` and `file` SecretRef sources:
+
+```json
+{
+  "embedding": {
+    "apiKey": { "source": "env", "id": "JINA_API_KEY" }
+  },
+  "retrieval": {
+    "rerankApiKey": { "source": "file", "id": "~/.openclaw/secrets/jina-rerank" }
+  }
+}
+```
+
+For `source: "file"`, `id` is resolved through OpenClaw's `api.resolvePath()` and then read as a UTF-8 file. The optional `provider` field is accepted for SecretRef object-shape compatibility but is not used for provider dispatch. `exec` and other SecretRef sources are rejected by runtime config validation.
+
 <details>
 <summary><strong>Full Configuration Example</strong></summary>
 

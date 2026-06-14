@@ -45,7 +45,7 @@ function createLlmServer() {
   });
 }
 
-async function withTestEnv(apiKeyConfig, fn) {
+async function withTestEnv(apiKeyConfig, fn, configOverrides = {}) {
   const workDir = mkdtempSync(path.join(tmpdir(), "env-vars-array-test-"));
   const dbPath = path.join(workDir, "test.db");
   const embeddingServer = createEmbeddingServer();
@@ -78,6 +78,7 @@ async function withTestEnv(apiKeyConfig, fn) {
           default: "global",
           definitions: { global: { description: "shared" } },
         },
+        ...configOverrides,
       },
       hooks: {},
       toolFactories: {},
@@ -228,6 +229,61 @@ test("parsePluginConfig rejects empty array apiKey", () => {
     }),
     /apiKey/,
   );
+});
+
+test("parsePluginConfig rejects unsupported SecretRef sources", () => {
+  assert.throws(
+    () => parsePluginConfig({
+      embedding: {
+        apiKey: { source: "exec", id: "print-secret" },
+        model: "text-embedding-3-small",
+      },
+    }),
+    /embedding\.apiKey/,
+  );
+
+  assert.throws(
+    () => parsePluginConfig({
+      embedding: {
+        apiKey: "embed-key",
+        model: "text-embedding-3-small",
+      },
+      retrieval: {
+        rerank: "cross-encoder",
+        rerankApiKey: { source: "vault", id: "rerank-secret" },
+      },
+    }),
+    /retrieval\.rerankApiKey.*source env\/file/,
+  );
+
+  assert.throws(
+    () => parsePluginConfig({
+      embedding: {
+        apiKey: "embed-key",
+        model: "text-embedding-3-small",
+      },
+      llm: {
+        apiKey: { source: "provider", id: "llm-secret" },
+      },
+    }),
+    /llm\.apiKey.*source env\/file/,
+  );
+});
+
+test("plugin startup does not resolve rerank SecretRef when rerank is none", async () => {
+  await withTestEnv("embed-key", (logs) => {
+    const warnLogs = logs.filter(([level]) => level === "warn").map(([, msg]) => msg);
+    assert.ok(
+      !warnLogs.some((msg) => msg.includes("smart extraction init failed")),
+      `disabled rerank SecretRef should not fail startup, got: ${JSON.stringify(warnLogs)}`,
+    );
+  }, {
+    retrieval: {
+      mode: "hybrid",
+      rerank: "none",
+      rerankApiKey: { source: "env", id: "__MISSING_DISABLED_RERANK_SECRET" },
+    },
+  });
 });
 
 test("parsePluginConfig resolves env vars in retrieval rerank config", () => {
