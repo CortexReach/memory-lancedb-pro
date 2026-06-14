@@ -139,6 +139,50 @@ describe("RedisLockManager", () => {
     assert.equal(setCalls, 0);
   });
 
+  it("waits for active Redis-locked writes before closing the client", async () => {
+    const events = [];
+    let releaseWrite;
+    const writeMayFinish = new Promise((resolve) => {
+      releaseWrite = resolve;
+    });
+    const manager = new RedisLockManager({
+      url: "redis://localhost:6379",
+      ttlMs: 5_000,
+      acquireTimeoutMs: 20,
+      retryDelayMs: 1,
+    }, {
+      async set() {
+        events.push("acquired");
+        return "OK";
+      },
+      async eval() {
+        events.push("released");
+        return 1;
+      },
+      async quit() {
+        events.push("quit");
+      },
+    });
+
+    const write = manager.withLock("/tmp/db", async () => {
+      events.push("write-started");
+      await writeMayFinish;
+      events.push("write-finished");
+    });
+
+    while (!events.includes("write-started")) {
+      await sleep(1);
+    }
+    const close = manager.close();
+    await sleep(10);
+    assert.deepEqual(events, ["acquired", "write-started"]);
+
+    releaseWrite();
+    await Promise.all([write, close]);
+
+    assert.deepEqual(events, ["acquired", "write-started", "write-finished", "released", "quit"]);
+  });
+
   it("rejects empty Redis lock resources without acquiring a client", async () => {
     let setCalls = 0;
     const manager = new RedisLockManager({
@@ -536,6 +580,33 @@ describe("Redis lock configuration", () => {
     assert.equal(parsed.redisUrl, "redis://localhost:6379/2");
     assert.equal(parsed.locking.redis.enabled, true);
     assert.equal(parsed.locking.redis.url, "redis://localhost:6379/2");
+  });
+
+  it("does not resolve Redis URL placeholders when Redis locking is disabled", () => {
+    delete process.env.REDIS_URL;
+    delete process.env.MEMORY_LANCEDB_REDIS_URL;
+
+    const parsed = parsePluginConfig({
+      embedding: { apiKey: "test-key" },
+      redisUrl: "${REDIS_URL}",
+      locking: {
+        redis: {
+          enabled: false,
+          url: "${REDIS_URL}",
+        },
+      },
+    });
+
+    assert.equal(parsed.redisUrl, undefined);
+    assert.deepEqual(parsed.locking.redis, {
+      enabled: false,
+      url: undefined,
+      keyPrefix: undefined,
+      ttlMs: 60000,
+      acquireTimeoutMs: 5000,
+      retryDelayMs: 50,
+      connectTimeoutMs: 1000,
+    });
   });
 
   it("declares Redis lock schema, ui hints, and dependency", () => {

@@ -351,14 +351,17 @@ try {
 
   const originalDestroy = MemoryStore.prototype.destroy;
   let destroyCalls = 0;
+  const destroyedDbPaths = [];
   try {
     MemoryStore.prototype.destroy = async function () {
       destroyCalls += 1;
+      destroyedDbPaths.push(this.config.dbPath);
     };
     const stopCleanupServices = [];
+    const stopCleanupDbPath = path.join(workDir, "db-stop-cleanup");
     const stopCleanupApi = createMockApi(
       {
-        dbPath: path.join(workDir, "db-stop-cleanup"),
+        dbPath: stopCleanupDbPath,
         autoCapture: false,
         autoRecall: false,
         embedding: {
@@ -376,6 +379,34 @@ try {
     assert.equal(stopCleanupServices.length, 1, "plugin should register a service for cleanup coverage");
     await stopCleanupServices[0].stop();
     assert.equal(destroyCalls, 1, "service stop should destroy the store and close lock resources");
+    assert.deepEqual(destroyedDbPaths, [stopCleanupDbPath]);
+
+    const reRegisterServices = [];
+    const reRegisterDbPath = path.join(workDir, "db-stop-cleanup-reregistered");
+    const reRegisterApi = createMockApi(
+      {
+        dbPath: reRegisterDbPath,
+        autoCapture: false,
+        autoRecall: false,
+        embedding: {
+          provider: "openai-compatible",
+          apiKey: "dummy",
+          model: "text-embedding-3-small",
+          baseURL: "http://127.0.0.1:9/v1",
+          dimensions: 1536,
+        },
+      },
+      { services: reRegisterServices },
+    );
+    plugin.register(reRegisterApi);
+    assert.equal(reRegisterServices.length, 1, "plugin should register after service stop");
+    await reRegisterServices[0].stop();
+    assert.equal(destroyCalls, 2, "re-registered service should destroy its own store");
+    assert.deepEqual(
+      destroyedDbPaths,
+      [stopCleanupDbPath, reRegisterDbPath],
+      "service stop should clear the cached singleton before re-registration",
+    );
   } finally {
     MemoryStore.prototype.destroy = originalDestroy;
   }

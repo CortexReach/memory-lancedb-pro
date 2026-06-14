@@ -53,6 +53,7 @@ export class RedisLockManager {
     config;
     clientPromise = null;
     isClosed = false;
+    activeLocks = new Set();
     constructor(config, injectedClient) {
         this.injectedClient = injectedClient;
         this.config = {
@@ -67,11 +68,24 @@ export class RedisLockManager {
         };
     }
     async withLock(resource, fn) {
+        if (this.isClosed) {
+            throw new RedisLockUnavailableError("Redis lock manager has been closed");
+        }
         const key = this.makeKey(resource);
         const client = await this.getClient();
         this.assertClientSupportsLocking(client);
         const token = randomUUID();
         await this.acquire(client, key, token);
+        const activeLock = this.runLockedCallback(client, key, token, fn);
+        this.activeLocks.add(activeLock);
+        try {
+            return await activeLock;
+        }
+        finally {
+            this.activeLocks.delete(activeLock);
+        }
+    }
+    async runLockedCallback(client, key, token, fn) {
         let leaseLost = null;
         let leaseExpiresAt = Date.now() + this.config.ttlMs;
         const markLeaseLost = (error) => {
@@ -122,10 +136,15 @@ export class RedisLockManager {
     }
     async close() {
         this.isClosed = true;
-        if (!this.clientPromise)
+        if (this.activeLocks.size > 0) {
+            await Promise.allSettled([...this.activeLocks]);
+        }
+        if (!this.injectedClient && !this.clientPromise)
             return;
-        const client = await this.clientPromise.catch(() => null);
-        this.clientPromise = null;
+        const client = this.injectedClient ?? (await this.clientPromise?.catch(() => null));
+        if (!this.injectedClient) {
+            this.clientPromise = null;
+        }
         if (!client)
             return;
         if (typeof client.quit === "function") {

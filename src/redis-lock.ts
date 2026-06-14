@@ -78,6 +78,7 @@ export class RedisLockManager {
   private readonly config: Required<Omit<RedisLockConfig, "url" | "onWarning">> & Pick<RedisLockConfig, "url" | "onWarning">;
   private clientPromise: Promise<RedisClientLike> | null = null;
   private isClosed = false;
+  private readonly activeLocks = new Set<Promise<unknown>>();
 
   constructor(config: RedisLockConfig, private readonly injectedClient?: RedisClientLike) {
     this.config = {
@@ -93,12 +94,30 @@ export class RedisLockManager {
   }
 
   async withLock<T>(resource: string, fn: () => Promise<T>): Promise<T> {
+    if (this.isClosed) {
+      throw new RedisLockUnavailableError("Redis lock manager has been closed");
+    }
     const key = this.makeKey(resource);
     const client = await this.getClient();
     this.assertClientSupportsLocking(client);
     const token = randomUUID();
 
     await this.acquire(client, key, token);
+    const activeLock = this.runLockedCallback(client, key, token, fn);
+    this.activeLocks.add(activeLock);
+    try {
+      return await activeLock;
+    } finally {
+      this.activeLocks.delete(activeLock);
+    }
+  }
+
+  private async runLockedCallback<T>(
+    client: RedisClientLike,
+    key: string,
+    token: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
 
     let leaseLost: RedisLockLeaseLostError | null = null;
     let leaseExpiresAt = Date.now() + this.config.ttlMs;
@@ -164,10 +183,15 @@ export class RedisLockManager {
 
   async close(): Promise<void> {
     this.isClosed = true;
-    if (!this.clientPromise) return;
+    if (this.activeLocks.size > 0) {
+      await Promise.allSettled([...this.activeLocks]);
+    }
+    if (!this.injectedClient && !this.clientPromise) return;
 
-    const client = await this.clientPromise.catch(() => null);
-    this.clientPromise = null;
+    const client = this.injectedClient ?? (await this.clientPromise?.catch(() => null));
+    if (!this.injectedClient) {
+      this.clientPromise = null;
+    }
     if (!client) return;
 
     if (typeof client.quit === "function") {

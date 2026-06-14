@@ -5283,6 +5283,12 @@ const memoryLanceDBProPlugin = {
           await store.destroy();
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: stop cleanup failed: ${String(err)}`);
+        } finally {
+          if (_singletonState?.store === store) {
+            _singletonState = null;
+          }
+          _registeredApis.delete(api);
+          _registeredApisMap.delete(api);
         }
         api.logger.info("memory-lancedb-pro: stopped");
       },
@@ -5374,11 +5380,17 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   const redisLockRaw = typeof lockingRaw?.redis === "object" && lockingRaw.redis !== null
     ? lockingRaw.redis as Record<string, unknown>
     : null;
-  const redisLockUrl =
-    resolveOptionalEnvString(redisLockRaw?.url) ??
-    resolveOptionalEnvString(cfg.redisUrl) ??
-    asNonEmptyString(process.env.MEMORY_LANCEDB_REDIS_URL);
   const redisLockExplicitlyDisabled = redisLockRaw?.enabled === false;
+  const legacyRedisUrl = redisLockExplicitlyDisabled
+    ? undefined
+    : resolveOptionalEnvString(cfg.redisUrl);
+  const redisLockUrl = redisLockExplicitlyDisabled
+    ? undefined
+    : (
+        resolveOptionalEnvString(redisLockRaw?.url) ??
+        legacyRedisUrl ??
+        asNonEmptyString(process.env.MEMORY_LANCEDB_REDIS_URL)
+      );
   const redisLockEnabled =
     !redisLockExplicitlyDisabled &&
     (redisLockRaw?.enabled === true || Boolean(redisLockUrl));
@@ -5456,7 +5468,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         },
       }
       : undefined,
-    redisUrl: resolveOptionalEnvString(cfg.redisUrl),
+    redisUrl: legacyRedisUrl,
     locking: redisLockRaw || redisLockUrl
       ? {
         redis: {
