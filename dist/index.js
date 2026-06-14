@@ -165,8 +165,10 @@ function getAutoRecallRerankTimeoutMs(config, retrievalConfig, autoRecallTimeout
     if (!Number.isFinite(autoRecallTimeoutMs) || autoRecallTimeoutMs <= 0)
         return undefined;
     const halfBudget = Math.floor(autoRecallTimeoutMs / 2);
+    if (halfBudget < 100)
+        return 0;
     if (autoRecallTimeoutMs <= 1_000)
-        return Math.max(100, halfBudget);
+        return halfBudget;
     return clampInt(halfBudget, 500, 2_500);
 }
 export function buildAutoRecallRerankCostWarning(config, retrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...(config.retrieval || {}) }) {

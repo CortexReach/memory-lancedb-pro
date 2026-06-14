@@ -874,6 +874,10 @@ export class MemoryRetriever {
         };
         if (this.config.rerank === "cross-encoder" && hasApiKey) {
             try {
+                if (timeoutOverrideMs !== undefined && timeoutOverrideMs <= 0) {
+                    recordFallback("timeout", "Rerank API skipped because caller timeout budget is exhausted");
+                    throw new Error("skip-remote-rerank-timeout-budget");
+                }
                 const model = this.config.rerankModel || "jina-reranker-v3";
                 const endpoint = this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
                 const documents = results.map((r) => r.entry.text);
@@ -940,7 +944,10 @@ export class MemoryRetriever {
                 }
             }
             catch (error) {
-                if (error instanceof Error && error.name === "AbortError") {
+                if (error instanceof Error && error.message === "skip-remote-rerank-timeout-budget") {
+                    // Caller supplied a zero/negative per-call timeout to reserve the outer budget.
+                }
+                else if (error instanceof Error && error.name === "AbortError") {
                     const message = `Rerank API timed out (${timeoutOverrideMs ?? this.config.rerankTimeoutMs ?? 5000}ms)`;
                     recordFallback("timeout", message);
                     console.warn(`${message}, falling back to cosine`);

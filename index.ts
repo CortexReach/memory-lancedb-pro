@@ -433,7 +433,8 @@ function getAutoRecallRerankTimeoutMs(
   if (!Number.isFinite(autoRecallTimeoutMs) || autoRecallTimeoutMs <= 0) return undefined;
 
   const halfBudget = Math.floor(autoRecallTimeoutMs / 2);
-  if (autoRecallTimeoutMs <= 1_000) return Math.max(100, halfBudget);
+  if (halfBudget < 100) return 0;
+  if (autoRecallTimeoutMs <= 1_000) return halfBudget;
   return clampInt(halfBudget, 500, 2_500);
 }
 
