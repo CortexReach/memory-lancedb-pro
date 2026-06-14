@@ -44,7 +44,7 @@ function makeEntry({
   };
 }
 
-function createTool(entries) {
+function createTool(entries, contextOverrides = {}) {
   const toolFactories = {};
   const api = {
     registerTool(factory, meta) {
@@ -74,6 +74,7 @@ function createTool(entries) {
     retriever: {},
     embedder: {},
     agentId: "main",
+    ...contextOverrides,
   });
 
   return toolFactories.memory_fact_query({ agentId: "main" });
@@ -255,4 +256,40 @@ test("memory_fact_query orders as-of matches by valid_from before entry timestam
   assert.equal(result.details.count, 2);
   assert.equal(result.details.facts[0].id, "newer-valid-from");
   assert.equal(result.details.facts[1].id, "older-valid-from");
+});
+
+test("memory_fact_query filters USER.md-exclusive facts from output and details", async () => {
+  const entries = [
+    makeEntry({
+      id: "profile-only",
+      text: "User profile: timezone is Asia/Shanghai",
+      validFrom: Date.parse("2026-01-01T00:00:00Z"),
+      memoryCategory: "profile",
+    }),
+    makeEntry({
+      id: "regular-fact",
+      text: "Workspace timezone test fixture remains visible",
+      factKey: "entities:workspace timezone fixture",
+      validFrom: Date.parse("2026-01-02T00:00:00Z"),
+    }),
+  ];
+  const tool = createTool(entries, {
+    workspaceBoundary: {
+      userMdExclusive: {
+        enabled: true,
+      },
+    },
+  });
+
+  const result = await tool.execute(null, {
+    query: "timezone",
+    at: "2026-01-15T00:00:00Z",
+    includeHistory: true,
+    limit: 10,
+  }, undefined, undefined, { agentId: "main" });
+
+  assert.equal(result.details.count, 1);
+  assert.equal(result.details.facts[0].id, "regular-fact");
+  assert.doesNotMatch(result.content[0].text, /Asia\/Shanghai/);
+  assert.ok(!result.details.facts.some((fact) => fact.id === "profile-only"));
 });

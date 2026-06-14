@@ -238,13 +238,29 @@ function serializeFactEntry(entry: MemoryEntry, atMs: number) {
 
 const FACT_QUERY_PAGE_SIZE = 500;
 
+type FactQueryCandidate = {
+  entry: MemoryEntry;
+  meta: ReturnType<typeof parseSmartMetadata>;
+  fact: ReturnType<typeof serializeFactEntry>;
+};
+
+function compareFactQueryCandidates(a: FactQueryCandidate, b: FactQueryCandidate): number {
+  if (a.fact.activeAt !== b.fact.activeAt) return a.fact.activeAt ? -1 : 1;
+  return (b.meta.valid_from || 0) - (a.meta.valid_from || 0)
+    || (b.entry.timestamp || 0) - (a.entry.timestamp || 0);
+}
+
 async function collectFactQueryMatches(
   store: MemoryStore,
   scopeFilter: string[] | undefined,
   query: string | undefined,
   factKey: string | undefined,
-): Promise<MemoryEntry[]> {
-  const matches: MemoryEntry[] = [];
+  atMs: number,
+  includeHistory: boolean,
+  limit: number,
+  workspaceBoundary?: WorkspaceBoundaryConfig | null,
+): Promise<FactQueryCandidate[]> {
+  const matches: FactQueryCandidate[] = [];
   const seenIds = new Set<string>();
 
   for (let offset = 0; ; offset += FACT_QUERY_PAGE_SIZE) {
@@ -252,13 +268,24 @@ async function collectFactQueryMatches(
     if (page.length === 0) break;
 
     let newRows = 0;
+    const pageMatches: FactQueryCandidate[] = [];
     for (const entry of page) {
       if (seenIds.has(entry.id)) continue;
       seenIds.add(entry.id);
       newRows += 1;
       if (isTemporalFactEntry(entry) && factQueryMatches(entry, query, factKey)) {
-        matches.push(entry);
+        const meta = parseSmartMetadata(entry.metadata, entry);
+        const fact = serializeFactEntry(entry, atMs);
+        if (meta.valid_from <= atMs && (includeHistory || fact.activeAt)) {
+          pageMatches.push({ entry, meta, fact });
+        }
       }
+    }
+
+    matches.push(...filterUserMdExclusiveRecallResults(pageMatches, workspaceBoundary));
+    matches.sort(compareFactQueryCandidates);
+    if (matches.length > limit) {
+      matches.length = limit;
     }
 
     if (page.length < FACT_QUERY_PAGE_SIZE || newRows === 0) break;
@@ -986,20 +1013,13 @@ export function registerMemoryFactQueryTool(
               resolvedScopes.scopeFilter,
               query,
               factKey,
+              atMs,
+              includeHistory,
+              safeLimit,
+              runtimeContext.workspaceBoundary,
             );
 
             const facts = entries
-              .map((entry) => {
-                const meta = parseSmartMetadata(entry.metadata, entry);
-                return { entry, meta, fact: serializeFactEntry(entry, atMs) };
-              })
-              .filter(({ meta, fact }) => meta.valid_from <= atMs && (includeHistory || fact.activeAt))
-              .sort((a, b) => {
-                if (a.fact.activeAt !== b.fact.activeAt) return a.fact.activeAt ? -1 : 1;
-                return (b.meta.valid_from || 0) - (a.meta.valid_from || 0)
-                  || (b.entry.timestamp || 0) - (a.entry.timestamp || 0);
-              })
-              .slice(0, safeLimit)
               .map(({ fact }) => fact);
 
             const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
