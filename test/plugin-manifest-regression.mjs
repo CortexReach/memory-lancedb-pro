@@ -407,6 +407,61 @@ try {
       [stopCleanupDbPath, reRegisterDbPath],
       "service stop should clear the cached singleton before re-registration",
     );
+
+    destroyCalls = 0;
+    destroyedDbPaths.length = 0;
+    const sharedDbPath = path.join(workDir, "db-stop-shared");
+    const firstSharedServices = [];
+    const secondSharedServices = [];
+    const firstSharedApi = createMockApi(
+      {
+        dbPath: sharedDbPath,
+        autoCapture: false,
+        autoRecall: false,
+        embedding: {
+          provider: "openai-compatible",
+          apiKey: "dummy",
+          model: "text-embedding-3-small",
+          baseURL: "http://127.0.0.1:9/v1",
+          dimensions: 1536,
+        },
+      },
+      { services: firstSharedServices },
+    );
+    const secondSharedApi = createMockApi(
+      {
+        dbPath: sharedDbPath,
+        autoCapture: false,
+        autoRecall: false,
+        embedding: {
+          provider: "openai-compatible",
+          apiKey: "dummy",
+          model: "text-embedding-3-small",
+          baseURL: "http://127.0.0.1:9/v1",
+          dimensions: 1536,
+        },
+      },
+      { services: secondSharedServices },
+    );
+    resetRegistration();
+    plugin.register(firstSharedApi);
+    plugin.register(secondSharedApi);
+    assert.equal(firstSharedServices.length, 1, "first registration should add a service");
+    assert.equal(secondSharedServices.length, 1, "second registration should add a service");
+    await firstSharedServices[0].stop();
+    assert.equal(
+      destroyCalls,
+      0,
+      "stopping one of multiple registrations should keep the shared store alive",
+    );
+    assert.deepEqual(destroyedDbPaths, []);
+    await secondSharedServices[0].stop();
+    assert.equal(
+      destroyCalls,
+      1,
+      "shared store should be destroyed only after the final registration stops",
+    );
+    assert.deepEqual(destroyedDbPaths, [sharedDbPath]);
   } finally {
     MemoryStore.prototype.destroy = originalDestroy;
   }

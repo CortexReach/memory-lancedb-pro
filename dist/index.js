@@ -1907,6 +1907,7 @@ const memoryLanceDBProPlugin = {
         // ========================================================================
         _registeredApis.add(api); // claim before init (Phase 2 singleton guard)
         _registeredApisMap.set(api, true); // dual-track: explicit claim for rollback
+        let registrationStopped = false;
         let singleton;
         try {
             if (!_singletonState) {
@@ -4143,6 +4144,12 @@ const memoryLanceDBProPlugin = {
                 }
             },
             stop: async () => {
+                if (registrationStopped) {
+                    return;
+                }
+                registrationStopped = true;
+                _registeredApis.delete(api);
+                _registeredApisMap.delete(api);
                 if (backupTimer) {
                     clearInterval(backupTimer);
                     backupTimer = null;
@@ -4155,18 +4162,18 @@ const memoryLanceDBProPlugin = {
                     clearInterval(storageMaintenanceTimer);
                     storageMaintenanceTimer = null;
                 }
-                try {
-                    await store.destroy();
-                }
-                catch (err) {
-                    api.logger.warn(`memory-lancedb-pro: stop cleanup failed: ${String(err)}`);
-                }
-                finally {
-                    if (_singletonState?.store === store) {
-                        _singletonState = null;
+                if (_registeredApisMap.size === 0 && _singletonState?.store === store) {
+                    try {
+                        await store.destroy();
                     }
-                    _registeredApis.delete(api);
-                    _registeredApisMap.delete(api);
+                    catch (err) {
+                        api.logger.warn(`memory-lancedb-pro: stop cleanup failed: ${String(err)}`);
+                    }
+                    finally {
+                        if (_singletonState?.store === store) {
+                            _singletonState = null;
+                        }
+                    }
                 }
                 api.logger.info("memory-lancedb-pro: stopped");
             },
