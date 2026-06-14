@@ -15,6 +15,7 @@ import { matchesMemoryCategoryFilter, resolveToolMemoryCategory, TEMPORAL_VERSIO
 import { appendSelfImprovementEntry, countSelfImprovementEntries, DEFAULT_SELF_IMPROVEMENT_MAX_ENTRIES, ensureSelfImprovementLearningFiles, } from "./self-improvement-files.js";
 import { getDisplayCategoryTag, parseReflectionMetadata } from "./reflection-metadata.js";
 import { filterUserMdExclusiveRecallResults, isUserMdExclusiveMemory, } from "./workspace-boundary.js";
+import { isSuppressed as isTier1Suppressed } from "./auto-recall-tier1.js";
 // ============================================================================
 // Types
 // ============================================================================
@@ -85,6 +86,29 @@ function sanitizeMemoryForSerialization(results) {
             }
             : {}),
     }));
+}
+function isManualRecallNeighborGovernanceEligible(result, nowMs) {
+    const meta = parseSmartMetadata(result.entry.metadata, result.entry);
+    if (meta.state !== "confirmed")
+        return false;
+    if (meta.memory_layer === "archive" || meta.memory_layer === "reflection")
+        return false;
+    if (isTier1Suppressed(meta, nowMs))
+        return false;
+    return true;
+}
+function filterManualRecallResultNeighbors(results, workspaceBoundary, nowMs = Date.now()) {
+    return results.map((result) => {
+        if (!result.neighbors || result.neighbors.length === 0)
+            return result;
+        const neighbors = filterUserMdExclusiveRecallResults(result.neighbors.filter((neighbor) => isManualRecallNeighborGovernanceEligible(neighbor, nowMs)), workspaceBoundary);
+        if (neighbors.length === result.neighbors.length)
+            return result;
+        if (neighbors.length > 0)
+            return { ...result, neighbors };
+        const { neighbors: _neighbors, ...withoutNeighbors } = result;
+        return withoutNeighbors;
+    });
 }
 function isUnresolvedReflectionItem(entry) {
     const metadata = parseReflectionMetadata(entry.metadata);
@@ -623,13 +647,14 @@ function createMemoryRecallTool(runtimeContext, options) {
                 const resolvedScopes = resolveReadableToolScopeFilter(runtimeContext.scopeManager, agentId, scope);
                 const { scopeFilter } = resolvedScopes;
                 const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
-                const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry(runtimeContext.retriever, {
+                const retrievedResults = await retrieveWithRetry(runtimeContext.retriever, {
                     query,
                     limit: safeLimit,
                     scopeFilter,
                     category,
                     source: "manual",
-                }, () => runtimeContext.store.count()), runtimeContext.workspaceBoundary);
+                }, () => runtimeContext.store.count());
+                const results = filterManualRecallResultNeighbors(filterUserMdExclusiveRecallResults(retrievedResults, runtimeContext.workspaceBoundary), runtimeContext.workspaceBoundary);
                 if (results.length === 0) {
                     return {
                         content: [{ type: "text", text: [ignoredScopeNotice, "No relevant memories found."].filter(Boolean).join("\n") }],

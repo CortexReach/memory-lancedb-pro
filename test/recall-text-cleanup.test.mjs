@@ -473,6 +473,40 @@ describe("recall text cleanup", () => {
     assert.equal(res.details.memories[0].neighbors.length, 1);
   });
 
+  it("filters boundary-sensitive and governance-ineligible neighbors from memory_recall output and details", async () => {
+    const tool = createTool(registerMemoryRecallTool, {
+      ...makeRecallContext(makeNeighborGovernanceResults()),
+      workspaceBoundary: {
+        userMdExclusive: {
+          enabled: true,
+        },
+      },
+    });
+    const res = await tool.execute(null, {
+      query: "neighbor governance",
+      limit: 2,
+      maxCharsPerItem: 1000,
+    });
+
+    assert.match(res.content[0].text, /neighbor-shared/);
+    assert.match(res.content[0].text, /neighbor-unique/);
+    assert.doesNotMatch(res.content[0].text, /neighbor-user-md|称呼偏好：宙斯/);
+    assert.doesNotMatch(res.content[0].text, /neighbor-pending|pending neighbor should not appear/);
+    assert.doesNotMatch(res.content[0].text, /neighbor-archive|archive neighbor should not appear/);
+    assert.doesNotMatch(res.content[0].text, /neighbor-reflection|reflection neighbor should not appear/);
+    assert.doesNotMatch(res.content[0].text, /neighbor-suppressed|suppressed neighbor should not appear/);
+
+    assert.deepEqual(
+      res.details.memories.map((memory) => memory.neighbors?.map((neighbor) => neighbor.id) ?? []),
+      [
+        ["neighbor-shared"],
+        ["neighbor-shared", "neighbor-unique"],
+      ],
+    );
+    assert.doesNotMatch(JSON.stringify(res.details.memories), /neighbor-user-md|称呼偏好：宙斯/);
+    assert.doesNotMatch(JSON.stringify(res.details.memories), /neighbor-pending|neighbor-archive|neighbor-reflection|neighbor-suppressed/);
+  });
+
   it("removes retrieval metadata from every rendered memory_recall line", async () => {
     const tool = createTool(registerMemoryRecallTool, makeRecallContext(makeExpandedResults()));
     const res = await tool.execute(null, { query: "test with multiple memories" });
