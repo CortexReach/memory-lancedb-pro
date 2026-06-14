@@ -148,6 +148,43 @@ function makeExpandedResults() {
   ];
 }
 
+function makeNeighborSummaryResults() {
+  return [
+    {
+      entry: {
+        id: "m-neighbor-primary",
+        text: "primary alpha",
+        category: "fact",
+        scope: "global",
+        importance: 0.7,
+        timestamp: Date.now(),
+        metadata: confirmedMetadata(),
+      },
+      score: 0.82,
+      sources: {
+        vector: { score: 0.82, rank: 1 },
+      },
+      neighbors: [
+        {
+          entry: {
+            id: "n1",
+            text: "neighbor beta detail should share the same per item budget instead of expanding the summary line",
+            category: "fact",
+            scope: "global",
+            importance: 0.6,
+            timestamp: Date.now(),
+            metadata: confirmedMetadata(),
+          },
+          score: 0.7,
+          sources: {
+            bm25: { score: 0.7, rank: 1 },
+          },
+        },
+      ],
+    },
+  ];
+}
+
 function makeUserMdExclusiveResults() {
   return [
     ...makeResults(),
@@ -417,6 +454,23 @@ describe("recall text cleanup", () => {
     assert.equal(typeof res.details.memories[1].score, "number");
     assert.ok(res.details.memories[1].sources.vector);
     assert.ok(res.details.memories[1].sources.bm25);
+  });
+
+  it("keeps memory_recall neighbor summaries within the per-item character budget", async () => {
+    const tool = createTool(registerMemoryRecallTool, makeRecallContext(makeNeighborSummaryResults()));
+    const res = await tool.execute(null, {
+      query: "neighbor budget",
+      maxCharsPerItem: 60,
+    });
+
+    const line = extractRenderedMemoryRecallLines(res.content[0].text)[0];
+    const summary = line.replace(/^1\. \[m-neighbor-primary\] \[fact:global\] /, "");
+
+    assert.match(summary, /Neighbors:/);
+    assert.ok(summary.length <= 60, `expected ${summary.length} chars to stay within the configured budget`);
+    assert.match(summary, /…$/);
+    assert.doesNotMatch(summary, /expanding the summary line/);
+    assert.equal(res.details.memories[0].neighbors.length, 1);
   });
 
   it("removes retrieval metadata from every rendered memory_recall line", async () => {

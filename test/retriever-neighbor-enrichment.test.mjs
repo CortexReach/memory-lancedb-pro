@@ -127,6 +127,7 @@ describe("retrieval neighbor enrichment", () => {
     );
     assert.equal(results[0].neighbors?.[0].sources.bm25.rank, 1);
     assert.equal(store.bm25Calls.length, 2, "enabled mode should issue a supplemental BM25 lookup");
+    assert.equal(store.bm25Calls[1].limit, 13, "supplemental lookup should reserve slack after primary-id exclusion");
   });
 
   it("returns primary hybrid results when supplemental neighbor lookup fails", async () => {
@@ -178,6 +179,31 @@ describe("retrieval neighbor enrichment", () => {
     assert.deepEqual(config.neighborEnrichment, {
       enabled: true,
       maxPerResult: 2,
+    });
+  });
+
+  it("normalizes neighbor enrichment bounds in returned retriever config", () => {
+    const retriever = createRetriever(createStore(), embedder, createConfig({
+      neighborEnrichment: {
+        enabled: true,
+        maxPerResult: 99,
+      },
+    }));
+
+    assert.deepEqual(retriever.getConfig().neighborEnrichment, {
+      enabled: true,
+      maxPerResult: 5,
+    });
+
+    retriever.updateConfig({
+      neighborEnrichment: {
+        maxPerResult: 0,
+      },
+    });
+
+    assert.deepEqual(retriever.getConfig().neighborEnrichment, {
+      enabled: true,
+      maxPerResult: 1,
     });
   });
 });

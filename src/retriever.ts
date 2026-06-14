@@ -241,12 +241,16 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
 export function normalizeRetrievalConfig(
   config?: RetrievalConfigInput,
 ): RetrievalConfig {
+  const neighborEnrichment = {
+    ...DEFAULT_RETRIEVAL_CONFIG.neighborEnrichment,
+    ...(config?.neighborEnrichment || {}),
+  };
   return {
     ...DEFAULT_RETRIEVAL_CONFIG,
     ...config,
     neighborEnrichment: {
-      ...DEFAULT_RETRIEVAL_CONFIG.neighborEnrichment,
-      ...(config?.neighborEnrichment || {}),
+      enabled: Boolean(neighborEnrichment.enabled),
+      maxPerResult: clampInt(neighborEnrichment.maxPerResult, 1, 5),
     },
   };
 }
@@ -1228,6 +1232,10 @@ export class MemoryRetriever {
 
     const maxPerResult = clampInt(config.maxPerResult, 1, 5);
     const primaryIds = new Set(results.map((result) => result.entry.id));
+    const neighborCandidateLimit = Math.min(
+      primaryIds.size + maxPerResult + Math.max(10, maxPerResult * 4),
+      50,
+    );
 
     return await Promise.all(results.map(async (result) => {
       const resultScope = result.entry.scope || "global";
@@ -1239,7 +1247,7 @@ export class MemoryRetriever {
       try {
         candidates = await this.store.bm25Search(
           result.entry.text,
-          Math.min(maxPerResult + primaryIds.size + 4, 25),
+          neighborCandidateLimit,
           [resultScope],
           { excludeInactive: true },
         );

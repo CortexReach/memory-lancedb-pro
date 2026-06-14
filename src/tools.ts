@@ -888,15 +888,15 @@ function createMemoryRecallTool(
                 ? (metadata.l2_content || metadata.l1_overview || r.entry.text)
                 : (metadata.l0_abstract || r.entry.text);
               const inline = normalizeInlineText(base);
-              const rendered = includeFullText
-                ? inline
-                : truncateText(inline, safeCharsPerItem);
               const neighborText = r.neighbors && r.neighbors.length > 0
-                ? `\n   Neighbors: ${r.neighbors
+                ? ` Neighbors: ${r.neighbors
                   .map((neighbor) => `[${neighbor.entry.id}] ${truncateText(normalizeInlineText(neighbor.entry.text), 120)}`)
                   .join("; ")}`
                 : "";
-              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${rendered}${neighborText}`;
+              const rendered = includeFullText
+                ? `${inline}${neighborText}`
+                : truncateText(`${inline}${neighborText}`, safeCharsPerItem);
+              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${rendered}`;
             })
             .join("\n");
 
