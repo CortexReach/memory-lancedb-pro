@@ -3237,24 +3237,28 @@ const memoryLanceDBProPlugin = {
 
           let stateFilteredCount = 0;
           let suppressedFilteredCount = 0;
-          const governanceEligible = finalResults.filter((r) => {
+          const isAutoRecallGovernanceEligible = (
+            r: { entry: { id: string; text: string; metadata?: string }; score?: number },
+            countFiltered: boolean,
+          ) => {
             const meta = parseSmartMetadata(r.entry.metadata, r.entry);
             if (meta.state !== "confirmed") {
-              stateFilteredCount++;
-              api.logger.debug(`memory-lancedb-pro: governance: filtered id=${r.entry.id} reason=state(${meta.state}) score=${r.score?.toFixed(3)} text=${r.entry.text.slice(0, 50)}`);
+              if (countFiltered) stateFilteredCount++;
+              api.logger.debug?.(`memory-lancedb-pro: governance: filtered id=${r.entry.id} reason=state(${meta.state}) score=${r.score?.toFixed(3)} text=${r.entry.text.slice(0, 50)}`);
               return false;
             }
             if (meta.memory_layer === "archive" || meta.memory_layer === "reflection") {
-              stateFilteredCount++;
-              api.logger.debug(`memory-lancedb-pro: governance: filtered id=${r.entry.id} reason=layer(${meta.memory_layer}) score=${r.score?.toFixed(3)} text=${r.entry.text.slice(0, 50)}`);
+              if (countFiltered) stateFilteredCount++;
+              api.logger.debug?.(`memory-lancedb-pro: governance: filtered id=${r.entry.id} reason=layer(${meta.memory_layer}) score=${r.score?.toFixed(3)} text=${r.entry.text.slice(0, 50)}`);
               return false;
             }
             if (isTier1Suppressed(meta, Date.now())) {
-              suppressedFilteredCount++;
+              if (countFiltered) suppressedFilteredCount++;
               return false;
             }
             return true;
-          });
+          };
+          const governanceEligible = finalResults.filter((r) => isAutoRecallGovernanceEligible(r, true));
 
           if (governanceEligible.length === 0) {
             api.logger.info?.(
@@ -3275,6 +3279,7 @@ const memoryLanceDBProPlugin = {
             }
           })();
 
+          const renderedNeighborIds = new Set(governanceEligible.map((r) => r.entry.id));
           const preBudgetCandidates = governanceEligible.map((r) => {
             const metaObj = parseSmartMetadata(r.entry.metadata, r.entry);
             const displayCategory = metaObj.memory_category || r.entry.category;
@@ -3286,8 +3291,21 @@ const memoryLanceDBProPlugin = {
               : intent?.depth === "full"
                 ? (r.entry.text) // full text for deep queries
                 : (metaObj.l0_abstract || r.entry.text); // L0/L1 default
-            const neighborContext = r.neighbors && r.neighbors.length > 0
-              ? ` Related: ${r.neighbors
+            const eligibleNeighbors = r.neighbors && r.neighbors.length > 0
+              ? filterUserMdExclusiveRecallResults(
+                r.neighbors.filter((neighbor) => {
+                  if (renderedNeighborIds.has(neighbor.entry.id)) return false;
+                  return isAutoRecallGovernanceEligible(neighbor, false);
+                }),
+                config.workspaceBoundary,
+              ).filter((neighbor) => {
+                if (renderedNeighborIds.has(neighbor.entry.id)) return false;
+                renderedNeighborIds.add(neighbor.entry.id);
+                return true;
+              })
+              : [];
+            const neighborContext = eligibleNeighbors.length > 0
+              ? ` Related: ${eligibleNeighbors
                 .map((neighbor) => sanitizeForContext(neighbor.entry.text).slice(0, 80))
                 .filter(Boolean)
                 .join(" | ")}`
