@@ -119,6 +119,22 @@ function formatFactTimestamp(value) {
         ? new Date(value).toISOString()
         : undefined;
 }
+function parseMetadataObject(rawMetadata) {
+    if (!rawMetadata)
+        return {};
+    try {
+        const parsed = JSON.parse(rawMetadata);
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+            ? parsed
+            : {};
+    }
+    catch {
+        return {};
+    }
+}
+function hasExplicitMetadataField(entry, field) {
+    return Object.prototype.hasOwnProperty.call(parseMetadataObject(entry.metadata), field);
+}
 function factQueryMatches(entry, query, factKey) {
     const meta = parseSmartMetadata(entry.metadata, entry);
     const normalizedFactKey = factKey?.trim().toLowerCase();
@@ -138,6 +154,7 @@ function factQueryMatches(entry, query, factKey) {
 function isTemporalFactEntry(entry) {
     const meta = parseSmartMetadata(entry.metadata, entry);
     return Boolean(meta.fact_key ||
+        hasExplicitMetadataField(entry, "valid_from") ||
         meta.supersedes ||
         meta.superseded_by ||
         meta.invalidated_at ||
@@ -160,6 +177,29 @@ function serializeFactEntry(entry, atMs) {
         supersedes: meta.supersedes,
         supersededBy: meta.superseded_by,
     };
+}
+const FACT_QUERY_PAGE_SIZE = 500;
+async function collectFactQueryMatches(store, scopeFilter, query, factKey) {
+    const matches = [];
+    const seenIds = new Set();
+    for (let offset = 0;; offset += FACT_QUERY_PAGE_SIZE) {
+        const page = await store.list(scopeFilter, undefined, FACT_QUERY_PAGE_SIZE, offset);
+        if (page.length === 0)
+            break;
+        let newRows = 0;
+        for (const entry of page) {
+            if (seenIds.has(entry.id))
+                continue;
+            seenIds.add(entry.id);
+            newRows += 1;
+            if (isTemporalFactEntry(entry) && factQueryMatches(entry, query, factKey)) {
+                matches.push(entry);
+            }
+        }
+        if (page.length < FACT_QUERY_PAGE_SIZE || newRows === 0)
+            break;
+    }
+    return matches;
 }
 const _warnedMissingAgentId = new Set();
 /** @internal Exported for testing only — resets the missing-agent warning throttle. */
@@ -698,16 +738,18 @@ export function registerMemoryFactQueryTool(api, context) {
                     const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
                     const resolvedScopes = resolveReadableToolScopeFilter(runtimeContext.scopeManager, agentId, scope);
                     const atMs = parseFactQueryTimestamp(at);
-                    const entries = await runtimeContext.store.list(resolvedScopes.scopeFilter, undefined, Math.max(safeLimit * 10, 100), 0);
+                    const entries = await collectFactQueryMatches(runtimeContext.store, resolvedScopes.scopeFilter, query, factKey);
                     const facts = entries
-                        .filter(isTemporalFactEntry)
-                        .filter((entry) => factQueryMatches(entry, query, factKey))
-                        .map((entry) => ({ entry, fact: serializeFactEntry(entry, atMs) }))
-                        .filter(({ fact }) => includeHistory || fact.activeAt)
+                        .map((entry) => {
+                        const meta = parseSmartMetadata(entry.metadata, entry);
+                        return { entry, meta, fact: serializeFactEntry(entry, atMs) };
+                    })
+                        .filter(({ meta, fact }) => meta.valid_from <= atMs && (includeHistory || fact.activeAt))
                         .sort((a, b) => {
                         if (a.fact.activeAt !== b.fact.activeAt)
                             return a.fact.activeAt ? -1 : 1;
-                        return (b.entry.timestamp || 0) - (a.entry.timestamp || 0);
+                        return (b.meta.valid_from || 0) - (a.meta.valid_from || 0)
+                            || (b.entry.timestamp || 0) - (a.entry.timestamp || 0);
                     })
                         .slice(0, safeLimit)
                         .map(({ fact }) => fact);

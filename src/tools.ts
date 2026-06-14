@@ -172,6 +172,22 @@ function formatFactTimestamp(value: number | undefined): string | undefined {
     : undefined;
 }
 
+function parseMetadataObject(rawMetadata: string | undefined): Record<string, unknown> {
+  if (!rawMetadata) return {};
+  try {
+    const parsed = JSON.parse(rawMetadata);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function hasExplicitMetadataField(entry: MemoryEntry, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(parseMetadataObject(entry.metadata), field);
+}
+
 function factQueryMatches(entry: MemoryEntry, query: string | undefined, factKey: string | undefined): boolean {
   const meta = parseSmartMetadata(entry.metadata, entry);
   const normalizedFactKey = factKey?.trim().toLowerCase();
@@ -193,6 +209,7 @@ function isTemporalFactEntry(entry: MemoryEntry): boolean {
   const meta = parseSmartMetadata(entry.metadata, entry);
   return Boolean(
     meta.fact_key ||
+    hasExplicitMetadataField(entry, "valid_from") ||
     meta.supersedes ||
     meta.superseded_by ||
     meta.invalidated_at ||
@@ -217,6 +234,37 @@ function serializeFactEntry(entry: MemoryEntry, atMs: number) {
     supersedes: meta.supersedes,
     supersededBy: meta.superseded_by,
   };
+}
+
+const FACT_QUERY_PAGE_SIZE = 500;
+
+async function collectFactQueryMatches(
+  store: MemoryStore,
+  scopeFilter: string[] | undefined,
+  query: string | undefined,
+  factKey: string | undefined,
+): Promise<MemoryEntry[]> {
+  const matches: MemoryEntry[] = [];
+  const seenIds = new Set<string>();
+
+  for (let offset = 0; ; offset += FACT_QUERY_PAGE_SIZE) {
+    const page = await store.list(scopeFilter, undefined, FACT_QUERY_PAGE_SIZE, offset);
+    if (page.length === 0) break;
+
+    let newRows = 0;
+    for (const entry of page) {
+      if (seenIds.has(entry.id)) continue;
+      seenIds.add(entry.id);
+      newRows += 1;
+      if (isTemporalFactEntry(entry) && factQueryMatches(entry, query, factKey)) {
+        matches.push(entry);
+      }
+    }
+
+    if (page.length < FACT_QUERY_PAGE_SIZE || newRows === 0) break;
+  }
+
+  return matches;
 }
 
 const _warnedMissingAgentId = new Set<string>();
@@ -933,21 +981,23 @@ export function registerMemoryFactQueryTool(
             const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
             const resolvedScopes = resolveReadableToolScopeFilter(runtimeContext.scopeManager, agentId, scope);
             const atMs = parseFactQueryTimestamp(at);
-            const entries = await runtimeContext.store.list(
+            const entries = await collectFactQueryMatches(
+              runtimeContext.store,
               resolvedScopes.scopeFilter,
-              undefined,
-              Math.max(safeLimit * 10, 100),
-              0,
+              query,
+              factKey,
             );
 
             const facts = entries
-              .filter(isTemporalFactEntry)
-              .filter((entry) => factQueryMatches(entry, query, factKey))
-              .map((entry) => ({ entry, fact: serializeFactEntry(entry, atMs) }))
-              .filter(({ fact }) => includeHistory || fact.activeAt)
+              .map((entry) => {
+                const meta = parseSmartMetadata(entry.metadata, entry);
+                return { entry, meta, fact: serializeFactEntry(entry, atMs) };
+              })
+              .filter(({ meta, fact }) => meta.valid_from <= atMs && (includeHistory || fact.activeAt))
               .sort((a, b) => {
                 if (a.fact.activeAt !== b.fact.activeAt) return a.fact.activeAt ? -1 : 1;
-                return (b.entry.timestamp || 0) - (a.entry.timestamp || 0);
+                return (b.meta.valid_from || 0) - (a.meta.valid_from || 0)
+                  || (b.entry.timestamp || 0) - (a.entry.timestamp || 0);
               })
               .slice(0, safeLimit)
               .map(({ fact }) => fact);
