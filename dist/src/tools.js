@@ -151,14 +151,15 @@ function factQueryMatches(entry, query, factKey) {
         entry.text,
     ].some((value) => typeof value === "string" && value.toLowerCase().includes(normalizedQuery));
 }
-function isTemporalFactEntry(entry) {
-    const meta = parseSmartMetadata(entry.metadata, entry);
-    return Boolean(meta.fact_key ||
-        hasExplicitMetadataField(entry, "valid_from") ||
-        meta.supersedes ||
-        meta.superseded_by ||
-        meta.invalidated_at ||
-        meta.valid_until);
+function isTemporalFactEntry(entry, hasFactKeySelector) {
+    const rawMetadata = parseMetadataObject(entry.metadata);
+    if (hasFactKeySelector)
+        return true;
+    return Boolean(hasExplicitMetadataField(entry, "supersedes") ||
+        hasExplicitMetadataField(entry, "superseded_by") ||
+        hasExplicitMetadataField(entry, "invalidated_at") ||
+        hasExplicitMetadataField(entry, "valid_until") ||
+        rawMetadata.memory_temporal_type === "dynamic");
 }
 function serializeFactEntry(entry, atMs) {
     const meta = parseSmartMetadata(entry.metadata, entry);
@@ -188,6 +189,7 @@ function compareFactQueryCandidates(a, b) {
 async function collectFactQueryMatches(store, scopeFilter, query, factKey, atMs, includeHistory, limit, workspaceBoundary) {
     const matches = [];
     const seenIds = new Set();
+    const hasFactKeySelector = Boolean(factKey?.trim());
     for (let offset = 0;; offset += FACT_QUERY_PAGE_SIZE) {
         const page = await store.list(scopeFilter, undefined, FACT_QUERY_PAGE_SIZE, offset);
         if (page.length === 0)
@@ -199,7 +201,7 @@ async function collectFactQueryMatches(store, scopeFilter, query, factKey, atMs,
                 continue;
             seenIds.add(entry.id);
             newRows += 1;
-            if (isTemporalFactEntry(entry) && factQueryMatches(entry, query, factKey)) {
+            if (isTemporalFactEntry(entry, hasFactKeySelector) && factQueryMatches(entry, query, factKey)) {
                 const meta = parseSmartMetadata(entry.metadata, entry);
                 const fact = serializeFactEntry(entry, atMs);
                 if (meta.valid_from <= atMs && (includeHistory || fact.activeAt)) {
@@ -751,10 +753,24 @@ export function registerMemoryFactQueryTool(api, context) {
                 const { query, factKey, at, scope, includeHistory = false, limit = 10, } = params;
                 try {
                     const safeLimit = clampInt(limit, 1, 100);
+                    const trimmedQuery = query?.trim();
+                    const trimmedFactKey = factKey?.trim();
+                    if (!trimmedQuery && !trimmedFactKey) {
+                        return {
+                            content: [{
+                                    type: "text",
+                                    text: "Fact query requires a query or exact factKey selector.",
+                                }],
+                            details: {
+                                action: "fact_query",
+                                error: "missing_selector",
+                            },
+                        };
+                    }
                     const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
                     const resolvedScopes = resolveReadableToolScopeFilter(runtimeContext.scopeManager, agentId, scope);
                     const atMs = parseFactQueryTimestamp(at);
-                    const entries = await collectFactQueryMatches(runtimeContext.store, resolvedScopes.scopeFilter, query, factKey, atMs, includeHistory, safeLimit, runtimeContext.workspaceBoundary);
+                    const entries = await collectFactQueryMatches(runtimeContext.store, resolvedScopes.scopeFilter, trimmedQuery, trimmedFactKey, atMs, includeHistory, safeLimit, runtimeContext.workspaceBoundary);
                     const facts = entries
                         .map(({ fact }) => fact);
                     const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
@@ -777,8 +793,8 @@ export function registerMemoryFactQueryTool(api, context) {
                             }],
                         details: {
                             action: "fact_query",
-                            query,
-                            factKey,
+                            query: trimmedQuery,
+                            factKey: trimmedFactKey,
                             asOf: new Date(atMs).toISOString(),
                             includeHistory,
                             count: facts.length,

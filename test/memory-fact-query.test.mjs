@@ -17,6 +17,8 @@ function makeEntry({
   validFrom,
   invalidatedAt,
   validUntil,
+  supersedes,
+  memoryTemporalType,
   timestamp = validFrom,
   memoryCategory = "entities",
 }) {
@@ -38,6 +40,8 @@ function makeEntry({
           valid_from: validFrom,
           invalidated_at: invalidatedAt,
           valid_until: validUntil,
+          supersedes,
+          memory_temporal_type: memoryTemporalType,
         },
       ),
     ),
@@ -96,6 +100,7 @@ test("memory_fact_query returns the fact active at the requested date", async ()
       text: "MyQuant strategy version: v12.0",
       factKey: "entities:myquant strategy version",
       validFrom: newFrom,
+      supersedes: "old-version",
     }),
   ];
   const tool = createTool(entries);
@@ -207,13 +212,14 @@ test("memory_fact_query includeHistory excludes facts that are not valid yet", a
   assert.equal(result.details.facts[0].id, "expired-fact");
 });
 
-test("memory_fact_query treats explicit valid_from metadata as temporal without a fact key", async () => {
+test("memory_fact_query treats explicitly dynamic metadata as temporal without a fact key", async () => {
   const entries = [
     makeEntry({
       id: "valid-from-only",
       text: "The workspace runs nightly cleanup at 02:00",
       validFrom: Date.parse("2026-01-01T00:00:00Z"),
       memoryCategory: "patterns",
+      memoryTemporalType: "dynamic",
     }),
   ];
   const tool = createTool(entries);
@@ -225,6 +231,47 @@ test("memory_fact_query treats explicit valid_from metadata as temporal without 
 
   assert.equal(result.details.count, 1);
   assert.equal(result.details.facts[0].id, "valid-from-only");
+});
+
+test("memory_fact_query requires an explicit query or factKey selector", async () => {
+  const tool = createTool([
+    makeEntry({
+      id: "broad-list-target",
+      text: "Workspace canonical branch: trunk",
+      factKey: "entities:workspace canonical branch",
+      validFrom: Date.parse("2026-01-01T00:00:00Z"),
+    }),
+  ]);
+
+  const result = await tool.execute(null, {}, undefined, undefined, { agentId: "main" });
+
+  assert.equal(result.details.error, "missing_selector");
+  assert.match(result.content[0].text, /requires a query or exact factKey/);
+});
+
+test("memory_fact_query text search does not treat ordinary smart metadata as temporal facts", async () => {
+  const ordinaryEntry = makeEntry({
+    id: "ordinary-smart-memory",
+    text: "Workspace timezone test fixture remains visible",
+    factKey: "entities:workspace timezone fixture",
+    validFrom: Date.parse("2026-01-01T00:00:00Z"),
+  });
+  const temporalEntry = makeEntry({
+    id: "dynamic-temporal-memory",
+    text: "Workspace timezone rotates tomorrow",
+    factKey: "entities:workspace timezone dynamic",
+    validFrom: Date.parse("2026-01-02T00:00:00Z"),
+    memoryTemporalType: "dynamic",
+  });
+  const tool = createTool([ordinaryEntry, temporalEntry]);
+
+  const result = await tool.execute(null, {
+    query: "workspace timezone",
+    at: "2026-01-15T00:00:00Z",
+    includeHistory: true,
+  }, undefined, undefined, { agentId: "main" });
+
+  assert.deepEqual(result.details.facts.map((fact) => fact.id), ["dynamic-temporal-memory"]);
 });
 
 test("memory_fact_query orders as-of matches by valid_from before entry timestamp", async () => {
@@ -265,12 +312,14 @@ test("memory_fact_query filters USER.md-exclusive facts from output and details"
       text: "User profile: timezone is Asia/Shanghai",
       validFrom: Date.parse("2026-01-01T00:00:00Z"),
       memoryCategory: "profile",
+      memoryTemporalType: "dynamic",
     }),
     makeEntry({
       id: "regular-fact",
       text: "Workspace timezone test fixture remains visible",
       factKey: "entities:workspace timezone fixture",
       validFrom: Date.parse("2026-01-02T00:00:00Z"),
+      memoryTemporalType: "dynamic",
     }),
   ];
   const tool = createTool(entries, {

@@ -205,15 +205,16 @@ function factQueryMatches(entry: MemoryEntry, query: string | undefined, factKey
   ].some((value) => typeof value === "string" && value.toLowerCase().includes(normalizedQuery));
 }
 
-function isTemporalFactEntry(entry: MemoryEntry): boolean {
-  const meta = parseSmartMetadata(entry.metadata, entry);
+function isTemporalFactEntry(entry: MemoryEntry, hasFactKeySelector: boolean): boolean {
+  const rawMetadata = parseMetadataObject(entry.metadata);
+  if (hasFactKeySelector) return true;
+
   return Boolean(
-    meta.fact_key ||
-    hasExplicitMetadataField(entry, "valid_from") ||
-    meta.supersedes ||
-    meta.superseded_by ||
-    meta.invalidated_at ||
-    meta.valid_until,
+    hasExplicitMetadataField(entry, "supersedes") ||
+    hasExplicitMetadataField(entry, "superseded_by") ||
+    hasExplicitMetadataField(entry, "invalidated_at") ||
+    hasExplicitMetadataField(entry, "valid_until") ||
+    rawMetadata.memory_temporal_type === "dynamic",
   );
 }
 
@@ -262,6 +263,7 @@ async function collectFactQueryMatches(
 ): Promise<FactQueryCandidate[]> {
   const matches: FactQueryCandidate[] = [];
   const seenIds = new Set<string>();
+  const hasFactKeySelector = Boolean(factKey?.trim());
 
   for (let offset = 0; ; offset += FACT_QUERY_PAGE_SIZE) {
     const page = await store.list(scopeFilter, undefined, FACT_QUERY_PAGE_SIZE, offset);
@@ -273,7 +275,7 @@ async function collectFactQueryMatches(
       if (seenIds.has(entry.id)) continue;
       seenIds.add(entry.id);
       newRows += 1;
-      if (isTemporalFactEntry(entry) && factQueryMatches(entry, query, factKey)) {
+      if (isTemporalFactEntry(entry, hasFactKeySelector) && factQueryMatches(entry, query, factKey)) {
         const meta = parseSmartMetadata(entry.metadata, entry);
         const fact = serializeFactEntry(entry, atMs);
         if (meta.valid_from <= atMs && (includeHistory || fact.activeAt)) {
@@ -1005,14 +1007,28 @@ export function registerMemoryFactQueryTool(
 
           try {
             const safeLimit = clampInt(limit, 1, 100);
+            const trimmedQuery = query?.trim();
+            const trimmedFactKey = factKey?.trim();
+            if (!trimmedQuery && !trimmedFactKey) {
+              return {
+                content: [{
+                  type: "text",
+                  text: "Fact query requires a query or exact factKey selector.",
+                }],
+                details: {
+                  action: "fact_query",
+                  error: "missing_selector",
+                },
+              };
+            }
             const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
             const resolvedScopes = resolveReadableToolScopeFilter(runtimeContext.scopeManager, agentId, scope);
             const atMs = parseFactQueryTimestamp(at);
             const entries = await collectFactQueryMatches(
               runtimeContext.store,
               resolvedScopes.scopeFilter,
-              query,
-              factKey,
+              trimmedQuery,
+              trimmedFactKey,
               atMs,
               includeHistory,
               safeLimit,
@@ -1043,8 +1059,8 @@ export function registerMemoryFactQueryTool(
               }],
               details: {
                 action: "fact_query",
-                query,
-                factKey,
+                query: trimmedQuery,
+                factKey: trimmedFactKey,
                 asOf: new Date(atMs).toISOString(),
                 includeHistory,
                 count: facts.length,
