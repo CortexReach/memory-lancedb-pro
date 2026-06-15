@@ -18,11 +18,19 @@ import {
   appendRelation,
   buildSmartMetadata,
   deriveFactKey,
+  isMemoryActiveAt,
+  isMemoryExpired,
   parseSmartMetadata,
   stringifySmartMetadata,
 } from "./smart-metadata.js";
 import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
-import { TEMPORAL_VERSIONED_CATEGORIES } from "./memory-categories.js";
+import {
+  matchesMemoryCategoryFilter,
+  resolveToolMemoryCategory,
+  TEMPORAL_VERSIONED_CATEGORIES,
+  TOOL_MEMORY_CATEGORIES,
+  type MemoryCategory,
+} from "./memory-categories.js";
 import {
   appendSelfImprovementEntry,
   countSelfImprovementEntries,
@@ -41,14 +49,7 @@ import {
 // Types
 // ============================================================================
 
-export const MEMORY_CATEGORIES = [
-  "preference",
-  "fact",
-  "decision",
-  "entity",
-  "reflection",
-  "other",
-] as const;
+export const MEMORY_CATEGORIES = TOOL_MEMORY_CATEGORIES;
 
 function stringEnum<T extends readonly [string, ...string[]]>(values: T) {
   return Type.Unsafe<T[number]>({
@@ -103,8 +104,8 @@ function truncateText(text: string, maxChars: number): string {
   return `${clipped}…`;
 }
 
-function deriveManualMemoryLayer(category: string): "durable" | "working" {
-  if (category === "preference" || category === "decision" || category === "fact") {
+function deriveManualMemoryLayer(category: MemoryCategory): "durable" | "working" {
+  if (category === "profile" || category === "preferences" || category === "events") {
     return "durable";
   }
   return "working";
@@ -153,6 +154,145 @@ function formatReflectionResolvePreview(candidates: Array<{ entry: MemoryEntry; 
     `Reflection resolve preview: ${candidates.length} candidate(s). No changes made.`,
     ...lines,
   ].join("\n");
+}
+
+function parseFactQueryTimestamp(value: unknown): number {
+  if (typeof value !== "string" || value.trim().length === 0) return Date.now();
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid at timestamp: ${value}`);
+  }
+  return parsed;
+}
+
+function formatFactTimestamp(value: number | undefined): string | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? new Date(value).toISOString()
+    : undefined;
+}
+
+function parseMetadataObject(rawMetadata: string | undefined): Record<string, unknown> {
+  if (!rawMetadata) return {};
+  try {
+    const parsed = JSON.parse(rawMetadata);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function hasExplicitMetadataField(entry: MemoryEntry, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(parseMetadataObject(entry.metadata), field);
+}
+
+function factQueryMatches(entry: MemoryEntry, query: string | undefined, factKey: string | undefined): boolean {
+  const meta = parseSmartMetadata(entry.metadata, entry);
+  const normalizedFactKey = factKey?.trim().toLowerCase();
+  if (normalizedFactKey && meta.fact_key?.toLowerCase() !== normalizedFactKey) return false;
+
+  const normalizedQuery = query?.trim().toLowerCase();
+  if (!normalizedQuery) return true;
+
+  return [
+    meta.fact_key,
+    meta.memory_category,
+    meta.l0_abstract,
+    meta.l1_overview,
+    entry.text,
+  ].some((value) => typeof value === "string" && value.toLowerCase().includes(normalizedQuery));
+}
+
+function isTemporalFactEntry(entry: MemoryEntry, hasFactKeySelector: boolean): boolean {
+  const rawMetadata = parseMetadataObject(entry.metadata);
+  if (hasFactKeySelector) return true;
+
+  return Boolean(
+    hasExplicitMetadataField(entry, "supersedes") ||
+    hasExplicitMetadataField(entry, "superseded_by") ||
+    hasExplicitMetadataField(entry, "invalidated_at") ||
+    hasExplicitMetadataField(entry, "valid_until") ||
+    rawMetadata.memory_temporal_type === "dynamic",
+  );
+}
+
+function serializeFactEntry(entry: MemoryEntry, atMs: number) {
+  const meta = parseSmartMetadata(entry.metadata, entry);
+  const activeAt = isMemoryActiveAt(meta, atMs) && !isMemoryExpired(meta, atMs);
+  return {
+    id: entry.id,
+    text: entry.text,
+    scope: entry.scope,
+    category: entry.category,
+    memoryCategory: meta.memory_category,
+    factKey: meta.fact_key,
+    activeAt,
+    validFrom: formatFactTimestamp(meta.valid_from),
+    validUntil: formatFactTimestamp(meta.valid_until),
+    invalidatedAt: formatFactTimestamp(meta.invalidated_at),
+    supersedes: meta.supersedes,
+    supersededBy: meta.superseded_by,
+  };
+}
+
+const FACT_QUERY_PAGE_SIZE = 500;
+
+type FactQueryCandidate = {
+  entry: MemoryEntry;
+  meta: ReturnType<typeof parseSmartMetadata>;
+  fact: ReturnType<typeof serializeFactEntry>;
+};
+
+function compareFactQueryCandidates(a: FactQueryCandidate, b: FactQueryCandidate): number {
+  if (a.fact.activeAt !== b.fact.activeAt) return a.fact.activeAt ? -1 : 1;
+  return (b.meta.valid_from || 0) - (a.meta.valid_from || 0)
+    || (b.entry.timestamp || 0) - (a.entry.timestamp || 0);
+}
+
+async function collectFactQueryMatches(
+  store: MemoryStore,
+  scopeFilter: string[] | undefined,
+  query: string | undefined,
+  factKey: string | undefined,
+  atMs: number,
+  includeHistory: boolean,
+  limit: number,
+  workspaceBoundary?: WorkspaceBoundaryConfig | null,
+): Promise<FactQueryCandidate[]> {
+  const matches: FactQueryCandidate[] = [];
+  const seenIds = new Set<string>();
+  const hasFactKeySelector = Boolean(factKey?.trim());
+
+  for (let offset = 0; ; offset += FACT_QUERY_PAGE_SIZE) {
+    const page = await store.list(scopeFilter, undefined, FACT_QUERY_PAGE_SIZE, offset);
+    if (page.length === 0) break;
+
+    let newRows = 0;
+    const pageMatches: FactQueryCandidate[] = [];
+    for (const entry of page) {
+      if (seenIds.has(entry.id)) continue;
+      seenIds.add(entry.id);
+      newRows += 1;
+      if (isTemporalFactEntry(entry, hasFactKeySelector) && factQueryMatches(entry, query, factKey)) {
+        const meta = parseSmartMetadata(entry.metadata, entry);
+        const fact = serializeFactEntry(entry, atMs);
+        if (meta.valid_from <= atMs && (includeHistory || fact.activeAt)) {
+          pageMatches.push({ entry, meta, fact });
+        }
+      }
+    }
+
+    matches.push(...filterUserMdExclusiveRecallResults(pageMatches, workspaceBoundary));
+    matches.sort(compareFactQueryCandidates);
+    if (matches.length > limit) {
+      matches.length = limit;
+    }
+
+    if (page.length < FACT_QUERY_PAGE_SIZE || newRows === 0) break;
+  }
+
+  return matches;
 }
 
 const _warnedMissingAgentId = new Set<string>();
@@ -827,6 +967,123 @@ export function registerMemoryRecallAliasTool(
   );
 }
 
+export function registerMemoryFactQueryTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return {
+        name: "memory_fact_query",
+        label: "Memory Fact Query",
+        description:
+          "Deterministically query current or historical temporal facts by fact key or text without semantic reranking.",
+        parameters: Type.Object({
+          query: Type.Optional(Type.String({ description: "Text to match against fact keys and fact summaries." })),
+          factKey: Type.Optional(Type.String({ description: "Exact temporal fact key, such as preferences:drink." })),
+          at: Type.Optional(Type.String({ description: "ISO timestamp/date for as-of lookup. Defaults to now." })),
+          scope: Type.Optional(Type.String({ description: "Optional scope filter." })),
+          includeHistory: Type.Optional(Type.Boolean({ description: "Include inactive superseded/expired facts (default false)." })),
+          limit: Type.Optional(Type.Number({ description: "Maximum facts to return (default 10, max 100)." })),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
+          const {
+            query,
+            factKey,
+            at,
+            scope,
+            includeHistory = false,
+            limit = 10,
+          } = params as {
+            query?: string;
+            factKey?: string;
+            at?: string;
+            scope?: string;
+            includeHistory?: boolean;
+            limit?: number;
+          };
+
+          try {
+            const safeLimit = clampInt(limit, 1, 100);
+            const trimmedQuery = query?.trim();
+            const trimmedFactKey = factKey?.trim();
+            if (!trimmedQuery && !trimmedFactKey) {
+              return {
+                content: [{
+                  type: "text",
+                  text: "Fact query requires a query or exact factKey selector.",
+                }],
+                details: {
+                  action: "fact_query",
+                  error: "missing_selector",
+                },
+              };
+            }
+            const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
+            const resolvedScopes = resolveReadableToolScopeFilter(runtimeContext.scopeManager, agentId, scope);
+            const atMs = parseFactQueryTimestamp(at);
+            const entries = await collectFactQueryMatches(
+              runtimeContext.store,
+              resolvedScopes.scopeFilter,
+              trimmedQuery,
+              trimmedFactKey,
+              atMs,
+              includeHistory,
+              safeLimit,
+              runtimeContext.workspaceBoundary,
+            );
+
+            const facts = entries
+              .map(({ fact }) => fact);
+
+            const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
+            const lines = facts.map((fact, index) => {
+              const status = fact.activeAt ? "active" : "historical";
+              const datePart = [fact.validFrom ? `from=${fact.validFrom}` : undefined, fact.validUntil ? `until=${fact.validUntil}` : undefined]
+                .filter(Boolean)
+                .join(" ");
+              return `${index + 1}. [${status}] ${fact.factKey ?? fact.memoryCategory ?? fact.category} ${datePart} ${truncateText(normalizeInlineText(fact.text), 180)}`.trim();
+            });
+
+            return {
+              content: [{
+                type: "text",
+                text: [
+                  ignoredScopeNotice,
+                  lines.length > 0
+                    ? `Fact query returned ${facts.length} result(s) as of ${new Date(atMs).toISOString()}:\n${lines.join("\n")}`
+                    : `Fact query returned 0 result(s) as of ${new Date(atMs).toISOString()}.`,
+                ].filter(Boolean).join("\n"),
+              }],
+              details: {
+                action: "fact_query",
+                query: trimmedQuery,
+                factKey: trimmedFactKey,
+                asOf: new Date(atMs).toISOString(),
+                includeHistory,
+                count: facts.length,
+                ignoredScope: resolvedScopes.ignoredScope,
+                accessibleScopes: resolvedScopes.accessibleScopes,
+                facts,
+              },
+            };
+          } catch (error) {
+            return {
+              content: [{
+                type: "text",
+                text: `Fact query failed: ${error instanceof Error ? error.message : String(error)}`,
+              }],
+              details: { error: "fact_query_failed", message: String(error) },
+            };
+          }
+        },
+      };
+    },
+    { name: "memory_fact_query" },
+  );
+}
+
 export function registerMemoryStoreTool(
   api: OpenClawPluginApi,
   context: ToolContext,
@@ -957,6 +1214,8 @@ export function registerMemoryStoreTool(
           }
 
           const safeImportance = clamp01(importance, 0.7);
+          const { memoryCategory, storageCategory } =
+            resolveToolMemoryCategory(category);
           const vector = await runtimeContext.embedder.embedPassage(stripped);
 
           // Temporal awareness: classify and infer expiry
@@ -966,12 +1225,9 @@ export function registerMemoryStoreTool(
           // (bypasses importance/recency weighting).
           // Fail-open by design: dedup must never block a legitimate memory write.
           // excludeInactive: superseded historical records must not block new writes.
-          // Align with TEMPORAL_VERSIONED_CATEGORIES: only preference and entity
-          // are semantically version-controlled. "fact"/"other" can reverse-map
-          // to unrelated semantic categories, risking cross-supersede.
-          const SUPERSEDE_ELIGIBLE: ReadonlySet<string> = new Set([
-            "preference", "entity",
-          ]);
+          // Align with TEMPORAL_VERSIONED_CATEGORIES at the smart-category
+          // layer so legacy storage categories like "fact" don't cross-match
+          // unrelated profile/case memories.
           let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
           try {
             existing = await runtimeContext.store.vectorSearch(vector, 3, 0.1, [
@@ -1009,8 +1265,8 @@ export function registerMemoryStoreTool(
             (r) =>
               r.score > 0.95 &&
               r.score <= 0.98 &&
-              r.entry.category === category &&
-              SUPERSEDE_ELIGIBLE.has(r.entry.category),
+              TEMPORAL_VERSIONED_CATEGORIES.has(memoryCategory) &&
+              matchesMemoryCategoryFilter(r.entry.category, memoryCategory, r.entry.metadata),
           );
 
           if (supersedeCandidate) {
@@ -1023,7 +1279,7 @@ export function registerMemoryStoreTool(
             // Store new memory with supersedes link, preserving canonical fields
             // from the old entry (aligns with memory_update supersede path).
             const newMeta = buildSmartMetadata(
-              { text, category: category as any, importance: safeImportance },
+              { text, category: storageCategory, importance: safeImportance },
               {
                 l0_abstract: text,
                 l1_overview: oldMeta.l1_overview || `- ${text}`,
@@ -1032,7 +1288,7 @@ export function registerMemoryStoreTool(
                 tier: oldMeta.tier,
                 source: "manual",
                 state: "confirmed",
-                memory_layer: deriveManualMemoryLayer(category as string),
+                memory_layer: deriveManualMemoryLayer(oldMeta.memory_category),
                 last_confirmed_use_at: now,
                 bad_recall_count: 0,
                 suppressed_until_turn: 0,
@@ -1050,7 +1306,7 @@ export function registerMemoryStoreTool(
               text,
               vector,
               importance: safeImportance,
-              category: category as any,
+              category: storageCategory,
               scope: targetScope,
               metadata: stringifySmartMetadata(newMeta),
             });
@@ -1080,7 +1336,7 @@ export function registerMemoryStoreTool(
             // Dual-write to Markdown mirror if enabled
             if (context.mdMirror) {
               await context.mdMirror(
-                { text, category: category as string, scope: targetScope, timestamp: newEntry.timestamp },
+                { text, category: storageCategory, scope: targetScope, timestamp: newEntry.timestamp },
                 { source: "memory_store", agentId },
               );
             }
@@ -1097,7 +1353,8 @@ export function registerMemoryStoreTool(
                 id: newEntry.id,
                 supersededId: oldEntry.id,
                 scope: newEntry.scope,
-                category: newEntry.category,
+                category: memoryCategory,
+                rawCategory: newEntry.category,
                 importance: newEntry.importance,
                 similarity: supersedeCandidate.score,
               },
@@ -1108,22 +1365,23 @@ export function registerMemoryStoreTool(
             text,
             vector,
             importance: safeImportance,
-            category: category as any,
+            category: storageCategory,
             scope: targetScope,
             metadata: stringifySmartMetadata(
               buildSmartMetadata(
                 {
                   text,
-                  category: category as any,
+                  category: storageCategory,
                   importance: safeImportance,
                 },
                 {
                   l0_abstract: text,
                   l1_overview: `- ${text}`,
                   l2_content: text,
+                  memory_category: memoryCategory,
                   source: "manual",
                   state: "confirmed",
-                  memory_layer: deriveManualMemoryLayer(category as string),
+                  memory_layer: deriveManualMemoryLayer(memoryCategory),
                   last_confirmed_use_at: Date.now(),
                   bad_recall_count: 0,
                   suppressed_until_turn: 0,
@@ -1137,7 +1395,7 @@ export function registerMemoryStoreTool(
           // Dual-write to Markdown mirror if enabled
           if (context.mdMirror) {
             await context.mdMirror(
-              { text, category: category as string, scope: targetScope, timestamp: entry.timestamp },
+              { text, category: storageCategory, scope: targetScope, timestamp: entry.timestamp },
               { source: "memory_store", agentId },
             );
           }
@@ -1153,7 +1411,8 @@ export function registerMemoryStoreTool(
               action: "created",
               id: entry.id,
               scope: entry.scope,
-              category: entry.category,
+              category: memoryCategory,
+              rawCategory: entry.category,
               importance: entry.importance,
               ...(duplicateCandidate && force
                 ? { duplicateOverride: {
@@ -1390,6 +1649,9 @@ export function registerMemoryUpdateTool(
               details: { error: "no_updates" },
             };
           }
+          const categoryResolution = category
+            ? resolveToolMemoryCategory(category)
+            : undefined;
 
           // Determine accessible scopes
           const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
@@ -1461,7 +1723,7 @@ export function registerMemoryUpdateTool(
           // importance-only change that still needs metadata sync). Shared by
           // the temporal supersede guard and the normal-path metadata rebuild.
           let existing: MemoryEntry | null = null;
-          if (text || importance !== undefined) {
+          if (text || importance !== undefined || categoryResolution) {
             existing = await context.store.getById(resolvedId, scopeFilter);
           }
 
@@ -1471,18 +1733,22 @@ export function registerMemoryUpdateTool(
           if (text && newVector && existing) {
             const meta = parseSmartMetadata(existing.metadata, existing);
             if (TEMPORAL_VERSIONED_CATEGORIES.has(meta.memory_category)) {
+                const effectiveMemoryCategory =
+                  categoryResolution?.memoryCategory ?? meta.memory_category;
+                const effectiveStorageCategory =
+                  categoryResolution?.storageCategory ?? existing.category;
                 const now = Date.now();
                 const factKey =
-                  meta.fact_key ?? deriveFactKey(meta.memory_category, text);
+                  meta.fact_key ?? deriveFactKey(effectiveMemoryCategory, text);
 
                 // Create new superseding record
                 const newMeta = buildSmartMetadata(
-                  { text, category: existing.category },
+                  { text, category: effectiveStorageCategory },
                   {
                     l0_abstract: text,
                     l1_overview: meta.l1_overview,
                     l2_content: text,
-                    memory_category: meta.memory_category,
+                    memory_category: effectiveMemoryCategory,
                     tier: meta.tier,
                     access_count: 0,
                     confidence: importance !== undefined ? clamp01(importance, 0.7) : meta.confidence,
@@ -1499,7 +1765,7 @@ export function registerMemoryUpdateTool(
                 const newEntry = await context.store.store({
                   text,
                   vector: newVector,
-                  category: category ? (category as any) : existing.category,
+                  category: effectiveStorageCategory,
                   scope: existing.scope,
                   importance:
                     importance !== undefined
@@ -1542,7 +1808,7 @@ export function registerMemoryUpdateTool(
                     action: "superseded",
                     oldId: resolvedId,
                     newId: newEntry.id,
-                    category: meta.memory_category,
+                    category: effectiveMemoryCategory,
                   },
                 };
             }
@@ -1554,16 +1820,18 @@ export function registerMemoryUpdateTool(
           if (newVector) updates.vector = newVector;
           if (importance !== undefined)
             updates.importance = clamp01(importance, 0.7);
-          if (category) updates.category = category;
+          if (categoryResolution) updates.category = categoryResolution.storageCategory;
 
           // Rebuild smart metadata when text or importance changes (#544)
           if (text && existing) {
             const meta = parseSmartMetadata(existing.metadata, existing);
-            const effectiveCategory = (category as any) ?? meta.memory_category;
+            const effectiveCategory =
+              categoryResolution?.memoryCategory ?? meta.memory_category;
             const updatedMeta = buildSmartMetadata(existing, {
               l0_abstract: text,
               l1_overview: `- ${text}`,
               l2_content: text,
+              memory_category: effectiveCategory,
               fact_key: deriveFactKey(effectiveCategory, text),
               memory_temporal_type: classifyTemporal(text),
               confidence:
@@ -1576,10 +1844,15 @@ export function registerMemoryUpdateTool(
             // clears any stale value inherited from the previous text.
             updatedMeta.valid_until = inferExpiry(text);
             updates.metadata = stringifySmartMetadata(updatedMeta);
-          } else if (importance !== undefined && existing) {
-            // Sync confidence for importance-only changes
+          } else if ((importance !== undefined || categoryResolution) && existing) {
+            // Sync metadata for importance/category-only changes
             const updatedMeta = buildSmartMetadata(existing, {
-              confidence: clamp01(importance, 0.7),
+              ...(importance !== undefined
+                ? { confidence: clamp01(importance, 0.7) }
+                : {}),
+              ...(categoryResolution
+                ? { memory_category: categoryResolution.memoryCategory }
+                : {}),
             });
             updates.metadata = stringifySmartMetadata(updatedMeta);
           }
@@ -1754,7 +2027,7 @@ export function registerMemoryDebugTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const staticAgentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId);
       return {
         name: "memory_debug",
         label: "Memory Debug",
@@ -1769,12 +2042,13 @@ export function registerMemoryDebugTool(
             Type.String({ description: "Specific memory scope to search in (optional)" }),
           ),
         }),
-        async execute(_toolCallId, params) {
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
           const { query, limit = 5, scope } = params as {
             query: string; limit?: number; scope?: string;
           };
           try {
             const safeLimit = clampInt(limit, 1, 20);
+            const agentId = resolveRuntimeAgentId(staticAgentId, runtimeCtx);
             const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
             const { scopeFilter } = resolvedScopes;
             const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
@@ -2602,6 +2876,7 @@ export function registerAllMemoryTools(
   registerMemoryRecallTool(api, context);
   registerMemoryRecallAliasTool(api, context, "memory_search");
   registerMemoryRecallAliasTool(api, context, "memory_get");
+  registerMemoryFactQueryTool(api, context);
   registerMemoryStoreTool(api, context);
   registerMemoryForgetTool(api, context);
   registerMemoryUpdateTool(api, context);

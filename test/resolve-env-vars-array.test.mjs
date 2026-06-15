@@ -45,7 +45,7 @@ function createLlmServer() {
   });
 }
 
-async function withTestEnv(apiKeyConfig, fn) {
+async function withTestEnv(apiKeyConfig, fn, configOverrides = {}) {
   const workDir = mkdtempSync(path.join(tmpdir(), "env-vars-array-test-"));
   const dbPath = path.join(workDir, "test.db");
   const embeddingServer = createEmbeddingServer();
@@ -78,6 +78,7 @@ async function withTestEnv(apiKeyConfig, fn) {
           default: "global",
           definitions: { global: { description: "shared" } },
         },
+        ...configOverrides,
       },
       hooks: {},
       toolFactories: {},
@@ -146,6 +147,24 @@ test("smart extraction initializes with env var in array apiKey", async () => {
   }
 });
 
+test("smart extraction initializes with env SecretRef apiKey", async () => {
+  process.env.__TEST_MEMORY_SECRET_REF_KEY = "resolved-secret-ref";
+  try {
+    await withTestEnv(
+      { source: "env", provider: "default", id: "__TEST_MEMORY_SECRET_REF_KEY" },
+      (logs) => {
+        const warnLogs = logs.filter(([level]) => level === "warn").map(([, msg]) => msg);
+        assert.ok(
+          !warnLogs.some((msg) => msg.includes("smart extraction init failed")),
+          `env SecretRef should resolve, got: ${JSON.stringify(warnLogs)}`,
+        );
+      },
+    );
+  } finally {
+    delete process.env.__TEST_MEMORY_SECRET_REF_KEY;
+  }
+});
+
 test("parsePluginConfig preserves string[] apiKey", () => {
   const config = parsePluginConfig({
     embedding: {
@@ -158,6 +177,17 @@ test("parsePluginConfig preserves string[] apiKey", () => {
   assert.equal(config.embedding.apiKey.length, 2);
 });
 
+test("parsePluginConfig preserves SecretRef apiKey", () => {
+  const secretRef = { source: "file", provider: "filemain", id: "/tmp/memory-secret" };
+  const config = parsePluginConfig({
+    embedding: {
+      apiKey: secretRef,
+      model: "text-embedding-3-small",
+    },
+  });
+  assert.deepEqual(config.embedding.apiKey, secretRef);
+});
+
 test("parsePluginConfig preserves single string apiKey", () => {
   const config = parsePluginConfig({
     embedding: {
@@ -166,6 +196,27 @@ test("parsePluginConfig preserves single string apiKey", () => {
     },
   });
   assert.equal(config.embedding.apiKey, "single-key");
+});
+
+test("parsePluginConfig preserves SecretRef rerank and llm api keys", () => {
+  const rerankRef = { source: "env", provider: "default", id: "RERANK_SECRET" };
+  const llmRef = { source: "file", provider: "filemain", id: "/tmp/llm-secret" };
+  const config = parsePluginConfig({
+    embedding: {
+      apiKey: "embed-key",
+      model: "text-embedding-3-small",
+    },
+    retrieval: {
+      rerank: "cross-encoder",
+      rerankApiKey: rerankRef,
+    },
+    llm: {
+      apiKey: llmRef,
+      model: "mock-llm",
+    },
+  });
+  assert.deepEqual(config.retrieval.rerankApiKey, rerankRef);
+  assert.deepEqual(config.llm.apiKey, llmRef);
 });
 
 test("parsePluginConfig rejects empty array apiKey", () => {
@@ -178,6 +229,61 @@ test("parsePluginConfig rejects empty array apiKey", () => {
     }),
     /apiKey/,
   );
+});
+
+test("parsePluginConfig rejects unsupported SecretRef sources", () => {
+  assert.throws(
+    () => parsePluginConfig({
+      embedding: {
+        apiKey: { source: "exec", id: "print-secret" },
+        model: "text-embedding-3-small",
+      },
+    }),
+    /embedding\.apiKey/,
+  );
+
+  assert.throws(
+    () => parsePluginConfig({
+      embedding: {
+        apiKey: "embed-key",
+        model: "text-embedding-3-small",
+      },
+      retrieval: {
+        rerank: "cross-encoder",
+        rerankApiKey: { source: "vault", id: "rerank-secret" },
+      },
+    }),
+    /retrieval\.rerankApiKey.*source env\/file/,
+  );
+
+  assert.throws(
+    () => parsePluginConfig({
+      embedding: {
+        apiKey: "embed-key",
+        model: "text-embedding-3-small",
+      },
+      llm: {
+        apiKey: { source: "provider", id: "llm-secret" },
+      },
+    }),
+    /llm\.apiKey.*source env\/file/,
+  );
+});
+
+test("plugin startup does not resolve rerank SecretRef when rerank is none", async () => {
+  await withTestEnv("embed-key", (logs) => {
+    const warnLogs = logs.filter(([level]) => level === "warn").map(([, msg]) => msg);
+    assert.ok(
+      !warnLogs.some((msg) => msg.includes("smart extraction init failed")),
+      `disabled rerank SecretRef should not fail startup, got: ${JSON.stringify(warnLogs)}`,
+    );
+  }, {
+    retrieval: {
+      mode: "hybrid",
+      rerank: "none",
+      rerankApiKey: { source: "env", id: "__MISSING_DISABLED_RERANK_SECRET" },
+    },
+  });
 });
 
 test("parsePluginConfig resolves env vars in retrieval rerank config", () => {

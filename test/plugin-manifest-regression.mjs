@@ -80,7 +80,7 @@ assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "auth"),
   "configSchema should declare llm.auth",
 );
-for (const toolName of ["memory_recall", "memory_search", "memory_get", "memory_store"]) {
+for (const toolName of ["memory_recall", "memory_search", "memory_get", "memory_fact_query", "memory_store"]) {
   assert.ok(
     manifest.contracts.tools.includes(toolName),
     `contracts.tools should declare ${toolName}`,
@@ -137,6 +137,18 @@ assert.ok(
   manifest.configSchema.properties.embedding.required.includes("apiKey"),
   "embedding.apiKey should remain schema-required when an embedding block is supplied",
 );
+assert.ok(
+  manifest.configSchema.properties.embedding.properties.apiKey.oneOf.some((entry) =>
+    entry.type === "object" && entry.required?.includes("source") && entry.required?.includes("id")
+  ),
+  "embedding.apiKey should accept OpenClaw SecretRef objects",
+);
+assert.ok(
+  manifest.configSchema.properties.embedding.properties.apiKey.oneOf
+    .find((entry) => entry.type === "array")
+    ?.items?.oneOf?.some((entry) => entry.type === "object" && entry.required?.includes("source")),
+  "embedding.apiKey arrays should accept SecretRef objects",
+);
 assert.equal(
   manifest.configSchema.properties.embedding.properties.omitDimensions?.type,
   "boolean",
@@ -159,6 +171,18 @@ assert.equal(
 assert.ok(
   manifest.configSchema.properties.retrieval.properties.rerankProvider.enum.includes("tei"),
   "rerankProvider schema should include tei",
+);
+assert.ok(
+  manifest.configSchema.properties.retrieval.properties.rerankApiKey.oneOf.some((entry) =>
+    entry.type === "object" && entry.required?.includes("source") && entry.required?.includes("id")
+  ),
+  "retrieval.rerankApiKey should accept OpenClaw SecretRef objects",
+);
+assert.ok(
+  manifest.configSchema.properties.llm.properties.apiKey.oneOf.some((entry) =>
+    entry.type === "object" && entry.required?.includes("source") && entry.required?.includes("id")
+  ),
+  "llm.apiKey should accept OpenClaw SecretRef objects",
 );
 assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties, "dreaming"),

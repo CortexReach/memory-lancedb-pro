@@ -107,7 +107,7 @@ import {
 interface PluginConfig {
   embedding: {
     provider: "openai-compatible";
-    apiKey: string | string[];
+    apiKey: SecretCredential | SecretCredential[];
     model?: string;
     baseURL?: string;
     dimensions?: number;
@@ -160,7 +160,7 @@ interface PluginConfig {
     minScore?: number;
     rerank?: "cross-encoder" | "lightweight" | "none";
     candidatePoolSize?: number;
-    rerankApiKey?: string;
+    rerankApiKey?: SecretCredential;
     rerankModel?: string;
     rerankEndpoint?: string;
     /** Rerank API timeout in milliseconds (default: 5000). Increase for local/CPU-based rerank servers. */
@@ -211,7 +211,7 @@ interface PluginConfig {
   smartExtraction?: boolean;
   llm?: {
     auth?: "api-key" | "oauth";
-    apiKey?: string;
+    apiKey?: SecretCredential;
     model?: string;
     baseURL?: string;
     oauthProvider?: string;
@@ -295,6 +295,17 @@ interface PluginConfig {
   declaredAgents?: Set<string>;
 }
 
+const SUPPORTED_SECRET_REF_SOURCES = ["env", "file"] as const;
+type SecretRefSource = (typeof SUPPORTED_SECRET_REF_SOURCES)[number];
+
+type SecretRefConfig = {
+  source: SecretRefSource;
+  provider?: string;
+  id: string;
+};
+
+type SecretCredential = string | SecretRefConfig;
+
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
 type SessionStrategy = "memoryReflection" | "systemSessionMemory" | "none";
 type ReflectionInjectMode = "inheritance-only" | "inheritance+derived";
@@ -333,12 +344,78 @@ function resolveEnvVars(value: string): string {
   });
 }
 
-function resolveFirstApiKey(apiKey: string | string[]): string {
+function isSecretRefConfig(value: unknown): value is SecretRefConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return isSupportedSecretRefSource(raw.source) &&
+    typeof raw.id === "string" && raw.id.trim().length > 0;
+}
+
+function isSupportedSecretRefSource(value: unknown): value is SecretRefSource {
+  return typeof value === "string" &&
+    (SUPPORTED_SECRET_REF_SOURCES as readonly string[]).includes(value.trim());
+}
+
+function isSecretCredential(value: unknown): value is SecretCredential {
+  return (typeof value === "string" && value.trim().length > 0) || isSecretRefConfig(value);
+}
+
+function describeSecretRef(ref: SecretRefConfig): string {
+  return `source=${ref.source}, id=${ref.id}`;
+}
+
+function resolveSecretRef(
+  api: Pick<OpenClawPluginApi, "resolvePath">,
+  ref: SecretRefConfig,
+  label: string,
+): string {
+  const source = ref.source.trim() as SecretRefSource;
+  const id = ref.id.trim();
+  try {
+    if (source === "env") {
+      const value = process.env[id];
+      if (!value) throw new Error(`environment variable ${id} is not set`);
+      return value;
+    }
+    if (source === "file") {
+      const filePath = api.resolvePath(id);
+      const value = readFileSync(filePath, "utf8").trimEnd();
+      if (!value) throw new Error(`file ${filePath} is empty`);
+      return value;
+    }
+    const exhaustive: never = source;
+    throw new Error(`unsupported SecretRef source "${exhaustive}"`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to resolve SecretRef for ${label} (${describeSecretRef(ref)}): ${message}`);
+  }
+}
+
+function resolveSecretCredential(
+  api: Pick<OpenClawPluginApi, "resolvePath">,
+  value: SecretCredential,
+  label: string,
+): string {
+  return typeof value === "string"
+    ? resolveEnvVars(value)
+    : resolveSecretRef(api, value, label);
+}
+
+function resolveSecretCredentialArray(
+  api: Pick<OpenClawPluginApi, "resolvePath">,
+  value: SecretCredential | SecretCredential[],
+  label: string,
+): string | string[] {
+  if (!Array.isArray(value)) return resolveSecretCredential(api, value, label);
+  return value.map((entry, index) => resolveSecretCredential(api, entry, `${label}[${index}]`));
+}
+
+function resolveFirstApiKey(api: Pick<OpenClawPluginApi, "resolvePath">, apiKey: SecretCredential | SecretCredential[]): string {
   const key = Array.isArray(apiKey) ? apiKey[0] : apiKey;
   if (!key) {
     throw new Error("embedding.apiKey is empty");
   }
-  return resolveEnvVars(key);
+  return resolveSecretCredential(api, key, "embedding.apiKey");
 }
 
 function resolveOptionalPathWithEnv(
@@ -423,9 +500,24 @@ function getAutoRecallRerankInputLimit(retrieveLimit: number): number {
   return clampInt(retrieveLimit, 1, 20) * 2;
 }
 
+function getAutoRecallRerankTimeoutMs(
+  config: PluginConfig,
+  retrievalConfig: RetrievalConfig,
+  autoRecallTimeoutMs: number,
+): number | undefined {
+  if (retrievalConfig.rerank !== "cross-encoder" || !retrievalConfig.rerankApiKey) return undefined;
+  if (typeof config.retrieval?.rerankTimeoutMs === "number") return undefined;
+  if (!Number.isFinite(autoRecallTimeoutMs) || autoRecallTimeoutMs <= 0) return undefined;
+
+  const halfBudget = Math.floor(autoRecallTimeoutMs / 2);
+  if (halfBudget < 100) return 0;
+  if (autoRecallTimeoutMs <= 1_000) return halfBudget;
+  return clampInt(halfBudget, 500, 2_500);
+}
+
 export function buildAutoRecallRerankCostWarning(
   config: PluginConfig,
-  retrievalConfig: RetrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...(config.retrieval || {}) },
+  retrievalConfig: RetrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...(config.retrieval || {}) } as RetrievalConfig,
 ): string | null {
   if (config.autoRecall !== true || config.recallMode === "off") return null;
   if (retrievalConfig.mode === "vector") return null;
@@ -2135,6 +2227,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     config.embedding.dimensions,
     config.embedding.requestDimensions,
   );
+  const embeddingApiKey = resolveSecretCredentialArray(api, config.embedding.apiKey, "embedding.apiKey");
   const store = new MemoryStore({
     dbPath: resolvedDbPath,
     vectorDim,
@@ -2143,7 +2236,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   });
   const embedder = createEmbedder({
     provider: "openai-compatible",
-    apiKey: config.embedding.apiKey,
+    apiKey: embeddingApiKey,
     model: config.embedding.model || "text-embedding-3-small",
     baseURL: config.embedding.baseURL,
     dimensions: config.embedding.dimensions,
@@ -2164,14 +2257,24 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     ...DEFAULT_TIER_CONFIG,
     ...(config.tier || {}),
   });
-  const retrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config.retrieval };
+  const retrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config.retrieval } as RetrievalConfig & {
+    rerankApiKey?: SecretCredential;
+  };
+  if (retrievalConfig.rerank === "cross-encoder" && retrievalConfig.rerankApiKey) {
+    retrievalConfig.rerankApiKey = resolveSecretCredential(
+      api,
+      retrievalConfig.rerankApiKey,
+      "retrieval.rerankApiKey",
+    );
+  }
+  const resolvedRetrievalConfig = retrievalConfig as RetrievalConfig;
   const retriever = createRetriever(
     store,
     embedder,
-    retrievalConfig,
+    resolvedRetrievalConfig,
     { decayEngine },
   );
-  const rerankCostWarning = buildAutoRecallRerankCostWarning(config, retrievalConfig);
+  const rerankCostWarning = buildAutoRecallRerankCostWarning(config, resolvedRetrievalConfig);
   if (rerankCostWarning) {
     api.logger.warn(rerankCostWarning);
   }
@@ -2200,8 +2303,8 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
       const llmApiKey = llmAuth === "oauth"
         ? undefined
         : config.llm?.apiKey
-          ? resolveEnvVars(config.llm.apiKey)
-          : resolveFirstApiKey(config.embedding.apiKey);
+          ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
+          : resolveFirstApiKey(api, config.embedding.apiKey);
       const llmBaseURL = llmAuth === "oauth"
         ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
         : config.llm?.baseURL
@@ -2485,6 +2588,8 @@ const memoryLanceDBProPlugin = {
       category?: string;
       source?: "manual" | "auto-recall" | "cli";
       signal?: AbortSignal;
+      rerankTimeoutMs?: number;
+      rerankDeadlineMs?: number;
     }) {
       let results = await retriever.retrieve(params);
       if (results.length === 0) {
@@ -2886,8 +2991,8 @@ const memoryLanceDBProPlugin = {
             const llmApiKey = llmAuth === "oauth"
               ? undefined
               : config.llm?.apiKey
-                ? resolveEnvVars(config.llm.apiKey)
-                : resolveFirstApiKey(config.embedding.apiKey);
+                ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
+                : resolveFirstApiKey(api, config.embedding.apiKey);
             const llmBaseURL = llmAuth === "oauth"
               ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
               : config.llm?.baseURL
@@ -2943,6 +3048,7 @@ const memoryLanceDBProPlugin = {
 
       const AUTO_RECALL_TIMEOUT_MS = parsePositiveInt(config.autoRecallTimeoutMs) ?? 5_000; // configurable; default raised from 3s to 5s for remote embedding APIs behind proxies
       api.on("before_prompt_build", async (event: any, ctx: any) => {
+        const autoRecallDeadlineMs = Date.now() + AUTO_RECALL_TIMEOUT_MS;
         // Skip auto-recall for sub-agent sessions — their context comes from the parent.
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (sessionKey.includes(":subagent:")) return;
@@ -3044,6 +3150,11 @@ const memoryLanceDBProPlugin = {
           const retrieveLimit = getAutoRecallRetrieveLimit(autoRecallMaxItems);
           const retrievalConfig = retriever.getConfig();
           const rerankInputLimit = getAutoRecallRerankInputLimit(retrieveLimit);
+          const autoRecallRerankTimeoutMs = getAutoRecallRerankTimeoutMs(
+            config,
+            retrievalConfig,
+            AUTO_RECALL_TIMEOUT_MS,
+          );
 
           // Adaptive intent analysis (zero-LLM-cost pattern matching)
           const intent = recallMode === "adaptive" ? analyzeIntent(recallQuery) : undefined;
@@ -3059,6 +3170,12 @@ const memoryLanceDBProPlugin = {
             scopeFilter: accessibleScopes,
             source: "auto-recall",
             signal: autoRecallAbortController.signal,
+            ...(autoRecallRerankTimeoutMs !== undefined
+              ? {
+                rerankTimeoutMs: autoRecallRerankTimeoutMs,
+                rerankDeadlineMs: autoRecallDeadlineMs,
+              }
+              : {}),
           }), config.workspaceBoundary);
 
           if (shouldDropLateAutoRecall("post-retrieve")) return;
@@ -5178,24 +5295,29 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     );
   }
 
-  // Accept single key (string) or array of keys for round-robin rotation
-  let apiKey: string | string[];
+  // Accept single key (string or SecretRef) or array of keys for round-robin rotation
+  let apiKey: SecretCredential | SecretCredential[];
   if (typeof embedding.apiKey === "string") {
     apiKey = embedding.apiKey;
+  } else if (isSecretRefConfig(embedding.apiKey)) {
+    apiKey = embedding.apiKey;
   } else if (Array.isArray(embedding.apiKey) && embedding.apiKey.length > 0) {
-    // Validate every element is a non-empty string
+    // Validate every element is a non-empty string or SecretRef
     const invalid = embedding.apiKey.findIndex(
-      (k: unknown) => typeof k !== "string" || (k as string).trim().length === 0,
+      (k: unknown) => !(
+        (typeof k === "string" && k.trim().length > 0) ||
+        isSecretRefConfig(k)
+      ),
     );
     if (invalid !== -1) {
       throw new Error(
-        `embedding.apiKey[${invalid}] is invalid: expected non-empty string`,
+        `embedding.apiKey[${invalid}] is invalid: expected non-empty string or SecretRef`,
       );
     }
-    apiKey = embedding.apiKey as string[];
+    apiKey = embedding.apiKey as SecretCredential[];
   } else if (embedding.apiKey !== undefined) {
     // apiKey is present but wrong type — throw, don't silently fall back
-    throw new Error("embedding.apiKey must be a string or non-empty array of strings");
+    throw new Error("embedding.apiKey must be a string, SecretRef, or non-empty array of strings/SecretRefs");
   } else {
     apiKey = process.env.OPENAI_API_KEY || "";
   }
@@ -5215,6 +5337,9 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     : null;
   const storageMaintenanceRaw = typeof cfg.storageMaintenance === "object" && cfg.storageMaintenance !== null
     ? cfg.storageMaintenance as Record<string, unknown>
+    : null;
+  const llmRaw = typeof cfg.llm === "object" && cfg.llm !== null
+    ? cfg.llm as Record<string, unknown>
     : null;
   const storageAutoCleanupRaw = typeof storageMaintenanceRaw?.autoCleanup === "object" && storageMaintenanceRaw.autoCleanup !== null
     ? storageMaintenanceRaw.autoCleanup as Record<string, unknown>
@@ -5348,6 +5473,9 @@ export function parsePluginConfig(value: unknown): PluginConfig {
           // This prevents startup failures when reranking is disabled and rerankApiKey
           // is left as an unresolved placeholder.
           const rerankEnabled = retrieval.rerank !== "none";
+          if (retrieval.rerankApiKey !== undefined && !isSecretCredential(retrieval.rerankApiKey)) {
+            throw new Error("retrieval.rerankApiKey must be a non-empty string or SecretRef with source env/file");
+          }
           if (rerankEnabled && typeof retrieval.rerankApiKey === "string" && retrieval.rerankApiKey.includes("${")) {
             retrieval.rerankApiKey = resolveEnvVars(retrieval.rerankApiKey);
           }
@@ -5367,7 +5495,15 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     tier: typeof cfg.tier === "object" && cfg.tier !== null ? cfg.tier as any : undefined,
     // Smart extraction config (Phase 1)
     smartExtraction: cfg.smartExtraction !== false, // Default ON
-    llm: typeof cfg.llm === "object" && cfg.llm !== null ? cfg.llm as any : undefined,
+    llm: llmRaw
+      ? (() => {
+        const llm = { ...llmRaw };
+        if (llm.apiKey !== undefined && !isSecretCredential(llm.apiKey)) {
+          throw new Error("llm.apiKey must be a non-empty string or SecretRef with source env/file");
+        }
+        return llm as any;
+      })()
+      : undefined,
     extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
     extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
     scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,

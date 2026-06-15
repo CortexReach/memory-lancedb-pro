@@ -232,6 +232,71 @@ await runRerankFallbackDiagnosticsScenario();
 
 console.log("OK: rerank fallback diagnostics test passed");
 
+async function runExhaustedRerankBudgetSkipsRemoteScenario() {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error("remote rerank should be skipped");
+  };
+
+  try {
+    const retriever = createRetriever(fakeStore, fakeEmbedder, retrieverConfig);
+    const results = await retriever.retrieve({
+      query: "TESTMEM-20260306-092541",
+      limit: 5,
+      scopeFilter: ["global"],
+      rerankTimeoutMs: 0,
+    });
+
+    assert.ok(Array.isArray(results), "rerank fallback should resolve with a result array");
+    assert.equal(fetchCalls, 0, "remote rerank fetch should not run when per-call budget is exhausted");
+
+    const diagnostics = retriever.getLastDiagnostics();
+    assert.equal(diagnostics?.failureStage, undefined, "exhausted rerank budget should not fail retrieval");
+    assert.equal(diagnostics?.rerankFallback?.reason, "timeout");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+await runExhaustedRerankBudgetSkipsRemoteScenario();
+
+console.log("OK: exhausted rerank budget skip test passed");
+
+async function runExpiredRerankDeadlineSkipsRemoteScenario() {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error("remote rerank should be skipped");
+  };
+
+  try {
+    const retriever = createRetriever(fakeStore, fakeEmbedder, retrieverConfig);
+    const results = await retriever.retrieve({
+      query: "TESTMEM-20260306-092541",
+      limit: 5,
+      scopeFilter: ["global"],
+      rerankTimeoutMs: 2500,
+      rerankDeadlineMs: Date.now() - 1,
+    });
+
+    assert.ok(Array.isArray(results), "expired rerank deadline should fall back to local scoring");
+    assert.equal(fetchCalls, 0, "remote rerank fetch should not run after the caller deadline is exhausted");
+
+    const diagnostics = retriever.getLastDiagnostics();
+    assert.equal(diagnostics?.failureStage, undefined, "expired rerank deadline should not fail retrieval");
+    assert.equal(diagnostics?.rerankFallback?.reason, "timeout");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+await runExpiredRerankDeadlineSkipsRemoteScenario();
+
+console.log("OK: expired rerank deadline skip test passed");
+
 const lexicalEntry = {
   id: "lexical-regression-1",
   text: "用户测试饮料偏好是乌龙茶，不喜欢美式咖啡。",

@@ -402,6 +402,7 @@ Query → BM25 FTS ─────┘
 - Built-in scopes: `global`, `agent:<id>`, `custom:<name>`, `project:<id>`, `user:<id>`
 - Agent-level access control via `scopes.agentAccess`
 - Default: each agent accesses `global` + its own `agent:<id>` scope
+- Read-only tools such as `memory_recall`, `memory_search`, `memory_list`, and `memory_debug` fail soft when a requested scope is inaccessible: they search the caller's accessible scopes instead and return `ignoredScope` plus `accessibleScopes` in details. Write and mutation tools still return `scope_access_denied` for inaccessible scopes.
 
 ### Auto-Capture & Auto-Recall
 
@@ -446,6 +447,21 @@ Query → BM25 FTS ─────┘
 ---
 
 ## Configuration
+
+API-key fields (`embedding.apiKey`, `retrieval.rerankApiKey`, and `llm.apiKey`) accept plain strings, `${ENV_VAR}` placeholders, or SecretRef objects. This plugin supports the `env` and `file` SecretRef sources:
+
+```json
+{
+  "embedding": {
+    "apiKey": { "source": "env", "id": "JINA_API_KEY" }
+  },
+  "retrieval": {
+    "rerankApiKey": { "source": "file", "id": "~/.openclaw/secrets/jina-rerank" }
+  }
+}
+```
+
+For `source: "file"`, `id` is resolved through OpenClaw's `api.resolvePath()` and then read as a UTF-8 file. The optional `provider` field is accepted for SecretRef object-shape compatibility but is not used for provider dispatch. `exec` and other SecretRef sources are rejected by runtime config validation.
 
 <details>
 <summary><strong>Full Configuration Example</strong></summary>

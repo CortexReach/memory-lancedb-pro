@@ -302,6 +302,126 @@ describe("auto-recall timeout", () => {
     );
   });
 
+  it("uses a shorter default rerank timeout inside the auto-recall budget", async () => {
+    let capturedContext;
+
+    activeCreateRetriever = function mockCreateRetriever() {
+      return {
+        async retrieve(context) {
+          capturedContext = context;
+          return [];
+        },
+        getConfig() {
+          return {
+            mode: "hybrid",
+            rerank: "cross-encoder",
+            rerankApiKey: "rerank-key",
+            rerankProvider: "jina",
+          };
+        },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+    activeCreateEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() {
+          return new Float32Array(384).fill(0);
+        },
+        async embedPassage() {
+          return new Float32Array(384).fill(0);
+        },
+      };
+    };
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: true,
+        autoRecallMinLength: 1,
+        autoRecallTimeoutMs: 5000,
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+
+    const autoRecallHook = getAutoRecallHook(harness.eventHandlers);
+    const beforeHookMs = Date.now();
+    await autoRecallHook(
+      { prompt: "Please recall what I mentioned before about this task." },
+      { sessionId: "auto-rerank-budget", sessionKey: "agent:main:session:auto-rerank-budget", agentId: "main" },
+    );
+
+    assert.equal(capturedContext?.source, "auto-recall");
+    assert.equal(capturedContext?.rerankTimeoutMs, 2500);
+    assert.equal(typeof capturedContext?.rerankDeadlineMs, "number");
+    assert.ok(capturedContext.rerankDeadlineMs > beforeHookMs);
+    assert.ok(capturedContext.rerankDeadlineMs <= beforeHookMs + 5100);
+  });
+
+  it("skips remote rerank timeout budget for very small auto-recall budgets", async () => {
+    let capturedContext;
+
+    activeCreateRetriever = function mockCreateRetriever() {
+      return {
+        async retrieve(context) {
+          capturedContext = context;
+          return [];
+        },
+        getConfig() {
+          return {
+            mode: "hybrid",
+            rerank: "cross-encoder",
+            rerankApiKey: "rerank-key",
+            rerankProvider: "jina",
+          };
+        },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+    activeCreateEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() {
+          return new Float32Array(384).fill(0);
+        },
+        async embedPassage() {
+          return new Float32Array(384).fill(0);
+        },
+      };
+    };
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: true,
+        autoRecallMinLength: 1,
+        autoRecallTimeoutMs: 1,
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+
+    const autoRecallHook = getAutoRecallHook(harness.eventHandlers);
+    await autoRecallHook(
+      { prompt: "Please recall what I mentioned before about this task." },
+      { sessionId: "auto-rerank-tiny-budget", sessionKey: "agent:main:session:auto-rerank-tiny-budget", agentId: "main" },
+    );
+
+    assert.equal(capturedContext?.source, "auto-recall");
+    assert.equal(capturedContext?.rerankTimeoutMs, 0);
+  });
+
   it("returns context before auto-recall metadata patch settles", async () => {
     const logs = { info: [], warn: [], debug: [] };
     const patchResolvers = [];

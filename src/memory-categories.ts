@@ -14,7 +14,40 @@ export const MEMORY_CATEGORIES = [
   "patterns",
 ] as const;
 
+export const LEGACY_MEMORY_CATEGORIES = [
+  "preference",
+  "fact",
+  "decision",
+  "entity",
+  "reflection",
+  "other",
+] as const;
+
+export const TOOL_MEMORY_CATEGORIES = [
+  ...MEMORY_CATEGORIES,
+  ...LEGACY_MEMORY_CATEGORIES,
+] as const;
+
 export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
+export type LegacyMemoryCategory = (typeof LEGACY_MEMORY_CATEGORIES)[number];
+
+const SMART_TO_STORAGE_CATEGORY: Record<MemoryCategory, LegacyMemoryCategory> = {
+  profile: "fact",
+  preferences: "preference",
+  entities: "entity",
+  events: "decision",
+  cases: "fact",
+  patterns: "other",
+};
+
+const LEGACY_TO_SMART_CATEGORY: Record<LegacyMemoryCategory, MemoryCategory> = {
+  preference: "preferences",
+  fact: "cases",
+  decision: "events",
+  entity: "entities",
+  reflection: "patterns",
+  other: "patterns",
+};
 
 /** Categories that always merge (skip dedup entirely). */
 export const ALWAYS_MERGE_CATEGORIES = new Set<MemoryCategory>(["profile"]);
@@ -79,8 +112,107 @@ export type ExtractionStats = {
 /** Validate and normalize a category string. */
 export function normalizeCategory(raw: string): MemoryCategory | null {
   const lower = raw.toLowerCase().trim();
-  if ((MEMORY_CATEGORIES as readonly string[]).includes(lower)) {
-    return lower as MemoryCategory;
+  const aliases: Record<string, MemoryCategory> = {
+    preference: "preferences",
+    entity: "entities",
+    event: "events",
+    case: "cases",
+    pattern: "patterns",
+  };
+  const normalized = aliases[lower] ?? lower;
+  if ((MEMORY_CATEGORIES as readonly string[]).includes(normalized)) {
+    return normalized as MemoryCategory;
   }
   return null;
+}
+
+export function matchesMemoryCategoryFilter(
+  entryCategory: string,
+  requestedCategory: string,
+  entryMetadata?: string,
+): boolean {
+  const rawEntryCategory = entryCategory.toLowerCase().trim();
+  const rawRequestedCategory = requestedCategory.toLowerCase().trim();
+  if (rawEntryCategory === rawRequestedCategory) return true;
+
+  const metadataCategory = extractMetadataMemoryCategory(entryMetadata);
+  const normalizedEntryCategory = normalizeCategory(rawEntryCategory);
+  const normalizedRequestedCategory = normalizeCategory(rawRequestedCategory);
+  if (metadataCategory && normalizedRequestedCategory) {
+    return metadataCategory === normalizedRequestedCategory;
+  }
+  if (normalizedEntryCategory && normalizedRequestedCategory) {
+    return normalizedEntryCategory === normalizedRequestedCategory;
+  }
+
+  if (normalizedRequestedCategory && isLegacyMemoryCategory(rawEntryCategory)) {
+    return LEGACY_TO_SMART_CATEGORY[rawEntryCategory] === normalizedRequestedCategory;
+  }
+
+  return false;
+}
+
+export function resolveCategoryFilterCandidates(requestedCategory: string): string[] {
+  const rawRequestedCategory = requestedCategory.toLowerCase().trim();
+  const normalizedRequestedCategory = normalizeCategory(rawRequestedCategory);
+  const candidates = new Set<string>([rawRequestedCategory]);
+
+  if (normalizedRequestedCategory) {
+    candidates.add(normalizedRequestedCategory);
+    candidates.add(SMART_TO_STORAGE_CATEGORY[normalizedRequestedCategory]);
+    for (const category of TOOL_MEMORY_CATEGORIES) {
+      if (normalizeCategory(category) === normalizedRequestedCategory) {
+        candidates.add(category);
+      }
+    }
+  }
+
+  return [...candidates];
+}
+
+export function getStorageCategoryForMemoryCategory(
+  category: MemoryCategory,
+): LegacyMemoryCategory {
+  return SMART_TO_STORAGE_CATEGORY[category];
+}
+
+export function resolveToolMemoryCategory(rawCategory: string): {
+  memoryCategory: MemoryCategory;
+  storageCategory: LegacyMemoryCategory;
+} {
+  const raw = rawCategory.toLowerCase().trim();
+  const normalized = normalizeCategory(raw);
+  if (normalized) {
+    return {
+      memoryCategory: normalized,
+      storageCategory: SMART_TO_STORAGE_CATEGORY[normalized],
+    };
+  }
+
+  if (isLegacyMemoryCategory(raw)) {
+    return {
+      memoryCategory: LEGACY_TO_SMART_CATEGORY[raw],
+      storageCategory: raw,
+    };
+  }
+
+  return {
+    memoryCategory: "patterns",
+    storageCategory: "other",
+  };
+}
+
+function isLegacyMemoryCategory(value: string): value is LegacyMemoryCategory {
+  return (LEGACY_MEMORY_CATEGORIES as readonly string[]).includes(value);
+}
+
+function extractMetadataMemoryCategory(rawMetadata?: string): MemoryCategory | null {
+  if (!rawMetadata) return null;
+  try {
+    const parsed = JSON.parse(rawMetadata) as { memory_category?: unknown };
+    if (typeof parsed.memory_category !== "string") return null;
+    return normalizeCategory(parsed.memory_category);
+  } catch {
+    return null;
+  }
 }

@@ -119,6 +119,55 @@ describe("memory governance tools", () => {
     assert.equal(res.details.requestedScope, "current_conversation");
   });
 
+  it("resolves memory_debug scopes from execute-time runtime context", async () => {
+    const debugScopeFilters = [];
+    const context = {
+      workspaceDir: "/tmp",
+      mdMirror: null,
+      scopeManager: {
+        getAccessibleScopes: (agentId) => ["global", `agent:${agentId}`, `reflection:agent:${agentId}`],
+        getScopeFilter: (agentId) => ["global", `agent:${agentId}`, `reflection:agent:${agentId}`],
+        isAccessible: (scope, agentId) => ["global", `agent:${agentId}`, `reflection:agent:${agentId}`].includes(scope),
+        getDefaultScope: (agentId) => `agent:${agentId}`,
+      },
+      retriever: {
+        async retrieveWithTrace({ scopeFilter }) {
+          debugScopeFilters.push(scopeFilter);
+          return {
+            results: [],
+            trace: {
+              mode: "hybrid",
+              totalMs: 1,
+              stages: [],
+            },
+          };
+        },
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+      },
+      store: {},
+      embedder: { async embedPassage() { return [0.1, 0.2, 0.3]; } },
+    };
+
+    const tools = createToolSet(context);
+    const debug = tools.get("memory_debug");
+
+    const res = await debug.execute(
+      null,
+      { query: "coffee", scope: "current_conversation" },
+      undefined,
+      undefined,
+      { agentId: "debugger" },
+    );
+
+    const expectedScopes = ["global", "agent:debugger", "reflection:agent:debugger"];
+    assert.deepEqual(debugScopeFilters[0], expectedScopes);
+    assert.match(res.content[0].text, /Ignored inaccessible scope "current_conversation"/);
+    assert.equal(res.details.ignoredScope, "current_conversation");
+    assert.deepEqual(res.details.accessibleScopes, expectedScopes);
+  });
+
   it("defaults stats and list to the caller's accessible scopes", async () => {
     const statsScopeFilters = [];
     const listScopeFilters = [];
