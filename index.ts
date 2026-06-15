@@ -19,6 +19,11 @@ import { spawn } from "node:child_process";
 // so we downgrade them to debug level when running in CLI mode.
 const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 
+// register() can run several times per gateway boot (one per registration
+// context) and once per CLI command; the dual-memory hint only needs to be
+// taught once per process.
+let dualMemoryHintLogged = false;
+
 // Import core components
 import { MemoryStore, normalizeStoragePath, type MemoryEntry } from "./src/store.js";
 import {
@@ -2276,7 +2281,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   );
   const rerankCostWarning = buildAutoRecallRerankCostWarning(config, resolvedRetrievalConfig);
   if (rerankCostWarning) {
-    api.logger.warn(rerankCostWarning);
+    // Gateway-boot cost advisory (#843); debug in CLI mode so every
+    // memory-pro command does not repeat it before its output (#888).
+    (isCliMode() ? api.logger.debug : api.logger.warn)(rerankCostWarning);
   }
   const scopeManager = createScopeManager(config.scopes);
   const canonicalCorpusIndexer = new CanonicalCorpusIndexer({
@@ -2815,12 +2822,17 @@ const memoryLanceDBProPlugin = {
 
     // Dual-memory model warning: help users understand the two-layer architecture
     // Runs synchronously and logs warnings; does NOT block gateway startup.
-    api.logger.info(
-      `[memory-lancedb-pro] memory_recall queries the plugin store (LanceDB), not MEMORY.md.\n` +
-      `  - Plugin memory (LanceDB) = primary recall source for semantic search\n` +
-      `  - MEMORY.md / memory/YYYY-MM-DD.md = startup context / journal only\n` +
-      `  - Use memory_store or auto-capture for recallable memories.\n`
-    );
+    // Once per process via the CLI-aware logReg (#888): repeated per-registration
+    // info copies drowned operational logs and CLI command output.
+    if (!dualMemoryHintLogged) {
+      dualMemoryHintLogged = true;
+      logReg(
+        `[memory-lancedb-pro] memory_recall queries the plugin store (LanceDB), not MEMORY.md.\n` +
+        `  - Plugin memory (LanceDB) = primary recall source for semantic search\n` +
+        `  - MEMORY.md / memory/YYYY-MM-DD.md = startup context / journal only\n` +
+        `  - Use memory_store or auto-capture for recallable memories.\n`
+      );
+    }
 
     // Health status for OpenClaw memory runtime (reflects actual plugin health)
     // Updated by runStartupChecks after testing embedder and retriever
