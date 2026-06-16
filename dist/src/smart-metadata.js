@@ -36,6 +36,7 @@ function normalizeSource(value) {
         case "manual":
         case "auto-capture":
         case "reflection":
+        case "dreaming-engine":
         case "session-summary":
         case "legacy":
             return value;
@@ -55,7 +56,7 @@ function normalizeLayer(value) {
     }
 }
 function deriveDefaultLayer(source, memoryCategory, state) {
-    if (source === "reflection" || source === "session-summary")
+    if (source === "reflection" || source === "dreaming-engine" || source === "session-summary")
         return "reflection";
     if (state === "archived")
         return "archive";

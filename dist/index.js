@@ -51,6 +51,7 @@ import { normalizeAdmissionControlConfig, resolveRejectedAuditFilePath, } from "
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
 import { CanonicalCorpusIndexer, parseCanonicalCorpusConfig, } from "./src/corpus-indexer.js";
+import { computeNextDreamingDelayMs, createDreamingEngine, normalizeDreamingConfig, } from "./src/dreaming-engine.js";
 const SUPPORTED_SECRET_REF_SOURCES = ["env", "file"];
 // ============================================================================
 // Default Configuration
@@ -1706,6 +1707,18 @@ function _initPluginState(api) {
         log: (message) => api.logger.info(message),
         warn: (message) => api.logger.warn(message),
     });
+    const dreamingEngine = createDreamingEngine({
+        store,
+        embedder,
+        decayEngine,
+        tierManager,
+        config: config.dreaming,
+        getScopes: async () => {
+            const stats = await store.stats();
+            return Object.keys(stats.scopeCounts).sort();
+        },
+        logger: api.logger,
+    });
     const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
     if (clawteamScopes.length > 0) {
         applyClawteamScopes(scopeManager, clawteamScopes);
@@ -1795,6 +1808,7 @@ function _initPluginState(api) {
         tierManager,
         retriever,
         canonicalCorpusIndexer,
+        dreamingEngine,
         scopeManager,
         migrator,
         smartExtractor,
@@ -1914,7 +1928,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, scopeManager, migrator, smartExtractor, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, scopeManager, migrator, smartExtractor, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -3953,6 +3967,8 @@ const memoryLanceDBProPlugin = {
         let storageMaintenanceTimer = null;
         let storageMaintenanceRunning = false;
         const storageAutoCleanup = config.storageMaintenance?.autoCleanup;
+        let dreamingTimer = null;
+        let dreamingRunning = false;
         async function runBackup() {
             try {
                 // resolvedDbPath is already absolute (produced by api.resolvePath at
@@ -4025,6 +4041,44 @@ const memoryLanceDBProPlugin = {
             finally {
                 storageMaintenanceRunning = false;
             }
+        }
+        async function runDreamingSweep() {
+            if (config.dreaming?.enabled !== true)
+                return;
+            if (dreamingRunning) {
+                api.logger.debug("memory-lancedb-pro: dreaming sweep skipped because a prior run is still active");
+                return;
+            }
+            dreamingRunning = true;
+            const startedAt = Date.now();
+            try {
+                const result = await dreamingEngine.runSweep();
+                const changed = Object.values(result.phases).reduce((sum, phase) => sum + phase.changed, 0);
+                if (changed > 0 || result.errors.length > 0 || config.dreaming.verboseLogging) {
+                    api.logger.info(`memory-lancedb-pro: dreaming sweep completed ` +
+                        `(changed=${changed}, scopes=${result.scopes.length}, errors=${result.errors.length}, elapsedMs=${Date.now() - startedAt})`);
+                }
+            }
+            catch (err) {
+                api.logger.warn(`memory-lancedb-pro: dreaming sweep failed: ${String(err)}`);
+            }
+            finally {
+                dreamingRunning = false;
+            }
+        }
+        function scheduleNextDreamingSweep() {
+            if (config.dreaming?.enabled !== true)
+                return;
+            if (dreamingTimer)
+                clearTimeout(dreamingTimer);
+            const delayMs = computeNextDreamingDelayMs(config.dreaming.frequency, config.dreaming.timezone);
+            api.logger.info(`memory-lancedb-pro: dreaming scheduled ` +
+                `(frequency="${config.dreaming.frequency}", nextRunInMs=${delayMs})`);
+            dreamingTimer = setTimeout(async () => {
+                dreamingTimer = null;
+                await runDreamingSweep();
+                scheduleNextDreamingSweep();
+            }, delayMs);
         }
         // ========================================================================
         // Service Registration
@@ -4135,6 +4189,7 @@ const memoryLanceDBProPlugin = {
                     storageMaintenanceInitialTimer = setTimeout(() => void runStorageMaintenance(), initialDelayMs);
                     storageMaintenanceTimer = setInterval(() => void runStorageMaintenance(), intervalMs);
                 }
+                scheduleNextDreamingSweep();
             },
             stop: async () => {
                 if (backupTimer) {
@@ -4149,6 +4204,11 @@ const memoryLanceDBProPlugin = {
                     clearInterval(storageMaintenanceTimer);
                     storageMaintenanceTimer = null;
                 }
+                if (dreamingTimer) {
+                    clearTimeout(dreamingTimer);
+                    dreamingTimer = null;
+                }
+                dreamingEngine.stop();
                 api.logger.info("memory-lancedb-pro: stopped");
             },
         });
@@ -4384,6 +4444,7 @@ export function parsePluginConfig(value) {
             }
             : undefined,
         canonicalCorpus: parseCanonicalCorpusConfig(cfg.canonicalCorpus),
+        dreaming: normalizeDreamingConfig(cfg.dreaming),
         memoryReflection: memoryReflectionRaw
             ? {
                 enabled: sessionStrategy === "memoryReflection",

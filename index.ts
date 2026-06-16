@@ -99,6 +99,13 @@ import {
   parseCanonicalCorpusConfig,
   type CanonicalCorpusConfig,
 } from "./src/corpus-indexer.js";
+import {
+  computeNextDreamingDelayMs,
+  createDreamingEngine,
+  normalizeDreamingConfig,
+  type DreamingConfig,
+  type DreamingEngine,
+} from "./src/dreaming-engine.js";
 
 // ============================================================================
 // Configuration & Types
@@ -236,6 +243,7 @@ interface PluginConfig {
     maxEntries?: number;
   };
   canonicalCorpus?: CanonicalCorpusConfig;
+  dreaming?: DreamingConfig;
   memoryReflection?: {
     enabled?: boolean;
     storeToLanceDB?: boolean;
@@ -2200,6 +2208,7 @@ interface PluginSingletonState {
   tierManager: ReturnType<typeof createTierManager>;
   retriever: ReturnType<typeof createRetriever>;
   canonicalCorpusIndexer: CanonicalCorpusIndexer;
+  dreamingEngine: DreamingEngine;
   scopeManager: ReturnType<typeof createScopeManager>;
   migrator: ReturnType<typeof createMigrator>;
   smartExtractor: SmartExtractor | null;
@@ -2286,6 +2295,18 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     getOpenClawConfig: () => (api as OpenClawPluginApi & { config?: unknown }).config ?? api.pluginConfig,
     log: (message) => api.logger.info(message),
     warn: (message) => api.logger.warn(message),
+  });
+  const dreamingEngine = createDreamingEngine({
+    store,
+    embedder,
+    decayEngine,
+    tierManager,
+    config: config.dreaming,
+    getScopes: async () => {
+      const stats = await store.stats();
+      return Object.keys(stats.scopeCounts).sort();
+    },
+    logger: api.logger,
   });
 
   const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
@@ -2393,6 +2414,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     tierManager,
     retriever,
     canonicalCorpusIndexer,
+    dreamingEngine,
     scopeManager,
     migrator,
     smartExtractor,
@@ -2538,6 +2560,7 @@ const memoryLanceDBProPlugin = {
       embedder,
       retriever,
       canonicalCorpusIndexer,
+      dreamingEngine,
       scopeManager,
       migrator,
       smartExtractor,
@@ -4999,6 +5022,8 @@ const memoryLanceDBProPlugin = {
     let storageMaintenanceTimer: ReturnType<typeof setInterval> | null = null;
     let storageMaintenanceRunning = false;
     const storageAutoCleanup = config.storageMaintenance?.autoCleanup;
+    let dreamingTimer: ReturnType<typeof setTimeout> | null = null;
+    let dreamingRunning = false;
 
     async function runBackup() {
       try {
@@ -5087,6 +5112,50 @@ const memoryLanceDBProPlugin = {
       } finally {
         storageMaintenanceRunning = false;
       }
+    }
+
+    async function runDreamingSweep() {
+      if (config.dreaming?.enabled !== true) return;
+      if (dreamingRunning) {
+        api.logger.debug("memory-lancedb-pro: dreaming sweep skipped because a prior run is still active");
+        return;
+      }
+
+      dreamingRunning = true;
+      const startedAt = Date.now();
+      try {
+        const result = await dreamingEngine.runSweep();
+        const changed = Object.values(result.phases).reduce((sum, phase) => sum + phase.changed, 0);
+        if (changed > 0 || result.errors.length > 0 || config.dreaming.verboseLogging) {
+          api.logger.info(
+            `memory-lancedb-pro: dreaming sweep completed ` +
+            `(changed=${changed}, scopes=${result.scopes.length}, errors=${result.errors.length}, elapsedMs=${Date.now() - startedAt})`,
+          );
+        }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: dreaming sweep failed: ${String(err)}`);
+      } finally {
+        dreamingRunning = false;
+      }
+    }
+
+    function scheduleNextDreamingSweep() {
+      if (config.dreaming?.enabled !== true) return;
+      if (dreamingTimer) clearTimeout(dreamingTimer);
+
+      const delayMs = computeNextDreamingDelayMs(
+        config.dreaming.frequency,
+        config.dreaming.timezone,
+      );
+      api.logger.info(
+        `memory-lancedb-pro: dreaming scheduled ` +
+        `(frequency="${config.dreaming.frequency}", nextRunInMs=${delayMs})`,
+      );
+      dreamingTimer = setTimeout(async () => {
+        dreamingTimer = null;
+        await runDreamingSweep();
+        scheduleNextDreamingSweep();
+      }, delayMs);
     }
 
     // ========================================================================
@@ -5246,6 +5315,8 @@ const memoryLanceDBProPlugin = {
             intervalMs,
           );
         }
+
+        scheduleNextDreamingSweep();
       },
       stop: async () => {
         if (backupTimer) {
@@ -5260,6 +5331,11 @@ const memoryLanceDBProPlugin = {
           clearInterval(storageMaintenanceTimer);
           storageMaintenanceTimer = null;
         }
+        if (dreamingTimer) {
+          clearTimeout(dreamingTimer);
+          dreamingTimer = null;
+        }
+        dreamingEngine.stop();
         api.logger.info("memory-lancedb-pro: stopped");
       },
     });
@@ -5519,6 +5595,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       }
       : undefined,
     canonicalCorpus: parseCanonicalCorpusConfig(cfg.canonicalCorpus),
+    dreaming: normalizeDreamingConfig(cfg.dreaming),
     memoryReflection: memoryReflectionRaw
       ? {
         enabled: sessionStrategy === "memoryReflection",

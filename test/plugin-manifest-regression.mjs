@@ -260,6 +260,23 @@ assert.deepEqual(
   "parsePluginConfig should wire supported AST chunking settings and discard unsupported language names",
 );
 
+const parsedDreamingConfig = plugin.parsePluginConfig({
+  embedding: {
+    provider: "openai-compatible",
+    apiKey: "dummy",
+  },
+  dreaming: {
+    enabled: true,
+    frequency: "0 4 * * *",
+    phases: {
+      deep: { minUniqueQueries: 0 },
+    },
+  },
+}).dreaming;
+assert.equal(parsedDreamingConfig.enabled, true, "parsePluginConfig should enable configured dreaming");
+assert.equal(parsedDreamingConfig.frequency, "0 4 * * *", "parsePluginConfig should preserve dreaming frequency");
+assert.equal(parsedDreamingConfig.phases.deep.minUniqueQueries, 0, "parsePluginConfig should preserve deep dreaming knobs");
+
 const workDir = mkdtempSync(path.join(tmpdir(), "memory-plugin-regression-"));
 const services = [];
 const embeddingRequests = [];

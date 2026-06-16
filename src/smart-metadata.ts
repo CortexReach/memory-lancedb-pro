@@ -32,6 +32,7 @@ export type MemorySource =
   | "manual"
   | "auto-capture"
   | "reflection"
+  | "dreaming-engine"
   | "session-summary"
   | "legacy";
 
@@ -122,6 +123,7 @@ function normalizeSource(value: unknown): MemorySource {
     case "manual":
     case "auto-capture":
     case "reflection":
+    case "dreaming-engine":
     case "session-summary":
     case "legacy":
       return value;
@@ -147,7 +149,7 @@ function deriveDefaultLayer(
   memoryCategory: MemoryCategory,
   state: MemoryState,
 ): MemoryLayer {
-  if (source === "reflection" || source === "session-summary") return "reflection";
+  if (source === "reflection" || source === "dreaming-engine" || source === "session-summary") return "reflection";
   if (state === "archived") return "archive";
   if (
     memoryCategory === "profile" ||
