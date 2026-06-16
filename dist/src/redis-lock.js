@@ -190,7 +190,7 @@ export class RedisLockManager {
         }
         catch (err) {
             this.clientPromise = null;
-            this.config.onWarning?.(`memory-lancedb-pro: Redis lock connection failed; using file lock when available: ${String(err)}`);
+            this.config.onWarning?.(`memory-lancedb-pro: Redis lock connection failed; writes will fail closed until Redis locking is available: ${String(err)}`);
             throw new RedisLockUnavailableError(`Redis lock connection failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
         }
     }

@@ -8,7 +8,7 @@ import { access as accessAsync, lstat as lstatAsync, mkdir as mkdirAsync, realpa
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchesMemoryCategoryFilter, resolveCategoryFilterCandidates } from "./memory-categories.js";
-import { RedisLockManager, RedisLockUnavailableError, } from "./redis-lock.js";
+import { RedisLockManager, } from "./redis-lock.js";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 // ============================================================================
 // LanceDB Dynamic Import
@@ -414,15 +414,10 @@ export class MemoryStore {
         };
         this.disableNativeCosine = config.disableNativeCosine === true || envDisablesNativeCosine;
         if (config.redisLock?.enabled === true) {
-            if (config.redisLock.url) {
-                this.redisLock = new RedisLockManager({
-                    ...config.redisLock,
-                    onWarning: config.onLockWarning,
-                });
-            }
-            else {
-                config.onLockWarning?.("memory-lancedb-pro: Redis lock is enabled but no Redis URL is configured; using file lock");
-            }
+            this.redisLock = new RedisLockManager({
+                ...config.redisLock,
+                onWarning: config.onLockWarning,
+            });
         }
     }
     async runWithFileLock(fn) {
@@ -554,16 +549,7 @@ export class MemoryStore {
         if (!this.redisLock) {
             return this.runWithFileLock(fn);
         }
-        try {
-            return await this.redisLock.withLock(this.config.dbPath, fn);
-        }
-        catch (err) {
-            if (!(err instanceof RedisLockUnavailableError)) {
-                throw err;
-            }
-            this.config.onLockWarning?.(`memory-lancedb-pro: Redis write lock unavailable; falling back to file lock: ${err.message}`);
-            return this.runWithFileLock(fn);
-        }
+        return this.redisLock.withLock(this.config.dbPath, fn);
     }
     async closeLockResources() {
         if (!this.redisLock)
@@ -614,7 +600,7 @@ export class MemoryStore {
         const mods = this.dataModsSinceIndexFold;
         this.dataModsSinceIndexFold = 0;
         try {
-            await this.runWithFileLock(async () => {
+            await this.runWithWriteLock(async () => {
                 await this.table.optimize({ cleanupOlderThan: new Date(0) });
             });
             console.log(`[memory-lancedb-pro] index fold completed (reason=${reason}, modsSinceLast=${mods})`);

@@ -34,8 +34,13 @@ across those processes because they are not writing to the same LanceDB store.
 ## Redis Status
 
 Redis is not required for single-gateway or same-filesystem deployments, and the
-current plugin does not enable a Redis lock automatically. If you operate
-multiple independent writers, prefer one of these approaches:
+plugin does not enable a Redis lock automatically. If you enable Redis locking
+with `locking.redis.enabled` or a Redis URL, every LanceDB write and index
+maintenance mutation uses the Redis lock domain. Redis connection or lock-client
+availability failures fail writes closed instead of falling back to a local file
+lock.
+
+If you operate multiple independent writers, prefer one of these approaches:
 
 - route writes through one OpenClaw gateway
 - place the LanceDB directory on a filesystem whose lock-directory behavior is
@@ -43,8 +48,8 @@ multiple independent writers, prefer one of these approaches:
 - add an explicit external write coordinator before enabling multiple writers
 
 Do not use a no-op lock fallback for write paths. If an external coordinator is
-unavailable, fall back to the built-in file lock so failed Redis setup does not
-silently remove write protection.
+required but unavailable, fail the write and retry after the coordinator is
+healthy rather than switching that writer into a separate local lock domain.
 
 ## Troubleshooting Lock Contention
 
