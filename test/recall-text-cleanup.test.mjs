@@ -26,7 +26,11 @@ const origCreateEmbedder = embedderModuleForMock.createEmbedder;
 const pluginModule = jiti("../index.ts");
 const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
 const resetRegistration = pluginModule.resetRegistration ?? (() => {});
-const { registerMemoryRecallTool, registerMemoryStoreTool } = jiti("../src/tools.ts");
+const {
+  registerMemoryExplainRankTool,
+  registerMemoryRecallTool,
+  registerMemoryStoreTool,
+} = jiti("../src/tools.ts");
 const { MemoryRetriever } = jiti("../src/retriever.js");
 const { buildSmartMetadata, stringifySmartMetadata } = jiti("../src/smart-metadata.ts");
 
@@ -505,6 +509,27 @@ describe("recall text cleanup", () => {
     );
     assert.doesNotMatch(JSON.stringify(res.details.memories), /neighbor-user-md|称呼偏好：宙斯/);
     assert.doesNotMatch(JSON.stringify(res.details.memories), /neighbor-pending|neighbor-archive|neighbor-reflection|neighbor-suppressed/);
+  });
+
+  it("omits unfiltered neighbors from non-recall serialized tool details", async () => {
+    const tool = createTool(registerMemoryExplainRankTool, {
+      ...makeRecallContext(makeNeighborGovernanceResults()),
+      workspaceBoundary: {
+        userMdExclusive: {
+          enabled: true,
+        },
+      },
+    });
+    const res = await tool.execute(null, {
+      query: "neighbor governance",
+      limit: 2,
+    });
+
+    assert.equal(res.details.results.length, 2);
+    assert.equal(res.details.results[0].neighbors, undefined);
+    assert.equal(res.details.results[1].neighbors, undefined);
+    assert.doesNotMatch(JSON.stringify(res.details.results), /neighbor-user-md|称呼偏好：宙斯/);
+    assert.doesNotMatch(JSON.stringify(res.details.results), /neighbor-pending|neighbor-archive|neighbor-reflection|neighbor-suppressed/);
   });
 
   it("removes retrieval metadata from every rendered memory_recall line", async () => {

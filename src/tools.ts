@@ -112,7 +112,10 @@ function deriveManualMemoryLayer(category: MemoryCategory): "durable" | "working
   return "working";
 }
 
-function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
+function sanitizeMemoryForSerialization(
+  results: RetrievalResult[],
+  options: { includeNeighbors?: boolean } = {},
+) {
   return results.map((r) => ({
     id: r.entry.id,
     text: r.entry.text,
@@ -122,7 +125,7 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
     importance: r.entry.importance,
     score: r.score,
     sources: r.sources,
-    ...(r.neighbors && r.neighbors.length > 0
+    ...(options.includeNeighbors && r.neighbors && r.neighbors.length > 0
       ? {
         neighbors: r.neighbors.map((neighbor) => ({
           id: neighbor.entry.id,
@@ -936,7 +939,7 @@ function createMemoryRecallTool(
             })
             .join("\n");
 
-          const serializedMemories = sanitizeMemoryForSerialization(results);
+          const serializedMemories = sanitizeMemoryForSerialization(results, { includeNeighbors: true });
           if (includeFullText) {
             for (let i = 0; i < results.length; i++) {
               const metadata = parseSmartMetadata(results[i].entry.metadata, results[i].entry);
