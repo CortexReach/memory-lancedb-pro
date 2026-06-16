@@ -20,9 +20,11 @@ const {
 } = jiti("../src/dreaming-engine.ts");
 const {
   buildSmartMetadata,
+  isMemoryActiveAt,
   parseSmartMetadata,
   stringifySmartMetadata,
 } = jiti("../src/smart-metadata.ts");
+const { createRetriever } = jiti("../src/retriever.ts");
 
 const NOW = Date.UTC(2026, 5, 15, 10, 0, 0);
 
@@ -47,6 +49,20 @@ function memoryEntry({
     timestamp,
     metadata: stringifySmartMetadata(buildSmartMetadata(base, metadata)),
   };
+}
+
+function cosineSimilarity(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length || a.length === 0) return 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  if (normA <= 0 || normB <= 0) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
 class MockStore {
@@ -86,6 +102,39 @@ class MockStore {
     return rows.slice(0, limit).map((entry) => ({ ...entry, vector: [...entry.vector] }));
   }
 
+  async vectorSearch(vector, limit = 5, minScore = 0, scopeFilter, options = {}) {
+    let rows = this.entries;
+    if (scopeFilter?.length) {
+      rows = rows.filter((entry) => scopeFilter.includes(entry.scope ?? "global"));
+    }
+    return rows
+      .map((entry) => ({ ...entry, vector: entry.vector ? [...entry.vector] : [] }))
+      .filter((entry) => !options.excludeInactive || isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry), NOW))
+      .map((entry) => ({ entry, score: cosineSimilarity(vector, entry.vector) }))
+      .filter((result) => result.score >= minScore)
+      .sort((a, b) => b.score - a.score || b.entry.timestamp - a.entry.timestamp)
+      .slice(0, limit);
+  }
+
+  async bm25Search(query, limit = 5, scopeFilter, options = {}) {
+    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+    let rows = this.entries;
+    if (scopeFilter?.length) {
+      rows = rows.filter((entry) => scopeFilter.includes(entry.scope ?? "global"));
+    }
+    return rows
+      .map((entry) => ({ ...entry, vector: entry.vector ? [...entry.vector] : [] }))
+      .filter((entry) => !options.excludeInactive || isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry), NOW))
+      .map((entry) => {
+        const text = entry.text.toLowerCase();
+        const hits = terms.filter((term) => text.includes(term)).length;
+        return { entry, score: terms.length ? hits / terms.length : 0 };
+      })
+      .filter((result) => result.score > 0)
+      .sort((a, b) => b.score - a.score || b.entry.timestamp - a.entry.timestamp)
+      .slice(0, limit);
+  }
+
   async patchMetadata(id, patch) {
     const entry = this.entries.find((candidate) => candidate.id === id);
     if (!entry) return null;
@@ -116,6 +165,9 @@ class MockStore {
 const embedder = {
   async embed() {
     return [0.5, 0.5];
+  },
+  async embedQuery() {
+    return [1, 0];
   },
 };
 
@@ -176,7 +228,7 @@ test("light dreaming archives near-duplicate recent memories and skips dream out
     vector: [1, 0],
     importance: 0.9,
     timestamp: NOW - 60_000,
-    metadata: { source: "manual", tier: "working" },
+    metadata: { source: "manual", tier: "working", dreaming_phase: "light" },
   });
   const duplicate = memoryEntry({
     id: "duplicate",
@@ -184,7 +236,7 @@ test("light dreaming archives near-duplicate recent memories and skips dream out
     vector: [0.999, 0.001],
     importance: 0.4,
     timestamp: NOW - 30_000,
-    metadata: { source: "manual", tier: "working" },
+    metadata: { source: "manual", tier: "working", dreaming_phase: "light" },
   });
   const dreamOutput = memoryEntry({
     id: "dream-output",
@@ -216,8 +268,28 @@ test("light dreaming archives near-duplicate recent memories and skips dream out
   const duplicateMeta = parseSmartMetadata(duplicate.metadata, duplicate);
   assert.equal(duplicateMeta.state, "archived");
   assert.equal(duplicateMeta.canonical_id, "canonical");
+  assert.equal(duplicateMeta.invalidated_at, NOW);
+  assert.equal(isMemoryActiveAt(duplicateMeta, NOW), false);
   const dreamMeta = parseSmartMetadata(dreamOutput.metadata, dreamOutput);
   assert.equal(dreamMeta.state, "confirmed");
+
+  const retriever = createRetriever(store, embedder, {
+    mode: "vector",
+    minScore: 0,
+    hardMinScore: 0,
+    filterNoise: false,
+    rerank: "none",
+    candidatePoolSize: 10,
+  });
+  const retrieved = await retriever.retrieve({
+    query: "production checklist",
+    limit: 10,
+    scopeFilter: ["global"],
+    source: "manual",
+  });
+  const retrievedIds = retrieved.map((result) => result.entry.id);
+  assert.ok(retrievedIds.includes("canonical"));
+  assert.equal(retrievedIds.includes("duplicate"), false);
 });
 
 test("deep dreaming promotes high-value recalled working memories", async () => {

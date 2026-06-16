@@ -291,7 +291,7 @@ function parseUniqueQueryCount(metadata) {
 }
 function isDreamingGenerated(entry) {
     const metadata = parseSmartMetadata(entry.metadata, entry);
-    return metadata.source === "dreaming-engine" || typeof metadata.dreaming_phase === "string";
+    return metadata.source === "dreaming-engine";
 }
 function isActiveUserMemory(entry, at) {
     const metadata = parseSmartMetadata(entry.metadata, entry);
@@ -439,12 +439,14 @@ export function createDreamingEngine(deps) {
                     continue;
                 const canonical = selectCanonical(a, b);
                 const duplicate = canonical.id === a.id ? b : a;
+                const archivedAt = now();
                 const patched = await deps.store.patchMetadata(duplicate.id, {
                     state: "archived",
                     memory_layer: "archive",
+                    invalidated_at: archivedAt,
                     canonical_id: canonical.id,
                     dreaming_phase: "light",
-                    dreaming_archived_at: now(),
+                    dreaming_archived_at: archivedAt,
                     dreaming_archive_reason: `duplicate similarity ${similarity.toFixed(3)}`,
                 }, [scope]);
                 if (patched) {
