@@ -182,21 +182,46 @@ export function normalizeMemoryTimestamp(value: unknown, fallback = Date.now()):
  *   1 → 0.20   2 → 0.40   3 → 0.60   4 → 0.80   5 → 0.95
  *
  * Values already in 0~1 range pass through unchanged.
- * Function is idempotent (safe to call multiple times on same value).
+ * Use ONLY where the data is known to be legacy (migrate / importEntry / backfill).
+ * For generic v2+ read paths, use clampImportance instead to avoid double-normalization
+ * corruption (e.g. 99 -> 1.0 -> 0.20).
+ *
+ * NOTE: 1.0 is indistinguishable from legacy integer 1 in JS (Number.isInteger(1.0) === true),
+ * so legacy-v1 callers must be aware that legitimate 1.0 will map to 0.20. This trade-off is
+ * only safe in legacy import contexts; v2+ data flows through clampImportance.
  */
-export function normalizeImportance(value: number): number {
+export function normalizeLegacyImportance(value: number): number {
   // Guard against NaN / Infinity / -Infinity from corrupted data
-  if (typeof value !== "number" || !Number.isFinite(value)) return 0.5;
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0.7;
 
   // Legacy v1.x integer scale (1-5) → v2+ 0~1
   if (Number.isInteger(value) && value >= 1 && value <= 5) {
     return [null, 0.20, 0.40, 0.60, 0.80, 0.95][value];
   }
 
-  // v2+ 0~1 float: clamp outliers.
-  // Note: 1.0 is indistinguishable from legacy integer 1 in JS (Number.isInteger(1.0) === true),
-  // so it always hits the legacy path above and maps to 0.20.
+  // Non-legacy float (incl. v2+ 0~1) — pass through with clamp as defensive bound
   return Math.max(0.0, Math.min(1.0, value));
+}
+
+/**
+ * Clamp a value to the v2+ 0~1 range, preserving legitimate v2+ values like 1.0.
+ * Use on ALL read paths (search, list, getById, update, etc.) to avoid
+ * double-normalization corruption.
+ *
+ * Idempotent: clampImportance(clampImportance(x)) === clampImportance(x).
+ */
+export function clampImportance(value: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0.7;
+  return Math.max(0.0, Math.min(1.0, value));
+}
+
+/**
+ * @deprecated Use normalizeLegacyImportance (for legacy data) or clampImportance
+ * (for v2+ data) based on data provenance. This wrapper is kept for backward
+ * compatibility and routes to normalizeLegacyImportance.
+ */
+export function normalizeImportance(value: number): number {
+  return normalizeLegacyImportance(value);
 }
 
 function normalizePredicateTimestamp(value: unknown): number | null {
@@ -1449,7 +1474,7 @@ export class MemoryStore {
     const full: MemoryEntry = {
       ...entry,
       scope: entry.scope || "global",
-      importance: Number.isFinite(entry.importance) ? normalizeImportance(entry.importance) : 0.7,
+      importance: normalizeLegacyImportance(entry.importance),
       timestamp: normalizeMemoryTimestamp(entry.timestamp),
       metadata: entry.metadata || "{}",
     };
@@ -1503,7 +1528,7 @@ export class MemoryStore {
       vector: Array.from(row.vector as Iterable<number>),
       category: row.category as MemoryEntry["category"],
       scope: rowScope,
-      importance: normalizeImportance(Number(row.importance)),
+      importance: clampImportance(Number(row.importance)),
       timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
       metadata: (row.metadata as string) || "{}",
     };
@@ -1619,7 +1644,7 @@ export class MemoryStore {
         vector: rowVector,
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: normalizeImportance(Number(row.importance)),
+        importance: clampImportance(Number(row.importance)),
         timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
@@ -1701,7 +1726,7 @@ export class MemoryStore {
             vector: row.vector as number[],
             category: row.category as MemoryEntry["category"],
             scope: rowScope,
-            importance: normalizeImportance(Number(row.importance)),
+            importance: clampImportance(Number(row.importance)),
             timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: (row.metadata as string) || "{}",
         };
@@ -1765,7 +1790,7 @@ export class MemoryStore {
         vector: row.vector as number[],
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: normalizeImportance(Number(row.importance)),
+        importance: clampImportance(Number(row.importance)),
         timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
@@ -1909,7 +1934,7 @@ export class MemoryStore {
           vector: [], // Don't include vectors in list results for performance
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
-          importance: normalizeImportance(Number(row.importance)),
+          importance: clampImportance(Number(row.importance)),
           timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),
@@ -2269,7 +2294,7 @@ export class MemoryStore {
         vector: Array.from(row.vector as Iterable<number>),
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: normalizeImportance(Number(row.importance)),
+        importance: clampImportance(Number(row.importance)),
         timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
@@ -2499,7 +2524,7 @@ export class MemoryStore {
           vector: Array.isArray(row.vector) ? (row.vector as number[]) : [],
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
-          importance: normalizeImportance(Number(row.importance)),
+          importance: clampImportance(Number(row.importance)),
           timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),
