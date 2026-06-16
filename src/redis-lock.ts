@@ -97,19 +97,23 @@ export class RedisLockManager {
     if (this.isClosed) {
       throw new RedisLockUnavailableError("Redis lock manager has been closed");
     }
-    const key = this.makeKey(resource);
-    const client = await this.getClient();
-    this.assertClientSupportsLocking(client);
-    const token = randomUUID();
-
-    await this.acquire(client, key, token);
-    const activeLock = this.runLockedCallback(client, key, token, fn);
+    const activeLock = this.runLockLifecycle(resource, fn);
     this.activeLocks.add(activeLock);
     try {
       return await activeLock;
     } finally {
       this.activeLocks.delete(activeLock);
     }
+  }
+
+  private async runLockLifecycle<T>(resource: string, fn: () => Promise<T>): Promise<T> {
+    const key = this.makeKey(resource);
+    const client = await this.getClient();
+    this.assertClientSupportsLocking(client);
+    const token = randomUUID();
+
+    await this.acquire(client, key, token);
+    return this.runLockedCallback(client, key, token, fn);
   }
 
   private async runLockedCallback<T>(
@@ -125,9 +129,12 @@ export class RedisLockManager {
       if (leaseLost) return;
       leaseLost = error;
     };
-    const throwPostWriteLeaseError = (error: RedisLockLeaseLostError): never => {
+    const throwPostWriteLeaseError = (error: RedisLockLeaseLostError, callbackError?: unknown): never => {
+      const callbackDetail = callbackError
+        ? `; callback also failed: ${callbackError instanceof Error ? callbackError.message : String(callbackError)}`
+        : "";
       throw new RedisLockLeaseIntegrityError(
-        `Redis lock ${key} was lost before the write settled; the write outcome is ambiguous and must not be retried automatically`,
+        `Redis lock ${key} was lost before the write settled; the write outcome is ambiguous and must not be retried automatically${callbackDetail}`,
         { cause: error },
       );
     };
@@ -159,14 +166,24 @@ export class RedisLockManager {
     if (typeof renewTimer.unref === "function") renewTimer.unref();
 
     try {
-      const result = await fn();
+      let result: T;
+      let callbackError: unknown;
+      try {
+        result = await fn();
+      } catch (err) {
+        callbackError = err;
+      }
       if (leaseLost) {
-        throwPostWriteLeaseError(leaseLost);
+        throwPostWriteLeaseError(leaseLost, callbackError);
       }
       if (Date.now() >= leaseExpiresAt) {
         throwPostWriteLeaseError(
           new RedisLockLeaseLostError(`Redis lock ${key} expired before the write settled`),
+          callbackError,
         );
+      }
+      if (callbackError) {
+        throw callbackError;
       }
       return result;
     } finally {

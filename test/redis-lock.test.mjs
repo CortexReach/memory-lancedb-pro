@@ -183,6 +183,50 @@ describe("RedisLockManager", () => {
     assert.deepEqual(events, ["acquired", "write-started", "write-finished", "released", "quit"]);
   });
 
+  it("waits for in-flight Redis lock acquisition before closing the client", async () => {
+    const events = [];
+    let finishAcquire;
+    const acquireMayFinish = new Promise((resolve) => {
+      finishAcquire = resolve;
+    });
+    const manager = new RedisLockManager({
+      url: "redis://localhost:6379",
+      ttlMs: 5_000,
+      acquireTimeoutMs: 200,
+      retryDelayMs: 1,
+    }, {
+      async set() {
+        events.push("acquire-started");
+        await acquireMayFinish;
+        events.push("acquired");
+        return "OK";
+      },
+      async eval() {
+        events.push("released");
+        return 1;
+      },
+      async quit() {
+        events.push("quit");
+      },
+    });
+
+    const write = manager.withLock("/tmp/db", async () => {
+      events.push("write-started");
+    });
+
+    while (!events.includes("acquire-started")) {
+      await sleep(1);
+    }
+    const close = manager.close();
+    await sleep(10);
+    assert.deepEqual(events, ["acquire-started"]);
+
+    finishAcquire();
+    await Promise.all([write, close]);
+
+    assert.deepEqual(events, ["acquire-started", "acquired", "write-started", "released", "quit"]);
+  });
+
   it("rejects empty Redis lock resources without acquiring a client", async () => {
     let setCalls = 0;
     const manager = new RedisLockManager({
@@ -352,6 +396,44 @@ describe("RedisLockManager", () => {
       RedisLockLeaseIntegrityError,
     );
     assert.deepEqual(events.at(-1), "write-settled");
+    assert.ok(events.includes("lease-lost"));
+  });
+
+  it("reports Redis lease integrity loss even when the locked callback throws", async () => {
+    const events = [];
+    const manager = new RedisLockManager({
+      url: "redis://localhost:6379",
+      ttlMs: 120,
+      acquireTimeoutMs: 20,
+      retryDelayMs: 1,
+    }, {
+      async set() {
+        return "OK";
+      },
+      async eval(script) {
+        if (script.includes("pexpire")) {
+          events.push("lease-lost");
+          return 0;
+        }
+        return 0;
+      },
+    });
+
+    await assert.rejects(
+      () => manager.withLock("/tmp/db", async () => {
+        events.push("write-started");
+        await sleep(150);
+        events.push("write-throwing");
+        throw new Error("callback failed");
+      }),
+      (err) => {
+        assert.ok(err instanceof RedisLockLeaseIntegrityError);
+        assert.match(err.message, /callback also failed: callback failed/);
+        assert.equal(err.cause?.name, "RedisLockLeaseLostError");
+        return true;
+      },
+    );
+    assert.deepEqual(events.at(-1), "write-throwing");
     assert.ok(events.includes("lease-lost"));
   });
 
