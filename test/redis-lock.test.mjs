@@ -183,6 +183,50 @@ describe("RedisLockManager", () => {
     assert.deepEqual(events, ["acquired", "write-started", "write-finished", "released", "quit"]);
   });
 
+  it("waits for in-flight Redis lock acquisition before closing the client", async () => {
+    const events = [];
+    let finishAcquire;
+    const acquireMayFinish = new Promise((resolve) => {
+      finishAcquire = resolve;
+    });
+    const manager = new RedisLockManager({
+      url: "redis://localhost:6379",
+      ttlMs: 5_000,
+      acquireTimeoutMs: 200,
+      retryDelayMs: 1,
+    }, {
+      async set() {
+        events.push("acquire-started");
+        await acquireMayFinish;
+        events.push("acquired");
+        return "OK";
+      },
+      async eval() {
+        events.push("released");
+        return 1;
+      },
+      async quit() {
+        events.push("quit");
+      },
+    });
+
+    const write = manager.withLock("/tmp/db", async () => {
+      events.push("write-started");
+    });
+
+    while (!events.includes("acquire-started")) {
+      await sleep(1);
+    }
+    const close = manager.close();
+    await sleep(10);
+    assert.deepEqual(events, ["acquire-started"]);
+
+    finishAcquire();
+    await Promise.all([write, close]);
+
+    assert.deepEqual(events, ["acquire-started", "acquired", "write-started", "released", "quit"]);
+  });
+
   it("rejects empty Redis lock resources without acquiring a client", async () => {
     let setCalls = 0;
     const manager = new RedisLockManager({
@@ -355,6 +399,44 @@ describe("RedisLockManager", () => {
     assert.ok(events.includes("lease-lost"));
   });
 
+  it("reports Redis lease integrity loss even when the locked callback throws", async () => {
+    const events = [];
+    const manager = new RedisLockManager({
+      url: "redis://localhost:6379",
+      ttlMs: 120,
+      acquireTimeoutMs: 20,
+      retryDelayMs: 1,
+    }, {
+      async set() {
+        return "OK";
+      },
+      async eval(script) {
+        if (script.includes("pexpire")) {
+          events.push("lease-lost");
+          return 0;
+        }
+        return 0;
+      },
+    });
+
+    await assert.rejects(
+      () => manager.withLock("/tmp/db", async () => {
+        events.push("write-started");
+        await sleep(150);
+        events.push("write-throwing");
+        throw new Error("callback failed");
+      }),
+      (err) => {
+        assert.ok(err instanceof RedisLockLeaseIntegrityError);
+        assert.match(err.message, /callback also failed: callback failed/);
+        assert.equal(err.cause?.name, "RedisLockLeaseLostError");
+        return true;
+      },
+    );
+    assert.deepEqual(events.at(-1), "write-throwing");
+    assert.ok(events.includes("lease-lost"));
+  });
+
   it("does not lose the lease after a single transient renewal failure", async () => {
     const warnings = [];
     let renewAttempts = 0;
@@ -443,10 +525,9 @@ describe("RedisLockManager", () => {
   });
 });
 
-describe("MemoryStore Redis lock domain", () => {
-  it("fails closed without taking a file lock when Redis is unavailable", async () => {
+describe("MemoryStore Redis fail-closed locking", () => {
+  it("fails closed instead of falling back to file locking when Redis is unavailable", async () => {
     const dbPath = tempDbPath();
-    const warnings = [];
     let fileLocks = 0;
     const added = [];
     __setLockfileModuleForTests({
@@ -460,7 +541,6 @@ describe("MemoryStore Redis lock domain", () => {
       dbPath,
       vectorDim: 3,
       redisLock: { enabled: true, url: "redis://localhost:6379" },
-      onLockWarning: (message) => warnings.push(message),
     });
     store.table = {
       add: async (entries) => {
@@ -477,7 +557,7 @@ describe("MemoryStore Redis lock domain", () => {
     await assert.rejects(
       () => store.importEntry({
         id: "memory-1",
-        text: "must not write through fallback",
+        text: "must not write through local fallback",
         vector: [0.1, 0.2, 0.3],
         category: "fact",
         scope: "global",
@@ -490,7 +570,6 @@ describe("MemoryStore Redis lock domain", () => {
 
     assert.equal(added.length, 0);
     assert.equal(fileLocks, 0);
-    assert.match(warnings.join("\n"), /failed closed/i);
   });
 
   it("does not fall back to file locking when Redis lock acquisition times out", async () => {
@@ -539,11 +618,10 @@ describe("MemoryStore Redis lock domain", () => {
     assert.equal(fileLocks, 0);
   });
 
-  it("routes automatic index folding through the Redis write lock domain", async () => {
+  it("fails closed when Redis locking is explicitly enabled without a URL", async () => {
     const dbPath = tempDbPath();
     let fileLocks = 0;
-    let redisLocks = 0;
-    let optimized = 0;
+    const added = [];
     __setLockfileModuleForTests({
       lock: async () => {
         fileLocks += 1;
@@ -554,26 +632,75 @@ describe("MemoryStore Redis lock domain", () => {
     const store = new MemoryStore({
       dbPath,
       vectorDim: 3,
+      redisLock: { enabled: true },
+    });
+    store.table = {
+      add: async (entries) => {
+        added.push(...entries);
+      },
+    };
+
+    await assert.rejects(
+      () => store.importEntry({
+        id: "memory-1",
+        text: "must not write without redis url",
+        vector: [0.1, 0.2, 0.3],
+        category: "fact",
+        scope: "global",
+        importance: 0.7,
+        timestamp: Date.now(),
+        metadata: "{}",
+      }),
+      RedisLockUnavailableError,
+    );
+
+    assert.equal(added.length, 0);
+    assert.equal(fileLocks, 0);
+  });
+
+  it("runs automatic index folding inside the Redis write-lock domain", async () => {
+    const dbPath = tempDbPath();
+    let fileLocks = 0;
+    const redisEvents = [];
+    __setLockfileModuleForTests({
+      lock: async () => {
+        fileLocks += 1;
+        return async () => {};
+      },
+    });
+
+    let optimizeCalls = 0;
+    const store = new MemoryStore({
+      dbPath,
+      vectorDim: 3,
       redisLock: { enabled: true, url: "redis://localhost:6379" },
     });
     store.table = {
-      optimize: async () => {
-        optimized += 1;
+      optimize: async (options) => {
+        optimizeCalls += 1;
+        redisEvents.push(options.cleanupOlderThan?.getTime?.());
         return {};
       },
     };
     store.redisLock = {
       withLock: async (_resource, fn) => {
-        redisLocks += 1;
+        redisEvents.push("redis-lock");
         return fn();
       },
       close: async () => {},
     };
 
-    await Reflect.get(store, "foldIndices").call(store, "test");
+    for (let i = 0; i < 20; i++) {
+      store.noteDataModification();
+    }
 
-    assert.equal(optimized, 1);
-    assert.equal(redisLocks, 1);
+    const deadline = Date.now() + 250;
+    while (optimizeCalls === 0 && Date.now() < deadline) {
+      await sleep(5);
+    }
+
+    assert.equal(optimizeCalls, 1);
+    assert.deepEqual(redisEvents, ["redis-lock", 0]);
     assert.equal(fileLocks, 0);
   });
 });
@@ -617,6 +744,26 @@ describe("Redis lock configuration", () => {
     assert.equal(parsed.redisUrl, "redis://localhost:6379/2");
     assert.equal(parsed.locking.redis.enabled, true);
     assert.equal(parsed.locking.redis.url, "redis://localhost:6379/2");
+  });
+
+  it("prefers nested Redis URL before resolving legacy redisUrl", () => {
+    delete process.env.REDIS_URL;
+    delete process.env.MEMORY_LANCEDB_REDIS_URL;
+
+    const parsed = parsePluginConfig({
+      embedding: { apiKey: "test-key" },
+      redisUrl: "${REDIS_URL}",
+      locking: {
+        redis: {
+          enabled: true,
+          url: "redis://localhost:6379/3",
+        },
+      },
+    });
+
+    assert.equal(parsed.redisUrl, undefined);
+    assert.equal(parsed.locking.redis.enabled, true);
+    assert.equal(parsed.locking.redis.url, "redis://localhost:6379/3");
   });
 
   it("does not resolve Redis URL placeholders when Redis locking is disabled", () => {

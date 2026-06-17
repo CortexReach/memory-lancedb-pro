@@ -237,7 +237,7 @@
               "enabled": {
                 "type": "boolean",
                 "default": false,
-                "description": "Use Redis SET NX PX write locks before mutating LanceDB. Falls back to file lock when Redis is unavailable."
+                "description": "Use Redis SET NX PX write locks before mutating LanceDB. When enabled, Redis lock failures fail writes closed instead of falling back to local file locks."
               },
               "url": {
                 "type": "string",
@@ -1756,7 +1756,7 @@
     },
     "locking.redis.enabled": {
       "label": "Redis Write Lock",
-      "help": "Use Redis distributed locks for LanceDB writes, with file-lock fallback if Redis is unavailable.",
+      "help": "Use Redis distributed locks for LanceDB writes. When enabled, Redis lock failures fail writes closed instead of falling back to local file locks.",
       "advanced": true
     },
     "locking.redis.url": {
@@ -1793,7 +1793,7 @@
     "locking.redis.connectTimeoutMs": {
       "label": "Redis Lock Connect Timeout",
       "placeholder": "1000",
-      "help": "Redis connection timeout in milliseconds before falling back to the file lock.",
+      "help": "Redis connection timeout in milliseconds before Redis-locked writes fail closed.",
       "advanced": true
     },
     "smartExtraction": {

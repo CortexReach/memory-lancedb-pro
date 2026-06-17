@@ -4253,12 +4253,15 @@ export function parsePluginConfig(value) {
         ? lockingRaw.redis
         : null;
     const redisLockExplicitlyDisabled = redisLockRaw?.enabled === false;
-    const legacyRedisUrl = redisLockExplicitlyDisabled
+    const nestedRedisUrl = redisLockExplicitlyDisabled
+        ? undefined
+        : resolveOptionalEnvString(redisLockRaw?.url);
+    const legacyRedisUrl = redisLockExplicitlyDisabled || nestedRedisUrl
         ? undefined
         : resolveOptionalEnvString(cfg.redisUrl);
     const redisLockUrl = redisLockExplicitlyDisabled
         ? undefined
-        : (resolveOptionalEnvString(redisLockRaw?.url) ??
+        : (nestedRedisUrl ??
             legacyRedisUrl ??
             asNonEmptyString(process.env.MEMORY_LANCEDB_REDIS_URL));
     const redisLockEnabled = !redisLockExplicitlyDisabled &&

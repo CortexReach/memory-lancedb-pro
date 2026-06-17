@@ -71,12 +71,7 @@ export class RedisLockManager {
         if (this.isClosed) {
             throw new RedisLockUnavailableError("Redis lock manager has been closed");
         }
-        const key = this.makeKey(resource);
-        const client = await this.getClient();
-        this.assertClientSupportsLocking(client);
-        const token = randomUUID();
-        await this.acquire(client, key, token);
-        const activeLock = this.runLockedCallback(client, key, token, fn);
+        const activeLock = this.runLockLifecycle(resource, fn);
         this.activeLocks.add(activeLock);
         try {
             return await activeLock;
@@ -84,6 +79,14 @@ export class RedisLockManager {
         finally {
             this.activeLocks.delete(activeLock);
         }
+    }
+    async runLockLifecycle(resource, fn) {
+        const key = this.makeKey(resource);
+        const client = await this.getClient();
+        this.assertClientSupportsLocking(client);
+        const token = randomUUID();
+        await this.acquire(client, key, token);
+        return this.runLockedCallback(client, key, token, fn);
     }
     async runLockedCallback(client, key, token, fn) {
         let leaseLost = null;
@@ -93,8 +96,11 @@ export class RedisLockManager {
                 return;
             leaseLost = error;
         };
-        const throwPostWriteLeaseError = (error) => {
-            throw new RedisLockLeaseIntegrityError(`Redis lock ${key} was lost before the write settled; the write outcome is ambiguous and must not be retried automatically`, { cause: error });
+        const throwPostWriteLeaseError = (error, callbackError) => {
+            const callbackDetail = callbackError
+                ? `; callback also failed: ${callbackError instanceof Error ? callbackError.message : String(callbackError)}`
+                : "";
+            throw new RedisLockLeaseIntegrityError(`Redis lock ${key} was lost before the write settled; the write outcome is ambiguous and must not be retried automatically${callbackDetail}`, { cause: error });
         };
         const renewIntervalMs = Math.max(100, Math.floor(this.config.ttlMs / 5));
         const renewTimer = setInterval(() => {
@@ -115,12 +121,22 @@ export class RedisLockManager {
         if (typeof renewTimer.unref === "function")
             renewTimer.unref();
         try {
-            const result = await fn();
+            let result;
+            let callbackError;
+            try {
+                result = await fn();
+            }
+            catch (err) {
+                callbackError = err;
+            }
             if (leaseLost) {
-                throwPostWriteLeaseError(leaseLost);
+                throwPostWriteLeaseError(leaseLost, callbackError);
             }
             if (Date.now() >= leaseExpiresAt) {
-                throwPostWriteLeaseError(new RedisLockLeaseLostError(`Redis lock ${key} expired before the write settled`));
+                throwPostWriteLeaseError(new RedisLockLeaseLostError(`Redis lock ${key} expired before the write settled`), callbackError);
+            }
+            if (callbackError) {
+                throw callbackError;
             }
             return result;
         }
@@ -190,7 +206,7 @@ export class RedisLockManager {
         }
         catch (err) {
             this.clientPromise = null;
-            this.config.onWarning?.(`memory-lancedb-pro: Redis lock connection failed; using file lock when available: ${String(err)}`);
+            this.config.onWarning?.(`memory-lancedb-pro: Redis lock connection failed; writes will fail closed until Redis locking is available: ${String(err)}`);
             throw new RedisLockUnavailableError(`Redis lock connection failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
         }
     }

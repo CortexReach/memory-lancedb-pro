@@ -30,7 +30,6 @@ import { fileURLToPath } from "node:url";
 import { matchesMemoryCategoryFilter, resolveCategoryFilterCandidates } from "./memory-categories.js";
 import {
   RedisLockManager,
-  RedisLockUnavailableError,
   type RedisLockConfig,
 } from "./redis-lock.js";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
@@ -561,16 +560,10 @@ export class MemoryStore {
     };
     this.disableNativeCosine = config.disableNativeCosine === true || envDisablesNativeCosine;
     if (config.redisLock?.enabled === true) {
-      if (config.redisLock.url) {
-        this.redisLock = new RedisLockManager({
-          ...config.redisLock,
-          onWarning: config.onLockWarning,
-        });
-      } else {
-        config.onLockWarning?.(
-          "memory-lancedb-pro: Redis lock is enabled but no Redis URL is configured; using file lock",
-        );
-      }
+      this.redisLock = new RedisLockManager({
+        ...config.redisLock,
+        onWarning: config.onLockWarning,
+      });
     }
   }
 
@@ -696,16 +689,7 @@ export class MemoryStore {
       return this.runWithFileLock(fn);
     }
 
-    try {
-      return await this.redisLock.withLock(this.config.dbPath, fn);
-    } catch (err) {
-      if (err instanceof RedisLockUnavailableError) {
-        this.config.onLockWarning?.(
-          `memory-lancedb-pro: Redis write lock unavailable; write failed closed to preserve Redis lock-domain isolation: ${err.message}`,
-        );
-      }
-      throw err;
-    }
+    return this.redisLock.withLock(this.config.dbPath, fn);
   }
 
   private async closeLockResources(): Promise<void> {
