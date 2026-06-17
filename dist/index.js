@@ -1671,6 +1671,7 @@ function _initPluginState(api) {
         baseURL: config.embedding.baseURL,
         dimensions: config.embedding.dimensions,
         requestDimensions: config.embedding.requestDimensions,
+        maxInputChars: config.embedding.maxInputChars,
         omitDimensions: config.embedding.omitDimensions,
         taskQuery: config.embedding.taskQuery,
         taskPassage: config.embedding.taskPassage,
@@ -4254,6 +4255,7 @@ export function parsePluginConfig(value) {
             dimensions: parsePositiveInt(embedding.dimensions ?? cfg.dimensions),
             // Intentionally no top-level fallback: requestDimensions is request-only.
             requestDimensions: parsePositiveInt(embedding.requestDimensions),
+            maxInputChars: parsePositiveInt(embedding.maxInputChars ?? cfg.maxInputChars),
             omitDimensions: typeof embedding.omitDimensions === "boolean"
                 ? embedding.omitDimensions
                 : undefined,

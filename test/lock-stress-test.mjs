@@ -10,27 +10,47 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { MemoryStore } = jiti("../src/store.ts");
 
 let workDir;
+const stores = [];
+
+function makeStore(name) {
+  const store = new MemoryStore({ dbPath: join(workDir, name), vectorDim: 3 });
+  stores.push(store);
+  return store;
+}
 
 before(() => {
   workDir = mkdtempSync(join(tmpdir(), "memory-lancedb-pro-stress-v2-"));
 });
 
-after(() => {
+after(async () => {
+  for (const store of stores.reverse()) {
+    await store.destroy?.().catch(() => {});
+  }
+
   if (workDir) {
-    rmSync(workDir, { recursive: true, force: true });
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        rmSync(workDir, { recursive: true, force: true });
+        break;
+      } catch (error) {
+        if (attempt === 9 || error?.code !== "ENOTEMPTY") throw error;
+        await delay(100);
+      }
+    }
   }
 });
 
 describe("高並發鎖壓力測試 v2", { concurrency: 1 }, () => {
   // 測試 1：中等並發（3個同時寫）不 crash
   it("中等並發寫入（3行程×5次）無 ECOMPROMISED crash", async () => {
-    const store = new MemoryStore({ dbPath: join(workDir, "medium-concurrent"), vectorDim: 3 });
+    const store = makeStore("medium-concurrent");
     const errors = [];
 
     const worker = async (workerId) => {
@@ -75,7 +95,7 @@ describe("高並發鎖壓力測試 v2", { concurrency: 1 }, () => {
   // 模擬 holder 持有 lock 時，competitor 嘗試取得 lock
   // 結果應該是：兩個都成功（一個立即，一個等到 lock 釋放後）
   it("並發寫入時兩個都成功（retry 機制正常運作）", async () => {
-    const store = new MemoryStore({ dbPath: join(workDir, "concurrent-retry"), vectorDim: 3 });
+    const store = makeStore("concurrent-retry");
 
     // 用 Promise.all 同時發起兩個 store 請求，真正測試並發競爭下的 retry 行為
     const start = Date.now();
@@ -110,7 +130,7 @@ describe("高並發鎖壓力測試 v2", { concurrency: 1 }, () => {
 
   // 測試 3：批量順序寫入後資料完整性（stress test 不該用 30 個並發，那會 ELOCKED）
   it("批量寫入後所有資料都能正確讀回", async () => {
-    const store = new MemoryStore({ dbPath: join(workDir, "bulk-integrity"), vectorDim: 3 });
+    const store = makeStore("bulk-integrity");
     const COUNT = 20;
     const TIMEOUT_MS = 60_000; // EF4 修復：60 秒安全上限，防止 CI hang
 

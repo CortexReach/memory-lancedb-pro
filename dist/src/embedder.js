@@ -131,6 +131,20 @@ function resolveEnvVars(value) {
 function getErrorMessage(error) {
     return error instanceof Error ? error.message : String(error);
 }
+function defaultMaxInputChars(model) {
+    const normalized = model.toLowerCase();
+    if (normalized.includes("nomic-embed-text"))
+        return 1400;
+    return undefined;
+}
+function truncateForEmbeddingInput(text, maxChars) {
+    const trimmed = text.trim();
+    if (!maxChars || trimmed.length <= maxChars)
+        return trimmed;
+    if (maxChars <= 3)
+        return trimmed.slice(0, maxChars);
+    return `${trimmed.slice(0, maxChars - 3).trimEnd()}...`;
+}
 function getErrorStatus(error) {
     if (!error || typeof error !== "object")
         return undefined;
@@ -393,6 +407,8 @@ export class Embedder {
     _clientTimeoutMs;
     /** Optional requested dimensions to pass through to the embedding provider (OpenAI-compatible). */
     _requestDimensions;
+    /** Optional maximum characters sent to the embedding provider per input. */
+    _maxInputChars;
     /** When true, omit the dimensions parameter even if _requestDimensions is set. */
     _omitDimensions;
     /** Enable automatic chunking for long documents (default: true) */
@@ -410,6 +426,9 @@ export class Embedder {
         this._taskPassage = config.taskPassage;
         this._normalized = config.normalized;
         this._requestDimensions = config.requestDimensions;
+        this._maxInputChars = Number.isFinite(config.maxInputChars) && config.maxInputChars > 0
+            ? Math.floor(config.maxInputChars)
+            : defaultMaxInputChars(config.model);
         this._omitDimensions = config.omitDimensions === true;
         // Enable auto-chunking by default for better handling of long documents
         this._autoChunk = config.chunking !== false;
@@ -453,6 +472,9 @@ export class Embedder {
         }
         this.dimensions = getEffectiveVectorDimensions(config.model, config.dimensions, config.requestDimensions);
         this._cache = new EmbeddingCache(256, 30); // 256 entries, 30 min TTL
+    }
+    prepareInput(input) {
+        return truncateForEmbeddingInput(input, this._maxInputChars);
     }
     // --------------------------------------------------------------------------
     // Multi-key rotation helpers
@@ -781,9 +803,12 @@ export class Embedder {
         }
     }
     buildPayload(input, task) {
+        const safeInput = Array.isArray(input)
+            ? input.map((item) => this.prepareInput(item))
+            : this.prepareInput(input);
         const payload = {
             model: this.model,
-            input,
+            input: safeInput,
         };
         if (this._capabilities.encoding_format) {
             // Force float output where providers explicitly support OpenAI-style formatting.
@@ -824,18 +849,19 @@ export class Embedder {
             }
             text = text.slice(0, safeLimit);
         }
+        const inputText = this.prepareInput(text);
         // Check cache first
-        const cached = this._cache.get(text, task);
+        const cached = this._cache.get(inputText, task);
         if (cached)
             return cached;
         try {
-            const response = await this.embedWithRetry(this.buildPayload(text, task), signal);
+            const response = await this.embedWithRetry(this.buildPayload(inputText, task), signal);
             const embedding = response.data[0]?.embedding;
             if (!embedding) {
                 throw new Error("No embedding returned from provider");
             }
             this.validateEmbedding(embedding);
-            this._cache.set(text, task, embedding);
+            this._cache.set(inputText, task, embedding);
             return embedding;
         }
         catch (error) {
@@ -845,7 +871,7 @@ export class Embedder {
             if (isContextError && this._autoChunk) {
                 try {
                     console.log(`Document exceeded context limit (${errorMsg}), attempting chunking...`);
-                    const chunkResult = smartChunk(text, this._model, this._astChunking);
+                    const chunkResult = smartChunk(inputText, this._model, this._astChunking);
                     if (chunkResult.chunks.length === 0) {
                         throw new Error(`Failed to chunk document: ${errorMsg}`);
                     }
@@ -854,10 +880,10 @@ export class Embedder {
                     // did not actually reduce the problem. Force-truncate with STRICT
                     // reduction to guarantee progress.
                     if (chunkResult.chunks.length === 1 &&
-                        chunkResult.chunks[0].length > text.length * 0.9) {
+                        chunkResult.chunks[0].length > inputText.length * 0.9) {
                         // Use strict reduction factor to guarantee each retry makes progress
-                        const safeLimit = Math.floor(text.length * STRICT_REDUCTION_FACTOR);
-                        console.warn(`[memory-lancedb-pro] smartChunk produced 1 chunk (${chunkResult.chunks[0].length} chars) ≈ original (${text.length} chars). ` +
+                        const safeLimit = Math.floor(inputText.length * STRICT_REDUCTION_FACTOR);
+                        console.warn(`[memory-lancedb-pro] smartChunk produced 1 chunk (${chunkResult.chunks[0].length} chars) ~= original (${inputText.length} chars). ` +
                             `Force-truncating to ${safeLimit} chars (strict ${STRICT_REDUCTION_FACTOR * 100}% reduction) to avoid infinite recursion.`);
                         if (safeLimit < 100) {
                             throw new Error(`[memory-lancedb-pro] Failed to embed: chunking couldn't reduce input size enough for model context`);
@@ -886,7 +912,7 @@ export class Embedder {
                     }, new Array(this.dimensions).fill(0));
                     const finalEmbedding = avgEmbedding.map(v => v / chunkEmbeddings.length);
                     // Cache the result for the original text (using its hash)
-                    this._cache.set(text, task, finalEmbedding);
+                    this._cache.set(inputText, task, finalEmbedding);
                     console.log(`Successfully embedded long document as ${chunkEmbeddings.length} averaged chunks`);
                     return finalEmbedding;
                 }
@@ -912,8 +938,9 @@ export class Embedder {
         const validTexts = [];
         const validIndices = [];
         texts.forEach((text, index) => {
-            if (text && text.trim().length > 0) {
-                validTexts.push(text);
+            const inputText = text ? this.prepareInput(text) : "";
+            if (inputText.length > 0) {
+                validTexts.push(inputText);
                 validIndices.push(index);
             }
         });

@@ -8,6 +8,7 @@ export const CI_TEST_GROUPS = [
 
 export const CI_TEST_MANIFEST = [
   { group: "llm-clients-and-auth", runner: "node", file: "test/embedder-error-hints.test.mjs" },
+  { group: "llm-clients-and-auth", runner: "node", file: "test/embedder-max-input-chars.test.mjs", args: ["--test"] },
   { group: "llm-clients-and-auth", runner: "node", file: "test/cjk-recursion-regression.test.mjs" },
   { group: "storage-and-schema", runner: "node", file: "test/migrate-legacy-schema.test.mjs" },
   { group: "storage-and-schema", runner: "node", file: "test/config-session-strategy-migration.test.mjs", args: ["--test"] },
