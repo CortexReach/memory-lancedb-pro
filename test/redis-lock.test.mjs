@@ -443,19 +443,16 @@ describe("RedisLockManager", () => {
   });
 });
 
-describe("MemoryStore Redis fallback", () => {
-  it("falls back to the file lock when Redis is unavailable before the write runs", async () => {
+describe("MemoryStore Redis lock domain", () => {
+  it("fails closed without taking a file lock when Redis is unavailable", async () => {
     const dbPath = tempDbPath();
     const warnings = [];
     let fileLocks = 0;
-    let fileReleases = 0;
     const added = [];
     __setLockfileModuleForTests({
       lock: async () => {
         fileLocks += 1;
-        return async () => {
-          fileReleases += 1;
-        };
+        return async () => {};
       },
     });
 
@@ -477,21 +474,23 @@ describe("MemoryStore Redis fallback", () => {
       close: async () => {},
     };
 
-    await store.importEntry({
-      id: "memory-1",
-      text: "stored through fallback",
-      vector: [0.1, 0.2, 0.3],
-      category: "fact",
-      scope: "global",
-      importance: 0.7,
-      timestamp: Date.now(),
-      metadata: "{}",
-    });
+    await assert.rejects(
+      () => store.importEntry({
+        id: "memory-1",
+        text: "must not write through fallback",
+        vector: [0.1, 0.2, 0.3],
+        category: "fact",
+        scope: "global",
+        importance: 0.7,
+        timestamp: Date.now(),
+        metadata: "{}",
+      }),
+      RedisLockUnavailableError,
+    );
 
-    assert.equal(added.length, 1);
-    assert.equal(fileLocks, 1);
-    assert.equal(fileReleases, 1);
-    assert.match(warnings.join("\n"), /falling back to file lock/i);
+    assert.equal(added.length, 0);
+    assert.equal(fileLocks, 0);
+    assert.match(warnings.join("\n"), /failed closed/i);
   });
 
   it("does not fall back to file locking when Redis lock acquisition times out", async () => {
@@ -537,6 +536,44 @@ describe("MemoryStore Redis fallback", () => {
     );
 
     assert.equal(added.length, 0);
+    assert.equal(fileLocks, 0);
+  });
+
+  it("routes automatic index folding through the Redis write lock domain", async () => {
+    const dbPath = tempDbPath();
+    let fileLocks = 0;
+    let redisLocks = 0;
+    let optimized = 0;
+    __setLockfileModuleForTests({
+      lock: async () => {
+        fileLocks += 1;
+        return async () => {};
+      },
+    });
+
+    const store = new MemoryStore({
+      dbPath,
+      vectorDim: 3,
+      redisLock: { enabled: true, url: "redis://localhost:6379" },
+    });
+    store.table = {
+      optimize: async () => {
+        optimized += 1;
+        return {};
+      },
+    };
+    store.redisLock = {
+      withLock: async (_resource, fn) => {
+        redisLocks += 1;
+        return fn();
+      },
+      close: async () => {},
+    };
+
+    await Reflect.get(store, "foldIndices").call(store, "test");
+
+    assert.equal(optimized, 1);
+    assert.equal(redisLocks, 1);
     assert.equal(fileLocks, 0);
   });
 });

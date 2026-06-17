@@ -558,11 +558,10 @@ export class MemoryStore {
             return await this.redisLock.withLock(this.config.dbPath, fn);
         }
         catch (err) {
-            if (!(err instanceof RedisLockUnavailableError)) {
-                throw err;
+            if (err instanceof RedisLockUnavailableError) {
+                this.config.onLockWarning?.(`memory-lancedb-pro: Redis write lock unavailable; write failed closed to preserve Redis lock-domain isolation: ${err.message}`);
             }
-            this.config.onLockWarning?.(`memory-lancedb-pro: Redis write lock unavailable; falling back to file lock: ${err.message}`);
-            return this.runWithFileLock(fn);
+            throw err;
         }
     }
     async closeLockResources() {
@@ -614,7 +613,7 @@ export class MemoryStore {
         const mods = this.dataModsSinceIndexFold;
         this.dataModsSinceIndexFold = 0;
         try {
-            await this.runWithFileLock(async () => {
+            await this.runWithWriteLock(async () => {
                 await this.table.optimize({ cleanupOlderThan: new Date(0) });
             });
             console.log(`[memory-lancedb-pro] index fold completed (reason=${reason}, modsSinceLast=${mods})`);
