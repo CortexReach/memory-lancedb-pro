@@ -437,5 +437,160 @@ describe("importance normalization", () => {
     });
   });
 
+  // ========================================================================
+  // F3 coverage: raw write path must clamp out-of-range importance
+  // PR #828 follow-up (rwmjhb): "CLI JSON imports without ids still pass
+  // finite raw importance values through the direct store() branch, so
+  // importance: 4 or 99 can persist out-of-range raw data unless store()/
+  // bulkStore() or that no-id import path clamps at write time."
+  //
+  // store(), upsert(), update(), and bulkUpdateExact() are the direct
+  // (non-importEntry) write surfaces. They must clamp raw out-of-range
+  // values so a v2+ read never sees 4 or 99.
+  // ========================================================================
+  describe("raw write path (F3: store/upsert/update/bulkUpdateExact clamp out-of-range)", () => {
+    it("store() clamps importance=4 to 1.0 at write time", async () => {
+      const store = createStore();
+      const written = await store.store({
+        text: "raw store 4",
+        vector: [1, 0, 0, 0],
+        category: "fact",
+        scope: "global",
+        importance: 4,
+        metadata: "{}",
+      });
+      assert.equal(written.importance, 1.0);
+      const loaded = await store.getById(written.id);
+      assert.equal(loaded?.importance, 1.0);
+    });
+
+    it("store() clamps importance=99 to 1.0 at write time", async () => {
+      const store = createStore();
+      const written = await store.store({
+        text: "raw store 99",
+        vector: [1, 0, 0, 0],
+        category: "fact",
+        scope: "global",
+        importance: 99,
+        metadata: "{}",
+      });
+      assert.equal(written.importance, 1.0);
+      const loaded = await store.getById(written.id);
+      assert.equal(loaded?.importance, 1.0);
+    });
+
+    it("store() clamps negative importance to 0.0 at write time", async () => {
+      const store = createStore();
+      const written = await store.store({
+        text: "raw store negative",
+        vector: [1, 0, 0, 0],
+        category: "fact",
+        scope: "global",
+        importance: -2.5,
+        metadata: "{}",
+      });
+      assert.equal(written.importance, 0.0);
+      const loaded = await store.getById(written.id);
+      assert.equal(loaded?.importance, 0.0);
+    });
+
+    it("store() preserves legitimate v2+ 0.7 unchanged", async () => {
+      const store = createStore();
+      const written = await store.store({
+        text: "raw store 0.7",
+        vector: [1, 0, 0, 0],
+        category: "fact",
+        scope: "global",
+        importance: 0.7,
+        metadata: "{}",
+      });
+      assert.equal(written.importance, 0.7);
+    });
+
+    it("bulkStore() clamps a batch with mixed out-of-range values", async () => {
+      const store = createStore();
+      const results = await store.bulkStore([
+        { text: "raw bulk 4",   vector: [1, 0, 0, 0], category: "fact", scope: "global", importance: 4,   metadata: "{}" },
+        { text: "raw bulk 99",  vector: [0, 1, 0, 0], category: "fact", scope: "global", importance: 99,  metadata: "{}" },
+        { text: "raw bulk 0.7", vector: [0, 0, 1, 0], category: "fact", scope: "global", importance: 0.7, metadata: "{}" },
+        { text: "raw bulk -1",  vector: [0, 0, 0, 1], category: "fact", scope: "global", importance: -1,  metadata: "{}" },
+      ]);
+      assert.equal(results[0].importance, 1.0);
+      assert.equal(results[1].importance, 1.0);
+      assert.equal(results[2].importance, 0.7);
+      assert.equal(results[3].importance, 0.0);
+    });
+
+    it("upsert() clamps out-of-range importance at write time", async () => {
+      const store = createStore();
+      const written = await store.upsert({
+        id: "upsert-99",
+        text: "upsert 99",
+        vector: [1, 0, 0, 0],
+        category: "fact",
+        scope: "global",
+        importance: 99,
+        timestamp: Date.now(),
+        metadata: "{}",
+      });
+      assert.equal(written.importance, 1.0);
+      const loaded = await store.getById("upsert-99");
+      assert.equal(loaded?.importance, 1.0);
+    });
+
+    it("update() clamps out-of-range importance passed via updates.importance", async () => {
+      const store = createStore();
+      await store.upsert({
+        id: "update-99",
+        text: "update 99",
+        vector: [1, 0, 0, 0],
+        category: "fact",
+        scope: "global",
+        importance: 0.5,
+        timestamp: Date.now(),
+        metadata: "{}",
+      });
+      const updated = await store.update("update-99", { importance: 99 });
+      assert.equal(updated?.importance, 1.0);
+      const loaded = await store.getById("update-99");
+      assert.equal(loaded?.importance, 1.0);
+    });
+
+    it("bulkUpdateExact() clamps out-of-range importance", async () => {
+      const store = createStore();
+      await store.upsert({
+        id: "bulk-update-99",
+        text: "bulk update 99",
+        vector: [1, 0, 0, 0],
+        category: "fact",
+        scope: "global",
+        importance: 0.5,
+        timestamp: Date.now(),
+        metadata: "{}",
+      });
+      const results = await store.bulkUpdateExact([
+        { id: "bulk-update-99", updates: { importance: 99 } },
+      ]);
+      assert.equal(results[0].entry?.importance, 1.0);
+      const loaded = await store.getById("bulk-update-99");
+      assert.equal(loaded?.importance, 1.0);
+    });
+
+    it("store() is a no-op clamp for already-clamped values (idempotent)", async () => {
+      // If a caller (e.g. CLI with a future pre-clamp) already clamped to 0.5,
+      // store() must not alter it.
+      const store = createStore();
+      const written = await store.store({
+        text: "already clamped",
+        vector: [1, 0, 0, 0],
+        category: "fact",
+        scope: "global",
+        importance: clampImportance(0.5),
+        metadata: "{}",
+      });
+      assert.equal(written.importance, 0.5);
+    });
+  });
+
   });
 });

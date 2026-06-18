@@ -1106,7 +1106,19 @@ export class MemoryStore {
     // F1 fix: store() now routes through bulkStore() accumulator
     // for consistent lock contention behavior (no per-call file lock).
     // MR2 fix: when pendingBatch is empty, immediate flush avoids 100ms delay.
-    const results = await this.bulkStore([entry]);
+    // F3 fix (PR #828 follow-up): clamp importance at the write boundary so
+    // direct store() callers (e.g. the CLI JSON no-id import path) cannot
+    // persist out-of-range raw values like 4 or 99. clampImportance is
+    // idempotent and preserves legitimate v2+ 0~1 values, so wrapping here is
+    // safe for callers that already normalized upstream. importEntry() keeps
+    // its explicit legacy branch — this clamp is the generic v2+ boundary.
+    // Number() coerces the structurally-typed entry.importance to a real
+    // number so clampImportance's NaN/Infinity fallback can do its job.
+    const clampedEntry: Omit<MemoryEntry, "id" | "timestamp"> = {
+      ...entry,
+      importance: clampImportance(Number(entry.importance)),
+    };
+    const results = await this.bulkStore([clampedEntry]);
     return results[0];
   }
 
@@ -1116,9 +1128,13 @@ export class MemoryStore {
     const result = await this.runWithFileLock(() => this.runSerializedUpdate(async () => {
       const safeId = escapeSqlLiteral(entry.id);
       await this.table!.delete(`id = '${safeId}'`).catch(() => undefined);
+      // F3 fix (PR #828 follow-up): clamp importance at the write boundary so
+      // upsert() callers cannot persist out-of-range raw values. clampImportance
+      // is idempotent and preserves legitimate v2+ 0~1 values.
       const normalizedEntry: MemoryEntry = {
         ...entry,
         metadata: entry.metadata || "{}",
+        importance: clampImportance(entry.importance),
       };
       await this.table!.add([normalizedEntry]);
       return normalizedEntry;
@@ -1174,11 +1190,20 @@ export class MemoryStore {
     }
 
     // 附加 id/timestamp
+    // F3 fix (PR #828 follow-up): clamp importance at the bulk write boundary
+    // so direct bulkStore() callers cannot persist out-of-range raw values like
+    // 4 or 99. clampImportance is idempotent, so callers that already
+    // normalized upstream are unaffected. store() applies the same clamp
+    // before calling bulkStore(); doing it again here covers direct bulkStore
+    // callers (e.g. CLI JSON import retry paths).
+    // Number() coerces the structurally-typed entry.importance to a real
+    // number so clampImportance's NaN/Infinity fallback can do its job.
     const fullEntries: MemoryEntry[] = validEntries.map((entry) => ({
       ...entry,
       id: randomUUID(),
       timestamp: Date.now(),
       metadata: entry.metadata || "{}",
+      importance: clampImportance(Number(entry.importance)),
     }) as MemoryEntry);
 
     // 【MR2 fix】當 pendingBatch 達到上限時，等待前一個 flush 完成後再加入
@@ -2144,7 +2169,11 @@ export class MemoryStore {
             vector: candidate.updates.vector ?? original.vector,
             category: candidate.updates.category ?? original.category,
             scope: rowScope,
-            importance: candidate.updates.importance ?? original.importance,
+            // F3 fix (PR #828 follow-up): clamp importance on update path so
+            // bulkUpdateExact callers cannot persist out-of-range values.
+            importance: clampImportance(
+              candidate.updates.importance ?? original.importance,
+            ),
             timestamp: original.timestamp,
             metadata: candidate.updates.metadata ?? original.metadata,
           };
@@ -2329,7 +2358,11 @@ export class MemoryStore {
         vector: updates.vector ?? original.vector,
         category: updates.category ?? original.category,
         scope: rowScope,
-        importance: updates.importance ?? original.importance,
+        // F3 fix (PR #828 follow-up): clamp importance on update path so
+        // update() callers cannot persist out-of-range values.
+        importance: clampImportance(
+          updates.importance ?? original.importance,
+        ),
         timestamp: original.timestamp, // preserve original
         metadata: updates.metadata ?? original.metadata,
       };

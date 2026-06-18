@@ -122,6 +122,8 @@ export class MemoryMigrator {
                 id: row.id,
                 text: row.text,
                 vector: normalizeLegacyVector(row.vector),
+                // Keep raw legacy importance; importEntry({ legacy: true }) normalizes
+                // it exactly once at the explicit legacy-provenance boundary.
                 importance: Number(row.importance),
                 category: row.category || "other",
                 createdAt: Number(row.createdAt),
@@ -153,6 +155,10 @@ export class MemoryMigrator {
                     }
                 }
                 // Convert legacy entry to new format while preserving legacy identity.
+                // Pass the raw legacy importance through to importEntry with
+                // { legacy: true } so normalization happens exactly once at this
+                // explicit legacy-provenance boundary (avoids repeated calls to a
+                // non-idempotent legacy normalizer on out-of-range/corrupt data).
                 const newEntry = {
                     id: legacy.id,
                     text: legacy.text,
@@ -167,7 +173,7 @@ export class MemoryMigrator {
                         originalCreatedAt: legacy.createdAt,
                     }),
                 };
-                await this.targetStore.importEntry(newEntry);
+                await this.targetStore.importEntry(newEntry, { legacy: true });
                 migrated++;
                 if (migrated % 100 === 0) {
                     console.log(`Migrated ${migrated}/${legacyEntries.length} entries...`);
