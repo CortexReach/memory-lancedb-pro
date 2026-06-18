@@ -16,15 +16,16 @@ function readJson(relativePath) {
 }
 
 function verifyDistFreshness() {
-  const result = spawnSync("git", ["diff", "--quiet", "--", "dist"], {
+  const result = spawnSync("git", ["status", "--porcelain", "--untracked-files=all", "--", "dist"], {
     cwd: repoRoot,
     encoding: "utf8",
   });
-  if (result.status === 0) return;
-  if (result.status === 1) {
-    fail("dist/ is stale after build; run npm run build and commit the generated dist output");
+  if (result.status !== 0) {
+    fail(`could not verify dist freshness with git status: ${result.stderr || result.stdout || `exit ${result.status}`}`);
   }
-  fail(`could not verify dist freshness with git diff: ${result.stderr || result.stdout || `exit ${result.status}`}`);
+  const changedDistOutput = result.stdout.trim();
+  if (changedDistOutput.length === 0) return;
+  fail(`dist/ has uncommitted or untracked output after build:\n${changedDistOutput}\nRun npm run build and commit the generated dist output`);
 }
 
 function normalizeRuntimePath(value) {
