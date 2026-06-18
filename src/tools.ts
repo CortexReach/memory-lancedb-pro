@@ -44,6 +44,7 @@ import {
   isUserMdExclusiveMemory,
   type WorkspaceBoundaryConfig,
 } from "./workspace-boundary.js";
+import { isSuppressed as isTier1Suppressed } from "./auto-recall-tier1.js";
 
 // ============================================================================
 // Types
@@ -111,7 +112,10 @@ function deriveManualMemoryLayer(category: MemoryCategory): "durable" | "working
   return "working";
 }
 
-function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
+function sanitizeMemoryForSerialization(
+  results: RetrievalResult[],
+  options: { includeNeighbors?: boolean } = {},
+) {
   return results.map((r) => ({
     id: r.entry.id,
     text: r.entry.text,
@@ -121,7 +125,52 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
     importance: r.entry.importance,
     score: r.score,
     sources: r.sources,
+    ...(options.includeNeighbors && r.neighbors && r.neighbors.length > 0
+      ? {
+        neighbors: r.neighbors.map((neighbor) => ({
+          id: neighbor.entry.id,
+          text: neighbor.entry.text,
+          category: getDisplayCategoryTag(neighbor.entry),
+          rawCategory: neighbor.entry.category,
+          scope: neighbor.entry.scope,
+          importance: neighbor.entry.importance,
+          score: neighbor.score,
+          sources: neighbor.sources,
+        })),
+      }
+      : {}),
   }));
+}
+
+function isManualRecallNeighborGovernanceEligible(
+  result: RetrievalResult,
+  nowMs: number,
+): boolean {
+  const meta = parseSmartMetadata(result.entry.metadata, result.entry);
+  if (meta.state !== "confirmed") return false;
+  if (meta.memory_layer === "archive" || meta.memory_layer === "reflection") return false;
+  if (isTier1Suppressed(meta, nowMs)) return false;
+  return true;
+}
+
+function filterManualRecallResultNeighbors(
+  results: RetrievalResult[],
+  workspaceBoundary?: WorkspaceBoundaryConfig,
+  nowMs = Date.now(),
+): RetrievalResult[] {
+  return results.map((result) => {
+    if (!result.neighbors || result.neighbors.length === 0) return result;
+
+    const neighbors = filterUserMdExclusiveRecallResults(
+      result.neighbors.filter((neighbor) => isManualRecallNeighborGovernanceEligible(neighbor, nowMs)),
+      workspaceBoundary,
+    );
+    if (neighbors.length === result.neighbors.length) return result;
+    if (neighbors.length > 0) return { ...result, neighbors };
+
+    const { neighbors: _neighbors, ...withoutNeighbors } = result;
+    return withoutNeighbors;
+  });
 }
 
 function isUnresolvedReflectionItem(entry: MemoryEntry): boolean {
@@ -821,13 +870,17 @@ function createMemoryRecallTool(
           const { scopeFilter } = resolvedScopes;
           const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
 
-          const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry(runtimeContext.retriever, {
+          const retrievedResults = await retrieveWithRetry(runtimeContext.retriever, {
             query,
             limit: safeLimit,
             scopeFilter,
             category,
             source: "manual",
-          }, () => runtimeContext.store.count()), runtimeContext.workspaceBoundary);
+          }, () => runtimeContext.store.count());
+          const results = filterManualRecallResultNeighbors(
+            filterUserMdExclusiveRecallResults(retrievedResults, runtimeContext.workspaceBoundary),
+            runtimeContext.workspaceBoundary,
+          );
 
           if (results.length === 0) {
             return {
@@ -874,14 +927,19 @@ function createMemoryRecallTool(
                 ? (metadata.l2_content || metadata.l1_overview || r.entry.text)
                 : (metadata.l0_abstract || r.entry.text);
               const inline = normalizeInlineText(base);
+              const neighborText = r.neighbors && r.neighbors.length > 0
+                ? ` Neighbors: ${r.neighbors
+                  .map((neighbor) => `[${neighbor.entry.id}] ${truncateText(normalizeInlineText(neighbor.entry.text), 120)}`)
+                  .join("; ")}`
+                : "";
               const rendered = includeFullText
-                ? inline
-                : truncateText(inline, safeCharsPerItem);
+                ? `${inline}${neighborText}`
+                : truncateText(`${inline}${neighborText}`, safeCharsPerItem);
               return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${rendered}`;
             })
             .join("\n");
 
-          const serializedMemories = sanitizeMemoryForSerialization(results);
+          const serializedMemories = sanitizeMemoryForSerialization(results, { includeNeighbors: true });
           if (includeFullText) {
             for (let i = 0; i < results.length; i++) {
               const metadata = parseSmartMetadata(results[i].entry.metadata, results[i].entry);
@@ -2105,7 +2163,10 @@ export function registerMemoryDebugTool(
               if (r.sources.bm25) sources.push("BM25");
               if (r.sources.reranked) sources.push("reranked");
               const categoryTag = getDisplayCategoryTag(r.entry);
-              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text.slice(0, 120)}${r.entry.text.length > 120 ? "..." : ""} (${(r.score * 100).toFixed(1)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
+              const neighborText = r.neighbors && r.neighbors.length > 0
+                ? ` neighbors=${r.neighbors.map((neighbor) => neighbor.entry.id).join(",")}`
+                : "";
+              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text.slice(0, 120)}${r.entry.text.length > 120 ? "..." : ""} (${(r.score * 100).toFixed(1)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""}${neighborText})`;
             });
 
             const text = [...traceLines, ``, `Results (${results.length}):`, ...resultLines].join("\n");
@@ -2834,6 +2895,7 @@ export function registerMemoryExplainRankTool(
             if (r.sources.vector) sourceBreakdown.push(`vec=${r.sources.vector.score.toFixed(3)}`);
             if (r.sources.bm25) sourceBreakdown.push(`bm25=${r.sources.bm25.score.toFixed(3)}`);
             if (r.sources.reranked) sourceBreakdown.push(`rerank=${r.sources.reranked.score.toFixed(3)}`);
+            if (r.neighbors && r.neighbors.length > 0) sourceBreakdown.push(`neighbors=${r.neighbors.length}`);
             return [
               `${idx + 1}. [${r.entry.id}] score=${r.score.toFixed(3)} ${sourceBreakdown.join(" ")}`.trim(),
               `   state=${meta.state} layer=${meta.memory_layer} source=${meta.source} tier=${meta.tier}`,

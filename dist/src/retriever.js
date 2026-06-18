@@ -31,7 +31,25 @@ export const DEFAULT_RETRIEVAL_CONFIG = {
     reinforcementFactor: 0.5,
     maxHalfLifeMultiplier: 3,
     tagPrefixes: ["proj", "env", "team", "scope"],
+    neighborEnrichment: {
+        enabled: false,
+        maxPerResult: 2,
+    },
 };
+export function normalizeRetrievalConfig(config) {
+    const neighborEnrichment = {
+        ...DEFAULT_RETRIEVAL_CONFIG.neighborEnrichment,
+        ...(config?.neighborEnrichment || {}),
+    };
+    return {
+        ...DEFAULT_RETRIEVAL_CONFIG,
+        ...config,
+        neighborEnrichment: {
+            enabled: Boolean(neighborEnrichment.enabled),
+            maxPerResult: clampInt(neighborEnrichment.maxPerResult, 1, 5),
+        },
+    };
+}
 // ============================================================================
 // Utility Functions
 // ============================================================================
@@ -307,7 +325,6 @@ function cosineSimilarity(a, b) {
 export class MemoryRetriever {
     store;
     embedder;
-    config;
     decayEngine;
     accessTracker = null;
     lastDiagnostics = null;
@@ -316,9 +333,10 @@ export class MemoryRetriever {
     constructor(store, embedder, config = DEFAULT_RETRIEVAL_CONFIG, decayEngine = null) {
         this.store = store;
         this.embedder = embedder;
-        this.config = config;
         this.decayEngine = decayEngine;
+        this.config = normalizeRetrievalConfig(config);
     }
+    config;
     setAccessTracker(tracker) {
         this.accessTracker = tracker;
     }
@@ -760,7 +778,7 @@ export class MemoryRetriever {
             trace?.endStage(finalResults.map((r) => r.entry.id), finalResults.map((r) => r.score));
             if (diagnostics)
                 diagnostics.stageCounts.afterDiversity = deduplicated.length;
-            return finalResults;
+            return await this.enrichHybridNeighbors(finalResults, scopeFilter, category);
         }
         catch (error) {
             if (diagnostics) {
@@ -789,6 +807,56 @@ export class MemoryRetriever {
         return filtered.map((result, index) => ({
             ...result,
             rank: index + 1,
+        }));
+    }
+    async enrichHybridNeighbors(results, scopeFilter, category) {
+        const config = this.config.neighborEnrichment;
+        if (!config.enabled || results.length === 0)
+            return results;
+        const maxPerResult = clampInt(config.maxPerResult, 1, 5);
+        const primaryIds = new Set(results.map((result) => result.entry.id));
+        const neighborCandidateLimit = Math.min(primaryIds.size + maxPerResult + Math.max(10, maxPerResult * 4), 50);
+        return await Promise.all(results.map(async (result) => {
+            const resultScope = result.entry.scope || "global";
+            if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(resultScope)) {
+                return result;
+            }
+            let candidates;
+            try {
+                candidates = await this.store.bm25Search(result.entry.text, neighborCandidateLimit, [resultScope], { excludeInactive: true });
+            }
+            catch (error) {
+                console.warn(`[Retriever] neighbor enrichment BM25 lookup failed for ${result.entry.id}: ${formatErrorMessage(error)}`);
+                return result;
+            }
+            const neighbors = [];
+            for (const candidate of candidates) {
+                if (candidate.entry.id === result.entry.id)
+                    continue;
+                if (primaryIds.has(candidate.entry.id))
+                    continue;
+                if ((candidate.entry.scope || "global") !== resultScope)
+                    continue;
+                if (category && candidate.entry.category !== category)
+                    continue;
+                const metadata = parseSmartMetadata(candidate.entry.metadata, candidate.entry);
+                if (isMemoryExpired(metadata))
+                    continue;
+                if (this.config.filterNoise && filterNoise([candidate], (r) => r.entry.text).length === 0)
+                    continue;
+                neighbors.push({
+                    ...candidate,
+                    sources: {
+                        bm25: {
+                            score: candidate.score,
+                            rank: neighbors.length + 1,
+                        },
+                    },
+                });
+                if (neighbors.length >= maxPerResult)
+                    break;
+            }
+            return neighbors.length > 0 ? { ...result, neighbors } : result;
         }));
     }
     buildBM25Query(query, source) {
@@ -1296,11 +1364,21 @@ export class MemoryRetriever {
     }
     // Update configuration
     updateConfig(newConfig) {
-        this.config = { ...this.config, ...newConfig };
+        this.config = normalizeRetrievalConfig({
+            ...this.config,
+            ...newConfig,
+            neighborEnrichment: {
+                ...this.config.neighborEnrichment,
+                ...(newConfig.neighborEnrichment || {}),
+            },
+        });
     }
     // Get current configuration
     getConfig() {
-        return { ...this.config };
+        return {
+            ...this.config,
+            neighborEnrichment: { ...this.config.neighborEnrichment },
+        };
     }
     getLastDiagnostics() {
         if (!this.lastDiagnostics)
@@ -1361,6 +1439,6 @@ export class MemoryRetriever {
     }
 }
 export function createRetriever(store, embedder, config, options) {
-    const fullConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config };
+    const fullConfig = normalizeRetrievalConfig(config);
     return new MemoryRetriever(store, embedder, fullConfig, options?.decayEngine ?? null);
 }

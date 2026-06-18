@@ -26,7 +26,11 @@ const origCreateEmbedder = embedderModuleForMock.createEmbedder;
 const pluginModule = jiti("../index.ts");
 const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
 const resetRegistration = pluginModule.resetRegistration ?? (() => {});
-const { registerMemoryRecallTool, registerMemoryStoreTool } = jiti("../src/tools.ts");
+const {
+  registerMemoryExplainRankTool,
+  registerMemoryRecallTool,
+  registerMemoryStoreTool,
+} = jiti("../src/tools.ts");
 const { MemoryRetriever } = jiti("../src/retriever.js");
 const { buildSmartMetadata, stringifySmartMetadata } = jiti("../src/smart-metadata.ts");
 
@@ -144,6 +148,43 @@ function makeExpandedResults() {
       sources: {
         vector: { score: 0.65, rank: 3 },
       },
+    },
+  ];
+}
+
+function makeNeighborSummaryResults() {
+  return [
+    {
+      entry: {
+        id: "m-neighbor-primary",
+        text: "primary alpha",
+        category: "fact",
+        scope: "global",
+        importance: 0.7,
+        timestamp: Date.now(),
+        metadata: confirmedMetadata(),
+      },
+      score: 0.82,
+      sources: {
+        vector: { score: 0.82, rank: 1 },
+      },
+      neighbors: [
+        {
+          entry: {
+            id: "n1",
+            text: "neighbor beta detail should share the same per item budget instead of expanding the summary line",
+            category: "fact",
+            scope: "global",
+            importance: 0.6,
+            timestamp: Date.now(),
+            metadata: confirmedMetadata(),
+          },
+          score: 0.7,
+          sources: {
+            bm25: { score: 0.7, rank: 1 },
+          },
+        },
+      ],
     },
   ];
 }
@@ -300,6 +341,46 @@ function makeGovernanceFilteredResults() {
   ];
 }
 
+function makeNeighborGovernanceResults() {
+  const now = Date.now();
+  const result = (id, text, metadataOverrides = {}, neighbors = []) => ({
+    entry: {
+      id,
+      text,
+      category: "fact",
+      scope: "global",
+      importance: 0.7,
+      timestamp: now,
+      metadata: confirmedMetadata(metadataOverrides),
+    },
+    score: 0.9,
+    sources: { vector: { score: 0.9, rank: 1 } },
+    ...(neighbors.length > 0 ? { neighbors } : {}),
+  });
+  const userMdExclusiveNeighbor = result("neighbor-user-md", "称呼偏好：宙斯", {
+    l0_abstract: "称呼偏好：宙斯",
+    l1_overview: "## Addressing\n- Preferred form of address: 宙斯",
+    l2_content: "用户希望以后被称呼为“宙斯”。",
+    memory_category: "preferences",
+    fact_key: "preferences:称呼偏好",
+  });
+  const sharedNeighbor = result("neighbor-shared", "shared neighbor should appear once");
+  return [
+    result("primary-1", "primary one", {}, [
+      sharedNeighbor,
+      result("neighbor-pending", "pending neighbor should not appear", { state: "pending", memory_layer: "working" }),
+      result("neighbor-archive", "archive neighbor should not appear", { state: "archived", memory_layer: "archive" }),
+      result("neighbor-reflection", "reflection neighbor should not appear", { memory_layer: "reflection" }),
+      result("neighbor-suppressed", "suppressed neighbor should not appear", { suppressed_until_ms: now + 60_000 }),
+      userMdExclusiveNeighbor,
+    ]),
+    result("primary-2", "primary two", {}, [
+      sharedNeighbor,
+      result("neighbor-unique", "unique safe neighbor"),
+    ]),
+  ];
+}
+
 function makeRecallContext(results = makeResults()) {
   return {
     retriever: {
@@ -377,6 +458,78 @@ describe("recall text cleanup", () => {
     assert.equal(typeof res.details.memories[1].score, "number");
     assert.ok(res.details.memories[1].sources.vector);
     assert.ok(res.details.memories[1].sources.bm25);
+  });
+
+  it("keeps memory_recall neighbor summaries within the per-item character budget", async () => {
+    const tool = createTool(registerMemoryRecallTool, makeRecallContext(makeNeighborSummaryResults()));
+    const res = await tool.execute(null, {
+      query: "neighbor budget",
+      maxCharsPerItem: 60,
+    });
+
+    const line = extractRenderedMemoryRecallLines(res.content[0].text)[0];
+    const summary = line.replace(/^1\. \[m-neighbor-primary\] \[fact:global\] /, "");
+
+    assert.match(summary, /Neighbors:/);
+    assert.ok(summary.length <= 60, `expected ${summary.length} chars to stay within the configured budget`);
+    assert.match(summary, /…$/);
+    assert.doesNotMatch(summary, /expanding the summary line/);
+    assert.equal(res.details.memories[0].neighbors.length, 1);
+  });
+
+  it("filters boundary-sensitive and governance-ineligible neighbors from memory_recall output and details", async () => {
+    const tool = createTool(registerMemoryRecallTool, {
+      ...makeRecallContext(makeNeighborGovernanceResults()),
+      workspaceBoundary: {
+        userMdExclusive: {
+          enabled: true,
+        },
+      },
+    });
+    const res = await tool.execute(null, {
+      query: "neighbor governance",
+      limit: 2,
+      maxCharsPerItem: 1000,
+    });
+
+    assert.match(res.content[0].text, /neighbor-shared/);
+    assert.match(res.content[0].text, /neighbor-unique/);
+    assert.doesNotMatch(res.content[0].text, /neighbor-user-md|称呼偏好：宙斯/);
+    assert.doesNotMatch(res.content[0].text, /neighbor-pending|pending neighbor should not appear/);
+    assert.doesNotMatch(res.content[0].text, /neighbor-archive|archive neighbor should not appear/);
+    assert.doesNotMatch(res.content[0].text, /neighbor-reflection|reflection neighbor should not appear/);
+    assert.doesNotMatch(res.content[0].text, /neighbor-suppressed|suppressed neighbor should not appear/);
+
+    assert.deepEqual(
+      res.details.memories.map((memory) => memory.neighbors?.map((neighbor) => neighbor.id) ?? []),
+      [
+        ["neighbor-shared"],
+        ["neighbor-shared", "neighbor-unique"],
+      ],
+    );
+    assert.doesNotMatch(JSON.stringify(res.details.memories), /neighbor-user-md|称呼偏好：宙斯/);
+    assert.doesNotMatch(JSON.stringify(res.details.memories), /neighbor-pending|neighbor-archive|neighbor-reflection|neighbor-suppressed/);
+  });
+
+  it("omits unfiltered neighbors from non-recall serialized tool details", async () => {
+    const tool = createTool(registerMemoryExplainRankTool, {
+      ...makeRecallContext(makeNeighborGovernanceResults()),
+      workspaceBoundary: {
+        userMdExclusive: {
+          enabled: true,
+        },
+      },
+    });
+    const res = await tool.execute(null, {
+      query: "neighbor governance",
+      limit: 2,
+    });
+
+    assert.equal(res.details.results.length, 2);
+    assert.equal(res.details.results[0].neighbors, undefined);
+    assert.equal(res.details.results[1].neighbors, undefined);
+    assert.doesNotMatch(JSON.stringify(res.details.results), /neighbor-user-md|称呼偏好：宙斯/);
+    assert.doesNotMatch(JSON.stringify(res.details.results), /neighbor-pending|neighbor-archive|neighbor-reflection|neighbor-suppressed/);
   });
 
   it("removes retrieval metadata from every rendered memory_recall line", async () => {
@@ -720,6 +873,77 @@ describe("recall text cleanup", () => {
     assert.match(output.prependContext, /confirmed durable memory/);
     assert.doesNotMatch(output.prependContext, /pending memory should not auto-recall/);
     assert.doesNotMatch(output.prependContext, /archived memory should not auto-recall/);
+  });
+
+  it("applies auto-recall governance and dedupe to related neighbor snippets", async () => {
+    const mockResults = makeNeighborGovernanceResults();
+    const retrieverMod = jiti("../src/retriever.js");
+    retrieverMod.createRetriever = function mockCreateRetriever() {
+      return {
+        async retrieve() {
+          return mockResults;
+        },
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+        setAccessTracker() {},
+        setStatsCollector() {},
+      };
+    };
+    const embedderMod = jiti("../src/embedder.js");
+    embedderMod.createEmbedder = function mockCreateEmbedder() {
+      return {
+        async embedQuery() {
+          return new Float32Array(384).fill(0);
+        },
+        async embedPassage() {
+          return new Float32Array(384).fill(0);
+        },
+      };
+    };
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: true,
+        autoRecallMinLength: 1,
+        autoRecallMaxItems: 5,
+        autoRecallMaxChars: 3000,
+        autoRecallPerItemMaxChars: 1000,
+        workspaceBoundary: {
+          userMdExclusive: {
+            enabled: true,
+          },
+        },
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    const autoRecallHook = getAutoRecallHook(harness.eventHandlers);
+    const output = await autoRecallHook(
+      { prompt: "Please recall related details for this task." },
+      { sessionId: "auto-neighbor-governance", sessionKey: "agent:main:session:auto-neighbor-governance", agentId: "main" }
+    );
+
+    assert.ok(output);
+    assert.match(output.prependContext, /primary one/);
+    assert.match(output.prependContext, /primary two/);
+    assert.match(output.prependContext, /shared neighbor should appear once/);
+    assert.match(output.prependContext, /unique safe neighbor/);
+    assert.equal(
+      (output.prependContext.match(/shared neighbor should appear once/g) || []).length,
+      1,
+      "duplicate neighbor ids should render once across auto-recall lines",
+    );
+    assert.doesNotMatch(output.prependContext, /pending neighbor should not appear/);
+    assert.doesNotMatch(output.prependContext, /archive neighbor should not appear/);
+    assert.doesNotMatch(output.prependContext, /reflection neighbor should not appear/);
+    assert.doesNotMatch(output.prependContext, /suppressed neighbor should not appear/);
+    assert.doesNotMatch(output.prependContext, /称呼偏好：宙斯/);
   });
 
   it("filters USER.md-exclusive facts from memory_recall output", async () => {

@@ -97,7 +97,19 @@ export interface RetrievalConfig {
    *  Queries containing these prefixes (e.g. "proj:AIF") will use BM25-only + mustContain
    *  to avoid semantic false positives from vector search. */
   tagPrefixes: string[];
+  /** Default-off retrieval-time BM25 neighbors attached after MMR in hybrid mode. */
+  neighborEnrichment: NeighborEnrichmentConfig;
 }
+
+export interface NeighborEnrichmentConfig {
+  enabled: boolean;
+  maxPerResult: number;
+}
+
+export type RetrievalConfigInput =
+  Partial<Omit<RetrievalConfig, "neighborEnrichment">> & {
+    neighborEnrichment?: Partial<NeighborEnrichmentConfig>;
+  };
 
 export interface RetrievalContext {
   query: string;
@@ -120,6 +132,13 @@ export interface RetrievalResult extends MemorySearchResult {
     bm25?: { score: number; rank: number };
     fused?: { score: number };
     reranked?: { score: number };
+  };
+  neighbors?: RetrievalNeighbor[];
+}
+
+export interface RetrievalNeighbor extends MemorySearchResult {
+  sources: {
+    bm25: { score: number; rank: number };
   };
 }
 
@@ -213,7 +232,28 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   reinforcementFactor: 0.5,
   maxHalfLifeMultiplier: 3,
   tagPrefixes: ["proj", "env", "team", "scope"],
+  neighborEnrichment: {
+    enabled: false,
+    maxPerResult: 2,
+  },
 };
+
+export function normalizeRetrievalConfig(
+  config?: RetrievalConfigInput,
+): RetrievalConfig {
+  const neighborEnrichment = {
+    ...DEFAULT_RETRIEVAL_CONFIG.neighborEnrichment,
+    ...(config?.neighborEnrichment || {}),
+  };
+  return {
+    ...DEFAULT_RETRIEVAL_CONFIG,
+    ...config,
+    neighborEnrichment: {
+      enabled: Boolean(neighborEnrichment.enabled),
+      maxPerResult: clampInt(neighborEnrichment.maxPerResult, 1, 5),
+    },
+  };
+}
 
 // ============================================================================
 // Utility Functions
@@ -561,9 +601,13 @@ export class MemoryRetriever {
   constructor(
     private store: MemoryStore,
     private embedder: Embedder,
-    private config: RetrievalConfig = DEFAULT_RETRIEVAL_CONFIG,
+    config: RetrievalConfigInput = DEFAULT_RETRIEVAL_CONFIG,
     private decayEngine: DecayEngine | null = null,
-  ) { }
+  ) {
+    this.config = normalizeRetrievalConfig(config);
+  }
+
+  private config: RetrievalConfig;
 
   setAccessTracker(tracker: AccessTracker): void {
     this.accessTracker = tracker;
@@ -1129,7 +1173,7 @@ export class MemoryRetriever {
       trace?.endStage(finalResults.map((r) => r.entry.id), finalResults.map((r) => r.score));
       if (diagnostics) diagnostics.stageCounts.afterDiversity = deduplicated.length;
 
-      return finalResults;
+      return await this.enrichHybridNeighbors(finalResults, scopeFilter, category);
     } catch (error) {
       if (diagnostics) {
         diagnostics.failureStage = extractFailureStage(error) ?? failureStage;
@@ -1179,6 +1223,69 @@ export class MemoryRetriever {
     return filtered.map((result, index) => ({
       ...result,
       rank: index + 1,
+    }));
+  }
+
+  private async enrichHybridNeighbors(
+    results: RetrievalResult[],
+    scopeFilter?: string[],
+    category?: string,
+  ): Promise<RetrievalResult[]> {
+    const config = this.config.neighborEnrichment;
+    if (!config.enabled || results.length === 0) return results;
+
+    const maxPerResult = clampInt(config.maxPerResult, 1, 5);
+    const primaryIds = new Set(results.map((result) => result.entry.id));
+    const neighborCandidateLimit = Math.min(
+      primaryIds.size + maxPerResult + Math.max(10, maxPerResult * 4),
+      50,
+    );
+
+    return await Promise.all(results.map(async (result) => {
+      const resultScope = result.entry.scope || "global";
+      if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(resultScope)) {
+        return result;
+      }
+
+      let candidates: MemorySearchResult[];
+      try {
+        candidates = await this.store.bm25Search(
+          result.entry.text,
+          neighborCandidateLimit,
+          [resultScope],
+          { excludeInactive: true },
+        );
+      } catch (error) {
+        console.warn(
+          `[Retriever] neighbor enrichment BM25 lookup failed for ${result.entry.id}: ${formatErrorMessage(error)}`,
+        );
+        return result;
+      }
+
+      const neighbors: RetrievalNeighbor[] = [];
+      for (const candidate of candidates) {
+        if (candidate.entry.id === result.entry.id) continue;
+        if (primaryIds.has(candidate.entry.id)) continue;
+        if ((candidate.entry.scope || "global") !== resultScope) continue;
+        if (category && candidate.entry.category !== category) continue;
+
+        const metadata = parseSmartMetadata(candidate.entry.metadata, candidate.entry);
+        if (isMemoryExpired(metadata)) continue;
+        if (this.config.filterNoise && filterNoise([candidate], (r) => r.entry.text).length === 0) continue;
+
+        neighbors.push({
+          ...candidate,
+          sources: {
+            bm25: {
+              score: candidate.score,
+              rank: neighbors.length + 1,
+            },
+          },
+        });
+        if (neighbors.length >= maxPerResult) break;
+      }
+
+      return neighbors.length > 0 ? { ...result, neighbors } : result;
     }));
   }
 
@@ -1804,13 +1911,23 @@ export class MemoryRetriever {
   }
 
   // Update configuration
-  updateConfig(newConfig: Partial<RetrievalConfig>): void {
-    this.config = { ...this.config, ...newConfig };
+  updateConfig(newConfig: RetrievalConfigInput): void {
+    this.config = normalizeRetrievalConfig({
+      ...this.config,
+      ...newConfig,
+      neighborEnrichment: {
+        ...this.config.neighborEnrichment,
+        ...(newConfig.neighborEnrichment || {}),
+      },
+    });
   }
 
   // Get current configuration
   getConfig(): RetrievalConfig {
-    return { ...this.config };
+    return {
+      ...this.config,
+      neighborEnrichment: { ...this.config.neighborEnrichment },
+    };
   }
 
   getLastDiagnostics(): RetrievalDiagnostics | null {
@@ -1893,9 +2010,9 @@ export interface RetrieverLifecycleOptions {
 export function createRetriever(
   store: MemoryStore,
   embedder: Embedder,
-  config?: Partial<RetrievalConfig>,
+  config?: RetrievalConfigInput,
   options?: { decayEngine?: DecayEngine | null },
 ): MemoryRetriever {
-  const fullConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config };
+  const fullConfig = normalizeRetrievalConfig(config);
   return new MemoryRetriever(store, embedder, fullConfig, options?.decayEngine ?? null);
 }

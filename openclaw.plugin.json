@@ -637,6 +637,29 @@
             "default": true,
             "description": "Filter out noise memories (agent denials, meta-questions, boilerplate)"
           },
+          "neighborEnrichment": {
+            "type": "object",
+            "additionalProperties": false,
+            "default": {
+              "enabled": false,
+              "maxPerResult": 2
+            },
+            "description": "Default-off retrieval-time BM25 neighbor enrichment for hybrid search results.",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Attach bounded same-scope BM25 neighbors to each top-level hybrid retrieval result."
+              },
+              "maxPerResult": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5,
+                "default": 2,
+                "description": "Maximum supplemental neighbors to attach per top-level result."
+              }
+            }
+          },
           "disableNativeCosine": {
             "type": "boolean",
             "default": false,
@@ -1894,6 +1917,16 @@
     "retrieval.candidatePoolSize": {
       "label": "Candidate Pool Size",
       "help": "Number of candidates to fetch before fusion and reranking",
+      "advanced": true
+    },
+    "retrieval.neighborEnrichment.enabled": {
+      "label": "Neighbor Enrichment",
+      "help": "Attach bounded same-scope BM25 neighbors to hybrid retrieval results without changing the top-level count.",
+      "advanced": true
+    },
+    "retrieval.neighborEnrichment.maxPerResult": {
+      "label": "Neighbor Limit",
+      "help": "Maximum supplemental neighbors attached to each hybrid retrieval result.",
       "advanced": true
     },
     "retrieval.disableNativeCosine": {
