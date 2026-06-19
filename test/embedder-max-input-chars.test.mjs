@@ -49,9 +49,52 @@ function makeEmbeddingServer(requests) {
   });
 }
 
+function makeAggregateLimitEmbeddingServer(requests) {
+  return http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/v1/embeddings") {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("unexpected endpoint");
+      return;
+    }
+
+    const body = await readJson(req);
+    requests.push(body);
+    if (Array.isArray(body.input) && body.input.length > 1) {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "batch context length exceeded" } }));
+      return;
+    }
+
+    const count = Array.isArray(body.input) ? body.input.length : 1;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      data: Array.from({ length: count }, () => ({ embedding: dims() })),
+    }));
+  });
+}
+
 async function withEmbeddingServer(fn) {
   const requests = [];
   const server = makeEmbeddingServer(requests);
+  const port = await new Promise((resolve, reject) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (addr && typeof addr === "object") resolve(addr.port);
+      else reject(new Error("server did not expose a port"));
+    });
+    server.on("error", reject);
+  });
+
+  try {
+    await fn(`http://127.0.0.1:${port}/v1`, requests);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+async function withAggregateLimitEmbeddingServer(fn) {
+  const requests = [];
+  const server = makeAggregateLimitEmbeddingServer(requests);
   const port = await new Promise((resolve, reject) => {
     server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
@@ -156,6 +199,31 @@ test("batch embedding chunks over maxInputChars before provider requests", async
     assert.equal(inputs.every((input) => input.length <= 64), true);
     assert.match(inputs.join(""), /TAIL_ONE/);
     assert.match(inputs.join(""), /TAIL_TWO/);
+  });
+});
+
+test("batch context fallback retries individual items before chunking", async () => {
+  await withAggregateLimitEmbeddingServer(async (baseURL, requests) => {
+    const embedder = new Embedder({
+      provider: "openai-compatible",
+      apiKey: "test-key",
+      model: "text-embedding-004",
+      baseURL,
+      maxInputChars: 128,
+    });
+
+    const first = "first memory with trailing fact";
+    const second = "second memory with trailing fact";
+    const result = await embedder.embedBatchPassage([first, "", second]);
+
+    assert.equal(result.length, 3);
+    assert.deepEqual(result[1], []);
+    assert.equal(requests.length, 3);
+    assert.deepEqual(requests.map((request) => request.input), [
+      [first, second],
+      first,
+      second,
+    ]);
   });
 });
 

@@ -1004,20 +1004,22 @@ export class Embedder {
             return results;
         }
         catch (error) {
-            // Check if this is a context length exceeded error and try chunking each text
+            // Check if this is a context length exceeded error and retry each text
+            // separately. Some providers reject only the aggregate batch size while
+            // accepting each item unchanged.
             const errorMsg = error instanceof Error ? error.message : String(error);
             const isContextError = /context|too long|exceed|length/i.test(errorMsg);
             if (isContextError && this._autoChunk) {
                 try {
-                    console.log(`Batch embedding failed with context error, attempting chunking...`);
-                    const chunkResults = await Promise.all(validTexts.map(async (text, idx) => {
-                        const finalEmbedding = await this.embedChunkedText(text, task, 0, signal, `Batch embedding failed with context error, chunking item ${idx}...`);
+                    console.log(`Batch embedding failed with context error, retrying items individually...`);
+                    const retryResults = await Promise.all(validTexts.map(async (text, idx) => {
+                        const finalEmbedding = await this.embedSingle(text, task, 0, signal);
                         return { embedding: finalEmbedding, index: validIndices[idx] };
                     }));
-                    console.log(`Successfully chunked and embedded ${chunkResults.length} long documents`);
+                    console.log(`Successfully embedded ${retryResults.length} documents individually after batch context error`);
                     // Build results array
                     const results = new Array(texts.length);
-                    chunkResults.forEach(({ embedding, index }) => {
+                    retryResults.forEach(({ embedding, index }) => {
                         if (embedding.length > 0) {
                             this.validateEmbedding(embedding);
                             results[index] = embedding;
