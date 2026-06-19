@@ -17,17 +17,29 @@ Module._initPaths();
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 
 async function captureStdout(run) {
-  const chunks = [];
+  const stdoutChunks = [];
+  const logChunks = [];
   const originalLog = console.log;
+  const originalWrite = process.stdout.write;
   console.log = (...args) => {
-    chunks.push(args.join(" "));
+    logChunks.push(args.join(" "));
+  };
+  process.stdout.write = function write(chunk, encoding, callback) {
+    stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk.toString(encoding) : String(chunk));
+    if (typeof encoding === "function") {
+      encoding();
+    } else if (typeof callback === "function") {
+      callback();
+    }
+    return true;
   };
   try {
     await run();
   } finally {
+    process.stdout.write = originalWrite;
     console.log = originalLog;
   }
-  return chunks.join("\n");
+  return { stdout: stdoutChunks.join(""), logs: logChunks.join("\n") };
 }
 
 async function createSourceDb(sourceDbPath) {
@@ -163,6 +175,21 @@ async function runCliSmoke() {
   ]);
   assert.match(out2, /Import completed: 0 imported, 1 skipped/, out2);
 
+  const listOutput = await captureStdout(async () => {
+    await program.parseAsync([
+      "node",
+      "openclaw",
+      "memory-pro",
+      "list",
+      "--scope",
+      "agent:smoke",
+      "--json",
+    ]);
+  });
+
+  assert.equal(listOutput.logs, "", "memory-pro list --json should not use console.log");
+  assert.equal(JSON.parse(listOutput.stdout)[0].id, importId);
+
   const vaultPath = path.join(workDir, "obsidian-vault");
   const outObsidian = await captureLogs([
     "node",
@@ -278,7 +305,9 @@ async function runCliSmoke() {
     ]);
   });
 
-  assert.match(searchOutput, /search_regression_1/);
+  assert.equal(searchOutput.logs, "", "memory-pro search --json should not use console.log");
+  assert.match(searchOutput.stdout, /search_regression_1/);
+  assert.equal(JSON.parse(searchOutput.stdout)[0].entry.id, "search_regression_1");
 
   const lexicalStore = new MemoryStore({
     dbPath: path.join(workDir, "lexical-db"),
