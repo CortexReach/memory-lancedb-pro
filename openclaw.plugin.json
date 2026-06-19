@@ -136,7 +136,7 @@
           "maxInputChars": {
             "type": "integer",
             "minimum": 100,
-            "description": "Maximum characters sent to the embedding provider per input. Useful for local embedding servers with small context or batch limits; omitted uses a model-specific safe default when known."
+            "description": "Maximum characters sent to the embedding provider per request. With automatic chunking enabled, longer documents are split before this cap is applied to each provider request; with chunking disabled, excess text is truncated."
           },
           "chunking": {
             "type": "boolean",
@@ -1660,7 +1660,7 @@
     "embedding.maxInputChars": {
       "label": "Max Input Characters",
       "placeholder": "model-specific default",
-      "help": "Maximum characters sent to the embedding provider per input. Set lower for local embedding servers with small context or batch limits.",
+      "help": "Maximum characters sent to the embedding provider per request. Auto-chunking preserves longer documents by splitting first; disabling chunking makes this a truncation cap.",
       "advanced": true
     },
     "maxInputChars": {

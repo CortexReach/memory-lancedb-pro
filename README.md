@@ -546,7 +546,7 @@ Works with **OpenAI-compatible embedding APIs**, including provider-specific pay
 
 Voyage embedding requests use Voyage's `model` + `input` payload shape. When `requestDimensions` is configured it is sent as `output_dimension`; OpenAI-only fields such as `encoding_format` are omitted.
 
-Set `embedding.maxInputChars` for local embedding servers with small context or batch limits. The plugin applies a conservative default for `nomic-embed-text`.
+Set `embedding.maxInputChars` for local embedding servers with small context or batch limits. The plugin applies a conservative default for `nomic-embed-text`; with automatic chunking enabled, longer documents are split before the cap is applied to each provider request.
 
 </details>
 

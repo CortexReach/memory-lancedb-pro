@@ -68,7 +68,11 @@ async function withEmbeddingServer(fn) {
   }
 }
 
-test("nomic-embed-text defaults to a conservative max input character cap", async () => {
+function flattenRequestInputs(requests) {
+  return requests.flatMap((request) => Array.isArray(request.input) ? request.input : [request.input]);
+}
+
+test("nomic-embed-text chunks long input before applying the provider request cap", async () => {
   await withEmbeddingServer(async (baseURL, requests) => {
     const embedder = new Embedder({
       provider: "openai-compatible",
@@ -77,15 +81,17 @@ test("nomic-embed-text defaults to a conservative max input character cap", asyn
       baseURL,
     });
 
-    await embedder.embedPassage("x".repeat(2000));
+    const longInput = `${"x".repeat(1500)}TAIL_FACT:${"y".repeat(500)}`;
+    await embedder.embedPassage(longInput);
 
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].input.length, 1400);
-    assert.equal(requests[0].input.endsWith("..."), true);
+    const inputs = flattenRequestInputs(requests);
+    assert.ok(inputs.length > 1, "long input should be split into multiple provider requests");
+    assert.equal(inputs.every((input) => input.length <= 1400), true);
+    assert.match(inputs.join(""), /TAIL_FACT/);
   });
 });
 
-test("embedding.maxInputChars overrides the model default and drives the cache key", async () => {
+test("embedding.maxInputChars truncates and drives the cache key when chunking is disabled", async () => {
   await withEmbeddingServer(async (baseURL, requests) => {
     const embedder = new Embedder({
       provider: "openai-compatible",
@@ -93,6 +99,7 @@ test("embedding.maxInputChars overrides the model default and drives the cache k
       model: "nomic-embed-text",
       baseURL,
       maxInputChars: 120,
+      chunking: false,
     });
 
     const longInput = " ".repeat(4) + "y".repeat(300);
@@ -105,7 +112,7 @@ test("embedding.maxInputChars overrides the model default and drives the cache k
   });
 });
 
-test("batch embedding applies maxInputChars to each valid input", async () => {
+test("batch embedding applies maxInputChars to each valid input when chunking is disabled", async () => {
   await withEmbeddingServer(async (baseURL, requests) => {
     const embedder = new Embedder({
       provider: "openai-compatible",
@@ -113,6 +120,7 @@ test("batch embedding applies maxInputChars to each valid input", async () => {
       model: "text-embedding-004",
       baseURL,
       maxInputChars: 64,
+      chunking: false,
     });
 
     await embedder.embedBatchPassage(["a".repeat(120), "", "b".repeat(80)]);
@@ -123,6 +131,31 @@ test("batch embedding applies maxInputChars to each valid input", async () => {
       [64, 64],
     );
     assert.equal(requests[0].input.every((item) => item.endsWith("...")), true);
+  });
+});
+
+test("batch embedding chunks over maxInputChars before provider requests", async () => {
+  await withEmbeddingServer(async (baseURL, requests) => {
+    const embedder = new Embedder({
+      provider: "openai-compatible",
+      apiKey: "test-key",
+      model: "text-embedding-004",
+      baseURL,
+      maxInputChars: 64,
+    });
+
+    const first = `${"a".repeat(80)}TAIL_ONE`;
+    const second = `${"b".repeat(70)}TAIL_TWO`;
+    const result = await embedder.embedBatchPassage([first, "", second]);
+
+    assert.equal(result.length, 3);
+    assert.deepEqual(result[1], []);
+
+    const inputs = flattenRequestInputs(requests);
+    assert.ok(inputs.length > 2, "long batch inputs should be split before provider requests");
+    assert.equal(inputs.every((input) => input.length <= 64), true);
+    assert.match(inputs.join(""), /TAIL_ONE/);
+    assert.match(inputs.join(""), /TAIL_TWO/);
   });
 });
 
