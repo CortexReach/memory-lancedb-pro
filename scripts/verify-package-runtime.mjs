@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,6 +13,19 @@ function fail(message) {
 
 function readJson(relativePath) {
   return JSON.parse(readFileSync(path.join(repoRoot, relativePath), "utf8"));
+}
+
+function verifyDistFreshness() {
+  const result = spawnSync("git", ["status", "--porcelain", "--untracked-files=all", "--", "dist"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    fail(`could not verify dist freshness with git status: ${result.stderr || result.stdout || `exit ${result.status}`}`);
+  }
+  const changedDistOutput = result.stdout.trim();
+  if (changedDistOutput.length === 0) return;
+  fail(`dist/ has uncommitted or untracked output after build:\n${changedDistOutput}\nRun npm run build and commit the generated dist output`);
 }
 
 function normalizeRuntimePath(value) {
@@ -54,4 +68,6 @@ if (!files.includes("dist/**/*")) {
   fail('package.json files must include "dist/**/*" so compiled runtime output is published');
 }
 
-console.log("Package runtime entries point to compiled dist output");
+verifyDistFreshness();
+
+console.log("Package runtime entries point to compiled fresh dist output");
