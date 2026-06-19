@@ -5220,6 +5220,7 @@ const memoryLanceDBProPlugin = {
       id: "memory-lancedb-pro",
       start: async () => {
         dreamingStopped = false;
+        dreamingEngine.start();
         // IMPORTANT: Do not block gateway startup on external network calls.
         // If embedding/retrieval tests hang (bad network / slow provider), the gateway
         // may never bind its HTTP port, causing restart timeouts.

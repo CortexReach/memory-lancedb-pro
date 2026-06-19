@@ -493,6 +493,49 @@ test("dreaming stop prevents later phases from starting after in-flight light wo
   assert.equal(parseSmartMetadata(deepCandidate.metadata, deepCandidate).tier, "working");
 });
 
+test("dreaming engine can run again after stop and start", async () => {
+  const canonical = memoryEntry({
+    id: "canonical-restart",
+    text: "Deployments use the restart checklist.",
+    vector: [1, 0],
+    importance: 0.9,
+    metadata: { source: "manual", tier: "working" },
+  });
+  const duplicate = memoryEntry({
+    id: "duplicate-restart",
+    text: "Deployment should use the restart checklist.",
+    vector: [0.999, 0.001],
+    importance: 0.4,
+    metadata: { source: "manual", tier: "working" },
+  });
+  const store = new MockStore([canonical, duplicate]);
+  const engine = createDreamingEngine({
+    store,
+    embedder,
+    now: () => NOW,
+    config: {
+      enabled: true,
+      phases: {
+        light: { enabled: true, limit: 10, dedupeSimilarity: 0.99 },
+        deep: { enabled: false },
+        rem: { enabled: false },
+      },
+    },
+  });
+
+  engine.stop();
+  const stoppedResult = await engine.runSweep(["global"]);
+  assert.equal(stoppedResult.phases.light.archived ?? 0, 0);
+  assert.equal(store.patches.length, 0);
+
+  engine.start();
+  const restartedResult = await engine.runSweep(["global"]);
+  assert.equal(restartedResult.errors.length, 0);
+  assert.equal(restartedResult.phases.light.archived, 1);
+  assert.equal(store.patches.length, 1);
+  assert.equal(store.patches[0].id, "duplicate-restart");
+});
+
 test("REM dreaming writes a reflection with durable dreaming-engine source metadata", async () => {
   const entries = [
     memoryEntry({

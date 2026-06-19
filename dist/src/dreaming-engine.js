@@ -643,6 +643,9 @@ export function createDreamingEngine(deps) {
     }
     return {
         config,
+        start() {
+            stopped = false;
+        },
         stop() {
             stopped = true;
         },

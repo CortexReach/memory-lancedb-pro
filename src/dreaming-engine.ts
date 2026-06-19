@@ -174,6 +174,7 @@ export type PartialDreamingConfig = Partial<Omit<DreamingConfig, "phases">> & {
 
 export interface DreamingEngine {
   readonly config: DreamingConfig;
+  start(): void;
   runSweep(scopes?: string[]): Promise<DreamingSweepResult>;
   stop(): void;
 }
@@ -866,6 +867,9 @@ export function createDreamingEngine(deps: DreamingEngineDependencies): Dreaming
 
   return {
     config,
+    start() {
+      stopped = false;
+    },
     stop() {
       stopped = true;
     },
