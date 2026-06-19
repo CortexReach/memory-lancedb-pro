@@ -69,6 +69,8 @@ class MockStore {
   constructor(entries = []) {
     this.entries = entries;
     this.stored = [];
+    this.patches = [];
+    this.updates = [];
   }
 
   async stats() {
@@ -136,6 +138,7 @@ class MockStore {
   }
 
   async patchMetadata(id, patch) {
+    this.patches.push({ id, patch });
     const entry = this.entries.find((candidate) => candidate.id === id);
     if (!entry) return null;
     const parsed = JSON.parse(entry.metadata || "{}");
@@ -144,6 +147,7 @@ class MockStore {
   }
 
   async update(id, updates) {
+    this.updates.push({ id, updates });
     const entry = this.entries.find((candidate) => candidate.id === id);
     if (!entry) return null;
     Object.assign(entry, updates);
@@ -175,7 +179,7 @@ test("normalizes dreaming config and daily cron scheduling defaults", () => {
   const disabled = normalizeDreamingConfig(undefined);
   assert.equal(disabled.enabled, false);
   assert.equal(disabled.frequency, "0 3 * * *");
-  assert.equal(disabled.phases.deep.minUniqueQueries, 3);
+  assert.equal(disabled.phases.deep.minUniqueQueries, 0);
 
   const enabled = normalizeDreamingConfig({
     enabled: true,
@@ -193,6 +197,15 @@ test("normalizes dreaming config and daily cron scheduling defaults", () => {
 
   const delay = computeNextDreamingDelayMs("0 3 * * *", "UTC", Date.UTC(2026, 0, 1, 2, 30));
   assert.equal(delay, 30 * 60 * 1000);
+
+  assert.throws(
+    () => normalizeDreamingConfig({ enabled: true, frequency: "every 5 minutes" }),
+    /Unsupported dreaming\.frequency/,
+  );
+  assert.throws(
+    () => normalizeDreamingConfig({ enabled: true, phases: { light: { sources: ["unsupported"] } } }),
+    /Unsupported dreaming source filter/,
+  );
 });
 
 test("default-off engine returns without touching the store", async () => {
@@ -292,6 +305,52 @@ test("light dreaming archives near-duplicate recent memories and skips dream out
   assert.equal(retrievedIds.includes("duplicate"), false);
 });
 
+test("light dreaming maps advertised sources and applies recent lookback before limiting", async () => {
+  const oldRows = Array.from({ length: 8 }, (_, index) => memoryEntry({
+    id: `old-${index}`,
+    text: `Old unrelated deployment note ${index}.`,
+    vector: [0, 1],
+    timestamp: NOW - (5 * 24 * 60 * 60 * 1000) - index,
+    metadata: { source: "manual", tier: "working" },
+  }));
+  const canonical = memoryEntry({
+    id: "recent-canonical",
+    text: "Release trains use the Friday checklist.",
+    vector: [1, 0],
+    importance: 0.9,
+    timestamp: NOW - 60_000,
+    metadata: { source: "manual", tier: "working" },
+  });
+  const duplicate = memoryEntry({
+    id: "recent-duplicate",
+    text: "The Friday checklist governs release trains.",
+    vector: [0.999, 0.001],
+    importance: 0.4,
+    timestamp: NOW - 30_000,
+    metadata: { source: "manual", tier: "working" },
+  });
+  const store = new MockStore([...oldRows, canonical, duplicate]);
+  const engine = createDreamingEngine({
+    store,
+    embedder,
+    now: () => NOW,
+    config: {
+      enabled: true,
+      phases: {
+        light: { enabled: true, limit: 2, lookbackDays: 1, dedupeSimilarity: 0.99, sources: ["daily"] },
+        deep: { enabled: false },
+        rem: { enabled: false },
+      },
+    },
+  });
+
+  const result = await engine.runSweep(["global"]);
+
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.phases.light.archived, 1);
+  assert.equal(parseSmartMetadata(duplicate.metadata, duplicate).state, "archived");
+});
+
 test("deep dreaming promotes high-value recalled working memories", async () => {
   const candidate = memoryEntry({
     id: "candidate",
@@ -331,6 +390,107 @@ test("deep dreaming promotes high-value recalled working memories", async () => 
   assert.equal(metadata.tier, "core");
   assert.equal(metadata.memory_layer, "durable");
   assert.equal(metadata.dreaming_phase, "deep");
+  assert.equal(store.patches.length, 0);
+  assert.equal(store.updates.length, 1);
+  assert.ok(Object.prototype.hasOwnProperty.call(store.updates[0].updates, "importance"));
+  assert.ok(Object.prototype.hasOwnProperty.call(store.updates[0].updates, "metadata"));
+});
+
+test("deep dreaming default promotion uses normal access metadata without unique-query counters", async () => {
+  const candidate = memoryEntry({
+    id: "default-candidate",
+    text: "The launch checklist is consulted before every release.",
+    importance: 0.74,
+    timestamp: NOW - (2 * 60 * 60 * 1000),
+    metadata: {
+      source: "manual",
+      tier: "working",
+      memory_layer: "working",
+      access_count: 6,
+      confidence: 0.9,
+    },
+  });
+  const store = new MockStore([candidate]);
+  const engine = createDreamingEngine({
+    store,
+    embedder,
+    now: () => NOW,
+    config: {
+      enabled: true,
+      phases: {
+        light: { enabled: false },
+        deep: { enabled: true, limit: 2, minScore: 0.5, minRecallCount: 3 },
+        rem: { enabled: false },
+      },
+    },
+  });
+
+  const result = await engine.runSweep(["global"]);
+
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.phases.deep.promoted, 1);
+  const metadata = parseSmartMetadata(candidate.metadata, candidate);
+  assert.equal(metadata.tier, "core");
+  assert.equal(metadata.memory_layer, "durable");
+});
+
+test("dreaming stop prevents later phases from starting after in-flight light work", async () => {
+  const canonical = memoryEntry({
+    id: "canonical-stop",
+    text: "Deployments use the stop checklist.",
+    vector: [1, 0],
+    importance: 0.9,
+    metadata: { source: "manual", tier: "working" },
+  });
+  const duplicate = memoryEntry({
+    id: "duplicate-stop",
+    text: "Deployment should use the stop checklist.",
+    vector: [0.999, 0.001],
+    importance: 0.4,
+    metadata: { source: "manual", tier: "working" },
+  });
+  const deepCandidate = memoryEntry({
+    id: "deep-stop",
+    text: "The shutdown checklist is recalled often.",
+    vector: [0, 1],
+    importance: 0.8,
+    metadata: {
+      source: "manual",
+      tier: "working",
+      memory_layer: "working",
+      access_count: 6,
+      confidence: 0.9,
+    },
+  });
+  const store = new MockStore([canonical, duplicate, deepCandidate]);
+  const originalPatchMetadata = store.patchMetadata.bind(store);
+  let engine;
+  store.patchMetadata = async (...args) => {
+    const result = await originalPatchMetadata(...args);
+    engine.stop();
+    return result;
+  };
+  engine = createDreamingEngine({
+    store,
+    embedder,
+    now: () => NOW,
+    config: {
+      enabled: true,
+      phases: {
+        light: { enabled: true, limit: 10, dedupeSimilarity: 0.99 },
+        deep: { enabled: true, limit: 2, minScore: 0.5, minRecallCount: 3 },
+        rem: { enabled: true, limit: 5, minPatternStrength: 0.5 },
+      },
+    },
+  });
+
+  const result = await engine.runSweep(["global"]);
+
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.phases.light.archived, 1);
+  assert.equal(result.phases.deep.promoted ?? 0, 0);
+  assert.equal(store.stored.length, 0);
+  assert.equal(parseSmartMetadata(deepCandidate.metadata, deepCandidate).tier, "working");
 });
 
 test("REM dreaming writes a reflection with durable dreaming-engine source metadata", async () => {

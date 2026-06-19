@@ -1,7 +1,30 @@
+import { LEGACY_MEMORY_CATEGORIES, MEMORY_CATEGORIES, } from "./memory-categories.js";
 import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata, toLifecycleMemory, } from "./smart-metadata.js";
 const MS_PER_DAY = 86_400_000;
 const DEFAULT_FREQUENCY = "0 3 * * *";
 const DEFAULT_PAGE_SIZE = 100;
+const STORED_MEMORY_SOURCES = [
+    "manual",
+    "auto-capture",
+    "reflection",
+    "dreaming-engine",
+    "session-summary",
+    "legacy",
+];
+const DREAMING_SOURCE_ALIASES = {
+    daily: { sources: ["manual", "auto-capture", "legacy"] },
+    sessions: { sources: ["session-summary"] },
+    recall: { sources: ["manual", "auto-capture", "legacy"] },
+    logs: { sources: ["auto-capture"] },
+    memory: { sources: ["manual", "auto-capture", "legacy"] },
+    deep: { phases: ["deep"] },
+};
+const VALID_DREAMING_SOURCE_FILTERS = new Set([
+    ...Object.keys(DREAMING_SOURCE_ALIASES),
+    ...STORED_MEMORY_SOURCES,
+    ...MEMORY_CATEGORIES,
+    ...LEGACY_MEMORY_CATEGORIES,
+]);
 const STOP_WORDS = new Set([
     "about",
     "after",
@@ -46,7 +69,7 @@ export const DEFAULT_DREAMING_CONFIG = {
             limit: 10,
             minScore: 0.6,
             minRecallCount: 3,
-            minUniqueQueries: 3,
+            minUniqueQueries: 0,
             recencyHalfLifeDays: 14,
             maxAgeDays: 90,
         },
@@ -85,12 +108,21 @@ function asNumberInRange(value, min, max) {
         return undefined;
     return Math.min(max, Math.max(min, parsed));
 }
-function asStringArray(value) {
+function normalizeDreamingSources(value) {
     if (!Array.isArray(value))
         return undefined;
-    const values = value
-        .filter((item) => typeof item === "string" && item.trim().length > 0)
-        .map((item) => item.trim());
+    const values = [];
+    for (const item of value) {
+        if (typeof item !== "string" || item.trim().length === 0)
+            continue;
+        const normalized = item.trim().toLowerCase();
+        if (!VALID_DREAMING_SOURCE_FILTERS.has(normalized)) {
+            throw new Error(`Unsupported dreaming source filter "${item}". ` +
+                `Supported filters: ${[...VALID_DREAMING_SOURCE_FILTERS].sort().join(", ")}`);
+        }
+        if (!values.includes(normalized))
+            values.push(normalized);
+    }
     return values.length > 0 ? values : undefined;
 }
 function normalizeLight(raw) {
@@ -101,7 +133,7 @@ function normalizeLight(raw) {
         limit: asNonNegativeInt(cfg.limit) ?? DEFAULT_DREAMING_CONFIG.phases.light.limit,
         dedupeSimilarity: asNumberInRange(cfg.dedupeSimilarity, 0, 1) ??
             DEFAULT_DREAMING_CONFIG.phases.light.dedupeSimilarity,
-        sources: asStringArray(cfg.sources),
+        sources: normalizeDreamingSources(cfg.sources),
     };
 }
 function normalizeDeep(raw) {
@@ -117,7 +149,7 @@ function normalizeDeep(raw) {
         recencyHalfLifeDays: asPositiveInt(cfg.recencyHalfLifeDays) ??
             DEFAULT_DREAMING_CONFIG.phases.deep.recencyHalfLifeDays,
         maxAgeDays: asPositiveInt(cfg.maxAgeDays) ?? DEFAULT_DREAMING_CONFIG.phases.deep.maxAgeDays,
-        sources: asStringArray(cfg.sources),
+        sources: normalizeDreamingSources(cfg.sources),
     };
 }
 function normalizeRem(raw) {
@@ -128,17 +160,21 @@ function normalizeRem(raw) {
         limit: asNonNegativeInt(cfg.limit) ?? DEFAULT_DREAMING_CONFIG.phases.rem.limit,
         minPatternStrength: asNumberInRange(cfg.minPatternStrength, 0, 1) ??
             DEFAULT_DREAMING_CONFIG.phases.rem.minPatternStrength,
-        sources: asStringArray(cfg.sources),
+        sources: normalizeDreamingSources(cfg.sources),
     };
 }
 export function normalizeDreamingConfig(value) {
     const raw = isRecord(value) ? value : {};
     const phases = isRecord(raw.phases) ? raw.phases : {};
+    const frequency = typeof raw.frequency === "string" && raw.frequency.trim()
+        ? raw.frequency.trim()
+        : DEFAULT_DREAMING_CONFIG.frequency;
+    if (raw.enabled === true && !parseDailyCron(frequency)) {
+        throw new Error(`Unsupported dreaming.frequency "${frequency}". Use "@daily" or a daily cron expression like "0 3 * * *".`);
+    }
     return {
         enabled: raw.enabled === true,
-        frequency: typeof raw.frequency === "string" && raw.frequency.trim()
-            ? raw.frequency.trim()
-            : DEFAULT_DREAMING_CONFIG.frequency,
+        frequency,
         timezone: typeof raw.timezone === "string" && raw.timezone.trim() ? raw.timezone.trim() : undefined,
         verboseLogging: raw.verboseLogging === true,
         model: typeof raw.model === "string" && raw.model.trim() ? raw.model.trim() : undefined,
@@ -307,7 +343,21 @@ function entryMatchesSources(entry, sources) {
     if (!sources || sources.length === 0)
         return true;
     const metadata = parseSmartMetadata(entry.metadata, entry);
-    return sources.includes(metadata.source) || sources.includes(entry.category);
+    const memoryCategory = typeof metadata.memory_category === "string" ? metadata.memory_category : "";
+    const memoryLayer = typeof metadata.memory_layer === "string" ? metadata.memory_layer : "";
+    const dreamingPhase = typeof metadata.dreaming_phase === "string" ? metadata.dreaming_phase : "";
+    return sources.some((source) => {
+        const alias = DREAMING_SOURCE_ALIASES[source];
+        if (alias) {
+            return Boolean(alias.sources?.includes(metadata.source) ||
+                alias.phases?.includes(dreamingPhase));
+        }
+        return source === metadata.source ||
+            source === entry.category ||
+            source === memoryCategory ||
+            source === memoryLayer ||
+            source === dreamingPhase;
+    });
 }
 function scoreDeepCandidate(entry, config, now) {
     const metadata = parseSmartMetadata(entry.metadata, entry);
@@ -363,6 +413,7 @@ function phaseEnabled(config) {
 export function createDreamingEngine(deps) {
     const config = normalizeDreamingConfig(deps.config);
     const now = deps.now ?? (() => Date.now());
+    let stopped = false;
     const debug = (message) => {
         if (config.verboseLogging)
             deps.logger?.debug?.(message);
@@ -409,12 +460,14 @@ export function createDreamingEngine(deps) {
         if (!deps.store.fetchForCompaction)
             return [];
         const cutoff = now() - (config.lookbackDays * MS_PER_DAY);
-        const entries = await deps.store.fetchForCompaction(now() + 1, [scope], Math.max(config.limit * 2, config.limit));
+        const fetchLimit = Math.max(DEFAULT_PAGE_SIZE, config.limit * 10, config.limit);
+        const entries = await deps.store.fetchForCompaction(now() + 1, [scope], fetchLimit);
         return entries
             .filter((entry) => entry.timestamp >= cutoff)
             .filter((entry) => entryMatchesSources(entry, config.sources))
             .filter((entry) => isActiveUserMemory(entry, now()))
             .filter((entry) => Array.isArray(entry.vector) && entry.vector.length > 0)
+            .sort((a, b) => b.timestamp - a.timestamp)
             .slice(0, config.limit);
     }
     async function runLight(scope) {
@@ -505,18 +558,19 @@ export function createDreamingEngine(deps) {
             const score = scoreDeepCandidate(entry, phase, now());
             if (score < phase.minScore)
                 continue;
-            const patched = await deps.store.patchMetadata(entry.id, {
+            const promotedMetadata = buildSmartMetadata(entry, {
                 tier: "core",
                 memory_layer: "durable",
                 dreaming_phase: "deep",
                 dreaming_promoted_at: now(),
                 dreaming_deep_score: Number(score.toFixed(4)),
-            }, [scope]);
-            if (!patched)
-                continue;
-            await deps.store.update(entry.id, {
+            });
+            const updated = await deps.store.update(entry.id, {
                 importance: Math.max(entry.importance, Math.min(0.98, Math.max(entry.importance, score) + 0.05)),
+                metadata: stringifySmartMetadata(promotedMetadata),
             }, [scope]);
+            if (!updated)
+                continue;
             promoted += 1;
         }
         return {
@@ -589,7 +643,9 @@ export function createDreamingEngine(deps) {
     }
     return {
         config,
-        stop() { },
+        stop() {
+            stopped = true;
+        },
         async runSweep(explicitScopes) {
             const startedAt = now();
             const result = {
@@ -604,7 +660,7 @@ export function createDreamingEngine(deps) {
                 },
                 errors: [],
             };
-            if (!config.enabled) {
+            if (!config.enabled || stopped) {
                 result.finishedAt = now();
                 return result;
             }
@@ -612,7 +668,11 @@ export function createDreamingEngine(deps) {
             result.scopes = scopes;
             debug(`memory-lancedb-pro: dreaming sweep started for scopes: ${scopes.join(", ")}`);
             for (const scope of scopes) {
+                if (stopped)
+                    break;
                 for (const phase of ["light", "deep", "rem"]) {
+                    if (stopped)
+                        break;
                     try {
                         const phaseResult = await runPhase(phase, scope);
                         result.phases[phase].scanned += phaseResult.scanned;

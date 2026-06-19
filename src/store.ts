@@ -2467,7 +2467,6 @@ export class MemoryStore {
       .toArray();
 
     return results
-      .slice(0, limit)
       .map(
         (row): MemoryEntry => ({
           id: row.id as string,
@@ -2479,6 +2478,8 @@ export class MemoryStore {
           timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),
-      );
+      )
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, limit);
   }
 }

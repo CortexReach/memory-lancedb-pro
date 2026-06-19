@@ -4003,6 +4003,7 @@ const memoryLanceDBProPlugin = {
         const storageAutoCleanup = config.storageMaintenance?.autoCleanup;
         let dreamingTimer = null;
         let dreamingRunning = false;
+        let dreamingStopped = false;
         async function runBackup() {
             try {
                 // resolvedDbPath is already absolute (produced by api.resolvePath at
@@ -4079,6 +4080,8 @@ const memoryLanceDBProPlugin = {
         async function runDreamingSweep() {
             if (config.dreaming?.enabled !== true)
                 return;
+            if (dreamingStopped)
+                return;
             if (dreamingRunning) {
                 api.logger.debug("memory-lancedb-pro: dreaming sweep skipped because a prior run is still active");
                 return;
@@ -4103,6 +4106,8 @@ const memoryLanceDBProPlugin = {
         function scheduleNextDreamingSweep() {
             if (config.dreaming?.enabled !== true)
                 return;
+            if (dreamingStopped)
+                return;
             if (dreamingTimer)
                 clearTimeout(dreamingTimer);
             const delayMs = computeNextDreamingDelayMs(config.dreaming.frequency, config.dreaming.timezone);
@@ -4110,7 +4115,11 @@ const memoryLanceDBProPlugin = {
                 `(frequency="${config.dreaming.frequency}", nextRunInMs=${delayMs})`);
             dreamingTimer = setTimeout(async () => {
                 dreamingTimer = null;
+                if (dreamingStopped)
+                    return;
                 await runDreamingSweep();
+                if (dreamingStopped)
+                    return;
                 scheduleNextDreamingSweep();
             }, delayMs);
         }
@@ -4120,6 +4129,7 @@ const memoryLanceDBProPlugin = {
         api.registerService({
             id: "memory-lancedb-pro",
             start: async () => {
+                dreamingStopped = false;
                 // IMPORTANT: Do not block gateway startup on external network calls.
                 // If embedding/retrieval tests hang (bad network / slow provider), the gateway
                 // may never bind its HTTP port, causing restart timeouts.
@@ -4226,6 +4236,7 @@ const memoryLanceDBProPlugin = {
                 scheduleNextDreamingSweep();
             },
             stop: async () => {
+                dreamingStopped = true;
                 if (backupTimer) {
                     clearInterval(backupTimer);
                     backupTimer = null;
