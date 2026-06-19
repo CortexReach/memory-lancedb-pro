@@ -33,10 +33,15 @@ across those processes because they are not writing to the same LanceDB store.
 
 ## Redis Status
 
-Redis is not required for single-gateway or same-filesystem deployments, and the
-plugin does not enable a Redis lock automatically. If you enable Redis locking
-with `locking.redis.enabled` or a Redis URL, every LanceDB write and index
-maintenance mutation uses the Redis lock domain. Redis connection or lock-client
+Redis is not required for single-gateway or same-filesystem deployments. The
+plugin enables Redis locking when `locking.redis.enabled` is true, when
+`redisUrl`/`locking.redis.url` is set, or when `MEMORY_LANCEDB_REDIS_URL` is
+present in that process environment. Every writer that shares a LanceDB store
+must use the same Redis lock configuration; mixing Redis-locked writers with
+writers that only use the local file lock creates separate lock domains.
+
+When Redis locking is enabled, every LanceDB write and index-maintenance
+mutation uses the Redis lock domain. Redis connection or lock-client
 availability failures fail writes closed instead of falling back to a local file
 lock.
 

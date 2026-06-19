@@ -29,7 +29,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchesMemoryCategoryFilter, resolveCategoryFilterCandidates } from "./memory-categories.js";
 import {
+  RedisLockAcquisitionError,
+  RedisLockLeaseIntegrityError,
   RedisLockManager,
+  RedisLockUnavailableError,
   type RedisLockConfig,
 } from "./redis-lock.js";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
@@ -833,76 +836,7 @@ export class MemoryStore {
       );
     }
 
-    let table: LanceDB.Table;
-
-    // Idempotent table init: try openTable first, create only if missing,
-    // and handle the race where tableNames() misses an existing table but
-    // createTable then sees it (LanceDB eventual consistency).
-    try {
-      table = await db.openTable(TABLE_NAME);
-
-      // Migrate legacy tables: add missing columns for backward compatibility
-      try {
-        const schema = await table.schema();
-        const fieldNames = new Set(schema.fields.map((f: { name: string }) => f.name));
-
-        const missingColumns: Array<{ name: string; valueSql: string }> = [];
-        if (!fieldNames.has("scope")) {
-          missingColumns.push({ name: "scope", valueSql: "'global'" });
-        }
-        if (!fieldNames.has("timestamp")) {
-          missingColumns.push({ name: "timestamp", valueSql: "CAST(0 AS DOUBLE)" });
-        }
-        if (!fieldNames.has("metadata")) {
-          missingColumns.push({ name: "metadata", valueSql: "'{}'" });
-        }
-
-        if (missingColumns.length > 0) {
-          console.warn(
-            `memory-lancedb-pro: migrating legacy table — adding columns: ${missingColumns.map((c) => c.name).join(", ")}`,
-          );
-          await table.addColumns(missingColumns);
-          console.log(
-            `memory-lancedb-pro: migration complete — ${missingColumns.length} column(s) added`,
-          );
-        }
-      } catch (err) {
-        const msg = String(err);
-        if (msg.includes("already exists")) {
-          // Concurrent initialization race — another process already added the columns
-          console.log("memory-lancedb-pro: migration columns already exist (concurrent init)");
-        } else {
-          console.warn("memory-lancedb-pro: could not check/migrate table schema:", err);
-        }
-      }
-    } catch (_openErr) {
-      // Table doesn't exist yet — create it
-      const schemaEntry: MemoryEntry = {
-        id: "__schema__",
-        text: "",
-        vector: Array.from({ length: this.config.vectorDim }).fill(
-          0,
-        ) as number[],
-        category: "other",
-        scope: "global",
-        importance: 0,
-        timestamp: 0,
-        metadata: "{}",
-      };
-
-      try {
-        table = await db.createTable(TABLE_NAME, [schemaEntry]);
-        await table.delete('id = "__schema__"');
-      } catch (createErr) {
-        // Race: another caller (or eventual consistency) created the table
-        // between our failed openTable and this createTable — just open it.
-        if (String(createErr).includes("already exists")) {
-          table = await db.openTable(TABLE_NAME);
-        } else {
-          throw createErr;
-        }
-      }
-    }
+    const table = await this.openOrCreateMemoryTable(db);
 
     await this.backfillLegacySecondTimestamps(table);
 
@@ -921,7 +855,7 @@ export class MemoryStore {
 
     // Create FTS index for BM25 search (graceful fallback if unavailable)
     try {
-      await this.createFtsIndex(table);
+      await this.createFtsIndexWithWriteLock(table);
       this.ftsIndexCreated = true;
       this._lastFtsError = null;
     } catch (err) {
@@ -939,6 +873,117 @@ export class MemoryStore {
     // Fold any unindexed backlog accumulated while no maintenance ran
     // (best-effort, runs in the background, never blocks initialization).
     void this.scheduleStartupIndexCatchUp();
+  }
+
+  private isRedisLockCoordinationError(err: unknown): boolean {
+    return err instanceof RedisLockUnavailableError ||
+      err instanceof RedisLockAcquisitionError ||
+      err instanceof RedisLockLeaseIntegrityError;
+  }
+
+  private getMissingLegacyColumns(fieldNames: Set<string>): Array<{ name: string; valueSql: string }> {
+    const missingColumns: Array<{ name: string; valueSql: string }> = [];
+    if (!fieldNames.has("scope")) {
+      missingColumns.push({ name: "scope", valueSql: "'global'" });
+    }
+    if (!fieldNames.has("timestamp")) {
+      missingColumns.push({ name: "timestamp", valueSql: "CAST(0 AS DOUBLE)" });
+    }
+    if (!fieldNames.has("metadata")) {
+      missingColumns.push({ name: "metadata", valueSql: "'{}'" });
+    }
+    return missingColumns;
+  }
+
+  private async readMissingLegacyColumns(table: LanceDB.Table): Promise<Array<{ name: string; valueSql: string }>> {
+    const schema = await table.schema();
+    const fieldNames = new Set(schema.fields.map((f: { name: string }) => f.name));
+    return this.getMissingLegacyColumns(fieldNames);
+  }
+
+  private async migrateLegacyTableColumns(table: LanceDB.Table, alreadyLocked = false): Promise<void> {
+    try {
+      const missingColumns = await this.readMissingLegacyColumns(table);
+      if (missingColumns.length === 0) return;
+
+      const applyMigration = async () => {
+        const currentMissingColumns = await this.readMissingLegacyColumns(table);
+        if (currentMissingColumns.length === 0) return;
+
+        console.warn(
+          `memory-lancedb-pro: migrating legacy table — adding columns: ${currentMissingColumns.map((c) => c.name).join(", ")}`,
+        );
+        await table.addColumns(currentMissingColumns);
+        console.log(
+          `memory-lancedb-pro: migration complete — ${currentMissingColumns.length} column(s) added`,
+        );
+      };
+
+      if (alreadyLocked) {
+        await applyMigration();
+      } else {
+        await this.runWithWriteLock(applyMigration);
+      }
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes("already exists")) {
+        // Concurrent initialization race — another process already added the columns
+        console.log("memory-lancedb-pro: migration columns already exist (concurrent init)");
+      } else if (this.isRedisLockCoordinationError(err)) {
+        throw err;
+      } else {
+        console.warn("memory-lancedb-pro: could not check/migrate table schema:", err);
+      }
+    }
+  }
+
+  private async openOrCreateMemoryTable(db: LanceDB.Connection): Promise<LanceDB.Table> {
+    // Idempotent table init: try openTable first, create only if missing,
+    // and handle the race where tableNames() misses an existing table but
+    // createTable then sees it (LanceDB eventual consistency).
+    let table: LanceDB.Table;
+    try {
+      table = await db.openTable(TABLE_NAME);
+    } catch (_openErr) {
+      return this.runWithWriteLock(async () => {
+        let lockedTable: LanceDB.Table;
+        try {
+          lockedTable = await db.openTable(TABLE_NAME);
+        } catch {
+          // Table doesn't exist yet — create it
+          const schemaEntry: MemoryEntry = {
+            id: "__schema__",
+            text: "",
+            vector: Array.from({ length: this.config.vectorDim }).fill(
+              0,
+            ) as number[],
+            category: "other",
+            scope: "global",
+            importance: 0,
+            timestamp: 0,
+            metadata: "{}",
+          };
+
+          try {
+            lockedTable = await db.createTable(TABLE_NAME, [schemaEntry]);
+            await lockedTable.delete('id = "__schema__"');
+          } catch (createErr) {
+            // Race: another caller (or eventual consistency) created the table
+            // between our failed openTable and this createTable — just open it.
+            if (String(createErr).includes("already exists")) {
+              lockedTable = await db.openTable(TABLE_NAME);
+            } else {
+              throw createErr;
+            }
+          }
+        }
+        await this.migrateLegacyTableColumns(lockedTable, true);
+        return lockedTable;
+      });
+    }
+
+    await this.migrateLegacyTableColumns(table);
+    return table;
   }
 
   private async backfillLegacySecondTimestamps(table: LanceDB.Table): Promise<void> {
@@ -1069,6 +1114,10 @@ export class MemoryStore {
         `FTS index creation failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  private async createFtsIndexWithWriteLock(table: LanceDB.Table): Promise<void> {
+    await this.runWithWriteLock(() => this.createFtsIndex(table));
   }
 
   async store(
@@ -2452,19 +2501,21 @@ export class MemoryStore {
   async rebuildFtsIndex(): Promise<{ success: boolean; error?: string }> {
     await this.ensureInitialized();
     try {
-      // Drop existing FTS index if any
-      const indices = await this.table!.listIndices();
-      for (const idx of indices) {
-        if (idx.indexType === "FTS" || idx.columns?.includes("text")) {
-          try {
-            await this.table!.dropIndex((idx as any).name || "text");
-          } catch (err) {
-            console.warn(`memory-lancedb-pro: dropIndex(${(idx as any).name || "text"}) failed:`, err);
+      await this.runWithWriteLock(async () => {
+        // Drop existing FTS index if any
+        const indices = await this.table!.listIndices();
+        for (const idx of indices) {
+          if (idx.indexType === "FTS" || idx.columns?.includes("text")) {
+            try {
+              await this.table!.dropIndex((idx as any).name || "text");
+            } catch (err) {
+              console.warn(`memory-lancedb-pro: dropIndex(${(idx as any).name || "text"}) failed:`, err);
+            }
           }
         }
-      }
-      // Recreate
-      await this.createFtsIndex(this.table!);
+        // Recreate
+        await this.createFtsIndex(this.table!);
+      });
       this.ftsIndexCreated = true;
       this._lastFtsError = null;
       return { success: true };

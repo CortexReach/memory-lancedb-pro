@@ -523,6 +523,27 @@ describe("RedisLockManager", () => {
     assert.equal(result, 42);
     assert.match(warnings.join("\n"), /Redis lock release failed/);
   });
+
+  it("reports lease integrity loss when final release no longer owns the token", async () => {
+    const manager = new RedisLockManager({
+      url: "redis://localhost:6379",
+      ttlMs: 5_000,
+      acquireTimeoutMs: 20,
+      retryDelayMs: 1,
+    }, {
+      async set() {
+        return "OK";
+      },
+      async eval() {
+        return 0;
+      },
+    });
+
+    await assert.rejects(
+      () => manager.withLock("/tmp/db", async () => 42),
+      RedisLockLeaseIntegrityError,
+    );
+  });
 });
 
 describe("MemoryStore Redis fail-closed locking", () => {
@@ -703,6 +724,61 @@ describe("MemoryStore Redis fail-closed locking", () => {
     assert.deepEqual(redisEvents, ["redis-lock", 0]);
     assert.equal(fileLocks, 0);
   });
+
+  it("rebuilds the FTS index inside the Redis write-lock domain", async () => {
+    const dbPath = tempDbPath();
+    let fileLocks = 0;
+    const events = [];
+    __setLockfileModuleForTests({
+      lock: async () => {
+        fileLocks += 1;
+        return async () => {};
+      },
+    });
+
+    let indices = [{ indexType: "FTS", columns: ["text"], name: "text_idx" }];
+    const store = new MemoryStore({
+      dbPath,
+      vectorDim: 3,
+      redisLock: { enabled: true, url: "redis://localhost:6379" },
+    });
+    store.table = {
+      listIndices: async () => {
+        events.push("list");
+        return indices;
+      },
+      dropIndex: async (name) => {
+        events.push(`drop:${name}`);
+        indices = [];
+      },
+      createIndex: async (column) => {
+        events.push(`create:${column}`);
+        indices = [{ indexType: "FTS", columns: ["text"], name: "text_idx" }];
+      },
+    };
+    store.redisLock = {
+      withLock: async (_resource, fn) => {
+        events.push("redis-lock:start");
+        const result = await fn();
+        events.push("redis-lock:end");
+        return result;
+      },
+      close: async () => {},
+    };
+
+    const result = await store.rebuildFtsIndex();
+
+    assert.deepEqual(result, { success: true });
+    assert.deepEqual(events, [
+      "redis-lock:start",
+      "list",
+      "drop:text_idx",
+      "list",
+      "create:text",
+      "redis-lock:end",
+    ]);
+    assert.equal(fileLocks, 0);
+  });
 });
 
 describe("Redis lock configuration", () => {
@@ -744,6 +820,18 @@ describe("Redis lock configuration", () => {
     assert.equal(parsed.redisUrl, "redis://localhost:6379/2");
     assert.equal(parsed.locking.redis.enabled, true);
     assert.equal(parsed.locking.redis.url, "redis://localhost:6379/2");
+  });
+
+  it("enables Redis locking from MEMORY_LANCEDB_REDIS_URL", () => {
+    process.env.MEMORY_LANCEDB_REDIS_URL = "redis://localhost:6379/9";
+
+    const parsed = parsePluginConfig({
+      embedding: { apiKey: "test-key" },
+    });
+
+    assert.equal(parsed.redisUrl, undefined);
+    assert.equal(parsed.locking.redis.enabled, true);
+    assert.equal(parsed.locking.redis.url, "redis://localhost:6379/9");
   });
 
   it("prefers nested Redis URL before resolving legacy redisUrl", () => {
@@ -805,6 +893,7 @@ describe("Redis lock configuration", () => {
     assert.equal(manifest.configSchema.properties.locking.properties.redis.properties.ttlMs.default, 60000);
     assert.ok(Object.prototype.hasOwnProperty.call(manifest.uiHints, "locking.redis.enabled"));
     assert.equal(manifest.uiHints["locking.redis.url"].sensitive, true);
-    assert.ok(pkg.dependencies.ioredis, "package.json should declare ioredis");
+    assert.equal(pkg.dependencies.ioredis, undefined, "ioredis should not be a hard dependency");
+    assert.ok(pkg.optionalDependencies.ioredis, "package.json should declare ioredis as optional");
   });
 });

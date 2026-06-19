@@ -120,9 +120,9 @@ export class RedisLockManager {
         }, renewIntervalMs);
         if (typeof renewTimer.unref === "function")
             renewTimer.unref();
+        let callbackError;
         try {
             let result;
-            let callbackError;
             try {
                 result = await fn();
             }
@@ -143,9 +143,15 @@ export class RedisLockManager {
         finally {
             clearInterval(renewTimer);
             try {
-                await client.eval(RELEASE_SCRIPT, 1, key, token);
+                const releaseResult = await client.eval(RELEASE_SCRIPT, 1, key, token);
+                if (releaseResult !== 1) {
+                    throwPostWriteLeaseError(new RedisLockLeaseLostError(`Redis lock ${key} was no longer owned by this writer at release`), callbackError);
+                }
             }
             catch (err) {
+                if (err instanceof RedisLockLeaseIntegrityError) {
+                    throw err;
+                }
                 this.config.onWarning?.(`memory-lancedb-pro: Redis lock release failed for ${key}; lock will expire by TTL: ${String(err)}`);
             }
         }
