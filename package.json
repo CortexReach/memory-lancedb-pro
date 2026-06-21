@@ -40,7 +40,8 @@
     "test:llm-clients-and-auth": "node scripts/run-ci-tests.mjs --group llm-clients-and-auth",
     "test:packaging-and-workflow": "node scripts/verify-ci-test-manifest.mjs && node scripts/run-ci-tests.mjs --group packaging-and-workflow",
     "build": "tsc -p tsconfig.json",
-    "prepack": "npm run build && node scripts/verify-package-runtime.mjs",
+    "verify-package-runtime": "npm run build && node scripts/verify-package-runtime.mjs",
+    "prepack": "npm run verify-package-runtime",
     "bench": "jiti benchmark/run.ts",
     "bench:locomo": "jiti benchmark/run.ts --benchmark locomo",
     "bench:longmemeval": "jiti benchmark/run.ts --benchmark longmemeval",
@@ -65,7 +66,8 @@
     "@lancedb/lancedb-darwin-x64": "^0.26.2",
     "@lancedb/lancedb-linux-arm64-gnu": "^0.26.2",
     "@lancedb/lancedb-linux-x64-gnu": "^0.26.2",
-    "@lancedb/lancedb-win32-x64-msvc": "^0.26.2"
+    "@lancedb/lancedb-win32-x64-msvc": "^0.26.2",
+    "ioredis": "^5.11.1"
   },
   "devDependencies": {
     "commander": "^14.0.0",

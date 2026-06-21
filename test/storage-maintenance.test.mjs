@@ -73,6 +73,34 @@ describe("LanceDB storage maintenance", () => {
     assert.equal(result.cleanupOlderThan, optimizeOptions.cleanupOlderThan.toISOString());
   });
 
+  it("uses the Redis write lock domain when Redis locking is enabled", async () => {
+    let fileLocks = 0;
+    let redisLocks = 0;
+    __setLockfileModuleForTests({
+      lock: async () => {
+        fileLocks += 1;
+        return async () => {};
+      },
+    });
+
+    const store = makeStoreWithMockTable({
+      optimize: async () => ({ removedFiles: 1 }),
+    });
+    store.redisLock = {
+      withLock: async (_resource, fn) => {
+        redisLocks += 1;
+        return fn();
+      },
+      close: async () => {},
+    };
+
+    const result = await store.runStorageMaintenance(7);
+
+    assert.equal(result.retentionDays, 7);
+    assert.equal(redisLocks, 1);
+    assert.equal(fileLocks, 0);
+  });
+
   it("clamps unsafe retention values before cleanup", async () => {
     __setLockfileModuleForTests({
       lock: async () => async () => {},

@@ -28,6 +28,13 @@ import {
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchesMemoryCategoryFilter, resolveCategoryFilterCandidates } from "./memory-categories.js";
+import {
+  RedisLockAcquisitionError,
+  RedisLockLeaseIntegrityError,
+  RedisLockManager,
+  RedisLockUnavailableError,
+  type RedisLockConfig,
+} from "./redis-lock.js";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 
 // ============================================================================
@@ -55,7 +62,9 @@ export interface StoreConfig {
   vectorDim: number;
   /** Disable LanceDB native vector search and rank scanned rows with JS cosine. */
   disableNativeCosine?: boolean;
+  redisLock?: RedisLockConfig;
   onStoragePathWarning?: (message: string) => void;
+  onLockWarning?: (message: string) => void;
 }
 
 export interface StorageMaintenanceResult {
@@ -80,6 +89,16 @@ export interface MemoryBulkUpdateResult {
   id: string;
   entry: MemoryEntry | null;
   error?: string;
+}
+
+export interface ImportEntryOptions {
+  /**
+   * Treat the entry as known-legacy data (v1.x 1-5 integer importance scale)
+   * and apply `normalizeLegacyImportance` once at this explicit legacy-
+   * provenance boundary. Defaults to false — generic v2+ imports use
+   * `clampImportance` to preserve 0, 1, and decimal values.
+   */
+  legacy?: boolean;
 }
 
 // ============================================================================
@@ -173,6 +192,57 @@ export function normalizeMemoryTimestamp(value: unknown, fallback = Date.now()):
 
   const timestamp = Math.floor(raw);
   return timestamp < LEGACY_SECONDS_TIMESTAMP_MAX ? timestamp * 1000 : timestamp;
+}
+
+/**
+ * Normalize legacy v1.x importance scale (1-5 integers) to v2+ scale (0~1 floats)
+ *
+ * Mapping:
+ *   1 → 0.20   2 → 0.40   3 → 0.60   4 → 0.80   5 → 0.95
+ *
+ * Values already in 0~1 range pass through unchanged.
+ * Use ONLY where the data is known to be legacy (migrate / importEntry / backfill).
+ * For generic v2+ read paths, use clampImportance instead to avoid double-normalization
+ * corruption (e.g. 99 -> 1.0 -> 0.20).
+ *
+ * NOTE: 1.0 is indistinguishable from legacy integer 1 in JS (Number.isInteger(1.0) === true),
+ * so legacy-v1 callers must be aware that legitimate 1.0 will map to 0.20. This trade-off is
+ * only safe in legacy import contexts; v2+ data flows through clampImportance.
+ */
+export function normalizeLegacyImportance(value: number): number {
+  // Guard against NaN / Infinity / -Infinity from corrupted data
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0.7;
+
+  // Legacy v1.x integer scale (1-5) → v2+ 0~1
+  if (Number.isInteger(value) && value >= 1 && value <= 5) {
+    return [null, 0.20, 0.40, 0.60, 0.80, 0.95][value];
+  }
+
+  // Non-legacy float (incl. v2+ 0~1) — pass through with clamp as defensive bound
+  return Math.max(0.0, Math.min(1.0, value));
+}
+
+/**
+ * Clamp a value to the v2+ 0~1 range, preserving legitimate v2+ values like 1.0.
+ * Use on ALL read paths (search, list, getById, update, etc.) to avoid
+ * double-normalization corruption.
+ *
+ * Idempotent: clampImportance(clampImportance(x)) === clampImportance(x).
+ */
+export function clampImportance(value: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0.7;
+  return Math.max(0.0, Math.min(1.0, value));
+}
+
+/**
+ * @deprecated Use normalizeLegacyImportance (for legacy data) or clampImportance
+ * (for v2+ data) based on data provenance. This wrapper is kept for backward
+ * compatibility and routes to clampImportance (v2+ 0~1 semantics). The previous
+ * behavior routed to legacy normalization, which surprised callers expecting
+ * generic v2 clamp semantics (see PR #828 review).
+ */
+export function normalizeImportance(value: number): number {
+  return clampImportance(value);
 }
 
 function normalizePredicateTimestamp(value: unknown): number | null {
@@ -544,6 +614,7 @@ export class MemoryStore {
 
   private readonly config: StoreConfig;
   private readonly disableNativeCosine: boolean;
+  private redisLock: RedisLockManager | null = null;
 
   constructor(config: StoreConfig) {
     const envDisablesNativeCosine = parseBooleanEnvFlag(process.env.MEMORY_LANCEDB_DISABLE_NATIVE_COSINE);
@@ -552,6 +623,12 @@ export class MemoryStore {
       dbPath: normalizeStoragePath(config.dbPath),
     };
     this.disableNativeCosine = config.disableNativeCosine === true || envDisablesNativeCosine;
+    if (config.redisLock?.enabled === true) {
+      this.redisLock = new RedisLockManager({
+        ...config.redisLock,
+        onWarning: config.onLockWarning,
+      });
+    }
   }
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -671,6 +748,25 @@ export class MemoryStore {
     }
   }
 
+  private async runWithWriteLock<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.redisLock) {
+      return this.runWithFileLock(fn);
+    }
+
+    return this.redisLock.withLock(this.config.dbPath, fn);
+  }
+
+  private async closeLockResources(): Promise<void> {
+    if (!this.redisLock) return;
+    try {
+      await this.redisLock.close();
+    } catch (err) {
+      this.config.onLockWarning?.(
+        `memory-lancedb-pro: failed to close Redis lock client: ${String(err)}`,
+      );
+    }
+  }
+
   get dbPath(): string {
     return this.config.dbPath;
   }
@@ -685,7 +781,7 @@ export class MemoryStore {
     const safeRetentionDays = clampInt(retentionDays, 1, 3650);
     const cleanupOlderThan = new Date(Date.now() - safeRetentionDays * 24 * 60 * 60 * 1000);
 
-    return this.runWithFileLock(async () => {
+    return this.runWithWriteLock(async () => {
       if (!this.table || typeof this.table.optimize !== "function") {
         throw new Error("LanceDB table.optimize() is not available in this runtime");
       }
@@ -716,7 +812,7 @@ export class MemoryStore {
     const mods = this.dataModsSinceIndexFold;
     this.dataModsSinceIndexFold = 0;
     try {
-      await this.runWithFileLock(async () => {
+      await this.runWithWriteLock(async () => {
         await this.table!.optimize({ cleanupOlderThan: new Date(0) });
       });
       console.log(
@@ -801,76 +897,7 @@ export class MemoryStore {
       );
     }
 
-    let table: LanceDB.Table;
-
-    // Idempotent table init: try openTable first, create only if missing,
-    // and handle the race where tableNames() misses an existing table but
-    // createTable then sees it (LanceDB eventual consistency).
-    try {
-      table = await db.openTable(TABLE_NAME);
-
-      // Migrate legacy tables: add missing columns for backward compatibility
-      try {
-        const schema = await table.schema();
-        const fieldNames = new Set(schema.fields.map((f: { name: string }) => f.name));
-
-        const missingColumns: Array<{ name: string; valueSql: string }> = [];
-        if (!fieldNames.has("scope")) {
-          missingColumns.push({ name: "scope", valueSql: "'global'" });
-        }
-        if (!fieldNames.has("timestamp")) {
-          missingColumns.push({ name: "timestamp", valueSql: "CAST(0 AS DOUBLE)" });
-        }
-        if (!fieldNames.has("metadata")) {
-          missingColumns.push({ name: "metadata", valueSql: "'{}'" });
-        }
-
-        if (missingColumns.length > 0) {
-          console.warn(
-            `memory-lancedb-pro: migrating legacy table — adding columns: ${missingColumns.map((c) => c.name).join(", ")}`,
-          );
-          await table.addColumns(missingColumns);
-          console.log(
-            `memory-lancedb-pro: migration complete — ${missingColumns.length} column(s) added`,
-          );
-        }
-      } catch (err) {
-        const msg = String(err);
-        if (msg.includes("already exists")) {
-          // Concurrent initialization race — another process already added the columns
-          console.log("memory-lancedb-pro: migration columns already exist (concurrent init)");
-        } else {
-          console.warn("memory-lancedb-pro: could not check/migrate table schema:", err);
-        }
-      }
-    } catch (_openErr) {
-      // Table doesn't exist yet — create it
-      const schemaEntry: MemoryEntry = {
-        id: "__schema__",
-        text: "",
-        vector: Array.from({ length: this.config.vectorDim }).fill(
-          0,
-        ) as number[],
-        category: "other",
-        scope: "global",
-        importance: 0,
-        timestamp: 0,
-        metadata: "{}",
-      };
-
-      try {
-        table = await db.createTable(TABLE_NAME, [schemaEntry]);
-        await table.delete('id = "__schema__"');
-      } catch (createErr) {
-        // Race: another caller (or eventual consistency) created the table
-        // between our failed openTable and this createTable — just open it.
-        if (String(createErr).includes("already exists")) {
-          table = await db.openTable(TABLE_NAME);
-        } else {
-          throw createErr;
-        }
-      }
-    }
+    const table = await this.openOrCreateMemoryTable(db);
 
     await this.backfillLegacySecondTimestamps(table);
 
@@ -889,7 +916,7 @@ export class MemoryStore {
 
     // Create FTS index for BM25 search (graceful fallback if unavailable)
     try {
-      await this.createFtsIndex(table);
+      await this.createFtsIndexWithWriteLock(table);
       this.ftsIndexCreated = true;
       this._lastFtsError = null;
     } catch (err) {
@@ -909,11 +936,122 @@ export class MemoryStore {
     void this.scheduleStartupIndexCatchUp();
   }
 
+  private isRedisLockCoordinationError(err: unknown): boolean {
+    return err instanceof RedisLockUnavailableError ||
+      err instanceof RedisLockAcquisitionError ||
+      err instanceof RedisLockLeaseIntegrityError;
+  }
+
+  private getMissingLegacyColumns(fieldNames: Set<string>): Array<{ name: string; valueSql: string }> {
+    const missingColumns: Array<{ name: string; valueSql: string }> = [];
+    if (!fieldNames.has("scope")) {
+      missingColumns.push({ name: "scope", valueSql: "'global'" });
+    }
+    if (!fieldNames.has("timestamp")) {
+      missingColumns.push({ name: "timestamp", valueSql: "CAST(0 AS DOUBLE)" });
+    }
+    if (!fieldNames.has("metadata")) {
+      missingColumns.push({ name: "metadata", valueSql: "'{}'" });
+    }
+    return missingColumns;
+  }
+
+  private async readMissingLegacyColumns(table: LanceDB.Table): Promise<Array<{ name: string; valueSql: string }>> {
+    const schema = await table.schema();
+    const fieldNames = new Set(schema.fields.map((f: { name: string }) => f.name));
+    return this.getMissingLegacyColumns(fieldNames);
+  }
+
+  private async migrateLegacyTableColumns(table: LanceDB.Table, alreadyLocked = false): Promise<void> {
+    try {
+      const missingColumns = await this.readMissingLegacyColumns(table);
+      if (missingColumns.length === 0) return;
+
+      const applyMigration = async () => {
+        const currentMissingColumns = await this.readMissingLegacyColumns(table);
+        if (currentMissingColumns.length === 0) return;
+
+        console.warn(
+          `memory-lancedb-pro: migrating legacy table — adding columns: ${currentMissingColumns.map((c) => c.name).join(", ")}`,
+        );
+        await table.addColumns(currentMissingColumns);
+        console.log(
+          `memory-lancedb-pro: migration complete — ${currentMissingColumns.length} column(s) added`,
+        );
+      };
+
+      if (alreadyLocked) {
+        await applyMigration();
+      } else {
+        await this.runWithWriteLock(applyMigration);
+      }
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes("already exists")) {
+        // Concurrent initialization race — another process already added the columns
+        console.log("memory-lancedb-pro: migration columns already exist (concurrent init)");
+      } else if (this.isRedisLockCoordinationError(err)) {
+        throw err;
+      } else {
+        console.warn("memory-lancedb-pro: could not check/migrate table schema:", err);
+      }
+    }
+  }
+
+  private async openOrCreateMemoryTable(db: LanceDB.Connection): Promise<LanceDB.Table> {
+    // Idempotent table init: try openTable first, create only if missing,
+    // and handle the race where tableNames() misses an existing table but
+    // createTable then sees it (LanceDB eventual consistency).
+    let table: LanceDB.Table;
+    try {
+      table = await db.openTable(TABLE_NAME);
+    } catch (_openErr) {
+      return this.runWithWriteLock(async () => {
+        let lockedTable: LanceDB.Table;
+        try {
+          lockedTable = await db.openTable(TABLE_NAME);
+        } catch {
+          // Table doesn't exist yet — create it
+          const schemaEntry: MemoryEntry = {
+            id: "__schema__",
+            text: "",
+            vector: Array.from({ length: this.config.vectorDim }).fill(
+              0,
+            ) as number[],
+            category: "other",
+            scope: "global",
+            importance: 0,
+            timestamp: 0,
+            metadata: "{}",
+          };
+
+          try {
+            lockedTable = await db.createTable(TABLE_NAME, [schemaEntry]);
+            await lockedTable.delete('id = "__schema__"');
+          } catch (createErr) {
+            // Race: another caller (or eventual consistency) created the table
+            // between our failed openTable and this createTable — just open it.
+            if (String(createErr).includes("already exists")) {
+              lockedTable = await db.openTable(TABLE_NAME);
+            } else {
+              throw createErr;
+            }
+          }
+        }
+        await this.migrateLegacyTableColumns(lockedTable, true);
+        return lockedTable;
+      });
+    }
+
+    await this.migrateLegacyTableColumns(table);
+    return table;
+  }
+
   private async backfillLegacySecondTimestamps(table: LanceDB.Table): Promise<void> {
     try {
       let normalizedCount = 0;
 
-      await this.runWithFileLock(async () => {
+      await this.runWithWriteLock(async () => {
         const candidateRows = await table.query()
           .where(
             `(timestamp > 0 AND timestamp < ${LEGACY_SECONDS_TIMESTAMP_MAX}) OR ` +
@@ -1039,25 +1177,45 @@ export class MemoryStore {
     }
   }
 
+  private async createFtsIndexWithWriteLock(table: LanceDB.Table): Promise<void> {
+    await this.runWithWriteLock(() => this.createFtsIndex(table));
+  }
+
   async store(
     entry: Omit<MemoryEntry, "id" | "timestamp">,
   ): Promise<MemoryEntry> {
     // F1 fix: store() now routes through bulkStore() accumulator
     // for consistent lock contention behavior (no per-call file lock).
     // MR2 fix: when pendingBatch is empty, immediate flush avoids 100ms delay.
-    const results = await this.bulkStore([entry]);
+    // F3 fix (PR #828 follow-up): clamp importance at the write boundary so
+    // direct store() callers (e.g. the CLI JSON no-id import path) cannot
+    // persist out-of-range raw values like 4 or 99. clampImportance is
+    // idempotent and preserves legitimate v2+ 0~1 values, so wrapping here is
+    // safe for callers that already normalized upstream. importEntry() keeps
+    // its explicit legacy branch — this clamp is the generic v2+ boundary.
+    // Number() coerces the structurally-typed entry.importance to a real
+    // number so clampImportance's NaN/Infinity fallback can do its job.
+    const clampedEntry: Omit<MemoryEntry, "id" | "timestamp"> = {
+      ...entry,
+      importance: clampImportance(Number(entry.importance)),
+    };
+    const results = await this.bulkStore([clampedEntry]);
     return results[0];
   }
 
   async upsert(entry: MemoryEntry): Promise<MemoryEntry> {
     await this.ensureInitialized();
 
-    const result = await this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+    const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
       const safeId = escapeSqlLiteral(entry.id);
       await this.table!.delete(`id = '${safeId}'`).catch(() => undefined);
+      // F3 fix (PR #828 follow-up): clamp importance at the write boundary so
+      // upsert() callers cannot persist out-of-range raw values. clampImportance
+      // is idempotent and preserves legitimate v2+ 0~1 values.
       const normalizedEntry: MemoryEntry = {
         ...entry,
         metadata: entry.metadata || "{}",
+        importance: clampImportance(entry.importance),
       };
       await this.table!.add([normalizedEntry]);
       return normalizedEntry;
@@ -1113,11 +1271,20 @@ export class MemoryStore {
     }
 
     // 附加 id/timestamp
+    // F3 fix (PR #828 follow-up): clamp importance at the bulk write boundary
+    // so direct bulkStore() callers cannot persist out-of-range raw values like
+    // 4 or 99. clampImportance is idempotent, so callers that already
+    // normalized upstream are unaffected. store() applies the same clamp
+    // before calling bulkStore(); doing it again here covers direct bulkStore
+    // callers (e.g. CLI JSON import retry paths).
+    // Number() coerces the structurally-typed entry.importance to a real
+    // number so clampImportance's NaN/Infinity fallback can do its job.
     const fullEntries: MemoryEntry[] = validEntries.map((entry) => ({
       ...entry,
       id: randomUUID(),
       timestamp: Date.now(),
       metadata: entry.metadata || "{}",
+      importance: clampImportance(Number(entry.importance)),
     }) as MemoryEntry);
 
     // 【MR2 fix】當 pendingBatch 達到上限時，等待前一個 flush 完成後再加入
@@ -1221,7 +1388,7 @@ export class MemoryStore {
         const chunk = allEntries.slice(i, i + MemoryStore.MAX_BATCH_SIZE);
         const chunkIdx = Math.floor(i / MemoryStore.MAX_BATCH_SIZE);
         try {
-          await this.runWithFileLock(async () => {
+          await this.runWithWriteLock(async () => {
             await this.table!.add(chunk);
           });
           this.noteDataModification();
@@ -1377,6 +1544,7 @@ export class MemoryStore {
     // 1. destroy() 自己有錯 + lastBackgroundError 也有值 → composite error（兩個都保留）
     // 2. 只有 destroy() 自己有錯 → 只 throw destroy 的錯誤
     // 3. 只有 lastBackgroundError 有值 → throw timer 歷史錯誤
+    let destroyError: Error | null = null;
     if (result.hasError && result.lastError) {
       if (this.lastBackgroundError?.hasError) {
         // 情境 1：兩個錯誤都保留，包成 composite error
@@ -1388,18 +1556,24 @@ export class MemoryStore {
           `destroy flush failed (${result.lastError.message}); background flush also failed: ${timerError.message}`,
           { cause: result.lastError }
         );
-        throw compositeError;
+        destroyError = compositeError;
+      } else {
+        // 情境 2：只有 destroy 自己有錯
+        destroyError = result.lastError;
       }
-      // 情境 2：只有 destroy 自己有錯
-      throw result.lastError;
     }
 
     // 【F1 fix】檢查 lastBackgroundError（timers 錯誤的最後堡壘）
     // 情境 3：只有 lastBackgroundError 有值
-    if (this.lastBackgroundError?.hasError) {
+    if (!destroyError && this.lastBackgroundError?.hasError) {
       const err = this.lastBackgroundError.lastError ?? new Error("background flush failed");
       this.lastBackgroundError = null;
-      throw err;
+      destroyError = err;
+    }
+
+    await this.closeLockResources();
+    if (destroyError) {
+      throw destroyError;
     }
   }
 
@@ -1407,8 +1581,17 @@ export class MemoryStore {
    * Import a pre-built entry while preserving its id/timestamp.
    * Used for re-embedding / migration / A/B testing across embedding models.
    * Intentionally separate from `store()` to keep normal writes simple.
+   *
+   * Default behavior treats the entry as a generic v2+ import and applies
+   * idempotent `clampImportance` (preserves 0, 1, and decimal v2+ values).
+   * For known-legacy data sources (e.g. `migrate.ts` / explicit backfill),
+   * pass `{ legacy: true }` to apply the v1.x 1-5 integer → 0~1 mapping
+   * exactly once at this explicit legacy-provenance boundary.
    */
-  async importEntry(entry: MemoryEntry): Promise<MemoryEntry> {
+  async importEntry(
+    entry: MemoryEntry,
+    options: ImportEntryOptions = {},
+  ): Promise<MemoryEntry> {
     await this.ensureInitialized();
 
     if (!entry.id || typeof entry.id !== "string") {
@@ -1425,12 +1608,14 @@ export class MemoryStore {
     const full: MemoryEntry = {
       ...entry,
       scope: entry.scope || "global",
-      importance: Number.isFinite(entry.importance) ? entry.importance : 0.7,
+      importance: options.legacy
+        ? normalizeLegacyImportance(entry.importance)
+        : clampImportance(entry.importance),
       timestamp: normalizeMemoryTimestamp(entry.timestamp),
       metadata: entry.metadata || "{}",
     };
 
-    return this.runWithFileLock(async () => {
+    return this.runWithWriteLock(async () => {
       await this.table!.add([full]);
       return full;
     });
@@ -1479,7 +1664,7 @@ export class MemoryStore {
       vector: Array.from(row.vector as Iterable<number>),
       category: row.category as MemoryEntry["category"],
       scope: rowScope,
-      importance: Number(row.importance),
+      importance: clampImportance(Number(row.importance)),
       timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
       metadata: (row.metadata as string) || "{}",
     };
@@ -1520,7 +1705,7 @@ export class MemoryStore {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
-    return this.runWithFileLock(async () => {
+    return this.runWithWriteLock(async () => {
       await this.table!.delete(`id = '${safeId}'`);
       return true;
     });
@@ -1595,7 +1780,7 @@ export class MemoryStore {
         vector: rowVector,
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
+        importance: clampImportance(Number(row.importance)),
         timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
@@ -1677,7 +1862,7 @@ export class MemoryStore {
             vector: row.vector as number[],
             category: row.category as MemoryEntry["category"],
             scope: rowScope,
-            importance: Number(row.importance),
+            importance: clampImportance(Number(row.importance)),
             timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: (row.metadata as string) || "{}",
         };
@@ -1741,7 +1926,7 @@ export class MemoryStore {
         vector: row.vector as number[],
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
+        importance: clampImportance(Number(row.importance)),
         timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
@@ -1827,7 +2012,7 @@ export class MemoryStore {
       throw new Error(`Memory ${resolvedId} is outside accessible scopes`);
     }
 
-    return this.runWithFileLock(async () => {
+    return this.runWithWriteLock(async () => {
       await this.table!.delete(`id = '${resolvedId}'`);
       return true;
     });
@@ -1885,7 +2070,7 @@ export class MemoryStore {
           vector: [], // Don't include vectors in list results for performance
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
-          importance: Number(row.importance),
+          importance: clampImportance(Number(row.importance)),
           timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),
@@ -1991,7 +2176,7 @@ export class MemoryStore {
       }));
     }
 
-    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+    return this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
       const results = new Map<number, MemoryBulkUpdateResult>();
       const pending: Array<{ inputIndex: number; id: string; updates: MemoryUpdatePatch }> = [];
       const seenIds = new Set<string>();
@@ -2072,7 +2257,11 @@ export class MemoryStore {
             vector: candidate.updates.vector ?? original.vector,
             category: candidate.updates.category ?? original.category,
             scope: rowScope,
-            importance: candidate.updates.importance ?? original.importance,
+            // F3 fix (PR #828 follow-up): clamp importance on update path so
+            // bulkUpdateExact callers cannot persist out-of-range values.
+            importance: clampImportance(
+              candidate.updates.importance ?? original.importance,
+            ),
             timestamp: original.timestamp,
             metadata: candidate.updates.metadata ?? original.metadata,
           };
@@ -2180,7 +2369,7 @@ export class MemoryStore {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
-    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+    return this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
       // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
       // from older stores (for example "mem-md-..." or "data-pointer-...").
       const uuidRegex =
@@ -2245,7 +2434,7 @@ export class MemoryStore {
         vector: Array.from(row.vector as Iterable<number>),
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
+        importance: clampImportance(Number(row.importance)),
         timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
@@ -2257,7 +2446,11 @@ export class MemoryStore {
         vector: updates.vector ?? original.vector,
         category: updates.category ?? original.category,
         scope: rowScope,
-        importance: updates.importance ?? original.importance,
+        // F3 fix (PR #828 follow-up): clamp importance on update path so
+        // update() callers cannot persist out-of-range values.
+        importance: clampImportance(
+          updates.importance ?? original.importance,
+        ),
         timestamp: original.timestamp, // preserve original
         metadata: updates.metadata ?? original.metadata,
       };
@@ -2358,7 +2551,7 @@ export class MemoryStore {
 
     const whereClause = conditions.join(" AND ");
 
-    return this.runWithFileLock(async () => {
+    return this.runWithWriteLock(async () => {
       // Count first
       const countResults = await this.table!.query().where(whereClause).toArray();
       const deleteCount = countResults.length;
@@ -2413,19 +2606,21 @@ export class MemoryStore {
   async rebuildFtsIndex(): Promise<{ success: boolean; error?: string }> {
     await this.ensureInitialized();
     try {
-      // Drop existing FTS index if any
-      const indices = await this.table!.listIndices();
-      for (const idx of indices) {
-        if (idx.indexType === "FTS" || idx.columns?.includes("text")) {
-          try {
-            await this.table!.dropIndex((idx as any).name || "text");
-          } catch (err) {
-            console.warn(`memory-lancedb-pro: dropIndex(${(idx as any).name || "text"}) failed:`, err);
+      await this.runWithWriteLock(async () => {
+        // Drop existing FTS index if any
+        const indices = await this.table!.listIndices();
+        for (const idx of indices) {
+          if (idx.indexType === "FTS" || idx.columns?.includes("text")) {
+            try {
+              await this.table!.dropIndex((idx as any).name || "text");
+            } catch (err) {
+              console.warn(`memory-lancedb-pro: dropIndex(${(idx as any).name || "text"}) failed:`, err);
+            }
           }
         }
-      }
-      // Recreate
-      await this.createFtsIndex(this.table!);
+        // Recreate
+        await this.createFtsIndex(this.table!);
+      });
       this.ftsIndexCreated = true;
       this._lastFtsError = null;
       return { success: true };
@@ -2474,7 +2669,7 @@ export class MemoryStore {
           vector: Array.isArray(row.vector) ? (row.vector as number[]) : [],
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
-          importance: Number(row.importance),
+          importance: clampImportance(Number(row.importance)),
           timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),

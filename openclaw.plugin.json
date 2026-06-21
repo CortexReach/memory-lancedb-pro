@@ -221,6 +221,61 @@
           }
         }
       },
+      "redisUrl": {
+        "type": "string",
+        "description": "Optional shortcut for enabling Redis distributed write locking. Prefer locking.redis.url for new configs."
+      },
+      "locking": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Optional external locking configuration for high-concurrency or multi-instance deployments.",
+        "properties": {
+          "redis": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Use Redis SET NX PX write locks before mutating LanceDB. When enabled, Redis lock failures fail writes closed instead of falling back to local file locks."
+              },
+              "url": {
+                "type": "string",
+                "description": "Redis connection URL. May include ${ENV_VAR} placeholders."
+              },
+              "keyPrefix": {
+                "type": "string",
+                "default": "memory-lancedb-pro:write-lock",
+                "description": "Prefix for Redis lock keys."
+              },
+              "ttlMs": {
+                "type": "integer",
+                "minimum": 1000,
+                "default": 60000,
+                "description": "Redis lock TTL in milliseconds."
+              },
+              "acquireTimeoutMs": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 5000,
+                "description": "Maximum time to wait for the Redis lock before failing the write so the caller can retry later."
+              },
+              "retryDelayMs": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 50,
+                "description": "Initial Redis lock retry delay in milliseconds. Retries use exponential backoff."
+              },
+              "connectTimeoutMs": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 1000,
+                "description": "Redis connection timeout in milliseconds."
+              }
+            }
+          }
+        }
+      },
       "enableManagementTools": {
         "type": "boolean",
         "default": false,
@@ -1713,6 +1768,55 @@
       "label": "Storage Cleanup Initial Delay",
       "placeholder": "300000",
       "help": "Milliseconds to wait after startup before the first storage cleanup run.",
+      "advanced": true
+    },
+    "redisUrl": {
+      "label": "Redis Lock URL",
+      "placeholder": "redis://localhost:6379",
+      "help": "Shortcut for enabling Redis distributed write locking. Prefer locking.redis.url for new configs.",
+      "sensitive": true,
+      "advanced": true
+    },
+    "locking.redis.enabled": {
+      "label": "Redis Write Lock",
+      "help": "Use Redis distributed locks for LanceDB writes. When enabled, Redis lock failures fail writes closed instead of falling back to local file locks.",
+      "advanced": true
+    },
+    "locking.redis.url": {
+      "label": "Redis Lock URL",
+      "placeholder": "redis://localhost:6379",
+      "help": "Redis connection URL for distributed write locking. Supports ${ENV_VAR} placeholders.",
+      "sensitive": true,
+      "advanced": true
+    },
+    "locking.redis.keyPrefix": {
+      "label": "Redis Lock Key Prefix",
+      "placeholder": "memory-lancedb-pro:write-lock",
+      "help": "Prefix used for Redis lock keys. Change this when sharing Redis across unrelated deployments.",
+      "advanced": true
+    },
+    "locking.redis.ttlMs": {
+      "label": "Redis Lock TTL",
+      "placeholder": "60000",
+      "help": "Redis write lock TTL in milliseconds.",
+      "advanced": true
+    },
+    "locking.redis.acquireTimeoutMs": {
+      "label": "Redis Lock Acquire Timeout",
+      "placeholder": "5000",
+      "help": "Maximum time to wait for Redis lock acquisition before failing the write so the caller can retry later.",
+      "advanced": true
+    },
+    "locking.redis.retryDelayMs": {
+      "label": "Redis Lock Retry Delay",
+      "placeholder": "50",
+      "help": "Initial Redis lock retry delay in milliseconds; retries use exponential backoff.",
+      "advanced": true
+    },
+    "locking.redis.connectTimeoutMs": {
+      "label": "Redis Lock Connect Timeout",
+      "placeholder": "1000",
+      "help": "Redis connection timeout in milliseconds before Redis-locked writes fail closed.",
       "advanced": true
     },
     "smartExtraction": {

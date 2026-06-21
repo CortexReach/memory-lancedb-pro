@@ -144,6 +144,10 @@ function resolveFirstApiKey(api, apiKey) {
     }
     return resolveSecretCredential(api, key, "embedding.apiKey");
 }
+function resolveOptionalEnvString(value) {
+    const raw = asNonEmptyString(value);
+    return raw ? resolveEnvVars(raw) : undefined;
+}
 function resolveOptionalPathWithEnv(api, value, fallback) {
     const raw = typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback;
     return api.resolvePath(resolveEnvVars(raw));
@@ -1667,7 +1671,9 @@ function _initPluginState(api) {
         dbPath: resolvedDbPath,
         vectorDim,
         disableNativeCosine: config.retrieval?.disableNativeCosine === true,
+        redisLock: config.locking?.redis,
         onStoragePathWarning: (message) => api.logger.warn(message),
+        onLockWarning: (message) => api.logger.warn(message),
     });
     const embedder = createEmbedder({
         provider: "openai-compatible",
@@ -1921,6 +1927,7 @@ const memoryLanceDBProPlugin = {
         // ========================================================================
         _registeredApis.add(api); // claim before init (Phase 2 singleton guard)
         _registeredApisMap.set(api, true); // dual-track: explicit claim for rollback
+        let registrationStopped = false;
         let singleton;
         try {
             if (!_singletonState) {
@@ -4237,6 +4244,12 @@ const memoryLanceDBProPlugin = {
                 scheduleNextDreamingSweep();
             },
             stop: async () => {
+                if (registrationStopped) {
+                    return;
+                }
+                registrationStopped = true;
+                _registeredApis.delete(api);
+                _registeredApisMap.delete(api);
                 dreamingStopped = true;
                 if (backupTimer) {
                     clearInterval(backupTimer);
@@ -4255,6 +4268,19 @@ const memoryLanceDBProPlugin = {
                     dreamingTimer = null;
                 }
                 dreamingEngine.stop();
+                if (_registeredApisMap.size === 0 && _singletonState?.store === store) {
+                    try {
+                        await store.destroy();
+                    }
+                    catch (err) {
+                        api.logger.warn(`memory-lancedb-pro: stop cleanup failed: ${String(err)}`);
+                    }
+                    finally {
+                        if (_singletonState?.store === store) {
+                            _singletonState = null;
+                        }
+                    }
+                }
                 api.logger.info("memory-lancedb-pro: stopped");
             },
         });
@@ -4326,6 +4352,26 @@ export function parsePluginConfig(value) {
     const storageAutoCleanupRaw = typeof storageMaintenanceRaw?.autoCleanup === "object" && storageMaintenanceRaw.autoCleanup !== null
         ? storageMaintenanceRaw.autoCleanup
         : null;
+    const lockingRaw = typeof cfg.locking === "object" && cfg.locking !== null
+        ? cfg.locking
+        : null;
+    const redisLockRaw = typeof lockingRaw?.redis === "object" && lockingRaw.redis !== null
+        ? lockingRaw.redis
+        : null;
+    const redisLockExplicitlyDisabled = redisLockRaw?.enabled === false;
+    const nestedRedisUrl = redisLockExplicitlyDisabled
+        ? undefined
+        : resolveOptionalEnvString(redisLockRaw?.url);
+    const legacyRedisUrl = redisLockExplicitlyDisabled || nestedRedisUrl
+        ? undefined
+        : resolveOptionalEnvString(cfg.redisUrl);
+    const redisLockUrl = redisLockExplicitlyDisabled
+        ? undefined
+        : (nestedRedisUrl ??
+            legacyRedisUrl ??
+            asNonEmptyString(process.env.MEMORY_LANCEDB_REDIS_URL));
+    const redisLockEnabled = !redisLockExplicitlyDisabled &&
+        (redisLockRaw?.enabled === true || Boolean(redisLockUrl));
     const userMdExclusiveRaw = typeof workspaceBoundaryRaw?.userMdExclusive === "object" && workspaceBoundaryRaw.userMdExclusive !== null
         ? workspaceBoundaryRaw.userMdExclusive
         : null;
@@ -4386,6 +4432,20 @@ export function parsePluginConfig(value) {
                     intervalHours: parsePositiveInt(storageAutoCleanupRaw.intervalHours) ?? 24,
                     retentionDays: parsePositiveInt(storageAutoCleanupRaw.retentionDays) ?? 7,
                     initialDelayMs: parseNonNegativeInt(storageAutoCleanupRaw.initialDelayMs) ?? 300_000,
+                },
+            }
+            : undefined,
+        redisUrl: legacyRedisUrl,
+        locking: redisLockRaw || redisLockUrl
+            ? {
+                redis: {
+                    enabled: redisLockEnabled,
+                    url: redisLockUrl,
+                    keyPrefix: asNonEmptyString(redisLockRaw?.keyPrefix),
+                    ttlMs: parsePositiveInt(redisLockRaw?.ttlMs) ?? 60_000,
+                    acquireTimeoutMs: parsePositiveInt(redisLockRaw?.acquireTimeoutMs) ?? 5_000,
+                    retryDelayMs: parsePositiveInt(redisLockRaw?.retryDelayMs) ?? 50,
+                    connectTimeoutMs: parsePositiveInt(redisLockRaw?.connectTimeoutMs) ?? 1_000,
                 },
             }
             : undefined,

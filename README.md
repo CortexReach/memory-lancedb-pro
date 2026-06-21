@@ -689,10 +689,12 @@ OAuth login flow:
 enough for one gateway process, multiple agents through that gateway, and local
 processes that share the same database directory.
 
-Redis is not required for those deployments, and the current plugin does not
-automatically enable Redis locking. For multi-machine or multi-container
-writers, read [Lock Management](docs/lock-management.md) before sharing a
-LanceDB directory across processes.
+Redis is not required for those deployments. Redis locking is enabled when
+`locking.redis.enabled` is true, when `redisUrl`/`locking.redis.url` is set, or
+when `MEMORY_LANCEDB_REDIS_URL` is present in that process environment. For
+multi-machine or multi-container writers, read
+[Lock Management](docs/lock-management.md) before sharing a LanceDB directory
+across processes, and make sure every writer uses the same lock configuration.
 
 </details>
 

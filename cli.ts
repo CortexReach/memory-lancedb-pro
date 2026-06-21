@@ -1680,10 +1680,13 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
                 ? categoryRaw
                 : "other";
 
+            // Pass raw importance to importEntry — it applies clampImportance
+            // (v2+ 0~1) inside, which is idempotent and preserves 0, 1, and
+            // decimal values. The previous pre-clamp here could silently turn
+            // legacy values like 4 into 1 and then into 0.20 after legacy
+            // normalization (see PR #828 review).
             const importanceRaw = Number(memory.importance);
-            const importance = Number.isFinite(importanceRaw)
-              ? Math.max(0, Math.min(1, importanceRaw))
-              : 0.7;
+            const importance = Number.isFinite(importanceRaw) ? importanceRaw : 0.7;
 
             const timestampRaw = Number(memory.timestamp);
             const timestamp = Number.isFinite(timestampRaw) ? timestampRaw : Date.now();
