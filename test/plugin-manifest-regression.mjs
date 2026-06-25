@@ -720,11 +720,14 @@ try {
       sessionKey: "agent:main:test",
     });
     const requestCountBeforeWithDimensions = embeddingRequests.length;
+    const withDimensionsText = "dimensions should stay internal by default";
     await withDimensionsTool.execute("tool-3", {
-      text: "dimensions should stay internal by default",
+      text: withDimensionsText,
       scope: "global",
     });
-    const withDimensionsRequest = embeddingRequests.at(requestCountBeforeWithDimensions);
+    const withDimensionsRequest = embeddingRequests
+      .slice(requestCountBeforeWithDimensions)
+      .find((request) => request.input === withDimensionsText);
     assert.equal(
       Object.prototype.hasOwnProperty.call(withDimensionsRequest ?? {}, "dimensions"),
       false,
@@ -750,8 +753,9 @@ try {
       sessionKey: "agent:main:test",
     });
     const requestCountBeforeRequestDimensions = embeddingRequests.length;
+    const withRequestDimensionsText = "requestDimensions should drive both request payload and local schema size";
     const withRequestDimensionsResult = await withRequestDimensionsTool.execute("tool-3b", {
-      text: "requestDimensions should drive both request payload and local schema size",
+      text: withRequestDimensionsText,
       scope: "global",
     });
     assert.equal(
@@ -759,7 +763,9 @@ try {
       "created",
       "requestDimensions-only config should still create memories end-to-end",
     );
-    const withRequestDimensionsRequest = embeddingRequests.at(requestCountBeforeRequestDimensions);
+    const withRequestDimensionsRequest = embeddingRequests
+      .slice(requestCountBeforeRequestDimensions)
+      .find((request) => request.input === withRequestDimensionsText);
     assert.equal(
       withRequestDimensionsRequest?.dimensions,
       4,
@@ -786,11 +792,14 @@ try {
       sessionKey: "agent:main:test",
     });
     const requestCountBeforeOmitDimensions = embeddingRequests.length;
+    const omitDimensionsText = "dimensions should be omitted when configured";
     await omitDimensionsTool.execute("tool-4", {
-      text: "dimensions should be omitted when configured",
+      text: omitDimensionsText,
       scope: "global",
     });
-    const omitDimensionsRequest = embeddingRequests.at(requestCountBeforeOmitDimensions);
+    const omitDimensionsRequest = embeddingRequests
+      .slice(requestCountBeforeOmitDimensions)
+      .find((request) => request.input === omitDimensionsText);
     assert.equal(
       Object.prototype.hasOwnProperty.call(omitDimensionsRequest, "dimensions"),
       false,
