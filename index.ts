@@ -2242,6 +2242,7 @@ interface PluginSingletonState {
   retriever: ReturnType<typeof createRetriever>;
   canonicalCorpusIndexer: CanonicalCorpusIndexer;
   dreamingEngine: DreamingEngine;
+  dreamingScheduler: DreamingSchedulerState;
   scopeManager: ReturnType<typeof createScopeManager>;
   migrator: ReturnType<typeof createMigrator>;
   smartExtractor: SmartExtractor | null;
@@ -2256,6 +2257,13 @@ interface PluginSingletonState {
   autoCaptureSeenTextCount: Map<string, number>;
   autoCapturePendingIngressTexts: Map<string, string[]>;
   autoCaptureRecentTexts: Map<string, string[]>;
+}
+
+interface DreamingSchedulerState {
+  timer: ReturnType<typeof setTimeout> | null;
+  running: boolean;
+  stopped: boolean;
+  owners: Set<OpenClawPluginApi>;
 }
 
 let _singletonState: PluginSingletonState | null = null;
@@ -2347,6 +2355,12 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     },
     logger: api.logger,
   });
+  const dreamingScheduler: DreamingSchedulerState = {
+    timer: null,
+    running: false,
+    stopped: true,
+    owners: new Set(),
+  };
 
   const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
   if (clawteamScopes.length > 0) {
@@ -2454,6 +2468,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     retriever,
     canonicalCorpusIndexer,
     dreamingEngine,
+    dreamingScheduler,
     scopeManager,
     migrator,
     smartExtractor,
@@ -2601,6 +2616,7 @@ const memoryLanceDBProPlugin = {
       retriever,
       canonicalCorpusIndexer,
       dreamingEngine,
+      dreamingScheduler,
       scopeManager,
       migrator,
       smartExtractor,
@@ -5091,9 +5107,6 @@ const memoryLanceDBProPlugin = {
     let storageMaintenanceTimer: ReturnType<typeof setInterval> | null = null;
     let storageMaintenanceRunning = false;
     const storageAutoCleanup = config.storageMaintenance?.autoCleanup;
-    let dreamingTimer: ReturnType<typeof setTimeout> | null = null;
-    let dreamingRunning = false;
-    let dreamingStopped = false;
 
     async function runBackup() {
       try {
@@ -5186,13 +5199,13 @@ const memoryLanceDBProPlugin = {
 
     async function runDreamingSweep() {
       if (config.dreaming?.enabled !== true) return;
-      if (dreamingStopped) return;
-      if (dreamingRunning) {
+      if (dreamingScheduler.stopped) return;
+      if (dreamingScheduler.running) {
         api.logger.debug("memory-lancedb-pro: dreaming sweep skipped because a prior run is still active");
         return;
       }
 
-      dreamingRunning = true;
+      dreamingScheduler.running = true;
       const startedAt = Date.now();
       try {
         const result = await dreamingEngine.runSweep();
@@ -5206,14 +5219,14 @@ const memoryLanceDBProPlugin = {
       } catch (err) {
         api.logger.warn(`memory-lancedb-pro: dreaming sweep failed: ${String(err)}`);
       } finally {
-        dreamingRunning = false;
+        dreamingScheduler.running = false;
       }
     }
 
     function scheduleNextDreamingSweep() {
       if (config.dreaming?.enabled !== true) return;
-      if (dreamingStopped) return;
-      if (dreamingTimer) clearTimeout(dreamingTimer);
+      if (dreamingScheduler.stopped) return;
+      if (dreamingScheduler.timer) return;
 
       const delayMs = computeNextDreamingDelayMs(
         config.dreaming.frequency,
@@ -5223,11 +5236,11 @@ const memoryLanceDBProPlugin = {
         `memory-lancedb-pro: dreaming scheduled ` +
         `(frequency="${config.dreaming.frequency}", nextRunInMs=${delayMs})`,
       );
-      dreamingTimer = setTimeout(async () => {
-        dreamingTimer = null;
-        if (dreamingStopped) return;
+      dreamingScheduler.timer = setTimeout(async () => {
+        dreamingScheduler.timer = null;
+        if (dreamingScheduler.stopped) return;
         await runDreamingSweep();
-        if (dreamingStopped) return;
+        if (dreamingScheduler.stopped) return;
         scheduleNextDreamingSweep();
       }, delayMs);
     }
@@ -5239,7 +5252,12 @@ const memoryLanceDBProPlugin = {
     api.registerService({
       id: "memory-lancedb-pro",
       start: async () => {
-        dreamingStopped = false;
+        if (registrationStopped) {
+          api.logger.debug?.("memory-lancedb-pro: start ignored after service stop");
+          return;
+        }
+        dreamingScheduler.owners.add(api);
+        dreamingScheduler.stopped = false;
         dreamingEngine.start();
         // IMPORTANT: Do not block gateway startup on external network calls.
         // If embedding/retrieval tests hang (bad network / slow provider), the gateway
@@ -5401,7 +5419,7 @@ const memoryLanceDBProPlugin = {
         registrationStopped = true;
         _registeredApis.delete(api);
         _registeredApisMap.delete(api);
-        dreamingStopped = true;
+        dreamingScheduler.owners.delete(api);
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
@@ -5414,11 +5432,14 @@ const memoryLanceDBProPlugin = {
           clearInterval(storageMaintenanceTimer);
           storageMaintenanceTimer = null;
         }
-        if (dreamingTimer) {
-          clearTimeout(dreamingTimer);
-          dreamingTimer = null;
+        if (dreamingScheduler.owners.size === 0) {
+          dreamingScheduler.stopped = true;
+          if (dreamingScheduler.timer) {
+            clearTimeout(dreamingScheduler.timer);
+            dreamingScheduler.timer = null;
+          }
+          dreamingEngine.stop();
         }
-        dreamingEngine.stop();
         if (_registeredApisMap.size === 0 && _singletonState?.store === store) {
           try {
             await store.destroy();

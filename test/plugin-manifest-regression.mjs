@@ -38,6 +38,7 @@ function createMockApi(pluginConfig, options = {}) {
       warn() {},
       error() {},
       debug() {},
+      ...(options.logger ?? {}),
     },
     resolvePath(value) {
       return value;
@@ -430,11 +431,18 @@ try {
     const sharedDbPath = path.join(workDir, "db-stop-shared");
     const firstSharedServices = [];
     const secondSharedServices = [];
+    const sharedLogs = [];
+    const sharedLogger = {
+      info(message) {
+        sharedLogs.push(String(message));
+      },
+    };
     const firstSharedApi = createMockApi(
       {
         dbPath: sharedDbPath,
         autoCapture: false,
         autoRecall: false,
+        dreaming: { enabled: true, frequency: "@daily" },
         embedding: {
           provider: "openai-compatible",
           apiKey: "dummy",
@@ -443,13 +451,14 @@ try {
           dimensions: 1536,
         },
       },
-      { services: firstSharedServices },
+      { services: firstSharedServices, logger: sharedLogger },
     );
     const secondSharedApi = createMockApi(
       {
         dbPath: sharedDbPath,
         autoCapture: false,
         autoRecall: false,
+        dreaming: { enabled: true, frequency: "@daily" },
         embedding: {
           provider: "openai-compatible",
           apiKey: "dummy",
@@ -458,27 +467,59 @@ try {
           dimensions: 1536,
         },
       },
-      { services: secondSharedServices },
+      { services: secondSharedServices, logger: sharedLogger },
     );
     resetRegistration();
     plugin.register(firstSharedApi);
     plugin.register(secondSharedApi);
     assert.equal(firstSharedServices.length, 1, "first registration should add a service");
     assert.equal(secondSharedServices.length, 1, "second registration should add a service");
-    await firstSharedServices[0].stop();
-    assert.equal(
-      destroyCalls,
-      0,
-      "stopping one of multiple registrations should keep the shared store alive",
-    );
-    assert.deepEqual(destroyedDbPaths, []);
-    await secondSharedServices[0].stop();
-    assert.equal(
-      destroyCalls,
-      1,
-      "shared store should be destroyed only after the final registration stops",
-    );
-    assert.deepEqual(destroyedDbPaths, [sharedDbPath]);
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    const originalSetInterval = globalThis.setInterval;
+    const originalClearInterval = globalThis.clearInterval;
+    let fakeTimerId = 0;
+    try {
+      globalThis.setTimeout = () => ({ fakeTimerId: ++fakeTimerId });
+      globalThis.clearTimeout = () => {};
+      globalThis.setInterval = () => ({ fakeTimerId: ++fakeTimerId });
+      globalThis.clearInterval = () => {};
+
+      await firstSharedServices[0].start();
+      await secondSharedServices[0].start();
+      assert.equal(
+        sharedLogs.filter((message) => message.includes("memory-lancedb-pro: dreaming scheduled")).length,
+        1,
+        "multiple registrations should share one dreaming scheduler",
+      );
+
+      await firstSharedServices[0].stop();
+      assert.equal(
+        destroyCalls,
+        0,
+        "stopping one of multiple registrations should keep the shared store alive",
+      );
+      assert.deepEqual(destroyedDbPaths, []);
+
+      await secondSharedServices[0].stop();
+      assert.equal(
+        destroyCalls,
+        1,
+        "shared store should be destroyed only after the final registration stops",
+      );
+      assert.deepEqual(destroyedDbPaths, [sharedDbPath]);
+      await secondSharedServices[0].start();
+      assert.equal(
+        sharedLogs.filter((message) => message.includes("memory-lancedb-pro: dreaming scheduled")).length,
+        1,
+        "stopped service objects should not restart background dreaming work",
+      );
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+      globalThis.setInterval = originalSetInterval;
+      globalThis.clearInterval = originalClearInterval;
+    }
   } finally {
     MemoryStore.prototype.destroy = originalDestroy;
   }
