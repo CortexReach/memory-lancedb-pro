@@ -486,6 +486,14 @@ function formatJson(obj: any): string {
   return JSON.stringify(obj, null, 2);
 }
 
+function writeStdout(text: string): void {
+  process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
+}
+
+function writeJson(obj: any): void {
+  writeStdout(formatJson(obj));
+}
+
 function formatRetrievalDiagnosticsLines(diagnostics: {
   originalQuery: string;
   bm25Query: string | null;
@@ -1298,7 +1306,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         );
 
         if (options.json) {
-          console.log(formatJson(memories));
+          writeJson(memories);
         } else {
           if (memories.length === 0) {
             console.log("No memories found.");
@@ -1341,9 +1349,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         );
 
         if (options.json) {
-          console.log(
-            formatJson(options.debug ? { diagnostics, results } : results),
-          );
+          writeJson(options.debug ? { diagnostics, results } : results);
         } else {
           if (options.debug && diagnostics) {
             for (const line of formatRetrievalDiagnosticsLines(diagnostics)) {
@@ -1371,9 +1377,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       } catch (error) {
         const diagnostics = options.debug ? lastSearchDiagnostics : null;
         if (options.json) {
-          console.log(
-            formatJson(buildSearchErrorPayload(error, diagnostics, options.debug)),
-          );
+          writeJson(buildSearchErrorPayload(error, diagnostics, options.debug));
           process.exit(1);
         }
         if (diagnostics) {
@@ -1413,7 +1417,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         };
 
         if (options.json) {
-          console.log(formatJson(summary));
+          writeJson(summary);
         } else {
           console.log(`Memory Statistics:`);
           console.log(`• Total memories: ${stats.totalCount}`);
@@ -1547,7 +1551,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           await fs.writeFile(options.output, output);
           console.log(`Exported ${memories.length} memories to ${options.output}`);
         } else {
-          console.log(output);
+          writeStdout(output);
         }
       } catch (error) {
         console.error("Export failed:", error);

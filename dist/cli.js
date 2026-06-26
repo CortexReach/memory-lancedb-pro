@@ -362,6 +362,12 @@ function formatObsidianMemory(memory) {
 function formatJson(obj) {
     return JSON.stringify(obj, null, 2);
 }
+function writeStdout(text) {
+    process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
+}
+function writeJson(obj) {
+    writeStdout(formatJson(obj));
+}
 function formatRetrievalDiagnosticsLines(diagnostics) {
     const topDrops = diagnostics.dropSummary.length > 0
         ? diagnostics.dropSummary
@@ -1037,7 +1043,7 @@ export function registerMemoryCLI(program, context) {
             }
             const memories = await context.store.list(scopeFilter, options.category, limit, offset);
             if (options.json) {
-                console.log(formatJson(memories));
+                writeJson(memories);
             }
             else {
                 if (memories.length === 0) {
@@ -1074,7 +1080,7 @@ export function registerMemoryCLI(program, context) {
             }
             const { results, diagnostics } = await runSearch(query, limit, scopeFilter, options.category);
             if (options.json) {
-                console.log(formatJson(options.debug ? { diagnostics, results } : results));
+                writeJson(options.debug ? { diagnostics, results } : results);
             }
             else {
                 if (options.debug && diagnostics) {
@@ -1105,7 +1111,7 @@ export function registerMemoryCLI(program, context) {
         catch (error) {
             const diagnostics = options.debug ? lastSearchDiagnostics : null;
             if (options.json) {
-                console.log(formatJson(buildSearchErrorPayload(error, diagnostics, options.debug)));
+                writeJson(buildSearchErrorPayload(error, diagnostics, options.debug));
                 process.exit(1);
             }
             if (diagnostics) {
@@ -1141,7 +1147,7 @@ export function registerMemoryCLI(program, context) {
                 },
             };
             if (options.json) {
-                console.log(formatJson(summary));
+                writeJson(summary);
             }
             else {
                 console.log(`Memory Statistics:`);
@@ -1265,7 +1271,7 @@ export function registerMemoryCLI(program, context) {
                 console.log(`Exported ${memories.length} memories to ${options.output}`);
             }
             else {
-                console.log(output);
+                writeStdout(output);
             }
         }
         catch (error) {
