@@ -46,16 +46,28 @@ async function createLegacyDb(baseDir, rows) {
 
 async function captureStdout(run) {
   const logs = [];
+  const stdout = [];
   const originalLog = console.log;
+  const originalWrite = process.stdout.write;
   console.log = (...args) => {
     logs.push(args.join(" "));
+  };
+  process.stdout.write = function write(chunk, encoding, callback) {
+    stdout.push(Buffer.isBuffer(chunk) ? chunk.toString(encoding) : String(chunk));
+    if (typeof encoding === "function") {
+      encoding();
+    } else if (typeof callback === "function") {
+      callback();
+    }
+    return true;
   };
   try {
     await run();
   } finally {
+    process.stdout.write = originalWrite;
     console.log = originalLog;
   }
-  return logs.join("\n");
+  return stdout.join("") || logs.join("\n");
 }
 
 async function runFunctionalE2E() {

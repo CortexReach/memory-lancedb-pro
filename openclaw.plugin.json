@@ -133,6 +133,11 @@
             "type": "boolean",
             "description": "Request normalized embeddings when supported by the provider (e.g. Jina v5)"
           },
+          "maxInputChars": {
+            "type": "integer",
+            "minimum": 100,
+            "description": "Maximum characters sent to the embedding provider per request. With automatic chunking enabled, longer documents are split before this cap is applied to each provider request; with chunking disabled, excess text is truncated."
+          },
           "chunking": {
             "type": "boolean",
             "default": true,
@@ -184,6 +189,11 @@
       },
       "dbPath": {
         "type": "string"
+      },
+      "maxInputChars": {
+        "type": "integer",
+        "minimum": 100,
+        "description": "Legacy top-level alias for embedding.maxInputChars."
       },
       "storageMaintenance": {
         "type": "object",
@@ -1723,6 +1733,17 @@
     "embedding.normalized": {
       "label": "Normalized Embeddings",
       "help": "Request normalized embeddings when the provider supports it (Jina v5). If unset, the field is not sent.",
+      "advanced": true
+    },
+    "embedding.maxInputChars": {
+      "label": "Max Input Characters",
+      "placeholder": "model-specific default",
+      "help": "Maximum characters sent to the embedding provider per request. Auto-chunking preserves longer documents by splitting first; disabling chunking makes this a truncation cap.",
+      "advanced": true
+    },
+    "maxInputChars": {
+      "label": "Max Input Characters",
+      "help": "Legacy top-level alias for embedding.maxInputChars.",
       "advanced": true
     },
     "embedding.chunking": {

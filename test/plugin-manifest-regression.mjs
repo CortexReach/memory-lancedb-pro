@@ -161,9 +161,23 @@ assert.equal(
   "integer",
   "embedding.requestDimensions should be declared in the plugin schema",
 );
+assert.equal(
+  manifest.configSchema.properties.embedding.properties.maxInputChars?.type,
+  "integer",
+  "embedding.maxInputChars should be declared in the plugin schema",
+);
+assert.equal(
+  manifest.configSchema.properties.maxInputChars?.type,
+  "integer",
+  "legacy top-level maxInputChars alias should be declared in the plugin schema",
+);
 assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.uiHints, "embedding.requestDimensions"),
   "uiHints should expose embedding.requestDimensions",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.uiHints, "embedding.maxInputChars"),
+  "uiHints should expose embedding.maxInputChars",
 );
 assert.equal(
   manifest.configSchema.properties.sessionMemory.properties.enabled.default,
