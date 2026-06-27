@@ -277,6 +277,7 @@ interface PluginConfig {
     writeLegacyCombined?: boolean;
     injectMode?: ReflectionInjectMode;
     agentId?: string;
+    model?: string;
     messageCount?: number;
     maxInputChars?: number;
     timeoutMs?: number;
@@ -1592,6 +1593,7 @@ async function generateReflectionText(params: {
   maxInputChars: number;
   cfg: unknown;
   agentId: string;
+  model?: string;
   workspaceDir: string;
   timeoutMs: number;
   thinkLevel: ReflectionThinkLevel;
@@ -1632,7 +1634,8 @@ async function generateReflectionText(params: {
         // Model resolution chain: agent-specific primary model ref > global llm.model fallback.
         // The typeof guard ensures a non-string value (e.g. number) does not reach splitProviderModel as-is.
         const modelRef =
-          (resolveAgentPrimaryModelRef(params.cfg, params.agentId) as string | undefined)
+          params.model
+          ?? (resolveAgentPrimaryModelRef(params.cfg, params.agentId) as string | undefined)
           ?? (typeof modelRefFromConfig === "string" ? modelRefFromConfig : undefined);
 
         // Provider resolution chain: parsed from modelRef (e.g. "minimax/MiniMax-M2.7") > inferred from baseURL.
@@ -4320,6 +4323,7 @@ const memoryLanceDBProPlugin = {
       const reflectionTimeoutMs = config.memoryReflection?.timeoutMs ?? DEFAULT_REFLECTION_TIMEOUT_MS;
       const reflectionThinkLevel = config.memoryReflection?.thinkLevel ?? DEFAULT_REFLECTION_THINK_LEVEL;
       const reflectionAgentId = asNonEmptyString(config.memoryReflection?.agentId);
+      const reflectionModel = asNonEmptyString(config.memoryReflection?.model);
       const reflectionErrorReminderMaxEntries =
         parsePositiveInt(config.memoryReflection?.errorReminderMaxEntries) ?? DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES;
       const reflectionDedupeErrorSignals = config.memoryReflection?.dedupeErrorSignals !== false;
@@ -4705,6 +4709,7 @@ const memoryLanceDBProPlugin = {
             maxInputChars: reflectionMaxInputChars,
             cfg,
             agentId: reflectionRunAgentId,
+            model: reflectionModel,
             workspaceDir,
             timeoutMs: reflectionTimeoutMs,
             thinkLevel: reflectionThinkLevel,
@@ -5758,6 +5763,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         writeLegacyCombined: memoryReflectionRaw.writeLegacyCombined === true,
         injectMode: reflectionInjectMode,
         agentId: asNonEmptyString(memoryReflectionRaw.agentId),
+        model: asNonEmptyString(memoryReflectionRaw.model),
         messageCount: reflectionMessageCount,
         maxInputChars: parsePositiveInt(memoryReflectionRaw.maxInputChars) ?? DEFAULT_REFLECTION_MAX_INPUT_CHARS,
         timeoutMs: parsePositiveInt(memoryReflectionRaw.timeoutMs) ?? DEFAULT_REFLECTION_TIMEOUT_MS,
