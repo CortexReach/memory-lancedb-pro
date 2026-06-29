@@ -1173,7 +1173,8 @@ async function generateReflectionText(params) {
                 const modelRefFromConfig = llmConfig?.model;
                 // Model resolution chain: agent-specific primary model ref > global llm.model fallback.
                 // The typeof guard ensures a non-string value (e.g. number) does not reach splitProviderModel as-is.
-                const modelRef = resolveAgentPrimaryModelRef(params.cfg, params.agentId)
+                const modelRef = params.model
+                    ?? resolveAgentPrimaryModelRef(params.cfg, params.agentId)
                     ?? (typeof modelRefFromConfig === "string" ? modelRefFromConfig : undefined);
                 // Provider resolution chain: parsed from modelRef (e.g. "minimax/MiniMax-M2.7") > inferred from baseURL.
                 // inferProviderFromBaseURL uses .endsWith(".suffix") to prevent subdomain spoofing.
@@ -3320,6 +3321,7 @@ const memoryLanceDBProPlugin = {
             const reflectionTimeoutMs = config.memoryReflection?.timeoutMs ?? DEFAULT_REFLECTION_TIMEOUT_MS;
             const reflectionThinkLevel = config.memoryReflection?.thinkLevel ?? DEFAULT_REFLECTION_THINK_LEVEL;
             const reflectionAgentId = asNonEmptyString(config.memoryReflection?.agentId);
+            const reflectionModel = asNonEmptyString(config.memoryReflection?.model);
             const reflectionErrorReminderMaxEntries = parsePositiveInt(config.memoryReflection?.errorReminderMaxEntries) ?? DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES;
             const reflectionDedupeErrorSignals = config.memoryReflection?.dedupeErrorSignals !== false;
             const reflectionInjectMode = config.memoryReflection?.injectMode ?? "inheritance+derived";
@@ -3665,6 +3667,7 @@ const memoryLanceDBProPlugin = {
                         maxInputChars: reflectionMaxInputChars,
                         cfg,
                         agentId: reflectionRunAgentId,
+                        model: reflectionModel,
                         workspaceDir,
                         timeoutMs: reflectionTimeoutMs,
                         thinkLevel: reflectionThinkLevel,
@@ -4572,6 +4575,7 @@ export function parsePluginConfig(value) {
                 writeLegacyCombined: memoryReflectionRaw.writeLegacyCombined === true,
                 injectMode: reflectionInjectMode,
                 agentId: asNonEmptyString(memoryReflectionRaw.agentId),
+                model: asNonEmptyString(memoryReflectionRaw.model),
                 messageCount: reflectionMessageCount,
                 maxInputChars: parsePositiveInt(memoryReflectionRaw.maxInputChars) ?? DEFAULT_REFLECTION_MAX_INPUT_CHARS,
                 timeoutMs: parsePositiveInt(memoryReflectionRaw.timeoutMs) ?? DEFAULT_REFLECTION_TIMEOUT_MS,

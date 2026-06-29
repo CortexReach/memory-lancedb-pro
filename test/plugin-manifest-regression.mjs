@@ -241,6 +241,25 @@ assert.ok(
   (manifest.commandAliases ?? []).some((entry) => entry?.name === "dreaming"),
   "manifest should expose the dreaming runtime slash command alias while owning the memory slot",
 );
+assert.equal(
+  manifest.configSchema.properties.memoryReflection.properties.model.type,
+  "string",
+  "memoryReflection should expose an optional model override knob",
+);
+assert.equal(
+  manifest.configSchema.properties.memoryReflection.additionalProperties,
+  false,
+  "memoryReflection schema should continue to reject unknown keys after adding model",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.uiHints, "memoryReflection.model"),
+  "uiHints should expose the reflection model override",
+);
+assert.ok(
+  !Array.isArray(manifest.configSchema.properties.memoryReflection.required)
+    || !manifest.configSchema.properties.memoryReflection.required.includes("model"),
+  "memoryReflection.model must stay optional so omitting it preserves the existing default model resolution",
+);
 
 assert.equal(
   manifest.version,

@@ -1398,6 +1398,10 @@
             "type": "string",
             "description": "Optional dedicated agent id used to run reflection generation (for example: memory-distiller)."
           },
+          "model": {
+            "type": "string",
+            "description": "Optional provider/model override used to generate the reflection. Falls back to the reflection agent's primary model, then the plugin llm.model."
+          },
           "messageCount": {
             "type": "integer",
             "minimum": 1,
@@ -2181,6 +2185,12 @@
     "memoryReflection.agentId": {
       "label": "Reflection Agent Id",
       "help": "Optional dedicated agent id used for reflection generation (e.g. memory-distiller)",
+      "advanced": true
+    },
+    "memoryReflection.model": {
+      "label": "Reflection Model",
+      "placeholder": "anthropic/claude-sonnet-4-6",
+      "help": "Optional provider/model override for reflection generation. Falls back to the reflection agent's primary model, then llm.model.",
       "advanced": true
     },
     "memoryReflection.messageCount": {
