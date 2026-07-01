@@ -476,6 +476,7 @@ For `source: "file"`, `id` is resolved through OpenClaw's `api.resolvePath()` an
     "taskQuery": "retrieval.query",
     "taskPassage": "retrieval.passage",
     "normalized": true,
+    "maxInputChars": 1400,
     "clientTimeoutMs": 30000
   },
   "dbPath": "~/.openclaw/memory/lancedb-pro",
@@ -530,6 +531,26 @@ For `source: "file"`, `id` is resolved through OpenClaw's `api.resolvePath()` an
 ```
 
 </details>
+
+### OpenClaw Hook Permissions
+
+The published plugin manifest declares `hooks.allowConversationAccess` so the `agent_end` auto-capture hook can read conversation context. If you maintain a custom plugin entry or non-bundled install that overrides manifest hook metadata, keep conversation access enabled:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "memory-lancedb-pro": {
+        "hooks": {
+          "allowConversationAccess": true
+        }
+      }
+    }
+  }
+}
+```
+
+Without conversation access, recall can still load but auto-capture may be blocked.
 
 <details>
 <summary><strong>Embedding Providers</strong></summary>
