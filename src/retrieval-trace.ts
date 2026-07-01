@@ -12,6 +12,8 @@
 export interface RetrievalStageResult {
   /** Stage name, e.g. "vector_search", "bm25_search", "rrf_fusion" */
   name: string;
+  /** Stage kind. Operation stages measure work that does not transform entries. */
+  kind?: "pipeline" | "operation";
   /** Number of entries entering this stage */
   inputCount: number;
   /** Number of entries surviving this stage */
@@ -45,6 +47,7 @@ export interface RetrievalTrace {
 
 interface PendingStage {
   name: string;
+  kind: "pipeline" | "operation";
   inputIds: Set<string>;
   startTime: number;
 }
@@ -63,13 +66,18 @@ export class TraceCollector {
    * @param name - Stage identifier (e.g. "vector_search")
    * @param entryIds - IDs of entries entering this stage
    */
-  startStage(name: string, entryIds: string[]): void {
+  startStage(
+    name: string,
+    entryIds: string[],
+    kind: "pipeline" | "operation" = "pipeline",
+  ): void {
     // Auto-close any unclosed previous stage (defensive)
     if (this._pending) {
       this.endStage([...this._pending.inputIds]);
     }
     this._pending = {
       name,
+      kind,
       inputIds: new Set(entryIds),
       startTime: Date.now(),
     };
@@ -83,7 +91,7 @@ export class TraceCollector {
   endStage(survivingIds: string[], scores?: number[]): void {
     if (!this._pending) return;
 
-    const { name, inputIds, startTime } = this._pending;
+    const { name, kind, inputIds, startTime } = this._pending;
     const survivingSet = new Set(survivingIds);
 
     const droppedIds: string[] = [];
@@ -106,6 +114,7 @@ export class TraceCollector {
 
     this._stages.push({
       name,
+      kind,
       inputCount: inputIds.size,
       outputCount: survivingIds.length,
       droppedIds,
@@ -143,6 +152,10 @@ export class TraceCollector {
     const lines: string[] = [];
     lines.push(`Retrieval trace (${this._stages.length} stages):`);
     for (const stage of this._stages) {
+      if (stage.kind === "operation") {
+        lines.push(`  ${stage.name}: completed ${stage.durationMs}ms`);
+        continue;
+      }
       const dropped = stage.inputCount - stage.outputCount;
       const scoreStr = stage.scoreRange
         ? ` scores=[${stage.scoreRange[0].toFixed(3)}, ${stage.scoreRange[1].toFixed(3)}]`

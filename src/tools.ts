@@ -2123,6 +2123,12 @@ export function registerMemoryDebugTool(
               `  Stages:`,
             ];
             for (const stage of trace.stages) {
+              if (stage.kind === "operation") {
+                traceLines.push(
+                  `    ${stage.name}: completed ${stage.durationMs}ms`,
+                );
+                continue;
+              }
               const dropped = Math.max(0, stage.inputCount - stage.outputCount);
               const scoreStr = stage.scoreRange
                 ? ` scores=[${stage.scoreRange[0].toFixed(3)}, ${stage.scoreRange[1].toFixed(3)}]`
