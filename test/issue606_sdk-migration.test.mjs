@@ -57,9 +57,12 @@ describe("SDK Migration Bug 2 — static smoke tests", () => {
 
   it("generateReflectionText params include api field", () => {
     const content = readFileSync(INDEX_PATH, "utf-8");
-    // The params interface must include api: OpenClawPluginApi
-    const apiParamPattern = /api:\s*OpenClawPluginApi[^}]*\}\s*\)[\s\n]*:[\s\n]*Promise/;
+    // The params type must include api: OpenClawPluginApi
+    const apiParamPattern = /GenerateReflectionTextParams = \{[\s\S]*?api:\s*OpenClawPluginApi[\s\S]*?\n\};/;
     assert.match(content, apiParamPattern, "generateReflectionText params must include api: OpenClawPluginApi");
+    // and generateReflectionText must consume that params type and return a Promise
+    const signaturePattern = /generateReflectionText\([\s\n]*params:\s*GenerateReflectionTextParams[\s\n]*\)[\s\n]*:[\s\n]*Promise</;
+    assert.match(content, signaturePattern, "generateReflectionText must take GenerateReflectionTextParams and return a Promise");
   });
 
   it("generateReflectionText calls loadEmbeddedPiRunner with params.api", () => {

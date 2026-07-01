@@ -286,6 +286,8 @@ interface PluginConfig {
     dedupeErrorSignals?: boolean;
     /** Cooldown in ms between reflection triggers for the same session. Default: 120000 (2 min). Set to 0 to disable. */
     serialCooldownMs?: number;
+    /** Max concurrent reflection runs across all agents. Default: 1 (fully serialized, matching the previous behavior). Raise to let agents reflect in parallel. */
+    maxConcurrentRuns?: number;
     /** Agent/session patterns excluded from reflection injection. Supports exact match, wildcard prefix (e.g. "pi-"), and "temp:*". */
     excludeAgents?: string[];
   };
@@ -706,6 +708,7 @@ const DEFAULT_REFLECTION_MESSAGE_COUNT = 120;
 const DEFAULT_REFLECTION_MAX_INPUT_CHARS = 24_000;
 const DEFAULT_REFLECTION_TIMEOUT_MS = 20_000;
 const DEFAULT_REFLECTION_THINK_LEVEL: ReflectionThinkLevel = "medium";
+const DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS = 1;
 const DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES = 3;
 const DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS = true;
 const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
@@ -1588,7 +1591,7 @@ function buildReflectionFallbackText(): string {
   ].join("\n");
 }
 
-async function generateReflectionText(params: {
+type GenerateReflectionTextParams = {
   conversation: string;
   maxInputChars: number;
   cfg: unknown;
@@ -1597,10 +1600,64 @@ async function generateReflectionText(params: {
   workspaceDir: string;
   timeoutMs: number;
   thinkLevel: ReflectionThinkLevel;
+  maxConcurrentRuns?: number;
   toolErrorSignals?: ReflectionErrorSignal[];
   logger?: { info?: (message: string) => void; warn?: (message: string) => void };
   api: OpenClawPluginApi;  // SDK migration Bug 2: pass api to use new runtime.agent API
-}): Promise<{ text: string; usedFallback: boolean; promptHash: string; error?: string; runner: "embedded" | "cli" | "fallback" }> {
+};
+
+type GenerateReflectionTextResult = {
+  text: string;
+  usedFallback: boolean;
+  promptHash: string;
+  error?: string;
+  runner: "embedded" | "cli" | "fallback";
+};
+
+type ReflectionRunSlotState = { active: number; waiters: Array<() => void> };
+
+const REFLECTION_RUN_SLOTS = Symbol.for("openclaw.memory-lancedb-pro.reflection-run-slots");
+const getReflectionRunSlotState = (): ReflectionRunSlotState => {
+  const g = globalThis as Record<symbol, unknown>;
+  if (!g[REFLECTION_RUN_SLOTS]) g[REFLECTION_RUN_SLOTS] = { active: 0, waiters: [] };
+  return g[REFLECTION_RUN_SLOTS] as ReflectionRunSlotState;
+};
+
+// Waiting for a slot happens BEFORE the run's timeout clock starts, so a queued
+// reflection never burns its deadline waiting in line (the failure mode of the
+// old single shared "temp:memory-reflection" lane under concurrent bursts).
+export async function acquireReflectionRunSlot(maxConcurrentRuns?: number): Promise<() => void> {
+  const state = getReflectionRunSlotState();
+  const max = Math.max(1, Math.floor(maxConcurrentRuns ?? DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS) || 1);
+  if (state.active < max) {
+    state.active += 1;
+  } else {
+    await new Promise<void>((resolve) => state.waiters.push(resolve));
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = state.waiters.shift();
+    if (next) next();
+    else state.active -= 1;
+  };
+}
+
+export async function generateReflectionText(
+  params: GenerateReflectionTextParams
+): Promise<GenerateReflectionTextResult> {
+  const releaseRunSlot = await acquireReflectionRunSlot(params.maxConcurrentRuns);
+  try {
+    return await generateReflectionTextUnbounded(params);
+  } finally {
+    releaseRunSlot();
+  }
+}
+
+async function generateReflectionTextUnbounded(
+  params: GenerateReflectionTextParams
+): Promise<GenerateReflectionTextResult> {
   const prompt = buildReflectionPrompt(
     params.conversation,
     params.maxInputChars,
@@ -1648,7 +1705,7 @@ async function generateReflectionText(params: {
         return await withTimeout(
           runEmbeddedPiAgent({
             sessionId: `reflection-${Date.now()}`,
-            sessionKey: "temp:memory-reflection",
+            sessionKey: `temp:memory-reflection:${params.agentId}`,
             agentId: params.agentId,
             sessionFile: tempSessionFile,
             workspaceDir: params.workspaceDir,
@@ -4322,6 +4379,7 @@ const memoryLanceDBProPlugin = {
       const reflectionMaxInputChars = config.memoryReflection?.maxInputChars ?? DEFAULT_REFLECTION_MAX_INPUT_CHARS;
       const reflectionTimeoutMs = config.memoryReflection?.timeoutMs ?? DEFAULT_REFLECTION_TIMEOUT_MS;
       const reflectionThinkLevel = config.memoryReflection?.thinkLevel ?? DEFAULT_REFLECTION_THINK_LEVEL;
+      const reflectionMaxConcurrentRuns = config.memoryReflection?.maxConcurrentRuns ?? DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS;
       const reflectionAgentId = asNonEmptyString(config.memoryReflection?.agentId);
       const reflectionModel = asNonEmptyString(config.memoryReflection?.model);
       const reflectionErrorReminderMaxEntries =
@@ -4713,6 +4771,7 @@ const memoryLanceDBProPlugin = {
             workspaceDir,
             timeoutMs: reflectionTimeoutMs,
             thinkLevel: reflectionThinkLevel,
+            maxConcurrentRuns: reflectionMaxConcurrentRuns,
             toolErrorSignals,
             logger: api.logger,
             api,  // SDK migration Bug 2: pass api for new runtime.agent API
@@ -5775,6 +5834,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         errorReminderMaxEntries: parsePositiveInt(memoryReflectionRaw.errorReminderMaxEntries) ?? DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES,
         dedupeErrorSignals: memoryReflectionRaw.dedupeErrorSignals !== false,
         serialCooldownMs: parsePositiveInt(memoryReflectionRaw.serialCooldownMs) ?? DEFAULT_SERIAL_GUARD_COOLDOWN_MS,
+        maxConcurrentRuns: parsePositiveInt(memoryReflectionRaw.maxConcurrentRuns) ?? DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS,
         excludeAgents: Array.isArray(memoryReflectionRaw.excludeAgents)
           ? memoryReflectionRaw.excludeAgents.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
           : undefined,
@@ -5792,6 +5852,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         errorReminderMaxEntries: DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES,
         dedupeErrorSignals: DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS,
         serialCooldownMs: DEFAULT_SERIAL_GUARD_COOLDOWN_MS,
+        maxConcurrentRuns: DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS,
         excludeAgents: undefined,
       },
     sessionMemory:

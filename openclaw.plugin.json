@@ -1446,6 +1446,13 @@
             "minimum": 0,
             "description": "Cooldown in ms between reflection triggers for the same session. Default: 120000 (2 min). Set to 0 to disable."
           },
+          "maxConcurrentRuns": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 16,
+            "default": 1,
+            "description": "Max concurrent reflection runs across all agents. Defaults to 1, which keeps reflections fully serialized (the previous behavior) while per-agent lanes stop queued runs from burning their timeout budget. Raise to let agents reflect in parallel."
+          },
           "excludeAgents": {
             "type": "array",
             "items": {
@@ -2191,6 +2198,11 @@
       "label": "Reflection Model",
       "placeholder": "anthropic/claude-sonnet-4-6",
       "help": "Optional provider/model override for reflection generation. Falls back to the reflection agent's primary model, then llm.model.",
+      "advanced": true
+    },
+    "memoryReflection.maxConcurrentRuns": {
+      "label": "Reflection Max Concurrent Runs",
+      "help": "Max concurrent reflection runs across all agents (reflections queue in per-agent lanes). Default 1 keeps reflections serialized; raise to allow parallel reflections.",
       "advanced": true
     },
     "memoryReflection.messageCount": {
