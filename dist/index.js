@@ -359,6 +359,7 @@ const DEFAULT_REFLECTION_MESSAGE_COUNT = 120;
 const DEFAULT_REFLECTION_MAX_INPUT_CHARS = 24_000;
 const DEFAULT_REFLECTION_TIMEOUT_MS = 20_000;
 const DEFAULT_REFLECTION_THINK_LEVEL = "medium";
+const DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS = 1;
 const DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES = 3;
 const DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS = true;
 const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
@@ -1147,7 +1148,47 @@ function buildReflectionFallbackText() {
         "- Investigate why embedded reflection generation failed before trusting any next-run delta.",
     ].join("\n");
 }
-async function generateReflectionText(params) {
+const REFLECTION_RUN_SLOTS = Symbol.for("openclaw.memory-lancedb-pro.reflection-run-slots");
+const getReflectionRunSlotState = () => {
+    const g = globalThis;
+    if (!g[REFLECTION_RUN_SLOTS])
+        g[REFLECTION_RUN_SLOTS] = { active: 0, waiters: [] };
+    return g[REFLECTION_RUN_SLOTS];
+};
+// Waiting for a slot happens BEFORE the run's timeout clock starts, so a queued
+// reflection never burns its deadline waiting in line (the failure mode of the
+// old single shared "temp:memory-reflection" lane under concurrent bursts).
+export async function acquireReflectionRunSlot(maxConcurrentRuns) {
+    const state = getReflectionRunSlotState();
+    const max = Math.max(1, Math.floor(maxConcurrentRuns ?? DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS) || 1);
+    if (state.active < max) {
+        state.active += 1;
+    }
+    else {
+        await new Promise((resolve) => state.waiters.push(resolve));
+    }
+    let released = false;
+    return () => {
+        if (released)
+            return;
+        released = true;
+        const next = state.waiters.shift();
+        if (next)
+            next();
+        else
+            state.active -= 1;
+    };
+}
+export async function generateReflectionText(params) {
+    const releaseRunSlot = await acquireReflectionRunSlot(params.maxConcurrentRuns);
+    try {
+        return await generateReflectionTextUnbounded(params);
+    }
+    finally {
+        releaseRunSlot();
+    }
+}
+async function generateReflectionTextUnbounded(params) {
     const prompt = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
     const promptHash = sha256Hex(prompt);
     const tempSessionFile = join(tmpdir(), `memory-reflection-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
@@ -1184,7 +1225,7 @@ async function generateReflectionText(params) {
                 const embeddedTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
                 return await withTimeout(runEmbeddedPiAgent({
                     sessionId: `reflection-${Date.now()}`,
-                    sessionKey: "temp:memory-reflection",
+                    sessionKey: `temp:memory-reflection:${params.agentId}`,
                     agentId: params.agentId,
                     sessionFile: tempSessionFile,
                     workspaceDir: params.workspaceDir,
@@ -3320,6 +3361,7 @@ const memoryLanceDBProPlugin = {
             const reflectionMaxInputChars = config.memoryReflection?.maxInputChars ?? DEFAULT_REFLECTION_MAX_INPUT_CHARS;
             const reflectionTimeoutMs = config.memoryReflection?.timeoutMs ?? DEFAULT_REFLECTION_TIMEOUT_MS;
             const reflectionThinkLevel = config.memoryReflection?.thinkLevel ?? DEFAULT_REFLECTION_THINK_LEVEL;
+            const reflectionMaxConcurrentRuns = config.memoryReflection?.maxConcurrentRuns ?? DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS;
             const reflectionAgentId = asNonEmptyString(config.memoryReflection?.agentId);
             const reflectionModel = asNonEmptyString(config.memoryReflection?.model);
             const reflectionErrorReminderMaxEntries = parsePositiveInt(config.memoryReflection?.errorReminderMaxEntries) ?? DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES;
@@ -3671,6 +3713,7 @@ const memoryLanceDBProPlugin = {
                         workspaceDir,
                         timeoutMs: reflectionTimeoutMs,
                         thinkLevel: reflectionThinkLevel,
+                        maxConcurrentRuns: reflectionMaxConcurrentRuns,
                         toolErrorSignals,
                         logger: api.logger,
                         api, // SDK migration Bug 2: pass api for new runtime.agent API
@@ -4588,6 +4631,7 @@ export function parsePluginConfig(value) {
                 errorReminderMaxEntries: parsePositiveInt(memoryReflectionRaw.errorReminderMaxEntries) ?? DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES,
                 dedupeErrorSignals: memoryReflectionRaw.dedupeErrorSignals !== false,
                 serialCooldownMs: parsePositiveInt(memoryReflectionRaw.serialCooldownMs) ?? DEFAULT_SERIAL_GUARD_COOLDOWN_MS,
+                maxConcurrentRuns: parsePositiveInt(memoryReflectionRaw.maxConcurrentRuns) ?? DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS,
                 excludeAgents: Array.isArray(memoryReflectionRaw.excludeAgents)
                     ? memoryReflectionRaw.excludeAgents.filter((id) => typeof id === "string" && id.trim() !== "")
                     : undefined,
@@ -4605,6 +4649,7 @@ export function parsePluginConfig(value) {
                 errorReminderMaxEntries: DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES,
                 dedupeErrorSignals: DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS,
                 serialCooldownMs: DEFAULT_SERIAL_GUARD_COOLDOWN_MS,
+                maxConcurrentRuns: DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS,
                 excludeAgents: undefined,
             },
         sessionMemory: typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null

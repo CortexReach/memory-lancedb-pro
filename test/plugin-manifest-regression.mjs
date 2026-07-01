@@ -260,6 +260,25 @@ assert.ok(
     || !manifest.configSchema.properties.memoryReflection.required.includes("model"),
   "memoryReflection.model must stay optional so omitting it preserves the existing default model resolution",
 );
+assert.equal(
+  manifest.configSchema.properties.memoryReflection.properties.maxConcurrentRuns.type,
+  "integer",
+  "memoryReflection should expose the maxConcurrentRuns concurrency cap knob",
+);
+assert.equal(
+  manifest.configSchema.properties.memoryReflection.properties.maxConcurrentRuns.minimum,
+  1,
+  "maxConcurrentRuns minimum of 1 keeps the fully serialized escape hatch",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.uiHints, "memoryReflection.maxConcurrentRuns"),
+  "uiHints should expose the reflection concurrency cap",
+);
+assert.ok(
+  !Array.isArray(manifest.configSchema.properties.memoryReflection.required)
+    || !manifest.configSchema.properties.memoryReflection.required.includes("maxConcurrentRuns"),
+  "memoryReflection.maxConcurrentRuns must stay optional",
+);
 
 assert.equal(
   manifest.version,
