@@ -68,6 +68,19 @@ describe("TraceCollector", () => {
     assert.equal(trace.finalCount, 0);
   });
 
+  it("tracks operation-only stages", () => {
+    const tc = new TraceCollector();
+    tc.startStage("embed_query", [], "operation");
+    tc.endStage([]);
+
+    const trace = tc.finalize("q", "hybrid");
+    assert.equal(trace.stages[0].name, "embed_query");
+    assert.equal(trace.stages[0].kind, "operation");
+    assert.equal(trace.stages[0].inputCount, 0);
+    assert.equal(trace.stages[0].outputCount, 0);
+    assert.ok(tc.summarize().includes("embed_query: completed"));
+  });
+
   it("auto-closes unclosed stage on finalize", () => {
     const tc = new TraceCollector();
     tc.startStage("vector_search", ["a", "b"]);
