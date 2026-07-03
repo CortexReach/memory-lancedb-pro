@@ -5351,8 +5351,8 @@ const memoryLanceDBProPlugin = {
               `memory-lancedb-pro: initialized successfully ` +
               `(embedding: ${embedTest.success ? "OK" : "FAIL"}, ` +
               `retrieval: ${retrievalTest.success ? "OK" : "FAIL"}, ` +
-              `mode: ${retrievalTest.mode}, ` +
-              `FTS: ${retrievalTest.hasFtsSupport ? "enabled" : "disabled"})`,
+              `mode: ${retrievalTest.mode ?? "unknown"}, ` +
+              `FTS: ${retrievalTest.hasFtsSupport === undefined ? "unknown" : retrievalTest.hasFtsSupport ? "enabled" : "disabled"})`,
             );
 
             if (!embedTest.success) {
