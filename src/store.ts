@@ -858,7 +858,9 @@ export class MemoryStore {
     }
   }
 
-  private async ensureInitialized(): Promise<void> {
+  /** Public so callers can warm the one-time table open / FTS index build
+   *  outside latency-sensitive windows (startup health probes do this). */
+  async ensureInitialized(): Promise<void> {
     if (this.table) {
       return;
     }

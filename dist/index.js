@@ -4167,11 +4167,12 @@ const memoryLanceDBProPlugin = {
                             clearTimeout(timeout);
                     }
                 };
+                const STARTUP_CHECK_TIMEOUT_MS = parsePositiveInt(config.startupCheckTimeoutMs) ?? 8_000;
                 const runStartupPhase = async (label, check) => {
                     const startedAt = Date.now();
                     api.logger.info(`memory-lancedb-pro: startup check ${label} started`);
                     try {
-                        const result = await withTimeout(check(), 8_000, `${label} startup check`);
+                        const result = await withTimeout(check(), STARTUP_CHECK_TIMEOUT_MS, `${label} startup check`);
                         const elapsedMs = Date.now() - startedAt;
                         if (result.success) {
                             api.logger.info(`memory-lancedb-pro: startup check ${label} OK (${elapsedMs}ms)`);
@@ -4191,7 +4192,14 @@ const memoryLanceDBProPlugin = {
                 const runStartupChecks = async () => {
                     try {
                         api.logger.info(`memory-lancedb-pro: startup checks started (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`);
-                        const embedTest = await runStartupPhase("embedding", () => embedder.test({ timeoutMs: 7_500 }));
+                        // Warm the one-time store initialization (first table open, FTS
+                        // index build) outside the probe timers so the checks measure
+                        // steady-state behavior instead of cold-start costs.
+                        await runStartupPhase("store", async () => {
+                            await store.ensureInitialized();
+                            return { success: true };
+                        });
+                        const embedTest = await runStartupPhase("embedding", () => embedder.test({ timeoutMs: Math.max(1_000, STARTUP_CHECK_TIMEOUT_MS - 500) }));
                         const retrievalTest = await runStartupPhase("retrieval", () => retriever.test());
                         api.logger.info(`memory-lancedb-pro: initialized successfully ` +
                             `(embedding: ${embedTest.success ? "OK" : "FAIL"}, ` +
@@ -4480,6 +4488,7 @@ export function parsePluginConfig(value) {
         autoRecallPerItemMaxChars: parsePositiveInt(cfg.autoRecallPerItemMaxChars) ?? 180,
         autoRecallMaxQueryLength: clampInt(parsePositiveInt(cfg.autoRecallMaxQueryLength) ?? 2_000, 100, 10_000),
         autoRecallTimeoutMs: parsePositiveInt(cfg.autoRecallTimeoutMs) ?? 5000,
+        startupCheckTimeoutMs: parsePositiveInt(cfg.startupCheckTimeoutMs) ?? 8000,
         maxRecallPerTurn: parsePositiveInt(cfg.maxRecallPerTurn) ?? 10,
         recallMode: (cfg.recallMode === "full" || cfg.recallMode === "summary" || cfg.recallMode === "adaptive" || cfg.recallMode === "off") ? cfg.recallMode : "full",
         autoRecallExcludeAgents: Array.isArray(cfg.autoRecallExcludeAgents)

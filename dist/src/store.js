@@ -688,6 +688,8 @@ export class MemoryStore {
             // Index stats are best-effort; failures must never affect initialization.
         }
     }
+    /** Public so callers can warm the one-time table open / FTS index build
+     *  outside latency-sensitive windows (startup health probes do this). */
     async ensureInitialized() {
         if (this.table) {
             return;

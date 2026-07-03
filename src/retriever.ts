@@ -1970,9 +1970,13 @@ export class MemoryRetriever {
     };
 
     try {
+      // The health probe validates vector/FTS wiring, not the rerank vendor.
+      // A zero rerank budget trips the existing skip guard, so the probe never
+      // pays a cold remote rerank roundtrip.
       await this.retrieve({
         query,
         limit: 1,
+        rerankTimeoutMs: 0,
       });
       const fts = await resolveHealthFtsSupport();
 

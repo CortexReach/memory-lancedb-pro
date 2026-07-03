@@ -5330,6 +5330,14 @@ const memoryLanceDBProPlugin = {
               `memory-lancedb-pro: startup checks started (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`,
             );
 
+            // Warm the one-time store initialization (first table open, FTS
+            // index build) outside the probe timers so the checks measure
+            // steady-state behavior instead of cold-start costs.
+            await runStartupPhase("store", async () => {
+              await store.ensureInitialized();
+              return { success: true };
+            });
+
             const embedTest = await runStartupPhase(
               "embedding",
               () => embedder.test({ timeoutMs: Math.max(1_000, STARTUP_CHECK_TIMEOUT_MS - 500) }),
