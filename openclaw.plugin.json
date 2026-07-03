@@ -344,6 +344,13 @@
         "default": 5000,
         "description": "Timeout for the entire auto-recall pipeline (embedding + search + rerank) in milliseconds."
       },
+      "startupCheckTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 120000,
+        "default": 8000,
+        "description": "Outer time budget in milliseconds for each startup health check phase (embedding, retrieval). Raise on hosts where a cold boot exceeds 8 seconds; the checks run after startup and never block the gateway."
+      },
       "autoRecallMaxItems": {
         "type": "integer",
         "minimum": 1,
