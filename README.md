@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/cortexreach-memory-lancedb-pro-badge.png)](https://mseep.ai/app/cortexreach-memory-lancedb-pro)
+
 <div align="center">
 
 # 🧠 memory-lancedb-pro · 🦞OpenClaw Plugin
