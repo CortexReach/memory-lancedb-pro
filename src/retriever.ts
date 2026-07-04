@@ -811,7 +811,9 @@ export class MemoryRetriever {
     let failureStage: RetrievalDiagnostics["failureStage"] = "vector.embedQuery";
     try {
       const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
+      trace?.startStage("embed_query", [], "operation");
       const queryVector = await this.embedder.embedQuery(query, signal);
+      trace?.endStage([]);
       failureStage = "vector.vectorSearch";
       const results = await this.store.vectorSearch(
         queryVector,
@@ -1004,7 +1006,9 @@ export class MemoryRetriever {
     let failureStage: RetrievalDiagnostics["failureStage"] = "hybrid.embedQuery";
     try {
       const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
+      trace?.startStage("embed_query", [], "operation");
       const queryVector = await this.embedder.embedQuery(query, signal);
+      trace?.endStage([]);
       const bm25Query = this.buildBM25Query(query, source);
       if (diagnostics) {
         diagnostics.bm25Query = bm25Query;

@@ -16,13 +16,14 @@ export class TraceCollector {
      * @param name - Stage identifier (e.g. "vector_search")
      * @param entryIds - IDs of entries entering this stage
      */
-    startStage(name, entryIds) {
+    startStage(name, entryIds, kind = "pipeline") {
         // Auto-close any unclosed previous stage (defensive)
         if (this._pending) {
             this.endStage([...this._pending.inputIds]);
         }
         this._pending = {
             name,
+            kind,
             inputIds: new Set(entryIds),
             startTime: Date.now(),
         };
@@ -35,7 +36,7 @@ export class TraceCollector {
     endStage(survivingIds, scores) {
         if (!this._pending)
             return;
-        const { name, inputIds, startTime } = this._pending;
+        const { name, kind, inputIds, startTime } = this._pending;
         const survivingSet = new Set(survivingIds);
         const droppedIds = [];
         for (const id of inputIds) {
@@ -57,6 +58,7 @@ export class TraceCollector {
         }
         this._stages.push({
             name,
+            kind,
             inputCount: inputIds.size,
             outputCount: survivingIds.length,
             droppedIds,
@@ -90,6 +92,10 @@ export class TraceCollector {
         const lines = [];
         lines.push(`Retrieval trace (${this._stages.length} stages):`);
         for (const stage of this._stages) {
+            if (stage.kind === "operation") {
+                lines.push(`  ${stage.name}: completed ${stage.durationMs}ms`);
+                continue;
+            }
             const dropped = stage.inputCount - stage.outputCount;
             const scoreStr = stage.scoreRange
                 ? ` scores=[${stage.scoreRange[0].toFixed(3)}, ${stage.scoreRange[1].toFixed(3)}]`
