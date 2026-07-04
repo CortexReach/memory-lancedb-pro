@@ -179,6 +179,7 @@ export class SmartExtractor {
     admissionController;
     persistAdmissionAudit;
     onAdmissionRejected;
+    onPersisted;
     constructor(store, embedder, llm, config = {}) {
         this.store = store;
         this.embedder = embedder;
@@ -190,10 +191,27 @@ export class SmartExtractor {
             config.admissionControl?.enabled === true &&
                 config.admissionControl.auditMetadata !== false;
         this.onAdmissionRejected = config.onAdmissionRejected;
+        this.onPersisted = config.onPersisted;
         this.admissionController =
             config.admissionControl?.enabled === true
                 ? new AdmissionController(this.store, this.llm, config.admissionControl, this.debugLog)
                 : null;
+    }
+    /**
+     * Notify the onPersisted sink (e.g. markdown mirror) after a successful
+     * create or merge. Fire-and-forget from the caller's perspective: awaited
+     * here so ordering is deterministic, but errors are swallowed so a sink
+     * failure never fails the underlying store operation.
+     */
+    async notifyPersisted(entry, source, agentId) {
+        if (!this.onPersisted)
+            return;
+        try {
+            await this.onPersisted(entry, { source, agentId });
+        }
+        catch (err) {
+            this.log(`memory-pro: smart-extractor: onPersisted callback failed for entry "${entry.text.slice(0, 40)}": ${String(err)}`);
+        }
     }
     // --------------------------------------------------------------------------
     // Main entry point
@@ -213,6 +231,7 @@ export class SmartExtractor {
         const scopeFilter = hasExplicitScopeFilter
             ? options.scopeFilter
             : [targetScope];
+        const agentId = options.agentId;
         // Step 1: LLM extraction
         const candidates = await this.extractCandidates(conversationText);
         if (candidates.length === 0) {
@@ -288,7 +307,7 @@ export class SmartExtractor {
         const pendingSupersedeInvalidations = [];
         for (const { index, candidate } of processableCandidates) {
             try {
-                await this.processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVectors.get(index), createEntries, pendingSupersedeInvalidations);
+                await this.processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVectors.get(index), createEntries, pendingSupersedeInvalidations, agentId);
             }
             catch (err) {
                 this.log(`memory-pro: smart-extractor: failed to process candidate [${candidate.category}]: ${String(err)}`);
@@ -298,6 +317,14 @@ export class SmartExtractor {
             const createdEntries = await this.bulkStoreAndValidate(createEntries);
             if (createdEntries) {
                 await this.applyPendingSupersedeInvalidations(createdEntries, pendingSupersedeInvalidations);
+                for (const created of createdEntries) {
+                    await this.notifyPersisted({
+                        text: created.text,
+                        category: created.category,
+                        scope: created.scope,
+                        timestamp: created.timestamp,
+                    }, "smart-extraction", agentId);
+                }
             }
             else if (pendingSupersedeInvalidations.length > 0) {
                 this.log("memory-pro: smart-extractor: supersede invalidation skipped because bulkStore() did not return created entries");
@@ -537,10 +564,10 @@ export class SmartExtractor {
      *   When provided (from batch pre-embedding), skips the per-candidate embed
      *   call to reduce API round-trips.
      */
-    async processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVector, createEntries, pendingSupersedeInvalidations) {
+    async processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVector, createEntries, pendingSupersedeInvalidations, agentId) {
         // Profile always merges (skip dedup — admission control still applies)
         if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
-            const profileResult = await this.handleProfileMerge(candidate, conversationText, sessionKey, targetScope, scopeFilter, undefined, createEntries);
+            const profileResult = await this.handleProfileMerge(candidate, conversationText, sessionKey, targetScope, scopeFilter, undefined, createEntries, agentId);
             if (profileResult === "rejected") {
                 stats.rejected = (stats.rejected ?? 0) + 1;
             }
@@ -586,7 +613,7 @@ export class SmartExtractor {
             case "merge":
                 if (dedupResult.matchId &&
                     MERGE_SUPPORTED_CATEGORIES.has(candidate.category)) {
-                    await this.handleMerge(candidate, dedupResult.matchId, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries);
+                    await this.handleMerge(candidate, dedupResult.matchId, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId);
                     stats.merged++;
                 }
                 else {
@@ -602,7 +629,7 @@ export class SmartExtractor {
             case "supersede":
                 if (dedupResult.matchId &&
                     TEMPORAL_VERSIONED_CATEGORIES.has(candidate.category)) {
-                    await this.handleSupersede(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, admission?.audit, createEntries, pendingSupersedeInvalidations);
+                    await this.handleSupersede(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, admission?.audit, createEntries, pendingSupersedeInvalidations, agentId);
                     stats.created++;
                     stats.superseded = (stats.superseded ?? 0) + 1;
                 }
@@ -623,7 +650,7 @@ export class SmartExtractor {
                 break;
             case "contextualize":
                 if (dedupResult.matchId) {
-                    await this.handleContextualize(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries);
+                    await this.handleContextualize(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId);
                     stats.created++;
                 }
                 else {
@@ -635,12 +662,12 @@ export class SmartExtractor {
                 if (dedupResult.matchId) {
                     if (TEMPORAL_VERSIONED_CATEGORIES.has(candidate.category) &&
                         dedupResult.contextLabel === "general") {
-                        await this.handleSupersede(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, admission?.audit, createEntries, pendingSupersedeInvalidations);
+                        await this.handleSupersede(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, admission?.audit, createEntries, pendingSupersedeInvalidations, agentId);
                         stats.created++;
                         stats.superseded = (stats.superseded ?? 0) + 1;
                     }
                     else {
-                        await this.handleContradict(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries);
+                        await this.handleContradict(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId);
                         stats.created++;
                     }
                 }
@@ -752,7 +779,7 @@ export class SmartExtractor {
     /**
      * Profile always-merge: read existing profile, merge with LLM, upsert.
      */
-    async handleProfileMerge(candidate, conversationText, sessionKey, targetScope, scopeFilter, admissionAudit, createEntries) {
+    async handleProfileMerge(candidate, conversationText, sessionKey, targetScope, scopeFilter, admissionAudit, createEntries, agentId) {
         // Find existing profile memory by category
         const embeddingText = `${candidate.abstract} ${candidate.content}`;
         const vector = await this.embedder.embed(embeddingText);
@@ -783,7 +810,7 @@ export class SmartExtractor {
             }
         });
         if (profileMatch) {
-            await this.handleMerge(candidate, profileMatch.entry.id, targetScope, scopeFilter, undefined, admissionAudit, createEntries);
+            await this.handleMerge(candidate, profileMatch.entry.id, targetScope, scopeFilter, undefined, admissionAudit, createEntries, agentId);
             return "merged";
         }
         else {
@@ -795,7 +822,7 @@ export class SmartExtractor {
     /**
      * Merge a candidate into an existing memory using LLM.
      */
-    async handleMerge(candidate, matchId, targetScope, scopeFilter, contextLabel, admissionAudit, createEntries) {
+    async handleMerge(candidate, matchId, targetScope, scopeFilter, contextLabel, admissionAudit, createEntries, agentId) {
         let existingAbstract = "";
         let existingOverview = "";
         let existingContent = "";
@@ -840,6 +867,12 @@ export class SmartExtractor {
             vector: newVector,
             metadata,
         }, scopeFilter);
+        await this.notifyPersisted({
+            text: merged.abstract,
+            category: this.mapToStoreCategory(candidate.category),
+            scope: targetScope,
+            timestamp: Date.now(),
+        }, "smart-extraction", agentId);
         // Update support stats on the merged memory
         try {
             const updatedEntry = await this.store.getById(matchId, scopeFilter);
@@ -860,7 +893,7 @@ export class SmartExtractor {
      * Handle SUPERSEDE: preserve the old record as historical but mark it as no
      * longer current, then create the new active fact.
      */
-    async handleSupersede(candidate, vector, matchId, sessionKey, targetScope, scopeFilter, admissionAudit, createEntries, pendingSupersedeInvalidations) {
+    async handleSupersede(candidate, vector, matchId, sessionKey, targetScope, scopeFilter, admissionAudit, createEntries, pendingSupersedeInvalidations, agentId) {
         const existing = await this.store.getById(matchId, scopeFilter);
         if (!existing) {
             createEntries?.push(this.buildStoreEntry(candidate, vector || [], sessionKey, targetScope));
@@ -920,6 +953,7 @@ export class SmartExtractor {
         }
         const created = await this.store.store(entry);
         await this.invalidateSupersededMemory(matchId, existing, factKey, created.id, scopeFilter);
+        await this.notifyPersisted({ text: created.text, category: created.category, scope: created.scope, timestamp: created.timestamp }, "smart-extraction", agentId);
         this.log(`memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`);
     }
     async applyPendingSupersedeInvalidations(createdEntries, pendingSupersedeInvalidations) {
@@ -967,7 +1001,7 @@ export class SmartExtractor {
      * Handle CONTEXTUALIZE: create a new entry that adds situational nuance,
      * linked to the original via a relation in metadata.
      */
-    async handleContextualize(candidate, vector, matchId, sessionKey, targetScope, scopeFilter, contextLabel, admissionAudit, createEntries) {
+    async handleContextualize(candidate, vector, matchId, sessionKey, targetScope, scopeFilter, contextLabel, admissionAudit, createEntries, agentId) {
         const storeCategory = this.mapToStoreCategory(candidate.category);
         const metadata = stringifySmartMetadata(this.withAdmissionAudit({
             l0_abstract: candidate.abstract,
@@ -1000,7 +1034,8 @@ export class SmartExtractor {
             createEntries.push(entry_c);
         }
         else {
-            await this.store.store(entry_c);
+            const created = await this.store.store(entry_c);
+            await this.notifyPersisted({ text: created.text, category: created.category, scope: created.scope, timestamp: created.timestamp }, "smart-extraction", agentId);
         }
         this.log(`memory-pro: smart-extractor: contextualize [${contextLabel || "general"}] new entry linked to ${matchId.slice(0, 8)}`);
     }
@@ -1008,7 +1043,7 @@ export class SmartExtractor {
      * Handle CONTRADICT: create contradicting entry + record contradiction evidence
      * on the original memory's support stats.
      */
-    async handleContradict(candidate, vector, matchId, sessionKey, targetScope, scopeFilter, contextLabel, admissionAudit, createEntries) {
+    async handleContradict(candidate, vector, matchId, sessionKey, targetScope, scopeFilter, contextLabel, admissionAudit, createEntries, agentId) {
         // 1. Record contradiction on the existing memory
         const existing = await this.store.getById(matchId, scopeFilter);
         if (existing) {
@@ -1051,7 +1086,8 @@ export class SmartExtractor {
             createEntries.push(entry_d);
         }
         else {
-            await this.store.store(entry_d);
+            const created = await this.store.store(entry_d);
+            await this.notifyPersisted({ text: created.text, category: created.category, scope: created.scope, timestamp: created.timestamp }, "smart-extraction", agentId);
         }
         this.log(`memory-pro: smart-extractor: contradict [${contextLabel || "general"}] on ${matchId.slice(0, 8)}, new entry created`);
     }

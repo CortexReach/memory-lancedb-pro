@@ -1786,6 +1786,9 @@ function _initPluginState(api) {
         api.logger.info(`memory-lancedb-pro: CLAWTEAM_MEMORY_SCOPE added scopes: ${clawteamScopes.join(", ")}`);
     }
     const migrator = createMigrator(store);
+    // Created here (ahead of SmartExtractor) because SmartExtractor's onPersisted
+    // callback below closes over it.
+    const mdMirror = createMdMirrorWriter(api, config);
     let smartExtractor = null;
     if (config.smartExtraction !== false) {
         try {
@@ -1828,6 +1831,7 @@ function _initPluginState(api) {
                 workspaceBoundary: config.workspaceBoundary,
                 admissionControl: config.admissionControl,
                 onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
+                onPersisted: mdMirror ?? undefined,
                 log: (msg) => api.logger.info(msg),
                 debugLog: (msg) => api.logger.debug(msg),
                 noiseBank,
@@ -1874,6 +1878,7 @@ function _initPluginState(api) {
         scopeManager,
         migrator,
         smartExtractor,
+        mdMirror,
         extractionRateLimiter,
         reflectionErrorStateBySession,
         reflectionDerivedBySession,
@@ -1991,7 +1996,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2273,10 +2278,8 @@ const memoryLanceDBProPlugin = {
             }
             api.logger.debug(`memory-lancedb-pro: ingress before_message_write agent=${ctx.agentId || event.agentId || "unknown"} sessionKey=${ctx.sessionKey || event.sessionKey || "unknown"} role=${role} ${summarizeMessageContent(message?.content)}`);
         });
-        // ========================================================================
-        // Markdown Mirror
-        // ========================================================================
-        const mdMirror = createMdMirrorWriter(api, config);
+        // mdMirror comes from the singleton state (created once in _initPluginState
+        // so SmartExtractor's onPersisted callback can close over the same instance).
         // ========================================================================
         // Register Tools
         // ========================================================================
@@ -2942,7 +2945,7 @@ const memoryLanceDBProPlugin = {
                                 // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
                                 let stats = null;
                                 try {
-                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes });
+                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId });
                                 }
                                 catch (err) {
                                     api.logger.error(`memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`);

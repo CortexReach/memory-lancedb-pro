@@ -2311,6 +2311,7 @@ interface PluginSingletonState {
   scopeManager: ReturnType<typeof createScopeManager>;
   migrator: ReturnType<typeof createMigrator>;
   smartExtractor: SmartExtractor | null;
+  mdMirror: MdMirrorWriter | null;
   extractionRateLimiter: ReturnType<typeof createExtractionRateLimiter>;
   // Session Maps — persist across scope refreshes instead of being recreated
   reflectionErrorStateBySession: Map<string, ReflectionErrorState>;
@@ -2436,6 +2437,10 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
 
   const migrator = createMigrator(store);
 
+  // Created here (ahead of SmartExtractor) because SmartExtractor's onPersisted
+  // callback below closes over it.
+  const mdMirror = createMdMirrorWriter(api, config);
+
   let smartExtractor: SmartExtractor | null = null;
   if (config.smartExtraction !== false) {
     try {
@@ -2484,6 +2489,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         workspaceBoundary: config.workspaceBoundary,
         admissionControl: config.admissionControl,
         onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
+        onPersisted: mdMirror ?? undefined,
         log: (msg: string) => api.logger.info(msg),
         debugLog: (msg: string) => api.logger.debug(msg),
         noiseBank,
@@ -2538,6 +2544,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     scopeManager,
     migrator,
     smartExtractor,
+    mdMirror,
     extractionRateLimiter,
     reflectionErrorStateBySession,
     reflectionDerivedBySession,
@@ -2686,6 +2693,7 @@ const memoryLanceDBProPlugin = {
       scopeManager,
       migrator,
       smartExtractor,
+      mdMirror,
       decayEngine,
       tierManager,
       extractionRateLimiter,
@@ -3061,11 +3069,8 @@ const memoryLanceDBProPlugin = {
       );
     });
 
-    // ========================================================================
-    // Markdown Mirror
-    // ========================================================================
-
-    const mdMirror = createMdMirrorWriter(api, config);
+    // mdMirror comes from the singleton state (created once in _initPluginState
+    // so SmartExtractor's onPersisted callback can close over the same instance).
 
     // ========================================================================
     // Register Tools
@@ -3873,7 +3878,7 @@ const memoryLanceDBProPlugin = {
               try {
                 stats = await smartExtractor.extractAndPersist(
                   conversationText, sessionKey,
-                  { scope: defaultScope, scopeFilter: accessibleScopes },
+                  { scope: defaultScope, scopeFilter: accessibleScopes, agentId },
                 );
               } catch (err) {
                 api.logger.error(

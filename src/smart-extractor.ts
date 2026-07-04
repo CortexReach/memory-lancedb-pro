@@ -246,6 +246,20 @@ const VALID_DECISIONS = new Set<string>([
 // Smart Extractor
 // ============================================================================
 
+/** Entry data for a memory that was just created or merged, as persisted to the store. */
+export interface PersistedMemoryEntry {
+  text: string;
+  category: string;
+  scope: string;
+  timestamp: number;
+}
+
+/** Context describing which pipeline produced a PersistedMemoryEntry. */
+export interface PersistedMemoryMeta {
+  source: string;
+  agentId?: string;
+}
+
 export interface SmartExtractorConfig {
   /** User identifier for extraction prompt. */
   user?: string;
@@ -267,6 +281,8 @@ export interface SmartExtractorConfig {
   admissionControl?: AdmissionControlConfig;
   /** Optional sink for durable reject-audit logging. */
   onAdmissionRejected?: (entry: AdmissionRejectionAuditEntry) => Promise<void> | void;
+  /** Optional sink invoked after a memory is successfully created or merged (e.g. markdown mirror). */
+  onPersisted?: (entry: PersistedMemoryEntry, meta: PersistedMemoryMeta) => Promise<void> | void;
 }
 
 export interface ExtractPersistOptions {
@@ -280,6 +296,8 @@ export interface ExtractPersistOptions {
    * - pass a non-empty array to restrict reads to those scopes
    */
   scopeFilter?: string[];
+  /** Agent identifier forwarded to onPersisted, resolved the same way callers resolve it for other sinks. */
+  agentId?: string;
 }
 
 export class SmartExtractor {
@@ -288,6 +306,7 @@ export class SmartExtractor {
   private admissionController: AdmissionController | null;
   private persistAdmissionAudit: boolean;
   private onAdmissionRejected?: (entry: AdmissionRejectionAuditEntry) => Promise<void> | void;
+  private onPersisted?: (entry: PersistedMemoryEntry, meta: PersistedMemoryMeta) => Promise<void> | void;
 
   constructor(
     private store: MemoryStore,
@@ -301,6 +320,7 @@ export class SmartExtractor {
       config.admissionControl?.enabled === true &&
       config.admissionControl.auditMetadata !== false;
     this.onAdmissionRejected = config.onAdmissionRejected;
+    this.onPersisted = config.onPersisted;
     this.admissionController =
       config.admissionControl?.enabled === true
         ? new AdmissionController(
@@ -310,6 +330,27 @@ export class SmartExtractor {
             this.debugLog,
           )
         : null;
+  }
+
+  /**
+   * Notify the onPersisted sink (e.g. markdown mirror) after a successful
+   * create or merge. Fire-and-forget from the caller's perspective: awaited
+   * here so ordering is deterministic, but errors are swallowed so a sink
+   * failure never fails the underlying store operation.
+   */
+  private async notifyPersisted(
+    entry: PersistedMemoryEntry,
+    source: string,
+    agentId?: string,
+  ): Promise<void> {
+    if (!this.onPersisted) return;
+    try {
+      await this.onPersisted(entry, { source, agentId });
+    } catch (err) {
+      this.log(
+        `memory-pro: smart-extractor: onPersisted callback failed for entry "${entry.text.slice(0, 40)}": ${String(err)}`,
+      );
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -335,6 +376,7 @@ export class SmartExtractor {
     const scopeFilter = hasExplicitScopeFilter
       ? options.scopeFilter
       : [targetScope];
+    const agentId = options.agentId;
 
     // Step 1: LLM extraction
     const candidates = await this.extractCandidates(conversationText);
@@ -441,6 +483,7 @@ export class SmartExtractor {
           precomputedVectors.get(index),
           createEntries,
           pendingSupersedeInvalidations,
+          agentId,
         );
       } catch (err) {
         this.log(
@@ -456,6 +499,18 @@ export class SmartExtractor {
           createdEntries,
           pendingSupersedeInvalidations,
         );
+        for (const created of createdEntries) {
+          await this.notifyPersisted(
+            {
+              text: created.text,
+              category: created.category,
+              scope: created.scope,
+              timestamp: created.timestamp,
+            },
+            "smart-extraction",
+            agentId,
+          );
+        }
       } else if (pendingSupersedeInvalidations.length > 0) {
         this.log(
           "memory-pro: smart-extractor: supersede invalidation skipped because bulkStore() did not return created entries",
@@ -784,6 +839,7 @@ export class SmartExtractor {
     precomputedVector?: number[],
     createEntries?: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[],
     pendingSupersedeInvalidations?: PendingSupersedeInvalidation[],
+    agentId?: string,
   ): Promise<void> {
     // Profile always merges (skip dedup — admission control still applies)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -795,6 +851,7 @@ export class SmartExtractor {
         scopeFilter,
         undefined,
         createEntries,
+        agentId,
       );
       if (profileResult === "rejected") {
         stats.rejected = (stats.rejected ?? 0) + 1;
@@ -864,6 +921,7 @@ export class SmartExtractor {
             dedupResult.contextLabel,
             admission?.audit,
             createEntries,
+            agentId,
           );
           stats.merged++;
         } else {
@@ -895,6 +953,7 @@ export class SmartExtractor {
             admission?.audit,
             createEntries,
             pendingSupersedeInvalidations,
+            agentId,
           );
           stats.created++;
           stats.superseded = (stats.superseded ?? 0) + 1;
@@ -916,7 +975,7 @@ export class SmartExtractor {
 
       case "contextualize":
         if (dedupResult.matchId) {
-          await this.handleContextualize(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries);
+          await this.handleContextualize(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId);
           stats.created++;
         } else {
           createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
@@ -940,11 +999,12 @@ export class SmartExtractor {
               admission?.audit,
               createEntries,
               pendingSupersedeInvalidations,
+              agentId,
             );
             stats.created++;
             stats.superseded = (stats.superseded ?? 0) + 1;
           } else {
-            await this.handleContradict(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries);
+            await this.handleContradict(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId);
             stats.created++;
           }
         } else {
@@ -1103,6 +1163,7 @@ export class SmartExtractor {
     scopeFilter?: string[],
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
+    agentId?: string,
   ): Promise<"merged" | "created" | "rejected"> {
     // Find existing profile memory by category
     const embeddingText = `${candidate.abstract} ${candidate.content}`;
@@ -1151,6 +1212,7 @@ export class SmartExtractor {
         undefined,
         admissionAudit,
         createEntries,
+        agentId,
       );
       return "merged";
     } else {
@@ -1171,6 +1233,7 @@ export class SmartExtractor {
     contextLabel?: string,
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
+    agentId?: string,
   ): Promise<void> {
     let existingAbstract = "";
     let existingOverview = "";
@@ -1253,6 +1316,17 @@ export class SmartExtractor {
       scopeFilter,
     );
 
+    await this.notifyPersisted(
+      {
+        text: merged.abstract,
+        category: this.mapToStoreCategory(candidate.category),
+        scope: targetScope,
+        timestamp: Date.now(),
+      },
+      "smart-extraction",
+      agentId,
+    );
+
     // Update support stats on the merged memory
     try {
       const updatedEntry = await this.store.getById(matchId, scopeFilter);
@@ -1286,6 +1360,7 @@ export class SmartExtractor {
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
     pendingSupersedeInvalidations?: PendingSupersedeInvalidation[],
+    agentId?: string,
   ): Promise<void> {
     const existing = await this.store.getById(matchId, scopeFilter);
     if (!existing) {
@@ -1360,6 +1435,11 @@ export class SmartExtractor {
       factKey,
       created.id,
       scopeFilter,
+    );
+    await this.notifyPersisted(
+      { text: created.text, category: created.category, scope: created.scope, timestamp: created.timestamp },
+      "smart-extraction",
+      agentId,
     );
 
     this.log(
@@ -1465,6 +1545,7 @@ export class SmartExtractor {
     contextLabel?: string,
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
+    agentId?: string,
   ): Promise<void> {
     const storeCategory = this.mapToStoreCategory(candidate.category);
     const metadata = stringifySmartMetadata(this.withAdmissionAudit({
@@ -1498,7 +1579,12 @@ export class SmartExtractor {
     if (createEntries) {
       createEntries.push(entry_c);
     } else {
-      await this.store.store(entry_c);
+      const created = await this.store.store(entry_c);
+      await this.notifyPersisted(
+        { text: created.text, category: created.category, scope: created.scope, timestamp: created.timestamp },
+        "smart-extraction",
+        agentId,
+      );
     }
 
     this.log(
@@ -1520,6 +1606,7 @@ export class SmartExtractor {
     contextLabel?: string,
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
+    agentId?: string,
   ): Promise<void> {
     // 1. Record contradiction on the existing memory
     const existing = await this.store.getById(matchId, scopeFilter);
@@ -1568,7 +1655,12 @@ export class SmartExtractor {
     if (createEntries) {
       createEntries.push(entry_d);
     } else {
-      await this.store.store(entry_d);
+      const created = await this.store.store(entry_d);
+      await this.notifyPersisted(
+        { text: created.text, category: created.category, scope: created.scope, timestamp: created.timestamp },
+        "smart-extraction",
+        agentId,
+      );
     }
 
     this.log(
