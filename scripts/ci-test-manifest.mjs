@@ -35,6 +35,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/smart-memory-lifecycle.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-branches.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-embed.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/smart-extractor-noise-gating.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-capability-runtime.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/dreaming-engine.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-governance-tools.test.mjs", args: ["--test"] },
