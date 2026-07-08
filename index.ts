@@ -2206,7 +2206,7 @@ const memoryLanceDBProPlugin = {
 
           // Model-aware injection limits: reasoning models (mimo, deepseek-reasoning, etc.)
           // are more sensitive to injected context and may enter repetition loops.
-          // Apply conservative limits for these models to prevent output degradation.
+          // For these models, completely disable auto-recall to prevent output degradation.
           const REASONING_MODEL_PATTERNS = [
             /^mimo-/i,
             /^deepseek.*reasoning/i,
@@ -2222,26 +2222,17 @@ const memoryLanceDBProPlugin = {
           const modelId = ctx?.modelId || "";
           const isReasoning = isReasoningModel(modelId);
 
-          // Apply model-specific budget adjustments
-          const baseMaxItems = config.autoRecallMaxItems ?? 3;
-          const baseMaxChars = config.autoRecallMaxChars ?? 600;
-          const basePerItemMaxChars = config.autoRecallPerItemMaxChars ?? 180;
-
-          // For reasoning models, use more conservative defaults (50% reduction)
-          const REASONING_MODEL_REDUCTION = 0.5;
-          const adjustedMaxItems = isReasoning ? Math.max(1, Math.floor(baseMaxItems * REASONING_MODEL_REDUCTION)) : baseMaxItems;
-          const adjustedMaxChars = isReasoning ? Math.max(64, Math.floor(baseMaxChars * REASONING_MODEL_REDUCTION)) : baseMaxChars;
-          const adjustedPerItemMaxChars = isReasoning ? Math.max(32, Math.floor(basePerItemMaxChars * REASONING_MODEL_REDUCTION)) : basePerItemMaxChars;
-
+          // For reasoning models, completely skip auto-recall to prevent repetition loops
           if (isReasoning) {
             api.logger.info(
-              `memory-lancedb-pro: reasoning model detected (${modelId}), applying conservative injection limits: items=${adjustedMaxItems}, chars=${adjustedMaxChars}, perItem=${adjustedPerItemMaxChars}`
+              `memory-lancedb-pro: reasoning model detected (${modelId}), skipping auto-recall entirely to prevent repetition loops`
             );
+            return;
           }
 
-          const autoRecallMaxItems = clampInt(adjustedMaxItems, 1, 20);
-          const autoRecallMaxChars = clampInt(adjustedMaxChars, 64, 8000);
-          const autoRecallPerItemMaxChars = clampInt(adjustedPerItemMaxChars, 32, 1000);
+          const autoRecallMaxItems = clampInt(config.autoRecallMaxItems ?? 3, 1, 20);
+          const autoRecallMaxChars = clampInt(config.autoRecallMaxChars ?? 600, 64, 8000);
+          const autoRecallPerItemMaxChars = clampInt(config.autoRecallPerItemMaxChars ?? 180, 32, 1000);
           const retrieveLimit = clampInt(Math.max(autoRecallMaxItems * 2, autoRecallMaxItems), 1, 20);
 
           const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry({
