@@ -1190,6 +1190,13 @@ function isInternalReflectionSessionKey(sessionKey: unknown): boolean {
   return typeof sessionKey === "string" && sessionKey.trim().startsWith("temp:memory-reflection");
 }
 
+// Memory sub-completions (active-memory's embedded recall sub-build, and any :subagent:
+// sub-build) must not re-enter memory prompt injection: they would waste an embedding+vector
+// search per turn, and their injected block can leak into the main prompt via shared session messages.
+function isMemorySubsessionKey(sessionKey: unknown): boolean {
+  return typeof sessionKey === "string" && (sessionKey.includes(":subagent:") || sessionKey.includes(":active-memory:"));
+}
+
 function extractTextContent(content: unknown): string | null {
   if (!content) return null;
   if (typeof content === "string") return content;
@@ -3206,7 +3213,7 @@ const memoryLanceDBProPlugin = {
         const autoRecallDeadlineMs = Date.now() + AUTO_RECALL_TIMEOUT_MS;
         // Skip auto-recall for sub-agent sessions — their context comes from the parent.
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
-        if (sessionKey.includes(":subagent:")) return;
+        if (isMemorySubsessionKey(sessionKey)) return;
 
         // Per-agent inclusion/exclusion: autoRecallIncludeAgents takes precedence over autoRecallExcludeAgents.
         // - If autoRecallIncludeAgents is set: ONLY these agents receive auto-recall
@@ -4347,6 +4354,7 @@ const memoryLanceDBProPlugin = {
 
         api.on("before_prompt_build", async (event: any, ctx: any) => {
           const sessionKey = getSelfImprovementSessionKey(event, ctx);
+          if (isMemorySubsessionKey(sessionKey)) return;
           if (!sessionKey || !pendingSelfImprovementResetReminderBySession.delete(sessionKey)) {
             return;
           }
@@ -4461,7 +4469,7 @@ const memoryLanceDBProPlugin = {
       api.on("before_prompt_build", async (_event: any, ctx: any) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         // Skip reflection injection for sub-agent sessions.
-        if (sessionKey.includes(":subagent:")) return;
+        if (isMemorySubsessionKey(sessionKey)) return;
         if (isInternalReflectionSessionKey(sessionKey)) return;
         if (reflectionInjectMode !== "inheritance-only" && reflectionInjectMode !== "inheritance+derived") return;
         try {
@@ -4494,7 +4502,7 @@ const memoryLanceDBProPlugin = {
       api.on("before_prompt_build", async (_event: any, ctx: any) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         // Skip reflection injection for sub-agent sessions.
-        if (sessionKey.includes(":subagent:")) return;
+        if (isMemorySubsessionKey(sessionKey)) return;
         if (isInternalReflectionSessionKey(sessionKey)) return;
         const agentId = resolveHookAgentId(
           typeof ctx.agentId === "string" ? ctx.agentId : undefined,
