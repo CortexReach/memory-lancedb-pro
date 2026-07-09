@@ -228,6 +228,12 @@
                 "description": "Delay before the first storage maintenance run after service start."
               }
             }
+          },
+          "readConsistencyIntervalSeconds": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "Seconds between checks for LanceDB table updates committed by other processes (e.g. a CLI delete-bulk while this service holds a long-lived read handle). 0 means strong consistency: every read checks for updates."
           }
         }
       },
@@ -1807,6 +1813,12 @@
       "label": "Storage Cleanup Initial Delay",
       "placeholder": "300000",
       "help": "Milliseconds to wait after startup before the first storage cleanup run.",
+      "advanced": true
+    },
+    "storageMaintenance.readConsistencyIntervalSeconds": {
+      "label": "Read Consistency Interval",
+      "placeholder": "0",
+      "help": "Seconds between checks for table updates from other processes (e.g. a CLI delete-bulk). 0 checks on every read; a running gateway may otherwise take up to this many seconds to notice deletes made elsewhere.",
       "advanced": true
     },
     "redisUrl": {

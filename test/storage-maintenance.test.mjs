@@ -182,3 +182,54 @@ describe("storage maintenance config", () => {
     );
   });
 });
+
+describe("read consistency interval config", () => {
+  it("parses an explicit non-zero interval alongside auto-cleanup", () => {
+    const parsed = parsePluginConfig({
+      embedding: { apiKey: "test-key" },
+      storageMaintenance: {
+        autoCleanup: { enabled: true, intervalHours: 12, retentionDays: 5, initialDelayMs: 0 },
+        readConsistencyIntervalSeconds: 15,
+      },
+    });
+
+    assert.deepEqual(parsed.storageMaintenance, {
+      autoCleanup: {
+        enabled: true,
+        intervalHours: 12,
+        retentionDays: 5,
+        initialDelayMs: 0,
+      },
+      readConsistencyIntervalSeconds: 15,
+    });
+  });
+
+  it("preserves an explicit 0 (strong consistency) rather than treating it as unset", () => {
+    const parsed = parsePluginConfig({
+      embedding: { apiKey: "test-key" },
+      storageMaintenance: { readConsistencyIntervalSeconds: 0 },
+    });
+
+    assert.deepEqual(parsed.storageMaintenance, { readConsistencyIntervalSeconds: 0 });
+  });
+
+  it("omits storageMaintenance entirely when neither knob is configured", () => {
+    const parsed = parsePluginConfig({ embedding: { apiKey: "test-key" } });
+    assert.equal(parsed.storageMaintenance, undefined);
+  });
+
+  it("declares schema and ui hints for the read consistency interval", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    );
+
+    assert.equal(
+      manifest.configSchema.properties.storageMaintenance.properties.readConsistencyIntervalSeconds.default,
+      0,
+    );
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(manifest.uiHints, "storageMaintenance.readConsistencyIntervalSeconds"),
+      "read consistency interval should be discoverable in ui hints",
+    );
+  });
+});

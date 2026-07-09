@@ -5725,15 +5725,19 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
     storageMaintenance: (storageAutoCleanupRaw || readConsistencyIntervalSecondsRaw !== undefined)
       ? {
-        autoCleanup: storageAutoCleanupRaw
+        ...(storageAutoCleanupRaw
           ? {
-            enabled: storageAutoCleanupRaw.enabled === true,
-            intervalHours: parsePositiveInt(storageAutoCleanupRaw.intervalHours) ?? 24,
-            retentionDays: parsePositiveInt(storageAutoCleanupRaw.retentionDays) ?? 7,
-            initialDelayMs: parseNonNegativeInt(storageAutoCleanupRaw.initialDelayMs) ?? 300_000,
+            autoCleanup: {
+              enabled: storageAutoCleanupRaw.enabled === true,
+              intervalHours: parsePositiveInt(storageAutoCleanupRaw.intervalHours) ?? 24,
+              retentionDays: parsePositiveInt(storageAutoCleanupRaw.retentionDays) ?? 7,
+              initialDelayMs: parseNonNegativeInt(storageAutoCleanupRaw.initialDelayMs) ?? 300_000,
+            },
           }
-          : undefined,
-        readConsistencyIntervalSeconds: readConsistencyIntervalSecondsRaw,
+          : {}),
+        ...(readConsistencyIntervalSecondsRaw !== undefined
+          ? { readConsistencyIntervalSeconds: readConsistencyIntervalSecondsRaw }
+          : {}),
       }
       : undefined,
     redisUrl: legacyRedisUrl,
