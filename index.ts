@@ -146,6 +146,11 @@ interface PluginConfig {
       retentionDays?: number;
       initialDelayMs?: number;
     };
+    /** Seconds between checks for table updates committed by other processes
+     *  (e.g. a CLI delete-bulk while this gateway holds a long-lived read
+     *  handle). 0 = strong consistency (check every read, default). Unset
+     *  disables the check entirely (matches the LanceDB SDK default). */
+    readConsistencyIntervalSeconds?: number;
   };
   redisUrl?: string;
   locking?: {
@@ -2355,6 +2360,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     dbPath: resolvedDbPath,
     vectorDim,
     disableNativeCosine: config.retrieval?.disableNativeCosine === true,
+    readConsistencyInterval: config.storageMaintenance?.readConsistencyIntervalSeconds ?? 0,
     redisLock: config.locking?.redis,
     onStoragePathWarning: (message) => api.logger.warn(message),
     onLockWarning: (message) => api.logger.warn(message),
@@ -5628,6 +5634,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   const storageAutoCleanupRaw = typeof storageMaintenanceRaw?.autoCleanup === "object" && storageMaintenanceRaw.autoCleanup !== null
     ? storageMaintenanceRaw.autoCleanup as Record<string, unknown>
     : null;
+  const readConsistencyIntervalSecondsRaw = parseNonNegativeInt(storageMaintenanceRaw?.readConsistencyIntervalSeconds);
   const lockingRaw = typeof cfg.locking === "object" && cfg.locking !== null
     ? cfg.locking as Record<string, unknown>
     : null;
@@ -5716,14 +5723,17 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       clientTimeoutMs: parsePositiveInt(embedding.clientTimeoutMs),
     },
     dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
-    storageMaintenance: storageAutoCleanupRaw
+    storageMaintenance: (storageAutoCleanupRaw || readConsistencyIntervalSecondsRaw !== undefined)
       ? {
-        autoCleanup: {
-          enabled: storageAutoCleanupRaw.enabled === true,
-          intervalHours: parsePositiveInt(storageAutoCleanupRaw.intervalHours) ?? 24,
-          retentionDays: parsePositiveInt(storageAutoCleanupRaw.retentionDays) ?? 7,
-          initialDelayMs: parseNonNegativeInt(storageAutoCleanupRaw.initialDelayMs) ?? 300_000,
-        },
+        autoCleanup: storageAutoCleanupRaw
+          ? {
+            enabled: storageAutoCleanupRaw.enabled === true,
+            intervalHours: parsePositiveInt(storageAutoCleanupRaw.intervalHours) ?? 24,
+            retentionDays: parsePositiveInt(storageAutoCleanupRaw.retentionDays) ?? 7,
+            initialDelayMs: parseNonNegativeInt(storageAutoCleanupRaw.initialDelayMs) ?? 300_000,
+          }
+          : undefined,
+        readConsistencyIntervalSeconds: readConsistencyIntervalSecondsRaw,
       }
       : undefined,
     redisUrl: legacyRedisUrl,
