@@ -1719,6 +1719,7 @@ function _initPluginState(api) {
         dbPath: resolvedDbPath,
         vectorDim,
         disableNativeCosine: config.retrieval?.disableNativeCosine === true,
+        readConsistencyInterval: config.storageMaintenance?.readConsistencyIntervalSeconds ?? 0,
         redisLock: config.locking?.redis,
         onStoragePathWarning: (message) => api.logger.warn(message),
         onLockWarning: (message) => api.logger.warn(message),
@@ -4430,6 +4431,7 @@ export function parsePluginConfig(value) {
     const storageAutoCleanupRaw = typeof storageMaintenanceRaw?.autoCleanup === "object" && storageMaintenanceRaw.autoCleanup !== null
         ? storageMaintenanceRaw.autoCleanup
         : null;
+    const readConsistencyIntervalSecondsRaw = parseNonNegativeInt(storageMaintenanceRaw?.readConsistencyIntervalSeconds);
     const lockingRaw = typeof cfg.locking === "object" && cfg.locking !== null
         ? cfg.locking
         : null;
@@ -4504,14 +4506,21 @@ export function parsePluginConfig(value) {
             clientTimeoutMs: parsePositiveInt(embedding.clientTimeoutMs),
         },
         dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
-        storageMaintenance: storageAutoCleanupRaw
+        storageMaintenance: (storageAutoCleanupRaw || readConsistencyIntervalSecondsRaw !== undefined)
             ? {
-                autoCleanup: {
-                    enabled: storageAutoCleanupRaw.enabled === true,
-                    intervalHours: parsePositiveInt(storageAutoCleanupRaw.intervalHours) ?? 24,
-                    retentionDays: parsePositiveInt(storageAutoCleanupRaw.retentionDays) ?? 7,
-                    initialDelayMs: parseNonNegativeInt(storageAutoCleanupRaw.initialDelayMs) ?? 300_000,
-                },
+                ...(storageAutoCleanupRaw
+                    ? {
+                        autoCleanup: {
+                            enabled: storageAutoCleanupRaw.enabled === true,
+                            intervalHours: parsePositiveInt(storageAutoCleanupRaw.intervalHours) ?? 24,
+                            retentionDays: parsePositiveInt(storageAutoCleanupRaw.retentionDays) ?? 7,
+                            initialDelayMs: parseNonNegativeInt(storageAutoCleanupRaw.initialDelayMs) ?? 300_000,
+                        },
+                    }
+                    : {}),
+                ...(readConsistencyIntervalSecondsRaw !== undefined
+                    ? { readConsistencyIntervalSeconds: readConsistencyIntervalSecondsRaw }
+                    : {}),
             }
             : undefined,
         redisUrl: legacyRedisUrl,

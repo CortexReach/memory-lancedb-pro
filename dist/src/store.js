@@ -612,6 +612,9 @@ export class MemoryStore {
     get dbPath() {
         return this.config.dbPath;
     }
+    get readConsistencyInterval() {
+        return this.config.readConsistencyInterval;
+    }
     async runStorageMaintenance(retentionDays = 7) {
         if (this.destroyed) {
             throw new Error("MemoryStore instance has been destroyed");
@@ -714,7 +717,9 @@ export class MemoryStore {
         const lancedb = await loadLanceDB();
         let db;
         try {
-            db = await lancedb.connect(this.config.dbPath);
+            db = await lancedb.connect(this.config.dbPath, {
+                readConsistencyInterval: this.config.readConsistencyInterval,
+            });
         }
         catch (err) {
             const code = err.code || "";
