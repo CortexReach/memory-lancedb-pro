@@ -176,6 +176,16 @@ describe("reflection hooks tolerate bypass scope filters", () => {
     assert.match(startResult?.prependContext || "", /Always verify reflection hook coverage for main\./);
     assert.match(promptResult?.prependContext || "", /<derived-focus>/);
     assert.match(promptResult?.prependContext || "", /Next run exercise the reflection injection path for main\./);
+    assert.match(
+      startResult?.prependContext || "",
+      /Treat as long-term behavioral constraints unless user overrides\.\n\n1\./,
+      "inherited-rules block should have a blank line between the header and the first numbered item",
+    );
+    assert.match(
+      promptResult?.prependContext || "",
+      /Weighted recent derived execution deltas from reflection memory:\n\n1\./,
+      "derived-focus block should have a blank line between the header and the first numbered item",
+    );
     assert.deepStrictEqual(
       harness.logs.filter(([level]) => level === "warn"),
       [],

@@ -4482,6 +4482,7 @@ const memoryLanceDBProPlugin = {
             prependContext: [
               "<inherited-rules>",
               "Stable rules inherited from memory-lancedb-pro reflections. Treat as long-term behavioral constraints unless user overrides.",
+              "",
               body,
               "</inherited-rules>",
             ].join("\n"),
@@ -4527,6 +4528,7 @@ const memoryLanceDBProPlugin = {
                   [
                     "<derived-focus>",
                     "Weighted recent derived execution deltas from reflection memory:",
+                    "",
                     ...derivedLines.slice(0, 6).map((line, i) => `${i + 1}. ${line}`),
                     "</derived-focus>",
                   ].join("\n")
