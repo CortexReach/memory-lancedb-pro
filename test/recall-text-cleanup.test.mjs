@@ -460,6 +460,91 @@ describe("recall text cleanup", () => {
     assert.ok(res.details.memories[1].sources.bm25);
   });
 
+  it("returns manual recall results before access metadata patches settle", async () => {
+    const context = makeRecallContext();
+    let releasePatchGate;
+    const patchGate = new Promise((resolve) => {
+      releasePatchGate = resolve;
+    });
+    const patchPromises = [];
+    const patchCalls = [];
+    let patchMetadataCalls = 0;
+    let patchMetadataSettled = 0;
+
+    context.store.patchMetadata = (id, patch, scopeFilter) => {
+      patchMetadataCalls++;
+      patchCalls.push({ id, patch, scopeFilter });
+      const patchPromise = patchGate.then(() => {
+        patchMetadataSettled++;
+        return null;
+      });
+      patchPromises.push(patchPromise);
+      return patchPromise;
+    };
+
+    const tool = createTool(registerMemoryRecallTool, context);
+    const recallPromise = tool.execute(null, { query: "test" });
+    const timeoutMarker = Symbol("timeout");
+    const output = await Promise.race([
+      recallPromise,
+      new Promise((resolve) => setTimeout(() => resolve(timeoutMarker), 500)),
+    ]);
+
+    try {
+      assert.notEqual(output, timeoutMarker, "access metadata patches must not block manual recall");
+      assert.match(output.content[0].text, /<relevant-memories>/);
+      assert.equal(patchMetadataCalls, 2, "background access metadata patches should still start");
+      assert.equal(patchMetadataSettled, 0, "manual recall should return before access metadata patches settle");
+      assert.deepEqual(
+        patchCalls.map(({ id, scopeFilter }) => ({ id, scopeFilter })),
+        [
+          { id: "m1", scopeFilter: ["global"] },
+          { id: "m2", scopeFilter: ["global"] },
+        ],
+      );
+      assert.deepEqual(patchCalls[0].patch, {
+        access_count: 1,
+        last_accessed_at: patchCalls[0].patch.last_accessed_at,
+        last_confirmed_use_at: patchCalls[0].patch.last_confirmed_use_at,
+        bad_recall_count: 0,
+        suppressed_until_turn: 0,
+        suppressed_until_ms: 0,
+      });
+      assert.equal(patchCalls[0].patch.last_accessed_at, patchCalls[0].patch.last_confirmed_use_at);
+    } finally {
+      releasePatchGate();
+      await Promise.all(patchPromises);
+      await recallPromise;
+    }
+
+    assert.equal(patchMetadataSettled, 2, "background access metadata patches should eventually settle");
+  });
+
+  it("logs rejected background manual recall metadata patches", async () => {
+    const context = makeRecallContext();
+    context.store.patchMetadata = async (id) => {
+      if (id === "m1") throw new Error("simulated metadata write failure");
+      return null;
+    };
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(" "));
+
+    try {
+      const tool = createTool(registerMemoryRecallTool, context);
+      const output = await tool.execute(null, { query: "test" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.match(output.content[0].text, /<relevant-memories>/);
+      assert.ok(
+        warnings.some((line) => /background manual recall metadata patch failed for 1\/2 memories/.test(line)),
+        `expected background patch warning; warnings=${JSON.stringify(warnings)}`,
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
   it("keeps memory_recall neighbor summaries within the per-item character budget", async () => {
     const tool = createTool(registerMemoryRecallTool, makeRecallContext(makeNeighborSummaryResults()));
     const res = await tool.execute(null, {

@@ -896,7 +896,11 @@ function createMemoryRecallTool(
           }
 
           const now = Date.now();
-          await Promise.allSettled(
+          // Access metadata is best-effort usage telemetry. Keep it off the
+          // manual recall response path, matching auto-recall, so write-lock
+          // contention cannot turn an otherwise successful read into a tool
+          // timeout.
+          void Promise.allSettled(
             results.map((result) => {
               const meta = parseSmartMetadata(result.entry.metadata, result.entry);
               return runtimeContext.store.patchMetadata(
@@ -917,7 +921,18 @@ function createMemoryRecallTool(
                 scopeFilter,
               );
             }),
-          );
+          ).then((settled) => {
+            const rejected = settled.filter((result) => result.status === "rejected");
+            if (rejected.length > 0) {
+              console.warn(
+                `[memory-lancedb-pro] background manual recall metadata patch failed for ${rejected.length}/${settled.length} memories`,
+              );
+            }
+          }).catch((error) => {
+            console.warn(
+              `[memory-lancedb-pro] background manual recall metadata patch crashed: ${String(error)}`,
+            );
+          });
 
           const text = results
             .map((r, i) => {
