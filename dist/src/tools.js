@@ -668,7 +668,11 @@ function createMemoryRecallTool(runtimeContext, options) {
                     };
                 }
                 const now = Date.now();
-                await Promise.allSettled(results.map((result) => {
+                // Access metadata is best-effort usage telemetry. Keep it off the
+                // manual recall response path, matching auto-recall, so write-lock
+                // contention cannot turn an otherwise successful read into a tool
+                // timeout.
+                void Promise.allSettled(results.map((result) => {
                     const meta = parseSmartMetadata(result.entry.metadata, result.entry);
                     return runtimeContext.store.patchMetadata(result.entry.id, {
                         access_count: meta.access_count + 1,
@@ -683,7 +687,14 @@ function createMemoryRecallTool(runtimeContext, options) {
                         // memory the user just explicitly searched for.
                         suppressed_until_ms: 0,
                     }, scopeFilter);
-                }));
+                })).then((settled) => {
+                    const rejected = settled.filter((result) => result.status === "rejected");
+                    if (rejected.length > 0) {
+                        console.warn(`[memory-lancedb-pro] background manual recall metadata patch failed for ${rejected.length}/${settled.length} memories`);
+                    }
+                }).catch((error) => {
+                    console.warn(`[memory-lancedb-pro] background manual recall metadata patch crashed: ${String(error)}`);
+                });
                 const text = results
                     .map((r, i) => {
                     const categoryTag = getDisplayCategoryTag(r.entry);
