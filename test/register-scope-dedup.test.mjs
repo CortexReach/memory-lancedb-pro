@@ -252,11 +252,13 @@ describe("register() re-registration hardening", () => {
 
     // Same logical prompt-build event delivered to both attached handlers —
     // this is what handler accumulation would look like if the host ever
-    // re-attaches without clearing the previous handler.
+    // re-attaches without clearing the previous handler. The real
+    // before_prompt_build event carries no sessionKey/timestamp of its own —
+    // that identity lives on ctx — so the fabricated event here matches the
+    // production shape (see other before_prompt_build call sites in index.ts,
+    // all of which read identity from ctx.sessionKey / ctx.sessionId).
     const event = {
       prompt: "Please recall what I mentioned before about this task.",
-      sessionKey: "agent:main:session:cache-miss-test",
-      timestamp: 1_000_000,
     };
     const ctx = {
       sessionId: "cache-miss-test",
@@ -271,6 +273,37 @@ describe("register() re-registration hardening", () => {
       retrieveCallCounter.count,
       1,
       "the expensive recall pipeline must run exactly once for one logical prompt-build event",
+    );
+  });
+
+  it("(d) two distinct prompt-build events in the same session are NOT collapsed by the dedup guard", async () => {
+    const retrieveCallCounter = { count: 0 };
+    activeCreateRetriever = mockCreateRetriever(retrieveCallCounter);
+    activeCreateEmbedder = mockCreateEmbedder();
+    MemoryStore.prototype.patchMetadata = async (id, patch) => ({ id, ...patch });
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: baseScopeConfig(workspaceDir),
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoRecallHook(harness.eventHandlers);
+
+    const ctx = {
+      sessionId: "two-turns-test",
+      sessionKey: "agent:main:session:two-turns-test",
+      agentId: "main",
+    };
+
+    // Same session, real event shape (no sessionKey/timestamp on event), but
+    // two genuinely different turns — both must still trigger recall.
+    await hook({ prompt: "What did I say about the first task?" }, ctx);
+    await hook({ prompt: "What did I say about the second task?" }, ctx);
+
+    assert.equal(
+      retrieveCallCounter.count,
+      2,
+      "two distinct prompt-build events in the same session must each run the recall pipeline",
     );
   });
 });

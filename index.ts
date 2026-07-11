@@ -2228,11 +2228,16 @@ const _hookEventDedup = new Set<string>();
  * Returns true if this event was already processed (skip), false if first
  * occurrence (proceed). Automatically prunes Set when size > 200.
  */
-function _dedupHookEvent(handlerName: string, event: any): boolean {
-  const sk = typeof event?.sessionKey === "string" ? event.sessionKey : "?";
+function _dedupHookEvent(handlerName: string, event: any, ctx?: any): boolean {
+  const ctxSessionKey = ctx && typeof ctx === "object"
+    ? (typeof ctx.sessionKey === "string" ? ctx.sessionKey : (typeof ctx.sessionId === "string" ? ctx.sessionId : undefined))
+    : undefined;
+  const sk = ctxSessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : "?");
   const ts = event?.timestamp instanceof Date
     ? event.timestamp.getTime()
-    : (typeof event?.timestamp === "number" ? event.timestamp : Date.now());
+    : (typeof event?.timestamp === "number"
+        ? event.timestamp
+        : (typeof event?.prompt === "string" ? event.prompt : Date.now()));
   const key = `${handlerName}:${sk}:${ts}`;
   if (_hookEventDedup.has(key)) return true; // duplicate — skip
   _hookEventDedup.add(key);
@@ -3266,7 +3271,7 @@ const memoryLanceDBProPlugin = {
         }
         // Validation BEFORE dedup, same convention as the bootstrap/selfImprovement/
         // reflection guards above: skipped events must NOT pollute the shared dedup set.
-        if (_dedupHookEvent("autoRecall", event)) return;
+        if (_dedupHookEvent("autoRecall", event, ctx)) return;
 
         const currentTurn = (turnCounter.get(sessionId) || 0) + 1;
         turnCounter.set(sessionId, currentTurn);
