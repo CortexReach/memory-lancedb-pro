@@ -154,6 +154,28 @@ export function stripEnvelopeMetadata(text) {
     cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
     return cleaned.trim();
 }
+function globToRegExp(glob) {
+    const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+    return new RegExp(`^${escaped}$`);
+}
+/**
+ * Resolve the extraction policy for a scope against a scope-glob -> mode map.
+ * Exact-string entries take priority over glob entries; an unmatched scope
+ * (or an absent policy map) defaults to "full".
+ */
+export function resolveExtractionPolicy(scope, policy) {
+    if (!policy)
+        return "full";
+    if (Object.prototype.hasOwnProperty.call(policy, scope)) {
+        return policy[scope];
+    }
+    for (const [glob, mode] of Object.entries(policy)) {
+        if (glob.includes("*") && globToRegExp(glob).test(scope)) {
+            return mode;
+        }
+    }
+    return "full";
+}
 // ============================================================================
 // Constants
 // ============================================================================
@@ -244,8 +266,15 @@ export class SmartExtractor {
             ? options.scopeFilter
             : [targetScope];
         const agentId = options.agentId;
+        // Option C: scope-glob extraction policy — "none" skips extraction
+        // entirely, with zero LLM calls, before grounding is ever considered.
+        const policyMode = resolveExtractionPolicy(targetScope, this.config.extractionPolicy);
+        if (policyMode === "none") {
+            this.log(`memory-pro: smart-extractor: extraction policy "none" for scope ${targetScope}, skipping extraction`);
+            return stats;
+        }
         // Step 1: LLM extraction
-        const extraction = await this.extractCandidates(conversationText);
+        const extraction = await this.extractCandidates(conversationText, policyMode);
         const candidates = extraction.candidates;
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
@@ -515,7 +544,7 @@ export class SmartExtractor {
     /**
      * Call LLM to extract candidate memories from conversation text.
      */
-    async extractCandidates(conversationText) {
+    async extractCandidates(conversationText, policyMode = "full") {
         const maxChars = this.config.extractMaxChars ?? 8000;
         const truncated = conversationText.length > maxChars
             ? conversationText.slice(-maxChars)
@@ -541,6 +570,9 @@ export class SmartExtractor {
         let invalidCategoryCount = 0;
         let shortAbstractCount = 0;
         let noiseAbstractCount = 0;
+        let policyDroppedCount = 0;
+        let constructedDroppedCount = 0;
+        let constructedEpisodicUsed = false;
         for (const raw of result.memories) {
             if (!raw || typeof raw !== "object") {
                 invalidCategoryCount++;
@@ -567,9 +599,37 @@ export class SmartExtractor {
                 this.debugLog(`memory-lancedb-pro: smart-extractor: dropping candidate due to noise abstract category=${category} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
                 continue;
             }
+            // Option C: scope policy restricts extraction to episodic-only,
+            // independent of grounding — checked before the grounding filter below.
+            if (policyMode === "episodic-only" && category !== "events") {
+                policyDroppedCount++;
+                this.debugLog(`memory-lancedb-pro: smart-extractor: dropping candidate due to episodic-only extraction policy category=${category} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
+                continue;
+            }
+            // Option A: grounding-aware register filter. Missing/non-string/unrecognized
+            // values fail open to "real" so a model that ignores the field can't break
+            // extraction. Constructed content (games, roleplay, fiction, hypotheticals,
+            // sample data) never becomes a durable profile/preferences/entities/cases/
+            // patterns memory; at most one constructed "events" note per extraction
+            // records that the real participants did the activity.
+            const rawGrounding = typeof raw.grounding === "string" ? raw.grounding.toLowerCase().trim() : "";
+            const grounding = rawGrounding === "constructed" ? "constructed" : "real";
+            if (grounding === "constructed") {
+                if (category !== "events") {
+                    constructedDroppedCount++;
+                    this.debugLog(`memory-lancedb-pro: smart-extractor: dropping constructed-grounding candidate outside events category=${category} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
+                    continue;
+                }
+                if (constructedEpisodicUsed) {
+                    constructedDroppedCount++;
+                    this.debugLog(`memory-lancedb-pro: smart-extractor: dropping extra constructed-grounding events candidate (cap 1 per extraction) abstract=${JSON.stringify(abstract.slice(0, 120))}`);
+                    continue;
+                }
+                constructedEpisodicUsed = true;
+            }
             candidates.push({ category, abstract, overview, content });
         }
-        this.debugLog(`memory-lancedb-pro: smart-extractor: validation summary accepted=${candidates.length}, invalidCategory=${invalidCategoryCount}, shortAbstract=${shortAbstractCount}, noiseAbstract=${noiseAbstractCount}`);
+        this.debugLog(`memory-lancedb-pro: smart-extractor: validation summary accepted=${candidates.length}, invalidCategory=${invalidCategoryCount}, shortAbstract=${shortAbstractCount}, noiseAbstract=${noiseAbstractCount}, policyDropped=${policyDroppedCount}, constructedDropped=${constructedDroppedCount}`);
         return { status: "ok", candidates };
     }
     // --------------------------------------------------------------------------

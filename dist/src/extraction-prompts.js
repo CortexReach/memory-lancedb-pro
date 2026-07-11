@@ -66,6 +66,20 @@ ${conversationText}
 - "Encountered problem A, used solution B" -> cases (not events)
 - "General process for handling certain problems" -> patterns (not cases)
 
+# Conversational Grounding
+
+Every memory must also be tagged with how grounded it is in reality:
+
+| grounding | Meaning |
+|-----------|---------|
+| "real" | An assertion about the actual user, the real world, or this real working session — including a genuine first-person aside stated in passing during a game (e.g. "btw my flight is Tuesday") |
+| "constructed" | An assertion whose truth exists only inside an in-conversation constructed context: a game's rules/scores/bets, a role or persona's claims, drafted fiction, a hypothetical ("suppose X"), or sample/test data being manipulated |
+
+Rules:
+- When the surrounding register is a game, roleplay, fiction, hypothetical, or sample-data exercise, you may record AT MOST ONE session-scoped "events" memory noting that the real participants did the activity (e.g. "agent-one and agent-two ran a puzzle exercise"). Do NOT lift any in-context proposition — an invented rule, a score, a bet, a persona's claim — into profile, preferences, entities, cases, or patterns.
+- A real aside spoken during play is still "real" and should be extracted normally under its natural category, even though it occurred inside a constructed register.
+- If you are unsure, default to "real" — under-tagging as constructed risks losing a genuine fact.
+
 # Three-Level Structure
 
 Each memory contains three levels:
@@ -86,7 +100,8 @@ Each memory contains three levels:
   "category": "profile",
   "abstract": "User basic info: AI development engineer, 3 years LLM experience",
   "overview": "## Background\\n- Occupation: AI development engineer\\n- Experience: 3 years LLM development\\n- Tech stack: Python, LangChain",
-  "content": "User is an AI development engineer with 3 years of LLM application development experience."
+  "content": "User is an AI development engineer with 3 years of LLM application development experience.",
+  "grounding": "real"
 }
 \`\`\`
 
@@ -96,7 +111,8 @@ Each memory contains three levels:
   "category": "preferences",
   "abstract": "Python code style: No type hints, concise and direct",
   "overview": "## Preference Domain\\n- Language: Python\\n- Topic: Code style\\n\\n## Details\\n- No type hints\\n- Concise function comments\\n- Direct implementation",
-  "content": "User prefers Python code without type hints, with concise function comments."
+  "content": "User prefers Python code without type hints, with concise function comments.",
+  "grounding": "real"
 }
 \`\`\`
 
@@ -106,9 +122,22 @@ Each memory contains three levels:
   "category": "cases",
   "abstract": "LanceDB BigInt numeric handling issue",
   "overview": "## Problem\\nLanceDB 0.26+ returns BigInt for numeric columns\\n\\n## Solution\\nCoerce values with Number(...) before arithmetic",
-  "content": "When LanceDB returns BigInt values, wrap them with Number() before doing arithmetic operations."
+  "content": "When LanceDB returns BigInt values, wrap them with Number() before doing arithmetic operations.",
+  "grounding": "real"
 }
 \`\`\`
+
+## constructed register (game / roleplay / hypothetical)
+\`\`\`json
+{
+  "category": "events",
+  "abstract": "agent-one and agent-two ran a two-round puzzle exercise",
+  "overview": "## What happened\\n- Two agents played a puzzle guessing game with invented rules and a bet",
+  "content": "agent-one and agent-two ran a two-round puzzle guessing exercise. The house rules, scores, and bet are part of the game, not durable facts.",
+  "grounding": "constructed"
+}
+\`\`\`
+Note: the invented house rule and the bet itself are NOT extracted as separate preferences/cases — only this one episodic note survives.
 
 # Output Format
 
@@ -119,7 +148,8 @@ Return JSON:
       "category": "profile|preferences|entities|events|cases|patterns",
       "abstract": "One-line index",
       "overview": "Structured Markdown summary",
-      "content": "Full narrative"
+      "content": "Full narrative",
+      "grounding": "real|constructed"
     }
   ]
 }
@@ -129,7 +159,8 @@ Notes:
 - Only extract truly valuable personalized information
 - If nothing worth recording, return {"memories": []}
 - Maximum 5 memories per extraction
-- Preferences should be aggregated by topic`;
+- Preferences should be aggregated by topic
+- Tag every memory's "grounding" field per the Conversational Grounding rules above`;
 }
 export function buildDedupPrompt(candidateAbstract, candidateOverview, candidateContent, existingMemories) {
     return `Determine how to handle this candidate memory.
