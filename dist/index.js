@@ -1240,6 +1240,9 @@ async function generateReflectionTextUnbounded(params) {
                     promptMode: "minimal",
                     disableTools: true,
                     disableMessageTool: true,
+                    // Request raw-run semantics so the host skips before_prompt_build
+                    // dispatch for ALL plugins here, not just our own hooks (see #916/#922).
+                    modelRun: true,
                     timeoutMs: params.timeoutMs,
                     runId: `memory-reflection-${Date.now()}`,
                     bootstrapContextMode: "lightweight",
