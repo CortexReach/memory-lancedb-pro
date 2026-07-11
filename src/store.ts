@@ -1763,7 +1763,9 @@ export class MemoryStore {
       const scopeConditions = scopeFilter
         .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
         .join(" OR ");
-      query = query.where(`(${scopeConditions}) OR scope IS NULL`); // NULL for backward compatibility
+      // NULL-scope rows are pre-scoping legacy data with no owner; including them here
+      // would make every such row visible to every agent's scope filter. Do not pass them.
+      query = query.where(`(${scopeConditions})`);
     }
 
     const results = await query.toArray();
@@ -1846,8 +1848,10 @@ export class MemoryStore {
         const scopeConditions = scopeFilter
           .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
           .join(" OR ");
+        // NULL-scope rows are pre-scoping legacy data with no owner; including them here
+        // would make every such row visible to every agent's scope filter. Do not pass them.
         searchQuery = searchQuery.where(
-          `(${scopeConditions}) OR scope IS NULL`,
+          `(${scopeConditions})`,
         );
       }
 
@@ -1924,7 +1928,9 @@ export class MemoryStore {
       const scopeConditions = scopeFilter
         .map(scope => `scope = '${escapeSqlLiteral(scope)}'`)
         .join(" OR ");
-      searchQuery = searchQuery.where(`(${scopeConditions}) OR scope IS NULL`);
+      // NULL-scope rows are pre-scoping legacy data with no owner; including them here
+      // would make every such row visible to every agent's scope filter. Do not pass them.
+      searchQuery = searchQuery.where(`(${scopeConditions})`);
     }
 
     const rows = await searchQuery.toArray();
@@ -2142,7 +2148,9 @@ export class MemoryStore {
       const scopeConditions = scopeFilter
         .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
         .join(" OR ");
-      conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
+      // NULL-scope rows are pre-scoping legacy data with no owner; including them here
+      // would make every such row visible to every agent's scope filter. Do not pass them.
+      conditions.push(`(${scopeConditions})`);
     }
 
     const applyConditions = (query: any) =>
@@ -2669,7 +2677,9 @@ export class MemoryStore {
       const scopeConditions = scopeFilter
         .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
         .join(" OR ");
-      conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
+      // NULL-scope rows are pre-scoping legacy data with no owner; including them here
+      // would make every such row visible to every agent's scope filter. Do not pass them.
+      conditions.push(`(${scopeConditions})`);
     }
 
     const whereClause = conditions.join(" AND ");

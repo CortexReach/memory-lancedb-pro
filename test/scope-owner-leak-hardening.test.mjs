@@ -76,6 +76,102 @@ describe("(a) MemoryStore.list() no longer passes NULL-scope rows through a scop
   });
 });
 
+describe("(a2) sibling read paths no longer pass NULL-scope rows through a scope filter", () => {
+  async function seedNullScopeAndScopedRow(store) {
+    // Same simulation technique as (a): upsert() writes the row as-is, so a
+    // NULL scope genuinely reaches the table (store()/bulkStore() would
+    // normalize a missing scope to "global" before it ever gets there).
+    await store.upsert({
+      id: "legacy-null-scope",
+      timestamp: Date.now(),
+      text: "legacy row with no scope talking about rockets",
+      vector: [0.1, 0.2, 0.3],
+      category: "fact",
+      scope: null,
+      importance: 0.5,
+      metadata: "{}",
+    });
+    await store.store({
+      text: "agent-a scoped row talking about rockets",
+      vector: [0.4, 0.5, 0.6],
+      category: "fact",
+      scope: "agent-a",
+      importance: 0.5,
+      metadata: "{}",
+    });
+  }
+
+  it("vectorSearch excludes a NULL-scope legacy row when a real scope filter is given", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedNullScopeAndScopedRow(store);
+      // Include "global" in the requested scopes: a NULL-scope row's app-layer
+      // display default (`row.scope ?? "global"`) coerces it to "global" before
+      // the double-check runs, so a filter that legitimately includes "global"
+      // (a common agent-scope + shared-scope config) is what actually exercises
+      // the leak — a filter of just ["agent-a"] would be masked by that
+      // app-layer double-check and pass even against the unfixed query.
+      const results = await store.vectorSearch([0.4, 0.5, 0.6], 20, 0, ["agent-a", "global"]);
+      assert.ok(
+        !results.some((r) => r.entry.id === "legacy-null-scope"),
+        "the NULL-scope legacy row must not leak into an agent-a+global scoped vector search",
+      );
+      assert.ok(
+        results.some((r) => r.entry.id !== "legacy-null-scope"),
+        "the actually-scoped row must still be returned (regression)",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("bm25Search (and its lexical fallback) excludes a NULL-scope legacy row when a real scope filter is given", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedNullScopeAndScopedRow(store);
+      // See the vectorSearch case above for why "global" must be in the filter
+      // to actually exercise the leak past the app-layer double-check.
+      const results = await store.bm25Search("rockets", 20, ["agent-a", "global"]);
+      assert.ok(
+        !results.some((r) => r.entry.id === "legacy-null-scope"),
+        "the NULL-scope legacy row must not leak into an agent-a+global scoped keyword search",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stats does not fold a NULL-scope legacy row's count into a requesting agent's scope stats", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedNullScopeAndScopedRow(store);
+      const result = await store.stats(["agent-a"]);
+      assert.equal(result.totalCount, 1, "only the agent-a scoped row should be counted");
+      assert.equal(result.scopeCounts["agent-a"], 1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fetchForCompaction excludes a NULL-scope legacy row when a real scope filter is given", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedNullScopeAndScopedRow(store);
+      const results = await store.fetchForCompaction(Date.now() + 60_000, ["agent-a"], 200);
+      assert.ok(
+        !results.some((r) => r.id === "legacy-null-scope"),
+        "the NULL-scope legacy row must not leak into an agent-a scoped compaction fetch",
+      );
+      assert.ok(
+        results.some((r) => r.id !== "legacy-null-scope"),
+        "the actually-scoped row must still be returned (regression)",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("(b) isOwnedByAgent no longer grants universal main or blank-owner access", () => {
   it("rejects a blank-owner legacy/invariant row for any requesting agent", () => {
     const metadata = { type: "memory-reflection", agentId: "" };
