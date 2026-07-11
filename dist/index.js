@@ -368,6 +368,7 @@ const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_MAX_ENTRIES = 200;
+const DEFAULT_REFLECTION_CACHE_TTL_MS = 15_000;
 // After /new or /reset, the just-closed session may have generated fresh
 // derived deltas. Keep those out of the immediately opened prompt window.
 const DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS = 120_000;
@@ -2176,7 +2177,7 @@ const memoryLanceDBProPlugin = {
                 : "<NO_SCOPE_FILTER>";
             const cacheKey = `${agentId}::${scopeKey}`;
             const cached = reflectionByAgentCache.get(cacheKey);
-            if (cached && Date.now() - cached.updatedAt < 15_000)
+            if (cached && Date.now() - cached.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS)
                 return cached;
             // Prefer reflection-category rows to avoid full-table reads on bypass callers.
             // Fall back to an uncategorized scan only when the category query produced no
@@ -2209,14 +2210,25 @@ const memoryLanceDBProPlugin = {
             reflectionByAgentCache.set(cacheKey, next);
             return next;
         };
-        // Invalidate in-process reflection read caches after an in-process delete
-        // (CLI delete/delete-bulk, sharing this same plugin instance) removes rows,
-        // so injected reflection context cannot keep serving deleted content.
+        // Fast-path invalidation for SAME-PROCESS deletes only: CLI delete/delete-bulk
+        // commands run as a short-lived, separate process from the long-running Gateway
+        // in typical deployments, so this callback firing there does not reach (and
+        // cannot invalidate) the Gateway process own in-memory caches. It only has an
+        // effect when a delete genuinely happens inside this same plugin instance.
+        //
+        // The actual cross-process staleness bound comes from two other layers:
+        //   - DEFAULT_REFLECTION_CACHE_TTL_MS bounds how long either cache below can
+        //     serve stale content after ANY delete, same-process or not (see the read
+        //     sites in loadAgentReflectionSlices and the derived-focus injector).
+        //   - readConsistencyInterval (store config) bounds how long the underlying
+        //     LanceDB table handle can serve stale rows to a fresh query in the first
+        //     place, which is what a TTL-expired cache re-populates from.
+        //
         // reflectionByAgentCache is keyed "<agentId>::scopes:<sorted,scopes>" (or
         // "<agentId>::<NO_SCOPE_FILTER>"); drop any entry whose scope set intersects
         // the deleted scopes, plus every no-scope-filter entry (it spans all scopes).
         // reflectionDerivedBySession has no cheap scope-to-session mapping, so it is
-        // cleared in full rather than left to (possibly never) expire on its own.
+        // cleared in full rather than left to expire on its own TTL.
         const invalidateReflectionCachesAfterDelete = (deletedScopes) => {
             const deletedSet = new Set(deletedScopes ?? []);
             for (const cacheKey of reflectionByAgentCache.keys()) {
@@ -3562,7 +3574,8 @@ const memoryLanceDBProPlugin = {
                                 reflectionDerivedSuppressionBySession.delete(sessionKey);
                             const scopes = resolveScopeFilter(scopeManager, agentId);
                             const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
-                            const derivedLines = derivedCache?.derived?.length
+                            const derivedCacheFresh = derivedCache && Date.now() - derivedCache.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS;
+                            const derivedLines = derivedCacheFresh && derivedCache.derived.length
                                 ? derivedCache.derived
                                 : (await loadAgentReflectionSlices(agentId, scopes)).derived;
                             if (derivedLines.length > 0) {

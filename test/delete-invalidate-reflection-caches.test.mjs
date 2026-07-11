@@ -296,3 +296,60 @@ describe("delete/delete-bulk synchronously invalidate in-process reflection cach
     );
   });
 });
+
+// The CLI delete/delete-bulk commands run as a short-lived, separate process from the
+// long-running Gateway in typical deployments, so onMemoriesDeleted firing there (as
+// exercised above) does not reach this process's caches. These tests simulate that
+// genuinely cross-process case directly: the underlying row is deleted through a
+// second, unrelated MemoryStore instance that never goes through this harness's CLI
+// wiring at all, proving the bounded TTL added to both caches' read paths -- not the
+// CLI invalidation callback -- is what actually bounds staleness for that scenario.
+describe("cross-process deletes are bounded by cache TTL, not by the same-process invalidation callback", () => {
+  let workDir;
+  let realDateNow;
+
+  beforeEach(() => {
+    workDir = mkdtempSync(path.join(tmpdir(), "delete-invalidate-reflection-ttl-"));
+    resetRegistration();
+    realDateNow = Date.now;
+  });
+
+  afterEach(() => {
+    Date.now = realDateNow;
+    resetRegistration();
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("reflectionByAgentCache: still serves stale content immediately after a cross-process delete, but not once the TTL has elapsed", async () => {
+    const pluginConfig = makePluginConfig(workDir);
+    await seedReflection(pluginConfig.dbPath, "dave", "global");
+
+    const harness = createPluginApiHarness({ resolveRoot: workDir, pluginConfig });
+    memoryLanceDBProPlugin.register(harness.api);
+    const { inheritedRules } = getReflectionHooks(harness.eventHandlers);
+    const ctx = { sessionKey: "agent:dave:test", agentId: "dave" };
+
+    const primed = await inheritedRules({}, ctx);
+    assert.match(primed?.prependContext ?? "", /Always verify reflection hook coverage for dave\./, "sanity: cache primed");
+
+    // Delete through a second, independent store instance -- this harness's
+    // onMemoriesDeleted callback never fires, matching a genuine cross-process delete.
+    const otherProcessStore = new MemoryStore({ dbPath: pluginConfig.dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    await otherProcessStore.bulkDelete(["global"], Date.now() + 1);
+
+    const immediatelyAfter = await inheritedRules({}, ctx);
+    assert.match(
+      immediatelyAfter?.prependContext ?? "",
+      /Always verify reflection hook coverage for dave\./,
+      "expected boundary: within the TTL window, an out-of-band delete this process was never told about is still served from cache",
+    );
+
+    Date.now = () => realDateNow() + 16_000; // past DEFAULT_REFLECTION_CACHE_TTL_MS (15s)
+    const afterTtl = await inheritedRules({}, ctx);
+    assert.equal(
+      afterTtl,
+      undefined,
+      "once the TTL has elapsed the cache must be treated as stale and recomputed, reflecting the cross-process delete",
+    );
+  });
+});
