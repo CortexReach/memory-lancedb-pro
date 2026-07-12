@@ -2408,6 +2408,11 @@ const memoryLanceDBProPlugin = {
                 const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
                 if (isMemorySubsessionKey(sessionKey))
                     return;
+                // The reflection distiller runs its own embedded sub-session (sessionKey
+                // shaped "temp:memory-reflection:<agentId>") to summarize the transcript being
+                // reflected on; it must not receive an unrelated auto-recall block injected into it.
+                if (isInternalReflectionSessionKey(sessionKey))
+                    return;
                 // Per-agent inclusion/exclusion: autoRecallIncludeAgents takes precedence over autoRecallExcludeAgents.
                 // - If autoRecallIncludeAgents is set: ONLY these agents receive auto-recall
                 // - Else if autoRecallExcludeAgents is set: all agents EXCEPT these receive auto-recall
