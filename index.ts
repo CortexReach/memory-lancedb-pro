@@ -3701,6 +3701,19 @@ const memoryLanceDBProPlugin = {
           return;
         }
 
+        // Internal memory sub-sessions (the reflection distiller's embedded
+        // temp:memory-reflection run, :subagent:/:active-memory: sub-builds) emit
+        // agent_end too; capturing them would extract memory scaffolding prompts
+        // as if they were conversation. Same guard convention as the sibling
+        // reflection injection hooks.
+        const hookSessionKey = ctx?.sessionKey || (event as any).sessionKey;
+        if (isInternalReflectionSessionKey(hookSessionKey) || isMemorySubsessionKey(hookSessionKey)) {
+          api.logger.debug(
+            `memory-lancedb-pro: auto-capture skip \u2014 internal memory session '${hookSessionKey}'`,
+          );
+          return;
+        }
+
         // Fire-and-forget: run capture work in the background so the hook
         // returns immediately and does not hold the session lock.  Blocking
         // here causes downstream channel deliveries (e.g. Telegram) to be
