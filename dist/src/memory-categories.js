@@ -58,6 +58,14 @@ export const APPEND_ONLY_CATEGORIES = new Set([
     "events",
     "cases",
 ]);
+/** Durable registers: constructed content must never land in these. */
+export const DURABLE_CATEGORIES = new Set([
+    "profile",
+    "preferences",
+    "entities",
+    "cases",
+    "patterns",
+]);
 /** Validate and normalize a category string. */
 export function normalizeCategory(raw) {
     const lower = raw.toLowerCase().trim();
