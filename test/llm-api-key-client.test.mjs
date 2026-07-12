@@ -52,6 +52,11 @@ describe("LLM api-key client", () => {
     const result = await llm.completeJson("hello", "api-key-probe");
     assert.deepEqual(result, { memories: [] });
     assert.equal(requestHeaders.authorization, "Bearer test-api-key");
+    assert.equal(
+      requestHeaders["x-memory-call-label"],
+      "api-key-probe",
+      "the internal call label must reach the gateway as a request header",
+    );
     assert.equal(requestBody.model, "gpt-4o-mini");
     assert.deepEqual(requestBody.messages, [
       {

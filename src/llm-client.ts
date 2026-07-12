@@ -103,6 +103,12 @@ function shouldDisableReasoningForJson(model: string): boolean {
   return /qwen3|deepseek.*r1|qwq/i.test(model);
 }
 
+/** Restrict a call label to header-safe characters (labels are internal literals). */
+function sanitizeLabelHeader(label: string): string {
+  const cleaned = label.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 64);
+  return cleaned || "generic";
+}
+
 function previewText(value: string, maxLen = 200): string {
   const normalized = value.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLen) return normalized;
@@ -245,7 +251,14 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
             : {}),
         };
 
-        const response = await client.chat.completions.create(request as any);
+        // Transmit the internal call label as a request header so gateway-side
+        // observability (tracing UIs, proxy logs) can distinguish call sites
+        // without any change to the prompt or sampling parameters. Applied on
+        // the openai-compatible path only; the OAuth path posts to a foreign
+        // endpoint with a fixed request shape and is left untouched.
+        const response = await client.chat.completions.create(request as any, {
+          headers: { "x-memory-call-label": sanitizeLabelHeader(label) },
+        });
 
         const message = response.choices?.[0]?.message;
         const raw = message?.content;
