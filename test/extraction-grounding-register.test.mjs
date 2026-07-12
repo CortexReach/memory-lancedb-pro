@@ -55,14 +55,20 @@ function makeEmbedder(dims = 97) {
   };
 }
 
-/** `memories` is the raw memories array the mocked "extract-candidates" LLM call returns. */
-function makeLlm(memories) {
+/**
+ * `memories` is the raw memories array the mocked "extract-candidates" LLM
+ * call returns; `conversationRegister` (optional) is the batch-level
+ * conversation_register field — omitted to simulate legacy payloads.
+ */
+function makeLlm(memories, conversationRegister) {
   let extractCandidatesCalls = 0;
   return {
     async completeJson(_prompt, mode) {
       if (mode !== "extract-candidates") return null;
       extractCandidatesCalls++;
-      return { memories };
+      return conversationRegister
+        ? { conversation_register: conversationRegister, memories }
+        : { memories };
     },
     get extractCandidatesCalls() {
       return extractCandidatesCalls;
@@ -310,5 +316,269 @@ describe("SmartExtractor scope-glob extraction policy (Option C)", () => {
 
     assert.equal(llm.extractCandidatesCalls, 1);
     assert.equal(stats.created, 2);
+  });
+});
+
+// ============================================================================
+// Grounding v2 — batch register signal, contradiction check, propagation,
+// grounding-aware admission
+// ============================================================================
+
+/** Fiction-frame durables the extractor mislabeled as "real" (Mode A shape). */
+const MISLABELED_FICTION_CANDIDATES = [
+  {
+    category: "profile",
+    abstract: "User lives in Moon Base 9",
+    overview: "## Background\n- Residence: Moon Base 9",
+    content: "User lives in Moon Base 9.",
+    grounding: "real", // wrong: asserted only inside the game canon
+  },
+  {
+    category: "preferences",
+    abstract: "Favorite drink is nebula tea",
+    overview: "## Preference\n- Drink: nebula tea",
+    content: "User's favorite drink is nebula tea.",
+    grounding: "real", // wrong: asserted only inside the game canon
+  },
+  {
+    category: "events",
+    abstract: "User and assistant played one round of a space roleplay game",
+    overview: "## What happened\n- One roleplay round",
+    content: "User and assistant played one round of a space roleplay game this session.",
+    grounding: "constructed",
+  },
+];
+
+describe("SmartExtractor batch register signal (grounding v2)", () => {
+  it("register 'fiction' drops ALL durable candidates even when their per-item tags say 'real'", async () => {
+    const store = makeStore();
+    const llm = makeLlm(MISLABELED_FICTION_CANDIDATES, "fiction");
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    const stats = await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    const categories = persistedCategories(store);
+    assert.deepEqual(
+      categories,
+      ["events"],
+      "mislabeled real-tagged durables must not survive a fiction-register batch",
+    );
+    assert.equal(stats.created, 1);
+  });
+
+  it("register 'fiction' caps events notes at one, regardless of per-item tags", async () => {
+    const store = makeStore();
+    const llm = makeLlm(
+      [
+        MISLABELED_FICTION_CANDIDATES[2],
+        {
+          ...MISLABELED_FICTION_CANDIDATES[2],
+          abstract: "User and assistant also played a bonus round",
+          grounding: "real", // tag wobble: still capped by the register rule
+        },
+      ],
+      "fiction",
+    );
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    assert.equal(persistedCategories(store).length, 1);
+  });
+
+  it("register 'mixed' with a constructed sibling demotes real-tagged durables (batch contradiction check)", async () => {
+    const store = makeStore();
+    const llm = makeLlm(
+      [
+        MISLABELED_FICTION_CANDIDATES[0], // profile tagged real
+        MISLABELED_FICTION_CANDIDATES[2], // events tagged constructed — the contradiction evidence
+        REAL_ASIDE_CANDIDATE, // real events aside must still survive
+      ],
+      "mixed",
+    );
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    const categories = persistedCategories(store);
+    assert.ok(!categories.includes("profile"), "real-tagged durable must be demoted in a mixed-register batch with constructed siblings");
+    assert.equal(categories.filter((c) => c === "events").length, 2, "both events notes (constructed episodic + real aside) survive");
+  });
+
+  it("register 'real' fully trusts per-item tags (durables kept alongside a constructed events note)", async () => {
+    const store = makeStore();
+    const llm = makeLlm(
+      [FACTUAL_CANDIDATES[0], MISLABELED_FICTION_CANDIDATES[2]],
+      "real",
+    );
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist("mostly factual conversation with a brief game", "s1");
+
+    const categories = persistedCategories(store).sort();
+    assert.deepEqual(categories, ["events", "preferences"], "register 'real' must not demote per-item-real durables");
+  });
+
+  it("missing register (legacy payload) with no constructed tags behaves exactly as before", async () => {
+    const store = makeStore();
+    const llm = makeLlm(FACTUAL_CANDIDATES); // no conversation_register field
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    const stats = await extractor.extractAndPersist("some factual conversation", "s1");
+
+    assert.equal(stats.created, 2, "legacy payloads (no register, no constructed tags) must be unaffected");
+  });
+
+  it("propagates grounding and conversation_register into stored metadata", async () => {
+    const store = makeStore();
+    const llm = makeLlm(
+      [FACTUAL_CANDIDATES[0], MISLABELED_FICTION_CANDIDATES[2]],
+      "real",
+    );
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist("mostly factual conversation with a brief game", "s1");
+
+    const metas = store.bulkStoreCalls.flat().map((e) => JSON.parse(e.metadata || "{}"));
+    const prefMeta = metas.find((m) => m.memory_category === "preferences");
+    const eventsMeta = metas.find((m) => m.memory_category === "events");
+    assert.equal(prefMeta.grounding, "real");
+    assert.equal(prefMeta.conversation_register, "real");
+    assert.equal(eventsMeta.grounding, "constructed");
+    assert.equal(eventsMeta.conversation_register, "real");
+  });
+
+  it("buildExtractionPrompt documents the batch register contract (structural check)", () => {
+    const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
+    const prompt = buildExtractionPrompt("some conversation", "test-user");
+
+    assert.match(prompt, /conversation_register/);
+    assert.match(prompt, /"real\|mixed\|fiction"/);
+    assert.match(prompt, /storage rule applied after tagging/i, "the cap must be framed as a storage rule, not a tagging quota");
+    assert.match(prompt, /all-constructed batch/i, "all-constructed batches must be documented as normal");
+    assert.match(prompt, /self-consistency/i, "the batch self-consistency instruction must be present");
+  });
+});
+
+describe("AdmissionController grounding awareness (grounding v2)", () => {
+  const { AdmissionController, ADMISSION_CONTROL_PRESETS, scoreGroundedTypePrior } = jiti("../src/admission-control.ts");
+  const balanced = ADMISSION_CONTROL_PRESETS.balanced;
+
+  function makeAdmissionLlm() {
+    let utilityCalls = 0;
+    return {
+      async completeJson(_prompt, mode) {
+        if (mode === "admission-utility") {
+          utilityCalls++;
+          return { utility: 0.9, reason: "mock" };
+        }
+        return null;
+      },
+      get utilityCalls() {
+        return utilityCalls;
+      },
+    };
+  }
+
+  const admissionStore = { async vectorSearch() { return []; } };
+
+  it("short-circuits constructed durable candidates to reject with zero LLM calls", async () => {
+    const llm = makeAdmissionLlm();
+    const controller = new AdmissionController(admissionStore, llm, balanced);
+
+    const evaluation = await controller.evaluate({
+      candidate: {
+        category: "preferences",
+        abstract: "House rule: puzzle answers must be even numbers",
+        overview: "## Rule\n- Even numbers only",
+        content: "The puzzle house rule is that answers must always be even numbers.",
+        grounding: "constructed",
+        conversationRegister: "fiction",
+      },
+      candidateVector: [1, 0, 0],
+      conversationText: GAME_TRANSCRIPT,
+      scopeFilter: ["global"],
+    });
+
+    assert.equal(evaluation.decision, "reject");
+    assert.equal(llm.utilityCalls, 0, "the short-circuit must not spend an LLM call");
+    assert.match(evaluation.audit.reason, /constructed-grounding/);
+    assert.equal(evaluation.audit.grounding, "constructed");
+    assert.equal(evaluation.audit.conversation_register, "fiction");
+  });
+
+  it("constructed events candidates still go through normal scoring (only durables short-circuit)", async () => {
+    const llm = makeAdmissionLlm();
+    const controller = new AdmissionController(admissionStore, llm, balanced);
+
+    const evaluation = await controller.evaluate({
+      candidate: {
+        category: "events",
+        abstract: "User and assistant played one round of a space roleplay game",
+        overview: "## What happened\n- One roleplay round",
+        content: "User and assistant played one round of a space roleplay game this session.",
+        grounding: "constructed",
+        conversationRegister: "fiction",
+      },
+      candidateVector: [1, 0, 0],
+      conversationText: GAME_TRANSCRIPT,
+      scopeFilter: ["global"],
+    });
+
+    assert.equal(llm.utilityCalls, 1, "events candidates use the normal scoring path");
+    assert.equal(evaluation.audit.grounding, "constructed");
+  });
+
+  it("scoreGroundedTypePrior caps durable priors at the events prior for fiction-register candidates", () => {
+    const priors = balanced.typePriors;
+    const fictionProfile = {
+      category: "profile",
+      abstract: "x",
+      overview: "",
+      content: "",
+      grounding: "real",
+      conversationRegister: "fiction",
+    };
+    const realProfile = { ...fictionProfile, conversationRegister: "real" };
+
+    assert.equal(scoreGroundedTypePrior(fictionProfile, priors), priors.events, "fiction register must cap the profile prior at the events prior");
+    assert.equal(scoreGroundedTypePrior(realProfile, priors), priors.profile, "real register keeps the raw prior");
+  });
+
+  it("buildUtilityPrompt interpolates grounding and names all six registers (structural check)", async () => {
+    const llm = {
+      prompts: [],
+      async completeJson(prompt, mode) {
+        if (mode === "admission-utility") {
+          this.prompts.push(prompt);
+          return { utility: 0.5, reason: "mock" };
+        }
+        return null;
+      },
+    };
+    const controller = new AdmissionController(admissionStore, llm, balanced);
+
+    await controller.evaluate({
+      candidate: {
+        category: "events",
+        abstract: "User and assistant played one round of a space roleplay game",
+        overview: "",
+        content: "One roleplay round happened.",
+        grounding: "constructed",
+        conversationRegister: "fiction",
+      },
+      candidateVector: [1, 0, 0],
+      conversationText: GAME_TRANSCRIPT,
+      scopeFilter: ["global"],
+    });
+
+    assert.equal(llm.prompts.length, 1);
+    const prompt = llm.prompts[0];
+    assert.match(prompt, /Grounding: constructed/);
+    assert.match(prompt, /Conversation register: fiction/);
+    for (const register of ["profile", "preferences", "entities", "events", "cases", "patterns"]) {
+      assert.match(prompt, new RegExp(register), `utility prompt must name the ${register} register`);
+    }
+    assert.match(prompt, /roleplay/i, "utility prompt must carry the fiction guidance");
   });
 });

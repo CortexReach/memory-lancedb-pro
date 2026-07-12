@@ -80,12 +80,36 @@ export const APPEND_ONLY_CATEGORIES = new Set<MemoryCategory>([
 /** Memory tier levels for lifecycle management. */
 export type MemoryTier = "core" | "working" | "peripheral";
 
+/** Per-candidate conversational grounding self-tag from extraction. */
+export type CandidateGrounding = "real" | "constructed";
+
+/**
+ * Batch-level register judgment for the whole extraction input:
+ * "real" ordinary conversation, "fiction" an in-character/game/roleplay
+ * frame, "mixed" both interleaved. Judged once per extraction batch —
+ * more stable than the per-item grounding tags.
+ */
+export type ConversationRegister = "real" | "mixed" | "fiction";
+
+/** Durable registers: constructed content must never land in these. */
+export const DURABLE_CATEGORIES = new Set<MemoryCategory>([
+  "profile",
+  "preferences",
+  "entities",
+  "cases",
+  "patterns",
+]);
+
 /** A candidate memory extracted from conversation by LLM. */
 export type CandidateMemory = {
   category: MemoryCategory;
   abstract: string; // L0: one-sentence index
   overview: string; // L1: structured markdown summary
   content: string; // L2: full narrative
+  /** Absent on legacy payloads: treat as "real" (fail open per item). */
+  grounding?: CandidateGrounding;
+  /** Batch register the candidate was extracted under; absent on legacy payloads. */
+  conversationRegister?: ConversationRegister;
 };
 
 /** Dedup decision from LLM. */

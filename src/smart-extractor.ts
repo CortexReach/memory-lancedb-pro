@@ -21,12 +21,15 @@ import {
   type AdmissionRejectionAuditEntry,
 } from "./admission-control.js";
 import {
+  type CandidateGrounding,
   type CandidateMemory,
+  type ConversationRegister,
   type DedupDecision,
   type DedupResult,
   type ExtractionStats,
   type MemoryCategory,
   ALWAYS_MERGE_CATEGORIES,
+  DURABLE_CATEGORIES,
   getStorageCategoryForMemoryCategory,
   MERGE_SUPPORTED_CATEGORIES,
   MEMORY_CATEGORIES,
@@ -823,6 +826,7 @@ export class SmartExtractor {
     const prompt = buildExtractionPrompt(cleaned, user);
 
     const result = await this.llm.completeJson<{
+      conversation_register?: string;
       memories: Array<{
         category: string;
         abstract: string;
@@ -849,6 +853,18 @@ export class SmartExtractor {
       `memory-lancedb-pro: smart-extractor: extract-candidates raw memories=${result.memories.length}`,
     );
 
+    // Batch-level register signal, judged once per extraction. The model
+    // classifies whole sessions far more reliably than it self-tags single
+    // items, so the register deterministically overrides per-item grounding
+    // wobble below. Missing/unrecognized values fail toward scrutiny
+    // ("mixed"), never toward open.
+    const rawRegister =
+      typeof result.conversation_register === "string"
+        ? result.conversation_register.toLowerCase().trim()
+        : "";
+    const conversationRegister: ConversationRegister =
+      rawRegister === "real" || rawRegister === "fiction" ? rawRegister : "mixed";
+
     // Validate and normalize candidates
     const candidates: CandidateMemory[] = [];
     let invalidCategoryCount = 0;
@@ -856,7 +872,9 @@ export class SmartExtractor {
     let noiseAbstractCount = 0;
     let policyDroppedCount = 0;
     let constructedDroppedCount = 0;
+    let fictionRegisterDroppedCount = 0;
     let constructedEpisodicUsed = false;
+    let batchHasConstructedTag = false;
     for (const raw of result.memories) {
       if (!raw || typeof raw !== "object") {
         invalidCategoryCount++;
@@ -905,16 +923,40 @@ export class SmartExtractor {
       }
 
       // Option A: grounding-aware register filter. Missing/non-string/unrecognized
-      // values fail open to "real" so a model that ignores the field can't break
-      // extraction. Constructed content (games, roleplay, fiction, hypotheticals,
-      // sample data) never becomes a durable profile/preferences/entities/cases/
-      // patterns memory; at most one constructed "events" note per extraction
-      // records that the real participants did the activity.
+      // per-item values fail open to "real" so a model that ignores the field
+      // can't break extraction. Constructed content (games, roleplay, fiction,
+      // hypotheticals, sample data) never becomes a durable profile/preferences/
+      // entities/cases/patterns memory; at most one constructed "events" note per
+      // extraction records that the real participants did the activity.
       const rawGrounding =
         typeof raw.grounding === "string" ? raw.grounding.toLowerCase().trim() : "";
-      const grounding: "real" | "constructed" =
+      const grounding: CandidateGrounding =
         rawGrounding === "constructed" ? "constructed" : "real";
-      if (grounding === "constructed") {
+      if (rawGrounding === "constructed") {
+        batchHasConstructedTag = true;
+      }
+
+      if (conversationRegister === "fiction") {
+        // Register enforcement: an in-fiction batch can never produce durable
+        // memories, whatever the per-item self-tags claim (the per-item tags
+        // are exactly the wobble the batch register exists to override), and
+        // keeps at most one session-scoped events note.
+        if (DURABLE_CATEGORIES.has(category)) {
+          fictionRegisterDroppedCount++;
+          this.debugLog(
+            `memory-lancedb-pro: smart-extractor: dropping durable candidate from fiction-register batch category=${category} grounding=${grounding} abstract=${JSON.stringify(abstract.slice(0, 120))}`,
+          );
+          continue;
+        }
+        if (constructedEpisodicUsed) {
+          fictionRegisterDroppedCount++;
+          this.debugLog(
+            `memory-lancedb-pro: smart-extractor: dropping extra events candidate from fiction-register batch (cap 1 per extraction) abstract=${JSON.stringify(abstract.slice(0, 120))}`,
+          );
+          continue;
+        }
+        constructedEpisodicUsed = true;
+      } else if (grounding === "constructed") {
         if (category !== "events") {
           constructedDroppedCount++;
           this.debugLog(
@@ -932,11 +974,30 @@ export class SmartExtractor {
         constructedEpisodicUsed = true;
       }
 
-      candidates.push({ category, abstract, overview, content });
+      candidates.push({ category, abstract, overview, content, grounding, conversationRegister });
+    }
+
+    // Batch contradiction check: when the batch shows evidence of a
+    // constructed frame (register not "real" AND at least one item the model
+    // itself tagged constructed), surviving real-tagged durables in the same
+    // batch are the classic mislabel shape — fiction items where only the
+    // grounding tag wobbled. Demote them deterministically, no extra LLM call.
+    let contradictionDemotedCount = 0;
+    if (conversationRegister !== "real" && batchHasConstructedTag) {
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        const candidate = candidates[i];
+        if (DURABLE_CATEGORIES.has(candidate.category)) {
+          contradictionDemotedCount++;
+          this.debugLog(
+            `memory-lancedb-pro: smart-extractor: demoting real-tagged durable from ${conversationRegister}-register batch with constructed siblings (batch contradiction) category=${candidate.category} abstract=${JSON.stringify(candidate.abstract.slice(0, 120))}`,
+          );
+          candidates.splice(i, 1);
+        }
+      }
     }
 
     this.debugLog(
-      `memory-lancedb-pro: smart-extractor: validation summary accepted=${candidates.length}, invalidCategory=${invalidCategoryCount}, shortAbstract=${shortAbstractCount}, noiseAbstract=${noiseAbstractCount}, policyDropped=${policyDroppedCount}, constructedDropped=${constructedDroppedCount}`,
+      `memory-lancedb-pro: smart-extractor: validation summary register=${conversationRegister}, accepted=${candidates.length}, invalidCategory=${invalidCategoryCount}, shortAbstract=${shortAbstractCount}, noiseAbstract=${noiseAbstractCount}, policyDropped=${policyDroppedCount}, constructedDropped=${constructedDroppedCount}, fictionRegisterDropped=${fictionRegisterDroppedCount}, contradictionDemoted=${contradictionDemotedCount}`,
     );
 
     return { status: "ok", candidates };
@@ -1832,6 +1893,12 @@ export class SmartExtractor {
           suppressed_until_turn: 0,
           memory_temporal_type: classifyTemporal(classifyText),
           valid_until: inferExpiry(classifyText),
+          // Grounding audit trail: which self-tag and batch register this
+          // memory was admitted under. Absent on legacy payloads.
+          ...(candidate.grounding ? { grounding: candidate.grounding } : {}),
+          ...(candidate.conversationRegister
+            ? { conversation_register: candidate.conversationRegister }
+            : {}),
           ...(admissionAudit ? { admission_audit: JSON.stringify(admissionAudit) } : {}),
         },
       ),
