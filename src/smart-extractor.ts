@@ -342,6 +342,20 @@ export class SmartExtractor {
   }
 
   /**
+   * Expose the admission controller so sibling write paths (reflection
+   * mapped rows) gate through the same instance and config as extraction
+   * candidates. Null when admission control is disabled.
+   */
+  getAdmissionController(): AdmissionController | null {
+    return this.admissionController;
+  }
+
+  /** Whether admitted entries should carry the admission audit in metadata. */
+  shouldPersistAdmissionAudit(): boolean {
+    return this.persistAdmissionAudit;
+  }
+
+  /**
    * Notify the onPersisted sink (e.g. markdown mirror) after a successful
    * create or merge. Fire-and-forget from the caller's perspective: awaited
    * here so ordering is deterministic, but errors are swallowed so a sink

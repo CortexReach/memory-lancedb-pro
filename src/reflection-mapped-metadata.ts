@@ -27,6 +27,8 @@ export interface ReflectionMappedMetadata {
   sourceReflectionPath?: string;
   // Issue #680: heading stored in entry for bulkStore filtering recovery
   _reflectionHeading?: string;
+  /** Serialized admission audit when the row passed through admission control. */
+  admission_audit?: string;
 }
 
 export interface ReflectionMappedDecayDefaults {

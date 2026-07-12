@@ -67,6 +67,7 @@ import {
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
+import { gateMappedReflectionEntry } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
@@ -1461,7 +1462,7 @@ async function ensureDailyLogFile(dailyPath: string, dateStr: string): Promise<v
   }
 }
 
-function buildReflectionPrompt(
+export function buildReflectionPrompt(
   conversation: string,
   maxInputChars: number,
   toolErrorSignals: ReflectionErrorSignal[] = []
@@ -1496,6 +1497,7 @@ function buildReflectionPrompt(
     "- Do not wrap one bullet across multiple lines.",
     "- If a bullet section is empty, write exactly: '- (none captured)'",
     "- Do not paste raw transcript.",
+    "- Grounding: treat claims made inside roleplay, games, fiction, hypotheticals, or test/simulation frames as not real. Such content may be summarized in Context or Open loops, but must NEVER appear under Decisions (durable), User model deltas, Agent model deltas, or Lessons & pitfalls \u2014 those sections become durable memory rows.",
     "- Do not invent Logged timestamps, ids, file paths, commit hashes, session ids, or storage metadata unless they already appear in the input.",
     "- If secrets/tokens/passwords appear, keep them as [REDACTED].",
     "",
@@ -5011,6 +5013,28 @@ const memoryLanceDBProPlugin = {
               continue;
             }
 
+            // Writer-1 admission routing: mapped rows previously bypassed
+            // admission control entirely. Gate each row through the same
+            // AdmissionController as extraction candidates; passthrough when
+            // admission control (or smart extraction) is disabled.
+            const mappedGate = await gateMappedReflectionEntry({
+              admissionController: smartExtractor?.getAdmissionController() ?? null,
+              attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+              text: mapped.text,
+              category: mapped.category,
+              heading: mapped.heading,
+              vector,
+              reflectionText,
+              scopeFilter: [targetScope],
+              warnLog: (msg: string) => api.logger.warn(msg),
+            });
+            if (!mappedGate.admit) {
+              api.logger.info(
+                `memory-reflection: admission rejected mapped row heading=${JSON.stringify(mapped.heading)} provenance=memory-reflection-mapped: ${mappedGate.reason ?? "no reason"}`,
+              );
+              continue;
+            }
+
             const importance = mapped.category === "decision" ? 0.85 : 0.8;
             const baseMetadata = buildReflectionMappedMetadata({
               mappedItem: mapped,
@@ -5025,6 +5049,9 @@ const memoryLanceDBProPlugin = {
             });
             // embed heading in metadata JSON so it survives bulkStore round-trip to LanceDB
             baseMetadata._reflectionHeading = mapped.heading;
+            if (mappedGate.auditJson) {
+              baseMetadata.admission_audit = mappedGate.auditJson;
+            }
             const metadata = JSON.stringify(baseMetadata);
 
             mappedEntries.push({
