@@ -1634,7 +1634,7 @@ export class MemoryStore {
                 const entry = {
                     id: row.id,
                     text: row.text,
-                    vector: row.vector,
+                    vector: toNumberVector(row.vector),
                     category: row.category,
                     scope: rowScope,
                     importance: clampImportance(Number(row.importance)),
@@ -1693,7 +1693,7 @@ export class MemoryStore {
             const entry = {
                 id: row.id,
                 text: row.text,
-                vector: row.vector,
+                vector: toNumberVector(row.vector),
                 category: row.category,
                 scope: rowScope,
                 importance: clampImportance(Number(row.importance)),
@@ -2727,7 +2727,7 @@ export class MemoryStore {
             .map((row) => ({
             id: row.id,
             text: row.text,
-            vector: Array.isArray(row.vector) ? row.vector : [],
+            vector: toNumberVector(row.vector),
             category: row.category,
             scope: row.scope ?? "global",
             importance: clampImportance(Number(row.importance)),
