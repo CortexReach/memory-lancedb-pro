@@ -5179,6 +5179,18 @@ const memoryLanceDBProPlugin = {
               vectorSearch: (vector, limit, minScore, scopeFilter) =>
                 store.vectorSearch(vector, limit, minScore, scopeFilter),
               store: (entry) => store.store(entry),
+              onPersisted: mdMirror
+                ? async (entry, kind) => {
+                    const source =
+                      kind === "event" ? "reflection-slice:event"
+                      : kind === "item-invariant" ? "reflection-slice:invariant"
+                      : "reflection-slice:derived";
+                    await mdMirror(
+                      { text: entry.text, category: entry.category, scope: entry.scope, timestamp: entry.timestamp },
+                      { source, agentId: sourceAgentId },
+                    );
+                  }
+                : undefined,
             });
             if (sessionKey && stored.slices.derived.length > 0 && !isSessionBoundaryReflectionAction(action)) {
               reflectionDerivedBySession.set(sessionKey, {
