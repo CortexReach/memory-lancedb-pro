@@ -237,11 +237,11 @@ async function runScenario(mode) {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
     llmCalls += 1;
 
     let content;
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are an extraction agent")) {
       content = JSON.stringify({
         memories: [
           {
@@ -256,7 +256,7 @@ async function runScenario(mode) {
           },
         ],
       });
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+    } else if (prompt.includes("You are a dedup decider")) {
       content = JSON.stringify({
         decision: mode === "merge" ? "merge" : "skip",
         match_index: 1,
@@ -264,7 +264,7 @@ async function runScenario(mode) {
           ? "Same preference domain, merge into existing memory"
           : "Candidate fully duplicates existing memory",
       });
-    } else if (prompt.includes("Merge the following memory into a single coherent record")) {
+    } else if (prompt.includes("You are a merge writer")) {
       content = JSON.stringify({
         abstract: "饮品偏好：乌龙茶、茉莉花茶",
         overview: "## Preference Domain\n- 饮品\n\n## Details\n- 喜欢乌龙茶\n- 喜欢茉莉花茶",
@@ -374,10 +374,10 @@ async function runMultiRoundScenario() {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
 
     let content;
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are an extraction agent")) {
       extractionCall += 1;
       if (extractionCall === 1) {
         content = JSON.stringify({
@@ -424,7 +424,7 @@ async function runMultiRoundScenario() {
           ],
         });
       }
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+    } else if (prompt.includes("You are a dedup decider")) {
       dedupCall += 1;
       if (dedupCall === 1) {
         content = JSON.stringify({
@@ -445,7 +445,7 @@ async function runMultiRoundScenario() {
           reason: "Already merged into existing memory",
         });
       }
-    } else if (prompt.includes("Merge the following memory into a single coherent record")) {
+    } else if (prompt.includes("You are a merge writer")) {
       mergeCall += 1;
       content = JSON.stringify({
         abstract: "饮品偏好：乌龙茶、茉莉花茶",
@@ -1020,10 +1020,10 @@ async function runUserMdExclusiveProfileScenario() {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
 
     let content = JSON.stringify({ memories: [] });
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are an extraction agent")) {
       content = JSON.stringify({
         memories: [
           {
@@ -1118,10 +1118,10 @@ async function runBoundarySkipKeepsRegexFallbackScenario() {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
 
     let content = JSON.stringify({ memories: [] });
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are an extraction agent")) {
       content = JSON.stringify({
         memories: [
           {
@@ -1219,11 +1219,11 @@ async function runInboundMetadataCleanupScenario() {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
     llmCalls += 1;
 
     let content;
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are an extraction agent")) {
       extractionPrompt = prompt;
       content = JSON.stringify({
         memories: [
@@ -1235,7 +1235,7 @@ async function runInboundMetadataCleanupScenario() {
           },
         ],
       });
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+    } else if (prompt.includes("You are a dedup decider")) {
       content = JSON.stringify({
         decision: "create",
         reason: "No similar memory exists yet",
@@ -1591,9 +1591,9 @@ async function runDedupDecisionLLMCallScenario() {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
 
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are an extraction agent")) {
       extractCalls += 1;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -1612,7 +1612,7 @@ async function runDedupDecisionLLMCallScenario() {
           }, finish_reason: "stop"
         }]
       }));
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+    } else if (prompt.includes("You are a dedup decider")) {
       dedupCalls += 1;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({

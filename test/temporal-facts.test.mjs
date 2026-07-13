@@ -85,10 +85,10 @@ async function runTest() {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
     let content = JSON.stringify({ memories: [] });
 
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are an extraction agent")) {
       content = JSON.stringify({
         memories: [{
           category: "preferences",
@@ -97,7 +97,7 @@ async function runTest() {
           content: "用户现在改喝咖啡。",
         }],
       });
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+    } else if (prompt.includes("You are a dedup decider")) {
       content = JSON.stringify({
         decision: dedupDecision,
         match_index: 1,

@@ -4,20 +4,22 @@
  * - buildExtractionPrompt: 6-category L0/L1/L2 extraction with few-shot
  * - buildDedupPrompt: CREATE/MERGE/SKIP dedup decision
  * - buildMergePrompt: Memory merge with three-level structure
+ *
+ * Each builder returns a {system, user} pair: instructions, criteria,
+ * identity, and the output-format contract live in `system`; the per-call
+ * conversation excerpt / candidate rows / neighbor rows live in `user`.
  */
+
+export interface SplitPrompt {
+  system: string;
+  user: string;
+}
 
 export function buildExtractionPrompt(
   conversationText: string,
   user: string,
-): string {
-  return `Analyze the following session context and extract memories worth long-term preservation.
-
-User: ${user}
-
-Target Output Language: auto (detect from recent messages)
-
-## Recent Conversation
-${conversationText}
+): SplitPrompt {
+  const system = `You are an extraction agent. Analyze session context and extract memories worth long-term preservation.
 
 # Memory Extraction Criteria
 
@@ -134,6 +136,15 @@ Notes:
 - If nothing worth recording, return {"memories": []}
 - Maximum 5 memories per extraction
 - Preferences should be aggregated by topic`;
+
+  const userMessage = `User: ${user}
+
+Target Output Language: auto (detect from recent messages)
+
+## Recent Conversation
+${conversationText}`;
+
+  return { system, user: userMessage };
 }
 
 export function buildDedupPrompt(
@@ -141,16 +152,8 @@ export function buildDedupPrompt(
   candidateOverview: string,
   candidateContent: string,
   existingMemories: string,
-): string {
-  return `Determine how to handle this candidate memory.
-
-**Candidate Memory**:
-Abstract: ${candidateAbstract}
-Overview: ${candidateOverview}
-Content: ${candidateContent}
-
-**Existing Similar Memories**:
-${existingMemories}
+): SplitPrompt {
+  const system = `You are a dedup decider. Determine how to handle a candidate memory relative to existing similar memories.
 
 Please decide:
 - SKIP: Candidate memory duplicates existing memories, no need to save. Also SKIP if the candidate contains LESS information than an existing memory on the same topic (information degradation — e.g., candidate says "programming language preference" but existing memory already says "programming language preference: Python, TypeScript")
@@ -178,6 +181,16 @@ Return JSON format:
 
 - If decision is "merge"/"supersede"/"support"/"contextualize"/"contradict", set "match_index" to the number of the existing memory (1-based).
 - Only include "context_label" for support/contextualize/contradict decisions.`;
+
+  const userMessage = `**Candidate Memory**:
+Abstract: ${candidateAbstract}
+Overview: ${candidateOverview}
+Content: ${candidateContent}
+
+**Existing Similar Memories**:
+${existingMemories}`;
+
+  return { system, user: userMessage };
 }
 
 export function buildMergePrompt(
@@ -188,35 +201,37 @@ export function buildMergePrompt(
   newOverview: string,
   newContent: string,
   category: string,
-): string {
-  return `Merge the following memory into a single coherent record with all three levels.
+): SplitPrompt {
+  const system = `You are a merge writer. Merge two versions of the same memory into a single coherent record with all three levels.
 
-** Category **: ${category}
-
-** Existing Memory:**
-    Abstract: ${existingAbstract}
-  Overview:
-${existingOverview}
-  Content:
-${existingContent}
-
-** New Information:**
-    Abstract: ${newAbstract}
-  Overview:
-${newOverview}
-  Content:
-${newContent}
-
-  Requirements:
-  - Remove duplicate information
-    - Keep the most up - to - date details
-      - Maintain a coherent narrative
-        - Keep code identifiers / URIs / model names unchanged when they are proper nouns
+Requirements:
+- Remove duplicate information
+- Keep the most up-to-date details
+- Maintain a coherent narrative
+- Keep code identifiers, URIs, and model names unchanged when they are proper nouns
 
 Return JSON:
-  {
-    "abstract": "Merged one-line abstract",
-      "overview": "Merged structured Markdown overview",
-        "content": "Merged full content"
-  } `;
+{
+  "abstract": "Merged one-line abstract",
+  "overview": "Merged structured Markdown overview",
+  "content": "Merged full content"
+}`;
+
+  const userMessage = `Category: ${category}
+
+Existing Memory:
+Abstract: ${existingAbstract}
+Overview:
+${existingOverview}
+Content:
+${existingContent}
+
+New Information:
+Abstract: ${newAbstract}
+Overview:
+${newOverview}
+Content:
+${newContent}`;
+
+  return { system, user: userMessage };
 }
