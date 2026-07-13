@@ -3060,6 +3060,12 @@ const memoryLanceDBProPlugin = {
                                 }
                                 if ((stats.boundarySkipped ?? 0) === 0) {
                                     api.logger.info(`memory-lancedb-pro: smart extraction produced no candidates and no boundary texts for agent ${agentId}; skipping regex fallback`);
+                                    // A valid-empty result (the LLM genuinely ran and confirmed
+                                    // nothing worth storing) is just as conclusive as a
+                                    // successful extraction for watermark purposes -- reset the
+                                    // same way (issue #417 Fix #5), or the next turn re-fires on
+                                    // just one new message instead of waiting for a fresh window.
+                                    autoCaptureSeenTextCount.set(sessionKey, 0);
                                     return;
                                 }
                                 api.logger.info(`memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`);
