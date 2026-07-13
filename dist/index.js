@@ -1639,11 +1639,16 @@ const _hookEventDedup = new Set();
  * Returns true if this event was already processed (skip), false if first
  * occurrence (proceed). Automatically prunes Set when size > 200.
  */
-function _dedupHookEvent(handlerName, event) {
-    const sk = typeof event?.sessionKey === "string" ? event.sessionKey : "?";
+function _dedupHookEvent(handlerName, event, ctx) {
+    const ctxSessionKey = ctx && typeof ctx === "object"
+        ? (typeof ctx.sessionKey === "string" ? ctx.sessionKey : (typeof ctx.sessionId === "string" ? ctx.sessionId : undefined))
+        : undefined;
+    const sk = ctxSessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : "?");
     const ts = event?.timestamp instanceof Date
         ? event.timestamp.getTime()
-        : (typeof event?.timestamp === "number" ? event.timestamp : Date.now());
+        : (typeof event?.timestamp === "number"
+            ? event.timestamp
+            : (typeof event?.prompt === "string" ? event.prompt : Date.now()));
     const key = `${handlerName}:${sk}:${ts}`;
     if (_hookEventDedup.has(key))
         return true; // duplicate — skip
@@ -1866,10 +1871,6 @@ function _initPluginState(api) {
     const autoCaptureSeenTextCount = new Map();
     const autoCapturePendingIngressTexts = new Map();
     const autoCaptureRecentTexts = new Map();
-    const logReg = isCliMode() ? api.logger.debug : api.logger.info;
-    logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered [singleton init] `
-        + `(db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`);
-    logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
     return {
         config,
         resolvedDbPath,
@@ -1990,6 +1991,7 @@ const memoryLanceDBProPlugin = {
         _registeredApis.add(api); // claim before init (Phase 2 singleton guard)
         _registeredApisMap.set(api, true); // dual-track: explicit claim for rollback
         let registrationStopped = false;
+        const isFirstRegistration = !_singletonState;
         let singleton;
         try {
             if (!_singletonState) {
@@ -2201,8 +2203,10 @@ const memoryLanceDBProPlugin = {
         };
         const pendingRecall = new Map();
         const logReg = isCliMode() ? api.logger.debug : api.logger.info;
-        logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`);
-        logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
+        if (isFirstRegistration) {
+            logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`);
+            logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
+        }
         // Dual-memory model warning: help users understand the two-layer architecture
         // Runs synchronously and logs warnings; does NOT block gateway startup.
         // Once per process via the CLI-aware logReg (#888): repeated per-registration
@@ -2444,6 +2448,10 @@ const memoryLanceDBProPlugin = {
                     shouldSkipRetrieval(gatingText, config.autoRecallMinLength)) {
                     return;
                 }
+                // Validation BEFORE dedup, same convention as the bootstrap/selfImprovement/
+                // reflection guards above: skipped events must NOT pollute the shared dedup set.
+                if (_dedupHookEvent("autoRecall", event, ctx))
+                    return;
                 const currentTurn = (turnCounter.get(sessionId) || 0) + 1;
                 turnCounter.set(sessionId, currentTurn);
                 // Wrap the entire recall pipeline in a timeout so slow embedding/rerank
