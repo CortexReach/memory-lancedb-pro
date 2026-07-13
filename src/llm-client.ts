@@ -54,6 +54,18 @@ export interface LlmClientConfig {
   transport?: "direct" | "host";
   /** Host-owned runtime LLM completion surface, required for transport: "host". */
   runtimeLlmComplete?: RuntimeLlmCompleteFn;
+  /**
+   * Reasoning effort requested on the host transport, e.g. "low" | "medium" |
+   * "high". Defaults to DEFAULT_HOST_REASONING_EFFORT ("medium") when unset.
+   * An explicit value must always be sent: an omitted reasoning field has
+   * been observed to fall through to a disabled/no-reasoning default further
+   * down the host-managed runtime stack, which silently degrades reasoning
+   * models (confirmed via a live trace showing rawRequest reasoning:
+   * {effort:"none"} for a reasoning-capable model whose request never set
+   * the field). Only applies to the host transport; the direct client sends
+   * no reasoning parameter at all, letting the provider's own default apply.
+   */
+  reasoningEffort?: string;
 }
 
 export type RuntimeLlmCompleteMessage = {
@@ -71,7 +83,19 @@ export type RuntimeLlmCompleteFn = (params: {
   model?: string;
   temperature?: number;
   purpose?: string;
+  reasoning?: string;
 }) => Promise<RuntimeLlmCompleteResult>;
+
+/**
+ * Default reasoning effort sent on the host transport when llm.reasoningEffort
+ * is not configured. "medium" is a universally-supported effort level across
+ * the model families OpenClaw's core reasoning-effort normalization knows
+ * about, and it never disables reasoning outright the way an omitted field
+ * has been observed to (core's own "adaptive" shorthand maps to this same
+ * value). Chosen over leaving the field unset, which is what caused the
+ * incident this constant documents.
+ */
+const DEFAULT_HOST_REASONING_EFFORT = "medium";
 
 export interface LlmClient {
   /** Send a prompt and parse the JSON response. Returns null on failure. */
@@ -318,6 +342,7 @@ function createHostClient(
             model: config.model,
             temperature: 0.1,
             purpose: `memory-lancedb-pro:${label}`,
+            reasoning: config.reasoningEffort?.trim() || DEFAULT_HOST_REASONING_EFFORT,
           }),
           config.timeoutMs,
         );

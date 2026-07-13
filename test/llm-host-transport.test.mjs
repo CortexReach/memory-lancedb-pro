@@ -89,6 +89,69 @@ describe("LLM host transport", () => {
     assert.equal(calls[0].purpose, "memory-lancedb-pro:admission-utility");
   });
 
+  it("forwards a default reasoning effort to the host runtime call when llm.reasoningEffort is not configured", async () => {
+    const calls = [];
+    const runtimeLlmComplete = async (params) => {
+      calls.push(params);
+      return { text: "{\"memories\":[]}" };
+    };
+
+    const llm = createLlmClient({
+      transport: "host",
+      model: "openrouter/openai/gpt-oss-120b",
+      runtimeLlmComplete,
+    });
+
+    await llm.completeJson("conversation text to extract from", "extract-candidates");
+
+    assert.equal(calls.length, 1);
+    assert.equal(
+      calls[0].reasoning,
+      "medium",
+      "an unconfigured host-transport call must still send an explicit reasoning effort -- core has been observed to fall through to a disabled/no-reasoning default when the field is omitted",
+    );
+  });
+
+  it("forwards an explicit llm.reasoningEffort override to the host runtime call", async () => {
+    const calls = [];
+    const runtimeLlmComplete = async (params) => {
+      calls.push(params);
+      return { text: "{\"memories\":[]}" };
+    };
+
+    const llm = createLlmClient({
+      transport: "host",
+      model: "openrouter/openai/gpt-oss-120b",
+      reasoningEffort: "high",
+      runtimeLlmComplete,
+    });
+
+    await llm.completeJson("conversation text to extract from", "extract-candidates");
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].reasoning, "high");
+  });
+
+  it("falls back to the default reasoning effort when llm.reasoningEffort is configured as an empty/blank string", async () => {
+    const calls = [];
+    const runtimeLlmComplete = async (params) => {
+      calls.push(params);
+      return { text: "{\"memories\":[]}" };
+    };
+
+    const llm = createLlmClient({
+      transport: "host",
+      model: "openrouter/openai/gpt-oss-120b",
+      reasoningEffort: "   ",
+      runtimeLlmComplete,
+    });
+
+    await llm.completeJson("conversation text to extract from", "extract-candidates");
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].reasoning, "medium");
+  });
+
   it("falls back to the direct transport with a warning when the host runtime surface is unavailable", async () => {
     let requestBody;
     server = http.createServer(async (req, res) => {
