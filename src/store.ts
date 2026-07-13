@@ -99,6 +99,13 @@ export interface MemoryBulkUpdateResult {
   error?: string;
 }
 
+export interface ManualRecallMetadataUpdate {
+  id: string;
+  expectedScope: string;
+  accessCountDelta: number;
+  accessedAt: number;
+}
+
 export interface ImportEntryOptions {
   /**
    * Treat the entry as known-legacy data (v1.x 1-5 integer importance scale)
@@ -2167,6 +2174,199 @@ export class MemoryStore {
       scopeCounts,
       categoryCounts,
     };
+  }
+
+  /**
+   * Merge coalesced manual-recall reinforcement into exact IDs under one lock.
+   *
+   * The row read and metadata merge both happen after the write lock is held,
+   * so concurrent recall events cannot overwrite a newer counter/timestamp
+   * snapshot. `expectedScope` preserves the authorization decision made by the
+   * retrieval path without widening the caller's readable scopes.
+   */
+  async applyManualRecallMetadataBatch(
+    updates: ManualRecallMetadataUpdate[],
+  ): Promise<MemoryBulkUpdateResult[]> {
+    await this.ensureInitialized();
+    if (updates.length === 0) return [];
+
+    return this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+      const results = new Map<number, MemoryBulkUpdateResult>();
+      const pending: Array<ManualRecallMetadataUpdate & { inputIndex: number }> = [];
+      const seenIds = new Set<string>();
+
+      updates.forEach((candidate, inputIndex) => {
+        const isValidId =
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(candidate.id) ||
+          isLegacyStableMemoryId(candidate.id);
+        if (!isValidId) {
+          results.set(inputIndex, {
+            id: String(candidate.id),
+            entry: null,
+            error: `Invalid exact memory ID: ${String(candidate.id)}`,
+          });
+          return;
+        }
+        if (seenIds.has(candidate.id)) {
+          results.set(inputIndex, {
+            id: candidate.id,
+            entry: null,
+            error: `Duplicate exact memory ID: ${candidate.id}`,
+          });
+          return;
+        }
+        if (!Number.isInteger(candidate.accessCountDelta) || candidate.accessCountDelta <= 0) {
+          results.set(inputIndex, {
+            id: candidate.id,
+            entry: null,
+            error: `Invalid accessCountDelta for ${candidate.id}`,
+          });
+          return;
+        }
+        if (!Number.isFinite(candidate.accessedAt) || candidate.accessedAt <= 0) {
+          results.set(inputIndex, {
+            id: candidate.id,
+            entry: null,
+            error: `Invalid accessedAt for ${candidate.id}`,
+          });
+          return;
+        }
+        seenIds.add(candidate.id);
+        pending.push({ ...candidate, inputIndex });
+      });
+
+      for (let i = 0; i < pending.length; i += MemoryStore.MAX_BATCH_SIZE) {
+        const chunk = pending.slice(i, i + MemoryStore.MAX_BATCH_SIZE);
+        const whereClause = chunk
+          .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
+          .join(" OR ");
+        const rows = whereClause.length > 0
+          ? await this.table!.query().where(`(${whereClause})`).toArray()
+          : [];
+        const rowsById = new Map<string, any>();
+        for (const row of rows) rowsById.set(row.id as string, row);
+
+        const originals: MemoryEntry[] = [];
+        const updatedEntries: MemoryEntry[] = [];
+        const updatedInputIndices: number[] = [];
+
+        for (const candidate of chunk) {
+          const row = rowsById.get(candidate.id);
+          if (!row) {
+            results.set(candidate.inputIndex, { id: candidate.id, entry: null });
+            continue;
+          }
+
+          const rowScope = (row.scope as string | undefined) ?? "global";
+          if (rowScope !== candidate.expectedScope) {
+            results.set(candidate.inputIndex, {
+              id: candidate.id,
+              entry: null,
+              error:
+                `Memory ${candidate.id} scope changed from ` +
+                `${candidate.expectedScope} to ${rowScope}`,
+            });
+            continue;
+          }
+
+          const original: MemoryEntry = {
+            id: row.id as string,
+            text: row.text as string,
+            vector: Array.from(row.vector as Iterable<number>),
+            category: row.category as MemoryEntry["category"],
+            scope: rowScope,
+            importance: clampImportance(Number(row.importance)),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+            metadata: (row.metadata as string) || "{}",
+          };
+          const current = parseSmartMetadata(original.metadata, original);
+          const accessedAt = Math.max(current.last_accessed_at, candidate.accessedAt);
+          const confirmedAt = Math.max(
+            current.last_confirmed_use_at ?? 0,
+            candidate.accessedAt,
+          );
+          const metadata = stringifySmartMetadata(buildSmartMetadata(original, {
+            access_count: current.access_count + candidate.accessCountDelta,
+            last_accessed_at: accessedAt,
+            last_confirmed_use_at: confirmedAt,
+            bad_recall_count: 0,
+            suppressed_until_turn: 0,
+            suppressed_until_ms: 0,
+          }));
+
+          originals.push(original);
+          updatedEntries.push({ ...original, metadata });
+          updatedInputIndices.push(candidate.inputIndex);
+        }
+
+        if (updatedEntries.length === 0) continue;
+
+        const deleteWhereClause = updatedEntries
+          .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
+          .join(" OR ");
+        let deleted = false;
+        try {
+          await this.table!.delete(`(${deleteWhereClause})`);
+          deleted = true;
+          await this.table!.add(updatedEntries);
+          this.noteDataModification();
+          for (let index = 0; index < updatedEntries.length; index++) {
+            results.set(updatedInputIndices[index], {
+              id: updatedEntries[index].id,
+              entry: updatedEntries[index],
+            });
+          }
+        } catch (writeError) {
+          const writeMessage = writeError instanceof Error ? writeError.message : String(writeError);
+          if (deleted) {
+            const existingAfterFailure = await this.table!.query()
+              .where(`(${deleteWhereClause})`)
+              .toArray()
+              .catch(() => []);
+            const preservedIds = new Set(
+              existingAfterFailure.map((row: any) => row.id as string),
+            );
+            const originalsToRestore = originals.filter((entry) => !preservedIds.has(entry.id));
+            try {
+              if (originalsToRestore.length > 0) await this.table!.add(originalsToRestore);
+            } catch (rollbackError) {
+              const rollbackMessage = rollbackError instanceof Error
+                ? rollbackError.message
+                : String(rollbackError);
+              for (let index = 0; index < updatedEntries.length; index++) {
+                results.set(updatedInputIndices[index], {
+                  id: updatedEntries[index].id,
+                  entry: null,
+                  error:
+                    `Failed to apply recall metadata for ${updatedEntries[index].id}: ` +
+                    `write failed and rollback also failed. Write error: ${writeMessage}. ` +
+                    `Rollback error: ${rollbackMessage}`,
+                });
+              }
+              continue;
+            }
+          }
+
+          for (let index = 0; index < updatedEntries.length; index++) {
+            results.set(updatedInputIndices[index], {
+              id: updatedEntries[index].id,
+              entry: null,
+              error:
+                `Failed to apply recall metadata for ${updatedEntries[index].id}: ` +
+                `${writeMessage}`,
+            });
+          }
+        }
+      }
+
+      return updates.map((candidate, inputIndex) =>
+        results.get(inputIndex) ?? {
+          id: candidate.id,
+          entry: null,
+          error: `Memory ${candidate.id} was not processed`,
+        },
+      );
+    }));
   }
 
   /**
