@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import jitiFactory from "jiti";
+import { Command } from "commander";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
@@ -356,5 +357,35 @@ describe("memory consolidate: orchestration", () => {
 
     const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, now: ts + 100 });
     assert.equal(result.scanned, 1, "fetchRows must only see the requested scope");
+  });
+});
+
+describe("memory consolidate: CLI attachment", () => {
+  it("registers consolidate as a subcommand of the memory-pro group, not the root program", () => {
+    const { createMemoryCLI } = jiti(path.join(testDir, "..", "cli.ts"));
+
+    const program = new Command();
+    const stubContext = {
+      store: {},
+      retriever: {},
+      scopeManager: {},
+      migrator: {},
+    };
+    createMemoryCLI(stubContext)({ program });
+
+    const memoryPro = program.commands.find((c) => c.name() === "memory-pro");
+    assert.ok(memoryPro, "memory-pro group command must be registered");
+
+    const groupNames = memoryPro.commands.map((c) => c.name());
+    assert.ok(
+      groupNames.includes("consolidate"),
+      `expected "consolidate" under the memory-pro group, got: ${groupNames.join(", ")}`
+    );
+
+    const rootNames = program.commands.map((c) => c.name());
+    assert.ok(
+      !rootNames.includes("consolidate"),
+      `"consolidate" must not be reachable as a root-level command, root has: ${rootNames.join(", ")}`
+    );
   });
 });

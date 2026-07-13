@@ -1845,7 +1845,7 @@ export function registerMemoryCLI(program, context) {
         }
     });
     // consolidate: reconcile duplicate/contradictory rows already in the store
-    program
+    memory
         .command("consolidate")
         .description("Reconcile duplicate or contradictory memories already in the store across write lanes (dry-run by default)")
         .requiredOption("--scope <scope>", "Scope to consolidate")
