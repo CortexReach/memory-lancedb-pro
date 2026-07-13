@@ -759,6 +759,17 @@ export function inferProviderFromBaseURL(baseURL) {
         return undefined;
     }
 }
+/**
+ * Feature-detect the OpenClaw host-managed runtime LLM completion surface
+ * (api.runtime.llm.complete). Returns undefined on older hosts that do not
+ * expose it yet, so callers can fall back to the direct/oauth transport.
+ */
+export function resolveRuntimeLlmComplete(api) {
+    const runtimeLlm = api.runtime?.llm;
+    return typeof runtimeLlm?.complete === "function"
+        ? runtimeLlm.complete.bind(runtimeLlm)
+        : undefined;
+}
 function asNonEmptyString(value) {
     if (typeof value !== "string")
         return undefined;
@@ -1838,6 +1849,8 @@ function _initPluginState(api) {
                 oauthProvider: llmOauthProvider,
                 oauthPath: llmOauthPath,
                 timeoutMs: llmTimeoutMs,
+                transport: config.llm?.transport,
+                runtimeLlmComplete: resolveRuntimeLlmComplete(api),
                 log: (msg) => api.logger.debug(msg),
                 warnLog: (msg) => api.logger.warn(msg),
             });
@@ -2434,6 +2447,8 @@ const memoryLanceDBProPlugin = {
                         oauthProvider: llmOauthProvider,
                         oauthPath: llmOauthPath,
                         timeoutMs: llmTimeoutMs,
+                        transport: config.llm?.transport,
+                        runtimeLlmComplete: resolveRuntimeLlmComplete(api),
                         log: (msg) => api.logger.debug(msg),
                     });
                 }

@@ -174,6 +174,94 @@ function createTimeoutSignal(timeoutMs) {
         dispose: () => clearTimeout(timer),
     };
 }
+/**
+ * Bounds a host-transport call with an application-level timer. The runtime
+ * LLM surface has no AbortSignal parameter, so this cannot cancel the
+ * underlying request -- it only stops waiting on it, mirroring the direct
+ * transport's timeoutMs contract from the caller's point of view.
+ */
+function raceWithTimeout(promise, timeoutMs) {
+    const effectiveTimeoutMs = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30_000;
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`timed out after ${effectiveTimeoutMs}ms`)), effectiveTimeoutMs);
+        promise.then((value) => {
+            clearTimeout(timer);
+            resolve(value);
+        }, (err) => {
+            clearTimeout(timer);
+            reject(err);
+        });
+    });
+}
+function createHostClient(config, runtimeLlmComplete, log, warnLog) {
+    let lastError = null;
+    return {
+        async completeJson(prompt, label = "generic", systemPrompt) {
+            lastError = null;
+            try {
+                const result = await raceWithTimeout(runtimeLlmComplete({
+                    messages: [
+                        {
+                            role: "system",
+                            content: systemPrompt ??
+                                "You are a memory extraction assistant. Always respond with valid JSON only.",
+                        },
+                        { role: "user", content: prompt },
+                    ],
+                    model: config.model,
+                    temperature: 0.1,
+                    purpose: `memory-lancedb-pro:${label}`,
+                }), config.timeoutMs);
+                const raw = result?.text;
+                if (!raw || typeof raw !== "string") {
+                    lastError =
+                        `memory-lancedb-pro: llm-client [${label}] empty host-transport response content from model ${config.model}`;
+                    log(lastError);
+                    return null;
+                }
+                const jsonStr = extractJsonFromResponse(raw);
+                if (!jsonStr) {
+                    lastError =
+                        `memory-lancedb-pro: llm-client [${label}] no JSON object found in host-transport response (chars=${raw.length}, preview=${JSON.stringify(previewText(raw))})`;
+                    log(lastError);
+                    return null;
+                }
+                try {
+                    return JSON.parse(jsonStr);
+                }
+                catch (err) {
+                    const repairedJsonStr = repairCommonJson(jsonStr);
+                    if (repairedJsonStr !== jsonStr) {
+                        try {
+                            const repaired = JSON.parse(repairedJsonStr);
+                            log(`memory-lancedb-pro: llm-client [${label}] recovered malformed host-transport JSON via heuristic repair (jsonChars=${jsonStr.length})`);
+                            return repaired;
+                        }
+                        catch (repairErr) {
+                            lastError =
+                                `memory-lancedb-pro: llm-client [${label}] host-transport JSON.parse failed: ${err instanceof Error ? err.message : String(err)}; repair failed: ${repairErr instanceof Error ? repairErr.message : String(repairErr)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
+                            log(lastError);
+                            return null;
+                        }
+                    }
+                    lastError =
+                        `memory-lancedb-pro: llm-client [${label}] host-transport JSON.parse failed: ${err instanceof Error ? err.message : String(err)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
+                    log(lastError);
+                    return null;
+                }
+            }
+            catch (err) {
+                lastError =
+                    `memory-lancedb-pro: llm-client [${label}] host-transport request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
+                (warnLog ?? log)(lastError);
+                return null;
+            }
+        },
+        getLastError() {
+            return lastError;
+        },
+    };
+}
 function createApiKeyClient(config, log, warnLog) {
     if (!config.apiKey) {
         throw new Error("LLM api-key mode requires llm.apiKey or embedding.apiKey");
@@ -413,6 +501,12 @@ function createOauthClient(config, log, warnLog) {
 export function createLlmClient(config) {
     const log = config.log ?? (() => { });
     const warnLog = config.warnLog;
+    if (config.transport === "host") {
+        if (typeof config.runtimeLlmComplete === "function") {
+            return createHostClient(config, config.runtimeLlmComplete, log, warnLog);
+        }
+        (warnLog ?? log)("memory-lancedb-pro: llm-client transport \"host\" is configured but the OpenClaw runtime.llm.complete surface is unavailable on this host; falling back to the direct transport");
+    }
     if (config.auth === "oauth") {
         return createOauthClient(config, log, warnLog);
     }
