@@ -113,6 +113,60 @@ describe("memory consolidate: clustering", () => {
     const clusters = clusterConsolidateCandidates([a], 0.9);
     assert.equal(clusters.length, 0);
   });
+
+  it("links a naturally-phrased reversal to a free-text reflection-mapped duplicate, even with a mismatched derived fact_key and low cosine", () => {
+    // Realistic cross-lane wording: smart-extraction follows the strict
+    // "[Merge key]: Description" abstract convention and gets a clean derived
+    // fact_key. Reflection writer-1 mapped rows carry NO stored fact_key and
+    // are free-text LLM summaries with no colon convention at all, so their
+    // DERIVED fact_key is the whole normalized sentence -- it will never match
+    // the smart-extraction row's key. A naturally-phrased reversal is in the
+    // same boat (confirmed against the real deriveFactKey, not a hypothetical).
+    const original = buildConsolidateCandidate(
+      makeRow({
+        abstract: "Favorite soda: Coca-Cola",
+        vector: [1, 0, 0, 0],
+        factKey: "preferences:favorite soda",
+        source: "auto-capture",
+      })
+    );
+    const mappedDuplicate = buildConsolidateCandidate(
+      makeRow({
+        abstract: "User prefers Coca-Cola as their favorite soft drink",
+        vector: [1, 0, 0, 0],
+        factKey: undefined,
+        source: "reflection",
+      })
+    );
+    const reversal = buildConsolidateCandidate(
+      makeRow({
+        // Deliberately low cosine (orthogonal vector) to simulate an embedder
+        // that separates the reversal from its originals, and a free-text
+        // wording whose derived fact_key ("preferences:user has stopped
+        // drinking coca-cola") does not match "preferences:favorite soda".
+        abstract: "User has stopped drinking Coca-Cola",
+        vector: [0, 0, 0, 1],
+        factKey: undefined,
+        source: "manual",
+      })
+    );
+    const control = buildConsolidateCandidate(
+      makeRow({
+        abstract: "User no longer works at Acme Corp",
+        vector: [0, 1, 0, 0],
+        factKey: undefined,
+        source: "manual",
+      })
+    );
+
+    const clusters = clusterConsolidateCandidates([original, mappedDuplicate, reversal, control], 0.86);
+    assert.equal(clusters.length, 1, "exactly one cluster should form");
+    assert.deepEqual(
+      clusters[0].slice().sort(),
+      [0, 1, 2],
+      "the reversal must join the cluster despite a mismatched derived fact_key and low cosine; the unrelated reversal-shaped control row must stay out"
+    );
+  });
 });
 
 describe("memory consolidate: cluster chunking", () => {
