@@ -167,6 +167,62 @@ describe("memory consolidate: clustering", () => {
       "the reversal must join the cluster despite a mismatched derived fact_key and low cosine; the unrelated reversal-shaped control row must stay out"
     );
   });
+
+  it("does not transitively chain two unrelated near-duplicate pairs together through a moderately-similar bridge pair", () => {
+    // Live dry-run found 8-row grab-bag clusters mixing weekly planning,
+    // standing desks, and roleplay notes -- none of these rows are
+    // reversal-shaped, so this is pure cosine transitivity chaining:
+    // A1~A2 direct link, A2~B1 direct link (the "bridge"), B1~B2 direct link,
+    // so union-find would glue all four into one cluster even though A1/A2
+    // are never directly similar enough to B1/B2. Cosine values here are
+    // computed exactly (15/25/40/45-degree unit vectors), not guessed:
+    // A1-A2=0.966, A2-B1=0.906 (the bridge, well above 0.86), B1-B2=0.996,
+    // A1-B1=0.766, A1-B2=0.707 (both well below 0.86).
+    const A1 = buildConsolidateCandidate(makeRow({ abstract: "Prefers Sunday evening weekly planning.", vector: [1, 0], factKey: undefined }));
+    const A2 = buildConsolidateCandidate(makeRow({ abstract: "User now does weekly planning on Sunday evenings.", vector: [0.9659258262890683, 0.25881904510252074], factKey: undefined }));
+    const B1 = buildConsolidateCandidate(makeRow({ abstract: "Experimenting this month with a standing desk for back comfort.", vector: [0.766044443118978, 0.6427876096865393], factKey: undefined }));
+    const B2 = buildConsolidateCandidate(makeRow({ abstract: "Testing a standing desk setup this month to help with back pain.", vector: [0.7071067811865476, 0.7071067811865475], factKey: undefined }));
+
+    const clusters = clusterConsolidateCandidates([A1, A2, B1, B2], 0.86);
+    assert.equal(clusters.length, 2, "the weekly-planning pair and the standing-desk pair must stay as two separate clusters");
+    const sorted = clusters.map((c) => c.slice().sort()).sort((x, y) => x[0] - y[0]);
+    assert.deepEqual(sorted, [[0, 1], [2, 3]]);
+  });
+
+  it("does not let a long multi-topic reversal narrative bridge a tight cola cluster to unrelated desk rows (paraphrased live shape)", () => {
+    // Paraphrased from the live cluster-4 grab bag: a tight favorite-drink +
+    // reversal pair should stay together, but a long narrative row that also
+    // happens to mention "quit" (reversal-shaped) and touches several other
+    // topics at once must not bridge in the unrelated desk-move rows via
+    // incidental keyword overlap.
+    const favorite = buildConsolidateCandidate(
+      makeRow({ abstract: "User's favorite drink is Coca-Cola.", vector: [1, 0, 0], factKey: "preferences:favorite drink" })
+    );
+    const reversalShort = buildConsolidateCandidate(
+      makeRow({ abstract: "User will no longer drink cola", vector: [0, 0, 1], factKey: undefined })
+    );
+    const longNarrative = buildConsolidateCandidate(
+      makeRow({
+        abstract:
+          "User quit drinking Coca-Cola after the fridge explosion incident. Decided to redesign their room and moved their desk from a dark corner to next to the window for natural light and better productivity.",
+        vector: [0, 1, 0],
+        factKey: undefined,
+      })
+    );
+    const deskMove = buildConsolidateCandidate(
+      makeRow({ abstract: "User will move their desk to sit directly next to the window for natural light.", vector: [0, 1, 0], factKey: undefined })
+    );
+
+    const clusters = clusterConsolidateCandidates([favorite, reversalShort, longNarrative, deskMove], 0.86);
+
+    const colaCluster = clusters.find((c) => c.includes(0));
+    assert.ok(colaCluster, "the favorite-drink row must be in some cluster");
+    assert.ok(colaCluster.includes(1), "the short reversal must join the favorite-drink row");
+    assert.ok(
+      !colaCluster.includes(3),
+      "the unrelated desk-move row must not be glued into the cola cluster through the long narrative row"
+    );
+  });
 });
 
 describe("memory consolidate: cluster chunking", () => {
@@ -225,6 +281,32 @@ describe("memory consolidate: prompt shape", () => {
     }
     assert.match(prompt.user, /1\./);
     assert.match(prompt.user, /2\./);
+  });
+
+  it("tells the decider that supersede is non-destructive soft-invalidation, not deletion", () => {
+    const prompt = buildConsolidatePrompt([
+      { index: 1, category: "preferences", abstract: "a", overview: "", content: "a", source: "manual" },
+    ]);
+    // Defect 1: the live decider reasoned "kept as historical rather than
+    // REQUIRING DELETION" as a reason to skip a clear reversal, because the
+    // prompt never said supersede preserves history. Mirror buildDedupPrompt's
+    // own SUPERSEDE language ("kept as historical but no longer current").
+    assert.match(prompt.system, /not.{0,60}destructive/i);
+    assert.match(prompt.system, /never (be )?delet/i);
+    assert.match(prompt.system, /historical/i);
+  });
+
+  it("tells the decider it may act on a subset of the cluster, leaving append-only rows untouched", () => {
+    const prompt = buildConsolidatePrompt([
+      { index: 1, category: "preferences", abstract: "a", overview: "", content: "a", source: "manual" },
+    ]);
+    // Defect 2: the live decider skipped whole 3-8 row clusters just because
+    // ONE member was an append-only events/cases row, even when the rest were
+    // exact duplicates. survivor_index/absorbed_indices already support acting
+    // on a subset (unlisted rows are simply left untouched) -- the prompt must
+    // say so explicitly instead of implying every row must be covered.
+    assert.match(prompt.system, /not.{0,40}(need|have) to (act on|cover) every row|leave.{0,40}(out|untouched)/i);
+    assert.match(prompt.system, /append-only/i);
   });
 });
 
@@ -398,6 +480,40 @@ describe("memory consolidate: orchestration", () => {
     assert.equal(result.applied.length, 0, "append-only categories must never merge/supersede, even on LLM instruction");
     assert.equal(store.rows.length, 2, "both events rows must remain untouched");
     assert.ok(logs.some((l) => /append-only/i.test(l)));
+  });
+
+  it("still merges the actionable duplicates in a cluster that also contains an unreferenced append-only row (paraphrased live shape)", async () => {
+    // Paraphrased from a live dry-run: a lamp-preference cluster of 3 rows
+    // where 2 are true preference duplicates and 1 is a "finalized decision"
+    // events row. The decider should be able to merge just the 2 duplicates,
+    // leaving the append-only row alone -- not skip the whole cluster.
+    const ts = 1_700_000_000_000;
+    const rows = [
+      makeRow({ category: "preference", memoryCategory: "preferences", abstract: "Reading lamp preference: warm white, bookshelf side.", factKey: "preferences:reading lamp", vector: [1, 0], timestamp: ts }),
+      makeRow({ category: "decision", memoryCategory: "events", abstract: "Reading lamp finalized: warm white, positioned on the bookshelf side.", factKey: "events:reading lamp", vector: [1, 0], timestamp: ts + 1 }),
+      makeRow({ category: "preference", memoryCategory: "preferences", abstract: "Prefers warm white lighting on the bookshelf side for reading.", factKey: "preferences:reading lamp", vector: [1, 0], timestamp: ts + 2 }),
+    ];
+    const store = makeFakeStore(rows);
+    const completeJson = async () => ({
+      verdict: "merge",
+      survivor_index: 1,
+      absorbed_indices: [3],
+      reason: "rows 1 and 3 are the same lamp preference; row 2 is an append-only decision left untouched",
+    });
+
+    const result = await runConsolidate(
+      { ...store, completeJson },
+      { scope: "global", apply: true, now: ts + 100 }
+    );
+
+    assert.equal(result.applied.length, 1, "the actionable subset must still merge");
+    assert.equal(result.applied[0].survivorId, rows[0].id);
+    assert.deepEqual(result.applied[0].absorbedIds, [rows[2].id]);
+    assert.equal(store.rows.length, 2, "the two preference duplicates collapse into one");
+    assert.ok(
+      store.rows.some((r) => r.id === rows[1].id),
+      "the unreferenced append-only events row must remain completely untouched"
+    );
   });
 
   it("never touches rows outside the requested scope", async () => {
