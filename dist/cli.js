@@ -1749,7 +1749,7 @@ export function registerMemoryCLI(program, context) {
         }
     });
     // reindex-fts: Rebuild FTS index
-    program
+    memory
         .command("reindex-fts")
         .description("Rebuild the BM25 full-text search index")
         .action(async () => {
@@ -1771,7 +1771,7 @@ export function registerMemoryCLI(program, context) {
         }
     });
     // repair-summaries: Detect and fix stale L0/L1/L2 summaries
-    program
+    memory
         .command("repair-summaries")
         .description("Detect and fix L0/L1/L2 summaries that are inconsistent with text (text updated but summaries not regenerated)")
         .option("--scope <scope>", "Filter by scope (e.g. agent:bs-intern)")
