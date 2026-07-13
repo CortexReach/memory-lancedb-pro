@@ -201,3 +201,28 @@ Return JSON:
         "content": "Merged full content"
   } `;
 }
+export function buildConsolidatePrompt(members) {
+    const system = `You are a memory consolidation decider. You are given a cluster of existing memories that were flagged as likely related, either by embedding similarity or by sharing a topic key. Decide how the whole cluster should be reconciled.
+
+Return exactly one verdict for the cluster:
+- skip: the rows are related but describe genuinely distinct facts that should coexist. No action.
+- merge: the rows are duplicates or near-duplicates of the same fact. Pick the row with the best-quality, most complete text as the survivor and list every other row as absorbed.
+- supersede: one row is a newer fact or an explicit reversal that replaces the others (for example, a decision to stop doing something the older rows describe). The survivor is the newer/reversal row; every other row in the cluster becomes historical.
+- contradict: the rows conflict and it is not clear which one is correct. Flag this for human review. No destructive action.
+
+"events" and "cases" categories are append-only in this system — prefer skip for those unless rows are exact duplicates.
+
+Return JSON only:
+{
+  "verdict": "skip|merge|supersede|contradict",
+  "survivor_index": 1,
+  "absorbed_indices": [2, 3],
+  "reason": "short explanation"
+}
+
+Only include survivor_index and absorbed_indices for merge or supersede. survivor_index and every entry in absorbed_indices must be one of the row numbers shown below.`;
+    const user = `Cluster members:\n\n${members
+        .map((m) => `${m.index}. [${m.category}]${m.source ? ` (source: ${m.source})` : ""}\nAbstract: ${m.abstract}\nOverview: ${m.overview}\nContent: ${m.content}`)
+        .join("\n\n")}`;
+    return { system, user };
+}
