@@ -16,6 +16,8 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/reflection-bypass-hook.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-scope-filter.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/store-empty-scope-filter.test.mjs", args: ["--test"] },
+  // Typed-array vectors (Float32Array/Arrow) from LanceDB must materialize as real Arrays on every fetch path
+  { group: "storage-and-schema", runner: "node", file: "test/typed-array-vector-fetch.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/store-timestamp-normalization.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/storage-path-normalization.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/storage-maintenance.test.mjs", args: ["--test"] },
