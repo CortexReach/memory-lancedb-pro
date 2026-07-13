@@ -1435,6 +1435,124 @@ assert.ok(cumulativeResult.smartExtractionSkipped,
   cumulativeResult.logs.map((e) => e[1]).join(" | "));
 
 // ===============================================================
+// Test: assistantContextTexts "context" mode — eligibility counting
+// unchanged (assistant turns never count toward extractMinMessages),
+// while assistant text still reaches the extraction prompt as marked,
+// non-extractable context.
+// Turn 1: user + assistant messages, only the user message counts
+//   -> cumulative=1 < minMessages=2, skip
+// Turn 2: user + assistant messages, only the user message counts
+//   -> cumulative=2 >= minMessages=2, trigger extraction
+// If assistant turns wrongly counted, turn 1 alone would already reach
+// cumulative=2 and trigger prematurely.
+// ===============================================================
+
+async function runAssistantContextModeScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-assistant-context-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  const embeddingServer = createEmbeddingServer();
+  const capturedPrompts = [];
+
+  const llmServer = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404); res.end(); return;
+    }
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
+    capturedPrompts.push(prompt);
+    const content = JSON.stringify({ memories: [] });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "test", object: "chat.completion",
+      created: Math.floor(Date.now() / 1000), model: "mock",
+      choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const llmPort = llmServer.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    const api = createMockApi(
+      dbPath,
+      `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${llmPort}`,
+      logs,
+      { extractMinMessages: 2, smartExtraction: true, captureAssistant: "context" },
+    );
+    registerFreshPlugin(api);
+
+    const sessionKey = "agent:main:discord:dm:user456";
+
+    await runAgentEndHook(
+      api,
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "我的名字是小明" },
+          { role: "assistant", content: "很高兴认识你，小明！你喜欢什么运动？" },
+        ],
+      },
+      { agentId: "main", sessionKey },
+    );
+
+    await runAgentEndHook(
+      api,
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "我喜歡游泳" },
+          { role: "assistant", content: "游泳是很好的运动！" },
+        ],
+      },
+      { agentId: "main", sessionKey },
+    );
+
+    const smartExtractionTriggeredAtTwo = logs.some((entry) =>
+      entry[1].includes("running smart extraction") &&
+      entry[1].includes("cumulative=2")
+    );
+    const smartExtractionSkippedAtOne = logs.some((entry) =>
+      entry[1].includes("skipped smart extraction") &&
+      entry[1].includes("cumulative=1")
+    );
+
+    return { logs, smartExtractionTriggeredAtTwo, smartExtractionSkippedAtOne, capturedPrompts };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const assistantContextResult = await runAssistantContextModeScenario();
+assert.ok(
+  assistantContextResult.smartExtractionSkippedAtOne,
+  "Turn 1 should skip with cumulative=1 -- the assistant turn must not count toward eligibility. Logs: " +
+  assistantContextResult.logs.map((e) => e[1]).join(" | "),
+);
+assert.ok(
+  assistantContextResult.smartExtractionTriggeredAtTwo,
+  "Turn 2 should trigger with cumulative=2, not 4 -- assistant turns are never counted. Logs: " +
+  assistantContextResult.logs.map((e) => e[1]).join(" | "),
+);
+assert.ok(
+  assistantContextResult.capturedPrompts.some((p) => p.includes("Assistant (context only")),
+  "extraction prompt should include the marked assistant context label",
+);
+assert.ok(
+  assistantContextResult.capturedPrompts.some((p) => p.includes("游泳是很好的运动")),
+  "extraction prompt should include the actual assistant context text for disambiguation",
+);
+
+// ===============================================================
 // Test: F5 — Counter reset after successful extraction
 // Scenario: Verifies Fix #9 (counter resets to 0 after success).
 // Turn 1: cumulative=1, skip
