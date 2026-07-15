@@ -56,17 +56,22 @@ export interface LlmClientConfig {
   runtimeLlmComplete?: RuntimeLlmCompleteFn;
   /**
    * Reasoning effort requested from the model, e.g. "low" | "medium" |
-   * "high". Host transport: always sent, defaulting to
-   * DEFAULT_HOST_REASONING_EFFORT ("medium") when unset -- an omitted
-   * reasoning field has been observed to fall through to a disabled/
-   * no-reasoning default further down the host-managed runtime stack, which
-   * silently degrades reasoning models (confirmed via a live trace showing
-   * rawRequest reasoning: {effort:"none"} for a reasoning-capable model
-   * whose request never set the field). Direct transport: sent only when
-   * explicitly configured (as reasoning: {effort: ...}, the OpenRouter-
-   * compatible shape); when unset, no reasoning parameter is sent at all,
-   * letting the provider's own default apply.
+   * "high". Canonical config key (llm.thinkLevel), named for consistency
+   * with memoryReflection.thinkLevel. Host transport: always sent,
+   * defaulting to DEFAULT_HOST_REASONING_EFFORT ("medium") when unset -- an
+   * omitted reasoning field has been observed to fall through to a
+   * disabled/no-reasoning default further down the host-managed runtime
+   * stack, which silently degrades reasoning models (confirmed via a live
+   * trace showing rawRequest reasoning: {effort:"none"} for a
+   * reasoning-capable model whose request never set the field). Direct
+   * transport: sent only when explicitly configured (as reasoning: {effort:
+   * ...}, the OpenRouter-compatible shape); when unset, no reasoning
+   * parameter is sent at all, letting the provider's own default apply.
+   * Resolved from raw config by resolveThinkLevel before either transport
+   * reads it -- see the deprecated reasoningEffort field below.
    */
+  thinkLevel?: string;
+  /** @deprecated Use thinkLevel instead. Kept as a backward-compatible alias; resolveThinkLevel prefers thinkLevel when both are set. */
   reasoningEffort?: string;
 }
 
@@ -89,8 +94,9 @@ export type RuntimeLlmCompleteFn = (params: {
 }) => Promise<RuntimeLlmCompleteResult>;
 
 /**
- * Default reasoning effort sent on the host transport when llm.reasoningEffort
- * is not configured. "medium" is a universally-supported effort level across
+ * Default reasoning effort sent on the host transport when llm.thinkLevel
+ * (or its deprecated llm.reasoningEffort alias) is not configured. "medium"
+ * is a universally-supported effort level across
  * the model families OpenClaw's core reasoning-effort normalization knows
  * about, and it never disables reasoning outright the way an omitted field
  * has been observed to (core's own "adaptive" shorthand maps to this same
@@ -344,7 +350,7 @@ function createHostClient(
             model: config.model,
             temperature: 0.1,
             purpose: `memory-lancedb-pro:${label}`,
-            reasoning: config.reasoningEffort?.trim() || DEFAULT_HOST_REASONING_EFFORT,
+            reasoning: config.thinkLevel?.trim() || DEFAULT_HOST_REASONING_EFFORT,
           }),
           config.timeoutMs,
         );
@@ -428,8 +434,8 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
             { role: "user", content: prompt },
           ],
           temperature: 0.1,
-          ...(config.reasoningEffort?.trim()
-            ? { reasoning: { effort: config.reasoningEffort.trim() } }
+          ...(config.thinkLevel?.trim()
+            ? { reasoning: { effort: config.thinkLevel.trim() } }
             : {}),
           ...(shouldDisableReasoningForJson(config.model)
             ? { chat_template_kwargs: { enable_thinking: false } }
@@ -688,9 +694,60 @@ export function resetHostTransportFallbackWarnForTests(): void {
   hostTransportFallbackWarned = false;
 }
 
+// Module-level, same rationale as hostTransportFallbackWarned above: these
+// two warnings are about the *raw config*, not the resolved client, so they
+// must dedupe across all lanes (extraction, admission, CLI) that each build
+// their own LlmClientConfig from the same underlying llm.thinkLevel /
+// llm.reasoningEffort settings.
+let thinkLevelBothKeysWarned = false;
+let thinkLevelDeprecatedAliasWarned = false;
+
+/** Test-only: resets the process-level thinkLevel/reasoningEffort alias-warn dedupe flags. */
+export function resetThinkLevelDeprecationWarnForTests(): void {
+  thinkLevelBothKeysWarned = false;
+  thinkLevelDeprecatedAliasWarned = false;
+}
+
+/**
+ * Resolves the canonical llm.thinkLevel value, honoring the deprecated
+ * llm.reasoningEffort alias: llm.thinkLevel wins when both are configured
+ * (a single once-per-process warning, not a hard failure -- config may
+ * straddle both keys during a migration), and llm.reasoningEffort-only
+ * usage keeps working unchanged, with its own once-per-process deprecation
+ * warning naming the new key. Blank/whitespace-only values are treated as
+ * unset for both keys, matching reasoningEffort's pre-existing semantics.
+ */
+export function resolveThinkLevel(
+  config: Pick<LlmClientConfig, "thinkLevel" | "reasoningEffort">,
+  warnLog: (msg: string) => void,
+): string | undefined {
+  const thinkLevel = config.thinkLevel?.trim();
+  const reasoningEffort = config.reasoningEffort?.trim();
+  if (thinkLevel) {
+    if (reasoningEffort && !thinkLevelBothKeysWarned) {
+      thinkLevelBothKeysWarned = true;
+      warnLog(
+        "memory-lancedb-pro: both llm.thinkLevel and the deprecated llm.reasoningEffort are configured; llm.thinkLevel wins. Remove llm.reasoningEffort.",
+      );
+    }
+    return thinkLevel;
+  }
+  if (reasoningEffort) {
+    if (!thinkLevelDeprecatedAliasWarned) {
+      thinkLevelDeprecatedAliasWarned = true;
+      warnLog(
+        "memory-lancedb-pro: llm.reasoningEffort is deprecated, use llm.thinkLevel instead. llm.reasoningEffort will keep working as an alias.",
+      );
+    }
+    return reasoningEffort;
+  }
+  return undefined;
+}
+
 export function createLlmClient(config: LlmClientConfig): LlmClient {
   const log = config.log ?? (() => {});
   const warnLog = config.warnLog;
+  config = { ...config, thinkLevel: resolveThinkLevel(config, warnLog ?? log) };
   if (config.transport === "host") {
     if (typeof config.runtimeLlmComplete === "function") {
       return createHostClient(config, config.runtimeLlmComplete, log, warnLog);
