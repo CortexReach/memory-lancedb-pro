@@ -1502,6 +1502,32 @@ async function runAssistantContextModeScenario() {
       { agentId: "main", sessionKey },
     );
 
+    // NOTE (2026-07-15): this turn intentionally sends only THIS turn's
+    // delta messages, not the full accumulated session history. That is
+    // correct and required on this branch as it stands today: the counter
+    // model here (issue #417 Fix #4/#5) only resets to 0 on a *successful*
+    // extraction, never rolls back on a skip, so per-turn deltas accumulate
+    // correctly turn-over-turn (verified: cumulative=1 after turn 1,
+    // cumulative=1+1=2 after this turn).
+    //
+    // If this branch is ever rebased onto (or merged alongside)
+    // fix/autocapture-reset-on-valid-empty-extraction (issue #417 Fix #9,
+    // which rolls the counter back to its pre-turn value when a turn is
+    // skipped, so the *next* agent_end redelivers the full history and the
+    // slice-by-previousSeenCount logic recovers the skipped turn's texts),
+    // this fixture MUST switch to sending the FULL accumulated history each
+    // turn -- i.e. this second runAgentEndHook call's `messages` should be
+    // turn 1's two messages PLUS turn 2's two messages, matching the
+    // established agent_end simulation pattern in
+    // test/autocapture-watermark-reset.test.mjs ("Turn 2: agent_end again
+    // carries the FULL history"). Sending only the delta at that point would
+    // make turn 2 look like a fresh 1-message turn (cumulative stays at 1)
+    // instead of the correct accumulated 2, and this test would fail with
+    // "Turn 2 should trigger with cumulative=2, not 4" pointing at a
+    // regression that is actually just this fixture being stale -- this
+    // exact failure mode was hit and root-caused during an internal
+    // integration test where this branch's code was combined with
+    // issue #417 Fix #9 (see above).
     await runAgentEndHook(
       api,
       {
