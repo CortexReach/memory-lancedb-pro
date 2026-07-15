@@ -62,6 +62,7 @@ export function buildExtractionPrompt(conversationText, user) {
 - "User prefers X" -> preferences (not profile)
 - "Encountered problem A, used solution B" -> cases (not events)
 - "General process for handling certain problems" -> patterns (not cases)
+- "Switched my commute to the M4" / "Spanish lesson before breakfast" -> preferences or patterns, not events: recurring or durable state and habit changes are the user's new normal, not a one-off occurrence. Reserve events for genuinely one-off happenings.
 
 # Three-Level Structure
 
