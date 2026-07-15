@@ -1,4 +1,5 @@
 import type { ReflectionMappedMemoryItem } from "./reflection-slices.js";
+import type { MemoryCategory } from "./memory-categories.js";
 import type { MemorySource } from "./smart-metadata.js";
 
 export type ReflectionMappedKind = "user-model" | "agent-model" | "lesson" | "decision";
@@ -12,6 +13,7 @@ export interface ReflectionMappedMetadata {
   eventId: string;
   mappedKind: ReflectionMappedKind;
   mappedCategory: ReflectionMappedCategory;
+  memory_category: MemoryCategory;
   section: string;
   ordinal: number;
   groupSize: number;
@@ -51,6 +53,25 @@ export function getReflectionMappedDecayDefaults(kind: ReflectionMappedKind): Re
   return REFLECTION_MAPPED_DECAY_DEFAULTS[kind];
 }
 
+/**
+ * mappedKind is known structurally at write time (each kind comes from a
+ * fixed reflection section), so the 6-category classification is a direct
+ * lookup rather than a text-sniffing heuristic. "decision" and "lesson" both
+ * land in "cases" — durable operational facts, not one-off "events" — which
+ * is what kept mapped decision rows shielded from consolidation before this
+ * stamp existed (see reverseMapLegacyCategory's old decision→events case).
+ */
+const REFLECTION_MAPPED_MEMORY_CATEGORY: Record<ReflectionMappedKind, MemoryCategory> = {
+  "user-model": "preferences",
+  "agent-model": "preferences",
+  lesson: "cases",
+  decision: "cases",
+};
+
+export function getReflectionMappedMemoryCategory(kind: ReflectionMappedKind): MemoryCategory {
+  return REFLECTION_MAPPED_MEMORY_CATEGORY[kind];
+}
+
 export function buildReflectionMappedMetadata(params: {
   mappedItem: ReflectionMappedMemoryItem;
   eventId: string;
@@ -71,6 +92,7 @@ export function buildReflectionMappedMetadata(params: {
     eventId: params.eventId,
     mappedKind: params.mappedItem.mappedKind,
     mappedCategory: params.mappedItem.category,
+    memory_category: getReflectionMappedMemoryCategory(params.mappedItem.mappedKind),
     section: params.mappedItem.heading,
     ordinal: params.mappedItem.ordinal,
     groupSize: params.mappedItem.groupSize,
