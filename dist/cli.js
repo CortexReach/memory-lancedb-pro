@@ -1879,7 +1879,6 @@ export function registerMemoryCLI(program, context) {
             const result = await runConsolidate({
                 fetchRows: (scopeFilter, maxTimestamp, limit) => context.store.fetchForCompaction(maxTimestamp, scopeFilter, limit),
                 update: (id, patch, scopeFilter) => context.store.update(id, patch, scopeFilter),
-                delete: (id, scopeFilter) => context.store.delete(id, scopeFilter),
                 embed: (text) => embedder.embedPassage(text),
                 completeJson: (prompt, label, system, temperature) => llmClient.completeJson(prompt, label, system, temperature),
                 log: (message) => console.warn(message),

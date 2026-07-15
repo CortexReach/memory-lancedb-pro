@@ -783,8 +783,19 @@ describe("memory consolidate: orchestration", () => {
     assert.equal(result.applied.length, 1);
     assert.equal(result.applied[0].survivorId, rows[0].id);
     assert.deepEqual(result.applied[0].absorbedIds, [rows[1].id]);
-    assert.equal(store.rows.length, 1, "the absorbed row is removed on merge");
-    assert.equal(store.rows[0].text, "Coffee order: oat milk latte, extra hot");
+
+    assert.equal(store.rows.length, 2, "merge is non-destructive: the absorbed row must still be present, only invalidated");
+    const survivorRow = store.rows.find((r) => r.id === rows[0].id);
+    assert.equal(survivorRow.text, "Coffee order: oat milk latte, extra hot");
+
+    const absorbedRow = store.rows.find((r) => r.id === rows[1].id);
+    assert.ok(absorbedRow, "the absorbed row must not be hard-deleted");
+    const absorbedMeta = JSON.parse(absorbedRow.metadata);
+    assert.ok(absorbedMeta.invalidated_at, "the absorbed row must be marked invalidated");
+    assert.equal(absorbedMeta.superseded_by, rows[0].id, "the absorbed row must point at the survivor");
+    assert.ok(absorbedMeta.consolidation_audit, "the absorbed row must carry its own consolidation audit");
+    assert.equal(absorbedMeta.consolidation_audit.action, "merge");
+    assert.equal(absorbedMeta.consolidation_audit.survivorId, rows[0].id);
   });
 
   it("skips a cluster with a warning when the LLM response is malformed, without failing the run", async () => {
@@ -886,11 +897,80 @@ describe("memory consolidate: orchestration", () => {
     assert.equal(result.applied.length, 1, "the actionable subset must still merge");
     assert.equal(result.applied[0].survivorId, rows[0].id);
     assert.deepEqual(result.applied[0].absorbedIds, [rows[2].id]);
-    assert.equal(store.rows.length, 2, "the two preference duplicates collapse into one");
+    assert.equal(store.rows.length, 3, "merge is non-destructive: all 3 rows must still be present");
+    const absorbedRow = store.rows.find((r) => r.id === rows[2].id);
+    assert.ok(absorbedRow, "the absorbed preference duplicate must not be hard-deleted, only invalidated");
+    assert.ok(JSON.parse(absorbedRow.metadata).invalidated_at, "the absorbed row must be marked invalidated");
     assert.ok(
       store.rows.some((r) => r.id === rows[1].id),
       "the unreferenced append-only events row must remain completely untouched"
     );
+  });
+
+  it("plugin-wide invariant: no LLM verdict path (merge or supersede) ever calls a hard delete", async () => {
+    // deps intentionally has NO delete method at all -- if either
+    // applyMergeVerdict or applySupersedeVerdict tried to call it, this
+    // would throw "deps.delete is not a function" and fail the test.
+    const ts = 1_700_000_000_000;
+    // Deliberately disjoint vocabulary between the two pairs (no shared
+    // words at all) so neither the reversal-gated nor the ratio-gated
+    // topic-overlap fallback can bridge them into one cluster -- this test
+    // is only about the delete-method invariant, not clustering.
+    const mergeRows = [
+      makeRow({ abstract: "Coffee order: oat milk latte", factKey: "preferences:coffee order", vector: [1, 0, 0, 0], timestamp: ts }),
+      makeRow({ abstract: "Coffee order: oat milk latte, extra hot", factKey: "preferences:coffee order", vector: [1, 0, 0, 0], timestamp: ts + 1 }),
+    ];
+    const supersedeRows = [
+      makeRow({ abstract: "Desk setup: standing desk", factKey: "preferences:desk setup", vector: [0, 1, 0, 0], timestamp: ts + 2 }),
+      makeRow({ abstract: "Desk setup: no longer using a standing desk", factKey: "preferences:desk setup", vector: [0, 1, 0, 0], timestamp: ts + 3 }),
+    ];
+    const rows = [...mergeRows, ...supersedeRows];
+    const store = makeFakeStore(rows);
+    const { delete: _omittedDelete, ...storeWithoutDelete } = store;
+
+    const completeJson = async (_prompt, label) => {
+      if (label === "consolidate-decide") {
+        return {
+          verdicts: [
+            { cluster_index: 1, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "dup" },
+            { cluster_index: 2, verdict: "supersede", survivor_index: 2, absorbed_indices: [1], reason: "reversal" },
+          ],
+        };
+      }
+      return { abstract: "merged", overview: "", content: "merged" };
+    };
+
+    const result = await runConsolidate(
+      { ...storeWithoutDelete, completeJson },
+      { scope: "global", apply: true, now: ts + 100_000 }
+    );
+
+    assert.equal(result.applied.length, 2, "both verdicts must apply successfully without a delete method available");
+    assert.equal(store.rows.length, 4, "no row may be removed by either verdict path");
+  });
+
+  it("merge is idempotent: a second apply run over the same store makes zero further changes", async () => {
+    const ts = 1_700_000_000_000;
+    const rows = [
+      makeRow({ abstract: "Coffee order: oat milk latte", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts }),
+      makeRow({ abstract: "Coffee order: oat milk latte, extra hot", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts + 1000 }),
+    ];
+    const store = makeFakeStore(rows);
+    const completeJson = async (_prompt, label) => {
+      if (label === "consolidate-decide") {
+        return {
+          verdicts: [{ cluster_index: 1, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "dup" }],
+        };
+      }
+      return { abstract: "merged", overview: "", content: "merged" };
+    };
+
+    const first = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, now: ts + 100_000 });
+    const second = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, now: ts + 200_000 });
+
+    assert.equal(first.applied.length, 1);
+    assert.equal(second.applied.length, 0, "the invalidated absorbed row must not re-enter clustering on the next run");
+    assert.equal(store.rows.length, 2, "still non-destructive: both rows remain present after two runs");
   });
 
   it("decides multiple independent clusters with exactly ONE completeJson call, not one call per cluster", async () => {

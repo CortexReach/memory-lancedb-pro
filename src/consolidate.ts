@@ -327,13 +327,16 @@ export interface ConsolidateAuditEntry {
   scope: string;
 }
 
+// No `delete` method: no LLM verdict path may hard-delete a row. Both
+// applyMergeVerdict and applySupersedeVerdict soft-invalidate absorbed rows
+// via `update` only. Hard delete stays an operator-only CLI command, wired
+// through a completely separate code path outside this pipeline.
 export interface ConsolidateWriteDeps {
   update: (
     id: string,
     patch: { text?: string; vector?: number[]; metadata: string },
     scopeFilter?: string[]
   ) => Promise<unknown>;
-  delete: (id: string, scopeFilter?: string[]) => Promise<unknown>;
   embed: (text: string) => Promise<number[]>;
   completeJson: <T>(prompt: string, label?: string, system?: string, temperature?: number) => Promise<T | null>;
 }
@@ -391,8 +394,26 @@ async function applyMergeVerdict(
     scopeFilter
   );
 
+  // Non-destructive: absorbed rows are soft-invalidated with the same
+  // primitive applySupersedeVerdict uses (invalidated_at + superseded_by +
+  // relations), not hard-deleted. Each absorbed row also gets its own
+  // consolidation_audit pointing back at the survivor, so its history is
+  // independently inspectable without cross-referencing the survivor's
+  // audit. No LLM verdict path may call a hard delete; hard delete stays an
+  // operator-only CLI command.
   for (const idx of verdict.absorbedIndices!) {
-    await deps.delete(members[idx - 1].entry.id, scopeFilter);
+    const absorbed = members[idx - 1];
+    const existingMeta = parseSmartMetadata(absorbed.entry.metadata, absorbed.entry);
+    const invalidatedMeta = buildSmartMetadata(absorbed.entry, {
+      invalidated_at: now,
+      superseded_by: survivor.entry.id,
+      relations: appendRelation(existingMeta.relations, { type: "superseded_by", targetId: survivor.entry.id }),
+    });
+    const auditedAbsorbedMeta = {
+      ...invalidatedMeta,
+      consolidation_audit: { action: "merge", survivorId: survivor.entry.id, reason: verdict.reason, at: now },
+    };
+    await deps.update(absorbed.entry.id, { metadata: stringifySmartMetadata(auditedAbsorbedMeta) }, scopeFilter);
   }
 
   return { action: "merge", survivorId: survivor.entry.id, absorbedIds, reason: verdict.reason, scope: survivor.entry.scope };

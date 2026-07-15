@@ -279,8 +279,26 @@ async function applyMergeVerdict(deps, members, verdict, scopeFilter, now) {
         consolidation_audit: { action: "merge", absorbedIds, reason: verdict.reason, at: now },
     };
     await deps.update(survivor.entry.id, { text: abstract, vector: newVector, metadata: stringifySmartMetadata(auditedMeta) }, scopeFilter);
+    // Non-destructive: absorbed rows are soft-invalidated with the same
+    // primitive applySupersedeVerdict uses (invalidated_at + superseded_by +
+    // relations), not hard-deleted. Each absorbed row also gets its own
+    // consolidation_audit pointing back at the survivor, so its history is
+    // independently inspectable without cross-referencing the survivor's
+    // audit. No LLM verdict path may call a hard delete; hard delete stays an
+    // operator-only CLI command.
     for (const idx of verdict.absorbedIndices) {
-        await deps.delete(members[idx - 1].entry.id, scopeFilter);
+        const absorbed = members[idx - 1];
+        const existingMeta = parseSmartMetadata(absorbed.entry.metadata, absorbed.entry);
+        const invalidatedMeta = buildSmartMetadata(absorbed.entry, {
+            invalidated_at: now,
+            superseded_by: survivor.entry.id,
+            relations: appendRelation(existingMeta.relations, { type: "superseded_by", targetId: survivor.entry.id }),
+        });
+        const auditedAbsorbedMeta = {
+            ...invalidatedMeta,
+            consolidation_audit: { action: "merge", survivorId: survivor.entry.id, reason: verdict.reason, at: now },
+        };
+        await deps.update(absorbed.entry.id, { metadata: stringifySmartMetadata(auditedAbsorbedMeta) }, scopeFilter);
     }
     return { action: "merge", survivorId: survivor.entry.id, absorbedIds, reason: verdict.reason, scope: survivor.entry.scope };
 }
