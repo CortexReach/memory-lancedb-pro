@@ -419,7 +419,10 @@
         "description": "Whitelist mode for auto-recall injection. Only agents in this list receive auto-recall. Agent resolution falls back to 'main' when no explicit agentId is available. If both include and exclude are set, autoRecallIncludeAgents takes precedence (whitelist wins)."
       },
       "captureAssistant": {
-        "type": "boolean"
+        "oneOf": [
+          { "type": "boolean" },
+          { "type": "string", "enum": ["context"] }
+        ]
       },
       "smartExtraction": {
         "type": "boolean",
