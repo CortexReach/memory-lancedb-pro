@@ -6,6 +6,7 @@
  *
  */
 import { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt, } from "./extraction-prompts.js";
+import { formatConversationTranscript, } from "./auto-capture-cleanup.js";
 import { AdmissionController, } from "./admission-control.js";
 import { ALWAYS_MERGE_CATEGORIES, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
@@ -169,18 +170,6 @@ const VALID_DECISIONS = new Set([
     "contradict",
     "supersede",
 ]);
-export const ASSISTANT_CONTEXT_LABEL = "Assistant (context only — do not extract from these lines)";
-/**
- * Format assistant-authored lines as clearly marked, non-extractable context
- * appended after the real conversation text. Returns an empty string when
- * there is nothing to add, so callers can always concatenate the result.
- */
-export function formatAssistantContextBlock(texts) {
-    if (!texts || texts.length === 0)
-        return "";
-    const lines = texts.map((text) => `${ASSISTANT_CONTEXT_LABEL}: ${text}`).join("\n");
-    return `\n\n## Assistant Context (for disambiguation only)\n${lines}`;
-}
 export class SmartExtractor {
     store;
     embedder;
@@ -245,7 +234,7 @@ export class SmartExtractor {
             : [targetScope];
         const agentId = options.agentId;
         // Step 1: LLM extraction
-        const extraction = await this.extractCandidates(conversationText, options.assistantContextTexts);
+        const extraction = await this.extractCandidates(conversationText, options.assistantContextTexts, options.conversationTurns);
         const candidates = extraction.candidates;
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
@@ -513,23 +502,31 @@ export class SmartExtractor {
     // Step 1: LLM Extraction
     // --------------------------------------------------------------------------
     /**
-     * Call LLM to extract candidate memories from conversation text.
-     * `assistantContextTexts`, when present, are appended as clearly marked
-     * context lines the extractor may read but must never source candidates
-     * from directly.
+     * Call LLM to extract candidate memories from conversation text. Assembles
+     * the single interleaved conversation-turns transcript: `conversationTurns`
+     * (oldest-first, real per-message roles) when the caller has them, else a
+     * fallback of one user turn from `conversationText` followed by
+     * `assistantContextTexts` as trailing assistant turns. Assistant turns are
+     * context only -- the extractor must never source a candidate from one
+     * directly (enforced by prompt instruction, not a deterministic gate).
      */
-    async extractCandidates(conversationText, assistantContextTexts) {
+    async extractCandidates(conversationText, assistantContextTexts, conversationTurns) {
         const maxChars = this.config.extractMaxChars ?? 8000;
-        const truncated = conversationText.length > maxChars
-            ? conversationText.slice(-maxChars)
-            : conversationText;
+        const user = this.config.user ?? "User";
         // Strip platform envelope metadata injected by OpenClaw channels
         // (e.g. "System: [2026-03-18 14:21:36 GMT+8] Feishu[default] DM | ou_...")
         // These pollute extraction if treated as conversation content.
-        const cleaned = stripEnvelopeMetadata(truncated);
-        const withAssistantContext = `${cleaned}${formatAssistantContextBlock(assistantContextTexts)}`;
-        const user = this.config.user ?? "User";
-        const prompt = buildExtractionPrompt(withAssistantContext, user);
+        const turns = conversationTurns
+            ? conversationTurns.map((turn) => ({ ...turn, text: stripEnvelopeMetadata(turn.text) }))
+            : [
+                ...(conversationText
+                    ? [{ role: "user", text: stripEnvelopeMetadata(conversationText) }]
+                    : []),
+                ...(assistantContextTexts ?? []).map((text) => ({ role: "assistant", text })),
+            ];
+        const rawTranscript = formatConversationTranscript(turns, user);
+        const transcript = rawTranscript.length > maxChars ? rawTranscript.slice(-maxChars) : rawTranscript;
+        const prompt = buildExtractionPrompt(transcript, user);
         const result = await this.llm.completeJson(prompt, "extract-candidates");
         if (!result) {
             this.debugLog("memory-lancedb-pro: smart-extractor: extract-candidates returned null");

@@ -1570,8 +1570,12 @@ assert.ok(
   assistantContextResult.logs.map((e) => e[1]).join(" | "),
 );
 assert.ok(
-  assistantContextResult.capturedPrompts.some((p) => p.includes("Assistant (context only")),
-  "extraction prompt should include the marked assistant context label",
+  assistantContextResult.capturedPrompts.some((p) => p.includes("## Recent conversation turns")),
+  "extraction prompt should include the single conversation-turns transcript header",
+);
+assert.ok(
+  assistantContextResult.capturedPrompts.some((p) => /\nAssistant: /.test(p)),
+  "extraction prompt should include an Assistant: turn in the transcript",
 );
 assert.ok(
   assistantContextResult.capturedPrompts.some((p) => p.includes("游泳是很好的运动")),

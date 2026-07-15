@@ -151,3 +151,79 @@ export function normalizeAutoCaptureText(
   if (shouldSkipMessage?.(role, normalized)) return null;
   return normalized;
 }
+
+/** One turn in the extraction prompt's conversation transcript. */
+export interface ConversationTurn {
+  role: "user" | "assistant";
+  text: string;
+}
+
+/**
+ * Renders turns oldest-first as a continuous "Label: text" transcript, one
+ * line per turn, no blank lines or per-turn metadata between them. `userLabel`
+ * replaces the generic "User" label when a configured name is known;
+ * assistant turns always render as "Assistant" (no per-agent name surface).
+ */
+export function formatConversationTranscript(
+  turns: ConversationTurn[],
+  userLabel: string = "User",
+): string {
+  return turns
+    .map((turn) => `${turn.role === "user" ? userLabel : "Assistant"}: ${turn.text}`)
+    .join("\n");
+}
+
+/**
+ * Assembles the ordered turn sequence for the extraction prompt's transcript
+ * from this call's true message-loop order, without recomputing any
+ * eligibility or watermark decision -- it only consumes their already-decided
+ * results:
+ * - `newUserTexts` narrower than `eligibleTexts` (watermark tail-slice):
+ *   drop that many leading user turns, keep every assistant-context turn.
+ * - `assistantContextForRun` longer than this call's own `assistantContextTexts`
+ *   (rolling window carried a prior call's context forward): prepend the
+ *   carried-over entries as leading assistant turns, chronologically ahead
+ *   of this call's turns.
+ * - `newUserTexts` not a tail-slice of `eligibleTexts` at all (pending-ingress
+ *   replay from a different source, no per-message role correlation
+ *   available): fall back to flat user turns for the replayed content, still
+ *   preceded by any carried-over assistant context.
+ */
+export function buildConversationTurnsForExtraction(params: {
+  messageLoopTurns: ConversationTurn[];
+  eligibleTexts: string[];
+  newUserTexts: string[];
+  assistantContextForRun: string[];
+  assistantContextTexts: string[];
+}): ConversationTurn[] {
+  const { messageLoopTurns, eligibleTexts, newUserTexts, assistantContextForRun, assistantContextTexts } = params;
+
+  const leadingCount = Math.max(0, assistantContextForRun.length - assistantContextTexts.length);
+  const leadingAssistantTurns: ConversationTurn[] = assistantContextForRun
+    .slice(0, leadingCount)
+    .map((text) => ({ role: "assistant", text }));
+
+  const isTailSliceOfEligible =
+    newUserTexts.length <= eligibleTexts.length &&
+    eligibleTexts
+      .slice(eligibleTexts.length - newUserTexts.length)
+      .every((text, i) => text === newUserTexts[i]);
+
+  if (!isTailSliceOfEligible) {
+    const userTurns: ConversationTurn[] = newUserTexts.map((text) => ({ role: "user", text }));
+    return [...leadingAssistantTurns, ...userTurns];
+  }
+
+  const skipUserCount = eligibleTexts.length - newUserTexts.length;
+  const thisCallTurns: ConversationTurn[] = [];
+  let userSeen = 0;
+  for (const turn of messageLoopTurns) {
+    if (turn.role === "user") {
+      userSeen++;
+      if (userSeen <= skipUserCount) continue;
+    }
+    thisCallTurns.push(turn);
+  }
+
+  return [...leadingAssistantTurns, ...thisCallTurns];
+}

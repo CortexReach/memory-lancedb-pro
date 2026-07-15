@@ -69,7 +69,11 @@ import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
+import {
+  normalizeAutoCaptureText,
+  type ConversationTurn,
+  buildConversationTurnsForExtraction,
+} from "./src/auto-capture-cleanup.js";
 
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
@@ -3814,6 +3818,7 @@ const memoryLanceDBProPlugin = {
           // Extract text content from messages
           const eligibleTexts: string[] = [];
           const assistantContextTexts: string[] = [];
+          const conversationTurns: ConversationTurn[] = [];
           let skippedAutoCaptureTexts = 0;
           const captureAssistantValue = config.captureAssistant;
           const captureAssistantEligible = captureAssistantValue === true;
@@ -3841,6 +3846,7 @@ const memoryLanceDBProPlugin = {
                 skippedAutoCaptureTexts++;
               } else {
                 targetTexts.push(normalized);
+                conversationTurns.push({ role: role as "user" | "assistant", text: normalized });
               }
               continue;
             }
@@ -3861,6 +3867,7 @@ const memoryLanceDBProPlugin = {
                     skippedAutoCaptureTexts++;
                   } else {
                     targetTexts.push(normalized);
+                    conversationTurns.push({ role: role as "user" | "assistant", text: normalized });
                   }
                 }
               }
@@ -3989,12 +3996,19 @@ const memoryLanceDBProPlugin = {
                 `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
               const conversationText = cleanTexts.join("\n");
+              const finalConversationTurns = buildConversationTurnsForExtraction({
+                messageLoopTurns: conversationTurns,
+                eligibleTexts,
+                newUserTexts: cleanTexts,
+                assistantContextForRun,
+                assistantContextTexts,
+              });
               // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
               let stats: Awaited<ReturnType<typeof smartExtractor.extractAndPersist>> | null = null;
               try {
                 stats = await smartExtractor.extractAndPersist(
                   conversationText, sessionKey,
-                  { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantContextForRun },
+                  { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantContextForRun, conversationTurns: finalConversationTurns },
                 );
               } catch (err) {
                 api.logger.error(

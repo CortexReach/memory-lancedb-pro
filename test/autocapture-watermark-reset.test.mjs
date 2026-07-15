@@ -93,7 +93,7 @@ function createLlmServer(extractionPrompts) {
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     const prompt = String(payload.messages?.map((m) => m.content).join("\n") ?? "");
-    if (prompt.includes("## Recent Conversation")) {
+    if (prompt.includes("## Recent conversation turns")) {
       extractionPrompts.push(prompt);
     }
     calls += 1;

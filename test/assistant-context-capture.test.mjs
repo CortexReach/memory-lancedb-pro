@@ -87,50 +87,90 @@ function makeExtractor(llm, config = {}) {
 // ============================================================================
 
 describe("SmartExtractor assistant-context marking", () => {
-  it("includes marked assistant context lines in the prompt when assistantContextTexts is provided", async () => {
+  it("includes assistant context lines, plainly labeled, inside the single conversation transcript when assistantContextTexts is provided", async () => {
     const llm = makeRecordingLlm();
     const extractor = makeExtractor(llm);
 
     await extractor.extractAndPersist(
-      "User: yes exactly, that one",
+      "yes exactly, that one",
       "s1",
       { assistantContextTexts: ["I found two options: the blue mug and the red mug."] },
     );
 
     const extractCall = llm.calls.find((c) => c.label === "extract-candidates");
     assert.ok(extractCall, "extract-candidates call should have happened");
-    assert.match(extractCall.prompt, /## Assistant Context/);
-    assert.match(extractCall.prompt, /Assistant \(context only — do not extract from these lines\)/);
+    assert.match(extractCall.prompt, /## Recent conversation turns/);
+    assert.match(extractCall.prompt, /Assistant: I found two options: the blue mug and the red mug\./);
     assert.match(extractCall.prompt, /blue mug and the red mug/);
   });
 
-  it("omits the assistant-context block entirely when assistantContextTexts is absent", async () => {
+  it("has no Assistant: line in the transcript when assistantContextTexts is absent", async () => {
     const llm = makeRecordingLlm();
     const extractor = makeExtractor(llm);
 
-    await extractor.extractAndPersist("User: some ordinary message", "s1");
+    await extractor.extractAndPersist("some ordinary message", "s1");
 
     const extractCall = llm.calls.find((c) => c.label === "extract-candidates");
     assert.ok(extractCall);
-    // The general instruction always mentions the marker; only the actual
-    // appended block (with its heading) signals real context content.
-    assert.doesNotMatch(extractCall.prompt, /## Assistant Context/);
+    assert.doesNotMatch(extractCall.prompt, /\nAssistant: /);
   });
 
-  it("omits the assistant-context block when assistantContextTexts is an empty array", async () => {
+  it("has no Assistant: line in the transcript when assistantContextTexts is an empty array", async () => {
     const llm = makeRecordingLlm();
     const extractor = makeExtractor(llm);
 
-    await extractor.extractAndPersist("User: some ordinary message", "s1", { assistantContextTexts: [] });
+    await extractor.extractAndPersist("some ordinary message", "s1", { assistantContextTexts: [] });
 
     const extractCall = llm.calls.find((c) => c.label === "extract-candidates");
-    assert.doesNotMatch(extractCall.prompt, /## Assistant Context/);
+    assert.doesNotMatch(extractCall.prompt, /\nAssistant: /);
   });
 
   it("buildExtractionPrompt documents the assistant-context rule (structural check)", () => {
     const prompt = buildExtractionPrompt("some conversation", "test-user");
-    assert.match(prompt, /Assistant \(context only — do not extract from these lines\)/);
+    assert.match(prompt, /"Assistant:" lines/);
     assert.match(prompt, /grounded in a user-authored line/i);
+  });
+
+  it("renders the conversation transcript under a single header with a description, exactly once", async () => {
+    const llm = makeRecordingLlm();
+    const extractor = makeExtractor(llm);
+
+    await extractor.extractAndPersist(
+      "some message",
+      "s1",
+      { assistantContextTexts: ["some context"] },
+    );
+
+    const extractCall = llm.calls.find((c) => c.label === "extract-candidates");
+    const headerMatches = extractCall.prompt.match(/## Recent conversation turns/g) || [];
+    assert.equal(headerMatches.length, 1, "the header must appear exactly once");
+    assert.match(
+      extractCall.prompt,
+      /## Recent conversation turns\nContext for extraction\. Extract memory candidates ONLY from user turns\. Assistant turns are included so you can resolve references and understand what the user meant; never treat assistant statements as the user's facts, preferences, or decisions\.\n/,
+    );
+  });
+
+  it("interleaves explicit conversationTurns oldest-first, using the configured user label", async () => {
+    const llm = makeRecordingLlm();
+    const extractor = makeExtractor(llm, { user: "Alex" });
+
+    await extractor.extractAndPersist(
+      "unused-fallback-text",
+      "s1",
+      {
+        conversationTurns: [
+          { role: "user", text: "my name is Alex" },
+          { role: "assistant", text: "nice to meet you, Alex" },
+          { role: "user", text: "yes exactly, that one" },
+        ],
+      },
+    );
+
+    const extractCall = llm.calls.find((c) => c.label === "extract-candidates");
+    assert.match(
+      extractCall.prompt,
+      /Alex: my name is Alex\nAssistant: nice to meet you, Alex\nAlex: yes exactly, that one/,
+    );
   });
 });
 
