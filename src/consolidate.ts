@@ -327,6 +327,38 @@ export interface ConsolidateAuditEntry {
   scope: string;
 }
 
+// ============================================================================
+// Item 7: LLM-cost gate. Clustering is free (local cosine + fact_key/topic
+// linking); the only paid calls are the one batched decider call and, since
+// item 8 moves merge-content generation into the plan phase, up to one
+// merge-content generation per absorbed member of every unit that MIGHT turn
+// out to be a merge verdict. Both are knowable from clustering alone, before
+// any LLM call is made -- which is what lets the gate sit ahead of the
+// decide call and cover dry-runs as well as --apply.
+// ============================================================================
+
+export interface ConsolidateCostPreview {
+  clusterCount: number;
+  maxMergeGenerations: number;
+}
+
+export function computeConsolidateCostPreview(
+  units: Array<{ members: unknown[] }>
+): ConsolidateCostPreview {
+  return {
+    clusterCount: units.length,
+    maxMergeGenerations: units.reduce((sum, u) => sum + Math.max(0, u.members.length - 1), 0),
+  };
+}
+
+export function formatConsolidateCostPreview(preview: ConsolidateCostPreview): string {
+  const lines = [`${preview.clusterCount} cluster(s) -> 1 batched decider call`];
+  if (preview.maxMergeGenerations > 0) {
+    lines.push(`+ up to ${preview.maxMergeGenerations} merge-content generation(s)`);
+  }
+  return lines.join("\n");
+}
+
 // No `delete` method: no LLM verdict path may hard-delete a row. Both
 // applyMergeVerdict and applySupersedeVerdict soft-invalidate absorbed rows
 // via `update` only. Hard delete stays an operator-only CLI command, wired
@@ -341,19 +373,30 @@ export interface ConsolidateWriteDeps {
   completeJson: <T>(prompt: string, label?: string, system?: string, temperature?: number) => Promise<T | null>;
 }
 
-async function applyMergeVerdict(
-  deps: ConsolidateWriteDeps,
+export interface ConsolidateMergedContent {
+  abstract: string;
+  overview: string;
+  content: string;
+  vector: number[];
+}
+
+/**
+ * Item 8: pure content generation for a merge verdict -- every
+ * `consolidate-merge` completion plus the final re-embed, with NO store
+ * writes. Called once per merge verdict at PLAN-BUILD time (dry-run or
+ * --apply alike), so execution later can be pure store operations that
+ * never regenerate content and never call the LLM again.
+ */
+async function buildMergePlanContent(
+  deps: Pick<ConsolidateWriteDeps, "embed" | "completeJson">,
   members: ConsolidateCandidate[],
-  verdict: ConsolidateVerdictResult,
-  scopeFilter: string[] | undefined,
-  now: number
-): Promise<ConsolidateAuditEntry> {
+  verdict: ConsolidateVerdictResult
+): Promise<ConsolidateMergedContent> {
   const survivor = members[verdict.survivorIndex! - 1];
   let abstract = survivor.abstract;
   let overview = survivor.overview;
   let content = survivor.content;
 
-  const absorbedIds: string[] = [];
   for (const idx of verdict.absorbedIndices!) {
     const absorbed = members[idx - 1];
     const prompt = buildMergePrompt(
@@ -375,10 +418,33 @@ async function applyMergeVerdict(
       overview = merged.overview;
       content = merged.content;
     }
-    absorbedIds.push(absorbed.entry.id);
   }
 
-  const newVector = await deps.embed(`${abstract} ${content}`);
+  const vector = await deps.embed(`${abstract} ${content}`);
+  return { abstract, overview, content, vector };
+}
+
+/**
+ * Item 8: pure store write for an already-planned merge verdict. Applies
+ * EXACTLY the precomputed content from `buildMergePlanContent` -- no LLM
+ * call, no regeneration, "apply exactly what was presented."
+ */
+async function writeMergeVerdict(
+  deps: Pick<ConsolidateWriteDeps, "update">,
+  members: ConsolidateCandidate[],
+  verdict: ConsolidateVerdictResult,
+  mergedContent: ConsolidateMergedContent,
+  scopeFilter: string[] | undefined,
+  now: number
+): Promise<ConsolidateAuditEntry> {
+  const survivor = members[verdict.survivorIndex! - 1];
+  const { abstract, overview, content, vector } = mergedContent;
+
+  const absorbedIds: string[] = [];
+  for (const idx of verdict.absorbedIndices!) {
+    absorbedIds.push(members[idx - 1].entry.id);
+  }
+
   const patchedMeta = buildSmartMetadata(survivor.entry, {
     l0_abstract: abstract,
     l1_overview: overview,
@@ -390,7 +456,7 @@ async function applyMergeVerdict(
   };
   await deps.update(
     survivor.entry.id,
-    { text: abstract, vector: newVector, metadata: stringifySmartMetadata(auditedMeta) },
+    { text: abstract, vector, metadata: stringifySmartMetadata(auditedMeta) },
     scopeFilter
   );
 
@@ -420,7 +486,7 @@ async function applyMergeVerdict(
 }
 
 async function applySupersedeVerdict(
-  deps: ConsolidateWriteDeps,
+  deps: Pick<ConsolidateWriteDeps, "update">,
   members: ConsolidateCandidate[],
   verdict: ConsolidateVerdictResult,
   scopeFilter: string[] | undefined,
@@ -457,10 +523,19 @@ async function applySupersedeVerdict(
 }
 
 export interface ClusterPlanReport {
+  clusterIndex: number;
   memberIds: string[];
   memberTexts: string[];
   verdict: ConsolidateVerdictResult | null;
   malformed: boolean;
+  /** null for skip/contradict/malformed/append-only-blocked units -- nothing to execute. */
+  action: "merge" | "supersede" | null;
+  survivorId?: string;
+  absorbedIds?: string[];
+  /** Item 8: precomputed at plan-build time, applied verbatim at execution. */
+  mergedContent?: ConsolidateMergedContent;
+  /** Snapshot used by the item-8 staleness guard: each member's id + exact metadata string at plan-build time. */
+  staleness: Array<{ id: string; metadata: string | undefined }>;
 }
 
 export interface RunConsolidateOptions {
@@ -473,19 +548,45 @@ export interface RunConsolidateOptions {
   clusterCap?: number;
   apply: boolean;
   now?: number;
+  /** --yes: bypasses the item-7 cost gate without ever calling confirmCost. */
+  autoConfirm?: boolean;
 }
 
 export interface RunConsolidateDeps extends ConsolidateWriteDeps {
   fetchRows: (scopeFilter: string[] | undefined, maxTimestamp: number, limit: number) => Promise<MemoryEntry[]>;
+  /** Re-fetches a row by id for the item-8 staleness guard. Omit to skip the guard (all clusters treated as fresh). */
+  getById?: (id: string, scopeFilter?: string[]) => Promise<MemoryEntry | null>;
+  /**
+   * Item 7 cost gate: called with a preview message before any LLM call,
+   * unless options.autoConfirm is set. A declined or missing confirmCost
+   * (and !autoConfirm) is a safe abort -- fail closed, never assume consent.
+   */
+  confirmCost?: (message: string) => Promise<boolean>;
+  /**
+   * Item 8 apply gate: called with the fully-built plan (message + per-
+   * cluster detail) when options.apply is false, so the user can review
+   * before anything is written. Never called when options.apply is true
+   * (direct --apply executes immediately, no second prompt). A declined or
+   * missing confirmApply is a safe no-op -- nothing gets written.
+   */
+  confirmApply?: (message: string, clusters: ClusterPlanReport[]) => Promise<boolean>;
   onAudit?: (audit: ConsolidateAuditEntry) => Promise<void> | void;
   log?: (message: string) => void;
 }
 
 export interface RunConsolidateResult {
+  /** "aborted": the item-7 cost gate was declined (or unavailable) -- zero LLM calls were made. */
+  status: "aborted" | "completed";
+  abortReason?: string;
   scanned: number;
   eligible: number;
+  costPreview?: ConsolidateCostPreview;
   clusters: ClusterPlanReport[];
   applied: ConsolidateAuditEntry[];
+  /** True iff the plan (or the fresh subset of it) was actually written to the store. */
+  executed: boolean;
+  /** Clusters withheld at execution time because a member row changed or disappeared since the plan was built. */
+  staleSkipped: Array<{ clusterIndex: number; memberIds: string[] }>;
   skippedMalformed: number;
   apply: boolean;
 }
@@ -493,6 +594,89 @@ export interface RunConsolidateResult {
 const DEFAULT_SIMILARITY_THRESHOLD = 0.86;
 const DEFAULT_CLUSTER_CAP = 8;
 const DEFAULT_SCAN_LIMIT = 100_000;
+
+function abortedResult(
+  reason: string,
+  scanned: number,
+  eligible: number,
+  costPreview: ConsolidateCostPreview | undefined,
+  apply: boolean
+): RunConsolidateResult {
+  return {
+    status: "aborted",
+    abortReason: reason,
+    scanned,
+    eligible,
+    costPreview,
+    clusters: [],
+    applied: [],
+    executed: false,
+    staleSkipped: [],
+    skippedMalformed: 0,
+    apply,
+  };
+}
+
+/**
+ * Item 8 staleness guard: re-fetches every member of a plan entry and
+ * compares its metadata string against the plan-build-time snapshot.
+ * Missing row (disappeared) or changed metadata (mutated by someone else)
+ * both count as stale. Skips the check entirely (treats as fresh) when
+ * deps.getById isn't provided -- an opt-in safety net, not a hard
+ * requirement, so callers that don't need it don't have to wire it up.
+ */
+async function isClusterFresh(
+  deps: Pick<RunConsolidateDeps, "getById">,
+  entry: ClusterPlanReport,
+  scopeFilter: string[] | undefined
+): Promise<boolean> {
+  if (!deps.getById) return true;
+  for (const snapshot of entry.staleness) {
+    const current = await deps.getById(snapshot.id, scopeFilter);
+    if (!current) return false;
+    if (current.metadata !== snapshot.metadata) return false;
+  }
+  return true;
+}
+
+async function executePlan(
+  deps: RunConsolidateDeps,
+  clusters: ClusterPlanReport[],
+  membersByCluster: Map<number, ConsolidateCandidate[]>,
+  scopeFilter: string[] | undefined,
+  now: number
+): Promise<{ applied: ConsolidateAuditEntry[]; staleSkipped: Array<{ clusterIndex: number; memberIds: string[] }> }> {
+  const applied: ConsolidateAuditEntry[] = [];
+  const staleSkipped: Array<{ clusterIndex: number; memberIds: string[] }> = [];
+
+  for (const entry of clusters) {
+    if (!entry.action || !entry.verdict) continue;
+    const members = membersByCluster.get(entry.clusterIndex);
+    if (!members) continue;
+
+    const fresh = await isClusterFresh(deps, entry, scopeFilter);
+    if (!fresh) {
+      staleSkipped.push({ clusterIndex: entry.clusterIndex, memberIds: entry.memberIds });
+      deps.log?.(
+        `memory-consolidate: cluster ${entry.clusterIndex} changed since the plan was built (stale); skipping, never partially applied`
+      );
+      continue;
+    }
+
+    try {
+      const audit =
+        entry.action === "merge"
+          ? await writeMergeVerdict(deps, members, entry.verdict, entry.mergedContent!, scopeFilter, now)
+          : await applySupersedeVerdict(deps, members, entry.verdict, scopeFilter, now);
+      applied.push(audit);
+      await deps.onAudit?.(audit);
+    } catch (err) {
+      deps.log?.(`memory-consolidate: failed to apply ${entry.action} verdict: ${String(err)}`);
+    }
+  }
+
+  return { applied, staleSkipped };
+}
 
 export async function runConsolidate(
   deps: RunConsolidateDeps,
@@ -530,10 +714,6 @@ export async function runConsolidate(
   const clusterCap = options.clusterCap ?? DEFAULT_CLUSTER_CAP;
   const clusterIndexGroups = clusterConsolidateCandidates(candidates, similarityThreshold);
 
-  const clusters: ClusterPlanReport[] = [];
-  const applied: ConsolidateAuditEntry[] = [];
-  let skippedMalformed = 0;
-
   const byId = (a: ConsolidateCandidate, b: ConsolidateCandidate) =>
     a.entry.id < b.entry.id ? -1 : a.entry.id > b.entry.id ? 1 : 0;
 
@@ -558,6 +738,34 @@ export async function runConsolidate(
     unit.clusterIndex = i + 1;
   });
 
+  // Item 7: the cost gate sits here -- clustering above is free (local
+  // cosine + fact_key/topic linking), and everything below this point is
+  // the first LLM call onward. Skipped entirely when there's nothing to
+  // decide (nothing to confirm), and bypassed without ever calling
+  // confirmCost when autoConfirm (--yes) is set. A declined OR missing
+  // confirmCost is treated identically: a safe abort, never assumed consent.
+  let costPreview: ConsolidateCostPreview | undefined;
+  if (units.length > 0) {
+    costPreview = computeConsolidateCostPreview(units);
+    if (!options.autoConfirm) {
+      const message = formatConsolidateCostPreview(costPreview);
+      const proceed = deps.confirmCost ? await deps.confirmCost(message) : false;
+      if (!proceed) {
+        return abortedResult(
+          "cost gate declined (or no confirmCost dep and --yes not set): no LLM call was made",
+          rawEntries.length,
+          candidates.length,
+          costPreview,
+          options.apply
+        );
+      }
+    }
+  }
+
+  const clusters: ClusterPlanReport[] = [];
+  const membersByCluster = new Map<number, ConsolidateCandidate[]>();
+  let skippedMalformed = 0;
+
   if (units.length > 0) {
     const batchClusters: ConsolidateBatchCluster[] = units.map((unit) => ({
       clusterIndex: unit.clusterIndex,
@@ -581,9 +789,14 @@ export async function runConsolidate(
         )
       : new Map<number, ConsolidateVerdictResult>();
 
+    // Item 8: build the COMPLETE plan now, regardless of apply/dry-run --
+    // every merge verdict gets its content generated here (moved from
+    // apply time), so execution later is pure store writes with zero
+    // further LLM calls.
     for (const unit of units) {
       const members = unit.members;
       const verdict = verdictMap.get(unit.clusterIndex) ?? null;
+      membersByCluster.set(unit.clusterIndex, members);
 
       if (!verdict) {
         skippedMalformed += 1;
@@ -591,23 +804,31 @@ export async function runConsolidate(
           `memory-consolidate: missing or malformed verdict for a cluster of ${members.length} rows, skipping`
         );
         clusters.push({
+          clusterIndex: unit.clusterIndex,
           memberIds: members.map((m) => m.entry.id),
           memberTexts: members.map((m) => m.abstract),
           verdict: null,
           malformed: true,
+          action: null,
+          staleness: members.map((m) => ({ id: m.entry.id, metadata: m.entry.metadata })),
         });
         continue;
       }
 
-      clusters.push({
-        memberIds: members.map((m) => m.entry.id),
-        memberTexts: members.map((m) => m.abstract),
-        verdict,
-        malformed: false,
-      });
+      const staleness = members.map((m) => ({ id: m.entry.id, metadata: m.entry.metadata }));
 
-      if (!options.apply) continue;
-      if (verdict.verdict === "skip" || verdict.verdict === "contradict") continue;
+      if (verdict.verdict === "skip" || verdict.verdict === "contradict") {
+        clusters.push({
+          clusterIndex: unit.clusterIndex,
+          memberIds: members.map((m) => m.entry.id),
+          memberTexts: members.map((m) => m.abstract),
+          verdict,
+          malformed: false,
+          action: null,
+          staleness,
+        });
+        continue;
+      }
 
       const actedUponIndices = [verdict.survivorIndex!, ...verdict.absorbedIndices!];
       if (
@@ -619,28 +840,94 @@ export async function runConsolidate(
         deps.log?.(
           `memory-consolidate: refusing to ${verdict.verdict} an append-only row (events/cases); skipping this verdict`
         );
+        clusters.push({
+          clusterIndex: unit.clusterIndex,
+          memberIds: members.map((m) => m.entry.id),
+          memberTexts: members.map((m) => m.abstract),
+          verdict,
+          malformed: false,
+          action: null,
+          staleness,
+        });
         continue;
       }
 
-      try {
-        const audit =
-          verdict.verdict === "merge"
-            ? await applyMergeVerdict(deps, members, verdict, scopeFilter, now)
-            : await applySupersedeVerdict(deps, members, verdict, scopeFilter, now);
-        applied.push(audit);
-        await deps.onAudit?.(audit);
-      } catch (err) {
-        deps.log?.(`memory-consolidate: failed to apply ${verdict.verdict} verdict: ${String(err)}`);
+      const survivor = members[verdict.survivorIndex! - 1];
+      const absorbedIds = verdict.absorbedIndices!.map((idx) => members[idx - 1].entry.id);
+
+      let mergedContent: ConsolidateMergedContent | undefined;
+      if (verdict.verdict === "merge") {
+        mergedContent = await buildMergePlanContent(deps, members, verdict);
       }
+
+      clusters.push({
+        clusterIndex: unit.clusterIndex,
+        memberIds: members.map((m) => m.entry.id),
+        memberTexts: members.map((m) => m.abstract),
+        verdict,
+        malformed: false,
+        action: verdict.verdict === "merge" ? "merge" : "supersede",
+        survivorId: survivor.entry.id,
+        absorbedIds,
+        mergedContent,
+        staleness,
+      });
+    }
+  }
+
+  const actionable = clusters.filter((c) => c.action);
+
+  // Item 8: direct --apply executes the plan immediately, no second prompt.
+  if (options.apply) {
+    const { applied, staleSkipped } = await executePlan(deps, actionable, membersByCluster, scopeFilter, now);
+    return {
+      status: "completed",
+      scanned: rawEntries.length,
+      eligible: candidates.length,
+      costPreview,
+      clusters,
+      applied,
+      executed: true,
+      staleSkipped,
+      skippedMalformed,
+      apply: true,
+    };
+  }
+
+  // Dry-run / interactive path: present the full plan, ask once, execute
+  // only on an explicit affirmative. A declined or missing confirmApply is
+  // a safe no-op -- the plan was built (and its LLM calls already spent),
+  // but nothing is written.
+  if (actionable.length > 0) {
+    const message = `${actionable.length} cluster(s) ready to apply. Apply these now? (YES/no)`;
+    const proceed = deps.confirmApply ? await deps.confirmApply(message, clusters) : false;
+    if (proceed) {
+      const { applied, staleSkipped } = await executePlan(deps, actionable, membersByCluster, scopeFilter, now);
+      return {
+        status: "completed",
+        scanned: rawEntries.length,
+        eligible: candidates.length,
+        costPreview,
+        clusters,
+        applied,
+        executed: true,
+        staleSkipped,
+        skippedMalformed,
+        apply: false,
+      };
     }
   }
 
   return {
+    status: "completed",
     scanned: rawEntries.length,
     eligible: candidates.length,
+    costPreview,
     clusters,
-    applied,
+    applied: [],
+    executed: false,
+    staleSkipped: [],
     skippedMalformed,
-    apply: options.apply,
+    apply: false,
   };
 }

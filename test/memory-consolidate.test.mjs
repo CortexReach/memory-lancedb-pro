@@ -80,6 +80,10 @@ function makeFakeStore(initialRows) {
       if (patch.metadata !== undefined) row.metadata = patch.metadata;
       return { ...row };
     },
+    getById: async (id) => {
+      const row = rows.find((r) => r.id === id);
+      return row ? { ...row } : null;
+    },
     delete: async (id) => {
       const idx = rows.findIndex((r) => r.id === id);
       if (idx === -1) return false;
@@ -574,7 +578,7 @@ describe("memory consolidate: deterministic verdicts", () => {
       return null;
     };
 
-    await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, now: ts + 1000 });
+    await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, autoConfirm: true, now: ts + 1000 });
 
     assert.equal(capturedTemperature, 0, "the consolidate-decide call must request temperature 0");
   });
@@ -605,11 +609,11 @@ describe("memory consolidate: deterministic verdicts", () => {
 
     await runConsolidate(
       { ...makeFakeStore(rowsInOrder), completeJson },
-      { scope: "global", apply: false, now: ts + 1000 }
+      { scope: "global", apply: false, autoConfirm: true, now: ts + 1000 }
     );
     await runConsolidate(
       { ...makeFakeStore(rowsShuffled), completeJson },
-      { scope: "global", apply: false, now: ts + 1000 }
+      { scope: "global", apply: false, autoConfirm: true, now: ts + 1000 }
     );
 
     assert.equal(capturedPrompts.length, 2);
@@ -648,7 +652,7 @@ describe("memory consolidate: deterministic verdicts", () => {
     const results = [];
     for (let i = 0; i < 3; i++) {
       const store = makeFakeStore(rows);
-      results.push(await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, now: ts + 100_000 }));
+      results.push(await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, autoConfirm: true, now: ts + 100_000 }));
     }
 
     assert.deepEqual(results[0].clusters, results[1].clusters, "run 1 vs run 2 verdict sets must be byte-identical");
@@ -685,7 +689,7 @@ describe("memory consolidate: orchestration", () => {
 
     const result = await runConsolidate(
       { ...store, completeJson },
-      { scope: "global", apply: false, now: 1_700_100_000_000 }
+      { scope: "global", apply: false, autoConfirm: true, now: 1_700_100_000_000 }
     );
 
     assert.equal(result.apply, false);
@@ -717,7 +721,7 @@ describe("memory consolidate: orchestration", () => {
 
     const result = await runConsolidate(
       { ...store, completeJson, onAudit: (a) => audits.push(a) },
-      { scope: "global", apply: true, now: 1_700_100_000_000 }
+      { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 }
     );
 
     assert.equal(result.applied.length, 1);
@@ -754,8 +758,8 @@ describe("memory consolidate: orchestration", () => {
       ],
     });
 
-    await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, now: 1_700_100_000_000 });
-    const secondResult = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, now: 1_700_200_000_000 });
+    await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 });
+    const secondResult = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, autoConfirm: true, now: 1_700_200_000_000 });
 
     assert.equal(secondResult.applied.length, 0, "no cluster should reform once duplicates are invalidated");
   });
@@ -778,7 +782,7 @@ describe("memory consolidate: orchestration", () => {
       return { abstract: "Coffee order: oat milk latte, extra hot", overview: "", content: "User orders an oat milk latte, extra hot." };
     };
 
-    const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, now: ts + 100_000 });
+    const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, autoConfirm: true, now: ts + 100_000 });
 
     assert.equal(result.applied.length, 1);
     assert.equal(result.applied[0].survivorId, rows[0].id);
@@ -805,7 +809,7 @@ describe("memory consolidate: orchestration", () => {
 
     const result = await runConsolidate(
       { ...store, completeJson, log: (msg) => logs.push(msg) },
-      { scope: "global", apply: true, now: 1_700_100_000_000 }
+      { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 }
     );
 
     assert.equal(result.skippedMalformed, 1);
@@ -825,12 +829,12 @@ describe("memory consolidate: orchestration", () => {
       verdicts: [{ cluster_index: 1, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "dup" }],
     });
 
-    const excluded = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, now: ts + 100 });
+    const excluded = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, autoConfirm: true, now: ts + 100 });
     assert.equal(excluded.eligible, 0, "reflection rows excluded by default");
 
     const included = await runConsolidate(
       { ...store, completeJson },
-      { scope: "global", apply: false, now: ts + 100, includeReflectionSlices: true }
+      { scope: "global", apply: false, autoConfirm: true, now: ts + 100, includeReflectionSlices: true }
     );
     assert.equal(included.eligible, 2, "reflection rows included with the opt-in flag");
   });
@@ -857,7 +861,7 @@ describe("memory consolidate: orchestration", () => {
 
     const result = await runConsolidate(
       { ...store, completeJson, log: (msg) => logs.push(msg) },
-      { scope: "global", apply: true, now: ts + 100 }
+      { scope: "global", apply: true, autoConfirm: true, now: ts + 100 }
     );
 
     assert.equal(result.applied.length, 0, "append-only categories must never merge/supersede, even on LLM instruction");
@@ -891,7 +895,7 @@ describe("memory consolidate: orchestration", () => {
 
     const result = await runConsolidate(
       { ...store, completeJson },
-      { scope: "global", apply: true, now: ts + 100 }
+      { scope: "global", apply: true, autoConfirm: true, now: ts + 100 }
     );
 
     assert.equal(result.applied.length, 1, "the actionable subset must still merge");
@@ -942,7 +946,7 @@ describe("memory consolidate: orchestration", () => {
 
     const result = await runConsolidate(
       { ...storeWithoutDelete, completeJson },
-      { scope: "global", apply: true, now: ts + 100_000 }
+      { scope: "global", apply: true, autoConfirm: true, now: ts + 100_000 }
     );
 
     assert.equal(result.applied.length, 2, "both verdicts must apply successfully without a delete method available");
@@ -965,8 +969,8 @@ describe("memory consolidate: orchestration", () => {
       return { abstract: "merged", overview: "", content: "merged" };
     };
 
-    const first = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, now: ts + 100_000 });
-    const second = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, now: ts + 200_000 });
+    const first = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, autoConfirm: true, now: ts + 100_000 });
+    const second = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, autoConfirm: true, now: ts + 200_000 });
 
     assert.equal(first.applied.length, 1);
     assert.equal(second.applied.length, 0, "the invalidated absorbed row must not re-enter clustering on the next run");
@@ -1002,7 +1006,7 @@ describe("memory consolidate: orchestration", () => {
       };
     };
 
-    const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, now: ts + 100_000 });
+    const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, autoConfirm: true, now: ts + 100_000 });
 
     assert.equal(decideCallCount, 1, "all 3 clusters must be decided in a single completeJson call");
     assert.equal(result.clusters.length, 3, "all 3 clusters must be reported");
@@ -1020,7 +1024,7 @@ describe("memory consolidate: orchestration", () => {
       verdicts: [{ cluster_index: 1, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "dup" }],
     });
 
-    const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, now: ts + 100 });
+    const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, autoConfirm: true, now: ts + 100 });
     assert.equal(result.scanned, 1, "fetchRows must only see the requested scope");
   });
 
@@ -1044,7 +1048,7 @@ describe("memory consolidate: orchestration", () => {
       };
     };
 
-    const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, now: ts + 100_000 });
+    const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, autoConfirm: true, now: ts + 100_000 });
 
     assert.equal(result.clusters.length, 1, "exactly one cluster must reach the decider");
     assert.equal(sawClusterMemberCount, 4, "the decider's prompt must list all 4 rows together in that one cluster");
@@ -1120,6 +1124,10 @@ describe("memory consolidate: CLI system-prompt wiring", () => {
             .filter((r) => (!scopeFilter || scopeFilter.includes(r.scope)) && r.timestamp <= maxTimestamp)
             .slice(0, limit ?? rows.length),
         update: async () => ({}),
+        getById: async (id) => {
+          const row = rows.find((r) => r.id === id);
+          return row ? { ...row } : null;
+        },
         delete: async () => true,
       },
       retriever: {},
@@ -1146,7 +1154,7 @@ describe("memory consolidate: CLI system-prompt wiring", () => {
     program.exitOverride();
     createMemoryCLI(context)({ program });
 
-    await program.parseAsync(["node", "openclaw", "memory-pro", "consolidate", "--scope", "global", "--apply"]);
+    await program.parseAsync(["node", "openclaw", "memory-pro", "consolidate", "--scope", "global", "--apply", "--yes"]);
 
     const decide = calls.find((c) => c.label === "consolidate-decide");
     assert.ok(decide, "expected a consolidate-decide completeJson call");
@@ -1170,6 +1178,10 @@ describe("memory consolidate: CLI journal-mirror agent identity", () => {
             .filter((r) => (!scopeFilter || scopeFilter.includes(r.scope)) && r.timestamp <= maxTimestamp)
             .slice(0, limit ?? rows.length),
         update: async () => ({}),
+        getById: async (id) => {
+          const row = rows.find((r) => r.id === id);
+          return row ? { ...row } : null;
+        },
         delete: async () => true,
       },
       retriever: {},
@@ -1214,7 +1226,7 @@ describe("memory consolidate: CLI journal-mirror agent identity", () => {
 
     await program.parseAsync([
       "node", "openclaw", "memory-pro", "consolidate",
-      "--scope", "global", "--apply", "--agent", "terry",
+      "--scope", "global", "--apply", "--agent", "terry", "--yes",
     ]);
 
     assert.equal(mirrorCalls.length, 1, "expected exactly one journal-mirror write for the applied merge");
@@ -1231,7 +1243,7 @@ describe("memory consolidate: CLI journal-mirror agent identity", () => {
     program.exitOverride();
     createMemoryCLI(context)({ program });
 
-    await program.parseAsync(["node", "openclaw", "memory-pro", "consolidate", "--scope", "global", "--apply"]);
+    await program.parseAsync(["node", "openclaw", "memory-pro", "consolidate", "--scope", "global", "--apply", "--yes"]);
 
     assert.equal(mirrorCalls.length, 1);
     assert.equal(mirrorCalls[0].meta.agentId, undefined);
