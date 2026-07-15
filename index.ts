@@ -69,7 +69,7 @@ import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
+import { normalizeAutoCaptureText, capUnknownWatermarkWindow } from "./src/auto-capture-cleanup.js";
 import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 
 // Import smart extraction & lifecycle components
@@ -3877,15 +3877,25 @@ const memoryLanceDBProPlugin = {
             autoCapturePendingIngressTexts.delete(conversationKey);
           }
 
+          const minMessages = config.extractMinMessages ?? 4;
           const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
           let newTexts = eligibleTexts;
+          let watermarkAdvanceOverride: number | null = null;
           if (pendingIngressTexts.length > 0) {
             newTexts = pendingIngressTexts;
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
+          } else if (previousSeenCount === 0 && eligibleTexts.length > minMessages) {
+            // issue #417 item 5: a genuinely unknown watermark (first-ever
+            // run, or persisted state lost) meeting a history-carrying
+            // payload must not ingest the entire transcript in one call.
+            // Cap to the most recent batch and forfeit the rest by marking
+            // it seen below, rather than queueing it for a later turn.
+            newTexts = capUnknownWatermarkWindow(eligibleTexts, minMessages, config.extractMaxChars ?? 8000);
+            watermarkAdvanceOverride = eligibleTexts.length;
           }
           // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
-          const cumulativeCount = previousSeenCount + newTexts.length;
+          const cumulativeCount = watermarkAdvanceOverride ?? (previousSeenCount + newTexts.length);
           await persistAutoCaptureWatermark(sessionKey, cumulativeCount);
 
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
@@ -3903,7 +3913,6 @@ const memoryLanceDBProPlugin = {
             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
-          const minMessages = config.extractMinMessages ?? 4;
           if (skippedAutoCaptureTexts > 0) {
             api.logger.debug(
               `memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`,
