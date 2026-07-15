@@ -409,4 +409,62 @@ describe("AdmissionController buildUtilityPrompt (source-kind framing)", () => {
     );
     assert.match(userPrompt, /- Overview: ## Preference Domain\n {2}- Editor: Zed\n {2}- Theme: dark/);
   });
+
+  it("blank-line separates the Overview and Content bullets from the rest of the candidate block instead of gluing them with a single newline", async () => {
+    const llm = makeAdmissionLlm();
+    const controller = new AdmissionController(admissionStore, llm, balanced);
+
+    await controller.evaluate({
+      candidate: {
+        category: "preferences",
+        abstract: "Editor preferences",
+        overview: "Uses Zed",
+        content: "User prefers the Zed editor.",
+      },
+      candidateVector: [1, 0, 0],
+      conversationText: "some real conversation text",
+      scopeFilter: ["global"],
+    });
+
+    const { userPrompt } = llm.prompts[0];
+    assert.match(
+      userPrompt,
+      /- Abstract: Editor preferences\n\n- Overview: Uses Zed\n\n- Content: User prefers the Zed editor\./,
+      "Overview and Content carry multi-line content so each gets its own blank-line-separated block, not a single-\\n glued list"
+    );
+  });
+
+  it("wraps a clearly labeled, fenced few-shot example in the system prompt that cannot be mistaken for live candidate data", async () => {
+    const llm = makeAdmissionLlm();
+    const controller = new AdmissionController(admissionStore, llm, balanced);
+
+    await controller.evaluate({
+      candidate: {
+        category: "preferences",
+        abstract: "User prefers dark mode",
+        overview: "",
+        content: "User prefers dark mode.",
+      },
+      candidateVector: [1, 0, 0],
+      conversationText: "some real conversation text",
+      scopeFilter: ["global"],
+    });
+
+    const { systemPrompt } = llm.prompts[0];
+    const startIndex = systemPrompt.indexOf("--- EXAMPLE");
+    const endIndex = systemPrompt.indexOf("--- END EXAMPLE ---");
+    assert.ok(startIndex !== -1, "system prompt must fence the few-shot example with a clear start marker");
+    assert.ok(endIndex !== -1, "system prompt must fence the few-shot example with a clear end marker");
+    assert.ok(startIndex < endIndex, "the end marker must close the example after the start marker");
+    assert.match(
+      systemPrompt.slice(startIndex, endIndex),
+      /Example response:/,
+      "the example's sample output must be labeled so it reads as illustrative, not a live instruction"
+    );
+    const contractIndex = systemPrompt.indexOf("Return JSON only:");
+    assert.ok(
+      endIndex < contractIndex,
+      "the fenced example must close before the live output-format contract"
+    );
+  });
 });

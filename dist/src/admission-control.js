@@ -319,6 +319,15 @@ Score future usefulness on a 0.0-1.0 scale.
 Use higher scores for durable preferences, profile facts, reusable procedures, and long-lived project/entity state.
 Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
 
+--- EXAMPLE (not part of the live data) ---
+Candidate memory:
+- Category: preferences
+- Abstract: User's preferred name is Alex
+
+Example response:
+{"utility": 0.9, "reason": "durable identity fact"}
+--- END EXAMPLE ---
+
 Return JSON only:
 {
   "utility": 0.0,
@@ -333,7 +342,9 @@ ${excerpt}
 Candidate memory:
 - Category: ${candidate.category}
 - Abstract: ${candidate.abstract}
+
 - Overview: ${candidate.overview.replace(/\n/g, "\n  ")}
+
 - Content: ${candidate.content.replace(/\n/g, "\n  ")}`;
     return { system, user };
 }
