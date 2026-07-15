@@ -561,8 +561,8 @@ describe("recall text cleanup", () => {
     });
 
     queue.enqueue([
-      { id: "m1", expectedScope: "global", accessCountDelta: 1, accessedAt: 100 },
-      { id: "m2", expectedScope: "global", accessCountDelta: 1, accessedAt: 100 },
+      { id: "m1", expectedScope: "global", accessCountDelta: 1, accessedAt: 100, governanceSnapshot: { badRecallCount: 0, suppressedUntilTurn: 0 } },
+      { id: "m2", expectedScope: "global", accessCountDelta: 1, accessedAt: 100, governanceSnapshot: { badRecallCount: 0, suppressedUntilTurn: 0 } },
     ]);
     await queue.flush();
     await new Promise((resolve) => setImmediate(resolve));
@@ -571,41 +571,6 @@ describe("recall text cleanup", () => {
     assert.equal(calls.length, 2);
     assert.deepEqual(calls[1].map(({ id }) => id), ["m1"]);
     assert.ok(warnings.some((line) => /retry id=m1 attempt=1\/3/.test(line)));
-  });
-
-  it("tracks batch failures by position when one ID has two expected scopes", async () => {
-    const calls = [];
-    const writer = {
-      async applyManualRecallMetadataBatch(updates) {
-        calls.push(updates);
-        if (calls.length === 1) {
-          return [
-            { id: "m1", entry: { id: "m1" } },
-            { id: "m1", entry: null, error: "scope changed" },
-          ];
-        }
-        return updates.map((update) => ({ id: update.id, entry: { id: update.id } }));
-      },
-    };
-    const queue = new ManualRecallMetadataQueue(writer, {
-      debounceMs: 60_000,
-      retryDelayMs: () => 0,
-      warn: () => {},
-    });
-
-    queue.enqueue([
-      { id: "m1", expectedScope: "global", accessCountDelta: 1, accessedAt: 100 },
-      { id: "m1", expectedScope: "agent:main", accessCountDelta: 1, accessedAt: 100 },
-    ]);
-    await queue.flush();
-    await new Promise((resolve) => setImmediate(resolve));
-    await queue.flush();
-
-    assert.equal(calls.length, 2);
-    assert.deepEqual(
-      calls[1].map(({ id, expectedScope }) => ({ id, expectedScope })),
-      [{ id: "m1", expectedScope: "agent:main" }],
-    );
   });
 
   it("keeps memory_recall neighbor summaries within the per-item character budget", async () => {

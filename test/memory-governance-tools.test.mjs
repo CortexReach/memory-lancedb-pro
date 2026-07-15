@@ -94,6 +94,12 @@ describe("memory governance tools", () => {
       })),
       [{ id: "recall-memory-1", expectedScope: "agent:main", accessCountDelta: 1 }],
     );
+    assert.deepEqual(metadataBatches[0][0].governanceSnapshot, {
+      lastInjectedAt: undefined,
+      badRecallCount: 0,
+      suppressedUntilTurn: 0,
+      suppressedUntilMs: undefined,
+    });
   });
 
   it("keeps inaccessible write scopes hard-denied", async () => {

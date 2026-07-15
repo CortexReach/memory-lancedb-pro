@@ -902,12 +902,21 @@ function createMemoryRecallTool(
           // concurrent agents share one lock-safe metadata batch.
           enqueueManualRecallMetadata(
             runtimeContext.store,
-            results.map((result) => ({
-              id: result.entry.id,
-              expectedScope: result.entry.scope,
-              accessCountDelta: 1,
-              accessedAt: now,
-            })),
+            results.map((result) => {
+              const metadata = parseSmartMetadata(result.entry.metadata, result.entry);
+              return {
+                id: result.entry.id,
+                expectedScope: result.entry.scope,
+                accessCountDelta: 1,
+                accessedAt: now,
+                governanceSnapshot: {
+                  lastInjectedAt: metadata.last_injected_at,
+                  badRecallCount: metadata.bad_recall_count,
+                  suppressedUntilTurn: metadata.suppressed_until_turn,
+                  suppressedUntilMs: metadata.suppressed_until_ms,
+                },
+              };
+            }),
           );
 
           const text = results

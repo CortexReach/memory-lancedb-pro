@@ -7,7 +7,16 @@ import { join } from "node:path";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
-const { MemoryStore } = jiti("../src/store.ts");
+const { MemoryStore, __setLockfileModuleForTests } = jiti("../src/store.ts");
+const {
+  enqueueManualRecallMetadata,
+  ManualRecallMetadataQueue,
+} = jiti("../src/manual-recall-metadata-queue.ts");
+const realLockfile = await import("proper-lockfile");
+const EMPTY_GOVERNANCE_SNAPSHOT = {
+  badRecallCount: 0,
+  suppressedUntilTurn: 0,
+};
 
 function makeStore() {
   const dir = mkdtempSync(join(tmpdir(), "memory-lancedb-pro-write-queue-"));
@@ -196,9 +205,38 @@ describe("MemoryStore write queue", () => {
       };
 
       const results = await store.applyManualRecallMetadataBatch([
-        { id: a.id, expectedScope: "global", accessCountDelta: 4, accessedAt: 700 },
-        { id: b.id, expectedScope: "global", accessCountDelta: 3, accessedAt: 600 },
-        { id: c.id, expectedScope: "tech", accessCountDelta: 1, accessedAt: 900 },
+        {
+          id: a.id,
+          expectedScope: "global",
+          accessCountDelta: 4,
+          accessedAt: 700,
+          governanceSnapshot: {
+            badRecallCount: 2,
+            suppressedUntilTurn: 9,
+            suppressedUntilMs: 900,
+          },
+        },
+        {
+          id: b.id,
+          expectedScope: "global",
+          accessCountDelta: 3,
+          accessedAt: 600,
+          governanceSnapshot: {
+            badRecallCount: 1,
+            suppressedUntilTurn: 4,
+            suppressedUntilMs: 850,
+          },
+        },
+        {
+          id: c.id,
+          expectedScope: "tech",
+          accessCountDelta: 1,
+          accessedAt: 900,
+          governanceSnapshot: {
+            badRecallCount: 0,
+            suppressedUntilTurn: 0,
+          },
+        },
       ]);
 
       table.delete = originalDelete;
@@ -254,6 +292,7 @@ describe("MemoryStore write queue", () => {
             expectedScope: "global",
             accessCountDelta: 2,
             accessedAt: now - 1_000,
+            governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
           },
         ]),
         store.applyManualRecallMetadataBatch([
@@ -262,6 +301,7 @@ describe("MemoryStore write queue", () => {
             expectedScope: "global",
             accessCountDelta: 3,
             accessedAt: now,
+            governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
           },
         ]),
       ]);
@@ -273,6 +313,323 @@ describe("MemoryStore write queue", () => {
       assert.equal(metadata.last_accessed_at, now);
       assert.equal(metadata.last_confirmed_use_at, now);
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves governance fields changed after the queued manual recall", async () => {
+    const { store, dir } = makeStore();
+    let queue;
+    try {
+      const entry = await store.store({
+        ...makeEntry(1),
+        metadata: JSON.stringify({
+          access_count: 2,
+          last_accessed_at: 900,
+          last_confirmed_use_at: 800,
+          last_injected_at: 1_000,
+          bad_recall_count: 3,
+          suppressed_until_turn: 7,
+          suppressed_until_ms: 5_000,
+        }),
+      });
+
+      queue = new ManualRecallMetadataQueue(store, {
+        debounceMs: 60_000,
+        warn: () => {},
+      });
+      queue.enqueue([{
+        id: entry.id,
+        expectedScope: "global",
+        accessCountDelta: 1,
+        accessedAt: 1_100,
+        governanceSnapshot: {
+          lastInjectedAt: 1_000,
+          badRecallCount: 3,
+          suppressedUntilTurn: 7,
+          suppressedUntilMs: 5_000,
+        },
+      }]);
+
+      await store.patchMetadata(entry.id, {
+        bad_recall_count: 4,
+        suppressed_until_ms: 9_000,
+      }, ["global"]);
+      await queue.flush();
+
+      const afterStaleRecall = JSON.parse((await store.getById(entry.id)).metadata);
+      assert.equal(afterStaleRecall.access_count, 3);
+      assert.equal(afterStaleRecall.last_accessed_at, 1_100);
+      assert.equal(afterStaleRecall.bad_recall_count, 4);
+      assert.equal(afterStaleRecall.suppressed_until_turn, 7);
+      assert.equal(afterStaleRecall.suppressed_until_ms, 9_000);
+
+      queue.enqueue([{
+        id: entry.id,
+        expectedScope: "global",
+        accessCountDelta: 1,
+        accessedAt: 1_200,
+        governanceSnapshot: {
+          lastInjectedAt: 1_000,
+          badRecallCount: 4,
+          suppressedUntilTurn: 7,
+          suppressedUntilMs: 9_000,
+        },
+      }]);
+      await queue.flush();
+
+      const afterNewerRecall = JSON.parse((await store.getById(entry.id)).metadata);
+      assert.equal(afterNewerRecall.access_count, 4);
+      assert.equal(afterNewerRecall.bad_recall_count, 0);
+      assert.equal(afterNewerRecall.suppressed_until_turn, 0);
+      assert.equal(afterNewerRecall.suppressed_until_ms, 0);
+    } finally {
+      if (queue) await queue.drain();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("applies the current-scope recall when an older queued recall has a stale scope", async () => {
+    const { store, dir } = makeStore();
+    let queue;
+    try {
+      const entry = await store.store(makeEntry(1));
+      queue = new ManualRecallMetadataQueue(store, {
+        debounceMs: 60_000,
+        maxRetries: 0,
+        warn: () => {},
+      });
+      queue.enqueue([{
+        id: entry.id,
+        expectedScope: "global",
+        accessCountDelta: 1,
+        accessedAt: 100,
+        governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
+      }]);
+
+      await store.upsert({ ...entry, scope: "agent:main" });
+      queue.enqueue([{
+        id: entry.id,
+        expectedScope: "agent:main",
+        accessCountDelta: 1,
+        accessedAt: 200,
+        governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
+      }]);
+      await queue.flush();
+
+      const current = await store.getById(entry.id);
+      assert.equal(current.scope, "agent:main");
+      assert.equal(JSON.parse(current.metadata).access_count, 1);
+      assert.deepEqual(queue.getPendingUpdates(), []);
+    } finally {
+      if (queue) await queue.drain();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retry a committed recall after the file lock release fails", async () => {
+    const { store, dir } = makeStore();
+    const warnings = [];
+    let queue;
+    try {
+      const entry = await store.store(makeEntry(1));
+      __setLockfileModuleForTests({
+        async lock() {
+          return async () => {
+            const error = new Error("simulated post-commit release failure");
+            error.code = "EIO";
+            throw error;
+          };
+        },
+      });
+      queue = new ManualRecallMetadataQueue(store, {
+        debounceMs: 60_000,
+        retryDelayMs: () => 60_000,
+        maxRetries: 1,
+        warn: (message) => warnings.push(message),
+      });
+      queue.enqueue([{
+        id: entry.id,
+        expectedScope: "global",
+        accessCountDelta: 1,
+        accessedAt: Date.now(),
+        governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
+      }]);
+
+      await queue.flush();
+
+      const metadata = JSON.parse((await store.getById(entry.id)).metadata);
+      assert.equal(metadata.access_count, 1);
+      assert.deepEqual(queue.getPendingUpdates(), []);
+      assert.ok(warnings.some((message) => /lock failed after the batch settled/.test(message)));
+    } finally {
+      __setLockfileModuleForTests(realLockfile);
+      if (queue) await queue.drain();
+      await store.destroy().catch(() => {});
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("retries only the uncommitted chunk after a later chunk query fails", async () => {
+    const { store, dir } = makeStore();
+    const originalMaxBatchSize = MemoryStore.MAX_BATCH_SIZE;
+    let queue;
+    let table;
+    let originalQuery;
+    try {
+      const first = await store.store(makeEntry(1));
+      const second = await store.store(makeEntry(2));
+      MemoryStore.MAX_BATCH_SIZE = 1;
+
+      table = store.table;
+      originalQuery = table.query.bind(table);
+      let queryCalls = 0;
+      table.query = (...args) => {
+        queryCalls += 1;
+        if (queryCalls === 2) {
+          return {
+            where() {
+              return {
+                async toArray() {
+                  throw new Error("simulated later chunk query failure");
+                },
+              };
+            },
+          };
+        }
+        return originalQuery(...args);
+      };
+
+      queue = new ManualRecallMetadataQueue(store, {
+        debounceMs: 60_000,
+        retryDelayMs: () => 60_000,
+        warn: () => {},
+      });
+      queue.enqueue([
+        { id: first.id, expectedScope: "global", accessCountDelta: 1, accessedAt: 100, governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT },
+        { id: second.id, expectedScope: "global", accessCountDelta: 1, accessedAt: 100, governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT },
+      ]);
+      await queue.flush();
+
+      assert.deepEqual(
+        queue.getPendingUpdates().map(({ id }) => id),
+        [second.id],
+        "the committed first chunk must not be requeued",
+      );
+
+      table.query = originalQuery;
+      await queue.flush();
+
+      const firstMetadata = JSON.parse((await store.getById(first.id)).metadata);
+      const secondMetadata = JSON.parse((await store.getById(second.id)).metadata);
+      assert.equal(firstMetadata.access_count, 1);
+      assert.equal(secondMetadata.access_count, 1);
+    } finally {
+      MemoryStore.MAX_BATCH_SIZE = originalMaxBatchSize;
+      if (table && originalQuery) table.query = originalQuery;
+      if (queue) await queue.drain();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retry rows already committed by a partially successful add", async () => {
+    const { store, dir } = makeStore();
+    let queue;
+    let table;
+    let originalAdd;
+    try {
+      const first = await store.store(makeEntry(1));
+      const second = await store.store(makeEntry(2));
+      table = store.table;
+      originalAdd = table.add.bind(table);
+      let injectedFailure = false;
+      table.add = async (entries) => {
+        if (!injectedFailure && entries.length === 2) {
+          injectedFailure = true;
+          await originalAdd([entries[0]]);
+          throw new Error("simulated partial add failure");
+        }
+        return originalAdd(entries);
+      };
+
+      queue = new ManualRecallMetadataQueue(store, {
+        debounceMs: 60_000,
+        retryDelayMs: () => 60_000,
+        warn: () => {},
+      });
+      queue.enqueue([
+        { id: first.id, expectedScope: "global", accessCountDelta: 1, accessedAt: 100, governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT },
+        { id: second.id, expectedScope: "global", accessCountDelta: 1, accessedAt: 100, governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT },
+      ]);
+      await queue.flush();
+
+      assert.deepEqual(
+        queue.getPendingUpdates().map(({ id }) => id),
+        [second.id],
+        "the row preserved by the partial add must be treated as committed",
+      );
+
+      await queue.flush();
+      const firstMetadata = JSON.parse((await store.getById(first.id)).metadata);
+      const secondMetadata = JSON.parse((await store.getById(second.id)).metadata);
+      assert.equal(firstMetadata.access_count, 1);
+      assert.equal(secondMetadata.access_count, 1);
+    } finally {
+      if (table && originalAdd) table.add = originalAdd;
+      if (queue) await queue.drain();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("drains a retrying production metadata queue before store shutdown", async () => {
+    const { store, dir } = makeStore();
+    const keepAlive = setInterval(() => {}, 1_000);
+    let destroyed = false;
+    try {
+      const entry = await store.store(makeEntry(1));
+      const originalApply = store.applyManualRecallMetadataBatch.bind(store);
+      let attempts = 0;
+      let resolveFirstAttempt;
+      const firstAttempt = new Promise((resolve) => {
+        resolveFirstAttempt = resolve;
+      });
+      store.applyManualRecallMetadataBatch = async (updates) => {
+        attempts += 1;
+        if (attempts === 1) {
+          resolveFirstAttempt();
+          return updates.map((update) => ({
+            id: update.id,
+            entry: null,
+            error: "simulated retry window",
+          }));
+        }
+        return originalApply(updates);
+      };
+
+      enqueueManualRecallMetadata(store, [{
+        id: entry.id,
+        expectedScope: "global",
+        accessCountDelta: 1,
+        accessedAt: 100,
+        governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
+      }]);
+      await firstAttempt;
+      await new Promise((resolve) => setImmediate(resolve));
+
+      await store.destroy();
+      destroyed = true;
+      assert.equal(attempts, 2, "shutdown should immediately drain the scheduled retry");
+
+      const reopened = new MemoryStore({ dbPath: dir, vectorDim: 3 });
+      try {
+        const metadata = JSON.parse((await reopened.getById(entry.id)).metadata);
+        assert.equal(metadata.access_count, 1);
+      } finally {
+        await reopened.destroy();
+      }
+    } finally {
+      clearInterval(keepAlive);
+      if (!destroyed) await store.destroy().catch(() => {});
       rmSync(dir, { recursive: true, force: true });
     }
   });

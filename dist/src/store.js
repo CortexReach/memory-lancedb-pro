@@ -8,6 +8,7 @@ import { access as accessAsync, lstat as lstatAsync, mkdir as mkdirAsync, realpa
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchesMemoryCategoryFilter, resolveCategoryFilterCandidates } from "./memory-categories.js";
+import { drainManualRecallMetadata, ManualRecallMetadataBatchSettledError, } from "./manual-recall-metadata-queue.js";
 import { RedisLockAcquisitionError, RedisLockLeaseIntegrityError, RedisLockManager, RedisLockUnavailableError, } from "./redis-lock.js";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 // ============================================================================
@@ -1287,6 +1288,7 @@ export class MemoryStore {
      * @public
      */
     async destroy() {
+        await drainManualRecallMetadata(this);
         if (this.flushTimer) {
             clearTimeout(this.flushTimer);
             this.flushTimer = null;
@@ -1795,11 +1797,13 @@ export class MemoryStore {
         await this.ensureInitialized();
         if (updates.length === 0)
             return [];
-        return this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+        let settledResults = null;
+        const applyBatch = () => this.runSerializedUpdate(async () => {
             const results = new Map();
             const pending = [];
-            const seenIds = new Set();
+            const seenUpdates = new Set();
             updates.forEach((candidate, inputIndex) => {
+                const updateKey = `${candidate.id}\u0000${candidate.expectedScope}`;
                 const isValidId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(candidate.id) ||
                     isLegacyStableMemoryId(candidate.id);
                 if (!isValidId) {
@@ -1807,14 +1811,16 @@ export class MemoryStore {
                         id: String(candidate.id),
                         entry: null,
                         error: `Invalid exact memory ID: ${String(candidate.id)}`,
+                        retryable: false,
                     });
                     return;
                 }
-                if (seenIds.has(candidate.id)) {
+                if (seenUpdates.has(updateKey)) {
                     results.set(inputIndex, {
                         id: candidate.id,
                         entry: null,
-                        error: `Duplicate exact memory ID: ${candidate.id}`,
+                        error: `Duplicate exact memory ID and scope: ${candidate.id} (${candidate.expectedScope})`,
+                        retryable: false,
                     });
                     return;
                 }
@@ -1823,6 +1829,7 @@ export class MemoryStore {
                         id: candidate.id,
                         entry: null,
                         error: `Invalid accessCountDelta for ${candidate.id}`,
+                        retryable: false,
                     });
                     return;
                 }
@@ -1831,10 +1838,11 @@ export class MemoryStore {
                         id: candidate.id,
                         entry: null,
                         error: `Invalid accessedAt for ${candidate.id}`,
+                        retryable: false,
                     });
                     return;
                 }
-                seenIds.add(candidate.id);
+                seenUpdates.add(updateKey);
                 pending.push({ ...candidate, inputIndex });
             });
             for (let i = 0; i < pending.length; i += MemoryStore.MAX_BATCH_SIZE) {
@@ -1842,9 +1850,24 @@ export class MemoryStore {
                 const whereClause = chunk
                     .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
                     .join(" OR ");
-                const rows = whereClause.length > 0
-                    ? await this.table.query().where(`(${whereClause})`).toArray()
-                    : [];
+                let rows;
+                try {
+                    rows = whereClause.length > 0
+                        ? await this.table.query().where(`(${whereClause})`).toArray()
+                        : [];
+                }
+                catch (queryError) {
+                    const queryMessage = queryError instanceof Error ? queryError.message : String(queryError);
+                    for (const candidate of chunk) {
+                        results.set(candidate.inputIndex, {
+                            id: candidate.id,
+                            entry: null,
+                            error: `Failed to read recall metadata for ${candidate.id}: ${queryMessage}`,
+                            retryable: true,
+                        });
+                    }
+                    continue;
+                }
                 const rowsById = new Map();
                 for (const row of rows)
                     rowsById.set(row.id, row);
@@ -1864,6 +1887,7 @@ export class MemoryStore {
                             entry: null,
                             error: `Memory ${candidate.id} scope changed from ` +
                                 `${candidate.expectedScope} to ${rowScope}`,
+                            retryable: false,
                         });
                         continue;
                     }
@@ -1880,13 +1904,24 @@ export class MemoryStore {
                     const current = parseSmartMetadata(original.metadata, original);
                     const accessedAt = Math.max(current.last_accessed_at, candidate.accessedAt);
                     const confirmedAt = Math.max(current.last_confirmed_use_at ?? 0, candidate.accessedAt);
+                    const snapshot = candidate.governanceSnapshot;
+                    const governanceUnchanged = snapshot !== undefined &&
+                        current.last_injected_at === snapshot.lastInjectedAt &&
+                        current.bad_recall_count === snapshot.badRecallCount &&
+                        current.suppressed_until_turn === snapshot.suppressedUntilTurn &&
+                        current.suppressed_until_ms === snapshot.suppressedUntilMs;
+                    const governanceReset = governanceUnchanged
+                        ? {
+                            bad_recall_count: 0,
+                            suppressed_until_turn: 0,
+                            suppressed_until_ms: 0,
+                        }
+                        : {};
                     const metadata = stringifySmartMetadata(buildSmartMetadata(original, {
                         access_count: current.access_count + candidate.accessCountDelta,
                         last_accessed_at: accessedAt,
                         last_confirmed_use_at: confirmedAt,
-                        bad_recall_count: 0,
-                        suppressed_until_turn: 0,
-                        suppressed_until_ms: 0,
+                        ...governanceReset,
                     }));
                     originals.push(original);
                     updatedEntries.push({ ...original, metadata });
@@ -1913,48 +1948,90 @@ export class MemoryStore {
                 catch (writeError) {
                     const writeMessage = writeError instanceof Error ? writeError.message : String(writeError);
                     if (deleted) {
-                        const existingAfterFailure = await this.table.query()
-                            .where(`(${deleteWhereClause})`)
-                            .toArray()
-                            .catch(() => []);
-                        const preservedIds = new Set(existingAfterFailure.map((row) => row.id));
-                        const originalsToRestore = originals.filter((entry) => !preservedIds.has(entry.id));
+                        this.noteDataModification();
+                        let existingAfterFailure;
                         try {
-                            if (originalsToRestore.length > 0)
-                                await this.table.add(originalsToRestore);
+                            existingAfterFailure = await this.table.query()
+                                .where(`(${deleteWhereClause})`)
+                                .toArray();
                         }
-                        catch (rollbackError) {
-                            const rollbackMessage = rollbackError instanceof Error
-                                ? rollbackError.message
-                                : String(rollbackError);
+                        catch (recoveryQueryError) {
+                            const recoveryMessage = recoveryQueryError instanceof Error
+                                ? recoveryQueryError.message
+                                : String(recoveryQueryError);
                             for (let index = 0; index < updatedEntries.length; index++) {
                                 results.set(updatedInputIndices[index], {
                                     id: updatedEntries[index].id,
                                     entry: null,
                                     error: `Failed to apply recall metadata for ${updatedEntries[index].id}: ` +
-                                        `write failed and rollback also failed. Write error: ${writeMessage}. ` +
-                                        `Rollback error: ${rollbackMessage}`,
+                                        `${writeMessage}. Commit state could not be verified: ${recoveryMessage}`,
+                                    retryable: false,
                                 });
                             }
                             continue;
                         }
+                        const preservedIds = new Set(existingAfterFailure.map((row) => row.id));
+                        const originalsToRestore = originals.filter((entry) => !preservedIds.has(entry.id));
+                        let rollbackMessage = null;
+                        try {
+                            if (originalsToRestore.length > 0)
+                                await this.table.add(originalsToRestore);
+                        }
+                        catch (rollbackError) {
+                            rollbackMessage = rollbackError instanceof Error
+                                ? rollbackError.message
+                                : String(rollbackError);
+                        }
+                        for (let index = 0; index < updatedEntries.length; index++) {
+                            const updatedEntry = updatedEntries[index];
+                            if (preservedIds.has(updatedEntry.id)) {
+                                results.set(updatedInputIndices[index], {
+                                    id: updatedEntry.id,
+                                    entry: updatedEntry,
+                                });
+                                continue;
+                            }
+                            results.set(updatedInputIndices[index], {
+                                id: updatedEntry.id,
+                                entry: null,
+                                error: rollbackMessage
+                                    ? `Failed to apply recall metadata for ${updatedEntry.id}: ` +
+                                        `write failed and rollback also failed. Write error: ${writeMessage}. ` +
+                                        `Rollback error: ${rollbackMessage}`
+                                    : `Failed to apply recall metadata for ${updatedEntry.id}: ${writeMessage}`,
+                                retryable: rollbackMessage === null,
+                            });
+                        }
+                        continue;
                     }
                     for (let index = 0; index < updatedEntries.length; index++) {
                         results.set(updatedInputIndices[index], {
                             id: updatedEntries[index].id,
                             entry: null,
-                            error: `Failed to apply recall metadata for ${updatedEntries[index].id}: ` +
-                                `${writeMessage}`,
+                            error: `Failed to apply recall metadata for ${updatedEntries[index].id}: ${writeMessage}`,
+                            retryable: true,
                         });
                     }
                 }
             }
-            return updates.map((candidate, inputIndex) => results.get(inputIndex) ?? {
+            settledResults = updates.map((candidate, inputIndex) => results.get(inputIndex) ?? {
                 id: candidate.id,
                 entry: null,
                 error: `Memory ${candidate.id} was not processed`,
+                retryable: false,
             });
-        }));
+            return settledResults;
+        });
+        try {
+            return await this.runWithWriteLock(applyBatch);
+        }
+        catch (error) {
+            if (settledResults !== null) {
+                const message = error instanceof Error ? error.message : String(error);
+                throw new ManualRecallMetadataBatchSettledError(`Manual recall metadata batch settled before the write lock failed: ${message}`, settledResults, { cause: error });
+            }
+            throw error;
+        }
     }
     /**
      * Update multiple already-resolved memory IDs under one write lock.
