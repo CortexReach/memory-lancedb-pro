@@ -368,7 +368,6 @@ const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_MAX_ENTRIES = 200;
-const DEFAULT_REFLECTION_CACHE_TTL_MS = 15_000;
 // After /new or /reset, the just-closed session may have generated fresh
 // derived deltas. Keep those out of the immediately opened prompt window.
 const DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS = 120_000;
@@ -1875,16 +1874,12 @@ function _initPluginState(api) {
     const reflectionDerivedBySession = new Map();
     const reflectionDerivedSuppressionBySession = new Map();
     const reflectionByAgentCache = new Map();
-    // Bumped on every invalidateReflectionCachesAfterDelete call. loadAgentReflectionSlices
-    // snapshots this before its awaited store.list() reads and skips caching its result if
-    // it changed mid-flight, so an in-flight read can never publish a stale pre-delete
-    // snapshot back into the cache after the delete already invalidated it.
-    const reflectionByAgentCacheGeneration = { count: 0 };
     const recallHistory = new Map();
     const turnCounter = new Map();
     const autoCaptureSeenTextCount = new Map();
     const autoCapturePendingIngressTexts = new Map();
     const autoCaptureRecentTexts = new Map();
+    const autoCaptureRecentAssistantTexts = new Map();
     return {
         config,
         resolvedDbPath,
@@ -1906,12 +1901,12 @@ function _initPluginState(api) {
         reflectionDerivedBySession,
         reflectionDerivedSuppressionBySession,
         reflectionByAgentCache,
-        reflectionByAgentCacheGeneration,
         recallHistory,
         turnCounter,
         autoCaptureSeenTextCount,
         autoCapturePendingIngressTexts,
         autoCaptureRecentTexts,
+        autoCaptureRecentAssistantTexts,
     };
 }
 export function isAgentOrSessionExcluded(agentId, sessionKey, patterns) {
@@ -2020,7 +2015,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentAssistantTexts, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2183,9 +2178,8 @@ const memoryLanceDBProPlugin = {
                 : "<NO_SCOPE_FILTER>";
             const cacheKey = `${agentId}::${scopeKey}`;
             const cached = reflectionByAgentCache.get(cacheKey);
-            if (cached && Date.now() - cached.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS)
+            if (cached && Date.now() - cached.updatedAt < 15_000)
                 return cached;
-            const generationAtStart = reflectionByAgentCacheGeneration.count;
             // Prefer reflection-category rows to avoid full-table reads on bypass callers.
             // Fall back to an uncategorized scan only when the category query produced no
             // agent-owned reflection slices, preserving backward compatibility with mixed-schema stores.
@@ -2214,49 +2208,8 @@ const memoryLanceDBProPlugin = {
             }
             const { invariants, derived } = slices;
             const next = { updatedAt: Date.now(), invariants, derived };
-            // Only cache if no delete invalidated this cacheKey while the awaits above were in
-            // flight (TOCTOU guard); otherwise this late-arriving, possibly-stale read would
-            // silently resurrect a cache entry the delete just cleared.
-            if (reflectionByAgentCacheGeneration.count === generationAtStart) {
-                reflectionByAgentCache.set(cacheKey, next);
-            }
+            reflectionByAgentCache.set(cacheKey, next);
             return next;
-        };
-        // Fast-path invalidation for SAME-PROCESS deletes only: CLI delete/delete-bulk
-        // commands run as a short-lived, separate process from the long-running Gateway
-        // in typical deployments, so this callback firing there does not reach (and
-        // cannot invalidate) the Gateway process own in-memory caches. It only has an
-        // effect when a delete genuinely happens inside this same plugin instance.
-        //
-        // The actual cross-process staleness bound comes from two other layers:
-        //   - DEFAULT_REFLECTION_CACHE_TTL_MS bounds how long either cache below can
-        //     serve stale content after ANY delete, same-process or not (see the read
-        //     sites in loadAgentReflectionSlices and the derived-focus injector).
-        //   - readConsistencyInterval (store config) bounds how long the underlying
-        //     LanceDB table handle can serve stale rows to a fresh query in the first
-        //     place, which is what a TTL-expired cache re-populates from.
-        //
-        // reflectionByAgentCache is keyed "<agentId>::scopes:<sorted,scopes>" (or
-        // "<agentId>::<NO_SCOPE_FILTER>"); drop any entry whose scope set intersects
-        // the deleted scopes, plus every no-scope-filter entry (it spans all scopes).
-        // reflectionDerivedBySession has no cheap scope-to-session mapping, so it is
-        // cleared in full rather than left to expire on its own TTL.
-        const invalidateReflectionCachesAfterDelete = (deletedScopes) => {
-            reflectionByAgentCacheGeneration.count++;
-            const deletedSet = new Set(deletedScopes ?? []);
-            for (const cacheKey of reflectionByAgentCache.keys()) {
-                const sepIdx = cacheKey.indexOf("::");
-                const scopePart = sepIdx === -1 ? "" : cacheKey.slice(sepIdx + 2);
-                if (scopePart === "<NO_SCOPE_FILTER>" || deletedSet.size === 0) {
-                    reflectionByAgentCache.delete(cacheKey);
-                    continue;
-                }
-                const cachedScopes = scopePart.startsWith("scopes:") ? scopePart.slice("scopes:".length).split(",") : [];
-                if (cachedScopes.some((s) => deletedSet.has(s))) {
-                    reflectionByAgentCache.delete(cacheKey);
-                }
-            }
-            reflectionDerivedBySession.clear();
         };
         const pendingRecall = new Map();
         const logReg = isCliMode() ? api.logger.debug : api.logger.info;
@@ -2361,9 +2314,6 @@ const memoryLanceDBProPlugin = {
             mdMirror,
             workspaceBoundary: config.workspaceBoundary,
             selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
-            // Mirrors the CLI context wiring below: keep in-process reflection caches
-            // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
-            onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
         }, {
             enableManagementTools: config.enableManagementTools,
             enableSelfImprovementTools: config.selfImprovement?.enabled === true,
@@ -2403,7 +2353,6 @@ const memoryLanceDBProPlugin = {
             store,
             retriever,
             scopeManager,
-            onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
             migrator,
             embedder,
             llmClient: smartExtractor ? (() => {
@@ -2900,21 +2849,26 @@ const memoryLanceDBProPlugin = {
                             ? config.scopes?.default ?? "global"
                             : scopeManager.getDefaultScope(agentId);
                         const sessionKey = ctx?.sessionKey || event.sessionKey || "unknown";
-                        api.logger.debug(`memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`);
+                        api.logger.debug(`memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${JSON.stringify(config.captureAssistant)}, ${summarizeAgentEndMessages(event.messages)})`);
                         // Extract text content from messages
                         const eligibleTexts = [];
+                        const assistantContextTexts = [];
                         let skippedAutoCaptureTexts = 0;
+                        const captureAssistantValue = config.captureAssistant;
+                        const captureAssistantEligible = captureAssistantValue === true;
+                        const captureAssistantAsContext = captureAssistantValue === "context";
                         for (const msg of event.messages) {
                             if (!msg || typeof msg !== "object") {
                                 continue;
                             }
                             const msgObj = msg;
                             const role = msgObj.role;
-                            const captureAssistant = config.captureAssistant === true;
-                            if (role !== "user" &&
-                                !(captureAssistant && role === "assistant")) {
+                            const isEligibleRole = role === "user" || (captureAssistantEligible && role === "assistant");
+                            const isContextOnlyRole = captureAssistantAsContext && role === "assistant";
+                            if (!isEligibleRole && !isContextOnlyRole) {
                                 continue;
                             }
+                            const targetTexts = isEligibleRole ? eligibleTexts : assistantContextTexts;
                             const content = msgObj.content;
                             if (typeof content === "string") {
                                 const normalized = normalizeAutoCaptureText(role, content, shouldSkipReflectionMessage);
@@ -2922,7 +2876,7 @@ const memoryLanceDBProPlugin = {
                                     skippedAutoCaptureTexts++;
                                 }
                                 else {
-                                    eligibleTexts.push(normalized);
+                                    targetTexts.push(normalized);
                                 }
                                 continue;
                             }
@@ -2940,7 +2894,7 @@ const memoryLanceDBProPlugin = {
                                             skippedAutoCaptureTexts++;
                                         }
                                         else {
-                                            eligibleTexts.push(normalized);
+                                            targetTexts.push(normalized);
                                         }
                                     }
                                 }
@@ -2976,6 +2930,13 @@ const memoryLanceDBProPlugin = {
                             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
                             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
                             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        }
+                        const priorAssistantContextTexts = autoCaptureRecentAssistantTexts.get(sessionKey) || [];
+                        let assistantContextForRun = priorAssistantContextTexts;
+                        if (assistantContextTexts.length > 0) {
+                            assistantContextForRun = [...priorAssistantContextTexts, ...assistantContextTexts].slice(-6);
+                            autoCaptureRecentAssistantTexts.set(sessionKey, assistantContextForRun);
+                            pruneMapIfOver(autoCaptureRecentAssistantTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
                         const minMessages = config.extractMinMessages ?? 4;
                         if (skippedAutoCaptureTexts > 0) {
@@ -3036,7 +2997,7 @@ const memoryLanceDBProPlugin = {
                                 // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
                                 let stats = null;
                                 try {
-                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId });
+                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantContextForRun });
                                 }
                                 catch (err) {
                                     api.logger.error(`memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`);
@@ -3056,6 +3017,7 @@ const memoryLanceDBProPlugin = {
                                     // consumed history length there instead, so the next turn
                                     // only sees the delta.
                                     autoCaptureSeenTextCount.set(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
+                                    autoCaptureRecentAssistantTexts.delete(sessionKey);
                                     return; // Smart extraction handled everything
                                 }
                                 if ((stats.boundarySkipped ?? 0) === 0) {
@@ -3590,8 +3552,7 @@ const memoryLanceDBProPlugin = {
                                 reflectionDerivedSuppressionBySession.delete(sessionKey);
                             const scopes = resolveScopeFilter(scopeManager, agentId);
                             const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
-                            const derivedCacheFresh = derivedCache && Date.now() - derivedCache.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS;
-                            const derivedLines = derivedCacheFresh && derivedCache.derived.length
+                            const derivedLines = derivedCache?.derived?.length
                                 ? derivedCache.derived
                                 : (await loadAgentReflectionSlices(agentId, scopes)).derived;
                             if (derivedLines.length > 0) {
@@ -3987,13 +3948,7 @@ const memoryLanceDBProPlugin = {
                         });
                         if (sessionKey && stored.slices.derived.length > 0 && !isSessionBoundaryReflectionAction(action)) {
                             reflectionDerivedBySession.set(sessionKey, {
-                                // Deliberately Date.now(), not nowTs (which mirrors the host-supplied
-                                // event.timestamp and can be skewed/future-dated): this field is a TTL
-                                // bookkeeping mark, and DEFAULT_REFLECTION_CACHE_TTL_MS above compares it
-                                // against a fresh Date.now() on every read. A skewed updatedAt can make
-                                // "Date.now() - updatedAt" go negative, which is always < the TTL, so the
-                                // cache would read as fresh indefinitely until wall-clock time caught up.
-                                updatedAt: Date.now(),
+                                updatedAt: nowTs,
                                 derived: stored.slices.derived,
                             });
                         }
@@ -4685,7 +4640,7 @@ export function parsePluginConfig(value) {
             }
             return s;
         })(),
-        captureAssistant: cfg.captureAssistant === true,
+        captureAssistant: cfg.captureAssistant === "context" ? "context" : cfg.captureAssistant === true,
         retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null
             ? (() => {
                 const retrieval = { ...cfg.retrieval };
