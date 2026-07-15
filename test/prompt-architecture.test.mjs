@@ -26,6 +26,7 @@ const { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt } = jiti(
   "../src/extraction-prompts.ts",
 );
 const { createLlmClient } = jiti("../src/llm-client.ts");
+const { formatExistingMemoryForDedupPrompt } = jiti("../src/smart-extractor.ts");
 
 // ============================================================================
 // buildExtractionPrompt — system/user split
@@ -91,6 +92,10 @@ describe("buildDedupPrompt system/user split", () => {
     assert.doesNotMatch(system, new RegExp(abstractMarker));
     assert.doesNotMatch(system, new RegExp(existingMarker));
   });
+
+  it("separates the candidate's Abstract/Overview/Content fields with blank lines so markdown in Overview/Content doesn't collapse into the label line above it", () => {
+    assert.match(user, /Abstract: .*\n\nOverview:\n.*\n\nContent:\n/s);
+  });
 });
 
 // ============================================================================
@@ -133,6 +138,42 @@ describe("buildMergePrompt system/user split and formatting", () => {
       .split("\n")
       .filter((line) => /^\s+[-*]\s/.test(line));
     assert.deepEqual(indentedBullets, [], "no indented bullet lines (progressive indentation regression)");
+  });
+
+  it("separates each memory's Abstract/Overview/Content fields with blank lines in both the existing and new blocks", () => {
+    assert.match(user, /Existing Memory:\nAbstract: .*\n\nOverview:\n.*\n\nContent:\n/s);
+    assert.match(user, /New Information:\nAbstract: .*\n\nOverview:\n.*\n\nContent:\n/s);
+  });
+});
+
+// ============================================================================
+// formatExistingMemoryForDedupPrompt — numbered-list indentation
+// ============================================================================
+
+describe("formatExistingMemoryForDedupPrompt (dedup candidate listing)", () => {
+  it("indents continuation lines of a multi-line Overview so its markdown stays nested under the numbered item instead of landing flush-left mid-list", () => {
+    const formatted = formatExistingMemoryForDedupPrompt(
+      1,
+      "preferences",
+      "Editor preferences",
+      "## Preference Domain\n- Editor: Zed\n- Theme: dark",
+      0.876,
+    );
+
+    assert.doesNotMatch(
+      formatted,
+      /\n## Preference Domain/,
+      "a continuation line of the Overview field must not land flush-left (would escape item 1's block in a rendered list)"
+    );
+    assert.equal(
+      formatted,
+      "1. [preferences] Editor preferences\n   Overview: ## Preference Domain\n   - Editor: Zed\n   - Theme: dark\n   Score: 0.876"
+    );
+  });
+
+  it("leaves a single-line Overview unchanged", () => {
+    const formatted = formatExistingMemoryForDedupPrompt(2, "profile", "User is a backend engineer", "", 0.5);
+    assert.equal(formatted, "2. [profile] User is a backend engineer\n   Overview: \n   Score: 0.500");
   });
 });
 
@@ -342,5 +383,30 @@ describe("AdmissionController buildUtilityPrompt (source-kind framing)", () => {
     const { userPrompt } = llm.prompts[0];
     assert.match(userPrompt, /Source document \(agent reflection\)/i);
     assert.doesNotMatch(userPrompt, /Conversation excerpt:/);
+  });
+
+  it("indents continuation lines of a multi-line Overview so its markdown stays nested under the bullet instead of landing flush-left mid-list", async () => {
+    const llm = makeAdmissionLlm();
+    const controller = new AdmissionController(admissionStore, llm, balanced);
+
+    await controller.evaluate({
+      candidate: {
+        category: "preferences",
+        abstract: "Editor preferences",
+        overview: "## Preference Domain\n- Editor: Zed\n- Theme: dark",
+        content: "User prefers the Zed editor with a dark theme.",
+      },
+      candidateVector: [1, 0, 0],
+      conversationText: "some real conversation text",
+      scopeFilter: ["global"],
+    });
+
+    const { userPrompt } = llm.prompts[0];
+    assert.doesNotMatch(
+      userPrompt,
+      /\n## Preference Domain/,
+      "a continuation line of the Overview bullet must not land flush-left (would escape the bullet in rendered markdown)"
+    );
+    assert.match(userPrompt, /- Overview: ## Preference Domain\n {2}- Editor: Zed\n {2}- Theme: dark/);
   });
 });

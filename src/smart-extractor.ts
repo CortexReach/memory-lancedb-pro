@@ -309,6 +309,23 @@ export interface ExtractPersistOptions {
   agentId?: string;
 }
 
+/**
+ * Formats one existing-memory candidate for the dedup prompt's numbered
+ * list. Continuation lines of a multi-line overview are indented to match
+ * the "Overview: " label so its markdown stays nested under this item
+ * instead of landing flush-left and visually escaping the list.
+ */
+export function formatExistingMemoryForDedupPrompt(
+  index: number,
+  category: string,
+  abstract: string,
+  overview: string,
+  score: number,
+): string {
+  const indentedOverview = overview.replace(/\n/g, "\n   ");
+  return `${index}. [${category}] ${abstract}\n   Overview: ${indentedOverview}\n   Score: ${score.toFixed(3)}`;
+}
+
 export class SmartExtractor {
   private log: (msg: string) => void;
   private debugLog: (msg: string) => void;
@@ -1096,7 +1113,13 @@ export class SmartExtractor {
         } catch { }
         const abstract = (metaObj.l0_abstract as string) || r.entry.text;
         const overview = (metaObj.l1_overview as string) || "";
-        return `${i + 1}. [${(metaObj.memory_category as string) || r.entry.category}] ${abstract}\n   Overview: ${overview}\n   Score: ${r.score.toFixed(3)}`;
+        return formatExistingMemoryForDedupPrompt(
+          i + 1,
+          (metaObj.memory_category as string) || r.entry.category,
+          abstract,
+          overview,
+          r.score,
+        );
       })
       .join("\n");
 

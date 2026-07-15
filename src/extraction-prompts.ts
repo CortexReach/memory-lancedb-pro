@@ -184,8 +184,12 @@ Return JSON format:
 
   const userMessage = `**Candidate Memory**:
 Abstract: ${candidateAbstract}
-Overview: ${candidateOverview}
-Content: ${candidateContent}
+
+Overview:
+${candidateOverview}
+
+Content:
+${candidateContent}
 
 **Existing Similar Memories**:
 ${existingMemories}`;
@@ -221,15 +225,19 @@ Return JSON:
 
 Existing Memory:
 Abstract: ${existingAbstract}
+
 Overview:
 ${existingOverview}
+
 Content:
 ${existingContent}
 
 New Information:
 Abstract: ${newAbstract}
+
 Overview:
 ${newOverview}
+
 Content:
 ${newContent}`;
 

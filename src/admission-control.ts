@@ -495,8 +495,8 @@ ${excerpt}
 Candidate memory:
 - Category: ${candidate.category}
 - Abstract: ${candidate.abstract}
-- Overview: ${candidate.overview}
-- Content: ${candidate.content}`;
+- Overview: ${candidate.overview.replace(/\n/g, "\n  ")}
+- Content: ${candidate.content.replace(/\n/g, "\n  ")}`;
 
   return { system, user };
 }

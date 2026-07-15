@@ -169,6 +169,16 @@ const VALID_DECISIONS = new Set([
     "contradict",
     "supersede",
 ]);
+/**
+ * Formats one existing-memory candidate for the dedup prompt's numbered
+ * list. Continuation lines of a multi-line overview are indented to match
+ * the "Overview: " label so its markdown stays nested under this item
+ * instead of landing flush-left and visually escaping the list.
+ */
+export function formatExistingMemoryForDedupPrompt(index, category, abstract, overview, score) {
+    const indentedOverview = overview.replace(/\n/g, "\n   ");
+    return `${index}. [${category}] ${abstract}\n   Overview: ${indentedOverview}\n   Score: ${score.toFixed(3)}`;
+}
 export class SmartExtractor {
     store;
     embedder;
@@ -733,7 +743,7 @@ export class SmartExtractor {
             catch { }
             const abstract = metaObj.l0_abstract || r.entry.text;
             const overview = metaObj.l1_overview || "";
-            return `${i + 1}. [${metaObj.memory_category || r.entry.category}] ${abstract}\n   Overview: ${overview}\n   Score: ${r.score.toFixed(3)}`;
+            return formatExistingMemoryForDedupPrompt(i + 1, metaObj.memory_category || r.entry.category, abstract, overview, r.score);
         })
             .join("\n");
         const { system, user: userPrompt } = buildDedupPrompt(candidate.abstract, candidate.overview, candidate.content, existingFormatted);
