@@ -892,3 +892,80 @@ describe("memory consolidate: CLI system-prompt wiring", () => {
     assert.match(merge.system, /merge writer/i);
   });
 });
+
+describe("memory consolidate: CLI journal-mirror agent identity", () => {
+  function buildContext(rows, mirrorCalls) {
+    return {
+      store: {
+        fetchForCompaction: async (maxTimestamp, scopeFilter, limit) =>
+          rows
+            .filter((r) => (!scopeFilter || scopeFilter.includes(r.scope)) && r.timestamp <= maxTimestamp)
+            .slice(0, limit ?? rows.length),
+        update: async () => ({}),
+        delete: async () => true,
+      },
+      retriever: {},
+      scopeManager: {},
+      migrator: {},
+      embedder: { embedPassage: async () => [1, 0] },
+      llmClient: {
+        completeJson: async (_prompt, label) => {
+          if (label === "consolidate-decide") {
+            return {
+              verdicts: [
+                { cluster_index: 1, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "dup" },
+              ],
+            };
+          }
+          return { abstract: "merged", overview: "", content: "merged" };
+        },
+        getLastError: () => null,
+      },
+      mdMirror: async (entry, meta) => {
+        mirrorCalls.push({ entry, meta });
+      },
+    };
+  }
+
+  function buildRows() {
+    const ts = 1_700_000_000_000;
+    return [
+      makeRow({ abstract: "Coffee order: oat milk latte", content: "a", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts }),
+      makeRow({ abstract: "Coffee order: oat milk latte, extra hot", content: "b", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts + 1000 }),
+    ];
+  }
+
+  it("threads --agent through to the journal-mirror writer's meta.agentId", async () => {
+    const { createMemoryCLI } = jiti(path.join(testDir, "..", "cli.ts"));
+    const mirrorCalls = [];
+    const context = buildContext(buildRows(), mirrorCalls);
+
+    const program = new Command();
+    program.exitOverride();
+    createMemoryCLI(context)({ program });
+
+    await program.parseAsync([
+      "node", "openclaw", "memory-pro", "consolidate",
+      "--scope", "global", "--apply", "--agent", "terry",
+    ]);
+
+    assert.equal(mirrorCalls.length, 1, "expected exactly one journal-mirror write for the applied merge");
+    assert.equal(mirrorCalls[0].meta.agentId, "terry", "the CLI's --agent value must reach the journal writer");
+    assert.match(mirrorCalls[0].meta.source, /memory-consolidate/);
+  });
+
+  it("leaves meta.agentId undefined when --agent is omitted, preserving the fallback-directory default", async () => {
+    const { createMemoryCLI } = jiti(path.join(testDir, "..", "cli.ts"));
+    const mirrorCalls = [];
+    const context = buildContext(buildRows(), mirrorCalls);
+
+    const program = new Command();
+    program.exitOverride();
+    createMemoryCLI(context)({ program });
+
+    await program.parseAsync(["node", "openclaw", "memory-pro", "consolidate", "--scope", "global", "--apply"]);
+
+    assert.equal(mirrorCalls.length, 1);
+    assert.equal(mirrorCalls[0].meta.agentId, undefined);
+  });
+});

@@ -1853,6 +1853,7 @@ export function registerMemoryCLI(program, context) {
         .option("--since <iso>", "Only consider rows stored at or after this ISO timestamp")
         .option("--apply", "Apply the consolidation plan (default is a dry-run preview)", false)
         .option("--include-reflection-slices", "Include reflection writer-2 slice rows in the scan (excluded by default)", false)
+        .option("--agent <agentId>", "Agent identity to route journal-mirror writes to (omit to use the fallback mirror directory)")
         .action(async (options) => {
         try {
             if (!context.llmClient) {
@@ -1885,7 +1886,7 @@ export function registerMemoryCLI(program, context) {
                 onAudit: mdMirror
                     ? async (audit) => {
                         const summary = `${audit.action} survivor=${audit.survivorId.slice(0, 8)} absorbed=${audit.absorbedIds.map((id) => id.slice(0, 8)).join(",")} reason="${audit.reason}"`;
-                        await mdMirror({ text: summary, category: "consolidation", scope: audit.scope, timestamp: Date.now() }, { source: `memory-consolidate:${audit.action}` });
+                        await mdMirror({ text: summary, category: "consolidation", scope: audit.scope, timestamp: Date.now() }, { source: `memory-consolidate:${audit.action}`, agentId: options.agent });
                     }
                     : undefined,
             }, {
