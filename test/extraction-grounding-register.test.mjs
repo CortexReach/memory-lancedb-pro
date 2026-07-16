@@ -429,6 +429,28 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
     assert.equal(stats.created, 2, "legacy payloads (no register, no constructed tags) must be unaffected");
   });
 
+  it("missing register (legacy payload) WITH a constructed sibling still arms the batch-wide durable wipe", async () => {
+    // Complements the test above: a missing/malformed register defaults to "mixed" (not
+    // "real"), and — unlike the no-constructed-tags case — a genuinely constructed sibling
+    // in the same batch is enough to arm the same wipe a "fiction"/"mixed" register would.
+    // This is the compound path a malformed extraction response could realistically hit
+    // (a legacy or dropped conversation_register field alongside a real constructed note),
+    // which the existing per-register tests don't individually cover.
+    const store = makeStore();
+    const llm = makeLlm([...FACTUAL_CANDIDATES, MISLABELED_FICTION_CANDIDATES[2]]); // no conversation_register field
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    const stats = await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    const categories = persistedCategories(store);
+    assert.deepEqual(
+      categories,
+      ["events"],
+      "a constructed sibling arms the wipe even when conversation_register is missing entirely",
+    );
+    assert.equal(stats.created, 1);
+  });
+
   it("propagates grounding and conversation_register into stored metadata", async () => {
     const store = makeStore();
     const llm = makeLlm(
