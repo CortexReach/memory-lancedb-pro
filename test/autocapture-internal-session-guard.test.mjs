@@ -24,6 +24,9 @@ const resetRegistration = pluginModule.resetRegistration ?? (() => {});
 const DISTILLER_SESSION_KEY = "temp:memory-reflection:dave";
 // A memory sub-completion key shape (isMemorySubsessionKey).
 const SUBAGENT_SESSION_KEY = "agent:dave:subagent:recall-1";
+// The other half of isMemorySubsessionKey's OR condition (":active-memory:"),
+// distinct from ":subagent:" — active-memory's own embedded recall sub-build.
+const ACTIVE_MEMORY_SESSION_KEY = "agent:dave:active-memory:recall-build-1";
 const CONTROL_SESSION_KEY = "agent:dave:main";
 
 function createPluginApiHarness({ pluginConfig, resolveRoot }) {
@@ -159,6 +162,53 @@ describe("auto-capture internal memory sub-session guard", () => {
       ),
       "expected a debug log recording the internal-session skip",
     );
+  });
+
+  it("skips auto-capture for active-memory sub-completion (:active-memory:) sessions", async () => {
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: pluginConfigWithAutoCapture(),
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+
+    hook(
+      { success: true, messages: userMessages("active-memory recall block build content") },
+      { sessionKey: ACTIVE_MEMORY_SESSION_KEY, agentId: "dave" },
+    );
+
+    assert.equal(
+      hook.__lastRun,
+      undefined,
+      "active-memory sub-completions must return before any background capture work starts",
+    );
+    assert.ok(
+      harness.logs.debug.some(
+        (line) => line.includes("auto-capture skip") && line.includes(ACTIVE_MEMORY_SESSION_KEY),
+      ),
+      "expected a debug log recording the internal-session skip",
+    );
+  });
+
+  it("proceeds with auto-capture when neither ctx nor event carries a sessionKey (keyless)", async () => {
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: pluginConfigWithAutoCapture(),
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+
+    hook(
+      { success: true, messages: userMessages("Remember that I use vitest for this repo.") },
+      { agentId: "dave" },
+    );
+
+    const backgroundRun = hook.__lastRun;
+    assert.ok(
+      backgroundRun && typeof backgroundRun.then === "function",
+      "a genuinely keyless session must not be misclassified as an internal memory session and must still capture",
+    );
+    await backgroundRun;
   });
 
   it("proceeds with auto-capture for an ordinary session", async () => {

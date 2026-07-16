@@ -767,9 +767,14 @@ function asNonEmptyString(value) {
 function isInternalReflectionSessionKey(sessionKey) {
     return typeof sessionKey === "string" && sessionKey.trim().startsWith("temp:memory-reflection");
 }
-// Memory sub-completions (active-memory's embedded recall sub-build, and any :subagent:
-// sub-build) must not re-enter memory prompt injection: they would waste an embedding+vector
-// search per turn, and their injected block can leak into the main prompt via shared session messages.
+// Any :subagent:/:active-memory: sub-build (delegated subagents in general, not only
+// memory-internal ones) is treated as "its context comes from the parent" across every
+// memory-adjacent hook in this file: auto-recall injection, reflection injection, and
+// self-improvement reminders all skip it via this same check (each with its own "skip for
+// sub-agent sessions" comment at its call site), and auto-capture (agent_end) follows the
+// same convention. This is deliberately broader than "memory-internal only"; a subagent's
+// own task-scoped conversation is not treated as an independent, capturable/injectable
+// top-level conversation by this plugin.
 function isMemorySubsessionKey(sessionKey) {
     return typeof sessionKey === "string" && (sessionKey.includes(":subagent:") || sessionKey.includes(":active-memory:"));
 }
