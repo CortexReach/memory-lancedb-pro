@@ -37,6 +37,8 @@ export class ManualRecallMetadataQueue {
     maxRetries;
     retryDelayMs;
     warn;
+    onActive;
+    onIdle;
     timer = null;
     timerDueAt = null;
     flushPromise = null;
@@ -44,6 +46,8 @@ export class ManualRecallMetadataQueue {
     retryNotBeforeAt = 0;
     closed = false;
     draining = false;
+    drainPromise = null;
+    settlePromise = null;
     constructor(writer, options = {}) {
         this.writer = writer;
         this.debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS;
@@ -51,6 +55,8 @@ export class ManualRecallMetadataQueue {
         this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
         this.retryDelayMs = options.retryDelayMs ?? ((attempt) => 100 * (2 ** (attempt - 1)));
         this.warn = options.warn ?? ((message) => console.warn(message));
+        this.onActive = options.onActive ?? (() => { });
+        this.onIdle = options.onIdle ?? (() => { });
     }
     enqueue(updates) {
         if (this.closed) {
@@ -70,6 +76,7 @@ export class ManualRecallMetadataQueue {
         }
         if (!added)
             return;
+        this.onActive();
         this.firstPendingAt ??= Date.now();
         this.schedulePending(this.debounceMs);
     }
@@ -108,20 +115,41 @@ export class ManualRecallMetadataQueue {
         }
         finally {
             this.flushPromise = null;
+            if (this.pending.size === 0)
+                this.onIdle();
         }
     }
     async drain() {
-        this.closed = true;
-        this.draining = true;
+        this.drainPromise ??= this.drainOnce();
+        await this.drainPromise;
+    }
+    async settle() {
+        const pendingSettle = this.settlePromise ?? this.settlePending();
+        this.settlePromise = pendingSettle;
+        try {
+            await pendingSettle;
+        }
+        finally {
+            if (this.settlePromise === pendingSettle)
+                this.settlePromise = null;
+        }
+    }
+    async settlePending() {
         this.clearTimer();
         this.retryNotBeforeAt = 0;
+        while (this.flushPromise || this.pending.size > 0) {
+            await this.flush();
+        }
+    }
+    async drainOnce() {
+        this.closed = true;
+        this.draining = true;
         try {
-            while (this.flushPromise || this.pending.size > 0) {
-                await this.flush();
-            }
+            await this.settle();
         }
         finally {
             this.draining = false;
+            this.onIdle();
         }
     }
     async flushOnce() {
@@ -220,12 +248,62 @@ export class ManualRecallMetadataQueue {
     }
 }
 const queues = new WeakMap();
+const activeQueues = new Set();
+let exitDrainInstalled = false;
+let exitDrainArmed = false;
+let exitProbeScheduled = false;
+async function drainQueue(queue) {
+    try {
+        await queue.drain();
+    }
+    finally {
+        activeQueues.delete(queue);
+    }
+}
+async function settleQueue(queue) {
+    await queue.settle();
+}
+function scheduleExitProbe() {
+    if (exitProbeScheduled || activeQueues.size === 0)
+        return;
+    exitProbeScheduled = true;
+    setImmediate(() => {
+        const pending = [...activeQueues];
+        void Promise.allSettled(pending.map((queue) => settleQueue(queue))).then((results) => {
+            const rejected = results.filter((result) => result.status === "rejected");
+            if (rejected.length > 0) {
+                console.warn(`[memory-lancedb-pro] failed to drain ${rejected.length} manual recall metadata queue(s) before exit`);
+            }
+        }).finally(() => {
+            exitProbeScheduled = false;
+            if (activeQueues.size > 0)
+                scheduleExitProbe();
+        });
+    });
+}
+function installExitDrain() {
+    if (exitDrainInstalled)
+        return;
+    exitDrainInstalled = true;
+    process.on("beforeExit", () => {
+        exitDrainArmed = true;
+        scheduleExitProbe();
+    });
+}
 function queueFor(writer) {
     const key = writer;
     let queue = queues.get(key);
     if (!queue) {
-        queue = new ManualRecallMetadataQueue(writer);
+        queue = new ManualRecallMetadataQueue(writer, {
+            onActive: () => {
+                activeQueues.add(queue);
+                if (exitDrainArmed)
+                    scheduleExitProbe();
+            },
+            onIdle: () => activeQueues.delete(queue),
+        });
         queues.set(key, queue);
+        installExitDrain();
     }
     return queue;
 }
@@ -236,5 +314,7 @@ export async function flushManualRecallMetadataForTest(writer) {
     await queueFor(writer).flush();
 }
 export async function drainManualRecallMetadata(writer) {
-    await queues.get(writer)?.drain();
+    const queue = queues.get(writer);
+    if (queue)
+        await drainQueue(queue);
 }

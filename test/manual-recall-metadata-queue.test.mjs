@@ -1,9 +1,18 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import { promisify } from "node:util";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { ManualRecallMetadataQueue } = jiti("../src/manual-recall-metadata-queue.ts");
+const { MemoryStore } = jiti("../src/store.ts");
+const execFileAsync = promisify(execFile);
+const queueModulePath = new URL("../src/manual-recall-metadata-queue.ts", import.meta.url).pathname;
+const storeModulePath = new URL("../src/store.ts", import.meta.url).pathname;
 const EMPTY_GOVERNANCE_SNAPSHOT = {
   badRecallCount: 0,
   suppressedUntilTurn: 0,
@@ -133,4 +142,79 @@ test("fresh enqueue traffic does not bypass retry backoff", async () => {
     ["fresh-memory", "retrying-memory"],
   );
   await queue.drain();
+});
+
+test("process beforeExit catches same-store work across repeated later-listener microtasks", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "memory-lancedb-pro-exit-drain-"));
+  const childScript = `
+    import jitiFactory from "jiti";
+    const jiti = jitiFactory(import.meta.url, { interopDefault: true });
+    const { MemoryStore } = jiti(${JSON.stringify(storeModulePath)});
+    const {
+      enqueueManualRecallMetadata,
+      flushManualRecallMetadataForTest,
+    } = jiti(${JSON.stringify(queueModulePath)});
+    const makeEntry = (text) => ({
+      text,
+      vector: [0.1, 0.2, 0.3],
+      category: "fact",
+      scope: "global",
+      importance: 0.5,
+      metadata: "{}",
+    });
+    const store = new MemoryStore({ dbPath: process.env.TEST_DB_PATH, vectorDim: 3 });
+    const first = await store.store(makeEntry("first exit-drain memory"));
+    const second = await store.store(makeEntry("later exit-drain memory"));
+    const third = await store.store(makeEntry("repeated exit-drain memory"));
+    enqueueManualRecallMetadata(store, [{
+      id: first.id,
+      expectedScope: "global",
+      accessCountDelta: 1,
+      accessedAt: Date.now(),
+      governanceSnapshot: { badRecallCount: 0, suppressedUntilTurn: 0 },
+    }]);
+    await flushManualRecallMetadataForTest(store);
+    const laterIds = [second.id, third.id];
+    let laterCycle = 0;
+    process.on("beforeExit", () => {
+      const id = laterIds[laterCycle++];
+      if (!id) return;
+      queueMicrotask(() => {
+        enqueueManualRecallMetadata(store, [{
+          id,
+          expectedScope: "global",
+          accessCountDelta: 1,
+          accessedAt: Date.now(),
+          governanceSnapshot: { badRecallCount: 0, suppressedUntilTurn: 0 },
+        }]);
+      });
+    });
+    process.stdout.write(first.id + "," + second.id + "," + third.id);
+  `;
+
+  try {
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      ["--input-type=module", "-e", childScript],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, TEST_DB_PATH: dir },
+        timeout: 10_000,
+      },
+    );
+    const [firstId, secondId, thirdId] = stdout.trim().split(",");
+    const reopened = new MemoryStore({ dbPath: dir, vectorDim: 3 });
+    try {
+      const firstMetadata = JSON.parse((await reopened.getById(firstId)).metadata);
+      const secondMetadata = JSON.parse((await reopened.getById(secondId)).metadata);
+      const thirdMetadata = JSON.parse((await reopened.getById(thirdId)).metadata);
+      assert.equal(firstMetadata.access_count, 1);
+      assert.equal(secondMetadata.access_count, 1);
+      assert.equal(thirdMetadata.access_count, 1);
+    } finally {
+      await reopened.destroy();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -16,6 +16,8 @@ interface ManualRecallMetadataQueueOptions {
   maxRetries?: number;
   retryDelayMs?: (attempt: number) => number;
   warn?: (message: string) => void;
+  onActive?: () => void;
+  onIdle?: () => void;
 }
 
 const DEFAULT_DEBOUNCE_MS = 50;
@@ -66,6 +68,8 @@ export class ManualRecallMetadataQueue {
   private readonly maxRetries: number;
   private readonly retryDelayMs: (attempt: number) => number;
   private readonly warn: (message: string) => void;
+  private readonly onActive: () => void;
+  private readonly onIdle: () => void;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private timerDueAt: number | null = null;
   private flushPromise: Promise<void> | null = null;
@@ -73,6 +77,8 @@ export class ManualRecallMetadataQueue {
   private retryNotBeforeAt = 0;
   private closed = false;
   private draining = false;
+  private drainPromise: Promise<void> | null = null;
+  private settlePromise: Promise<void> | null = null;
 
   constructor(
     private readonly writer: ManualRecallMetadataWriter,
@@ -83,6 +89,8 @@ export class ManualRecallMetadataQueue {
     this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.retryDelayMs = options.retryDelayMs ?? ((attempt) => 100 * (2 ** (attempt - 1)));
     this.warn = options.warn ?? ((message) => console.warn(message));
+    this.onActive = options.onActive ?? (() => {});
+    this.onIdle = options.onIdle ?? (() => {});
   }
 
   enqueue(updates: ManualRecallMetadataUpdate[]): void {
@@ -104,6 +112,7 @@ export class ManualRecallMetadataQueue {
       added = true;
     }
     if (!added) return;
+    this.onActive();
     this.firstPendingAt ??= Date.now();
     this.schedulePending(this.debounceMs);
   }
@@ -142,20 +151,41 @@ export class ManualRecallMetadataQueue {
       await this.flushPromise;
     } finally {
       this.flushPromise = null;
+      if (this.pending.size === 0) this.onIdle();
     }
   }
 
   async drain(): Promise<void> {
-    this.closed = true;
-    this.draining = true;
+    this.drainPromise ??= this.drainOnce();
+    await this.drainPromise;
+  }
+
+  async settle(): Promise<void> {
+    const pendingSettle = this.settlePromise ?? this.settlePending();
+    this.settlePromise = pendingSettle;
+    try {
+      await pendingSettle;
+    } finally {
+      if (this.settlePromise === pendingSettle) this.settlePromise = null;
+    }
+  }
+
+  private async settlePending(): Promise<void> {
     this.clearTimer();
     this.retryNotBeforeAt = 0;
+    while (this.flushPromise || this.pending.size > 0) {
+      await this.flush();
+    }
+  }
+
+  private async drainOnce(): Promise<void> {
+    this.closed = true;
+    this.draining = true;
     try {
-      while (this.flushPromise || this.pending.size > 0) {
-        await this.flush();
-      }
+      await this.settle();
     } finally {
       this.draining = false;
+      this.onIdle();
     }
   }
 
@@ -279,13 +309,64 @@ export class ManualRecallMetadataQueue {
 }
 
 const queues = new WeakMap<object, ManualRecallMetadataQueue>();
+const activeQueues = new Set<ManualRecallMetadataQueue>();
+let exitDrainInstalled = false;
+let exitDrainArmed = false;
+let exitProbeScheduled = false;
+
+async function drainQueue(queue: ManualRecallMetadataQueue): Promise<void> {
+  try {
+    await queue.drain();
+  } finally {
+    activeQueues.delete(queue);
+  }
+}
+
+async function settleQueue(queue: ManualRecallMetadataQueue): Promise<void> {
+  await queue.settle();
+}
+
+function scheduleExitProbe(): void {
+  if (exitProbeScheduled || activeQueues.size === 0) return;
+  exitProbeScheduled = true;
+  setImmediate(() => {
+    const pending = [...activeQueues];
+    void Promise.allSettled(pending.map((queue) => settleQueue(queue))).then((results) => {
+      const rejected = results.filter((result) => result.status === "rejected");
+      if (rejected.length > 0) {
+        console.warn(
+          `[memory-lancedb-pro] failed to drain ${rejected.length} manual recall metadata queue(s) before exit`,
+        );
+      }
+    }).finally(() => {
+      exitProbeScheduled = false;
+      if (activeQueues.size > 0) scheduleExitProbe();
+    });
+  });
+}
+
+function installExitDrain(): void {
+  if (exitDrainInstalled) return;
+  exitDrainInstalled = true;
+  process.on("beforeExit", () => {
+    exitDrainArmed = true;
+    scheduleExitProbe();
+  });
+}
 
 function queueFor(writer: ManualRecallMetadataWriter): ManualRecallMetadataQueue {
   const key = writer as object;
   let queue = queues.get(key);
   if (!queue) {
-    queue = new ManualRecallMetadataQueue(writer);
+    queue = new ManualRecallMetadataQueue(writer, {
+      onActive: () => {
+        activeQueues.add(queue!);
+        if (exitDrainArmed) scheduleExitProbe();
+      },
+      onIdle: () => activeQueues.delete(queue!),
+    });
     queues.set(key, queue);
+    installExitDrain();
   }
   return queue;
 }
@@ -306,5 +387,6 @@ export async function flushManualRecallMetadataForTest(
 export async function drainManualRecallMetadata(
   writer: ManualRecallMetadataWriter,
 ): Promise<void> {
-  await queues.get(writer as object)?.drain();
+  const queue = queues.get(writer as object);
+  if (queue) await drainQueue(queue);
 }

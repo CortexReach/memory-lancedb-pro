@@ -193,8 +193,10 @@ describe("MemoryStore write queue", () => {
       const table = store.table;
       const originalDelete = table.delete.bind(table);
       const originalAdd = table.add.bind(table);
+      const originalMergeInsert = table.mergeInsert.bind(table);
       let deleteCalls = 0;
       let addCalls = 0;
+      let mergeCalls = 0;
       table.delete = async (...args) => {
         deleteCalls += 1;
         return originalDelete(...args);
@@ -202,6 +204,10 @@ describe("MemoryStore write queue", () => {
       table.add = async (...args) => {
         addCalls += 1;
         return originalAdd(...args);
+      };
+      table.mergeInsert = (...args) => {
+        mergeCalls += 1;
+        return originalMergeInsert(...args);
       };
 
       const results = await store.applyManualRecallMetadataBatch([
@@ -241,9 +247,11 @@ describe("MemoryStore write queue", () => {
 
       table.delete = originalDelete;
       table.add = originalAdd;
+      table.mergeInsert = originalMergeInsert;
 
-      assert.equal(deleteCalls, 1, "eligible rows should share one delete");
-      assert.equal(addCalls, 1, "eligible rows should share one replacement add");
+      assert.equal(deleteCalls, 0, "recall metadata updates must not delete full rows");
+      assert.equal(addCalls, 0, "recall metadata updates must not use replacement add");
+      assert.equal(mergeCalls, 1, "eligible rows should share one atomic merge");
       assert.ok(results[0].entry);
       assert.ok(results[1].entry);
       assert.match(results[2].error, /scope changed from tech to global/);
@@ -344,7 +352,6 @@ describe("MemoryStore write queue", () => {
         accessCountDelta: 1,
         accessedAt: 1_100,
         governanceSnapshot: {
-          lastInjectedAt: 1_000,
           badRecallCount: 3,
           suppressedUntilTurn: 7,
           suppressedUntilMs: 5_000,
@@ -370,7 +377,6 @@ describe("MemoryStore write queue", () => {
         accessCountDelta: 1,
         accessedAt: 1_200,
         governanceSnapshot: {
-          lastInjectedAt: 1_000,
           badRecallCount: 4,
           suppressedUntilTurn: 7,
           suppressedUntilMs: 9_000,
@@ -383,6 +389,49 @@ describe("MemoryStore write queue", () => {
       assert.equal(afterNewerRecall.bad_recall_count, 0);
       assert.equal(afterNewerRecall.suppressed_until_turn, 0);
       assert.equal(afterNewerRecall.suppressed_until_ms, 0);
+    } finally {
+      if (queue) await queue.drain();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resets suppression when only last_injected_at changed after recall", async () => {
+    const { store, dir } = makeStore();
+    let queue;
+    try {
+      const entry = await store.store({
+        ...makeEntry(1),
+        metadata: JSON.stringify({
+          last_injected_at: 1_000,
+          bad_recall_count: 3,
+          suppressed_until_turn: 7,
+          suppressed_until_ms: 5_000,
+        }),
+      });
+      queue = new ManualRecallMetadataQueue(store, {
+        debounceMs: 60_000,
+        warn: () => {},
+      });
+      queue.enqueue([{
+        id: entry.id,
+        expectedScope: "global",
+        accessCountDelta: 1,
+        accessedAt: 1_100,
+        governanceSnapshot: {
+          badRecallCount: 3,
+          suppressedUntilTurn: 7,
+          suppressedUntilMs: 5_000,
+        },
+      }]);
+
+      await store.patchMetadata(entry.id, { last_injected_at: 1_050 }, ["global"]);
+      await queue.flush();
+
+      const metadata = JSON.parse((await store.getById(entry.id)).metadata);
+      assert.equal(metadata.last_injected_at, 1_050);
+      assert.equal(metadata.bad_recall_count, 0);
+      assert.equal(metadata.suppressed_until_turn, 0);
+      assert.equal(metadata.suppressed_until_ms, 0);
     } finally {
       if (queue) await queue.drain();
       rmSync(dir, { recursive: true, force: true });
@@ -532,25 +581,58 @@ describe("MemoryStore write queue", () => {
     }
   });
 
-  it("does not retry rows already committed by a partially successful add", async () => {
+  it("preserves original rows when atomic merge, add, and recovery paths fail", async () => {
     const { store, dir } = makeStore();
     let queue;
     let table;
+    let originalDelete;
     let originalAdd;
+    let originalQuery;
+    let originalMergeInsert;
     try {
       const first = await store.store(makeEntry(1));
       const second = await store.store(makeEntry(2));
+      const firstBefore = await store.getById(first.id);
+      const secondBefore = await store.getById(second.id);
       table = store.table;
+      originalDelete = table.delete.bind(table);
       originalAdd = table.add.bind(table);
-      let injectedFailure = false;
-      table.add = async (entries) => {
-        if (!injectedFailure && entries.length === 2) {
-          injectedFailure = true;
-          await originalAdd([entries[0]]);
-          throw new Error("simulated partial add failure");
-        }
-        return originalAdd(entries);
+      originalQuery = table.query.bind(table);
+      originalMergeInsert = table.mergeInsert.bind(table);
+      let deleteCalls = 0;
+      let addCalls = 0;
+      let queryCalls = 0;
+      table.delete = async () => {
+        deleteCalls += 1;
+        throw new Error("legacy delete path must not run");
       };
+      table.add = async () => {
+        addCalls += 1;
+        throw new Error("simulated replacement and rollback add failure");
+      };
+      table.query = (...args) => {
+        queryCalls += 1;
+        if (queryCalls > 1) {
+          return {
+            where() {
+              return {
+                async toArray() {
+                  throw new Error("simulated recovery read failure");
+                },
+              };
+            },
+          };
+        }
+        return originalQuery(...args);
+      };
+      table.mergeInsert = () => ({
+        whenMatchedUpdateAll() {
+          return this;
+        },
+        async execute() {
+          throw new Error("simulated atomic merge failure");
+        },
+      });
 
       queue = new ManualRecallMetadataQueue(store, {
         debounceMs: 60_000,
@@ -563,20 +645,149 @@ describe("MemoryStore write queue", () => {
       ]);
       await queue.flush();
 
-      assert.deepEqual(
-        queue.getPendingUpdates().map(({ id }) => id),
-        [second.id],
-        "the row preserved by the partial add must be treated as committed",
-      );
+      assert.equal(deleteCalls, 0);
+      assert.equal(addCalls, 0);
+      assert.equal(queryCalls, 2, "an uncertain merge should attempt one recovery read");
+      assert.deepEqual(queue.getPendingUpdates(), [], "unverifiable merge state must not retry");
+
+      table.delete = originalDelete;
+      table.add = originalAdd;
+      table.query = originalQuery;
+      table.mergeInsert = originalMergeInsert;
+
+      assert.deepEqual(await store.getById(first.id), firstBefore);
+      assert.deepEqual(await store.getById(second.id), secondBefore);
+
+    } finally {
+      if (table && originalDelete) table.delete = originalDelete;
+      if (table && originalAdd) table.add = originalAdd;
+      if (table && originalQuery) table.query = originalQuery;
+      if (table && originalMergeInsert) table.mergeInsert = originalMergeInsert;
+      if (queue) await queue.drain();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("retries an atomic merge only when recovery confirms it did not commit", async () => {
+    const { store, dir } = makeStore();
+    let queue;
+    let table;
+    let originalMergeInsert;
+    try {
+      const entry = await store.store(makeEntry(1));
+      table = store.table;
+      originalMergeInsert = table.mergeInsert.bind(table);
+      table.mergeInsert = () => ({
+        whenMatchedUpdateAll() {
+          return this;
+        },
+        async execute() {
+          throw new Error("simulated pre-commit atomic merge failure");
+        },
+      });
+      queue = new ManualRecallMetadataQueue(store, {
+        debounceMs: 60_000,
+        retryDelayMs: () => 60_000,
+        warn: () => {},
+      });
+      queue.enqueue([{
+        id: entry.id,
+        expectedScope: "global",
+        accessCountDelta: 1,
+        accessedAt: 100,
+        governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
+      }]);
 
       await queue.flush();
-      const firstMetadata = JSON.parse((await store.getById(first.id)).metadata);
-      const secondMetadata = JSON.parse((await store.getById(second.id)).metadata);
-      assert.equal(firstMetadata.access_count, 1);
-      assert.equal(secondMetadata.access_count, 1);
+      assert.deepEqual(queue.getPendingUpdates().map(({ id }) => id), [entry.id]);
+
+      table.mergeInsert = originalMergeInsert;
+      await queue.flush();
+      const metadata = JSON.parse((await store.getById(entry.id)).metadata);
+      assert.equal(metadata.access_count, 1);
     } finally {
-      if (table && originalAdd) table.add = originalAdd;
+      if (table && originalMergeInsert) table.mergeInsert = originalMergeInsert;
       if (queue) await queue.drain();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retry an atomic merge that committed before throwing", async () => {
+    const { store, dir } = makeStore();
+    let queue;
+    let table;
+    let originalMergeInsert;
+    try {
+      const entry = await store.store(makeEntry(1));
+      table = store.table;
+      originalMergeInsert = table.mergeInsert.bind(table);
+      table.mergeInsert = (...args) => {
+        const builder = originalMergeInsert(...args);
+        return {
+          whenMatchedUpdateAll(options) {
+            const matchedBuilder = builder.whenMatchedUpdateAll(options);
+            return {
+              async execute(entries) {
+                await matchedBuilder.execute(entries);
+                throw new Error("simulated post-commit atomic merge failure");
+              },
+            };
+          },
+        };
+      };
+      queue = new ManualRecallMetadataQueue(store, {
+        debounceMs: 60_000,
+        retryDelayMs: () => 0,
+        warn: () => {},
+      });
+      queue.enqueue([{
+        id: entry.id,
+        expectedScope: "global",
+        accessCountDelta: 1,
+        accessedAt: 100,
+        governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
+      }]);
+
+      await queue.flush();
+      assert.deepEqual(queue.getPendingUpdates(), []);
+
+      table.mergeInsert = originalMergeInsert;
+      await queue.flush();
+      const metadata = JSON.parse((await store.getById(entry.id)).metadata);
+      assert.equal(metadata.access_count, 1);
+    } finally {
+      if (table && originalMergeInsert) table.mergeInsert = originalMergeInsert;
+      if (queue) await queue.drain();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("updates legacy null-scope rows as global without inserting a duplicate", async () => {
+    const { store, dir } = makeStore();
+    try {
+      const entry = await store.store(makeEntry(1));
+      await store.table.update({
+        where: `id = ${JSON.stringify(entry.id)}`,
+        valuesSql: { scope: "NULL" },
+      });
+
+      const [result] = await store.applyManualRecallMetadataBatch([{
+        id: entry.id,
+        expectedScope: "global",
+        accessCountDelta: 1,
+        accessedAt: 100,
+        governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
+      }]);
+
+      assert.ok(result.entry);
+      const rows = await store.table.query()
+        .where(`id = ${JSON.stringify(entry.id)}`)
+        .toArray();
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].scope, "global");
+      assert.equal(JSON.parse(rows[0].metadata).access_count, 1);
+    } finally {
+      await store.destroy().catch(() => {});
       rmSync(dir, { recursive: true, force: true });
     }
   });

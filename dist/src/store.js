@@ -1906,7 +1906,6 @@ export class MemoryStore {
                     const confirmedAt = Math.max(current.last_confirmed_use_at ?? 0, candidate.accessedAt);
                     const snapshot = candidate.governanceSnapshot;
                     const governanceUnchanged = snapshot !== undefined &&
-                        current.last_injected_at === snapshot.lastInjectedAt &&
                         current.bad_recall_count === snapshot.badRecallCount &&
                         current.suppressed_until_turn === snapshot.suppressedUntilTurn &&
                         current.suppressed_until_ms === snapshot.suppressedUntilMs;
@@ -1929,14 +1928,83 @@ export class MemoryStore {
                 }
                 if (updatedEntries.length === 0)
                     continue;
-                const deleteWhereClause = updatedEntries
+                const mergeWhereClause = updatedEntries
                     .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
                     .join(" OR ");
-                let deleted = false;
+                const classifyUncertainMerge = async (reason) => {
+                    let dataMayHaveChanged = false;
+                    let rowsAfterFailure;
+                    try {
+                        rowsAfterFailure = await this.table.query()
+                            .where(`(${mergeWhereClause})`)
+                            .toArray();
+                    }
+                    catch (recoveryError) {
+                        this.noteDataModification();
+                        const recoveryMessage = recoveryError instanceof Error
+                            ? recoveryError.message
+                            : String(recoveryError);
+                        for (let index = 0; index < updatedEntries.length; index++) {
+                            results.set(updatedInputIndices[index], {
+                                id: updatedEntries[index].id,
+                                entry: null,
+                                error: `Atomic recall metadata merge failed for ${updatedEntries[index].id}: ` +
+                                    `${reason}. Commit state could not be verified: ${recoveryMessage}`,
+                                retryable: false,
+                            });
+                        }
+                        return;
+                    }
+                    const rowsAfterFailureById = new Map();
+                    for (const row of rowsAfterFailure)
+                        rowsAfterFailureById.set(row.id, row);
+                    for (let index = 0; index < updatedEntries.length; index++) {
+                        const original = originals[index];
+                        const updatedEntry = updatedEntries[index];
+                        const row = rowsAfterFailureById.get(updatedEntry.id);
+                        const rowScope = row?.scope ?? "global";
+                        const persistedMetadata = typeof row?.metadata === "string" ? row.metadata : "{}";
+                        if (row && rowScope === updatedEntry.scope && persistedMetadata === updatedEntry.metadata) {
+                            dataMayHaveChanged = true;
+                            results.set(updatedInputIndices[index], {
+                                id: updatedEntry.id,
+                                entry: updatedEntry,
+                            });
+                            continue;
+                        }
+                        if (row && rowScope === original.scope && persistedMetadata === original.metadata) {
+                            results.set(updatedInputIndices[index], {
+                                id: original.id,
+                                entry: null,
+                                error: `Atomic recall metadata merge failed for ${original.id}: ${reason}`,
+                                retryable: true,
+                            });
+                            continue;
+                        }
+                        results.set(updatedInputIndices[index], {
+                            id: updatedEntry.id,
+                            entry: null,
+                            error: `Atomic recall metadata merge failed for ${updatedEntry.id}: ${reason}. ` +
+                                `Persisted state no longer matches either the original or updated row`,
+                            retryable: false,
+                        });
+                        dataMayHaveChanged = true;
+                    }
+                    if (dataMayHaveChanged)
+                        this.noteDataModification();
+                };
                 try {
-                    await this.table.delete(`(${deleteWhereClause})`);
-                    deleted = true;
-                    await this.table.add(updatedEntries);
+                    const mergeResult = await this.table
+                        .mergeInsert("id")
+                        .whenMatchedUpdateAll({
+                        where: "target.scope = source.scope OR " +
+                            "(target.scope IS NULL AND source.scope = 'global')",
+                    })
+                        .execute(updatedEntries);
+                    if (mergeResult.numUpdatedRows !== updatedEntries.length) {
+                        await classifyUncertainMerge(`updated ${mergeResult.numUpdatedRows} of ${updatedEntries.length} expected rows`);
+                        continue;
+                    }
                     this.noteDataModification();
                     for (let index = 0; index < updatedEntries.length; index++) {
                         results.set(updatedInputIndices[index], {
@@ -1947,71 +2015,7 @@ export class MemoryStore {
                 }
                 catch (writeError) {
                     const writeMessage = writeError instanceof Error ? writeError.message : String(writeError);
-                    if (deleted) {
-                        this.noteDataModification();
-                        let existingAfterFailure;
-                        try {
-                            existingAfterFailure = await this.table.query()
-                                .where(`(${deleteWhereClause})`)
-                                .toArray();
-                        }
-                        catch (recoveryQueryError) {
-                            const recoveryMessage = recoveryQueryError instanceof Error
-                                ? recoveryQueryError.message
-                                : String(recoveryQueryError);
-                            for (let index = 0; index < updatedEntries.length; index++) {
-                                results.set(updatedInputIndices[index], {
-                                    id: updatedEntries[index].id,
-                                    entry: null,
-                                    error: `Failed to apply recall metadata for ${updatedEntries[index].id}: ` +
-                                        `${writeMessage}. Commit state could not be verified: ${recoveryMessage}`,
-                                    retryable: false,
-                                });
-                            }
-                            continue;
-                        }
-                        const preservedIds = new Set(existingAfterFailure.map((row) => row.id));
-                        const originalsToRestore = originals.filter((entry) => !preservedIds.has(entry.id));
-                        let rollbackMessage = null;
-                        try {
-                            if (originalsToRestore.length > 0)
-                                await this.table.add(originalsToRestore);
-                        }
-                        catch (rollbackError) {
-                            rollbackMessage = rollbackError instanceof Error
-                                ? rollbackError.message
-                                : String(rollbackError);
-                        }
-                        for (let index = 0; index < updatedEntries.length; index++) {
-                            const updatedEntry = updatedEntries[index];
-                            if (preservedIds.has(updatedEntry.id)) {
-                                results.set(updatedInputIndices[index], {
-                                    id: updatedEntry.id,
-                                    entry: updatedEntry,
-                                });
-                                continue;
-                            }
-                            results.set(updatedInputIndices[index], {
-                                id: updatedEntry.id,
-                                entry: null,
-                                error: rollbackMessage
-                                    ? `Failed to apply recall metadata for ${updatedEntry.id}: ` +
-                                        `write failed and rollback also failed. Write error: ${writeMessage}. ` +
-                                        `Rollback error: ${rollbackMessage}`
-                                    : `Failed to apply recall metadata for ${updatedEntry.id}: ${writeMessage}`,
-                                retryable: rollbackMessage === null,
-                            });
-                        }
-                        continue;
-                    }
-                    for (let index = 0; index < updatedEntries.length; index++) {
-                        results.set(updatedInputIndices[index], {
-                            id: updatedEntries[index].id,
-                            entry: null,
-                            error: `Failed to apply recall metadata for ${updatedEntries[index].id}: ${writeMessage}`,
-                            retryable: true,
-                        });
-                    }
+                    await classifyUncertainMerge(writeMessage);
                 }
             }
             settledResults = updates.map((candidate, inputIndex) => results.get(inputIndex) ?? {

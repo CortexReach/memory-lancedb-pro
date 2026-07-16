@@ -680,7 +680,6 @@ function createMemoryRecallTool(runtimeContext, options) {
                         accessCountDelta: 1,
                         accessedAt: now,
                         governanceSnapshot: {
-                            lastInjectedAt: metadata.last_injected_at,
                             badRecallCount: metadata.bad_recall_count,
                             suppressedUntilTurn: metadata.suppressed_until_turn,
                             suppressedUntilMs: metadata.suppressed_until_ms,
