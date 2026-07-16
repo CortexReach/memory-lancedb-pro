@@ -5009,6 +5009,14 @@ const memoryLanceDBProPlugin = {
             if (searchFailed) {
               continue;
             }
+            // Near-duplicate pre-check ahead of admission gating. This is the only dedup mapped
+            // rows get: a single vector-similarity threshold, direct skip, no LLM-mediated
+            // merge/contextualize/contradict decision. Extraction candidates own deduplicate()
+            // (src/smart-extractor.ts) is a genuinely different, richer pipeline (a 0.7
+            // pre-filter feeding an LLM decision, not a single hard cutoff) - deliberately not
+            // reused here yet. AdmissionController's "pass_to_dedup" decision for a mapped row
+            // is therefore always treated as "admit, subject to this cheaper pre-check" below,
+            // not "route through the same merge pipeline extraction candidates get".
             if (existing.length > 0 && existing[0].score > 0.95) {
               continue;
             }
@@ -5024,7 +5032,10 @@ const memoryLanceDBProPlugin = {
               category: mapped.category,
               heading: mapped.heading,
               vector,
-              reflectionText,
+              // The real transcript, not reflectionText (the distiller's own generated
+              // output mapped rows are parsed FROM): using the distillate as its own
+              // grounding evidence would let a hallucinated line appear self-grounded.
+              conversationText: conversation,
               scopeFilter: [targetScope],
               warnLog: (msg: string) => api.logger.warn(msg),
             });

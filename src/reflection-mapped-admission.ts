@@ -71,7 +71,12 @@ export async function gateMappedReflectionEntry(params: {
   category: string;
   heading: string;
   vector: number[];
-  reflectionText: string;
+  /**
+   * The REAL underlying transcript this row was distilled from, not the
+   * distiller's own generated output. Grounding the candidate against its own
+   * source text would let a hallucinated distillate line appear self-grounded.
+   */
+  conversationText: string;
   scopeFilter: string[];
   warnLog?: (msg: string) => void;
 }): Promise<MappedReflectionGateResult> {
@@ -90,14 +95,29 @@ export async function gateMappedReflectionEntry(params: {
         content: params.text,
       },
       candidateVector: params.vector,
-      conversationText: params.reflectionText,
+      conversationText: params.conversationText,
       scopeFilter: params.scopeFilter,
     });
   } catch (err) {
+    const reason = "admission evaluation failed open";
     params.warnLog?.(
       `memory-reflection: mapped-row admission evaluation failed, admitting without audit: ${String(err)}`,
     );
-    return { admit: true, reason: "admission evaluation failed open" };
+    return {
+      admit: true,
+      reason,
+      // Fail-open admits still need durable, queryable provenance on the row itself
+      // (not just an ephemeral log line): otherwise this row is indistinguishable
+      // from a normally-scored admit once persisted.
+      auditJson: params.attachAudit
+        ? JSON.stringify({
+            provenance: "memory-reflection-mapped",
+            failedOpen: true,
+            reason,
+            error: String(err),
+          })
+        : undefined,
+    };
   }
 
   if (evaluation.decision === "reject") {
