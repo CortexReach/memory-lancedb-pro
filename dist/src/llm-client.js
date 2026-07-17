@@ -25,8 +25,7 @@ export function normalizeDirectModelRef(modelRef) {
 }
 /**
  * Default reasoning effort sent on the host transport when llm.thinkLevel
- * (or its deprecated llm.reasoningEffort alias) is not configured. "medium"
- * is a universally-supported effort level across
+ * is not configured. "medium" is a universally-supported effort level across
  * the model families OpenClaw's core reasoning-effort normalization knows
  * about, and it never disables reasoning outright the way an omitted field
  * has been observed to (core's own "adaptive" shorthand maps to this same
@@ -554,61 +553,26 @@ let hostTransportFallbackWarned = false;
 export function resetHostTransportFallbackWarnForTests() {
     hostTransportFallbackWarned = false;
 }
-// Module-level, same rationale as hostTransportFallbackWarned above: these
-// two warnings are about the *raw config*, not the resolved client, so they
-// must dedupe across all lanes (extraction, admission, CLI) that each build
-// their own LlmClientConfig from the same underlying llm.thinkLevel /
-// llm.reasoningEffort settings.
-let thinkLevelBothKeysWarned = false;
-let thinkLevelDeprecatedAliasWarned = false;
-/** Test-only: resets the process-level thinkLevel/reasoningEffort alias-warn dedupe flags. */
-export function resetThinkLevelDeprecationWarnForTests() {
-    thinkLevelBothKeysWarned = false;
-    thinkLevelDeprecatedAliasWarned = false;
-}
 /**
- * Resolves the canonical llm.thinkLevel value, honoring the deprecated
- * llm.reasoningEffort alias: llm.thinkLevel wins when both are configured
- * (a single once-per-process warning, not a hard failure -- config may
- * straddle both keys during a migration), and llm.reasoningEffort-only
- * usage keeps working unchanged, with its own once-per-process deprecation
- * warning naming the new key. Blank/whitespace-only values are treated as
- * unset for both keys, matching reasoningEffort's pre-existing semantics.
+ * Resolves the canonical llm.thinkLevel value. Blank/whitespace-only values
+ * are treated as unset.
  *
  * Presence-based by construction: "configured" here means "a non-blank
  * string reached this function." That is only a correct proxy for "the
- * user actually set it" as long as neither openclaw.plugin.json schema
- * entry (llm.thinkLevel / llm.reasoningEffort) declares a JSON-schema
- * "default" -- a schema default gets materialized into the config object
- * upstream (observed on at least one OpenClaw host config-loading path)
- * before this function ever runs, indistinguishably from a genuine user
- * value. Do not add "default" back to either manifest key; that silently
- * resurrects an override of an explicitly-configured deprecated
- * reasoningEffort (2026-07-16 live incident).
+ * user actually set it" as long as the openclaw.plugin.json llm.thinkLevel
+ * schema entry does not declare a JSON-schema "default" -- a schema default
+ * gets materialized into the config object upstream (observed on at least
+ * one OpenClaw host config-loading path) before this function ever runs,
+ * indistinguishably from a genuine user value. Do not add "default" back to
+ * the manifest key (2026-07-16 live incident).
  */
-export function resolveThinkLevel(config, warnLog) {
-    const thinkLevel = config.thinkLevel?.trim();
-    const reasoningEffort = config.reasoningEffort?.trim();
-    if (thinkLevel) {
-        if (reasoningEffort && !thinkLevelBothKeysWarned) {
-            thinkLevelBothKeysWarned = true;
-            warnLog("memory-lancedb-pro: both llm.thinkLevel and the deprecated llm.reasoningEffort are configured; llm.thinkLevel wins. Remove llm.reasoningEffort.");
-        }
-        return thinkLevel;
-    }
-    if (reasoningEffort) {
-        if (!thinkLevelDeprecatedAliasWarned) {
-            thinkLevelDeprecatedAliasWarned = true;
-            warnLog("memory-lancedb-pro: llm.reasoningEffort is deprecated, use llm.thinkLevel instead. llm.reasoningEffort will keep working as an alias.");
-        }
-        return reasoningEffort;
-    }
-    return undefined;
+export function resolveThinkLevel(config) {
+    return config.thinkLevel?.trim() || undefined;
 }
 export function createLlmClient(config) {
     const log = config.log ?? (() => { });
     const warnLog = config.warnLog;
-    config = { ...config, thinkLevel: resolveThinkLevel(config, warnLog ?? log) };
+    config = { ...config, thinkLevel: resolveThinkLevel(config) };
     if (config.transport === "host") {
         if (typeof config.runtimeLlmComplete === "function") {
             return createHostClient(config, config.runtimeLlmComplete, log, warnLog);

@@ -1581,11 +1581,7 @@
           },
           "thinkLevel": {
             "type": "string",
-            "description": "Reasoning effort requested from the model, e.g. low, medium, high. Host transport: always sent with a default of medium, a level that never disables reasoning, because omitting it has been observed to fall through to a disabled/no-reasoning default further down the host-managed runtime stack, silently degrading reasoning-capable models. Direct transport: sent only when explicitly configured; when unset, no reasoning parameter is sent and the provider's own default applies. Deliberately no JSON-schema default here: a schema default gets materialized into the plugin config upstream on at least one OpenClaw host config-loading path, indistinguishably from a genuine user value, which would silently override an explicitly-configured deprecated llm.reasoningEffort (the medium default lives in code -- DEFAULT_HOST_REASONING_EFFORT in src/llm-client.ts -- applied only on the host transport when neither key is configured)."
-          },
-          "reasoningEffort": {
-            "type": "string",
-            "description": "Deprecated: renamed to llm.thinkLevel for consistency with memoryReflection.thinkLevel. Still accepted as a backward-compatible alias; llm.thinkLevel wins if both are configured. Set llm.thinkLevel instead. Deliberately no JSON-schema default here, for the same reason as llm.thinkLevel -- see its description."
+            "description": "Reasoning effort requested from the model, e.g. low, medium, high. Host transport: always sent with a default of medium, a level that never disables reasoning, because omitting it has been observed to fall through to a disabled/no-reasoning default further down the host-managed runtime stack, silently degrading reasoning-capable models. Direct transport: sent only when explicitly configured; when unset, no reasoning parameter is sent and the provider's own default applies. Deliberately no JSON-schema default here: a schema default gets materialized into the plugin config upstream on at least one OpenClaw host config-loading path, indistinguishably from a genuine user value (the medium default lives in code -- DEFAULT_HOST_REASONING_EFFORT in src/llm-client.ts -- applied only on the host transport when unconfigured)."
           }
         }
       },

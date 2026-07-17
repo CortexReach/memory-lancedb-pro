@@ -1862,7 +1862,6 @@ function _initPluginState(api) {
                 timeoutMs: llmTimeoutMs,
                 transport: config.llm?.transport,
                 thinkLevel: config.llm?.thinkLevel,
-                reasoningEffort: config.llm?.reasoningEffort,
                 runtimeLlmComplete: resolveRuntimeLlmComplete(api),
                 log: (msg) => api.logger.debug(msg),
                 warnLog: (msg) => api.logger.warn(msg),
@@ -2467,7 +2466,6 @@ const memoryLanceDBProPlugin = {
                         timeoutMs: llmTimeoutMs,
                         transport: config.llm?.transport,
                         thinkLevel: config.llm?.thinkLevel,
-                        reasoningEffort: config.llm?.reasoningEffort,
                         runtimeLlmComplete: resolveRuntimeLlmComplete(api),
                         log: (msg) => api.logger.debug(msg),
                     });

@@ -89,7 +89,7 @@ describe("LLM host transport", () => {
     assert.equal(calls[0].purpose, "memory-lancedb-pro:admission-utility");
   });
 
-  it("forwards a default reasoning effort to the host runtime call when llm.reasoningEffort is not configured", async () => {
+  it("forwards a default reasoning effort to the host runtime call when llm.thinkLevel is not configured", async () => {
     const calls = [];
     const runtimeLlmComplete = async (params) => {
       calls.push(params);
@@ -112,7 +112,7 @@ describe("LLM host transport", () => {
     );
   });
 
-  it("forwards an explicit llm.reasoningEffort override to the host runtime call", async () => {
+  it("forwards an explicit llm.thinkLevel override to the host runtime call", async () => {
     const calls = [];
     const runtimeLlmComplete = async (params) => {
       calls.push(params);
@@ -122,7 +122,7 @@ describe("LLM host transport", () => {
     const llm = createLlmClient({
       transport: "host",
       model: "openrouter/openai/gpt-oss-120b",
-      reasoningEffort: "high",
+      thinkLevel: "high",
       runtimeLlmComplete,
     });
 
@@ -132,7 +132,7 @@ describe("LLM host transport", () => {
     assert.equal(calls[0].reasoning, "high");
   });
 
-  it("falls back to the default reasoning effort when llm.reasoningEffort is configured as an empty/blank string", async () => {
+  it("falls back to the default reasoning effort when llm.thinkLevel is configured as an empty/blank string", async () => {
     const calls = [];
     const runtimeLlmComplete = async (params) => {
       calls.push(params);
@@ -142,7 +142,7 @@ describe("LLM host transport", () => {
     const llm = createLlmClient({
       transport: "host",
       model: "openrouter/openai/gpt-oss-120b",
-      reasoningEffort: "   ",
+      thinkLevel: "   ",
       runtimeLlmComplete,
     });
 
@@ -244,7 +244,7 @@ describe("LLM host transport", () => {
     );
   });
 
-  it("sends an explicit reasoning effort on a plain direct-transport request when llm.reasoningEffort is configured", async () => {
+  it("sends an explicit reasoning effort on a plain direct-transport request when llm.thinkLevel is configured", async () => {
     let requestBody;
     server = http.createServer(async (req, res) => {
       let body = "";
@@ -261,7 +261,7 @@ describe("LLM host transport", () => {
       apiKey: "test-api-key",
       model: "anthropic/claude-opus-4-8",
       baseURL: `http://127.0.0.1:${port}/v1`,
-      reasoningEffort: "high",
+      thinkLevel: "high",
     });
 
     await llm.completeJson("hello", "direct-reasoning-probe");
@@ -269,7 +269,7 @@ describe("LLM host transport", () => {
     assert.deepEqual(requestBody.reasoning, { effort: "high" });
   });
 
-  it("omits the reasoning field on a direct-transport request when llm.reasoningEffort is not configured (unchanged default)", async () => {
+  it("omits the reasoning field on a direct-transport request when llm.thinkLevel is not configured (unchanged default)", async () => {
     let requestBody;
     server = http.createServer(async (req, res) => {
       let body = "";
@@ -293,7 +293,7 @@ describe("LLM host transport", () => {
     assert.equal(
       "reasoning" in requestBody,
       false,
-      "an unconfigured reasoningEffort must not send a reasoning field, letting the provider's own default apply"
+      "an unconfigured thinkLevel must not send a reasoning field, letting the provider's own default apply"
     );
   });
 
@@ -315,7 +315,7 @@ describe("LLM host transport", () => {
       apiKey: "test-api-key",
       model: "gpt-4o-mini",
       baseURL: `http://127.0.0.1:${port}/v1`,
-      reasoningEffort: "low",
+      thinkLevel: "low",
       warnLog: () => {},
     });
 
