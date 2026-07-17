@@ -9,6 +9,7 @@ const {
   stripAutoCaptureInjectedPrefix,
   formatConversationTranscript,
   buildConversationTurnsForExtraction,
+  trimTurnsToUserCap,
 } = jiti("../src/auto-capture-cleanup.ts");
 
 describe("auto-capture cleanup", () => {
@@ -95,8 +96,8 @@ describe("formatConversationTranscript", () => {
 // recomputes them.
 // ============================================================================
 
-describe("buildConversationTurnsForExtraction", () => {
-  it("returns this call's message-loop turns unchanged when nothing was narrowed and no context rolled over from a prior call", () => {
+describe("buildConversationTurnsForExtraction (pair-shaped window)", () => {
+  it("returns this call's message-loop turns unchanged when nothing was narrowed", () => {
     const messageLoopTurns = [
       { role: "user", text: "u1" },
       { role: "assistant", text: "a1" },
@@ -106,13 +107,11 @@ describe("buildConversationTurnsForExtraction", () => {
       messageLoopTurns,
       eligibleTexts: ["u1", "u2"],
       newUserTexts: ["u1", "u2"],
-      assistantContextForRun: ["a1"],
-      assistantContextTexts: ["a1"],
     });
     assert.deepEqual(result, messageLoopTurns);
   });
 
-  it("drops already-extracted leading user turns (watermark narrowing) while keeping every assistant-context turn from this call", () => {
+  it("drops already-extracted leading user turns together with their pairs' assistant replies", () => {
     const messageLoopTurns = [
       { role: "user", text: "old1" },
       { role: "assistant", text: "a1" },
@@ -123,47 +122,79 @@ describe("buildConversationTurnsForExtraction", () => {
       messageLoopTurns,
       eligibleTexts: ["old1", "old2", "new1"],
       newUserTexts: ["new1"],
-      assistantContextForRun: ["a1"],
-      assistantContextTexts: ["a1"],
     });
-    assert.deepEqual(result, [
-      { role: "assistant", text: "a1" },
-      { role: "user", text: "new1" },
-    ]);
+    assert.deepEqual(result, [{ role: "user", text: "new1" }]);
   });
 
-  it("prepends assistant-context turns rolled over from before this call, ahead of this call's own turns", () => {
+  it("keeps assistant turns interleaved with kept user turns, dropping only consumed pairs", () => {
     const messageLoopTurns = [
-      { role: "user", text: "u1" },
-      { role: "assistant", text: "a2" },
+      { role: "user", text: "old1" },
+      { role: "assistant", text: "a-old" },
+      { role: "user", text: "new1" },
+      { role: "assistant", text: "a-new1" },
+      { role: "user", text: "new2" },
+      { role: "assistant", text: "a-new2" },
     ];
     const result = buildConversationTurnsForExtraction({
       messageLoopTurns,
-      eligibleTexts: ["u1"],
-      newUserTexts: ["u1"],
-      assistantContextForRun: ["a1", "a2"],
-      assistantContextTexts: ["a2"],
+      eligibleTexts: ["old1", "new1", "new2"],
+      newUserTexts: ["new1", "new2"],
     });
     assert.deepEqual(result, [
-      { role: "assistant", text: "a1" },
-      { role: "user", text: "u1" },
-      { role: "assistant", text: "a2" },
+      { role: "user", text: "new1" },
+      { role: "assistant", text: "a-new1" },
+      { role: "user", text: "new2" },
+      { role: "assistant", text: "a-new2" },
     ]);
   });
 
-  it("falls back to flat user turns (plus any rolled-over assistant context) when newUserTexts did not come from a tail-slice of eligibleTexts (pending-ingress replay)", () => {
+  it("falls back to flat user turns when newUserTexts did not come from a tail-slice of eligibleTexts (pending-ingress replay)", () => {
     const messageLoopTurns = [{ role: "user", text: "unrelated-this-call-text" }];
     const result = buildConversationTurnsForExtraction({
       messageLoopTurns,
       eligibleTexts: ["unrelated-this-call-text"],
       newUserTexts: ["replayed ingress text 1", "replayed ingress text 2"],
-      assistantContextForRun: ["a1"],
-      assistantContextTexts: [],
     });
     assert.deepEqual(result, [
-      { role: "assistant", text: "a1" },
       { role: "user", text: "replayed ingress text 1" },
       { role: "user", text: "replayed ingress text 2" },
+    ]);
+  });
+});
+
+describe("trimTurnsToUserCap (extractMinMessages as a window of pairs)", () => {
+  const turns = [
+    { role: "assistant", text: "a0" },
+    { role: "user", text: "u1" },
+    { role: "assistant", text: "a1" },
+    { role: "user", text: "u2" },
+    { role: "assistant", text: "a2" },
+    { role: "user", text: "u3" },
+    { role: "assistant", text: "a3" },
+  ];
+
+  it("keeps the newest N user turns with their interleaved assistant replies", () => {
+    assert.deepEqual(trimTurnsToUserCap(turns, 2), [
+      { role: "user", text: "u2" },
+      { role: "assistant", text: "a2" },
+      { role: "user", text: "u3" },
+      { role: "assistant", text: "a3" },
+    ]);
+  });
+
+  it("never leaves an orphan assistant turn ahead of the window's first user turn", () => {
+    const trimmed = trimTurnsToUserCap(turns, 3);
+    assert.deepEqual(trimmed[0], { role: "user", text: "u1" });
+  });
+
+  it("returns everything from the first user turn when the cap exceeds the user-turn count", () => {
+    assert.deepEqual(trimTurnsToUserCap(turns, 10), turns.slice(1));
+  });
+
+  it("keeps single-pair windows to exactly the last pair", () => {
+    assert.deepEqual(trimTurnsToUserCap(turns, 1), [
+      { role: "user", text: "u3" },
+      { role: "assistant", text: "a3" },
     ]);
   });
 });

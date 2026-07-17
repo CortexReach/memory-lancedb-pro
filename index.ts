@@ -73,6 +73,7 @@ import {
   normalizeAutoCaptureText,
   type ConversationTurn,
   buildConversationTurnsForExtraction,
+  trimTurnsToUserCap,
 } from "./src/auto-capture-cleanup.js";
 
 // Import smart extraction & lifecycle components
@@ -2355,7 +2356,7 @@ interface PluginSingletonState {
   autoCaptureSeenTextCount: Map<string, number>;
   autoCapturePendingIngressTexts: Map<string, string[]>;
   autoCaptureRecentTexts: Map<string, string[]>;
-  autoCaptureRecentAssistantTexts: Map<string, string[]>;
+  autoCaptureRecentPairTurns: Map<string, ConversationTurn[]>;
 }
 
 interface DreamingSchedulerState {
@@ -2560,7 +2561,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const autoCaptureSeenTextCount = new Map<string, number>();
   const autoCapturePendingIngressTexts = new Map<string, string[]>();
   const autoCaptureRecentTexts = new Map<string, string[]>();
-  const autoCaptureRecentAssistantTexts = new Map<string, string[]>();
+  const autoCaptureRecentPairTurns = new Map<string, ConversationTurn[]>();
 
   return {
     config,
@@ -2589,7 +2590,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCaptureSeenTextCount,
     autoCapturePendingIngressTexts,
     autoCaptureRecentTexts,
-    autoCaptureRecentAssistantTexts,
+    autoCaptureRecentPairTurns,
   };
 }
 
@@ -2743,7 +2744,7 @@ const memoryLanceDBProPlugin = {
       autoCaptureSeenTextCount,
       autoCapturePendingIngressTexts,
       autoCaptureRecentTexts,
-      autoCaptureRecentAssistantTexts,
+      autoCaptureRecentPairTurns,
     } = singleton;
 
     warnForDisabledChannelPlugin(
@@ -3909,15 +3910,29 @@ const memoryLanceDBProPlugin = {
             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
-          const priorAssistantContextTexts = autoCaptureRecentAssistantTexts.get(sessionKey) || [];
-          let assistantContextForRun = priorAssistantContextTexts;
-          if (assistantContextTexts.length > 0) {
-            assistantContextForRun = [...priorAssistantContextTexts, ...assistantContextTexts].slice(-6);
-            autoCaptureRecentAssistantTexts.set(sessionKey, assistantContextForRun);
-            pruneMapIfOver(autoCaptureRecentAssistantTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          const minMessages = config.extractMinMessages ?? 4;
+          // Rolling PAIR window (operator spec: extractMinMessages counts
+          // user<->assistant pairs, and captureAssistant context rides the
+          // same window). This call's new pairs -- kept user turns with the
+          // assistant replies interleaved in true order -- extend what
+          // earlier calls buffered, bounded to extractMinMessages user turns
+          // (or this call's own new-user count when larger, so unextracted
+          // user turns are never trimmed out of their own transcript).
+          const thisCallPairTurns = buildConversationTurnsForExtraction({
+            messageLoopTurns: conversationTurns,
+            eligibleTexts,
+            newUserTexts: newTexts,
+          });
+          const priorPairTurns = autoCaptureRecentPairTurns.get(sessionKey) || [];
+          const pairWindowTurns = trimTurnsToUserCap(
+            [...priorPairTurns, ...thisCallPairTurns],
+            Math.max(minMessages, thisCallPairTurns.filter((turn) => turn.role === "user").length),
+          );
+          if (thisCallPairTurns.length > 0) {
+            autoCaptureRecentPairTurns.set(sessionKey, pairWindowTurns);
+            pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
-          const minMessages = config.extractMinMessages ?? 4;
           if (skippedAutoCaptureTexts > 0) {
             api.logger.debug(
               `memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`,
@@ -3996,19 +4011,21 @@ const memoryLanceDBProPlugin = {
                 `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
               const conversationText = cleanTexts.join("\n");
-              const finalConversationTurns = buildConversationTurnsForExtraction({
-                messageLoopTurns: conversationTurns,
-                eligibleTexts,
-                newUserTexts: cleanTexts,
-                assistantContextForRun,
-                assistantContextTexts,
-              });
+              // The pair window is the transcript; user turns the noise
+              // filter dropped stay out of it so they cannot become sources.
+              const noiseDroppedTexts = new Set(texts.filter((text) => !cleanTexts.includes(text)));
+              const finalConversationTurns = pairWindowTurns.filter(
+                (turn) => !(turn.role === "user" && noiseDroppedTexts.has(turn.text)),
+              );
+              const assistantWindowTexts = finalConversationTurns
+                .filter((turn) => turn.role === "assistant")
+                .map((turn) => turn.text);
               // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
               let stats: Awaited<ReturnType<typeof smartExtractor.extractAndPersist>> | null = null;
               try {
                 stats = await smartExtractor.extractAndPersist(
                   conversationText, sessionKey,
-                  { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantContextForRun, conversationTurns: finalConversationTurns },
+                  { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantWindowTexts, conversationTurns: finalConversationTurns },
                 );
               } catch (err) {
                 api.logger.error(
@@ -4035,7 +4052,7 @@ const memoryLanceDBProPlugin = {
                   sessionKey,
                   pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length,
                 );
-                autoCaptureRecentAssistantTexts.delete(sessionKey);
+                autoCaptureRecentPairTurns.delete(sessionKey);
                 return; // Smart extraction handled everything
               }
 

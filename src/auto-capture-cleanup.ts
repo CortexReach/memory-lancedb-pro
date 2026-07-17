@@ -177,31 +177,25 @@ export function formatConversationTranscript(
  * Assembles the ordered turn sequence for the extraction prompt's transcript
  * from this call's true message-loop order, without recomputing any
  * eligibility or watermark decision -- it only consumes their already-decided
- * results:
+ * results. The window is PAIR-shaped: an assistant turn belongs to the user
+ * turn it follows (a reply), so dropping an already-extracted user turn also
+ * drops the assistant turns of its pair.
  * - `newUserTexts` narrower than `eligibleTexts` (watermark tail-slice):
- *   drop that many leading user turns, keep every assistant-context turn.
- * - `assistantContextForRun` longer than this call's own `assistantContextTexts`
- *   (rolling window carried a prior call's context forward): prepend the
- *   carried-over entries as leading assistant turns, chronologically ahead
- *   of this call's turns.
+ *   drop that many leading user turns AND every assistant turn that precedes
+ *   the first kept user turn (they are replies to the dropped pairs).
  * - `newUserTexts` not a tail-slice of `eligibleTexts` at all (pending-ingress
  *   replay from a different source, no per-message role correlation
- *   available): fall back to flat user turns for the replayed content, still
- *   preceded by any carried-over assistant context.
+ *   available): fall back to flat user turns for the replayed content.
+ * Prior-call assistant context is never resurrected here -- pair windows
+ * carry across calls through the caller's rolling pair buffer (see
+ * trimTurnsToUserCap), not through a separate assistant-only carry.
  */
 export function buildConversationTurnsForExtraction(params: {
   messageLoopTurns: ConversationTurn[];
   eligibleTexts: string[];
   newUserTexts: string[];
-  assistantContextForRun: string[];
-  assistantContextTexts: string[];
 }): ConversationTurn[] {
-  const { messageLoopTurns, eligibleTexts, newUserTexts, assistantContextForRun, assistantContextTexts } = params;
-
-  const leadingCount = Math.max(0, assistantContextForRun.length - assistantContextTexts.length);
-  const leadingAssistantTurns: ConversationTurn[] = assistantContextForRun
-    .slice(0, leadingCount)
-    .map((text) => ({ role: "assistant", text }));
+  const { messageLoopTurns, eligibleTexts, newUserTexts } = params;
 
   const isTailSliceOfEligible =
     newUserTexts.length <= eligibleTexts.length &&
@@ -210,8 +204,7 @@ export function buildConversationTurnsForExtraction(params: {
       .every((text, i) => text === newUserTexts[i]);
 
   if (!isTailSliceOfEligible) {
-    const userTurns: ConversationTurn[] = newUserTexts.map((text) => ({ role: "user", text }));
-    return [...leadingAssistantTurns, ...userTurns];
+    return newUserTexts.map((text) => ({ role: "user", text }));
   }
 
   const skipUserCount = eligibleTexts.length - newUserTexts.length;
@@ -221,9 +214,38 @@ export function buildConversationTurnsForExtraction(params: {
     if (turn.role === "user") {
       userSeen++;
       if (userSeen <= skipUserCount) continue;
+    } else if (userSeen <= skipUserCount) {
+      // Reply to a dropped (already-extracted) user turn: goes with its pair.
+      continue;
     }
     thisCallTurns.push(turn);
   }
 
-  return [...leadingAssistantTurns, ...thisCallTurns];
+  return thisCallTurns;
+}
+
+/**
+ * Bounds a rolling pair window to at most `maxUserTurns` user turns, keeping
+ * the newest ones with their interleaved assistant replies, and never leaving
+ * an orphan assistant turn ahead of the window's first user turn. This is how
+ * extractMinMessages acts as the window size in PAIRS: the caller passes
+ * max(extractMinMessages, this call's new user turns), so the transcript
+ * always contains every not-yet-extracted user turn, padded with earlier
+ * still-buffered pairs up to the configured window.
+ */
+export function trimTurnsToUserCap(
+  turns: ConversationTurn[],
+  maxUserTurns: number,
+): ConversationTurn[] {
+  const cap = Math.max(1, maxUserTurns);
+  let userCount = 0;
+  let start = turns.length;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (turns[i].role === "user") {
+      userCount++;
+      if (userCount > cap) break;
+      start = i;
+    }
+  }
+  return turns.slice(start);
 }
