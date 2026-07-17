@@ -86,7 +86,7 @@ describe("memory-pro upgrade: mapped-row category normalization", () => {
     assert.equal(byId["decision-legacy"].memory_category, "cases");
     assert.equal(byId["lesson-legacy"].memory_category, "cases");
     assert.equal(byId["user-model-legacy"].memory_category, "preferences");
-    assert.equal(byId["agent-model-legacy"].memory_category, "preferences");
+    assert.equal(byId["agent-model-legacy"].memory_category, "patterns");
     assert.equal(byId["corrupted"].memory_category, "cases");
 
     // Every other field on the corrected row survives untouched.

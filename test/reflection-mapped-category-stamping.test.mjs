@@ -40,7 +40,7 @@ describe("reflection-mapped write-time memory_category stamping", () => {
     assert.equal(metadata.memory_category, "preferences");
   });
 
-  it("stamps agent-model rows as preferences", () => {
+  it("stamps agent-model rows as patterns (assistant behavior, not user preferences)", () => {
     const metadata = buildReflectionMappedMetadata(buildParams({
       text: "Should default to terse summaries",
       category: "preference",
@@ -49,7 +49,7 @@ describe("reflection-mapped write-time memory_category stamping", () => {
       ordinal: 0,
       groupSize: 1,
     }));
-    assert.equal(metadata.memory_category, "preferences");
+    assert.equal(metadata.memory_category, "patterns");
   });
 
   it("stamps lesson rows as cases", () => {

@@ -66,7 +66,7 @@ import {
   isRecallUsed,
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
-import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
+import { buildReflectionMappedMetadata, getReflectionMappedMemoryCategory } from "./src/reflection-mapped-metadata.js";
 import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
@@ -5108,7 +5108,7 @@ const memoryLanceDBProPlugin = {
               continue;
             }
 
-            const importance = mapped.category === "decision" ? 0.85 : 0.8;
+            const importance = mapped.mappedKind === "decision" ? 0.85 : 0.8;
             const baseMetadata = buildReflectionMappedMetadata({
               mappedItem: mapped,
               eventId: reflectionEventId,
@@ -5131,7 +5131,7 @@ const memoryLanceDBProPlugin = {
               text: mapped.text,
               vector,
               importance,
-              category: mapped.category as MemoryEntry["category"],
+              category: getReflectionMappedMemoryCategory(mapped.mappedKind) as MemoryEntry["category"],
               scope: targetScope,
               metadata,
             });
