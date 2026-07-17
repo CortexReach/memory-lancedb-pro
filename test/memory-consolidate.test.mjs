@@ -496,6 +496,67 @@ describe("memory consolidate: batch prompt shape", () => {
   });
 });
 
+// Prompt-architecture slot conformance: every static block (identity, task
+// framing, rules, the JSON output contract) lives in the SYSTEM slot; the
+// USER slot carries only the numbered cluster/job data. Both consolidate
+// prompts already deliver a real split (completeJson(user, label, system)),
+// so these pins keep static text from ever drifting into the user slot.
+describe("memory consolidate: batched prompt slot conformance", () => {
+  const { buildConsolidateBatchMergePrompt } = jiti(path.join(testDir, "..", "src", "extraction-prompts.ts"));
+
+  function assertSlotSplit({ system, user }, { staticSentinels, userOpener }) {
+    for (const sentinel of staticSentinels) {
+      assert.ok(system.includes(sentinel), `system must carry static sentinel: ${sentinel}`);
+      assert.ok(!user.includes(sentinel), `user must NOT carry static sentinel: ${sentinel}`);
+    }
+    assert.ok(user.startsWith(userOpener), `user must open with the data header ${JSON.stringify(userOpener)}`);
+  }
+
+  it("consolidate-decide: identity, verdict rules, and output contract are system-only", () => {
+    const prompt = buildConsolidateBatchPrompt([
+      {
+        clusterIndex: 1,
+        members: [
+          { index: 1, category: "preferences", abstract: "row one", overview: "", content: "row one", source: "manual" },
+        ],
+      },
+    ]);
+    assertSlotSplit(prompt, {
+      staticSentinels: [
+        "You are a memory consolidation decider.",
+        "Decision criteria: apply these checks in order",
+        "Return JSON only:",
+        "Source legend:",
+      ],
+      userOpener: "Cluster 1 members:",
+    });
+    assert.ok(prompt.user.includes("row one"), "member rows are per-call data and belong in user");
+    assert.ok(!prompt.system.includes("row one"));
+  });
+
+  it("consolidate-merge-batch: identity, merge requirements, and output contract are system-only", () => {
+    const prompt = buildConsolidateBatchMergePrompt([
+      {
+        category: "preferences",
+        existing: { abstract: "existing abstract", overview: "existing overview", content: "existing content" },
+        additions: [{ abstract: "new abstract", overview: "new overview", content: "new content" }],
+      },
+    ]);
+    assertSlotSplit(prompt, {
+      staticSentinels: [
+        "You are a memory consolidation merge writer.",
+        "Requirements:",
+        "Return JSON only, with exactly one entry per job",
+      ],
+      userOpener: "Merge jobs:",
+    });
+    assert.match(prompt.user, /1\. Category: preferences/);
+    assert.ok(prompt.user.includes("existing abstract"));
+    assert.ok(prompt.user.includes("new content"));
+    assert.ok(!prompt.system.includes("existing abstract"), "job payloads must never leak into system");
+  });
+});
+
 describe("memory consolidate: batch verdict parsing", () => {
   it("parses multiple well-formed verdicts keyed by cluster_index", () => {
     const raw = {
