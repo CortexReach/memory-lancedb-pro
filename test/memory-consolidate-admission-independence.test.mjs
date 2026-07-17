@@ -42,8 +42,8 @@ describe("memory consolidate: item 9 admissionControl independence", () => {
 
     const ts = 1_700_000_000_000;
     const rows = [
-      makeRow({ abstract: "Coffee order: oat milk latte", content: "a", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts }),
-      makeRow({ abstract: "Coffee order: oat milk latte, extra hot", content: "b", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts + 1000 }),
+      makeRow({ scope: "agent:testbot", abstract: "Coffee order: oat milk latte", content: "a", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts }),
+      makeRow({ scope: "agent:testbot", abstract: "Coffee order: oat milk latte, extra hot", content: "b", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts + 1000 }),
     ];
 
     const calls = [];
@@ -92,7 +92,7 @@ describe("memory consolidate: item 9 admissionControl independence", () => {
     program.exitOverride();
     createMemoryCLI(context)({ program });
 
-    await program.parseAsync(["node", "openclaw", "memory-pro", "consolidate", "--scope", "global", "--apply", "--yes"]);
+    await program.parseAsync(["node", "openclaw", "memory-pro", "consolidate", "--agent", "testbot", "--apply", "--yes"]);
 
     assert.ok(calls.includes("consolidate-decide"), "the decider call must still fire normally");
     assert.ok(calls.includes("consolidate-merge-batch"), "merge-content generation must still fire normally");

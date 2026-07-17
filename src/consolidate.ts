@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { MemoryEntry } from "./store.js";
 import {
   parseSmartMetadata,
@@ -579,6 +580,16 @@ export interface ClusterPlanReport {
   memberTexts: string[];
   verdict: ConsolidateVerdictResult | null;
   malformed: boolean;
+  /**
+   * Why an undecided cluster is undecided: the whole decide call returned
+   * nothing (provider error/timeout) vs. the call succeeded but this
+   * cluster's verdict was missing or unparseable. Only set when malformed.
+   */
+  failure?: "call-failed" | "malformed-verdict";
+  /** Set when a decided verdict was withheld by the append-only shield. */
+  blocked?: "append-only-shield";
+  /** Stable identity of this cluster's member set + content, for the settled ledger. */
+  fingerprint?: string;
   /** null for skip/contradict/malformed/append-only-blocked units -- nothing to execute. */
   action: "merge" | "supersede" | null;
   survivorId?: string;
@@ -601,6 +612,14 @@ export interface RunConsolidateOptions {
   now?: number;
   /** --yes: bypasses the item-7 cost gate without ever calling confirmCost. */
   autoConfirm?: boolean;
+  /**
+   * Fingerprints of clusters settled by previous runs (skip/contradict
+   * verdicts and shield-blocked verdicts). Matching clusters are dropped
+   * before the cost gate and never reach the decider, so repeated runs
+   * converge to zero clusters. A fingerprint covers each member's exact
+   * metadata, so any member change re-opens its cluster automatically.
+   */
+  settledFingerprints?: Set<string>;
 }
 
 export interface RunConsolidateDeps extends ConsolidateWriteDeps {
@@ -638,7 +657,14 @@ export interface RunConsolidateResult {
   executed: boolean;
   /** Clusters withheld at execution time because a member row changed or disappeared since the plan was built. */
   staleSkipped: Array<{ clusterIndex: number; memberIds: string[] }>;
+  /** Clusters whose verdict was missing/unparseable while the decide call itself succeeded. */
   skippedMalformed: number;
+  /** Clusters left undecided because the decide call returned no response at all. */
+  undecidedCallFailed: number;
+  /** Clusters dropped before the decider because a previous run already settled them. */
+  settledSkipped: number;
+  /** Fingerprints newly settled by this run (skip/contradict/shield-blocked outcomes). */
+  newlySettled: string[];
   apply: boolean;
 }
 
@@ -664,8 +690,28 @@ function abortedResult(
     executed: false,
     staleSkipped: [],
     skippedMalformed: 0,
+    undecidedCallFailed: 0,
+    settledSkipped: 0,
+    newlySettled: [],
     apply,
   };
+}
+
+/**
+ * Stable identity for a cluster in the settled ledger: the sorted member
+ * ids with each member's exact metadata string. Any member change (edit,
+ * merge, invalidation) or any membership change produces a different
+ * fingerprint, so a settled entry can never suppress a cluster whose
+ * content moved on.
+ */
+export function computeClusterFingerprint(
+  members: Array<{ id: string; metadata: string | undefined }>,
+): string {
+  const parts = members
+    .map((m) => `${m.id}\n${m.metadata ?? ""}`)
+    .sort()
+    .join(" ");
+  return createHash("sha256").update(parts).digest("hex");
 }
 
 /**
@@ -785,6 +831,27 @@ export async function runConsolidate(
     }
   }
   units.sort((a, b) => byId(a.members[0], b.members[0]));
+
+  // Convergence: clusters settled by a previous run (same members, same
+  // content) are dropped before the cost gate and the decider ever see
+  // them, so repeated runs over an unchanged store reach zero clusters.
+  const fingerprintByUnit = new Map<(typeof units)[number], string>();
+  for (const unit of units) {
+    fingerprintByUnit.set(
+      unit,
+      computeClusterFingerprint(unit.members.map((m) => ({ id: m.entry.id, metadata: m.entry.metadata }))),
+    );
+  }
+  let settledSkipped = 0;
+  const activeUnits = units.filter((unit) => {
+    if (options.settledFingerprints?.has(fingerprintByUnit.get(unit)!)) {
+      settledSkipped += 1;
+      return false;
+    }
+    return true;
+  });
+  units.length = 0;
+  units.push(...activeUnits);
   units.forEach((unit, i) => {
     unit.clusterIndex = i + 1;
   });
@@ -821,6 +888,9 @@ export async function runConsolidate(
     verdict: ConsolidateVerdictResult;
   }> = [];
   let skippedMalformed = 0;
+  let undecidedCallFailed = 0;
+  let decideCallFailed = false;
+  const newlySettled: string[] = [];
 
   if (units.length > 0) {
     const batchClusters: ConsolidateBatchCluster[] = units.map((unit) => ({
@@ -838,9 +908,15 @@ export async function runConsolidate(
     }));
     const prompt = buildConsolidateBatchPrompt(batchClusters);
     const raw = await deps.completeJson<Record<string, unknown>>(prompt.user, "consolidate-decide", prompt.system, 0);
-    const verdictMap = raw
+    decideCallFailed = raw === null || raw === undefined;
+    if (decideCallFailed) {
+      deps.log?.(
+        `memory-consolidate: consolidate-decide call returned no response (provider error or timeout); ${units.length} cluster(s) left undecided`
+      );
+    }
+    const verdictMap = !decideCallFailed
       ? parseConsolidateBatchVerdicts(
-          raw,
+          raw!,
           units.map((u) => ({ clusterIndex: u.clusterIndex, memberCount: u.members.length }))
         )
       : new Map<number, ConsolidateVerdictResult>();
@@ -852,19 +928,26 @@ export async function runConsolidate(
     for (const unit of units) {
       const members = unit.members;
       const verdict = verdictMap.get(unit.clusterIndex) ?? null;
+      const fingerprint = fingerprintByUnit.get(unit)!;
       membersByCluster.set(unit.clusterIndex, members);
 
       if (!verdict) {
-        skippedMalformed += 1;
-        deps.log?.(
-          `memory-consolidate: missing or malformed verdict for a cluster of ${members.length} rows, skipping`
-        );
+        if (decideCallFailed) {
+          undecidedCallFailed += 1;
+        } else {
+          skippedMalformed += 1;
+          deps.log?.(
+            `memory-consolidate: missing or malformed verdict for a cluster of ${members.length} rows, skipping`
+          );
+        }
         clusters.push({
           clusterIndex: unit.clusterIndex,
           memberIds: members.map((m) => m.entry.id),
           memberTexts: members.map((m) => m.abstract),
           verdict: null,
           malformed: true,
+          failure: decideCallFailed ? "call-failed" : "malformed-verdict",
+          fingerprint,
           action: null,
           staleness: members.map((m) => ({ id: m.entry.id, metadata: m.entry.metadata })),
         });
@@ -874,12 +957,14 @@ export async function runConsolidate(
       const staleness = members.map((m) => ({ id: m.entry.id, metadata: m.entry.metadata }));
 
       if (verdict.verdict === "skip" || verdict.verdict === "contradict") {
+        newlySettled.push(fingerprint);
         clusters.push({
           clusterIndex: unit.clusterIndex,
           memberIds: members.map((m) => m.entry.id),
           memberTexts: members.map((m) => m.abstract),
           verdict,
           malformed: false,
+          fingerprint,
           action: null,
           staleness,
         });
@@ -907,12 +992,18 @@ export async function runConsolidate(
         deps.log?.(
           `memory-consolidate: refusing to ${verdict.verdict} an append-only row (events/cases) outside a same-category duplicate merge; skipping this verdict`
         );
+        // A shield-blocked verdict is as settled as a skip: re-running the
+        // decider over the same unchanged members can only produce another
+        // blocked verdict.
+        newlySettled.push(fingerprint);
         clusters.push({
           clusterIndex: unit.clusterIndex,
           memberIds: members.map((m) => m.entry.id),
           memberTexts: members.map((m) => m.abstract),
           verdict,
           malformed: false,
+          blocked: "append-only-shield",
+          fingerprint,
           action: null,
           staleness,
         });
@@ -928,6 +1019,7 @@ export async function runConsolidate(
         memberTexts: members.map((m) => m.abstract),
         verdict,
         malformed: false,
+        fingerprint,
         action: verdict.verdict === "merge" ? "merge" : "supersede",
         survivorId: survivor.entry.id,
         absorbedIds,
@@ -966,6 +1058,9 @@ export async function runConsolidate(
       executed: true,
       staleSkipped,
       skippedMalformed,
+      undecidedCallFailed,
+      settledSkipped,
+      newlySettled,
       apply: true,
     };
   }
@@ -989,6 +1084,9 @@ export async function runConsolidate(
         executed: true,
         staleSkipped,
         skippedMalformed,
+        undecidedCallFailed,
+        settledSkipped,
+        newlySettled,
         apply: false,
       };
     }
@@ -1004,6 +1102,9 @@ export async function runConsolidate(
     executed: false,
     staleSkipped: [],
     skippedMalformed,
+    undecidedCallFailed,
+    settledSkipped,
+    newlySettled,
     apply: false,
   };
 }

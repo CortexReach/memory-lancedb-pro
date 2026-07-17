@@ -1282,6 +1282,7 @@ describe("memory consolidate: CLI system-prompt wiring", () => {
     const ts = 1_700_000_000_000;
     const rows = [
       makeRow({
+        scope: "agent:testbot",
         abstract: "Coffee order: oat milk latte",
         content: "User orders an oat milk latte.",
         factKey: "preferences:coffee order",
@@ -1289,6 +1290,7 @@ describe("memory consolidate: CLI system-prompt wiring", () => {
         timestamp: ts,
       }),
       makeRow({
+        scope: "agent:testbot",
         abstract: "Coffee order: oat milk latte, extra hot",
         content: "User specified extra hot as well.",
         factKey: "preferences:coffee order",
@@ -1339,7 +1341,7 @@ describe("memory consolidate: CLI system-prompt wiring", () => {
     program.exitOverride();
     createMemoryCLI(context)({ program });
 
-    await program.parseAsync(["node", "openclaw", "memory-pro", "consolidate", "--scope", "global", "--apply", "--yes"]);
+    await program.parseAsync(["node", "openclaw", "memory-pro", "consolidate", "--agent", "testbot", "--apply", "--yes"]);
 
     const decide = calls.find((c) => c.label === "consolidate-decide");
     assert.ok(decide, "expected a consolidate-decide completeJson call");
@@ -1433,8 +1435,8 @@ describe("memory consolidate: CLI journal-mirror agent identity", () => {
   function buildRows() {
     const ts = 1_700_000_000_000;
     return [
-      makeRow({ abstract: "Coffee order: oat milk latte", content: "a", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts }),
-      makeRow({ abstract: "Coffee order: oat milk latte, extra hot", content: "b", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts + 1000 }),
+      makeRow({ scope: "agent:terry", abstract: "Coffee order: oat milk latte", content: "a", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts }),
+      makeRow({ scope: "agent:terry", abstract: "Coffee order: oat milk latte, extra hot", content: "b", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts + 1000 }),
     ];
   }
 
@@ -1449,7 +1451,7 @@ describe("memory consolidate: CLI journal-mirror agent identity", () => {
 
     await program.parseAsync([
       "node", "openclaw", "memory-pro", "consolidate",
-      "--scope", "global", "--apply", "--agent", "terry", "--yes",
+      "--apply", "--agent", "terry", "--yes",
     ]);
 
     assert.equal(mirrorCalls.length, 1, "expected exactly one journal-mirror write for the applied merge");
@@ -1457,7 +1459,7 @@ describe("memory consolidate: CLI journal-mirror agent identity", () => {
     assert.match(mirrorCalls[0].meta.source, /memory-consolidate/);
   });
 
-  it("leaves meta.agentId undefined when --agent is omitted, preserving the fallback-directory default", async () => {
+  it("refuses to run without --agent (scope is always derived as agent:<agentId>)", async () => {
     const { createMemoryCLI } = jiti(path.join(testDir, "..", "cli.ts"));
     const mirrorCalls = [];
     const context = buildContext(buildRows(), mirrorCalls);
@@ -1466,9 +1468,10 @@ describe("memory consolidate: CLI journal-mirror agent identity", () => {
     program.exitOverride();
     createMemoryCLI(context)({ program });
 
-    await program.parseAsync(["node", "openclaw", "memory-pro", "consolidate", "--scope", "global", "--apply", "--yes"]);
-
-    assert.equal(mirrorCalls.length, 1);
-    assert.equal(mirrorCalls[0].meta.agentId, undefined);
+    await assert.rejects(
+      () => program.parseAsync(["node", "openclaw", "memory-pro", "consolidate", "--apply", "--yes"]),
+      (err) => err instanceof Error && err.code === "commander.missingMandatoryOptionValue",
+    );
+    assert.equal(mirrorCalls.length, 0, "nothing may run or write without an agent identity");
   });
 });
