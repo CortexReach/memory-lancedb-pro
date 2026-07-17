@@ -1,6 +1,6 @@
 import { parseSmartMetadata, buildSmartMetadata, stringifySmartMetadata, appendRelation, deriveFactKey, isMemoryActiveAt, } from "./smart-metadata.js";
 import { APPEND_ONLY_CATEGORIES } from "./memory-categories.js";
-import { buildMergePrompt, buildConsolidateBatchPrompt, CONSOLIDATE_MERGE_SYSTEM_PROMPT, } from "./extraction-prompts.js";
+import { buildConsolidateBatchPrompt, buildConsolidateBatchMergePrompt, } from "./extraction-prompts.js";
 const REVERSAL_SIGNAL_PATTERN = /\b(no longer|not anymore|any ?more|stopped|quit|used to|former|discontinued|doesn'?t|don'?t|isn'?t|wasn'?t)\b/i;
 const TOPIC_TOKEN_STOPWORDS = new Set([
     "user", "users", "prefer", "prefers", "preferred", "preference", "preferences",
@@ -251,47 +251,107 @@ export function parseConsolidateBatchVerdicts(raw, units) {
     }
     return result;
 }
+// ============================================================================
+// Item 7: LLM-cost gate. Clustering is free (local cosine + fact_key/topic
+// linking); the only paid calls are the one batched decider call and one
+// batched merge-content call (chunked past CONSOLIDATE_MERGE_BATCH_MAX_SIZE)
+// covering every unit that MIGHT turn out to be a merge verdict, since item 8
+// moves merge-content generation into the plan phase. Both are knowable from
+// clustering alone, before any LLM call is made -- which is what lets the
+// gate sit ahead of the decide call and cover dry-runs as well as --apply.
+// ============================================================================
+/** Max merge jobs written in one batched merge-content LLM call; larger batches are chunked. */
+export const CONSOLIDATE_MERGE_BATCH_MAX_SIZE = 10;
 export function computeConsolidateCostPreview(units) {
+    const maxMergeJobs = units.length;
     return {
         clusterCount: units.length,
-        maxMergeGenerations: units.reduce((sum, u) => sum + Math.max(0, u.members.length - 1), 0),
+        maxMergeJobs,
+        maxMergeContentCalls: Math.ceil(maxMergeJobs / CONSOLIDATE_MERGE_BATCH_MAX_SIZE),
     };
 }
 export function formatConsolidateCostPreview(preview) {
     const lines = [`${preview.clusterCount} cluster(s) -> 1 batched decider call`];
-    if (preview.maxMergeGenerations > 0) {
-        lines.push(`+ up to ${preview.maxMergeGenerations} merge-content generation(s)`);
+    if (preview.maxMergeJobs > 0) {
+        lines.push(`+ up to ${preview.maxMergeContentCalls} batched merge-content call(s) covering up to ${preview.maxMergeJobs} merge job(s)`);
     }
     return lines.join("\n");
 }
 /**
- * Item 8: pure content generation for a merge verdict -- every
- * `consolidate-merge` completion plus the final re-embed, with NO store
- * writes. Called once per merge verdict at PLAN-BUILD time (dry-run or
- * --apply alike), so execution later can be pure store operations that
+ * Item 8: pure content generation for merge verdicts -- one batched
+ * `consolidate-merge-batch` completion per chunk of up to
+ * CONSOLIDATE_MERGE_BATCH_MAX_SIZE merge verdicts (each job folds ALL of a
+ * verdict's absorbed members into its survivor in one output), plus one
+ * re-embed per job, with NO store writes. Called at PLAN-BUILD time (dry-run
+ * or --apply alike), so execution later can be pure store operations that
  * never regenerate content and never call the LLM again.
+ *
+ * Per-item fail-closed: a response entry that is missing or malformed
+ * degrades ONLY that job to the survivor's own unmodified content -- exactly
+ * what the sequential per-member fold produced when its completions came
+ * back null -- and a chunk whose call itself fails degrades every job in
+ * that chunk the same way. Never throws, never fans back out into per-member
+ * LLM calls.
  */
-async function buildMergePlanContent(deps, members, verdict) {
-    const survivor = members[verdict.survivorIndex - 1];
-    let abstract = survivor.abstract;
-    let overview = survivor.overview;
-    let content = survivor.content;
-    for (const idx of verdict.absorbedIndices) {
-        const absorbed = members[idx - 1];
-        const prompt = buildMergePrompt(abstract, overview, content, absorbed.abstract, absorbed.overview, absorbed.content, survivor.memoryCategory || "preferences");
-        const merged = await deps.completeJson(prompt, "consolidate-merge", CONSOLIDATE_MERGE_SYSTEM_PROMPT);
-        if (merged) {
-            abstract = merged.abstract;
-            overview = merged.overview;
-            content = merged.content;
+async function buildMergePlanContentsBatch(deps, jobs, log) {
+    const out = new Array(jobs.length);
+    for (let chunkStart = 0; chunkStart < jobs.length; chunkStart += CONSOLIDATE_MERGE_BATCH_MAX_SIZE) {
+        const chunk = jobs.slice(chunkStart, chunkStart + CONSOLIDATE_MERGE_BATCH_MAX_SIZE);
+        const prompt = buildConsolidateBatchMergePrompt(chunk.map(({ members, verdict }) => {
+            const survivor = members[verdict.survivorIndex - 1];
+            return {
+                category: survivor.memoryCategory || "preferences",
+                existing: {
+                    abstract: survivor.abstract,
+                    overview: survivor.overview,
+                    content: survivor.content,
+                },
+                additions: verdict.absorbedIndices.map((idx) => {
+                    const absorbed = members[idx - 1];
+                    return {
+                        abstract: absorbed.abstract,
+                        overview: absorbed.overview,
+                        content: absorbed.content,
+                    };
+                }),
+            };
+        }));
+        const byIndex = new Map();
+        try {
+            const raw = await deps.completeJson(prompt.user, "consolidate-merge-batch", prompt.system);
+            for (const entry of raw && Array.isArray(raw.results) ? raw.results : []) {
+                if (!entry || typeof entry.index !== "number")
+                    continue;
+                byIndex.set(entry.index, entry);
+            }
+        }
+        catch (err) {
+            log?.(`memory-consolidate: batched merge-content call failed, keeping survivor content for ${chunk.length} job(s): ${String(err)}`);
+        }
+        for (let i = 0; i < chunk.length; i++) {
+            const { members, verdict } = chunk[i];
+            const survivor = members[verdict.survivorIndex - 1];
+            const entry = byIndex.get(i + 1);
+            const usable = entry &&
+                typeof entry.abstract === "string" &&
+                entry.abstract.trim().length > 0 &&
+                typeof entry.overview === "string" &&
+                typeof entry.content === "string";
+            if (!usable) {
+                log?.("memory-consolidate: missing or malformed merge-content entry, keeping survivor content for this job");
+            }
+            const abstract = usable ? entry.abstract : survivor.abstract;
+            const overview = usable ? entry.overview : survivor.overview;
+            const content = usable ? entry.content : survivor.content;
+            const vector = await deps.embed(`${abstract} ${content}`);
+            out[chunkStart + i] = { abstract, overview, content, vector };
         }
     }
-    const vector = await deps.embed(`${abstract} ${content}`);
-    return { abstract, overview, content, vector };
+    return out;
 }
 /**
  * Item 8: pure store write for an already-planned merge verdict. Applies
- * EXACTLY the precomputed content from `buildMergePlanContent` -- no LLM
+ * EXACTLY the precomputed content from `buildMergePlanContentsBatch` -- no LLM
  * call, no regeneration, "apply exactly what was presented."
  */
 async function writeMergeVerdict(deps, members, verdict, mergedContent, scopeFilter, now) {
@@ -500,6 +560,7 @@ export async function runConsolidate(deps, options) {
     }
     const clusters = [];
     const membersByCluster = new Map();
+    const pendingMergeContent = [];
     let skippedMalformed = 0;
     if (units.length > 0) {
         const batchClusters = units.map((unit) => ({
@@ -584,11 +645,7 @@ export async function runConsolidate(deps, options) {
             }
             const survivor = members[verdict.survivorIndex - 1];
             const absorbedIds = verdict.absorbedIndices.map((idx) => members[idx - 1].entry.id);
-            let mergedContent;
-            if (verdict.verdict === "merge") {
-                mergedContent = await buildMergePlanContent(deps, members, verdict);
-            }
-            clusters.push({
+            const cluster = {
                 clusterIndex: unit.clusterIndex,
                 memberIds: members.map((m) => m.entry.id),
                 memberTexts: members.map((m) => m.abstract),
@@ -597,8 +654,21 @@ export async function runConsolidate(deps, options) {
                 action: verdict.verdict === "merge" ? "merge" : "supersede",
                 survivorId: survivor.entry.id,
                 absorbedIds,
-                mergedContent,
                 staleness,
+            };
+            clusters.push(cluster);
+            if (verdict.verdict === "merge") {
+                pendingMergeContent.push({ cluster, members, verdict });
+            }
+        }
+        // One batched merge-content call (chunk-capped) covers every merge
+        // verdict's plan content, moved out of the per-unit loop so the plan
+        // build spends ceil(M/CONSOLIDATE_MERGE_BATCH_MAX_SIZE) LLM calls
+        // instead of one call per absorbed member.
+        if (pendingMergeContent.length > 0) {
+            const contents = await buildMergePlanContentsBatch(deps, pendingMergeContent, deps.log);
+            pendingMergeContent.forEach((pending, i) => {
+                pending.cluster.mergedContent = contents[i];
             });
         }
     }

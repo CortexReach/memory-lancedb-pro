@@ -316,3 +316,64 @@ Include exactly one verdict object per cluster listed below, each tagged with th
         .join("\n\n===\n\n");
     return { system, user };
 }
+/**
+ * Formats one labelled field for a numbered prompt block: the field on its
+ * own 3-space-indented line, multi-line values split per line with any
+ * leading markdown list-marker run (`- ` / `* `, repeated) stripped while
+ * the line's own inner indentation is kept, and every continuation line
+ * indented under the block. Other content markdown (e.g. `##` headings) is
+ * deliberately left as-is.
+ */
+function formatIndentedFieldLines(label, value) {
+    const valueLines = String(value ?? "")
+        .split("\n")
+        .map((line) => line.replace(/^(\s*)(?:[-*] )+/, "$1"));
+    const lines = [`   ${label}: ${valueLines[0]}`];
+    for (const continuation of valueLines.slice(1)) {
+        lines.push(`   ${continuation}`);
+    }
+    return lines;
+}
+/**
+ * Batched variant of the consolidate merge writer prompt: one LLM call
+ * writes every numbered merge job. Each job carries its survivor ("Existing
+ * memory") and every absorbed member folding into it ("New information");
+ * merge requirements match CONSOLIDATE_MERGE_SYSTEM_PROMPT verbatim — only
+ * the call topology changes from one call per absorbed member to one call
+ * per batch of merge verdicts.
+ */
+export function buildConsolidateBatchMergePrompt(jobs) {
+    const system = `You are a memory consolidation merge writer. Merge each numbered job below into a single coherent record with all three levels (abstract, overview, content). For each job, merge every "New information" section into that job's "Existing memory"; never mix content across jobs.
+
+Requirements:
+- Remove duplicate information
+- Keep the most up-to-date details
+- Maintain a coherent narrative
+- Keep code identifiers, URIs, and model names unchanged when they are proper nouns
+
+Return JSON only, with exactly one entry per job, in this shape:
+{
+  "results": [
+    { "index": 1, "abstract": "Merged one-line abstract", "overview": "Merged structured Markdown overview", "content": "Merged full content" }
+  ]
+}
+
+- "index" is the job's number in the batch below.`;
+    const blocks = jobs.map((job, i) => {
+        const lines = [`${i + 1}. Category: ${job.category}`, `   Existing memory:`];
+        lines.push(...formatIndentedFieldLines("Abstract", job.existing.abstract));
+        lines.push(...formatIndentedFieldLines("Overview", job.existing.overview));
+        lines.push(...formatIndentedFieldLines("Content", job.existing.content));
+        job.additions.forEach((addition, j) => {
+            lines.push(job.additions.length > 1 ? `   New information ${j + 1}:` : `   New information:`);
+            lines.push(...formatIndentedFieldLines("Abstract", addition.abstract));
+            lines.push(...formatIndentedFieldLines("Overview", addition.overview));
+            lines.push(...formatIndentedFieldLines("Content", addition.content));
+        });
+        return lines.join("\n");
+    });
+    const user = `Merge jobs:
+
+${blocks.join("\n\n")}`;
+    return { system, user };
+}
