@@ -8,6 +8,15 @@
  * with no gate and no audit trail. This module routes each mapped row through
  * the same AdmissionController evaluation extraction candidates get, while
  * preserving passthrough behavior when admission control is disabled.
+ *
+ * A reflection burst (all mapped rows parsed from one distillate) is gated as
+ * one unit via gateMappedReflectionEntries: when the controller exposes
+ * evaluateBatch (the batched admission judge), the whole burst costs one
+ * batched call per controller-side chunk instead of one standalone LLM call
+ * per row; when it does not (a controller predating batch support), the gate
+ * takes the historical per-row evaluate path unchanged. Per-row decisions,
+ * reasons, and audit records are identical either way — only the LLM call
+ * topology differs.
  */
 
 import type { AdmissionEvaluation } from "./admission-control.js";
@@ -36,13 +45,24 @@ export function mapReflectionMappedCategoryToSmartRegister(
   }
 }
 
+interface MappedReflectionGateItem {
+  candidate: CandidateMemory;
+  candidateVector: number[];
+  conversationText: string;
+  scopeFilter: string[];
+}
+
 export interface MappedReflectionAdmissionGate {
-  evaluate(params: {
-    candidate: CandidateMemory;
-    candidateVector: number[];
-    conversationText: string;
-    scopeFilter: string[];
-  }): Promise<AdmissionEvaluation>;
+  evaluate(params: MappedReflectionGateItem): Promise<AdmissionEvaluation>;
+  /**
+   * Batched admission judge: one utility-scoring LLM call per chunk of
+   * candidates (the controller owns chunk sizing and the utilityMode
+   * decision — when utilityMode isn't "batch" it degrades to per-candidate
+   * scoring internally). Optional because controllers predating batch
+   * admission support don't have it; the gate falls back to per-row
+   * evaluate() in that case.
+   */
+  evaluateBatch?(items: MappedReflectionGateItem[]): Promise<AdmissionEvaluation[]>;
 }
 
 export interface MappedReflectionGateResult {
@@ -52,17 +72,149 @@ export interface MappedReflectionGateResult {
   auditJson?: string;
 }
 
+/** One mapped row's gate-relevant fields, in distillate order. */
+export interface MappedReflectionEntryInput {
+  text: string;
+  category: string;
+  heading: string;
+  vector: number[];
+}
+
+function buildGateItem(
+  row: MappedReflectionEntryInput,
+  conversationText: string,
+  scopeFilter: string[],
+): MappedReflectionGateItem {
+  return {
+    candidate: {
+      category: mapReflectionMappedCategoryToSmartRegister(row.category),
+      abstract: row.text,
+      overview: `## ${row.heading}`,
+      content: row.text,
+    },
+    candidateVector: row.vector,
+    conversationText,
+    scopeFilter,
+  };
+}
+
+// Fail-open admits still need durable, queryable provenance on the row itself
+// (not just an ephemeral log line): otherwise this row is indistinguishable
+// from a normally-scored admit once persisted.
+function buildFailOpenResult(attachAudit: boolean, err: unknown): MappedReflectionGateResult {
+  const reason = "admission evaluation failed open";
+  return {
+    admit: true,
+    reason,
+    auditJson: attachAudit
+      ? JSON.stringify({
+          provenance: "memory-reflection-mapped",
+          failedOpen: true,
+          reason,
+          error: String(err),
+        })
+      : undefined,
+  };
+}
+
+function buildGateResult(
+  evaluation: AdmissionEvaluation,
+  attachAudit: boolean,
+): MappedReflectionGateResult {
+  if (evaluation.decision === "reject") {
+    return { admit: false, reason: evaluation.audit.reason };
+  }
+  return {
+    admit: true,
+    auditJson: attachAudit
+      ? JSON.stringify({ ...evaluation.audit, provenance: "memory-reflection-mapped" })
+      : undefined,
+  };
+}
+
 /**
- * Gate one mapped reflection row through admission control.
+ * Gate one reflection burst (every mapped row from one distillate) through
+ * admission control, returning one result per row in input order.
  *
  * - No controller (admission disabled or smart extraction off): passthrough,
  *   identical to the historical behavior.
- * - Controller reject: the row is dropped; the caller logs the reason.
+ * - Controller with evaluateBatch: the entire burst is judged in one
+ *   evaluateBatch call (the controller chunks internally and honors
+ *   utilityMode, so a non-batch mode still scores per candidate). A failure
+ *   of the batch call itself — or a malformed (wrong-length) result — fails
+ *   open for every row in the burst, mirroring the per-row fail-open path.
+ * - Controller without evaluateBatch: one evaluate() call per row with the
+ *   original per-row fail-open semantics, byte-identical to the historical
+ *   single-row gate.
+ * - Controller reject: that row is dropped; the caller logs the reason.
  * - Controller pass: the row proceeds; when `attachAudit` is set the audit
  *   record (tagged with provenance "memory-reflection-mapped") is returned
  *   for persistence alongside the row.
- * - Infra failure inside evaluation: fail open with a reason, so a transient
- *   store/LLM error cannot silently suppress reflection persistence.
+ */
+export async function gateMappedReflectionEntries(params: {
+  admissionController: MappedReflectionAdmissionGate | null;
+  attachAudit: boolean;
+  rows: MappedReflectionEntryInput[];
+  /**
+   * The REAL underlying transcript these rows were distilled from, not the
+   * distiller's own generated output. Grounding the candidates against their
+   * own source text would let a hallucinated distillate line appear
+   * self-grounded.
+   */
+  conversationText: string;
+  scopeFilter: string[];
+  warnLog?: (msg: string) => void;
+}): Promise<MappedReflectionGateResult[]> {
+  const { admissionController, rows } = params;
+  if (rows.length === 0) {
+    return [];
+  }
+  if (!admissionController) {
+    return rows.map(() => ({ admit: true }));
+  }
+
+  const items = rows.map((row) => buildGateItem(row, params.conversationText, params.scopeFilter));
+
+  if (typeof admissionController.evaluateBatch === "function") {
+    let evaluations: AdmissionEvaluation[];
+    try {
+      evaluations = await admissionController.evaluateBatch(items);
+      if (!Array.isArray(evaluations) || evaluations.length !== rows.length) {
+        throw new Error(
+          `evaluateBatch returned ${Array.isArray(evaluations) ? evaluations.length : typeof evaluations} evaluations for ${rows.length} rows`,
+        );
+      }
+    } catch (err) {
+      params.warnLog?.(
+        `memory-reflection: mapped-row batch admission evaluation failed, admitting burst without scores: ${String(err)}`,
+      );
+      return rows.map(() => buildFailOpenResult(params.attachAudit, err));
+    }
+    return evaluations.map((evaluation) => buildGateResult(evaluation, params.attachAudit));
+  }
+
+  const results: MappedReflectionGateResult[] = [];
+  for (const item of items) {
+    let evaluation: AdmissionEvaluation;
+    try {
+      evaluation = await admissionController.evaluate(item);
+    } catch (err) {
+      params.warnLog?.(
+        `memory-reflection: mapped-row admission evaluation failed, admitting without audit: ${String(err)}`,
+      );
+      results.push(buildFailOpenResult(params.attachAudit, err));
+      continue;
+    }
+    results.push(buildGateResult(evaluation, params.attachAudit));
+  }
+  return results;
+}
+
+/**
+ * Gate one mapped reflection row through admission control. Single-row
+ * convenience wrapper over gateMappedReflectionEntries — same decisions,
+ * reasons, and audit records; a burst caller should prefer the plural form so
+ * the whole burst shares one batched admission call.
  */
 export async function gateMappedReflectionEntry(params: {
   admissionController: MappedReflectionAdmissionGate | null;
@@ -80,54 +232,20 @@ export async function gateMappedReflectionEntry(params: {
   scopeFilter: string[];
   warnLog?: (msg: string) => void;
 }): Promise<MappedReflectionGateResult> {
-  if (!params.admissionController) {
-    return { admit: true };
-  }
-
-  const smartCategory = mapReflectionMappedCategoryToSmartRegister(params.category);
-  let evaluation: AdmissionEvaluation;
-  try {
-    evaluation = await params.admissionController.evaluate({
-      candidate: {
-        category: smartCategory,
-        abstract: params.text,
-        overview: `## ${params.heading}`,
-        content: params.text,
+  const [result] = await gateMappedReflectionEntries({
+    admissionController: params.admissionController,
+    attachAudit: params.attachAudit,
+    rows: [
+      {
+        text: params.text,
+        category: params.category,
+        heading: params.heading,
+        vector: params.vector,
       },
-      candidateVector: params.vector,
-      conversationText: params.conversationText,
-      scopeFilter: params.scopeFilter,
-    });
-  } catch (err) {
-    const reason = "admission evaluation failed open";
-    params.warnLog?.(
-      `memory-reflection: mapped-row admission evaluation failed, admitting without audit: ${String(err)}`,
-    );
-    return {
-      admit: true,
-      reason,
-      // Fail-open admits still need durable, queryable provenance on the row itself
-      // (not just an ephemeral log line): otherwise this row is indistinguishable
-      // from a normally-scored admit once persisted.
-      auditJson: params.attachAudit
-        ? JSON.stringify({
-            provenance: "memory-reflection-mapped",
-            failedOpen: true,
-            reason,
-            error: String(err),
-          })
-        : undefined,
-    };
-  }
-
-  if (evaluation.decision === "reject") {
-    return { admit: false, reason: evaluation.audit.reason };
-  }
-
-  return {
-    admit: true,
-    auditJson: params.attachAudit
-      ? JSON.stringify({ ...evaluation.audit, provenance: "memory-reflection-mapped" })
-      : undefined,
-  };
+    ],
+    conversationText: params.conversationText,
+    scopeFilter: params.scopeFilter,
+    warnLog: params.warnLog,
+  });
+  return result;
 }

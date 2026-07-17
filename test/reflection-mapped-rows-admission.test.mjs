@@ -30,6 +30,7 @@ const jiti = jitiFactory(import.meta.url, {
 const {
   mapReflectionMappedCategoryToSmartRegister,
   gateMappedReflectionEntry,
+  gateMappedReflectionEntries,
 } = jiti("../src/reflection-mapped-admission.ts");
 const { AdmissionController, ADMISSION_CONTROL_PRESETS } = jiti("../src/admission-control.ts");
 
@@ -194,6 +195,221 @@ describe("gateMappedReflectionEntry", () => {
   });
 });
 
+describe("gateMappedReflectionEntries (batched burst)", () => {
+  const rows = [
+    {
+      text: "Operator prefers streaming test reporters for long suites.",
+      category: "preference",
+      heading: "User model deltas (about the human)",
+      vector: [1, 0, 0],
+    },
+    {
+      text: "Symptom: flaky port bind. Cause: parallel suites. Fix: ephemeral ports.",
+      category: "fact",
+      heading: "Lessons & pitfalls",
+      vector: [0, 1, 0],
+    },
+    {
+      text: "Decision: keep the deploy branch cut from a fresh master.",
+      category: "decision",
+      heading: "Decisions (durable)",
+      vector: [0, 0, 1],
+    },
+  ];
+  const baseParams = {
+    attachAudit: true,
+    conversationText: REFLECTION_TEXT,
+    scopeFilter: ["global"],
+  };
+
+  it("gates a whole burst through ONE evaluateBatch call, preserving per-row decisions and audit provenance", async () => {
+    let batchCalls = 0;
+    let evaluateCalls = 0;
+    let seenItems = null;
+    const controller = {
+      async evaluate() {
+        evaluateCalls++;
+        throw new Error("per-row evaluate must not be used when the controller supports evaluateBatch");
+      },
+      async evaluateBatch(items) {
+        batchCalls++;
+        seenItems = items;
+        return items.map((item) =>
+          item.candidate.content.includes("flaky port bind")
+            ? { decision: "reject", audit: { decision: "reject", reason: "not grounded in conversation" } }
+            : { decision: "pass_to_dedup", audit: { decision: "pass_to_dedup", reason: "grounded" } },
+        );
+      },
+    };
+
+    const results = await gateMappedReflectionEntries({
+      ...baseParams,
+      admissionController: controller,
+      rows,
+    });
+
+    assert.equal(batchCalls, 1, "a burst must cost exactly one evaluateBatch call");
+    assert.equal(evaluateCalls, 0);
+    assert.equal(results.length, 3);
+
+    // Per-row candidate construction is identical to the singular gate: smart
+    // register mapping, heading as overview, the REAL conversation as grounding.
+    assert.equal(seenItems.length, 3);
+    assert.equal(seenItems[0].candidate.category, "preferences");
+    assert.equal(seenItems[1].candidate.category, "cases");
+    assert.equal(seenItems[2].candidate.category, "events");
+    for (const item of seenItems) {
+      assert.equal(item.conversationText, REFLECTION_TEXT);
+      assert.deepEqual(item.scopeFilter, ["global"]);
+    }
+
+    assert.equal(results[0].admit, true);
+    assert.equal(results[1].admit, false);
+    assert.match(results[1].reason, /not grounded/);
+    assert.equal(results[2].admit, true);
+    for (const admitted of [results[0], results[2]]) {
+      const audit = JSON.parse(admitted.auditJson);
+      assert.equal(audit.provenance, "memory-reflection-mapped");
+    }
+  });
+
+  it("falls back to one evaluate call per row when the controller predates evaluateBatch (behavior unchanged)", async () => {
+    let evaluateCalls = 0;
+    const controller = {
+      async evaluate(params) {
+        evaluateCalls++;
+        return params.candidate.content.includes("flaky port bind")
+          ? { decision: "reject", audit: { decision: "reject", reason: "not grounded in conversation" } }
+          : { decision: "pass_to_dedup", audit: { decision: "pass_to_dedup", reason: "grounded" } };
+      },
+    };
+
+    const results = await gateMappedReflectionEntries({
+      ...baseParams,
+      admissionController: controller,
+      rows,
+    });
+
+    assert.equal(evaluateCalls, 3, "no evaluateBatch on the controller means the historical per-row path");
+    assert.equal(results.length, 3);
+    assert.equal(results[0].admit, true);
+    assert.equal(results[1].admit, false);
+    assert.equal(results[2].admit, true);
+  });
+
+  it("returns an empty array with zero controller calls for an empty burst", async () => {
+    let calls = 0;
+    const controller = {
+      async evaluate() { calls++; },
+      async evaluateBatch() { calls++; return []; },
+    };
+    const results = await gateMappedReflectionEntries({
+      ...baseParams,
+      admissionController: controller,
+      rows: [],
+    });
+    assert.deepEqual(results, []);
+    assert.equal(calls, 0);
+  });
+
+  it("passes every row through untouched when admission control is disabled (null controller)", async () => {
+    const results = await gateMappedReflectionEntries({
+      ...baseParams,
+      admissionController: null,
+      rows,
+    });
+    assert.deepEqual(results, [{ admit: true }, { admit: true }, { admit: true }]);
+  });
+
+  it("fails open for every row in the burst when the batch call itself throws", async () => {
+    const warnings = [];
+    const controller = {
+      async evaluate() {
+        throw new Error("per-row evaluate must not be used when the controller supports evaluateBatch");
+      },
+      async evaluateBatch() {
+        throw new Error("vector store unavailable");
+      },
+    };
+    const results = await gateMappedReflectionEntries({
+      ...baseParams,
+      admissionController: controller,
+      rows,
+      warnLog: (msg) => warnings.push(msg),
+    });
+    assert.equal(results.length, 3);
+    for (const result of results) {
+      assert.equal(result.admit, true);
+      assert.match(result.reason, /failed open/);
+      const audit = JSON.parse(result.auditJson);
+      assert.equal(audit.failedOpen, true);
+      assert.equal(audit.provenance, "memory-reflection-mapped");
+      assert.match(audit.error, /vector store unavailable/);
+    }
+    assert.equal(warnings.length, 1, "one burst, one warn line");
+  });
+
+  it("fails open when evaluateBatch returns a wrong-length result (defensive, never drops rows silently)", async () => {
+    const controller = {
+      async evaluate() {
+        throw new Error("per-row evaluate must not be used when the controller supports evaluateBatch");
+      },
+      async evaluateBatch() {
+        return [{ decision: "pass_to_dedup", audit: { decision: "pass_to_dedup", reason: "grounded" } }];
+      },
+    };
+    const results = await gateMappedReflectionEntries({
+      ...baseParams,
+      admissionController: controller,
+      rows,
+      warnLog: () => {},
+    });
+    assert.equal(results.length, 3);
+    for (const result of results) {
+      assert.equal(result.admit, true);
+      assert.match(result.reason, /failed open/);
+    }
+  });
+
+  it("routes a burst per-row through a real AdmissionController on this base (no evaluateBatch yet); upgrades to batch automatically once the controller ships it", async () => {
+    // On this branch's base, AdmissionController has no evaluateBatch, so the
+    // plural gate must take the per-row fallback: one admission-utility call
+    // per row. When the batched admission controller (evaluateBatch honoring
+    // utilityMode and chunking at its own BATCH_UTILITY_MAX_SIZE) lands in
+    // src/admission-control.ts, this same call site composes into one
+    // admission-utility-batch call per chunk with no lane changes.
+    const utilityCalls = [];
+    const store = { async vectorSearch() { return []; } };
+    const llm = {
+      async completeJson(_prompt, mode) {
+        utilityCalls.push(mode);
+        return mode === "admission-utility" ? { utility: 0.9, reason: "useful" } : null;
+      },
+    };
+    const controller = new AdmissionController(store, llm, ADMISSION_CONTROL_PRESETS.balanced);
+    const hasBatch = typeof controller.evaluateBatch === "function";
+
+    const results = await gateMappedReflectionEntries({
+      ...baseParams,
+      admissionController: controller,
+      rows,
+    });
+
+    assert.equal(results.length, 3);
+    for (const result of results) {
+      assert.equal(result.admit, true);
+      assert.equal(JSON.parse(result.auditJson).provenance, "memory-reflection-mapped");
+    }
+    if (!hasBatch) {
+      assert.equal(
+        utilityCalls.filter((m) => m === "admission-utility").length,
+        3,
+        "pre-batch controller: per-row utility scoring, unchanged",
+      );
+    }
+  });
+});
+
 describe("production pipeline: parse distillate -> gate -> bulkStore (end to end)", () => {
   // Mirrors index.ts's runMemoryReflection loop shape exactly: parse mapped items from
   // the distillate, gate each one, skip on reject, push admitted rows to bulkStore.
@@ -211,20 +427,29 @@ describe("production pipeline: parse distillate -> gate -> bulkStore (end to end
       },
     };
 
+    // Two-phase, mirroring index.ts: collect gate-eligible rows first, gate the
+    // whole burst with ONE gateMappedReflectionEntries call, then consume the
+    // per-row results in order.
     const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
+    const gateRows = mappedReflectionMemories.map((mapped) => ({
+      text: mapped.text,
+      category: mapped.category,
+      heading: mapped.heading,
+      vector: [1, 0, 0],
+    }));
+    const gateResults = await gateMappedReflectionEntries({
+      admissionController,
+      attachAudit: true,
+      rows: gateRows,
+      conversationText,
+      scopeFilter: ["global"],
+    });
+
     const mappedEntries = [];
     const rejections = [];
-    for (const mapped of mappedReflectionMemories) {
-      const gate = await gateMappedReflectionEntry({
-        admissionController,
-        attachAudit: true,
-        text: mapped.text,
-        category: mapped.category,
-        heading: mapped.heading,
-        vector: [1, 0, 0],
-        conversationText,
-        scopeFilter: ["global"],
-      });
+    for (let i = 0; i < mappedReflectionMemories.length; i++) {
+      const mapped = mappedReflectionMemories[i];
+      const gate = gateResults[i];
       if (!gate.admit) {
         rejections.push({ text: mapped.text, reason: gate.reason });
         continue;

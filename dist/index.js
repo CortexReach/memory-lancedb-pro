@@ -37,7 +37,7 @@ import { parseReflectionMetadata } from "./src/reflection-metadata.js";
 import { extractReflectionLearningGovernanceCandidates, extractInjectableReflectionMappedMemoryItems, isRecallUsed, } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
-import { gateMappedReflectionEntry } from "./src/reflection-mapped-admission.js";
+import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
@@ -3906,8 +3906,11 @@ const memoryLanceDBProPlugin = {
                     const MAX_MAPPED_ENTRIES = 100;
                     const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
                     const mappedEntries = [];
+                    // Phase 1: per-row embed + near-duplicate pre-check, collecting the
+                    // gate-eligible rows so the whole burst can share one admission call.
+                    const gateEligible = [];
                     for (const mapped of mappedReflectionMemories) {
-                        if (mappedEntries.length >= MAX_MAPPED_ENTRIES) {
+                        if (gateEligible.length >= MAX_MAPPED_ENTRIES) {
                             api.logger.warn(`memory-reflection: mapped entries cap (${MAX_MAPPED_ENTRIES}) reached, skipping remaining items`);
                             break;
                         }
@@ -3935,24 +3938,34 @@ const memoryLanceDBProPlugin = {
                         if (existing.length > 0 && existing[0].score > 0.95) {
                             continue;
                         }
-                        // Writer-1 admission routing: mapped rows previously bypassed
-                        // admission control entirely. Gate each row through the same
-                        // AdmissionController as extraction candidates; passthrough when
-                        // admission control (or smart extraction) is disabled.
-                        const mappedGate = await gateMappedReflectionEntry({
-                            admissionController: smartExtractor?.getAdmissionController() ?? null,
-                            attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+                        gateEligible.push({ mapped, vector });
+                    }
+                    // Writer-1 admission routing: mapped rows previously bypassed
+                    // admission control entirely. Gate the whole burst through the same
+                    // AdmissionController as extraction candidates: one batched judge
+                    // call per burst when the controller supports evaluateBatch, the
+                    // historical per-row path otherwise; passthrough when admission
+                    // control (or smart extraction) is disabled.
+                    const mappedGateResults = await gateMappedReflectionEntries({
+                        admissionController: smartExtractor?.getAdmissionController() ?? null,
+                        attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+                        rows: gateEligible.map(({ mapped, vector }) => ({
                             text: mapped.text,
                             category: mapped.category,
                             heading: mapped.heading,
                             vector,
-                            // The real transcript, not reflectionText (the distiller's own generated
-                            // output mapped rows are parsed FROM): using the distillate as its own
-                            // grounding evidence would let a hallucinated line appear self-grounded.
-                            conversationText: conversation,
-                            scopeFilter: [targetScope],
-                            warnLog: (msg) => api.logger.warn(msg),
-                        });
+                        })),
+                        // The real transcript, not reflectionText (the distiller's own generated
+                        // output mapped rows are parsed FROM): using the distillate as its own
+                        // grounding evidence would let a hallucinated line appear self-grounded.
+                        conversationText: conversation,
+                        scopeFilter: [targetScope],
+                        warnLog: (msg) => api.logger.warn(msg),
+                    });
+                    // Consume the per-row gate results in input order.
+                    for (let gateIndex = 0; gateIndex < gateEligible.length; gateIndex++) {
+                        const { mapped, vector } = gateEligible[gateIndex];
+                        const mappedGate = mappedGateResults[gateIndex];
                         if (!mappedGate.admit) {
                             api.logger.info(`memory-reflection: admission rejected mapped row heading=${JSON.stringify(mapped.heading)} provenance=memory-reflection-mapped: ${mappedGate.reason ?? "no reason"}`);
                             continue;
