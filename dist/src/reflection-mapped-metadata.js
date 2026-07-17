@@ -10,14 +10,19 @@ export function getReflectionMappedDecayDefaults(kind) {
 /**
  * mappedKind is known structurally at write time (each kind comes from a
  * fixed reflection section), so the 6-category classification is a direct
- * lookup rather than a text-sniffing heuristic. "decision" and "lesson" both
- * land in "cases" — durable operational facts, not one-off "events" — which
- * is what kept mapped decision rows shielded from consolidation before this
- * stamp existed (see reverseMapLegacyCategory's old decision→events case).
+ * lookup rather than a text-sniffing heuristic. This map is the SINGLE
+ * source of the reflection heading→taxonomy mapping: metadata stamps, the
+ * stored row category, and admission scoring all read it. "decision" and
+ * "lesson" both land in "cases" — durable operational facts, not one-off
+ * "events" — which is what kept mapped decision rows shielded from
+ * consolidation before this stamp existed.
  */
 const REFLECTION_MAPPED_MEMORY_CATEGORY = {
     "user-model": "preferences",
-    "agent-model": "preferences",
+    // Agent self-observations are reusable assistant behavior, not statements
+    // about the human -- minting them as user "preferences" polluted recall
+    // and consolidation with rows that read as the user's own tendencies.
+    "agent-model": "patterns",
     lesson: "cases",
     decision: "cases",
 };
