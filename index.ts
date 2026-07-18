@@ -3218,6 +3218,7 @@ const memoryLanceDBProPlugin = {
         onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
         migrator,
         embedder,
+        mdMirror,
         llmClient: smartExtractor ? (() => {
           try {
             const llmAuth = config.llm?.auth || "api-key";
@@ -5332,7 +5333,10 @@ const memoryLanceDBProPlugin = {
         }
         await mkdir(backupDir, { recursive: true });
 
-        const allMemories = await store.list(undefined, undefined, 10000, 0);
+        // excludeInactive:false -- this is the automated backup dump and must
+        // keep full-dump semantics, including invalidated/superseded rows
+        // (item 6, PR #946).
+        const allMemories = await store.list(undefined, undefined, 10000, 0, { excludeInactive: false });
         if (allMemories.length === 0) return;
 
         const dateStr = new Date().toISOString().split("T")[0];

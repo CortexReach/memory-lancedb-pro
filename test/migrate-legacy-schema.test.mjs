@@ -74,13 +74,19 @@ describe("legacy LanceDB migration", () => {
   });
 
   it("skips re-import when skipExisting is enabled and the legacy id already exists", async () => {
+    // Legacy-epoch-seconds-style values (normalizeMemoryTimestamp treats
+    // anything under LEGACY_SECONDS_TIMESTAMP_MAX as seconds and multiplies
+    // by 1000). 1700000000 seconds -> Nov 2023, safely in the past --
+    // 2222222222 seconds would normalize to ~2040, a FUTURE timestamp that
+    // store.list()'s excludeInactive default (item 6) correctly treats as
+    // not-yet-active and excludes from the read-back assertion below.
     const legacyPath = await createLegacyDb([
       {
         id: "legacy-keep-id",
         text: "keep the original identifier",
         importance: 0.6,
         category: "decision",
-        createdAt: 2222222222,
+        createdAt: 1700000000,
         vector: [1, 0, 0, 0],
         scope: "agent:main",
       },
@@ -94,7 +100,7 @@ describe("legacy LanceDB migration", () => {
       category: "decision",
       scope: "agent:main",
       importance: 0.6,
-      timestamp: 2222222222,
+      timestamp: 1700000000,
       metadata: "{}",
     });
 

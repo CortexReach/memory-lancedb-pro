@@ -32,6 +32,7 @@ describe("MemoryStore empty scopeFilter semantics", () => {
       assert.deepStrictEqual(await store.bm25Search("test", 5, []), []);
       assert.deepStrictEqual(await store.stats([]), {
         totalCount: 0,
+        liveCount: 0,
         scopeCounts: {},
         categoryCounts: {},
       });

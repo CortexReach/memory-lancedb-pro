@@ -174,7 +174,10 @@ async function runTest() {
     assert.equal(stats.created, 1);
     assert.equal(stats.superseded, 1);
 
-    const entries = await store.list(["test"], undefined, 10, 0);
+    // excludeInactive:false: this test explicitly verifies the invalidated
+    // historical row is retained (not hard-deleted), so it needs the
+    // full/forensic view, not the excludeInactive-by-default read (item 6).
+    const entries = await store.list(["test"], undefined, 10, 0, { excludeInactive: false });
     assert.equal(entries.length, 2, "supersede should keep old + new entries");
 
     const currentEntry = entries.find((entry) => entry.text.includes("咖啡"));
@@ -255,7 +258,9 @@ async function runTest() {
     }
 
     // Verify there are now 10 total entries (1 original + 1 current + 8 history)
-    const allEntries = await store.list(["test"], undefined, 20, 0);
+    // excludeInactive:false: most of these 10 rows are invalidated_at-stamped
+    // history, so this forensic count needs the full view (item 6).
+    const allEntries = await store.list(["test"], undefined, 20, 0, { excludeInactive: false });
     assert.equal(allEntries.length, 10, "should have 10 entries total");
 
     const crowdedResults = await retriever.retrieve({

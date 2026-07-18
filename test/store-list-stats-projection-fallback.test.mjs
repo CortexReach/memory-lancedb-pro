@@ -68,6 +68,7 @@ describe("MemoryStore list/stats projection fallback", () => {
 
     assert.deepEqual(await store.stats(), {
       totalCount: 1,
+      liveCount: 1,
       scopeCounts: { global: 1 },
       categoryCounts: { fact: 1 },
     });
@@ -89,6 +90,7 @@ describe("MemoryStore list/stats projection fallback", () => {
 
     assert.deepEqual(await store.stats(), {
       totalCount: 0,
+      liveCount: 0,
       scopeCounts: {},
       categoryCounts: {},
     });

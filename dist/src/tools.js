@@ -1734,9 +1734,10 @@ export function registerMemoryListTool(api, context) {
                 offset: Type.Optional(Type.Number({
                     description: "Number of memories to skip (default: 0)",
                 })),
+                includeInvalidated: Type.Optional(Type.Boolean({ description: "Include invalidated/superseded rows (default false)." })),
             }),
             async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
-                const { limit = 10, scope, category, offset = 0, } = params;
+                const { limit = 10, scope, category, offset = 0, includeInvalidated = false, } = params;
                 try {
                     const safeLimit = clampInt(limit, 1, 50);
                     const safeOffset = clampInt(offset, 0, 1000);
@@ -1744,7 +1745,7 @@ export function registerMemoryListTool(api, context) {
                     const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
                     const { scopeFilter } = resolvedScopes;
                     const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
-                    const entries = await context.store.list(scopeFilter, category, safeLimit, safeOffset);
+                    const entries = await context.store.list(scopeFilter, category, safeLimit, safeOffset, { excludeInactive: !includeInvalidated });
                     if (entries.length === 0) {
                         return {
                             content: [{ type: "text", text: [ignoredScopeNotice, "No memories found."].filter(Boolean).join("\n") }],
@@ -2152,9 +2153,10 @@ export function registerMemoryCompactTool(api, context) {
                 scope: Type.Optional(Type.String({ description: "Optional scope filter." })),
                 dryRun: Type.Optional(Type.Boolean({ description: "Preview compaction only (default true)." })),
                 limit: Type.Optional(Type.Number({ description: "Max entries to scan (default 200)." })),
+                includeInvalidated: Type.Optional(Type.Boolean({ description: "Include invalidated/superseded rows in the scan (default false)." })),
             }),
             async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
-                const { scope, dryRun = true, limit = 200 } = params;
+                const { scope, dryRun = true, limit = 200, includeInvalidated = false } = params;
                 const safeLimit = clampInt(limit, 20, 1000);
                 const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
                 let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
@@ -2167,7 +2169,7 @@ export function registerMemoryCompactTool(api, context) {
                     }
                     scopeFilter = [scope];
                 }
-                const entries = await runtimeContext.store.list(scopeFilter, undefined, safeLimit, 0);
+                const entries = await runtimeContext.store.list(scopeFilter, undefined, safeLimit, 0, { excludeInactive: !includeInvalidated });
                 const canonicalByKey = new Map();
                 const duplicates = [];
                 for (const entry of entries) {

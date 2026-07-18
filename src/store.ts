@@ -1735,7 +1735,9 @@ export class MemoryStore {
     const safeLimit = clampInt(limit, 1, 20);
     // Over-fetch more aggressively when filtering inactive records,
     // because superseded historical rows can crowd out active ones.
-    const inactiveFilter = options?.excludeInactive ?? false;
+    // excludeInactive defaults to true: invalidated/superseded rows are
+    // invisible unless a caller opts out explicitly (item 6, PR #946).
+    const inactiveFilter = options?.excludeInactive ?? true;
     const overFetchMultiplier = inactiveFilter ? 20 : 10;
     const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
 
@@ -1829,7 +1831,8 @@ export class MemoryStore {
     if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
     const safeLimit = clampInt(limit, 1, 20);
-    const inactiveFilter = options?.excludeInactive ?? false;
+    // excludeInactive defaults to true: see vectorSearch above (item 6, PR #946).
+    const inactiveFilter = options?.excludeInactive ?? true;
     // Over-fetch when filtering inactive records to avoid crowding
     const fetchLimit = inactiveFilter ? Math.min(safeLimit * 20, 200) : safeLimit;
 
@@ -1949,8 +1952,9 @@ export class MemoryStore {
 
       const metadata = parseSmartMetadata(entry.metadata, entry);
 
-      // Skip inactive (superseded) records when requested
-      if (options?.excludeInactive && !isMemoryActiveAt(metadata)) {
+      // Skip inactive (superseded) records unless explicitly opted out
+      // (excludeInactive defaults to true -- item 6, PR #946).
+      if ((options?.excludeInactive ?? true) && !isMemoryActiveAt(metadata)) {
         continue;
       }
 
@@ -2039,6 +2043,7 @@ export class MemoryStore {
     category?: string,
     limit = 20,
     offset = 0,
+    options?: { excludeInactive?: boolean },
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
 
@@ -2092,11 +2097,18 @@ export class MemoryStore {
         }),
       );
 
+    // excludeInactive defaults to true: invalidated/superseded rows are
+    // invisible to list() unless a caller opts out explicitly (item 6, PR #946).
+    const excludeInactive = options?.excludeInactive ?? true;
+    const activeEntries = excludeInactive
+      ? entries.filter((entry) => isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry)))
+      : entries;
+
     return (category
-      ? entries.filter((entry) =>
+      ? activeEntries.filter((entry) =>
           matchesMemoryCategoryFilter(entry.category, category, entry.metadata),
         )
-      : entries)
+      : activeEntries)
       .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
       .slice(offset, offset + limit);
   }
@@ -2121,6 +2133,7 @@ export class MemoryStore {
 
   async stats(scopeFilter?: string[]): Promise<{
     totalCount: number;
+    liveCount: number;
     scopeCounts: Record<string, number>;
     categoryCounts: Record<string, number>;
   }> {
@@ -2130,6 +2143,7 @@ export class MemoryStore {
     if (isExplicitDenyAllScopeFilter(scopeFilter)) {
       return {
         totalCount: 0,
+        liveCount: 0,
         scopeCounts: {},
         categoryCounts: {},
       };
@@ -2146,13 +2160,18 @@ export class MemoryStore {
     const applyConditions = (query: any) =>
       conditions.length > 0 ? query.where(conditions.join(" AND ")) : query;
 
+    // scopeCounts/categoryCounts stay blended (total, historical record
+    // included) -- only the top-level total/live split is added here, per
+    // item 6 (PR #946): "report a live vs total split rather than one
+    // blended count."
     const results = await this.queryRowsWithProjectionFallback(
       applyConditions,
-      ["scope", "category"],
+      ["scope", "category", "metadata", "timestamp"],
     );
 
     const scopeCounts: Record<string, number> = {};
     const categoryCounts: Record<string, number> = {};
+    let liveCount = 0;
 
     for (const row of results) {
       const scope = (row.scope as string | undefined) ?? "global";
@@ -2160,10 +2179,16 @@ export class MemoryStore {
 
       scopeCounts[scope] = (scopeCounts[scope] || 0) + 1;
       categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+
+      const metadata = parseSmartMetadata((row.metadata as string) || "{}", {
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+      });
+      if (isMemoryActiveAt(metadata)) liveCount += 1;
     }
 
     return {
       totalCount: results.length,
+      liveCount,
       scopeCounts,
       categoryCounts,
     };
@@ -2658,6 +2683,7 @@ export class MemoryStore {
     maxTimestamp: number,
     scopeFilter?: string[],
     limit = 200,
+    options?: { excludeInactive?: boolean },
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
 
@@ -2677,7 +2703,7 @@ export class MemoryStore {
       .where(whereClause)
       .toArray();
 
-    return results
+    const entries = results
       .map(
         (row): MemoryEntry => ({
           id: row.id as string,
@@ -2689,7 +2715,16 @@ export class MemoryStore {
           timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),
-      )
+      );
+
+    // excludeInactive defaults to true: a background compactor or
+    // consolidate run must not cluster already-dead rows (item 6, PR #946).
+    const excludeInactive = options?.excludeInactive ?? true;
+    const activeEntries = excludeInactive
+      ? entries.filter((entry) => isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry)))
+      : entries;
+
+    return activeEntries
       .sort((a, b) => b.timestamp - a.timestamp)
       .slice(0, limit);
   }

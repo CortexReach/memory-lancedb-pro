@@ -2406,6 +2406,7 @@ const memoryLanceDBProPlugin = {
             onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
             migrator,
             embedder,
+            mdMirror,
             llmClient: smartExtractor ? (() => {
                 try {
                     const llmAuth = config.llm?.auth || "api-key";
@@ -4066,10 +4067,15 @@ const memoryLanceDBProPlugin = {
                 const now = new Date(params.timestampMs ?? Date.now());
                 const dateStr = now.toISOString().split("T")[0];
                 const timeStr = now.toISOString().split("T")[1].split(".")[0];
+                // Session key/id stay out of `text`: it is the FTS index surface, and
+                // the `simple` tokenizer splits a key like
+                // `agent:main:cron:<uuid>:run:<uuid>` on its punctuation — so every session
+                // summary ends up indexed under `agent`, `main`, `cron`, `run`. A query
+                // mentioning any of those then BM25-matches every session summary in the
+                // store regardless of content. Both ids are already recorded structurally
+                // in metadata below, so provenance is unaffected.
                 const memoryText = [
                     `Session: ${dateStr} ${timeStr} UTC`,
-                    `Session Key: ${params.sessionKey}`,
-                    `Session ID: ${params.sessionId}`,
                     `Source: ${params.source}`,
                     "",
                     "Conversation Summary:",
@@ -4194,7 +4200,10 @@ const memoryLanceDBProPlugin = {
                     return;
                 }
                 await mkdir(backupDir, { recursive: true });
-                const allMemories = await store.list(undefined, undefined, 10000, 0);
+                // excludeInactive:false -- this is the automated backup dump and must
+                // keep full-dump semantics, including invalidated/superseded rows
+                // (item 6, PR #946).
+                const allMemories = await store.list(undefined, undefined, 10000, 0, { excludeInactive: false });
                 if (allMemories.length === 0)
                     return;
                 const dateStr = new Date().toISOString().split("T")[0];

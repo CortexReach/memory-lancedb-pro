@@ -1451,7 +1451,9 @@ export class MemoryStore {
         const safeLimit = clampInt(limit, 1, 20);
         // Over-fetch more aggressively when filtering inactive records,
         // because superseded historical rows can crowd out active ones.
-        const inactiveFilter = options?.excludeInactive ?? false;
+        // excludeInactive defaults to true: invalidated/superseded rows are
+        // invisible unless a caller opts out explicitly (item 6, PR #946).
+        const inactiveFilter = options?.excludeInactive ?? true;
         const overFetchMultiplier = inactiveFilter ? 20 : 10;
         const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
         if (this.disableNativeCosine && !this.nativeCosineFallbackLogged) {
@@ -1524,7 +1526,8 @@ export class MemoryStore {
         if (isExplicitDenyAllScopeFilter(scopeFilter))
             return [];
         const safeLimit = clampInt(limit, 1, 20);
-        const inactiveFilter = options?.excludeInactive ?? false;
+        // excludeInactive defaults to true: see vectorSearch above (item 6, PR #946).
+        const inactiveFilter = options?.excludeInactive ?? true;
         // Over-fetch when filtering inactive records to avoid crowding
         const fetchLimit = inactiveFilter ? Math.min(safeLimit * 20, 200) : safeLimit;
         if (!this.ftsIndexCreated && !(await this.refreshFtsSupportFromTable())) {
@@ -1622,8 +1625,9 @@ export class MemoryStore {
                 metadata: row.metadata || "{}",
             };
             const metadata = parseSmartMetadata(entry.metadata, entry);
-            // Skip inactive (superseded) records when requested
-            if (options?.excludeInactive && !isMemoryActiveAt(metadata)) {
+            // Skip inactive (superseded) records unless explicitly opted out
+            // (excludeInactive defaults to true -- item 6, PR #946).
+            if ((options?.excludeInactive ?? true) && !isMemoryActiveAt(metadata)) {
                 continue;
             }
             const score = scoreLexicalHit(trimmedQuery, [
@@ -1692,7 +1696,7 @@ export class MemoryStore {
             return true;
         });
     }
-    async list(scopeFilter, category, limit = 20, offset = 0) {
+    async list(scopeFilter, category, limit = 20, offset = 0, options) {
         await this.ensureInitialized();
         if (isExplicitDenyAllScopeFilter(scopeFilter))
             return [];
@@ -1732,9 +1736,15 @@ export class MemoryStore {
             timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: row.metadata || "{}",
         }));
+        // excludeInactive defaults to true: invalidated/superseded rows are
+        // invisible to list() unless a caller opts out explicitly (item 6, PR #946).
+        const excludeInactive = options?.excludeInactive ?? true;
+        const activeEntries = excludeInactive
+            ? entries.filter((entry) => isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry)))
+            : entries;
         return (category
-            ? entries.filter((entry) => matchesMemoryCategoryFilter(entry.category, category, entry.metadata))
-            : entries)
+            ? activeEntries.filter((entry) => matchesMemoryCategoryFilter(entry.category, category, entry.metadata))
+            : activeEntries)
             .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
             .slice(offset, offset + limit);
     }
@@ -1756,6 +1766,7 @@ export class MemoryStore {
         if (isExplicitDenyAllScopeFilter(scopeFilter)) {
             return {
                 totalCount: 0,
+                liveCount: 0,
                 scopeCounts: {},
                 categoryCounts: {},
             };
@@ -1768,17 +1779,28 @@ export class MemoryStore {
             conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
         }
         const applyConditions = (query) => conditions.length > 0 ? query.where(conditions.join(" AND ")) : query;
-        const results = await this.queryRowsWithProjectionFallback(applyConditions, ["scope", "category"]);
+        // scopeCounts/categoryCounts stay blended (total, historical record
+        // included) -- only the top-level total/live split is added here, per
+        // item 6 (PR #946): "report a live vs total split rather than one
+        // blended count."
+        const results = await this.queryRowsWithProjectionFallback(applyConditions, ["scope", "category", "metadata", "timestamp"]);
         const scopeCounts = {};
         const categoryCounts = {};
+        let liveCount = 0;
         for (const row of results) {
             const scope = row.scope ?? "global";
             const category = row.category;
             scopeCounts[scope] = (scopeCounts[scope] || 0) + 1;
             categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+            const metadata = parseSmartMetadata(row.metadata || "{}", {
+                timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+            });
+            if (isMemoryActiveAt(metadata))
+                liveCount += 1;
         }
         return {
             totalCount: results.length,
+            liveCount,
             scopeCounts,
             categoryCounts,
         };
@@ -2189,7 +2211,7 @@ export class MemoryStore {
      * omitted from `list()` for performance, but compaction needs them for
      * cosine-similarity clustering.
      */
-    async fetchForCompaction(maxTimestamp, scopeFilter, limit = 200) {
+    async fetchForCompaction(maxTimestamp, scopeFilter, limit = 200, options) {
         await this.ensureInitialized();
         const conditions = [timestampBeforePredicate("timestamp", maxTimestamp)];
         if (scopeFilter && scopeFilter.length > 0) {
@@ -2203,7 +2225,7 @@ export class MemoryStore {
             .query()
             .where(whereClause)
             .toArray();
-        return results
+        const entries = results
             .map((row) => ({
             id: row.id,
             text: row.text,
@@ -2213,7 +2235,14 @@ export class MemoryStore {
             importance: clampImportance(Number(row.importance)),
             timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: row.metadata || "{}",
-        }))
+        }));
+        // excludeInactive defaults to true: a background compactor or
+        // consolidate run must not cluster already-dead rows (item 6, PR #946).
+        const excludeInactive = options?.excludeInactive ?? true;
+        const activeEntries = excludeInactive
+            ? entries.filter((entry) => isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry)))
+            : entries;
+        return activeEntries
             .sort((a, b) => b.timestamp - a.timestamp)
             .slice(0, limit);
     }

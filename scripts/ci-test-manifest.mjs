@@ -109,6 +109,13 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/memory-categories-storage-map.test.mjs", args: ["--test"] },
   // Delete/delete-bulk must synchronously invalidate in-process reflection read caches
   { group: "core-regression", runner: "node", file: "test/delete-invalidate-reflection-caches.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/store-excludeinactive-default.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/memory-consolidate.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/memory-consolidate-cost-gate.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/memory-consolidate-two-phase-apply.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/memory-consolidate-admission-independence.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/memory-consolidate-polish.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/invalidated-rows-visibility.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
