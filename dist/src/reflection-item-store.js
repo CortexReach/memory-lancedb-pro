@@ -37,6 +37,14 @@ export function buildReflectionItemPayloads(params) {
             agentId: params.agentId,
             sessionKey: params.sessionKey,
             sessionId: params.sessionId,
+            // Write-time L0/L1/L2: an item row is one distilled line, so the line is
+            // its own abstract and content; the section heading is the one piece of
+            // extra context worth an overview. Level-less item rows fell back to
+            // three identical lines in every shared pipeline prompt (same fix as
+            // reflection-mapped-metadata).
+            l0_abstract: item.text,
+            l1_overview: `## ${item.section}\n- ${item.text}`,
+            l2_content: item.text,
             storedAt: params.runAt,
             usedFallback: params.usedFallback,
             errorSignals: params.toolErrorSignals.map((signal) => signal.signatureHash),
