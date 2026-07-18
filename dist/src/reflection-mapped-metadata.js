@@ -40,6 +40,13 @@ export function buildReflectionMappedMetadata(params) {
         mappedKind: params.mappedItem.mappedKind,
         mappedCategory: params.mappedItem.category,
         memory_category: getReflectionMappedMemoryCategory(params.mappedItem.mappedKind),
+        // Write-time L0/L1/L2: a mapped row is one distilled line, so the line is
+        // its own abstract and content; the distillate section heading is the one
+        // piece of extra context worth an overview. Level-less mapped rows used to
+        // render as three identical fallback lines in every shared pipeline prompt.
+        l0_abstract: params.mappedItem.text,
+        l1_overview: `## ${params.mappedItem.heading}\n- ${params.mappedItem.text}`,
+        l2_content: params.mappedItem.text,
         section: params.mappedItem.heading,
         ordinal: params.mappedItem.ordinal,
         groupSize: params.mappedItem.groupSize,
