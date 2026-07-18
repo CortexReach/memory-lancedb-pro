@@ -200,6 +200,39 @@ assert.ok(
   ),
   "llm.apiKey should accept OpenClaw SecretRef objects",
 );
+assert.equal(
+  manifest.configSchema.properties.admissionControl.properties.model?.type,
+  "string",
+  "admissionControl.model schema should be declared as an optional string override",
+);
+assert.ok(
+  manifest.configSchema.properties.admissionControl.properties.modelAffinity?.enum?.includes("global") &&
+    manifest.configSchema.properties.admissionControl.properties.modelAffinity?.enum?.includes("lane"),
+  "admissionControl.modelAffinity schema should declare both global and lane",
+);
+assert.equal(
+  manifest.configSchema.properties.admissionControl.properties.modelAffinity?.default,
+  "global",
+  "admissionControl.modelAffinity schema default should remain global (lane is opt-in)",
+);
+assert.ok(
+  manifest.configSchema.properties.admissionControl.properties.utilityMode.enum.includes("batch"),
+  "admissionControl.utilityMode schema should declare the batch utility mode",
+);
+assert.equal(
+  manifest.configSchema.properties.admissionControl.properties.utilityMode.default,
+  "standalone",
+  "admissionControl.utilityMode schema default should remain standalone (batch is opt-in)",
+);
+assert.ok(
+  manifest.configSchema.properties.admissionControl.properties.utilityMode.enum.includes("batch"),
+  "admissionControl.utilityMode schema should declare the batch utility mode",
+);
+assert.equal(
+  manifest.configSchema.properties.admissionControl.properties.utilityMode.default,
+  "standalone",
+  "admissionControl.utilityMode schema default should remain standalone (batch is opt-in)",
+);
 assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties, "dreaming"),
   "configSchema should declare dreaming so the plugin can own the OpenClaw memory slot",

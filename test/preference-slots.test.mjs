@@ -145,9 +145,10 @@ function makeGuardExtractor({ vectorSearchResults, onDedupCalled }) {
           ],
         };
       }
-      if (mode === "dedup-decision") {
+      if (mode === "dedup-decision" || mode === "dedup-decision-batch") {
         onDedupCalled();
-        return { decision: "create", reason: "LLM fallback" };
+        const verdict = { decision: "create", reason: "LLM fallback" };
+        return mode === "dedup-decision-batch" ? { results: [{ index: 1, ...verdict }] } : verdict;
       }
       if (mode === "merge-memory") {
         return { merged: "merged text" };
@@ -257,9 +258,10 @@ test("dedup guard: non-preference category -> skips guard, goes to LLM", async (
           }],
         };
       }
-      if (mode === "dedup-decision") {
+      if (mode === "dedup-decision" || mode === "dedup-decision-batch") {
         dedupCalled = true;
-        return { decision: "create", reason: "different location" };
+        const verdict = { decision: "create", reason: "different location" };
+        return mode === "dedup-decision-batch" ? { results: [{ index: 1, ...verdict }] } : verdict;
       }
       if (mode === "merge-memory") {
         return { merged: "merged" };

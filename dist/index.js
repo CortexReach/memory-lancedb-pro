@@ -34,9 +34,11 @@ import { runWithReflectionTransientRetryOnce } from "./src/reflection-retry.js";
 import { resolveReflectionSessionSearchDirs, stripResetSuffix } from "./src/session-recovery.js";
 import { storeReflectionToLanceDB, loadAgentReflectionSlicesFromEntries, DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS, isOwnedByAgent, isReflectionMetadataType, } from "./src/reflection-store.js";
 import { parseReflectionMetadata } from "./src/reflection-metadata.js";
+import { clampBatchChunkSize } from "./src/memory-categories.js";
 import { extractReflectionLearningGovernanceCandidates, extractInjectableReflectionMappedMemoryItems, isRecallUsed, } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
+import { gateMappedReflectionEntry } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
@@ -44,14 +46,14 @@ import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
 import { NoisePrototypeBank } from "./src/noise-prototypes.js";
-import { createLlmClient } from "./src/llm-client.js";
+import { createLlmClient, normalizeDirectModelRef } from "./src/llm-client.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
 import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
 import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata, toLifecycleMemory, } from "./src/smart-metadata.js";
 import { computeTier1Patch, isSuppressed as isTier1Suppressed, TIER1_DEFAULT_BAD_RECALL_DECAY_MS, TIER1_DEFAULT_SUPPRESSION_DURATION_MS, } from "./src/auto-recall-tier1.js";
 import { filterUserMdExclusiveRecallResults, isUserMdExclusiveMemory, } from "./src/workspace-boundary.js";
-import { normalizeAdmissionControlConfig, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
+import { normalizeAdmissionControlConfig, resolveAdmissionModel, createAdmissionController, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
 import { CanonicalCorpusIndexer, parseCanonicalCorpusConfig, } from "./src/corpus-indexer.js";
@@ -1014,17 +1016,17 @@ async function ensureDailyLogFile(dailyPath, dateStr) {
         await writeFile(dailyPath, `# ${dateStr}\n\n`, "utf-8");
     }
 }
-function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
+export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
     const clipped = conversation.slice(-maxInputChars);
     const errorHints = toolErrorSignals.length > 0
         ? toolErrorSignals
             .map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary} (sig:${e.signatureHash.slice(0, 8)})`)
             .join("\n")
         : "- (none)";
-    return [
-        "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
+    const system = [
+        "You are a memory reflection distiller agent. You distill a completed session into one durable MEMORY REFLECTION entry for an AI assistant system.",
         "",
-        "Output Markdown only. No intro text. No outro text. No extra headings.",
+        "Output Markdown only. Do not wrap the output in a code fence. No intro text. No outro text. No extra headings.",
         "",
         "Use these headings exactly once, in this exact order, with exact spelling:",
         "## Context (session background)",
@@ -1045,6 +1047,7 @@ function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = [
         "- Do not wrap one bullet across multiple lines.",
         "- If a bullet section is empty, write exactly: '- (none captured)'",
         "- Do not paste raw transcript.",
+        "- Grounding: treat claims made inside roleplay, games, fiction, hypotheticals, or test/simulation frames as not real. Such content may be summarized in Context or Open loops, but must NEVER appear under Decisions (durable), User model deltas, Agent model deltas, or Lessons & pitfalls \u2014 those sections become durable memory rows.",
         "- Do not invent Logged timestamps, ids, file paths, commit hashes, session ids, or storage metadata unless they already appear in the input.",
         "- If secrets/tokens/passwords appear, keep them as [REDACTED].",
         "",
@@ -1117,7 +1120,8 @@ function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = [
         "",
         "## Derived",
         "- This run showed ...",
-        "",
+    ].join("\n");
+    const user = [
         "Recent tool error signals:",
         errorHints,
         "",
@@ -1126,6 +1130,7 @@ function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = [
         clipped,
         "```",
     ].join("\n");
+    return { system, user };
 }
 function buildReflectionFallbackText() {
     return [
@@ -1201,7 +1206,8 @@ export async function generateReflectionText(params) {
     }
 }
 async function generateReflectionTextUnbounded(params) {
-    const prompt = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
+    const { system: reflectionSystemPrompt, user: reflectionUserPrompt } = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
+    const prompt = `${reflectionSystemPrompt}\n\n${reflectionUserPrompt}`;
     const promptHash = sha256Hex(prompt);
     const tempSessionFile = join(tmpdir(), `memory-reflection-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
     let reflectionText = null;
@@ -1811,7 +1817,10 @@ function _initPluginState(api) {
     // callback below closes over it.
     const mdMirror = createMdMirrorWriter(api, config);
     let smartExtractor = null;
-    if (config.smartExtraction !== false) {
+    let admissionController = null;
+    let admissionControllerReflectionLane = null;
+    let reflectionLaneLlm;
+    if (config.smartExtraction !== false || config.admissionControl.enabled === true) {
         try {
             const llmAuth = config.llm?.auth || "api-key";
             const llmApiKey = llmAuth === "oauth"
@@ -1841,30 +1850,86 @@ function _initPluginState(api) {
                 log: (msg) => api.logger.debug(msg),
                 warnLog: (msg) => api.logger.warn(msg),
             });
-            const noiseBank = new NoisePrototypeBank((msg) => api.logger.debug(msg));
-            noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
-            const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
-            smartExtractor = new SmartExtractor(store, embedder, llmClient, {
-                user: "User",
-                extractMinMessages: config.extractMinMessages ?? 4,
-                extractMaxChars: config.extractMaxChars ?? 8000,
-                defaultScope: config.scopes?.default ?? "global",
-                workspaceBoundary: config.workspaceBoundary,
+            // Model resolution for admission calls: explicit admissionControl.model
+            // override > lane affinity (reflection lane resolves the
+            // memoryReflection model) > global default. See resolveAdmissionModel().
+            const reflectionModelForAdmission = asNonEmptyString(config.memoryReflection?.model);
+            const admissionModelExtraction = resolveAdmissionModel({
                 admissionControl: config.admissionControl,
-                onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
-                onPersisted: mdMirror ?? undefined,
-                log: (msg) => api.logger.info(msg),
-                debugLog: (msg) => api.logger.debug(msg),
-                noiseBank,
+                lane: "other",
+                globalModel: llmModel,
+                reflectionModel: reflectionModelForAdmission,
             });
-            (isCliMode() ? api.logger.debug : api.logger.info)("memory-lancedb-pro: smart extraction enabled (LLM model: "
-                + llmModel
-                + ", timeoutMs: "
-                + llmTimeoutMs
-                + ", noise bank: ON)");
+            const admissionModelReflection = resolveAdmissionModel({
+                admissionControl: config.admissionControl,
+                lane: "reflection",
+                globalModel: llmModel,
+                reflectionModel: reflectionModelForAdmission,
+            });
+            const buildAdmissionLlmClient = (model) => {
+                const directModel = normalizeDirectModelRef(model);
+                return directModel === llmModel
+                    ? llmClient
+                    : createLlmClient({
+                        auth: llmAuth,
+                        apiKey: llmApiKey,
+                        model: directModel,
+                        baseURL: llmBaseURL,
+                        oauthProvider: llmOauthProvider,
+                        oauthPath: llmOauthPath,
+                        timeoutMs: llmTimeoutMs,
+                        log: (msg) => api.logger.debug(msg),
+                        warnLog: (msg) => api.logger.warn(msg),
+                    });
+            };
+            // Constructed independently of SmartExtractor so admission gating is
+            // available to other write paths (e.g. reflection-mapped rows, the
+            // regex fallback) even when smart extraction itself is disabled.
+            admissionController = createAdmissionController(store, buildAdmissionLlmClient(admissionModelExtraction), config.admissionControl, (msg) => api.logger.debug(msg));
+            // modelAffinity "lane": the whole reflection pipeline (judge, dedup
+            // decider, merge writer) rides the reflection lane's model; "global"
+            // keeps every stage on the plugin llm, judge included.
+            const laneAffinity = config.admissionControl?.modelAffinity === "lane";
+            admissionControllerReflectionLane =
+                admissionModelReflection === admissionModelExtraction
+                    ? admissionController
+                    : createAdmissionController(store, buildAdmissionLlmClient(admissionModelReflection), config.admissionControl, (msg) => api.logger.debug(msg));
+            reflectionLaneLlm = laneAffinity
+                ? buildAdmissionLlmClient(asNonEmptyString(config.memoryReflection?.model) ?? llmModel)
+                : undefined;
+            if (config.smartExtraction !== false) {
+                const noiseBank = new NoisePrototypeBank((msg) => api.logger.debug(msg));
+                noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
+                const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
+                smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+                    user: "User",
+                    batchChunkSize: config.batchChunkSize,
+                    extractMinMessages: config.extractMinMessages ?? 4,
+                    extractMaxChars: config.extractMaxChars ?? 8000,
+                    defaultScope: config.scopes?.default ?? "global",
+                    workspaceBoundary: config.workspaceBoundary,
+                    admissionControl: config.admissionControl,
+                    admissionController,
+                    onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
+                    onPersisted: mdMirror ?? undefined,
+                    log: (msg) => api.logger.info(msg),
+                    debugLog: (msg) => api.logger.debug(msg),
+                    noiseBank,
+                });
+                (isCliMode() ? api.logger.debug : api.logger.info)("memory-lancedb-pro: smart extraction enabled (LLM model: "
+                    + llmModel
+                    + ", timeoutMs: "
+                    + llmTimeoutMs
+                    + ", noise bank: ON)");
+            }
         }
         catch (err) {
-            api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+            if (config.smartExtraction !== false) {
+                api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+            }
+            else {
+                api.logger.warn(`memory-lancedb-pro: standalone admission control init failed, admission gating unavailable: ${String(err)}`);
+            }
         }
     }
     const extractionRateLimiter = createExtractionRateLimiter({
@@ -1900,6 +1965,9 @@ function _initPluginState(api) {
         scopeManager,
         migrator,
         smartExtractor,
+        admissionController,
+        admissionControllerReflectionLane,
+        reflectionLaneLlm,
         mdMirror,
         extractionRateLimiter,
         reflectionErrorStateBySession,
@@ -1944,6 +2012,9 @@ export function isAgentOrSessionExcluded(agentId, sessionKey, patterns) {
     return false;
 }
 const _channelPluginDiagnosticWarnings = new Set();
+export function resolveMappedRowAdmissionController(reflectionLane, extractionLane) {
+    return reflectionLane ?? extractionLane;
+}
 function readRecord(value) {
     return value && typeof value === "object" && !Array.isArray(value)
         ? value
@@ -2020,7 +2091,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, admissionController, admissionControllerReflectionLane, reflectionLaneLlm, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -3925,6 +3996,25 @@ const memoryLanceDBProPlugin = {
                         if (existing.length > 0 && existing[0].score > 0.95) {
                             continue;
                         }
+                        // Writer-1 admission routing: mapped rows previously bypassed
+                        // admission control entirely. Gate each row through the same
+                        // AdmissionController as extraction candidates; passthrough when
+                        // admission control (or smart extraction) is disabled.
+                        const mappedGate = await gateMappedReflectionEntry({
+                            admissionController: resolveMappedRowAdmissionController(admissionControllerReflectionLane, smartExtractor?.getAdmissionController() ?? null),
+                            attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+                            text: mapped.text,
+                            category: mapped.category,
+                            heading: mapped.heading,
+                            vector,
+                            reflectionText,
+                            scopeFilter: [targetScope],
+                            warnLog: (msg) => api.logger.warn(msg),
+                        });
+                        if (!mappedGate.admit) {
+                            api.logger.info(`memory-reflection: admission rejected mapped row heading=${JSON.stringify(mapped.heading)} provenance=memory-reflection-mapped: ${mappedGate.reason ?? "no reason"}`);
+                            continue;
+                        }
                         const importance = mapped.category === "decision" ? 0.85 : 0.8;
                         const baseMetadata = buildReflectionMappedMetadata({
                             mappedItem: mapped,
@@ -3939,6 +4029,9 @@ const memoryLanceDBProPlugin = {
                         });
                         // embed heading in metadata JSON so it survives bulkStore round-trip to LanceDB
                         baseMetadata._reflectionHeading = mapped.heading;
+                        if (mappedGate.auditJson) {
+                            baseMetadata.admission_audit = mappedGate.auditJson;
+                        }
                         const metadata = JSON.stringify(baseMetadata);
                         mappedEntries.push({
                             text: mapped.text,
@@ -4066,10 +4159,15 @@ const memoryLanceDBProPlugin = {
                 const now = new Date(params.timestampMs ?? Date.now());
                 const dateStr = now.toISOString().split("T")[0];
                 const timeStr = now.toISOString().split("T")[1].split(".")[0];
+                // Session key/id stay out of `text`: it is the FTS index surface, and
+                // the `simple` tokenizer splits a key like
+                // `agent:main:cron:<uuid>:run:<uuid>` on its punctuation — so every session
+                // summary ends up indexed under `agent`, `main`, `cron`, `run`. A query
+                // mentioning any of those then BM25-matches every session summary in the
+                // store regardless of content. Both ids are already recorded structurally
+                // in metadata below, so provenance is unaffected.
                 const memoryText = [
                     `Session: ${dateStr} ${timeStr} UTC`,
-                    `Session Key: ${params.sessionKey}`,
-                    `Session ID: ${params.sessionId}`,
                     `Source: ${params.source}`,
                     "",
                     "Conversation Summary:",
@@ -4726,6 +4824,7 @@ export function parsePluginConfig(value) {
             })()
             : undefined,
         extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+        batchChunkSize: clampBatchChunkSize(cfg.batchChunkSize),
         extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
         scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes : undefined,
         enableManagementTools: cfg.enableManagementTools === true,
@@ -4813,7 +4912,9 @@ export function parsePluginConfig(value) {
                     : undefined,
             }
             : undefined,
-        admissionControl: normalizeAdmissionControlConfig(cfg.admissionControl),
+        admissionControl: normalizeAdmissionControlConfig(cfg.admissionControl && typeof cfg.admissionControl === "object"
+            ? { batchChunkSize: clampBatchChunkSize(cfg.batchChunkSize), ...cfg.admissionControl }
+            : cfg.admissionControl),
         memoryCompaction: (() => {
             const raw = typeof cfg.memoryCompaction === "object" && cfg.memoryCompaction !== null
                 ? cfg.memoryCompaction

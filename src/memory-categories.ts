@@ -222,3 +222,16 @@ function extractMetadataMemoryCategory(rawMetadata?: string): MemoryCategory | n
     return null;
   }
 }
+
+/**
+ * Clamp the batchChunkSize knob (JR-less public form: per-call chunk bound
+ * for every batched pipeline stage). Non-numeric or non-positive input falls
+ * back to the historical hardcoded 10; the ceiling guards prompt size.
+ */
+export const DEFAULT_BATCH_CHUNK_SIZE = 10;
+export const MAX_BATCH_CHUNK_SIZE = 50;
+export function clampBatchChunkSize(raw: unknown): number {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_BATCH_CHUNK_SIZE;
+  return Math.min(MAX_BATCH_CHUNK_SIZE, Math.max(1, Math.floor(n)));
+}

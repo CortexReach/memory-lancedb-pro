@@ -60,6 +60,7 @@ import {
   isReflectionMetadataType,
 } from "./src/reflection-store.js";
 import { parseReflectionMetadata } from "./src/reflection-metadata.js";
+import { clampBatchChunkSize } from "./src/memory-categories.js";
 import {
   extractReflectionLearningGovernanceCandidates,
   extractInjectableReflectionMappedMemoryItems,
@@ -67,6 +68,7 @@ import {
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
+import { gateMappedReflectionEntry } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
@@ -75,7 +77,7 @@ import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
 import { NoisePrototypeBank } from "./src/noise-prototypes.js";
-import { createLlmClient } from "./src/llm-client.js";
+import { createLlmClient, normalizeDirectModelRef } from "./src/llm-client.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
 import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
@@ -98,9 +100,12 @@ import {
 } from "./src/workspace-boundary.js";
 import {
   normalizeAdmissionControlConfig,
+  resolveAdmissionModel,
+  createAdmissionController,
   resolveRejectedAuditFilePath,
   type AdmissionControlConfig,
   type AdmissionRejectionAuditEntry,
+  type AdmissionController,
 } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
@@ -263,6 +268,7 @@ interface PluginConfig {
   };
   extractMinMessages?: number;
   extractMaxChars?: number;
+  batchChunkSize?: number;
   scopes?: {
     default?: string;
     definitions?: Record<string, { description: string }>;
@@ -1461,21 +1467,21 @@ async function ensureDailyLogFile(dailyPath: string, dateStr: string): Promise<v
   }
 }
 
-function buildReflectionPrompt(
+export function buildReflectionPrompt(
   conversation: string,
   maxInputChars: number,
   toolErrorSignals: ReflectionErrorSignal[] = []
-): string {
+): { system: string; user: string } {
   const clipped = conversation.slice(-maxInputChars);
   const errorHints = toolErrorSignals.length > 0
     ? toolErrorSignals
       .map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary} (sig:${e.signatureHash.slice(0, 8)})`)
       .join("\n")
     : "- (none)";
-  return [
-    "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
+  const system = [
+    "You are a memory reflection distiller agent. You distill a completed session into one durable MEMORY REFLECTION entry for an AI assistant system.",
     "",
-    "Output Markdown only. No intro text. No outro text. No extra headings.",
+    "Output Markdown only. Do not wrap the output in a code fence. No intro text. No outro text. No extra headings.",
     "",
     "Use these headings exactly once, in this exact order, with exact spelling:",
     "## Context (session background)",
@@ -1496,6 +1502,7 @@ function buildReflectionPrompt(
     "- Do not wrap one bullet across multiple lines.",
     "- If a bullet section is empty, write exactly: '- (none captured)'",
     "- Do not paste raw transcript.",
+    "- Grounding: treat claims made inside roleplay, games, fiction, hypotheticals, or test/simulation frames as not real. Such content may be summarized in Context or Open loops, but must NEVER appear under Decisions (durable), User model deltas, Agent model deltas, or Lessons & pitfalls \u2014 those sections become durable memory rows.",
     "- Do not invent Logged timestamps, ids, file paths, commit hashes, session ids, or storage metadata unless they already appear in the input.",
     "- If secrets/tokens/passwords appear, keep them as [REDACTED].",
     "",
@@ -1568,7 +1575,8 @@ function buildReflectionPrompt(
     "",
     "## Derived",
     "- This run showed ...",
-    "",
+  ].join("\n");
+  const user = [
     "Recent tool error signals:",
     errorHints,
     "",
@@ -1577,6 +1585,7 @@ function buildReflectionPrompt(
     clipped,
     "```",
   ].join("\n");
+  return { system, user };
 }
 
 function buildReflectionFallbackText(): string {
@@ -1680,11 +1689,12 @@ export async function generateReflectionText(
 async function generateReflectionTextUnbounded(
   params: GenerateReflectionTextParams
 ): Promise<GenerateReflectionTextResult> {
-  const prompt = buildReflectionPrompt(
+  const { system: reflectionSystemPrompt, user: reflectionUserPrompt } = buildReflectionPrompt(
     params.conversation,
     params.maxInputChars,
     params.toolErrorSignals ?? []
   );
+  const prompt = `${reflectionSystemPrompt}\n\n${reflectionUserPrompt}`;
   const promptHash = sha256Hex(prompt);
   const tempSessionFile = join(
     tmpdir(),
@@ -2337,6 +2347,9 @@ interface PluginSingletonState {
   scopeManager: ReturnType<typeof createScopeManager>;
   migrator: ReturnType<typeof createMigrator>;
   smartExtractor: SmartExtractor | null;
+  admissionController: AdmissionController | null;
+  admissionControllerReflectionLane: AdmissionController | null;
+  reflectionLaneLlm: ReturnType<typeof createLlmClient> | undefined;
   mdMirror: MdMirrorWriter | null;
   extractionRateLimiter: ReturnType<typeof createExtractionRateLimiter>;
   // Session Maps — persist across scope refreshes instead of being recreated
@@ -2470,7 +2483,10 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const mdMirror = createMdMirrorWriter(api, config);
 
   let smartExtractor: SmartExtractor | null = null;
-  if (config.smartExtraction !== false) {
+  let admissionController: AdmissionController | null = null;
+  let admissionControllerReflectionLane: AdmissionController | null = null;
+  let reflectionLaneLlm: ReturnType<typeof createLlmClient> | undefined;
+  if (config.smartExtraction !== false || config.admissionControl.enabled === true) {
     try {
       const llmAuth = config.llm?.auth || "api-key";
       const llmApiKey = llmAuth === "oauth"
@@ -2502,6 +2518,66 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         warnLog: (msg: string) => api.logger.warn(msg),
       });
 
+      // Model resolution for admission calls: explicit admissionControl.model
+      // override > lane affinity (reflection lane resolves the
+      // memoryReflection model) > global default. See resolveAdmissionModel().
+      const reflectionModelForAdmission = asNonEmptyString(config.memoryReflection?.model);
+      const admissionModelExtraction = resolveAdmissionModel({
+        admissionControl: config.admissionControl,
+        lane: "other",
+        globalModel: llmModel,
+        reflectionModel: reflectionModelForAdmission,
+      });
+      const admissionModelReflection = resolveAdmissionModel({
+        admissionControl: config.admissionControl,
+        lane: "reflection",
+        globalModel: llmModel,
+        reflectionModel: reflectionModelForAdmission,
+      });
+      const buildAdmissionLlmClient = (model: string) => {
+        const directModel = normalizeDirectModelRef(model);
+        return directModel === llmModel
+          ? llmClient
+          : createLlmClient({
+              auth: llmAuth,
+              apiKey: llmApiKey,
+              model: directModel,
+              baseURL: llmBaseURL,
+              oauthProvider: llmOauthProvider,
+              oauthPath: llmOauthPath,
+              timeoutMs: llmTimeoutMs,
+              log: (msg: string) => api.logger.debug(msg),
+              warnLog: (msg: string) => api.logger.warn(msg),
+            });
+      };
+
+      // Constructed independently of SmartExtractor so admission gating is
+      // available to other write paths (e.g. reflection-mapped rows, the
+      // regex fallback) even when smart extraction itself is disabled.
+      admissionController = createAdmissionController(
+        store,
+        buildAdmissionLlmClient(admissionModelExtraction),
+        config.admissionControl,
+        (msg: string) => api.logger.debug(msg),
+      );
+      // modelAffinity "lane": the whole reflection pipeline (judge, dedup
+      // decider, merge writer) rides the reflection lane's model; "global"
+      // keeps every stage on the plugin llm, judge included.
+      const laneAffinity = config.admissionControl?.modelAffinity === "lane";
+      admissionControllerReflectionLane =
+        admissionModelReflection === admissionModelExtraction
+          ? admissionController
+          : createAdmissionController(
+              store,
+              buildAdmissionLlmClient(admissionModelReflection),
+              config.admissionControl,
+              (msg: string) => api.logger.debug(msg),
+            );
+      reflectionLaneLlm = laneAffinity
+        ? buildAdmissionLlmClient(asNonEmptyString(config.memoryReflection?.model) ?? llmModel)
+        : undefined;
+
+      if (config.smartExtraction !== false) {
       const noiseBank = new NoisePrototypeBank((msg: string) => api.logger.debug(msg));
       noiseBank.init(embedder).catch((err) =>
         api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
@@ -2511,11 +2587,13 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
 
       smartExtractor = new SmartExtractor(store, embedder, llmClient, {
         user: "User",
+          batchChunkSize: config.batchChunkSize,
         extractMinMessages: config.extractMinMessages ?? 4,
         extractMaxChars: config.extractMaxChars ?? 8000,
         defaultScope: config.scopes?.default ?? "global",
         workspaceBoundary: config.workspaceBoundary,
         admissionControl: config.admissionControl,
+          admissionController,
         onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
         onPersisted: mdMirror ?? undefined,
         log: (msg: string) => api.logger.info(msg),
@@ -2530,8 +2608,13 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         + llmTimeoutMs
         + ", noise bank: ON)",
       );
+      }
     } catch (err) {
+      if (config.smartExtraction !== false) {
       api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+      } else {
+        api.logger.warn(`memory-lancedb-pro: standalone admission control init failed, admission gating unavailable: ${String(err)}`);
+      }
     }
   }
 
@@ -2570,6 +2653,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     scopeManager,
     migrator,
     smartExtractor,
+    admissionController,
+    admissionControllerReflectionLane,
+    reflectionLaneLlm,
     mdMirror,
     extractionRateLimiter,
     reflectionErrorStateBySession,
@@ -2620,6 +2706,13 @@ export function isAgentOrSessionExcluded(
 }
 
 const _channelPluginDiagnosticWarnings = new Set<string>();
+
+export function resolveMappedRowAdmissionController(
+  reflectionLane: AdmissionController | null,
+  extractionLane: AdmissionController | null,
+): AdmissionController | null {
+  return reflectionLane ?? extractionLane;
+}
 
 function readRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -2721,6 +2814,9 @@ const memoryLanceDBProPlugin = {
       scopeManager,
       migrator,
       smartExtractor,
+      admissionController,
+      admissionControllerReflectionLane,
+      reflectionLaneLlm,
       mdMirror,
       decayEngine,
       tierManager,
@@ -5011,6 +5107,31 @@ const memoryLanceDBProPlugin = {
               continue;
             }
 
+            // Writer-1 admission routing: mapped rows previously bypassed
+            // admission control entirely. Gate each row through the same
+            // AdmissionController as extraction candidates; passthrough when
+            // admission control (or smart extraction) is disabled.
+            const mappedGate = await gateMappedReflectionEntry({
+              admissionController: resolveMappedRowAdmissionController(
+                admissionControllerReflectionLane,
+                smartExtractor?.getAdmissionController() ?? null,
+              ),
+              attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+              text: mapped.text,
+              category: mapped.category,
+              heading: mapped.heading,
+              vector,
+              reflectionText,
+              scopeFilter: [targetScope],
+              warnLog: (msg: string) => api.logger.warn(msg),
+            });
+            if (!mappedGate.admit) {
+              api.logger.info(
+                `memory-reflection: admission rejected mapped row heading=${JSON.stringify(mapped.heading)} provenance=memory-reflection-mapped: ${mappedGate.reason ?? "no reason"}`,
+              );
+              continue;
+            }
+
             const importance = mapped.category === "decision" ? 0.85 : 0.8;
             const baseMetadata = buildReflectionMappedMetadata({
               mappedItem: mapped,
@@ -5025,6 +5146,9 @@ const memoryLanceDBProPlugin = {
             });
             // embed heading in metadata JSON so it survives bulkStore round-trip to LanceDB
             baseMetadata._reflectionHeading = mapped.heading;
+            if (mappedGate.auditJson) {
+              baseMetadata.admission_audit = mappedGate.auditJson;
+            }
             const metadata = JSON.stringify(baseMetadata);
 
             mappedEntries.push({
@@ -5953,6 +6077,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       })()
       : undefined,
     extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+    batchChunkSize: clampBatchChunkSize(cfg.batchChunkSize),
     extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
     scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,
     enableManagementTools: cfg.enableManagementTools === true,
@@ -6046,7 +6171,11 @@ export function parsePluginConfig(value: unknown): PluginConfig {
             : undefined,
         }
         : undefined,
-    admissionControl: normalizeAdmissionControlConfig(cfg.admissionControl),
+    admissionControl: normalizeAdmissionControlConfig(
+      cfg.admissionControl && typeof cfg.admissionControl === "object"
+        ? { batchChunkSize: clampBatchChunkSize(cfg.batchChunkSize), ...(cfg.admissionControl as Record<string, unknown>) }
+        : cfg.admissionControl,
+    ),
     memoryCompaction: (() => {
       const raw =
         typeof cfg.memoryCompaction === "object" && cfg.memoryCompaction !== null

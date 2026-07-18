@@ -5,6 +5,23 @@
 import OpenAI from "openai";
 import { buildOauthEndpoint, extractOutputTextFromSse, loadOAuthSession, needsRefresh, normalizeOauthModel, refreshOAuthSession, saveOAuthSession, } from "./llm-oauth.js";
 /**
+ * Strips a core-style provider prefix (e.g. "openrouter/anthropic/claude-...")
+ * down to the bare "<vendor>/<model>" form a direct OpenRouter-compatible API
+ * needs. Any other prefix, or a string with no "/", passes through unchanged.
+ */
+export function normalizeDirectModelRef(modelRef) {
+    const trimmed = modelRef.trim();
+    const idx = trimmed.indexOf("/");
+    if (idx <= 0)
+        return trimmed;
+    const provider = trimmed.slice(0, idx).trim().toLowerCase();
+    if (provider !== "openrouter")
+        return trimmed;
+    const rest = trimmed.slice(idx + 1).trim();
+    return rest || trimmed;
+}
+const DEFAULT_SYSTEM_PROMPT = "You are a memory extraction assistant. Always respond with valid JSON only.";
+/**
  * Extract JSON from an LLM response that may be wrapped in markdown fences
  * or contain surrounding text.
  */
@@ -185,7 +202,7 @@ function createApiKeyClient(config, log, warnLog) {
     });
     let lastError = null;
     return {
-        async completeJson(prompt, label = "generic") {
+        async completeJson(prompt, label = "generic", systemPrompt) {
             lastError = null;
             try {
                 const request = {
@@ -193,7 +210,7 @@ function createApiKeyClient(config, log, warnLog) {
                     messages: [
                         {
                             role: "system",
-                            content: "You are a memory extraction assistant. Always respond with valid JSON only.",
+                            content: systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
                         },
                         { role: "user", content: prompt },
                     ],
@@ -294,7 +311,7 @@ function createOauthClient(config, log, warnLog) {
         return session;
     }
     return {
-        async completeJson(prompt, label = "generic") {
+        async completeJson(prompt, label = "generic", systemPrompt) {
             lastError = null;
             try {
                 const session = await getSession();
@@ -314,7 +331,7 @@ function createOauthClient(config, log, warnLog) {
                         signal,
                         body: JSON.stringify({
                             model: normalizeOauthModel(config.model),
-                            instructions: "You are a memory extraction assistant. Always respond with valid JSON only.",
+                            instructions: systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
                             input: [
                                 {
                                     role: "user",

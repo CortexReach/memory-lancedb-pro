@@ -433,6 +433,13 @@
         "default": 4,
         "description": "Minimum conversation messages required before smart extraction runs."
       },
+      "batchChunkSize": {
+        "type": "number",
+        "minimum": 1,
+        "maximum": 50,
+        "default": 10,
+        "description": "Per-call chunk bound for every batched pipeline LLM stage (admission utility, dedup decider, merge writer, consolidate merge-content). Larger bursts split into ceil(N/batchChunkSize) calls."
+      },
       "extractMaxChars": {
         "type": "integer",
         "minimum": 256,
@@ -463,9 +470,11 @@
             "type": "string",
             "enum": [
               "standalone",
-              "off"
+              "off",
+              "batch"
             ],
-            "default": "standalone"
+            "default": "standalone",
+            "description": "standalone scores each candidate with its own LLM call; batch scores a whole extraction's candidates with one call per chunk of up to 10; off disables utility scoring entirely."
           },
           "rejectThreshold": {
             "type": "number",
@@ -478,6 +487,13 @@
             "minimum": 0,
             "maximum": 1,
             "default": 0.6
+          },
+          "utilityVetoThreshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.25,
+            "description": "Utility scores at or below this are rejected regardless of the weighted composite (0 disables the veto)"
           },
           "noveltyCandidatePoolSize": {
             "type": "integer",
@@ -496,6 +512,19 @@
           "rejectedAuditFilePath": {
             "type": "string",
             "description": "Optional JSONL file path for durable admission reject audit records. Defaults to a file beside the plugin memory data directory."
+          },
+          "model": {
+            "type": "string",
+            "description": "Optional absolute override: when set, every admission LLM call uses this model, regardless of modelAffinity."
+          },
+          "modelAffinity": {
+            "type": "string",
+            "enum": [
+              "global",
+              "lane"
+            ],
+            "default": "global",
+            "description": "lane routes reflection-mapped admission calls to memoryReflection.model instead of the global llm model; global uses the plugin's global llm model for every lane."
           },
           "recency": {
             "type": "object",
