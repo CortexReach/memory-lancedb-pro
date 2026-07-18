@@ -58,7 +58,12 @@ export const APPEND_ONLY_CATEGORIES = new Set([
     "events",
     "cases",
 ]);
-/** Durable registers: constructed content must never land in these. */
+/**
+ * Durable categories: governs fiction-register batch enforcement (an
+ * in-fiction batch can never produce durable memories) and the batch
+ * contradiction check. Per-item grounding "constructed" is dropped
+ * unconditionally in every category, so this set does not gate that rule.
+ */
 export const DURABLE_CATEGORIES = new Set([
     "profile",
     "preferences",
