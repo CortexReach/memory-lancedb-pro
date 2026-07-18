@@ -480,7 +480,7 @@ describe("AdmissionController buildUtilityPrompt (source-kind framing)", () => {
 });
 
 // ============================================================================
-// buildReflectionPrompt — system/user split (reflection distiller, JR-186)
+// buildReflectionPrompt — system/user split (reflection distiller)
 // ============================================================================
 
 describe("buildReflectionPrompt system/user split (reflection distiller)", () => {
