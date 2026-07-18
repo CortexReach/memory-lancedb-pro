@@ -6,7 +6,6 @@
  *
  */
 import { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt, } from "./extraction-prompts.js";
-import { AdmissionController, } from "./admission-control.js";
 import { ALWAYS_MERGE_CATEGORIES, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats, } from "./smart-metadata.js";
@@ -192,10 +191,7 @@ export class SmartExtractor {
                 config.admissionControl.auditMetadata !== false;
         this.onAdmissionRejected = config.onAdmissionRejected;
         this.onPersisted = config.onPersisted;
-        this.admissionController =
-            config.admissionControl?.enabled === true
-                ? new AdmissionController(this.store, this.llm, config.admissionControl, this.debugLog)
-                : null;
+        this.admissionController = config.admissionController ?? null;
     }
     /**
      * Notify the onPersisted sink (e.g. markdown mirror) after a successful

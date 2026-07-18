@@ -426,6 +426,17 @@ async function scoreUtility(llm, mode, candidate, conversationText) {
         reason: typeof response.reason === "string" ? response.reason.trim() : undefined,
     };
 }
+/**
+ * Construct an AdmissionController independently of any extraction engine.
+ * Availability depends only on the admission config's `enabled` flag, so
+ * callers that never build a SmartExtractor (e.g. smartExtraction: false)
+ * can still obtain a working controller to gate other write paths.
+ */
+export function createAdmissionController(store, llm, config, debugLog = () => { }) {
+    return config?.enabled === true
+        ? new AdmissionController(store, llm, config, debugLog)
+        : null;
+}
 export class AdmissionController {
     store;
     llm;

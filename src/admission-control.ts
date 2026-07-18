@@ -627,6 +627,23 @@ async function scoreUtility(
   };
 }
 
+/**
+ * Construct an AdmissionController independently of any extraction engine.
+ * Availability depends only on the admission config's `enabled` flag, so
+ * callers that never build a SmartExtractor (e.g. smartExtraction: false)
+ * can still obtain a working controller to gate other write paths.
+ */
+export function createAdmissionController(
+  store: MemoryStore,
+  llm: LlmClient,
+  config: AdmissionControlConfig | undefined,
+  debugLog: (msg: string) => void = () => {},
+): AdmissionController | null {
+  return config?.enabled === true
+    ? new AdmissionController(store, llm, config, debugLog)
+    : null;
+}
+
 export class AdmissionController {
   constructor(
     private readonly store: MemoryStore,
