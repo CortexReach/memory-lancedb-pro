@@ -3986,9 +3986,13 @@ const memoryLanceDBProPlugin = {
                             store: (entry) => store.store(entry),
                             onPersisted: mdMirror
                                 ? async (entry, kind) => {
-                                    const source = kind === "event" ? "reflection-slice:event"
-                                        : kind === "item-invariant" ? "reflection-slice:invariant"
-                                            : "reflection-slice:derived";
+                                    // The event row is a run-marker (kv stamp, no semantic content); the
+                                    // daily journal already records the run via its "Reflection generated"
+                                    // line, so mirroring the stamp only adds a content-less entry.
+                                    if (kind === "event")
+                                        return;
+                                    const source = kind === "item-invariant" ? "reflection-slice:invariant"
+                                        : "reflection-slice:derived";
                                     await mdMirror({ text: entry.text, category: entry.category, scope: entry.scope, timestamp: entry.timestamp }, { source, agentId: sourceAgentId });
                                 }
                                 : undefined,
