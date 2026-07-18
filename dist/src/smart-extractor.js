@@ -6,6 +6,7 @@
  *
  */
 import { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt, } from "./extraction-prompts.js";
+import { formatExistingMemoryEntry } from "./prompt-blocks.js";
 import { AdmissionController, } from "./admission-control.js";
 import { ALWAYS_MERGE_CATEGORIES, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
@@ -731,9 +732,8 @@ export class SmartExtractor {
         // Stage 2: LLM decision
         return this.llmDedupDecision(candidate, activeSimilar);
     }
-    async llmDedupDecision(candidate, similar) {
-        const topSimilar = similar.slice(0, MAX_SIMILAR_FOR_PROMPT);
-        const existingFormatted = topSimilar
+    formatExistingMemoriesForDedup(topSimilar) {
+        return topSimilar
             .map((r, i) => {
             // Extract L0 abstract from metadata if available, fallback to text
             let metaObj = {};
@@ -742,11 +742,14 @@ export class SmartExtractor {
             }
             catch { }
             const abstract = metaObj.l0_abstract || r.entry.text;
-            const overview = metaObj.l1_overview || "";
-            return formatExistingMemoryForDedupPrompt(i + 1, metaObj.memory_category || r.entry.category, abstract, overview, r.score);
+            return formatExistingMemoryEntry(i + 1, metaObj.memory_category || r.entry.category, abstract, r.score);
         })
             .join("\n");
-        const { system, user: userPrompt } = buildDedupPrompt(candidate.abstract, candidate.overview, candidate.content, existingFormatted);
+    }
+    async llmDedupDecision(candidate, similar) {
+        const topSimilar = similar.slice(0, MAX_SIMILAR_FOR_PROMPT);
+        const existingFormatted = this.formatExistingMemoriesForDedup(topSimilar);
+        const { system, user: userPrompt } = buildDedupPrompt(candidate, existingFormatted);
         try {
             const data = await this.llm.completeJson(userPrompt, "dedup-decision", system);
             if (!data) {
@@ -859,7 +862,7 @@ export class SmartExtractor {
             return;
         }
         // Call LLM to merge
-        const { system, user: userPrompt } = buildMergePrompt(existingAbstract, existingOverview, existingContent, candidate.abstract, candidate.overview, candidate.content, candidate.category);
+        const { system, user: userPrompt } = buildMergePrompt({ abstract: existingAbstract, overview: existingOverview, content: existingContent }, candidate);
         const merged = await this.llm.completeJson(userPrompt, "merge-memory", system);
         if (!merged) {
             this.log("memory-pro: smart-extractor: merge LLM failed, skipping merge");

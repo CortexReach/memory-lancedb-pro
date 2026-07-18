@@ -1,4 +1,6 @@
 import { join } from "node:path";
+import { ADMISSION_JUDGE_IDENTITY, CATEGORY_TAXONOMY, SCORE_TIER_RUBRIC } from "./prompt-blocks.js";
+import { formatCandidateBlock, jsonShape } from "./prompt-blocks.js";
 import { parseSmartMetadata } from "./smart-metadata.js";
 const DEFAULT_WEIGHTS = {
     utility: 0.1,
@@ -308,44 +310,25 @@ function cosineSimilarity(left, right) {
         return 0;
     return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
 }
-function buildUtilityPrompt(candidate, conversationText, sourceKind = "conversation") {
-    const excerpt = conversationText.length > 3000
-        ? conversationText.slice(-3000)
-        : conversationText;
-    const system = `You are an admission judge. Evaluate whether a candidate memory is worth keeping for future cross-session interactions.
+function buildUtilityPrompt(candidate) {
+    const system = `${ADMISSION_JUDGE_IDENTITY} Evaluate whether this candidate memory is worth keeping for future cross-session interactions.
+
+${CATEGORY_TAXONOMY}
 
 Score future usefulness on a 0.0-1.0 scale.
 
-Use higher scores for durable preferences, profile facts, reusable procedures, and long-lived project/entity state.
-Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
+${SCORE_TIER_RUBRIC}
 
---- EXAMPLE (not part of the live data) ---
-Candidate memory:
-- Category: preferences
-- Abstract: User's preferred name is Alex
+Grounding rule: this candidate's own grounding tag already passed the deterministic pre-admission check (a "constructed" tag is rejected before this scoring ever runs), but a mistagged or legacy candidate can still describe a claim that is true only WITHIN a fiction — a persona's invented trait from roleplay, a game's rules or score, drafted fiction, a hypothetical, or sample data. If the candidate's own content shows such a constructed frame and its claim lives inside it rather than being a claim ABOUT the fiction (e.g. that a session/game happened), score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity is a claim ABOUT the fiction and may still score moderately.
 
-Example response:
-{"utility": 0.9, "reason": "durable identity fact"}
---- END EXAMPLE ---
-
-Return JSON only:
-{
+Return JSON only (the raw object, no markdown code fences):
+${jsonShape(`{
   "utility": 0.0,
   "reason": "short explanation"
-}`;
-    const excerptHeading = sourceKind === "reflection"
-        ? "Source document (agent reflection):"
-        : "Conversation excerpt:";
-    const user = `${excerptHeading}
-${excerpt}
+}`)}`;
+    const user = `## Candidate
 
-Candidate memory:
-- Category: ${candidate.category}
-- Abstract: ${candidate.abstract}
-
-- Overview: ${candidate.overview.replace(/\n/g, "\n  ")}
-
-- Content: ${candidate.content.replace(/\n/g, "\n  ")}`;
+${formatCandidateBlock(1, candidate)}`;
     return { system, user };
 }
 function buildReason(details) {
@@ -427,7 +410,7 @@ async function scoreUtility(llm, mode, candidate, conversationText, sourceKind =
     }
     let response = null;
     try {
-        const { system, user } = buildUtilityPrompt(candidate, conversationText, sourceKind);
+        const { system, user } = buildUtilityPrompt(candidate);
         response = await llm.completeJson(user, "admission-utility", system);
     }
     catch {

@@ -1473,9 +1473,9 @@ export function buildReflectionPrompt(
       .join("\n")
     : "- (none)";
   const system = [
-    "You are a memory reflection distiller. Generate a durable MEMORY REFLECTION entry for an AI assistant system.",
+    "You are a memory reflection distiller agent. You distill a completed session into one durable MEMORY REFLECTION entry for an AI assistant system.",
     "",
-    "Output Markdown only. No intro text. No outro text. No extra headings.",
+    "Output Markdown only. Do not wrap the output in a code fence. No intro text. No outro text. No extra headings.",
     "",
     "Use these headings exactly once, in this exact order, with exact spelling:",
     "## Context (session background)",
