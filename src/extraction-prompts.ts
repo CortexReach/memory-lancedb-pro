@@ -35,7 +35,7 @@ ${conversationText}
 - Runtime scaffolding or orchestration wrappers such as "[Subagent Context]", "[Subagent Task]", bootstrap wrappers, task envelopes, or agent instructions — these are execution metadata, NEVER store them as memories
 - Recall queries / meta-questions: "Do you remember X?", "你还记得X吗?", "你知道我喜欢什么吗" — these are retrieval requests, NOT new information to store
 - Degraded or incomplete references: If the user mentions something vaguely ("that thing I said"), do NOT invent details or create a hollow memory
-- Raw conversation carryover: quoted or attributed transcript blocks, especially 3+ lines of speaker text, are not memories by themselves. Distill a concrete profile fact, preference, entity state, event, case, or pattern from them or skip.
+- Raw conversation carryover: quoted or attributed transcript blocks, especially 3+ lines of speaker text, are not memories by themselves. Distill a concrete profile detail, preference, entity state, event, case, or pattern from them or skip.
 - System/runtime artifacts: content containing "System:", compaction notices, model-switch/session-reset traces, tool-call transcripts, raw JSON blobs, or similar internal execution traces must be rejected unless a clean user fact can be extracted.
 - Fragment blobs: mixed filename shards, code snippets, metadata fields, or partial sentences that look like unprocessed context fragments should be skipped rather than preserved.
 - Atomic memory shape: each stored memory must read like one atomic profile fact, preference, entity state, event, case, or pattern. If a candidate reads like an excerpt, log, or raw transcript, compress it into one atomic statement or skip it.
@@ -86,19 +86,23 @@ Set the top-level "conversation_register" field:
 
 ## Per-item grounding
 
+Grounding describes the truth-grounding of the ASSERTION ITSELF, not which register the conversation happened in. Ask: is this claim true about the real world, or true only inside the fiction?
+
 Tag every memory's "grounding" field:
 
 | grounding | Meaning |
 |-----------|---------|
-| "real" | An assertion about the actual user, the real world, or this real working session — including a genuine first-person aside stated in passing during a game (e.g. "btw my flight is Tuesday") |
-| "constructed" | An assertion whose truth exists only inside an in-conversation constructed context: a game's rules/scores/bets, a role or persona's claims, drafted fiction, a hypothetical ("suppose X"), or sample/test data being manipulated |
+| "real" | The assertion is about the real world — INCLUDING an assertion ABOUT the fiction (e.g. "user and assistant played a one-round roleplay game where user was Admiral Vex" is a true statement about a real session, even though it describes fictional play). Also covers a genuine first-person aside stated in passing during a game (e.g. "btw my flight is Tuesday") |
+| "constructed" | The assertion holds only WITHIN the fiction — true in-character, in-game, or in-story, but not a fact about the real user or the real world (e.g. "user's favorite drink is plasma coffee", a persona's invented backstory, a game's score or rules) |
+
+One-line rule: **about-the-fiction is real; within-the-fiction is constructed.**
 
 Rules:
 - Grounding is judged PER ITEM, on that item's own content. There is no expected number of "real" or "constructed" tags per batch: a batch may be all-real, all-constructed, or anything between.
-- If the conversation is in-character or mid-fiction, EVERY item derived from the narrative is "constructed" — an all-constructed batch is the normal result for such input.
-- Do NOT lift any in-context proposition — an invented rule, a score, a bet, a persona's claim — into profile, preferences, entities, cases, or patterns. From a constructed frame, the only extractable memory is a session-scoped "events" note that the real participants did the activity; the storage layer keeps at most one such note per extraction. That cap is a storage rule applied after tagging — it is NOT a tagging quota, so never re-tag extra items "real" to fit under it.
+- A session-scoped "events" note that the real participants engaged in a game, roleplay, or other fiction is a REAL assertion — it is a true statement about what happened in the real session, not a claim that lives inside the fiction. Extract it like any other events item, under its natural category, with grounding "real".
+- Do NOT lift any in-character proposition — an invented rule, a score, a bet, a persona's claim, a fictional preference or trait — into profile, preferences, entities, cases, or patterns. Such claims are true only within the fiction; if you extract one at all, tag it "constructed" so it is never mistaken for a fact about the real user.
 - A real aside spoken during play is still "real" and should be extracted normally under its natural category, even though it occurred inside a constructed register.
-- Self-consistency check before answering: items derived from the same fictional frame must share the same grounding tag. If your draft tags one game-derived item "constructed" and another game-derived item "real", re-check the batch — either the item is a genuine out-of-character aside, or its tag is wrong.
+- Self-consistency check before answering: an item asserting what happened in the real session (including a session that was itself a game) is "real"; an item asserting a claim that is only true inside the story/game/persona is "constructed". If your draft tags the session-summary note itself as "constructed", re-check — it almost certainly describes a real event and should be "real".
 - If you are genuinely unsure about a single item, default to "real" — under-tagging as constructed risks losing a genuine fact.
 
 # Three-Level Structure
@@ -156,7 +160,7 @@ Each example is a full output batch, because register and grounding are judged t
 }
 \`\`\`
 
-## Mid-game conversation (register "fiction", ALL items constructed)
+## Mid-game conversation (register "fiction", session note is real; canon is not extracted)
 Input was one round of an in-character guessing game where a persona claimed to live on a moon base and named an invented drink.
 \`\`\`json
 {
@@ -167,12 +171,12 @@ Input was one round of an in-character guessing game where a persona claimed to 
       "abstract": "agent-one and agent-two ran a two-round puzzle exercise",
       "overview": "## What happened\\n- Two agents played a puzzle guessing game with invented rules and a bet",
       "content": "agent-one and agent-two ran a two-round puzzle guessing exercise. The house rules, scores, and bet are part of the game, not durable facts.",
-      "grounding": "constructed"
+      "grounding": "real"
     }
   ]
 }
 \`\`\`
-Note: the persona's home, the invented drink, the house rule, and the bet are NOT extracted at all — not as profile, not as preferences, not as entities. The whole batch carries "constructed" tags; that is the expected shape for mid-fiction input.
+Note: the persona's home, the invented drink, the house rule, and the bet are NOT extracted at all — not as profile, not as preferences, not as entities. This session note is a true statement about a real session (the session happened), so it carries grounding "real" even though the batch register is "fiction" — about-the-fiction is real.
 
 ## Game with a genuine out-of-character aside (register "mixed")
 \`\`\`json
@@ -191,7 +195,7 @@ Note: the persona's home, the invented drink, the house rule, and the bet are NO
       "abstract": "User and assistant played a riddle game",
       "overview": "## What happened\\n- One riddle game session",
       "content": "User and assistant played a short riddle game this session.",
-      "grounding": "constructed"
+      "grounding": "real"
     }
   ]
 }

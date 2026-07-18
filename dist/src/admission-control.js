@@ -334,7 +334,7 @@ Use higher scores for durable profile facts, preferences, entity state, patterns
 Use moderate scores for events worth an episodic record.
 Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
 
-Grounding rule: content asserted only inside roleplay, a game, fiction, a hypothetical, or a simulation is not a fact about the real user. If the excerpt shows a constructed frame (game rules, personas, "let's play", "suppose", canon of an invented world) and the candidate's claim lives inside that frame, score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity may still score moderately.
+Grounding rule: this candidate's own grounding tag already passed the deterministic pre-admission check (a "constructed" tag is rejected before this scoring ever runs), but a mistagged or legacy candidate can still describe a claim that is true only WITHIN a fiction — a persona's invented trait from roleplay, a game's rules or score, drafted fiction, a hypothetical, or sample data. If the candidate's own content shows such a constructed frame and its claim lives inside it rather than being a claim ABOUT the fiction (e.g. that a session/game happened), score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity is a claim ABOUT the fiction and may still score moderately.
 
 Return JSON only:
 {
@@ -461,7 +461,7 @@ export class AdmissionController {
         this.config = config;
         this.debugLog = debugLog;
     }
-    rejectConstructedDurable(candidate, now) {
+    rejectConstructed(candidate, now) {
         const featureScores = {
             utility: 0,
             confidence: 0,
@@ -469,7 +469,7 @@ export class AdmissionController {
             recency: 0,
             typePrior: 0,
         };
-        const reason = `Admission rejected (constructed-grounding candidate targeting durable category "${candidate.category}"; deterministic pre-admission short-circuit, no LLM call).`;
+        const reason = `Admission rejected (constructed-grounding candidate category "${candidate.category}"; deterministic pre-admission short-circuit, no LLM call).`;
         const audit = {
             version: "amac-v1",
             decision: "reject",
@@ -488,7 +488,7 @@ export class AdmissionController {
             grounding: candidate.grounding,
             conversation_register: candidate.conversationRegister,
         };
-        this.debugLog(`memory-lancedb-pro: admission-control: decision=reject (constructed durable short-circuit) candidate=${JSON.stringify(candidate.abstract.slice(0, 80))}`);
+        this.debugLog(`memory-lancedb-pro: admission-control: decision=reject (constructed short-circuit) candidate=${JSON.stringify(candidate.abstract.slice(0, 80))}`);
         return { decision: "reject", audit };
     }
     async loadRelevantMatches(candidate, candidateVector, scopeFilter) {
@@ -508,13 +508,13 @@ export class AdmissionController {
     async evaluate(params) {
         const now = params.now ?? Date.now();
         // Deterministic pre-admission short-circuit: a candidate tagged
-        // "constructed" must never occupy a durable register, no matter how any
-        // downstream score would blend. Reject before any LLM call. Candidates
-        // without grounding metadata (legacy payloads) fall through to normal
-        // scoring.
-        if (params.candidate.grounding === "constructed" &&
-            DURABLE_CATEGORIES.has(params.candidate.category)) {
-            return this.rejectConstructedDurable(params.candidate, now);
+        // "constructed" is true only within the fiction, never about the real
+        // world — it must never be stored, in any category or register, no
+        // matter how any downstream score would blend. Reject before any LLM
+        // call. Candidates without grounding metadata (legacy payloads) fall
+        // through to normal scoring.
+        if (params.candidate.grounding === "constructed") {
+            return this.rejectConstructed(params.candidate, now);
         }
         const relevantMatches = await this.loadRelevantMatches(params.candidate, params.candidateVector, params.scopeFilter);
         const utility = await scoreUtility(this.llm, this.config.utilityMode, params.candidate, params.conversationText);

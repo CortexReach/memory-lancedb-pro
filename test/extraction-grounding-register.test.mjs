@@ -1,13 +1,15 @@
 /**
- * Regression tests for grounding-aware extraction (Option A) and the
- * scope-glob extraction-policy knob (Option C).
+ * Regression tests for grounding-aware extraction (Option A, v3 semantics)
+ * and the scope-glob extraction-policy knob (Option C).
  *
  * extractCandidates() tags each raw candidate "grounding": "real" | "constructed".
- * A deterministic post-filter drops constructed candidates typed as
- * profile/preferences/entities/cases/patterns, and allows at most one
- * session-scoped "events" note per extraction for a constructed register
- * (game/roleplay/fiction/hypothetical). A genuine first-person aside spoken
- * during play is tagged "real" and must survive under its natural category.
+ * v3 grounding is about the truth-grounding of the ASSERTION itself, not which
+ * register the conversation happened in: "real" includes an assertion ABOUT a
+ * fiction/game session (e.g. that the session happened); "constructed" is a
+ * claim true only WITHIN the fiction (game canon, a persona's invented traits).
+ * A constructed-tagged candidate is NEVER stored, in any category or register —
+ * there is no per-extraction cap. A genuine first-person aside spoken during
+ * play is tagged "real" and must survive under its natural category.
  *
  * Fixtures are entirely synthetic (agent-one/agent-two, invented game
  * content) — no real fleet data.
@@ -128,23 +130,32 @@ const GAME_CANDIDATES = [
     abstract: "House rule: puzzle answers must be even numbers",
     overview: "## Rule\n- Even numbers only",
     content: "agent-two's puzzle house rule is that answers must always be even numbers.",
-    grounding: "constructed",
+    grounding: "constructed", // within-the-fiction: true only inside the game's rules
   },
   {
     category: "cases",
     abstract: "Puzzle round 2 answer was 8",
     overview: "## Answer\n- 8",
     content: "The round 2 puzzle answer was 8, so agent-two won the bet.",
-    grounding: "constructed",
+    grounding: "constructed", // within-the-fiction: true only inside the game's outcome
   },
   {
     category: "events",
     abstract: "agent-one and agent-two ran a two-round puzzle exercise",
     overview: "## What happened\n- Two agents played a puzzle guessing game",
     content: "agent-one and agent-two ran a two-round puzzle guessing exercise with an invented house rule and a bet.",
-    grounding: "constructed",
+    grounding: "real", // about-the-fiction: a true statement that the session happened
   },
 ];
+
+/** A within-the-fiction plot beat — true only inside the story, not a real occurrence. */
+const CONSTRUCTED_PLOT_EVENT = {
+  category: "events",
+  abstract: "Admiral Vex's ship was boarded by pirates",
+  overview: "## In-story plot beat\n- Ship boarded mid-roleplay",
+  content: "In the roleplay, Admiral Vex's ship was boarded by pirates.",
+  grounding: "constructed",
+};
 
 const REAL_ASIDE_CANDIDATE = {
   category: "events",
@@ -175,8 +186,8 @@ const FACTUAL_CANDIDATES = [
 // Option A — grounding-aware extraction
 // ============================================================================
 
-describe("SmartExtractor grounding-aware extraction (Option A)", () => {
-  it("drops constructed non-events candidates from a game transcript, keeping only the episodic events note", async () => {
+describe("SmartExtractor grounding-aware extraction (Option A, v3)", () => {
+  it("drops constructed candidates from a game transcript, keeping only the real session-events note", async () => {
     const store = makeStore();
     const llm = makeLlm(GAME_CANDIDATES);
     const extractor = makeExtractor(makeEmbedder(), llm, store);
@@ -184,27 +195,27 @@ describe("SmartExtractor grounding-aware extraction (Option A)", () => {
     const stats = await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
 
     const categories = persistedCategories(store);
-    assert.deepEqual(categories, ["events"], "only the single constructed-but-episodic events note should survive");
+    assert.deepEqual(categories, ["events"], "only the real (about-the-fiction) session-events note should survive");
     assert.equal(stats.created, 1);
   });
 
-  it("caps constructed events notes at one per extraction", async () => {
+  it("drops a constructed-tagged events candidate too — no cap, unconditional drop regardless of category", async () => {
     const store = makeStore();
-    const twoEventsNotes = [
-      GAME_CANDIDATES[2],
+    const twoConstructedEventsNotes = [
+      CONSTRUCTED_PLOT_EVENT,
       {
-        ...GAME_CANDIDATES[2],
-        abstract: "agent-one and agent-two also played a second puzzle round",
+        ...CONSTRUCTED_PLOT_EVENT,
+        abstract: "Admiral Vex also repelled a second boarding attempt",
       },
     ];
-    const llm = makeLlm(twoEventsNotes);
+    const llm = makeLlm(twoConstructedEventsNotes);
     const extractor = makeExtractor(makeEmbedder(), llm, store);
 
     const stats = await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
 
     const categories = persistedCategories(store);
-    assert.equal(categories.length, 1, "only the first constructed events note should survive the cap");
-    assert.equal(stats.created, 1);
+    assert.equal(categories.length, 0, "constructed-tagged events candidates are dropped unconditionally in v3 — the old one-per-extraction cap no longer applies");
+    assert.equal(stats.created, 0);
   });
 
   it("keeps a genuine real first-person aside stated during play (false-positive guard)", async () => {
@@ -219,10 +230,26 @@ describe("SmartExtractor grounding-aware extraction (Option A)", () => {
       abstracts.some((a) => a.includes("laptop arrives Thursday")),
       "the real aside must survive even though it was stated during a constructed register",
     );
-    // The constructed episodic note + the real aside both land as "events".
+    // The real session-events note + the real aside both land as "events".
     const categories = persistedCategories(store);
     assert.equal(categories.filter((c) => c === "events").length, 2);
     assert.equal(categories.length, 2, "constructed non-events candidates must still be dropped");
+  });
+
+  it("invariant: no stored row ever carries grounding 'constructed' — events included, no cap logic remains", async () => {
+    const store = makeStore();
+    const llm = makeLlm(
+      [GAME_CANDIDATES[0], GAME_CANDIDATES[1], CONSTRUCTED_PLOT_EVENT, GAME_CANDIDATES[2]],
+      "mixed",
+    );
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    const stats = await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    const metas = store.bulkStoreCalls.flat().map((e) => JSON.parse(e.metadata || "{}"));
+    assert.ok(metas.every((m) => m.grounding !== "constructed"), "no persisted row may carry grounding: constructed");
+    assert.deepEqual(persistedCategories(store), ["events"], "only the real session-events note survives; every constructed-tagged candidate is dropped regardless of category");
+    assert.equal(stats.created, 1);
   });
 
   it("leaves a purely factual transcript unchanged (regression guard)", async () => {
@@ -250,13 +277,15 @@ describe("SmartExtractor grounding-aware extraction (Option A)", () => {
     assert.equal(stats.created, 2, "non-string/unrecognized grounding values must fail open to 'real' and be kept");
   });
 
-  it("buildExtractionPrompt documents the grounding contract (structural check)", async () => {
+  it("buildExtractionPrompt documents the v3 grounding contract (structural check)", async () => {
     const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
     const prompt = buildExtractionPrompt("some conversation", "test-user");
 
     assert.match(prompt, /grounding/i);
     assert.match(prompt, /"real"\s*\|\s*"constructed"|real.*constructed/i);
-    assert.match(prompt, /at most one/i);
+    assert.match(prompt, /about-the-fiction is real/i, "the v3 about/within one-line rule must be present");
+    assert.match(prompt, /within-the-fiction/i, "the within-the-fiction definition of constructed must be present");
+    assert.doesNotMatch(prompt, /at most one/i, "the per-extraction constructed cap must be fully removed from the prompt");
   });
 });
 
@@ -331,21 +360,21 @@ const MISLABELED_FICTION_CANDIDATES = [
     abstract: "User lives in Moon Base 9",
     overview: "## Background\n- Residence: Moon Base 9",
     content: "User lives in Moon Base 9.",
-    grounding: "real", // wrong: asserted only inside the game canon
+    grounding: "real", // wrong: within-the-fiction canon should be "constructed"
   },
   {
     category: "preferences",
     abstract: "Favorite drink is nebula tea",
     overview: "## Preference\n- Drink: nebula tea",
     content: "User's favorite drink is nebula tea.",
-    grounding: "real", // wrong: asserted only inside the game canon
+    grounding: "real", // wrong: within-the-fiction canon should be "constructed"
   },
   {
     category: "events",
     abstract: "User and assistant played one round of a space roleplay game",
     overview: "## What happened\n- One roleplay round",
     content: "User and assistant played one round of a space roleplay game this session.",
-    grounding: "constructed",
+    grounding: "real", // correct under v3: about-the-fiction, a true statement that the session happened
   },
 ];
 
@@ -366,7 +395,7 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
     assert.equal(stats.created, 1);
   });
 
-  it("register 'fiction' caps events notes at one, regardless of per-item tags", async () => {
+  it("register 'fiction' no longer caps events notes — real session-events notes all survive (v3: cap removed)", async () => {
     const store = makeStore();
     const llm = makeLlm(
       [
@@ -374,7 +403,6 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
         {
           ...MISLABELED_FICTION_CANDIDATES[2],
           abstract: "User and assistant also played a bonus round",
-          grounding: "real", // tag wobble: still capped by the register rule
         },
       ],
       "fiction",
@@ -383,15 +411,15 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
 
     await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
 
-    assert.equal(persistedCategories(store).length, 1);
+    assert.equal(persistedCategories(store).length, 2, "both real session-events notes survive; the v2 one-per-extraction cap no longer applies");
   });
 
-  it("register 'mixed' with a constructed sibling demotes real-tagged durables (batch contradiction check)", async () => {
+  it("register 'mixed' with a constructed sibling demotes real-tagged durables (batch contradiction check) and drops the constructed sibling itself", async () => {
     const store = makeStore();
     const llm = makeLlm(
       [
-        MISLABELED_FICTION_CANDIDATES[0], // profile tagged real
-        MISLABELED_FICTION_CANDIDATES[2], // events tagged constructed — the contradiction evidence
+        MISLABELED_FICTION_CANDIDATES[0], // profile tagged real (mislabeled)
+        CONSTRUCTED_PLOT_EVENT, // events tagged constructed — the contradiction evidence, and itself dropped unconditionally
         REAL_ASIDE_CANDIDATE, // real events aside must still survive
       ],
       "mixed",
@@ -402,21 +430,21 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
 
     const categories = persistedCategories(store);
     assert.ok(!categories.includes("profile"), "real-tagged durable must be demoted in a mixed-register batch with constructed siblings");
-    assert.equal(categories.filter((c) => c === "events").length, 2, "both events notes (constructed episodic + real aside) survive");
+    assert.deepEqual(categories, ["events"], "only the real aside survives: the constructed plot event is dropped unconditionally (v3), profile demoted by contradiction check");
   });
 
-  it("register 'real' fully trusts per-item tags (durables kept alongside a constructed events note)", async () => {
+  it("register 'real' fully trusts per-item tags for durables, but still drops a constructed-tagged item regardless of register", async () => {
     const store = makeStore();
     const llm = makeLlm(
-      [FACTUAL_CANDIDATES[0], MISLABELED_FICTION_CANDIDATES[2]],
+      [FACTUAL_CANDIDATES[0], CONSTRUCTED_PLOT_EVENT],
       "real",
     );
     const extractor = makeExtractor(makeEmbedder(), llm, store);
 
     await extractor.extractAndPersist("mostly factual conversation with a brief game", "s1");
 
-    const categories = persistedCategories(store).sort();
-    assert.deepEqual(categories, ["events", "preferences"], "register 'real' must not demote per-item-real durables");
+    const categories = persistedCategories(store);
+    assert.deepEqual(categories, ["preferences"], "durable real-tagged preference survives; the constructed-tagged item is dropped even though the register is 'real'");
   });
 
   it("missing register (legacy payload) with no constructed tags behaves exactly as before", async () => {
@@ -436,8 +464,19 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
     // This is the compound path a malformed extraction response could realistically hit
     // (a legacy or dropped conversation_register field alongside a real constructed note),
     // which the existing per-register tests don't individually cover.
+    //
+    // MISLABELED_FICTION_CANDIDATES[2] no longer fits this fixture's role under v3: that
+    // abstract ("the session happened") is now correctly tagged "real" (about-the-fiction),
+    // so it can no longer arm the wipe. Seed an explicit constructed sibling instead
+    // (CONSTRUCTED_PLOT_EVENT, a within-the-fiction plot beat) alongside a genuine real
+    // events aside so something still survives to prove the durable-only wipe, not a
+    // blanket drop of everything.
     const store = makeStore();
-    const llm = makeLlm([...FACTUAL_CANDIDATES, MISLABELED_FICTION_CANDIDATES[2]]); // no conversation_register field
+    const llm = makeLlm([
+      FACTUAL_CANDIDATES[0], // preferences, durable — must be wiped by the constructed sibling below
+      CONSTRUCTED_PLOT_EVENT, // within-the-fiction: arms the wipe, and is itself dropped unconditionally
+      REAL_ASIDE_CANDIDATE, // real events aside must still survive
+    ]); // no conversation_register field
     const extractor = makeExtractor(makeEmbedder(), llm, store);
 
     const stats = await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
@@ -466,7 +505,7 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
     const eventsMeta = metas.find((m) => m.memory_category === "events");
     assert.equal(prefMeta.grounding, "real");
     assert.equal(prefMeta.conversation_register, "real");
-    assert.equal(eventsMeta.grounding, "constructed");
+    assert.equal(eventsMeta.grounding, "real");
     assert.equal(eventsMeta.conversation_register, "real");
   });
 
@@ -476,9 +515,8 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
 
     assert.match(prompt, /conversation_register/);
     assert.match(prompt, /"real\|mixed\|fiction"/);
-    assert.match(prompt, /storage rule applied after tagging/i, "the cap must be framed as a storage rule, not a tagging quota");
-    assert.match(prompt, /all-constructed batch/i, "all-constructed batches must be documented as normal");
     assert.match(prompt, /self-consistency/i, "the batch self-consistency instruction must be present");
+    assert.doesNotMatch(prompt, /storage rule applied after tagging/i, "the deleted per-extraction cap language must not remain in the prompt");
   });
 });
 
@@ -529,16 +567,16 @@ describe("AdmissionController grounding awareness (grounding v2)", () => {
     assert.equal(evaluation.audit.conversation_register, "fiction");
   });
 
-  it("constructed events candidates still go through normal scoring (only durables short-circuit)", async () => {
+  it("v3: short-circuits constructed candidates of ANY category to reject with zero LLM calls (total enforcement)", async () => {
     const llm = makeAdmissionLlm();
     const controller = new AdmissionController(admissionStore, llm, balanced);
 
     const evaluation = await controller.evaluate({
       candidate: {
         category: "events",
-        abstract: "User and assistant played one round of a space roleplay game",
-        overview: "## What happened\n- One roleplay round",
-        content: "User and assistant played one round of a space roleplay game this session.",
+        abstract: "Admiral Vex's ship was boarded by pirates",
+        overview: "## In-story plot beat\n- Ship boarded mid-roleplay",
+        content: "In the roleplay, Admiral Vex's ship was boarded by pirates.",
         grounding: "constructed",
         conversationRegister: "fiction",
       },
@@ -547,7 +585,9 @@ describe("AdmissionController grounding awareness (grounding v2)", () => {
       scopeFilter: ["global"],
     });
 
-    assert.equal(llm.utilityCalls, 1, "events candidates use the normal scoring path");
+    assert.equal(evaluation.decision, "reject");
+    assert.equal(llm.utilityCalls, 0, "v3 total enforcement must short-circuit events too, not just durable categories");
+    assert.match(evaluation.audit.reason, /constructed-grounding/);
     assert.equal(evaluation.audit.grounding, "constructed");
   });
 
@@ -586,7 +626,7 @@ describe("AdmissionController grounding awareness (grounding v2)", () => {
         abstract: "User and assistant played one round of a space roleplay game",
         overview: "",
         content: "One roleplay round happened.",
-        grounding: "constructed",
+        grounding: "real", // v3: real candidates reach normal scoring; constructed short-circuits before this prompt is ever built
         conversationRegister: "fiction",
       },
       candidateVector: [1, 0, 0],
@@ -596,8 +636,13 @@ describe("AdmissionController grounding awareness (grounding v2)", () => {
 
     assert.equal(llm.prompts.length, 1);
     const prompt = llm.prompts[0];
-    assert.match(prompt, /Grounding: constructed/);
-    assert.match(prompt, /Conversation register: fiction/);
+    // The judge does not see a per-candidate "Grounding:"/"Conversation
+    // register:" field (the candidate block is transcript-free and shared
+    // with every other admission path) -- grounding enforcement rides the
+    // deterministic constructed short-circuit (this candidate is "real", so
+    // it reaches normal scoring) plus this prose rule paragraph, both
+    // carried in the system prompt.
+    assert.match(prompt, /roleplay|fiction|hypothetical|simulation/i);
     for (const register of ["profile", "preferences", "entities", "events", "cases", "patterns"]) {
       assert.match(prompt, new RegExp(register), `utility prompt must name the ${register} register`);
     }

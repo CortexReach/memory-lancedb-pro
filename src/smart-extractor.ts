@@ -873,7 +873,6 @@ export class SmartExtractor {
     let policyDroppedCount = 0;
     let constructedDroppedCount = 0;
     let fictionRegisterDroppedCount = 0;
-    let constructedEpisodicUsed = false;
     let batchHasConstructedTag = false;
     for (const raw of result.memories) {
       if (!raw || typeof raw !== "object") {
@@ -922,12 +921,13 @@ export class SmartExtractor {
         continue;
       }
 
-      // Option A: grounding-aware register filter. Missing/non-string/unrecognized
+      // Option A / v3: grounding-aware filter. Missing/non-string/unrecognized
       // per-item values fail open to "real" so a model that ignores the field
-      // can't break extraction. Constructed content (games, roleplay, fiction,
-      // hypotheticals, sample data) never becomes a durable profile/preferences/
-      // entities/cases/patterns memory; at most one constructed "events" note per
-      // extraction records that the real participants did the activity.
+      // can't break extraction. Grounding describes the truth-grounding of the
+      // ASSERTION itself: "real" includes an assertion ABOUT a fiction/game
+      // session (e.g. that it happened); "constructed" is a claim true only
+      // WITHIN the fiction. A constructed-tagged candidate is never stored,
+      // in any category or register — there is no per-extraction cap anymore.
       const rawGrounding =
         typeof raw.grounding === "string" ? raw.grounding.toLowerCase().trim() : "";
       const grounding: CandidateGrounding =
@@ -936,42 +936,26 @@ export class SmartExtractor {
         batchHasConstructedTag = true;
       }
 
-      if (conversationRegister === "fiction") {
-        // Register enforcement: an in-fiction batch can never produce durable
-        // memories, whatever the per-item self-tags claim (the per-item tags
-        // are exactly the wobble the batch register exists to override), and
-        // keeps at most one session-scoped events note.
-        if (DURABLE_CATEGORIES.has(category)) {
-          fictionRegisterDroppedCount++;
-          this.debugLog(
-            `memory-lancedb-pro: smart-extractor: dropping durable candidate from fiction-register batch category=${category} grounding=${grounding} abstract=${JSON.stringify(abstract.slice(0, 120))}`,
-          );
-          continue;
-        }
-        if (constructedEpisodicUsed) {
-          fictionRegisterDroppedCount++;
-          this.debugLog(
-            `memory-lancedb-pro: smart-extractor: dropping extra events candidate from fiction-register batch (cap 1 per extraction) abstract=${JSON.stringify(abstract.slice(0, 120))}`,
-          );
-          continue;
-        }
-        constructedEpisodicUsed = true;
-      } else if (grounding === "constructed") {
-        if (category !== "events") {
-          constructedDroppedCount++;
-          this.debugLog(
-            `memory-lancedb-pro: smart-extractor: dropping constructed-grounding candidate outside events category=${category} abstract=${JSON.stringify(abstract.slice(0, 120))}`,
-          );
-          continue;
-        }
-        if (constructedEpisodicUsed) {
-          constructedDroppedCount++;
-          this.debugLog(
-            `memory-lancedb-pro: smart-extractor: dropping extra constructed-grounding events candidate (cap 1 per extraction) abstract=${JSON.stringify(abstract.slice(0, 120))}`,
-          );
-          continue;
-        }
-        constructedEpisodicUsed = true;
+      // Register enforcement: an in-fiction batch can never produce durable
+      // memories, whatever the per-item self-tags claim (the per-item tags
+      // are exactly the wobble the batch register exists to override).
+      if (conversationRegister === "fiction" && DURABLE_CATEGORIES.has(category)) {
+        fictionRegisterDroppedCount++;
+        this.debugLog(
+          `memory-lancedb-pro: smart-extractor: dropping durable candidate from fiction-register batch category=${category} grounding=${grounding} abstract=${JSON.stringify(abstract.slice(0, 120))}`,
+        );
+        continue;
+      }
+
+      // Grounding enforcement: a constructed assertion is true only within
+      // the fiction, never about the real world — never stored, regardless
+      // of category or register.
+      if (grounding === "constructed") {
+        constructedDroppedCount++;
+        this.debugLog(
+          `memory-lancedb-pro: smart-extractor: dropping constructed-grounding candidate category=${category} abstract=${JSON.stringify(abstract.slice(0, 120))}`,
+        );
+        continue;
       }
 
       candidates.push({ category, abstract, overview, content, grounding, conversationRegister });
