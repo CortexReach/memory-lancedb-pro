@@ -207,3 +207,18 @@ describe("parsePluginConfig captureAssistant normalization", () => {
     assert.equal(parsePluginConfig({ ...BASE_EMBEDDING_CONFIG, captureAssistant: null }).captureAssistant, false);
   });
 });
+
+describe("captureAssistant-conditional assistant-lines rule", () => {
+  const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
+  it("context-only rule by default: assistant lines are disambiguation context, never grounding", () => {
+    const prompt = buildExtractionPrompt("User: hi", "User");
+    assert.match(prompt, /provided only to help you understand/);
+    assert.doesNotMatch(prompt, /eligible sources in this configuration/);
+  });
+  it("captureAssistant true flips the rule: assistant lines become eligible grounding sources", () => {
+    const prompt = buildExtractionPrompt("User: hi", "User", { assistantEligible: true });
+    assert.match(prompt, /eligible sources in this configuration/);
+    assert.match(prompt, /ground it in the user's line/);
+    assert.doesNotMatch(prompt, /provided only to help you understand/);
+  });
+});

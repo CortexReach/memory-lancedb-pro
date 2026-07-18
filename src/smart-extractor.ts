@@ -280,6 +280,8 @@ export interface SmartExtractorConfig {
   extractMinMessages?: number;
   /** Maximum characters of conversation text to process. */
   extractMaxChars?: number;
+  /** Mirrors captureAssistant === true: assistant lines become eligible grounding sources instead of context-only. */
+  captureAssistantEligible?: boolean;
   /** Default scope for new memories. */
   defaultScope?: string;
   /** Logger function. */
@@ -795,7 +797,9 @@ export class SmartExtractor {
     const transcript =
       rawTranscript.length > maxChars ? rawTranscript.slice(-maxChars) : rawTranscript;
 
-    const prompt = buildExtractionPrompt(transcript, user);
+    const prompt = buildExtractionPrompt(transcript, user, {
+      assistantEligible: this.config.captureAssistantEligible === true,
+    });
 
     const result = await this.llm.completeJson<{
       memories: Array<{

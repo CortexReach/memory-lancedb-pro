@@ -1845,6 +1845,7 @@ function _initPluginState(api) {
             noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
             const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
             smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+                captureAssistantEligible: config.captureAssistant === true,
                 user: "User",
                 extractMinMessages: config.extractMinMessages ?? 4,
                 extractMaxChars: config.extractMaxChars ?? 8000,

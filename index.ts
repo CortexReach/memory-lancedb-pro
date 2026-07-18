@@ -2517,6 +2517,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
       const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
 
       smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+        captureAssistantEligible: config.captureAssistant === true,
         user: "User",
         extractMinMessages: config.extractMinMessages ?? 4,
         extractMaxChars: config.extractMaxChars ?? 8000,

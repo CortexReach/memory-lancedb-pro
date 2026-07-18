@@ -526,7 +526,9 @@ export class SmartExtractor {
             ];
         const rawTranscript = formatConversationTranscript(turns, user);
         const transcript = rawTranscript.length > maxChars ? rawTranscript.slice(-maxChars) : rawTranscript;
-        const prompt = buildExtractionPrompt(transcript, user);
+        const prompt = buildExtractionPrompt(transcript, user, {
+            assistantEligible: this.config.captureAssistantEligible === true,
+        });
         const result = await this.llm.completeJson(prompt, "extract-candidates");
         if (!result) {
             this.debugLog("memory-lancedb-pro: smart-extractor: extract-candidates returned null");
