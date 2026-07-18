@@ -5,6 +5,35 @@
 import OpenAI from "openai";
 import { buildOauthEndpoint, extractOutputTextFromSse, loadOAuthSession, needsRefresh, normalizeOauthModel, refreshOAuthSession, saveOAuthSession, } from "./llm-oauth.js";
 /**
+ * Strips a core-style provider prefix (e.g. "openrouter/anthropic/claude-...")
+ * down to the bare "<vendor>/<model>" form a direct OpenRouter-compatible API
+ * needs. Any other prefix, or a string with no "/", passes through unchanged.
+ * Shared by the host->direct transport fallback (see createLlmClient) and by
+ * admission-control.ts's per-lane model resolution, so both paths agree on
+ * exactly one definition of "what a direct client can accept."
+ */
+export function normalizeDirectModelRef(modelRef) {
+    const trimmed = modelRef.trim();
+    const idx = trimmed.indexOf("/");
+    if (idx <= 0)
+        return trimmed;
+    const provider = trimmed.slice(0, idx).trim().toLowerCase();
+    if (provider !== "openrouter")
+        return trimmed;
+    const rest = trimmed.slice(idx + 1).trim();
+    return rest || trimmed;
+}
+/**
+ * Default reasoning effort sent on the host transport when llm.thinkLevel
+ * is not configured. "medium" is a universally-supported effort level across
+ * the model families OpenClaw's core reasoning-effort normalization knows
+ * about, and it never disables reasoning outright the way an omitted field
+ * has been observed to (core's own "adaptive" shorthand maps to this same
+ * value). Chosen over leaving the field unset, which is what caused the
+ * incident this constant documents.
+ */
+const DEFAULT_HOST_REASONING_EFFORT = "medium";
+/**
  * Extract JSON from an LLM response that may be wrapped in markdown fences
  * or contain surrounding text.
  */
@@ -174,6 +203,95 @@ function createTimeoutSignal(timeoutMs) {
         dispose: () => clearTimeout(timer),
     };
 }
+/**
+ * Bounds a host-transport call with an application-level timer. The runtime
+ * LLM surface has no AbortSignal parameter, so this cannot cancel the
+ * underlying request -- it only stops waiting on it, mirroring the direct
+ * transport's timeoutMs contract from the caller's point of view.
+ */
+function raceWithTimeout(promise, timeoutMs) {
+    const effectiveTimeoutMs = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30_000;
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`timed out after ${effectiveTimeoutMs}ms`)), effectiveTimeoutMs);
+        promise.then((value) => {
+            clearTimeout(timer);
+            resolve(value);
+        }, (err) => {
+            clearTimeout(timer);
+            reject(err);
+        });
+    });
+}
+function createHostClient(config, runtimeLlmComplete, log, warnLog) {
+    let lastError = null;
+    return {
+        async completeJson(prompt, label = "generic", systemPrompt) {
+            lastError = null;
+            try {
+                const result = await raceWithTimeout(runtimeLlmComplete({
+                    messages: [
+                        {
+                            role: "system",
+                            content: systemPrompt ??
+                                "You are a memory extraction assistant. Always respond with valid JSON only.",
+                        },
+                        { role: "user", content: prompt },
+                    ],
+                    model: config.model,
+                    temperature: 0.1,
+                    purpose: `memory-lancedb-pro:${label}`,
+                    reasoning: config.thinkLevel?.trim() || DEFAULT_HOST_REASONING_EFFORT,
+                }), config.timeoutMs);
+                const raw = result?.text;
+                if (!raw || typeof raw !== "string") {
+                    lastError =
+                        `memory-lancedb-pro: llm-client [${label}] empty host-transport response content from model ${config.model}`;
+                    log(lastError);
+                    return null;
+                }
+                const jsonStr = extractJsonFromResponse(raw);
+                if (!jsonStr) {
+                    lastError =
+                        `memory-lancedb-pro: llm-client [${label}] no JSON object found in host-transport response (chars=${raw.length}, preview=${JSON.stringify(previewText(raw))})`;
+                    log(lastError);
+                    return null;
+                }
+                try {
+                    return JSON.parse(jsonStr);
+                }
+                catch (err) {
+                    const repairedJsonStr = repairCommonJson(jsonStr);
+                    if (repairedJsonStr !== jsonStr) {
+                        try {
+                            const repaired = JSON.parse(repairedJsonStr);
+                            log(`memory-lancedb-pro: llm-client [${label}] recovered malformed host-transport JSON via heuristic repair (jsonChars=${jsonStr.length})`);
+                            return repaired;
+                        }
+                        catch (repairErr) {
+                            lastError =
+                                `memory-lancedb-pro: llm-client [${label}] host-transport JSON.parse failed: ${err instanceof Error ? err.message : String(err)}; repair failed: ${repairErr instanceof Error ? repairErr.message : String(repairErr)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
+                            log(lastError);
+                            return null;
+                        }
+                    }
+                    lastError =
+                        `memory-lancedb-pro: llm-client [${label}] host-transport JSON.parse failed: ${err instanceof Error ? err.message : String(err)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
+                    log(lastError);
+                    return null;
+                }
+            }
+            catch (err) {
+                lastError =
+                    `memory-lancedb-pro: llm-client [${label}] host-transport request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
+                (warnLog ?? log)(lastError);
+                return null;
+            }
+        },
+        getLastError() {
+            return lastError;
+        },
+    };
+}
 function createApiKeyClient(config, log, warnLog) {
     if (!config.apiKey) {
         throw new Error("LLM api-key mode requires llm.apiKey or embedding.apiKey");
@@ -198,6 +316,9 @@ function createApiKeyClient(config, log, warnLog) {
                         { role: "user", content: prompt },
                     ],
                     temperature: 0.1,
+                    ...(config.thinkLevel?.trim()
+                        ? { reasoning: { effort: config.thinkLevel.trim() } }
+                        : {}),
                     ...(shouldDisableReasoningForJson(config.model)
                         ? { chat_template_kwargs: { enable_thinking: false } }
                         : {}),
@@ -410,9 +531,71 @@ function createOauthClient(config, log, warnLog) {
         },
     };
 }
+/** OpenRouter's direct API base URL, used as the host->direct fallback's default when llm.baseURL is not configured. */
+const OPENROUTER_DIRECT_BASE_URL = "https://openrouter.ai/api/v1";
+/**
+ * Resolves the baseURL for a host->direct fallback client: an explicitly
+ * configured llm.baseURL passes through unchanged, otherwise the fallback
+ * defaults to OpenRouter rather than inheriting whatever baseURL happened
+ * to be on the config (which, for a host-transport setup, should not be
+ * the embedding lane's baseURL -- see the credential-hygiene fix at the
+ * createLlmClient callsite).
+ */
+export function resolveDirectFallbackBaseURL(configuredBaseURL) {
+    return configuredBaseURL?.trim() || OPENROUTER_DIRECT_BASE_URL;
+}
+// Module-level (not per-client) so the "runtime surface unavailable"
+// warning is emitted once per process even though createLlmClient is
+// called once per lane (extraction, admission, CLI) and each call would
+// otherwise re-detect and re-warn about the same missing host surface.
+let hostTransportFallbackWarned = false;
+/** Test-only: resets the process-level fallback-warn dedupe flag. */
+export function resetHostTransportFallbackWarnForTests() {
+    hostTransportFallbackWarned = false;
+}
+/**
+ * Resolves the canonical llm.thinkLevel value. Blank/whitespace-only values
+ * are treated as unset.
+ *
+ * Presence-based by construction: "configured" here means "a non-blank
+ * string reached this function." That is only a correct proxy for "the
+ * user actually set it" as long as the openclaw.plugin.json llm.thinkLevel
+ * schema entry does not declare a JSON-schema "default" -- a schema default
+ * gets materialized into the config object upstream (observed on at least
+ * one OpenClaw host config-loading path) before this function ever runs,
+ * indistinguishably from a genuine user value. Do not add "default" back to
+ * the manifest key (2026-07-16 live incident).
+ */
+export function resolveThinkLevel(config) {
+    return config.thinkLevel?.trim() || undefined;
+}
 export function createLlmClient(config) {
     const log = config.log ?? (() => { });
     const warnLog = config.warnLog;
+    config = { ...config, thinkLevel: resolveThinkLevel(config) };
+    if (config.transport === "host") {
+        if (typeof config.runtimeLlmComplete === "function") {
+            return createHostClient(config, config.runtimeLlmComplete, log, warnLog);
+        }
+        if (!hostTransportFallbackWarned) {
+            hostTransportFallbackWarned = true;
+            (warnLog ?? log)("memory-lancedb-pro: llm-client transport \"host\" is configured but the OpenClaw runtime.llm.complete surface is unavailable on this host; falling back to the direct transport");
+        }
+        if (!config.apiKey) {
+            throw new Error("memory-lancedb-pro: llm-client transport \"host\" fell back to the direct transport, but no llm.apiKey is configured. " +
+                "The direct fallback does not inherit embedding.apiKey when transport is \"host\" -- set llm.apiKey explicitly.");
+        }
+        // The configured model may be a core-style catalog reference (e.g.
+        // "openrouter/anthropic/claude-...") that only the host-managed runtime
+        // resolves; the direct transport needs the bare provider-stripped id.
+        // Only this fallback path normalizes -- an explicitly configured direct
+        // transport keeps sending whatever model string it was given, unchanged.
+        config = {
+            ...config,
+            model: normalizeDirectModelRef(config.model),
+            baseURL: resolveDirectFallbackBaseURL(config.baseURL),
+        };
+    }
     if (config.auth === "oauth") {
         return createOauthClient(config, log, warnLog);
     }

@@ -76,6 +76,7 @@ import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extract
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
 import { NoisePrototypeBank } from "./src/noise-prototypes.js";
 import { createLlmClient } from "./src/llm-client.js";
+import type { RuntimeLlmCompleteFn } from "./src/llm-client.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
 import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
@@ -260,6 +261,8 @@ interface PluginConfig {
     oauthProvider?: string;
     oauthPath?: string;
     timeoutMs?: number;
+    transport?: "direct" | "host";
+    thinkLevel?: string;
   };
   extractMinMessages?: number;
   extractMaxChars?: number;
@@ -1184,6 +1187,18 @@ export function inferProviderFromBaseURL(baseURL: string | undefined): string | 
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Feature-detect the OpenClaw host-managed runtime LLM completion surface
+ * (api.runtime.llm.complete). Returns undefined on older hosts that do not
+ * expose it yet, so callers can fall back to the direct/oauth transport.
+ */
+export function resolveRuntimeLlmComplete(api: OpenClawPluginApi): RuntimeLlmCompleteFn | undefined {
+  const runtimeLlm = (api as unknown as { runtime?: { llm?: { complete?: unknown } } }).runtime?.llm;
+  return typeof runtimeLlm?.complete === "function"
+    ? (runtimeLlm.complete.bind(runtimeLlm) as RuntimeLlmCompleteFn)
+    : undefined;
 }
 
 function asNonEmptyString(value: unknown): string | undefined {
@@ -2473,16 +2488,27 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   if (config.smartExtraction !== false) {
     try {
       const llmAuth = config.llm?.auth || "api-key";
+      // A host-transport setup should never silently fall back to the
+      // embedding lane's credentials if the runtime.llm.complete surface
+      // turns out to be unavailable and createLlmClient falls back to a
+      // direct client -- that talks to the wrong provider with the wrong
+      // key on a split-provider setup. Leave apiKey/baseURL unset in that
+      // case; createLlmClient throws a clear error / defaults the baseURL.
+      const llmIsHostTransport = config.llm?.transport === "host";
       const llmApiKey = llmAuth === "oauth"
         ? undefined
         : config.llm?.apiKey
           ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
-          : resolveFirstApiKey(api, config.embedding.apiKey);
+          : llmIsHostTransport
+            ? undefined
+            : resolveFirstApiKey(api, config.embedding.apiKey);
       const llmBaseURL = llmAuth === "oauth"
         ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
         : config.llm?.baseURL
           ? resolveEnvVars(config.llm.baseURL)
-          : config.embedding.baseURL;
+          : llmIsHostTransport
+            ? undefined
+            : config.embedding.baseURL;
       const llmModel = config.llm?.model || "openai/gpt-oss-120b";
       const llmOauthPath = llmAuth === "oauth"
         ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
@@ -2498,6 +2524,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         oauthProvider: llmOauthProvider,
         oauthPath: llmOauthPath,
         timeoutMs: llmTimeoutMs,
+        transport: config.llm?.transport,
+        thinkLevel: config.llm?.thinkLevel,
+        runtimeLlmComplete: resolveRuntimeLlmComplete(api),
         log: (msg: string) => api.logger.debug(msg),
         warnLog: (msg: string) => api.logger.warn(msg),
       });
@@ -3221,16 +3250,21 @@ const memoryLanceDBProPlugin = {
         llmClient: smartExtractor ? (() => {
           try {
             const llmAuth = config.llm?.auth || "api-key";
+            const llmIsHostTransport = config.llm?.transport === "host";
             const llmApiKey = llmAuth === "oauth"
               ? undefined
               : config.llm?.apiKey
                 ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
-                : resolveFirstApiKey(api, config.embedding.apiKey);
+                : llmIsHostTransport
+                  ? undefined
+                  : resolveFirstApiKey(api, config.embedding.apiKey);
             const llmBaseURL = llmAuth === "oauth"
               ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
               : config.llm?.baseURL
                 ? resolveEnvVars(config.llm.baseURL)
-                : config.embedding.baseURL;
+                : llmIsHostTransport
+                  ? undefined
+                  : config.embedding.baseURL;
             const llmOauthPath = llmAuth === "oauth"
               ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
               : undefined;
@@ -3246,6 +3280,9 @@ const memoryLanceDBProPlugin = {
               oauthProvider: llmOauthProvider,
               oauthPath: llmOauthPath,
               timeoutMs: llmTimeoutMs,
+              transport: config.llm?.transport,
+              thinkLevel: config.llm?.thinkLevel,
+              runtimeLlmComplete: resolveRuntimeLlmComplete(api),
               log: (msg: string) => api.logger.debug(msg),
             });
           } catch { return undefined; }

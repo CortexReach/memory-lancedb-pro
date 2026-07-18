@@ -96,6 +96,56 @@ assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "oauthProvider"),
   "configSchema should declare llm.oauthProvider",
 );
+assert.ok(
+  manifest.configSchema.properties.llm.properties.transport.enum.includes("host"),
+  "llm.transport schema should declare the host transport option",
+);
+assert.equal(
+  manifest.configSchema.properties.llm.properties.transport.default,
+  "direct",
+  "llm.transport schema default should remain direct (host routing is opt-in)",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "thinkLevel"),
+  "configSchema should declare the canonical llm.thinkLevel"
+);
+assert.equal(
+  manifest.configSchema.properties.llm.properties.thinkLevel.type,
+  "string",
+  "llm.thinkLevel schema should accept a free-form string"
+);
+assert.ok(
+  !Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties.thinkLevel, "default"),
+  "llm.thinkLevel schema must NOT declare a JSON-schema default -- the OpenClaw host materializes schema " +
+  "defaults into the plugin config on at least one config-loading path, indistinguishably from a genuine " +
+  "user value (2026-07-16 live incident: an explicitly-configured llm.thinkLevel-equivalent value was " +
+  "silently overridden once resolveThinkLevel saw a schema-materialized default it never actually " +
+  "configured). The medium default for the host transport lives in code (DEFAULT_HOST_REASONING_EFFORT " +
+  "in src/llm-client.ts), not here."
+);
+assert.doesNotMatch(
+  manifest.configSchema.properties.llm.properties.thinkLevel.description,
+  /reasoning effort requested on the host transport only/i,
+  "thinkLevel description must not claim it's host-only now that the direct transport also sends it"
+);
+assert.match(
+  manifest.configSchema.properties.llm.properties.thinkLevel.description,
+  /host.*always sent.*default.*medium/i,
+  "thinkLevel description should document the host transport always sending a default"
+);
+assert.match(
+  manifest.configSchema.properties.llm.properties.thinkLevel.description,
+  /direct.*sent only when explicitly configured/i,
+  "thinkLevel description should document the direct transport only sending it when configured"
+);
+
+// llm.reasoningEffort never shipped upstream, so there is no deprecation
+// constituency to preserve -- it has been removed from the schema entirely,
+// not just marked deprecated. llm.thinkLevel is simply the knob's name.
+assert.ok(
+  !Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "reasoningEffort"),
+  "configSchema must NOT declare llm.reasoningEffort -- the legacy alias was removed entirely, not deprecated"
+);
 
 assert.equal(
   manifest.configSchema.properties.autoRecallMinRepeated.default,

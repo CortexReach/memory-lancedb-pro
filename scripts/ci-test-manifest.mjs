@@ -109,6 +109,10 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/memory-categories-storage-map.test.mjs", args: ["--test"] },
   // Delete/delete-bulk must synchronously invalidate in-process reflection read caches
   { group: "core-regression", runner: "node", file: "test/delete-invalidate-reflection-caches.test.mjs", args: ["--test"] },
+  { group: "llm-clients-and-auth", runner: "node", file: "test/llm-host-transport.test.mjs", args: ["--test"] },
+  { group: "llm-clients-and-auth", runner: "node", file: "test/admission-control-host-transport.test.mjs", args: ["--test"] },
+  { group: "llm-clients-and-auth", runner: "node", file: "test/llm-transport-credential-hygiene.test.mjs", args: ["--test"] },
+  { group: "llm-clients-and-auth", runner: "node", file: "test/llm-thinklevel.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

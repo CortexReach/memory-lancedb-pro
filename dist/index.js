@@ -759,6 +759,17 @@ export function inferProviderFromBaseURL(baseURL) {
         return undefined;
     }
 }
+/**
+ * Feature-detect the OpenClaw host-managed runtime LLM completion surface
+ * (api.runtime.llm.complete). Returns undefined on older hosts that do not
+ * expose it yet, so callers can fall back to the direct/oauth transport.
+ */
+export function resolveRuntimeLlmComplete(api) {
+    const runtimeLlm = api.runtime?.llm;
+    return typeof runtimeLlm?.complete === "function"
+        ? runtimeLlm.complete.bind(runtimeLlm)
+        : undefined;
+}
 function asNonEmptyString(value) {
     if (typeof value !== "string")
         return undefined;
@@ -1814,16 +1825,27 @@ function _initPluginState(api) {
     if (config.smartExtraction !== false) {
         try {
             const llmAuth = config.llm?.auth || "api-key";
+            // A host-transport setup should never silently fall back to the
+            // embedding lane's credentials if the runtime.llm.complete surface
+            // turns out to be unavailable and createLlmClient falls back to a
+            // direct client -- that talks to the wrong provider with the wrong
+            // key on a split-provider setup. Leave apiKey/baseURL unset in that
+            // case; createLlmClient throws a clear error / defaults the baseURL.
+            const llmIsHostTransport = config.llm?.transport === "host";
             const llmApiKey = llmAuth === "oauth"
                 ? undefined
                 : config.llm?.apiKey
                     ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
-                    : resolveFirstApiKey(api, config.embedding.apiKey);
+                    : llmIsHostTransport
+                        ? undefined
+                        : resolveFirstApiKey(api, config.embedding.apiKey);
             const llmBaseURL = llmAuth === "oauth"
                 ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
                 : config.llm?.baseURL
                     ? resolveEnvVars(config.llm.baseURL)
-                    : config.embedding.baseURL;
+                    : llmIsHostTransport
+                        ? undefined
+                        : config.embedding.baseURL;
             const llmModel = config.llm?.model || "openai/gpt-oss-120b";
             const llmOauthPath = llmAuth === "oauth"
                 ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
@@ -1838,6 +1860,9 @@ function _initPluginState(api) {
                 oauthProvider: llmOauthProvider,
                 oauthPath: llmOauthPath,
                 timeoutMs: llmTimeoutMs,
+                transport: config.llm?.transport,
+                thinkLevel: config.llm?.thinkLevel,
+                runtimeLlmComplete: resolveRuntimeLlmComplete(api),
                 log: (msg) => api.logger.debug(msg),
                 warnLog: (msg) => api.logger.warn(msg),
             });
@@ -2409,16 +2434,21 @@ const memoryLanceDBProPlugin = {
             llmClient: smartExtractor ? (() => {
                 try {
                     const llmAuth = config.llm?.auth || "api-key";
+                    const llmIsHostTransport = config.llm?.transport === "host";
                     const llmApiKey = llmAuth === "oauth"
                         ? undefined
                         : config.llm?.apiKey
                             ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
-                            : resolveFirstApiKey(api, config.embedding.apiKey);
+                            : llmIsHostTransport
+                                ? undefined
+                                : resolveFirstApiKey(api, config.embedding.apiKey);
                     const llmBaseURL = llmAuth === "oauth"
                         ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
                         : config.llm?.baseURL
                             ? resolveEnvVars(config.llm.baseURL)
-                            : config.embedding.baseURL;
+                            : llmIsHostTransport
+                                ? undefined
+                                : config.embedding.baseURL;
                     const llmOauthPath = llmAuth === "oauth"
                         ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
                         : undefined;
@@ -2434,6 +2464,9 @@ const memoryLanceDBProPlugin = {
                         oauthProvider: llmOauthProvider,
                         oauthPath: llmOauthPath,
                         timeoutMs: llmTimeoutMs,
+                        transport: config.llm?.transport,
+                        thinkLevel: config.llm?.thinkLevel,
+                        runtimeLlmComplete: resolveRuntimeLlmComplete(api),
                         log: (msg) => api.logger.debug(msg),
                     });
                 }
@@ -4066,10 +4099,15 @@ const memoryLanceDBProPlugin = {
                 const now = new Date(params.timestampMs ?? Date.now());
                 const dateStr = now.toISOString().split("T")[0];
                 const timeStr = now.toISOString().split("T")[1].split(".")[0];
+                // Session key/id stay out of `text`: it is the FTS index surface, and
+                // the `simple` tokenizer splits a key like
+                // `agent:main:cron:<uuid>:run:<uuid>` on its punctuation — so every session
+                // summary ends up indexed under `agent`, `main`, `cron`, `run`. A query
+                // mentioning any of those then BM25-matches every session summary in the
+                // store regardless of content. Both ids are already recorded structurally
+                // in metadata below, so provenance is unaffected.
                 const memoryText = [
                     `Session: ${dateStr} ${timeStr} UTC`,
-                    `Session Key: ${params.sessionKey}`,
-                    `Session ID: ${params.sessionId}`,
                     `Source: ${params.source}`,
                     "",
                     "Conversation Summary:",
