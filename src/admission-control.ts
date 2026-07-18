@@ -1,4 +1,6 @@
 import { join } from "node:path";
+import { ADMISSION_JUDGE_IDENTITY, CATEGORY_TAXONOMY, SCORE_TIER_RUBRIC } from "./prompt-blocks.js";
+import { formatCandidateBlock, jsonShape } from "./prompt-blocks.js";
 import type { LlmClient } from "./llm-client.js";
 import type { CandidateMemory, MemoryCategory } from "./memory-categories.js";
 import type { MemorySearchResult, MemoryStore } from "./store.js";
@@ -458,33 +460,30 @@ function cosineSimilarity(left: number[], right: number[]): number {
   return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
 }
 
-function buildUtilityPrompt(candidate: CandidateMemory, conversationText: string): string {
-  const excerpt =
-    conversationText.length > 3000
-      ? conversationText.slice(-3000)
-      : conversationText;
+export type AdmissionSourceKind = "conversation" | "reflection";
 
-  return `Evaluate whether this candidate memory is worth keeping for future cross-session interactions.
+function buildUtilityPrompt(candidate: CandidateMemory): { system: string; user: string } {
+  const system = `${ADMISSION_JUDGE_IDENTITY} Evaluate whether this candidate memory is worth keeping for future cross-session interactions.
 
-Conversation excerpt:
-${excerpt}
-
-Candidate memory:
-- Category: ${candidate.category}
-- Abstract: ${candidate.abstract}
-- Overview: ${candidate.overview}
-- Content: ${candidate.content}
+${CATEGORY_TAXONOMY}
 
 Score future usefulness on a 0.0-1.0 scale.
 
-Use higher scores for durable preferences, profile facts, reusable procedures, and long-lived project/entity state.
-Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
+${SCORE_TIER_RUBRIC}
 
-Return JSON only:
-{
+Grounding rule: this candidate's own grounding tag already passed the deterministic pre-admission check (a "constructed" tag is rejected before this scoring ever runs), but a mistagged or legacy candidate can still describe a claim that is true only WITHIN a fiction — a persona's invented trait from roleplay, a game's rules or score, drafted fiction, a hypothetical, or sample data. If the candidate's own content shows such a constructed frame and its claim lives inside it rather than being a claim ABOUT the fiction (e.g. that a session/game happened), score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity is a claim ABOUT the fiction and may still score moderately.
+
+Return JSON only (the raw object, no markdown code fences):
+${jsonShape(`{
   "utility": 0.0,
   "reason": "short explanation"
-}`;
+}`)}`;
+
+  const user = `## Candidate
+
+${formatCandidateBlock(1, candidate)}`;
+
+  return { system, user };
 }
 
 function buildReason(details: {
@@ -602,6 +601,7 @@ async function scoreUtility(
   mode: AdmissionControlConfig["utilityMode"],
   candidate: CandidateMemory,
   conversationText: string,
+  sourceKind: AdmissionSourceKind = "conversation",
 ): Promise<{ score: number; reason?: string }> {
   if (mode === "off") {
     return { score: 0.5, reason: "Utility scoring disabled" };
@@ -609,9 +609,11 @@ async function scoreUtility(
 
   let response: { utility?: number; reason?: string } | null = null;
   try {
+    const { system, user } = buildUtilityPrompt(candidate);
     response = await llm.completeJson<{ utility?: number; reason?: string }>(
-      buildUtilityPrompt(candidate, conversationText),
+      user,
       "admission-utility",
+      system,
     );
   } catch {
     return { score: 0.5, reason: "Utility scoring failed" };
@@ -669,6 +671,8 @@ export class AdmissionController {
     conversationText: string;
     scopeFilter: string[];
     now?: number;
+    /** Honest framing for the excerpt shown to the admission judge. Defaults to "conversation". */
+    sourceKind?: AdmissionSourceKind;
   }): Promise<AdmissionEvaluation> {
     const now = params.now ?? Date.now();
     const relevantMatches = await this.loadRelevantMatches(
@@ -682,6 +686,7 @@ export class AdmissionController {
       this.config.utilityMode,
       params.candidate,
       params.conversationText,
+      params.sourceKind ?? "conversation",
     );
     const confidence = scoreConfidenceSupport(params.candidate, params.conversationText);
     const novelty = scoreNoveltyFromMatches(params.candidateVector, relevantMatches);

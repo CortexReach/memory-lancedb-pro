@@ -85,10 +85,10 @@ async function runTest() {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
     let content = JSON.stringify({ memories: [] });
 
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       content = JSON.stringify({
         memories: [{
           category: "preferences",
@@ -97,12 +97,18 @@ async function runTest() {
           content: "用户现在改喝咖啡。",
         }],
       });
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
-      content = JSON.stringify({
+    } else if (
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
+    ) {
+      const verdict = {
         decision: dedupDecision,
         match_index: 1,
         reason: "same preference topic, new truth replaces old truth",
-      });
+      };
+      content = prompt.includes("Decide every candidate independently")
+        ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
+        : JSON.stringify(verdict);
     }
 
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -174,7 +180,10 @@ async function runTest() {
     assert.equal(stats.created, 1);
     assert.equal(stats.superseded, 1);
 
-    const entries = await store.list(["test"], undefined, 10, 0);
+    // excludeInactive:false: this test explicitly verifies the invalidated
+    // historical row is retained (not hard-deleted), so it needs the
+    // full/forensic view, not the excludeInactive-by-default read (item 6).
+    const entries = await store.list(["test"], undefined, 10, 0, { excludeInactive: false });
     assert.equal(entries.length, 2, "supersede should keep old + new entries");
 
     const currentEntry = entries.find((entry) => entry.text.includes("咖啡"));
@@ -255,7 +264,9 @@ async function runTest() {
     }
 
     // Verify there are now 10 total entries (1 original + 1 current + 8 history)
-    const allEntries = await store.list(["test"], undefined, 20, 0);
+    // excludeInactive:false: most of these 10 rows are invalidated_at-stamped
+    // history, so this forensic count needs the full view (item 6).
+    const allEntries = await store.list(["test"], undefined, 20, 0, { excludeInactive: false });
     assert.equal(allEntries.length, 10, "should have 10 entries total");
 
     const crowdedResults = await retriever.retrieve({

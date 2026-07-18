@@ -27,9 +27,16 @@ export interface LlmClientConfig {
   warnLog?: (msg: string) => void;
 }
 
+const DEFAULT_SYSTEM_PROMPT =
+  "You are a memory extraction assistant. Always respond with valid JSON only.";
+
 export interface LlmClient {
-  /** Send a prompt and parse the JSON response. Returns null on failure. */
-  completeJson<T>(prompt: string, label?: string): Promise<T | null>;
+  /**
+   * Send a prompt and parse the JSON response. Returns null on failure.
+   * `systemPrompt`, when provided, replaces the default generic system
+   * message with a stage-specific identity/instructions block.
+   */
+  completeJson<T>(prompt: string, label?: string, systemPrompt?: string): Promise<T | null>;
   /** Best-effort diagnostics for the most recent failure, if any. */
   getLastError(): string | null;
 }
@@ -232,7 +239,7 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
   let lastError: string | null = null;
 
   return {
-    async completeJson<T>(prompt: string, label = "generic"): Promise<T | null> {
+    async completeJson<T>(prompt: string, label = "generic", systemPrompt?: string): Promise<T | null> {
       lastError = null;
       try {
         const request = {
@@ -240,8 +247,7 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
           messages: [
             {
               role: "system",
-              content:
-                "You are a memory extraction assistant. Always respond with valid JSON only.",
+              content: systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
             },
             { role: "user", content: prompt },
           ],
@@ -351,7 +357,7 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
   }
 
   return {
-    async completeJson<T>(prompt: string, label = "generic"): Promise<T | null> {
+    async completeJson<T>(prompt: string, label = "generic", systemPrompt?: string): Promise<T | null> {
       lastError = null;
       try {
         const session = await getSession();
@@ -371,8 +377,7 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
             signal,
             body: JSON.stringify({
               model: normalizeOauthModel(config.model),
-              instructions:
-                "You are a memory extraction assistant. Always respond with valid JSON only.",
+              instructions: systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
               input: [
                 {
                   role: "user",
