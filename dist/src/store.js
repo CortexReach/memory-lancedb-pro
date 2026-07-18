@@ -1382,6 +1382,45 @@ export class MemoryStore {
         await this.ensureInitialized();
         return await this.table.countRows();
     }
+    /**
+     * Finds rows whose id starts with `prefix`, restricted to accessible
+     * scopes. Backs the documented "full UUID or 8+ char prefix" contract on
+     * memory_forget/memory_update: injected context shows agents truncated ids,
+     * so a unique-prefix lookup is the only way those handles can ever resolve.
+     * The prefix must be hex/dash shaped (validated here, defense in depth on
+     * top of the tool-layer classification) and at least 8 chars, so a short
+     * or malformed ref can never scan-match. Capped at `limit` matches: the
+     * caller only distinguishes zero / one / many.
+     */
+    async findByIdPrefix(prefix, scopeFilter, limit = 5) {
+        await this.ensureInitialized();
+        if (isExplicitDenyAllScopeFilter(scopeFilter))
+            return [];
+        const normalized = prefix.trim().toLowerCase();
+        if (!/^[0-9a-f][0-9a-f-]{7,35}$/.test(normalized))
+            return [];
+        const safePrefix = escapeSqlLiteral(normalized);
+        const rows = await this.table
+            .query()
+            .where(`id LIKE '${safePrefix}%'`)
+            .limit(Math.max(1, limit))
+            .toArray();
+        return rows
+            .filter((row) => {
+            const rowScope = row.scope ?? "global";
+            return !scopeFilter || scopeFilter.length === 0 || scopeFilter.includes(rowScope);
+        })
+            .map((row) => ({
+            id: row.id,
+            text: row.text,
+            vector: Array.from(row.vector),
+            category: row.category,
+            scope: row.scope ?? "global",
+            importance: clampImportance(Number(row.importance)),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+            metadata: row.metadata || "{}",
+        }));
+    }
     async getById(id, scopeFilter) {
         await this.ensureInitialized();
         if (isExplicitDenyAllScopeFilter(scopeFilter))

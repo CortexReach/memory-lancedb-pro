@@ -456,7 +456,7 @@ function formatIgnoredScopeNotice(resolvedScopes: {
   return `Ignored inaccessible scope "${resolvedScopes.ignoredScope}" and searched accessible scopes instead: ${scopes}.`;
 }
 
-async function resolveMemoryId(
+export async function resolveMemoryId(
   context: ToolContext,
   memoryRef: string,
   scopeFilter: string[],
@@ -464,7 +464,9 @@ async function resolveMemoryId(
   | { ok: true; id: string }
   | { ok: false; message: string; details?: Record<string, unknown> }
 > {
-  const trimmed = memoryRef.trim();
+  // Agents copy ids out of injected context, which truncates them and often
+  // appends an ellipsis ("407dec9c..."); strip that before classifying.
+  const trimmed = memoryRef.trim().replace(/[.…]+$/u, "");
   if (!trimmed) {
     return {
       ok: false,
@@ -473,9 +475,39 @@ async function resolveMemoryId(
     };
   }
 
-  const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(trimmed);
-  if (uuidLike) {
+  const isFullUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed);
+  if (isFullUuid) {
     return { ok: true, id: trimmed };
+  }
+
+  // Documented contract: "full UUID or 8+ char prefix". A hex-shaped ref
+  // that is not a complete UUID resolves as an id prefix within accessible
+  // scopes — unique match wins, multiple matches list candidates, and zero
+  // matches is an honest not-found (never a scan-match or a semantic guess).
+  const isIdPrefix = /^[0-9a-f][0-9a-f-]{7,35}$/i.test(trimmed);
+  if (isIdPrefix) {
+    const matches = await context.store.findByIdPrefix(trimmed, scopeFilter);
+    if (matches.length === 1) {
+      return { ok: true, id: matches[0].id };
+    }
+    if (matches.length > 1) {
+      const list = matches
+        .map(
+          (entry) =>
+            `- [${entry.id.slice(0, 8)}] ${entry.text.slice(0, 60)}${entry.text.length > 60 ? "..." : ""}`,
+        )
+        .join("\n");
+      return {
+        ok: false,
+        message: `Id prefix "${trimmed}" matches multiple memories. Use a longer prefix or the full id:\n${list}`,
+        details: { error: "ambiguous_id_prefix", prefix: trimmed },
+      };
+    }
+    return {
+      ok: false,
+      message: `Memory ${trimmed} not found or access denied.`,
+      details: { error: "not_found", id: trimmed },
+    };
   }
 
   const results = await retrieveWithRetry(context.retriever, {
@@ -1556,24 +1588,31 @@ export function registerMemoryForgetTool(
           }
 
           if (memoryId) {
-            const deleted = await context.store.delete(memoryId, scopeFilter);
+            const resolved = await resolveMemoryId(context, memoryId, scopeFilter);
+            if (resolved.ok === false) {
+              return {
+                content: [{ type: "text", text: resolved.message }],
+                details: resolved.details ?? { error: "not_found", id: memoryId },
+              };
+            }
+            const deleted = await context.store.delete(resolved.id, scopeFilter);
             if (deleted) {
               context.onMemoriesDeleted?.({ scopeFilter });
               return {
                 content: [
-                  { type: "text", text: `Memory ${memoryId} forgotten.` },
+                  { type: "text", text: `Memory ${resolved.id} forgotten.` },
                 ],
-                details: { action: "deleted", id: memoryId },
+                details: { action: "deleted", id: resolved.id },
               };
             } else {
               return {
                 content: [
                   {
                     type: "text",
-                    text: `Memory ${memoryId} not found or access denied.`,
+                    text: `Memory ${resolved.id} not found or access denied.`,
                   },
                 ],
-                details: { error: "not_found", id: memoryId },
+                details: { error: "not_found", id: resolved.id },
               };
             }
           }
@@ -1720,50 +1759,18 @@ export function registerMemoryUpdateTool(
           const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
           const scopeFilter = resolveScopeFilter(runtimeContext.scopeManager, agentId);
 
-          // Resolve memoryId: if it doesn't look like a UUID, try search
-          let resolvedId = memoryId;
-          const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(memoryId);
-          if (!uuidLike) {
-            // Treat as search query
-            const results = await retrieveWithRetry(context.retriever, {
-              query: memoryId,
-              limit: 3,
-              scopeFilter,
-            }, () => context.store.count());
-            if (results.length === 0) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `No memory found matching "${memoryId}".`,
-                  },
-                ],
-                details: { error: "not_found", query: memoryId },
-              };
-            }
-            if (results.length === 1 || results[0].score > 0.85) {
-              resolvedId = results[0].entry.id;
-            } else {
-              const list = results
-                .map(
-                  (r) =>
-                    `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
-                )
-                .join("\n");
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Multiple matches. Specify memoryId:\n${list}`,
-                  },
-                ],
-                details: {
-                  action: "candidates",
-                  candidates: sanitizeMemoryForSerialization(results),
-                },
-              };
-            }
+          // Resolve memoryId through the shared resolver: full UUID passes
+          // through, an 8+ char id prefix resolves against accessible rows
+          // (the tool's documented contract), anything else falls back to
+          // semantic search.
+          const resolution = await resolveMemoryId(context, memoryId, scopeFilter);
+          if (resolution.ok === false) {
+            return {
+              content: [{ type: "text", text: resolution.message }],
+              details: resolution.details ?? { error: "not_found", id: memoryId },
+            };
           }
+          const resolvedId = resolution.id;
 
           // If text changed, re-embed; reject noise
           let newVector: number[] | undefined;
