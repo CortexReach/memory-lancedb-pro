@@ -18,6 +18,10 @@ import type { LlmClient } from "./llm-client.js";
 import type { MemoryCategory } from "./memory-categories.js";
 import type { MemoryTier } from "./memory-categories.js";
 import { buildSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import {
+  getReflectionMappedMemoryCategory,
+  type ReflectionMappedKind,
+} from "./reflection-mapped-metadata.js";
 
 // ============================================================================
 // Types
@@ -47,6 +51,33 @@ export interface UpgradeResult {
   skipped: number;
   /** Errors encountered */
   errors: string[];
+}
+
+export interface CategoryNormalizationOptions {
+  /** Only report counts without modifying data (default: false) */
+  dryRun?: boolean;
+  /** Scope filter — only normalize memories in these scopes */
+  scopeFilter?: string[];
+}
+
+export interface CategoryNormalizationResult {
+  /** Total reflection-mapped rows scanned */
+  totalMapped: number;
+  /** Rows whose memory_category was missing or wrong, and got (re)stamped */
+  normalized: number;
+  /** Rows that already carried the correct memory_category — untouched */
+  alreadyCorrect: number;
+  /** Errors encountered */
+  errors: string[];
+}
+
+function isReflectionMappedKind(value: unknown): value is ReflectionMappedKind {
+  return (
+    value === "user-model" ||
+    value === "agent-model" ||
+    value === "lesson" ||
+    value === "decision"
+  );
 }
 
 interface EnrichedMetadata {
@@ -243,6 +274,66 @@ export class MemoryUpgrader {
   }
 
   /**
+   * One-shot, opt-in pass that re-stamps `memory_category` on existing
+   * reflection-mapped rows using the same write-time mapping new rows get
+   * (see `getReflectionMappedMemoryCategory`). Reflection-mapped rows are
+   * intentionally excluded from `isLegacyMemory`/`upgrade()` — this is a
+   * separate, narrower pass that touches only that one field on rows whose
+   * `type` is `memory-reflection-mapped`, and only when the stamped value is
+   * missing or wrong. Safe to run repeatedly: a row already carrying the
+   * correct value is left untouched, so a second run is a no-op.
+   */
+  async normalizeMappedRowCategories(
+    options: CategoryNormalizationOptions = {},
+  ): Promise<CategoryNormalizationResult> {
+    const dryRun = options.dryRun ?? false;
+    const scopeFilter = options.scopeFilter;
+
+    const result: CategoryNormalizationResult = {
+      totalMapped: 0,
+      normalized: 0,
+      alreadyCorrect: 0,
+      errors: [],
+    };
+
+    const allMemories = await this.store.list(scopeFilter, undefined, 10000, 0);
+
+    const toNormalize: Array<{ entry: MemoryEntry; meta: Record<string, unknown>; expected: MemoryCategory }> = [];
+    for (const entry of allMemories) {
+      const meta = parseMetadata(entry.metadata);
+      if (!meta || meta.type !== "memory-reflection-mapped") continue;
+      if (!isReflectionMappedKind(meta.mappedKind)) continue;
+
+      result.totalMapped++;
+      const expected = getReflectionMappedMemoryCategory(meta.mappedKind);
+      if (meta.memory_category === expected) {
+        result.alreadyCorrect++;
+        continue;
+      }
+      toNormalize.push({ entry, meta, expected });
+    }
+
+    if (dryRun || toNormalize.length === 0) {
+      result.normalized = toNormalize.length;
+      return result;
+    }
+
+    const prepared: PreparedUpgrade[] = toNormalize.map(({ entry, meta, expected }) => ({
+      entry,
+      updates: {
+        metadata: JSON.stringify({ ...meta, memory_category: expected }),
+      },
+    }));
+
+    const writeResult = { upgraded: 0, errors: [] as string[] };
+    await this.writePreparedBatch(prepared, writeResult, scopeFilter);
+    result.normalized = writeResult.upgraded;
+    result.errors = writeResult.errors;
+
+    return result;
+  }
+
+  /**
    * Main upgrade entry point.
    * Scans all memories, filters legacy ones, and enriches them.
    */
@@ -429,10 +520,12 @@ export class MemoryUpgrader {
 
   /**
    * Persist a prepared batch with one store-level batch call when available.
+   * Takes the narrow slice of the result shape it actually mutates so both
+   * `UpgradeResult` and `CategoryNormalizationResult` can reuse it.
    */
   private async writePreparedBatch(
     prepared: PreparedUpgrade[],
-    result: UpgradeResult,
+    result: { upgraded: number; errors: string[] },
     scopeFilter?: string[],
   ): Promise<void> {
     if (prepared.length === 0) return;

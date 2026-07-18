@@ -13,6 +13,13 @@
  *   4. Write prepared patches in a batch where the store supports it
  */
 import { buildSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import { getReflectionMappedMemoryCategory, } from "./reflection-mapped-metadata.js";
+function isReflectionMappedKind(value) {
+    return (value === "user-model" ||
+        value === "agent-model" ||
+        value === "lesson" ||
+        value === "decision");
+}
 const CURRENT_REFLECTION_METADATA_TYPES = new Set([
     "memory-reflection",
     "memory-reflection-event",
@@ -159,6 +166,57 @@ export class MemoryUpgrader {
         return { total: allMemories.length, legacy, byCategory };
     }
     /**
+     * One-shot, opt-in pass that re-stamps `memory_category` on existing
+     * reflection-mapped rows using the same write-time mapping new rows get
+     * (see `getReflectionMappedMemoryCategory`). Reflection-mapped rows are
+     * intentionally excluded from `isLegacyMemory`/`upgrade()` — this is a
+     * separate, narrower pass that touches only that one field on rows whose
+     * `type` is `memory-reflection-mapped`, and only when the stamped value is
+     * missing or wrong. Safe to run repeatedly: a row already carrying the
+     * correct value is left untouched, so a second run is a no-op.
+     */
+    async normalizeMappedRowCategories(options = {}) {
+        const dryRun = options.dryRun ?? false;
+        const scopeFilter = options.scopeFilter;
+        const result = {
+            totalMapped: 0,
+            normalized: 0,
+            alreadyCorrect: 0,
+            errors: [],
+        };
+        const allMemories = await this.store.list(scopeFilter, undefined, 10000, 0);
+        const toNormalize = [];
+        for (const entry of allMemories) {
+            const meta = parseMetadata(entry.metadata);
+            if (!meta || meta.type !== "memory-reflection-mapped")
+                continue;
+            if (!isReflectionMappedKind(meta.mappedKind))
+                continue;
+            result.totalMapped++;
+            const expected = getReflectionMappedMemoryCategory(meta.mappedKind);
+            if (meta.memory_category === expected) {
+                result.alreadyCorrect++;
+                continue;
+            }
+            toNormalize.push({ entry, meta, expected });
+        }
+        if (dryRun || toNormalize.length === 0) {
+            result.normalized = toNormalize.length;
+            return result;
+        }
+        const prepared = toNormalize.map(({ entry, meta, expected }) => ({
+            entry,
+            updates: {
+                metadata: JSON.stringify({ ...meta, memory_category: expected }),
+            },
+        }));
+        const writeResult = { upgraded: 0, errors: [] };
+        await this.writePreparedBatch(prepared, writeResult, scopeFilter);
+        result.normalized = writeResult.upgraded;
+        result.errors = writeResult.errors;
+        return result;
+    }
+    /**
      * Main upgrade entry point.
      * Scans all memories, filters legacy ones, and enriches them.
      */
@@ -298,6 +356,8 @@ export class MemoryUpgrader {
     }
     /**
      * Persist a prepared batch with one store-level batch call when available.
+     * Takes the narrow slice of the result shape it actually mutates so both
+     * `UpgradeResult` and `CategoryNormalizationResult` can reuse it.
      */
     async writePreparedBatch(prepared, result, scopeFilter) {
         if (prepared.length === 0)

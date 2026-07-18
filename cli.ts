@@ -1962,6 +1962,10 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .option("--no-llm", "Skip LLM calls; use simple text truncation for L0/L1")
     .option("--limit <n>", "Maximum number of memories to upgrade")
     .option("--scope <scope>", "Only upgrade memories in this scope")
+    .option(
+      "--categories-only",
+      "Only re-stamp memory_category on reflection-mapped rows (skip the general legacy L0/L1/L2 upgrade)",
+    )
     .action(async (options) => {
       try {
         const upgrader = createMemoryUpgrader(
@@ -1970,8 +1974,31 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           { log: console.log },
         );
 
-        // Show current status first
         const scopeFilter = options.scope ? [options.scope] : undefined;
+
+        if (options.categoriesOnly) {
+          const result = await upgrader.normalizeMappedRowCategories({
+            dryRun: !!options.dryRun,
+            scopeFilter,
+          });
+
+          console.log(`Mapped-Row Category Normalization:`);
+          console.log(`• Reflection-mapped rows scanned: ${result.totalMapped}`);
+          console.log(`• Already correct: ${result.alreadyCorrect}`);
+          console.log(
+            `${options.dryRun ? "• [DRY-RUN] Would normalize" : "• Normalized"}: ${result.normalized}`,
+          );
+          if (result.errors.length > 0) {
+            console.log(`• Errors: ${result.errors.length}`);
+            result.errors.slice(0, 5).forEach(err => console.log(`  - ${err}`));
+            if (result.errors.length > 5) {
+              console.log(`  ... and ${result.errors.length - 5} more`);
+            }
+          }
+          return;
+        }
+
+        // Show current status first
         const counts = await upgrader.countLegacy(scopeFilter);
 
         console.log(`Memory Upgrade Status:`);

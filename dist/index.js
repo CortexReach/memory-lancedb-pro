@@ -36,7 +36,7 @@ import { storeReflectionToLanceDB, loadAgentReflectionSlicesFromEntries, DEFAULT
 import { parseReflectionMetadata } from "./src/reflection-metadata.js";
 import { extractReflectionLearningGovernanceCandidates, extractInjectableReflectionMappedMemoryItems, isRecallUsed, } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
-import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
+import { buildReflectionMappedMetadata, getReflectionMappedMemoryCategory } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
@@ -3925,7 +3925,7 @@ const memoryLanceDBProPlugin = {
                         if (existing.length > 0 && existing[0].score > 0.95) {
                             continue;
                         }
-                        const importance = mapped.category === "decision" ? 0.85 : 0.8;
+                        const importance = mapped.mappedKind === "decision" ? 0.85 : 0.8;
                         const baseMetadata = buildReflectionMappedMetadata({
                             mappedItem: mapped,
                             eventId: reflectionEventId,
@@ -3944,7 +3944,7 @@ const memoryLanceDBProPlugin = {
                             text: mapped.text,
                             vector,
                             importance,
-                            category: mapped.category,
+                            category: getReflectionMappedMemoryCategory(mapped.mappedKind),
                             scope: targetScope,
                             metadata,
                         });
@@ -4066,10 +4066,15 @@ const memoryLanceDBProPlugin = {
                 const now = new Date(params.timestampMs ?? Date.now());
                 const dateStr = now.toISOString().split("T")[0];
                 const timeStr = now.toISOString().split("T")[1].split(".")[0];
+                // Session key/id stay out of `text`: it is the FTS index surface, and
+                // the `simple` tokenizer splits a key like
+                // `agent:main:cron:<uuid>:run:<uuid>` on its punctuation — so every session
+                // summary ends up indexed under `agent`, `main`, `cron`, `run`. A query
+                // mentioning any of those then BM25-matches every session summary in the
+                // store regardless of content. Both ids are already recorded structurally
+                // in metadata below, so provenance is unaffected.
                 const memoryText = [
                     `Session: ${dateStr} ${timeStr} UTC`,
-                    `Session Key: ${params.sessionKey}`,
-                    `Session ID: ${params.sessionId}`,
                     `Source: ${params.source}`,
                     "",
                     "Conversation Summary:",

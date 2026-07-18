@@ -73,11 +73,15 @@ export function reverseMapLegacyCategory(oldCategory, text = "") {
             return "preferences";
         case "entity":
             return "entities";
-        case "decision":
-            return "events";
         case "other":
             return "patterns";
+        // "decision" rows that never migrated to a stamped `memory_category`
+        // (reflection-mapped "Decisions (durable)" rows written before write-time
+        // stamping landed, or genuinely old legacy data) are durable operational
+        // facts, not one-off occurrences — read them through the same branch as
+        // "fact" rather than defaulting them into the append-only "events" bucket.
         case "fact":
+        case "decision":
             if (/\b(my |i am |i'm |name is |叫我|我的|我是)\b/i.test(text) &&
                 text.length < 200) {
                 return "profile";
