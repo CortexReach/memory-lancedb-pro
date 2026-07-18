@@ -84,7 +84,6 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-bulk-store-edge-cases.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/store-importance-normalization.test.mjs", args: ["--test"] },
-  { group: "storage-and-schema", runner: "node", file: "test/store-excludeinactive-default.test.mjs", args: ["--test"] },
   // Issue #680 regression tests (from upstream)
   { group: "core-regression", runner: "node", file: "test/memory-reflection-issue680-tdd.test.mjs", args: ["--test"] },
   // Issue #606 SDK migration Bug 2 regression tests
@@ -108,6 +107,9 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/autocapture-watermark-reset.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-internal-session-guard.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/memory-categories-storage-map.test.mjs", args: ["--test"] },
+  // Delete/delete-bulk must synchronously invalidate in-process reflection read caches
+  { group: "core-regression", runner: "node", file: "test/delete-invalidate-reflection-caches.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/store-excludeinactive-default.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-consolidate.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-consolidate-cost-gate.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-consolidate-two-phase-apply.test.mjs", args: ["--test"] },
