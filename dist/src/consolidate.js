@@ -271,10 +271,50 @@ export function computeConsolidateCostPreview(units) {
         maxMergeContentCalls: Math.ceil(maxMergeJobs / CONSOLIDATE_MERGE_BATCH_MAX_SIZE),
     };
 }
+export function pluralCount(count, noun) {
+    return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
 export function formatConsolidateCostPreview(preview) {
-    const lines = [`${preview.clusterCount} cluster(s) -> 1 batched decider call`];
-    if (preview.maxMergeJobs > 0) {
-        lines.push(`+ up to ${preview.maxMergeContentCalls} batched merge-content call(s) covering up to ${preview.maxMergeJobs} merge job(s)`);
+    const base = `${pluralCount(preview.clusterCount, "cluster")} -> 1 batched decider call`;
+    if (preview.maxMergeJobs === 0)
+        return base;
+    return `${base} + worst case ${pluralCount(preview.maxMergeContentCalls, "batched merge-content call")} covering ${pluralCount(preview.maxMergeJobs, "merge job")}`;
+}
+export function formatConsolidatePlanForDisplay(clusters) {
+    const actionable = clusters.filter((c) => c.action);
+    const blocked = clusters.filter((c) => c.blocked === "append-only-shield");
+    const noAction = clusters.filter((c) => !c.action && !c.blocked && !c.malformed && c.verdict);
+    if (actionable.length === 0 && blocked.length === 0 && noAction.length === 0) {
+        return "No actionable clusters in this plan.";
+    }
+    const lines = [
+        `Plan: ${pluralCount(actionable.length, "actionable cluster")}, ${blocked.length} blocked, ${pluralCount(noAction.length, "skip")}`,
+    ];
+    for (const cluster of actionable) {
+        lines.push(`  [${cluster.action}] cluster ${cluster.clusterIndex} — ${cluster.verdict.reason}`);
+        lines.push(`    members: ${cluster.memberIds.join(", ")}`);
+        lines.push(`    survivor: ${cluster.survivorId}`);
+        if (cluster.absorbedIds?.length) {
+            lines.push(`    absorbed: ${cluster.absorbedIds.join(", ")}`);
+        }
+        if (cluster.action === "merge" && cluster.mergedContent) {
+            lines.push(`    merged abstract: ${cluster.mergedContent.abstract}`);
+            lines.push(`    merged overview: ${cluster.mergedContent.overview}`);
+            lines.push(`    merged content: ${cluster.mergedContent.content}`);
+        }
+    }
+    for (const cluster of blocked) {
+        lines.push(`  [${cluster.verdict.verdict} — BLOCKED by append-only shield, will NOT be applied] cluster ${cluster.clusterIndex} — ${cluster.verdict.reason}`);
+        lines.push(`    members: ${cluster.memberIds.join(", ")}`);
+        for (const text of cluster.memberTexts) {
+            lines.push(`    - "${text}"`);
+        }
+    }
+    for (const cluster of noAction) {
+        lines.push(`  [${cluster.verdict.verdict}] cluster ${cluster.clusterIndex} — ${cluster.verdict.reason}`);
+        for (const text of cluster.memberTexts) {
+            lines.push(`    - "${text}"`);
+        }
     }
     return lines.join("\n");
 }

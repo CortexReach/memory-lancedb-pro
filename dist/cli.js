@@ -11,7 +11,7 @@ import { loadLanceDB } from "./src/store.js";
 import { parseSmartMetadata, buildSmartMetadata, stringifySmartMetadata, } from "./src/smart-metadata.js";
 import { createRetriever } from "./src/retriever.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
-import { runConsolidate, formatConsolidateCostPreview } from "./src/consolidate.js";
+import { runConsolidate, formatConsolidateCostPreview, formatConsolidatePlanForDisplay, pluralCount } from "./src/consolidate.js";
 import { getDefaultOauthModelForProvider, getOAuthProviderLabel, isOauthModelSupported, listOAuthProviders, normalizeOauthModel, normalizeOAuthProviderId, performOAuthLogin, } from "./src/llm-oauth.js";
 // ============================================================================
 // Utility Functions
@@ -1900,32 +1900,6 @@ async function saveConsolidateSettledLedger(ledgerPath, ledger, scope, newlySett
         console.warn(`consolidate: could not persist settled ledger: ${String(err)}`);
     }
 }
-export function formatConsolidatePlanForDisplay(clusters) {
-    const actionable = clusters.filter((c) => c.action);
-    const blocked = clusters.filter((c) => c.blocked === "append-only-shield");
-    if (actionable.length === 0 && blocked.length === 0) {
-        return "No actionable clusters in this plan.";
-    }
-    const lines = [`Plan (${actionable.length} cluster(s)):`];
-    for (const cluster of actionable) {
-        lines.push(`  [${cluster.action}] cluster ${cluster.clusterIndex} — ${cluster.verdict.reason}`);
-        lines.push(`    members: ${cluster.memberIds.join(", ")}`);
-        lines.push(`    survivor: ${cluster.survivorId}`);
-        if (cluster.absorbedIds?.length) {
-            lines.push(`    absorbed: ${cluster.absorbedIds.join(", ")}`);
-        }
-        if (cluster.action === "merge" && cluster.mergedContent) {
-            lines.push(`    merged abstract: ${cluster.mergedContent.abstract}`);
-            lines.push(`    merged overview: ${cluster.mergedContent.overview}`);
-            lines.push(`    merged content: ${cluster.mergedContent.content}`);
-        }
-    }
-    for (const cluster of blocked) {
-        lines.push(`  [${cluster.verdict.verdict} — BLOCKED by append-only shield, will NOT be applied] cluster ${cluster.clusterIndex} — ${cluster.verdict.reason}`);
-        lines.push(`    members: ${cluster.memberIds.join(", ")}`);
-    }
-    return lines.join("\n");
-}
 function registerConsolidateCommand(memory, context) {
     memory
         .command("consolidate")
@@ -1996,36 +1970,43 @@ function registerConsolidateCommand(memory, context) {
                 settledFingerprints: new Set(settledLedger[scope] ?? []),
             });
             if (result.status === "aborted") {
-                console.error(`consolidate: aborted -- ${result.abortReason}`);
-                if (result.costPreview) {
-                    console.error(formatConsolidateCostPreview(result.costPreview));
+                const declined = (result.abortReason ?? "").includes("cost gate declined");
+                if (declined) {
+                    console.log(`consolidate: cancelled at the cost gate — no LLM calls were made.`);
+                    console.log(`Pass --yes to skip this prompt (e.g. for automation).`);
                 }
-                console.error(`Pass --yes to skip this prompt (e.g. for automation), or re-run interactively and type YES.`);
+                else {
+                    console.error(`consolidate: aborted -- ${result.abortReason}`);
+                    if (result.costPreview) {
+                        console.error(formatConsolidateCostPreview(result.costPreview));
+                    }
+                    console.error(`Pass --yes to skip this prompt (e.g. for automation), or re-run interactively and type YES.`);
+                }
                 process.exit(1);
             }
-            console.log(`Scanned ${result.scanned} row(s), ${result.eligible} eligible for consolidation.`);
+            console.log(`Scanned ${pluralCount(result.scanned, "row")}, ${result.eligible} eligible for consolidation.`);
             const settledNote = result.settledSkipped > 0 ? ` (${result.settledSkipped} settled in previous runs)` : "";
             if (result.clusters.length === 0) {
                 console.log(`0 candidates${settledNote} — nothing to consolidate.\n`);
             }
             else {
-                console.log(`Found ${result.clusters.length} cluster(s) to decide${settledNote}.\n`);
+                console.log(`Decided ${pluralCount(result.clusters.length, "cluster")}${settledNote}:\n`);
             }
             for (const cluster of result.clusters) {
                 if (cluster.malformed) {
                     const label = cluster.failure === "call-failed" ? "undecided: LLM call failed" : "skipped: malformed verdict";
-                    console.log(`  [${label}] ${cluster.memberIds.length} rows`);
+                    console.log(`  [${label}] ${pluralCount(cluster.memberIds.length, "row")}`);
                     for (const text of cluster.memberTexts)
                         console.log(`    - "${text}"`);
                     continue;
                 }
                 const blockedNote = cluster.blocked === "append-only-shield" ? " — BLOCKED by append-only shield (not applied)" : "";
-                console.log(`  [${cluster.verdict.verdict}] ${cluster.memberIds.length} rows — ${cluster.verdict.reason}${blockedNote}`);
+                console.log(`  [${cluster.verdict.verdict}] ${pluralCount(cluster.memberIds.length, "row")} — ${cluster.verdict.reason}${blockedNote}`);
                 for (const text of cluster.memberTexts)
                     console.log(`    - "${text}"`);
             }
             if (result.staleSkipped.length > 0) {
-                console.log(`\n${result.staleSkipped.length} cluster(s) skipped: changed since the plan was built (stale).`);
+                console.log(`\n${pluralCount(result.staleSkipped.length, "cluster")} skipped: changed since the plan was built (stale).`);
             }
             if (result.status === "completed" && settledLedgerPath) {
                 await saveConsolidateSettledLedger(settledLedgerPath, settledLedger, scope, result.newlySettled);
@@ -2038,10 +2019,10 @@ function registerConsolidateCommand(memory, context) {
             }
             const failureNotes = [];
             if (result.skippedMalformed > 0)
-                failureNotes.push(`${result.skippedMalformed} cluster(s) skipped due to malformed verdicts`);
+                failureNotes.push(`${pluralCount(result.skippedMalformed, "cluster")} skipped due to malformed verdicts`);
             if (result.undecidedCallFailed > 0)
-                failureNotes.push(`${result.undecidedCallFailed} cluster(s) undecided because the decide call failed`);
-            console.log(`\nApplied ${result.applied.length} action(s)${failureNotes.length ? "; " + failureNotes.join("; ") : ""}.`);
+                failureNotes.push(`${pluralCount(result.undecidedCallFailed, "cluster")} undecided because the decide call failed`);
+            console.log(`\nApplied ${pluralCount(result.applied.length, "action")}${failureNotes.length ? "; " + failureNotes.join("; ") : ""}.`);
         }
         catch (error) {
             console.error("consolidate failed:", error);

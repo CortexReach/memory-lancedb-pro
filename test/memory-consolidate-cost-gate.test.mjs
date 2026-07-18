@@ -82,13 +82,24 @@ describe("memory consolidate: cost preview (pure)", () => {
     assert.equal(preview.maxMergeContentCalls, 2);
   });
 
-  it("formats the preview with real numbers, not placeholders", () => {
+  it("formats the preview as a single line with real plural counts and one worst-case qualifier", () => {
     const preview = { clusterCount: 4, maxMergeJobs: 4, maxMergeContentCalls: 1 };
     const text = formatConsolidateCostPreview(preview);
-    assert.match(text, /4 cluster/);
-    assert.match(text, /1 batched decider call/);
-    assert.match(text, /up to 1 batched merge-content call/);
-    assert.match(text, /up to 4 merge job/);
+    assert.equal(
+      text,
+      "4 clusters -> 1 batched decider call + worst case 1 batched merge-content call covering 4 merge jobs",
+    );
+    assert.ok(!text.includes("\n"), "preview must be a single line");
+    assert.doesNotMatch(text, /up to|\(s\)/);
+  });
+
+  it("uses singular nouns when every count is 1", () => {
+    const preview = { clusterCount: 1, maxMergeJobs: 1, maxMergeContentCalls: 1 };
+    const text = formatConsolidateCostPreview(preview);
+    assert.equal(
+      text,
+      "1 cluster -> 1 batched decider call + worst case 1 batched merge-content call covering 1 merge job",
+    );
   });
 
   it("omits the merge-writer line when no cluster could ever produce a merge", () => {

@@ -7,7 +7,7 @@ import jitiFactory from "jiti";
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 
-const { runConsolidate, computeClusterFingerprint } = jiti(
+const { runConsolidate, computeClusterFingerprint, formatConsolidatePlanForDisplay } = jiti(
   path.join(testDir, "..", "src", "consolidate.ts"),
 );
 
@@ -223,5 +223,46 @@ describe("consolidate polish: honest failure classing", () => {
     assert.equal(result.undecidedCallFailed, 0);
     assert.equal(result.newlySettled.length, 0, "a malformed cluster must not settle");
     assert.ok(logs.some((l) => l.includes("missing or malformed")));
+  });
+});
+
+describe("consolidate polish: plan display shows every verdict class", () => {
+  const clusters = [
+    {
+      clusterIndex: 1,
+      action: "merge",
+      memberIds: ["id-a", "id-b"],
+      memberTexts: ["Coffee: oat milk", "Coffee: oat milk latte"],
+      survivorId: "id-a",
+      absorbedIds: ["id-b"],
+      verdict: { verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "same coffee fact" },
+      mergedContent: { abstract: "Coffee: oat milk latte", overview: "o", content: "c" },
+    },
+    {
+      clusterIndex: 2,
+      blocked: "append-only-shield",
+      memberIds: ["id-c", "id-d"],
+      memberTexts: ["event one", "event two"],
+      verdict: { verdict: "supersede", survivor_index: 1, absorbed_indices: [2], reason: "newer event wins" },
+    },
+    {
+      clusterIndex: 3,
+      memberIds: ["id-e", "id-f"],
+      memberTexts: ["tea: green", "tea: green with honey"],
+      verdict: { verdict: "skip", reason: "distinct preparations" },
+    },
+  ];
+
+  it("headlines all three counts and lists skip verdicts with reason and member texts", () => {
+    const text = formatConsolidatePlanForDisplay(clusters);
+    assert.match(text, /Plan: 1 actionable cluster, 1 blocked, 1 skip\b/);
+    assert.match(text, /\[skip\] cluster 3 — distinct preparations/);
+    assert.match(text, /"tea: green with honey"/);
+    assert.match(text, /BLOCKED by append-only shield/);
+    assert.match(text, /"event two"/);
+  });
+
+  it("keeps the no-plan message when nothing was decided at all", () => {
+    assert.equal(formatConsolidatePlanForDisplay([]), "No actionable clusters in this plan.");
   });
 });
