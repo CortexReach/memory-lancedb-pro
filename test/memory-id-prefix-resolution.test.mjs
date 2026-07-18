@@ -81,7 +81,7 @@ async function callTool(toolFactories, name, params) {
   const entry = toolFactories.find(({ meta }) => meta?.name === name);
   assert.ok(entry, `expected a registered ${name} tool`);
   const tool = entry.toolFactory({});
-  return tool.execute("test-call-id", params, undefined, undefined, { agentId: "terry" });
+  return tool.execute("test-call-id", params, undefined, undefined, { agentId: "agent-one" });
 }
 
 describe("memory id-prefix resolution (forget/update contract)", () => {
@@ -104,7 +104,7 @@ describe("memory id-prefix resolution (forget/update contract)", () => {
       text: "Spice jars are labeled in the kitchen drawer",
       vector: FIXED_VECTOR,
       category: "entity",
-      scope: "agent:terry",
+      scope: "agent:agent-one",
       importance: 0.8,
       metadata: JSON.stringify({ memory_category: "entities", l0_abstract: "Spice jars labeled" }),
     });
@@ -123,7 +123,7 @@ describe("memory id-prefix resolution (forget/update contract)", () => {
     // Fresh store instance: the plugin deleted through its own handle, and a
     // second handle's read view can lag; a new instance sees current state.
     const reader = new MemoryStore({ dbPath: path.join(workDir, "db"), vectorDim: EMBEDDING_DIMENSIONS });
-    assert.equal(await reader.getById(seeded.id, ["agent:terry"]), null);
+    assert.equal(await reader.getById(seeded.id, ["agent:agent-one"]), null);
   });
 
   it("memory_forget tolerates the trailing ellipsis agents copy from injected context", async () => {
@@ -142,8 +142,8 @@ describe("memory id-prefix resolution (forget/update contract)", () => {
 
   it("resolveMemoryId reports ambiguity when a prefix matches multiple rows, resolving nothing", async () => {
     const rows = [
-      { id: "aabbccdd-1111-4111-8111-111111111111", text: "row one", vector: [], category: "entity", scope: "agent:terry", importance: 0.5, timestamp: 1, metadata: "{}" },
-      { id: "aabbccdd-2222-4222-8222-222222222222", text: "row two", vector: [], category: "entity", scope: "agent:terry", importance: 0.5, timestamp: 2, metadata: "{}" },
+      { id: "aabbccdd-1111-4111-8111-111111111111", text: "row one", vector: [], category: "entity", scope: "agent:agent-one", importance: 0.5, timestamp: 1, metadata: "{}" },
+      { id: "aabbccdd-2222-4222-8222-222222222222", text: "row two", vector: [], category: "entity", scope: "agent:agent-one", importance: 0.5, timestamp: 2, metadata: "{}" },
     ];
     const stubContext = {
       store: {
@@ -152,7 +152,7 @@ describe("memory id-prefix resolution (forget/update contract)", () => {
       },
       retriever: { async retrieve() { throw new Error("semantic search must not run for a hex prefix"); } },
     };
-    const resolution = await resolveMemoryId(stubContext, "aabbccdd", ["agent:terry"]);
+    const resolution = await resolveMemoryId(stubContext, "aabbccdd", ["agent:agent-one"]);
     assert.equal(resolution.ok, false);
     assert.match(resolution.message, /matches multiple memories/);
     assert.match(resolution.message, /aabbccdd/);
@@ -171,7 +171,7 @@ describe("memory id-prefix resolution (forget/update contract)", () => {
       `update reply must reference the prefix-resolved row: ${replyText}`,
     );
     const reader = new MemoryStore({ dbPath: path.join(workDir, "db"), vectorDim: EMBEDDING_DIMENSIONS });
-    const rows = await reader.list(["agent:terry"], undefined, 50, 0);
+    const rows = await reader.list(["agent:agent-one"], undefined, 50, 0);
     assert.ok(
       rows.some((row) => /alphabetized/.test(row.text)),
       "the superseding row must carry the new text",
