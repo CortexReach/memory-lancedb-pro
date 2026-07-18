@@ -1875,7 +1875,7 @@ export class MemoryStore {
         const entry: MemoryEntry = {
             id: row.id as string,
             text: row.text as string,
-            vector: row.vector as number[],
+            vector: toNumberVector(row.vector),
             category: row.category as MemoryEntry["category"],
             scope: rowScope,
             importance: clampImportance(Number(row.importance)),
@@ -1939,7 +1939,7 @@ export class MemoryStore {
       const entry: MemoryEntry = {
         id: row.id as string,
         text: row.text as string,
-        vector: row.vector as number[],
+        vector: toNumberVector(row.vector),
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
         importance: clampImportance(Number(row.importance)),
@@ -2682,7 +2682,7 @@ export class MemoryStore {
         (row): MemoryEntry => ({
           id: row.id as string,
           text: row.text as string,
-          vector: Array.isArray(row.vector) ? (row.vector as number[]) : [],
+          vector: toNumberVector(row.vector),
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
           importance: clampImportance(Number(row.importance)),
