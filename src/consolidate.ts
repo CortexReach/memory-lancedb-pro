@@ -602,15 +602,24 @@ async function applySupersedeVerdict(
     absorbedIds.push(absorbed.entry.id);
   }
 
-  const survivorMeta = parseSmartMetadata(survivor.entry.metadata, survivor.entry);
-  const patchedSurvivorMeta = buildSmartMetadata(survivor.entry, {
-    fact_key: factKey || survivorMeta.fact_key,
-  });
-  const auditedMeta = {
-    ...patchedSurvivorMeta,
-    consolidation_audit: { action: "supersede", absorbedIds, reason: verdict.reason, at: now },
-  };
-  await deps.update(survivor.entry.id, { metadata: stringifySmartMetadata(auditedMeta) }, scopeFilter);
+  // An append-only (events/cases) survivor is left byte-untouched: the shield
+  // admits it only because nothing gets written to it, so even the fact_key
+  // patch and audit annotation are skipped (the audit still lands in the plan
+  // report and journal mirror).
+  const survivorIsAppendOnly = Boolean(
+    survivor.memoryCategory && APPEND_ONLY_CATEGORIES.has(survivor.memoryCategory),
+  );
+  if (!survivorIsAppendOnly) {
+    const survivorMeta = parseSmartMetadata(survivor.entry.metadata, survivor.entry);
+    const patchedSurvivorMeta = buildSmartMetadata(survivor.entry, {
+      fact_key: factKey || survivorMeta.fact_key,
+    });
+    const auditedMeta = {
+      ...patchedSurvivorMeta,
+      consolidation_audit: { action: "supersede", absorbedIds, reason: verdict.reason, at: now },
+    };
+    await deps.update(survivor.entry.id, { metadata: stringifySmartMetadata(auditedMeta) }, scopeFilter);
+  }
 
   return { action: "supersede", survivorId: survivor.entry.id, absorbedIds, reason: verdict.reason, scope: survivor.entry.scope };
 }
@@ -1012,24 +1021,30 @@ export async function runConsolidate(
         continue;
       }
 
-      const actedUponIndices = [verdict.survivorIndex!, ...verdict.absorbedIndices!];
-      const actedUponCategories = actedUponIndices.map((idx) => members[idx - 1].memoryCategory);
-      const touchesAppendOnly = actedUponCategories.some(
+      const survivorCategory = members[verdict.survivorIndex! - 1].memoryCategory;
+      const absorbedCategories = verdict.absorbedIndices!.map((idx) => members[idx - 1].memoryCategory);
+      const survivorIsAppendOnly = Boolean(survivorCategory && APPEND_ONLY_CATEGORIES.has(survivorCategory));
+      const absorbedTouchesAppendOnly = absorbedCategories.some(
         (category) => category && APPEND_ONLY_CATEGORIES.has(category),
       );
-      // Append-only means invalidation-protection, not merge-immunity: even a
-      // perfectly-categorized events/cases row can be a true duplicate of
-      // another row in the same category. Allow merge only when every
-      // acted-upon row shares the identical append-only category (a genuine
-      // same-category duplicate) -- supersede/contradict still invalidate the
-      // absorbed row's currency, so they stay blocked unconditionally, and a
-      // merge that would mix an append-only row with a non-append-only row or
-      // with a different append-only category stays blocked too.
+      // Append-only means invalidation-protection, not merge-immunity, and
+      // the protection is directional: absorbed rows are what get invalidated
+      // (and merge additionally rewrites the survivor's content), so an
+      // append-only row may never be absorbed, and may only be a merge
+      // survivor when every acted-upon row shares the identical append-only
+      // category (a genuine same-category duplicate). A supersede survivor is
+      // never written at all when it is append-only (applySupersedeVerdict
+      // skips even the audit annotation), so an append-only row superseding
+      // stale mutable rows leaves the append-only guarantee intact.
       const isSameCategoryAppendOnlyMerge =
-        touchesAppendOnly &&
         verdict.verdict === "merge" &&
-        actedUponCategories.every((category) => category === actedUponCategories[0]);
-      if (touchesAppendOnly && !isSameCategoryAppendOnlyMerge) {
+        survivorIsAppendOnly &&
+        absorbedCategories.every((category) => category === survivorCategory);
+      const blockedByShield =
+        verdict.verdict === "merge"
+          ? (survivorIsAppendOnly || absorbedTouchesAppendOnly) && !isSameCategoryAppendOnlyMerge
+          : absorbedTouchesAppendOnly;
+      if (blockedByShield) {
         deps.log?.(
           `memory-consolidate: refusing to ${verdict.verdict} an append-only row (events/cases) outside a same-category duplicate merge; skipping this verdict`
         );
@@ -1111,7 +1126,7 @@ export async function runConsolidate(
   // a safe no-op -- the plan was built (and its LLM calls already spent),
   // but nothing is written.
   if (actionable.length > 0) {
-    const message = `${actionable.length} cluster(s) ready to apply. Apply these now? (YES/no)`;
+    const message = `${pluralCount(actionable.length, "cluster")} ready to apply. Apply these now? (YES/no)`;
     const proceed = deps.confirmApply ? await deps.confirmApply(message, clusters) : false;
     if (proceed) {
       const { applied, staleSkipped } = await executePlan(deps, actionable, membersByCluster, scopeFilter, now);

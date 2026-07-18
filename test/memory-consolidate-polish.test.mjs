@@ -10,6 +10,9 @@ const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { runConsolidate, computeClusterFingerprint, formatConsolidatePlanForDisplay } = jiti(
   path.join(testDir, "..", "src", "consolidate.ts"),
 );
+const { buildConsolidateBatchPrompt } = jiti(
+  path.join(testDir, "..", "src", "extraction-prompts.ts"),
+);
 
 let nextId = 1;
 function makeRow({
@@ -179,6 +182,77 @@ describe("consolidate polish: append-only shield visibility", () => {
     assert.equal(cluster.action, null);
     assert.equal(cluster.blocked, "append-only-shield", "shield-blocked verdicts must be marked, not silently actionless");
     assert.equal(result.newlySettled.length, 1, "a shield-blocked cluster is settled: rerunning cannot change the outcome");
+  });
+
+  it("allows a supersede whose survivor is append-only, invalidates only the mutable absorbed row, and never writes the survivor", async () => {
+    const ts = 1_700_000_000_000;
+    const rows = [
+      makeRow({ abstract: "Gym schedule changed to Tuesday and Friday evenings", content: "a", factKey: "events:gym schedule", category: "events", vector: [1, 0], timestamp: ts + 1000 }),
+      makeRow({ abstract: "Gym sessions happen Tuesday and Friday mornings", content: "b", factKey: "preferences:gym schedule", category: "preferences", vector: [1, 0], timestamp: ts }),
+    ];
+    const store = makeFakeStore(rows);
+    const updatedIds = [];
+    const llm = async (_prompt, label) =>
+      label === "consolidate-decide"
+        ? { verdicts: [{ cluster_index: 1, verdict: "supersede", survivor_index: 1, absorbed_indices: [2], reason: "evenings replaces mornings" }] }
+        : { results: [] };
+
+    const result = await runConsolidate(
+      {
+        ...store,
+        update: async (id, patch, scopeFilter) => {
+          updatedIds.push(id);
+          return store.update(id, patch, scopeFilter);
+        },
+        completeJson: llm,
+      },
+      { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 },
+    );
+
+    assert.equal(result.applied.length, 1, "the direction-safe supersede must apply");
+    assert.equal(result.clusters[0].blocked, undefined);
+    assert.deepEqual(updatedIds, [rows[1].id], "only the mutable absorbed row may be written");
+    const absorbedMeta = JSON.parse(store.rows.find((r) => r.id === rows[1].id).metadata);
+    assert.equal(absorbedMeta.superseded_by, rows[0].id);
+    assert.ok(absorbedMeta.invalidated_at, "absorbed mutable row must be marked no longer current");
+    assert.equal(store.rows.find((r) => r.id === rows[0].id).metadata, rows[0].metadata, "append-only survivor must stay byte-identical");
+  });
+
+  it("still blocks a supersede that would absorb an append-only row", async () => {
+    const ts = 1_700_000_000_000;
+    const rows = [
+      makeRow({ abstract: "Prefers evening gym sessions", content: "a", factKey: "preferences:gym schedule", category: "preferences", vector: [1, 0], timestamp: ts + 1000 }),
+      makeRow({ abstract: "Gym sessions moved to mornings", content: "b", factKey: "cases:gym schedule", category: "cases", vector: [1, 0], timestamp: ts }),
+    ];
+    const llm = async (_prompt, label) =>
+      label === "consolidate-decide"
+        ? { verdicts: [{ cluster_index: 1, verdict: "supersede", survivor_index: 1, absorbed_indices: [2], reason: "newer wins" }] }
+        : { results: [] };
+
+    const result = await runConsolidate(
+      { ...makeFakeStore(rows), completeJson: llm },
+      { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 },
+    );
+
+    assert.equal(result.applied.length, 0);
+    assert.equal(result.clusters[0].blocked, "append-only-shield", "invalidating an append-only row stays forbidden");
+    assert.equal(result.newlySettled.length, 1);
+  });
+
+  it("teaches the decider both the cross-category clause and the directional survivor exception", () => {
+    const { system } = buildConsolidateBatchPrompt([
+      {
+        clusterIndex: 1,
+        members: [
+          { index: 1, category: "profile", abstract: "User name: Sam Rivera", overview: "", content: "User name: Sam Rivera" },
+          { index: 2, category: "preferences", abstract: "User's name is Sam Rivera.", overview: "", content: "User's name is Sam Rivera." },
+        ],
+      },
+    ]);
+    assert.match(system, /fully actionable against each other/);
+    assert.match(system, /differing categories alone are never a reason to skip/);
+    assert.match(system, /supersede whose absorbed rows are all non-append-only/);
+    assert.match(system, /never make a stale row the survivor for category reasons/i);
   });
 });
 
