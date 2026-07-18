@@ -53,7 +53,7 @@ describe("auto-capture cleanup", () => {
 });
 
 // ============================================================================
-// formatConversationTranscript (JR-184/185)
+// formatConversationTranscript
 // ============================================================================
 
 describe("formatConversationTranscript", () => {
@@ -91,7 +91,7 @@ describe("formatConversationTranscript", () => {
 });
 
 // ============================================================================
-// buildConversationTurnsForExtraction (JR-184/185) — orthogonal to watermark
+// buildConversationTurnsForExtraction — orthogonal to watermark
 // counting: consumes already-computed eligibility/narrowing results, never
 // recomputes them.
 // ============================================================================

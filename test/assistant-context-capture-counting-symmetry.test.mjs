@@ -193,7 +193,7 @@ async function runScenario({ captureAssistant, payloadShape, embeddingPort, llmP
       baseURL: `http://127.0.0.1:${llmPort}`,
     },
   };
-  const ctx = { sessionKey: "agent:terry:webchat", agentId: "terry" };
+  const ctx = { sessionKey: "agent:agent-one:webchat", agentId: "agent-one" };
   const trace = [];
   let accumulated = [];
 
