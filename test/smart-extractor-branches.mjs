@@ -237,11 +237,11 @@ async function runScenario(mode) {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
     llmCalls += 1;
 
     let content;
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       content = JSON.stringify({
         memories: [
           {
@@ -256,20 +256,32 @@ async function runScenario(mode) {
           },
         ],
       });
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
-      content = JSON.stringify({
+    } else if (
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
+    ) {
+      const verdict = {
         decision: mode === "merge" ? "merge" : "skip",
         match_index: 1,
         reason: mode === "merge"
           ? "Same preference domain, merge into existing memory"
           : "Candidate fully duplicates existing memory",
-      });
-    } else if (prompt.includes("Merge the following memory into a single coherent record")) {
-      content = JSON.stringify({
+      };
+      content = prompt.includes("Decide every candidate independently")
+        ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
+        : JSON.stringify(verdict);
+    } else if (
+      prompt.includes("You are a memory merge writer.") ||
+      prompt.includes("For each job, merge every")
+    ) {
+      const merged = {
         abstract: "饮品偏好：乌龙茶、茉莉花茶",
         overview: "## Preference Domain\n- 饮品\n\n## Details\n- 喜欢乌龙茶\n- 喜欢茉莉花茶",
         content: "用户长期喜欢乌龙茶，并补充说明也喜欢茉莉花茶。",
-      });
+      };
+      content = prompt.includes("For each job, merge every")
+        ? JSON.stringify({ results: [{ index: 1, ...merged }] })
+        : JSON.stringify(merged);
     } else {
       content = JSON.stringify({ memories: [] });
     }
@@ -374,10 +386,10 @@ async function runMultiRoundScenario() {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
 
     let content;
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       extractionCall += 1;
       if (extractionCall === 1) {
         content = JSON.stringify({
@@ -424,34 +436,47 @@ async function runMultiRoundScenario() {
           ],
         });
       }
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+    } else if (
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
+    ) {
       dedupCall += 1;
+      let verdict;
       if (dedupCall === 1) {
-        content = JSON.stringify({
+        verdict = {
           decision: "skip",
           match_index: 1,
           reason: "Candidate fully duplicates existing memory",
-        });
+        };
       } else if (dedupCall === 2) {
-        content = JSON.stringify({
+        verdict = {
           decision: "merge",
           match_index: 1,
           reason: "New tea preference should extend existing memory",
-        });
+        };
       } else {
-        content = JSON.stringify({
+        verdict = {
           decision: "skip",
           match_index: 1,
           reason: "Already merged into existing memory",
-        });
+        };
       }
-    } else if (prompt.includes("Merge the following memory into a single coherent record")) {
+      content = prompt.includes("Decide every candidate independently")
+        ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
+        : JSON.stringify(verdict);
+    } else if (
+      prompt.includes("You are a memory merge writer.") ||
+      prompt.includes("For each job, merge every")
+    ) {
       mergeCall += 1;
-      content = JSON.stringify({
+      const merged = {
         abstract: "饮品偏好：乌龙茶、茉莉花茶",
         overview: "## Preference Domain\n- 饮品\n\n## Details\n- 喜欢乌龙茶\n- 喜欢茉莉花茶",
         content: "用户长期喜欢乌龙茶，并补充说明也喜欢茉莉花茶。",
-      });
+      };
+      content = prompt.includes("For each job, merge every")
+        ? JSON.stringify({ results: [{ index: 1, ...merged }] })
+        : JSON.stringify(merged);
     } else {
       content = JSON.stringify({ memories: [] });
     }
@@ -711,8 +736,10 @@ assert.ok(
 assert.ok(
   prependedRecallResult.logs.some((entry) => entry[1].includes("preview=\"请记住我的饮品偏好是乌龙茶。\"")),
 );
+// Below-threshold turns hand the stripped user text to the regex fallback
+// (this branch predates the fallback-gating change).
 assert.ok(
-  prependedRecallResult.logs.some((entry) => entry[1].includes("regex fallback found 1 capturable text(s)")),
+  prependedRecallResult.logs.some((entry) => entry[1].includes("auto-capture running regex fallback")),
 );
 
 async function runInboundMetadataWrappedScenario() {
@@ -800,9 +827,10 @@ assert.ok(
     entry[1].includes('preview="请记住我的饮品偏好是乌龙茶"')
   ),
 );
+// Same as above: below-threshold turn hands the text to the regex fallback.
 assert.ok(
   inboundMetadataWrappedResult.logs.some((entry) =>
-    entry[1].includes("regex fallback found 1 capturable text(s)")
+    entry[1].includes("auto-capture running regex fallback")
   ),
 );
 
@@ -1020,10 +1048,10 @@ async function runUserMdExclusiveProfileScenario() {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
 
     let content = JSON.stringify({ memories: [] });
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       content = JSON.stringify({
         memories: [
           {
@@ -1118,10 +1146,10 @@ async function runBoundarySkipKeepsRegexFallbackScenario() {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
 
     let content = JSON.stringify({ memories: [] });
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       content = JSON.stringify({
         memories: [
           {
@@ -1219,11 +1247,11 @@ async function runInboundMetadataCleanupScenario() {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
     llmCalls += 1;
 
     let content;
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       extractionPrompt = prompt;
       content = JSON.stringify({
         memories: [
@@ -1235,11 +1263,17 @@ async function runInboundMetadataCleanupScenario() {
           },
         ],
       });
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
-      content = JSON.stringify({
+    } else if (
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
+    ) {
+      const verdict = {
         decision: "create",
         reason: "No similar memory exists yet",
-      });
+      };
+      content = prompt.includes("Decide every candidate independently")
+        ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
+        : JSON.stringify(verdict);
     } else {
       content = JSON.stringify({ memories: [] });
     }
@@ -1435,17 +1469,16 @@ assert.ok(cumulativeResult.smartExtractionSkipped,
   cumulativeResult.logs.map((e) => e[1]).join(" | "));
 
 // ===============================================================
-// Test: F5 — Counter reset after successful extraction
-// Scenario: Verifies Fix #9 (counter resets to 0 after success).
-// Turn 1: cumulative=1, skip
-// Turn 2: cumulative=2, trigger extraction, LLM returns SUCCESS with memories
-//   -> counter resets to 0 (Fix #9)
-// Turn 3: cumulative restarts from 0, +1 new text = 1 < minMessages=2, skip
-// Key assertions:
-//   - LLM called exactly once (turn 2 only)
-//   - Turn 3 observes reset counter and does NOT re-trigger extraction
-// ===============================================================
-
+// Test: assistantContextTexts "context" mode — eligibility counting
+// unchanged (assistant turns never count toward extractMinMessages),
+// while assistant text still reaches the extraction prompt as marked,
+// non-extractable context.
+// Turn 1: user + assistant messages, only the user message counts
+//   -> cumulative=1 < minMessages=2, skip
+// Turn 2: user + assistant messages, only the user message counts
+//   -> cumulative=2 >= minMessages=2, trigger extraction
+// If assistant turns wrongly counted, turn 1 alone would already reach
+// cumulative=2 and trigger prematurely.
 async function runCounterResetSuccessScenario() {
   const workDir = mkdtempSync(path.join(tmpdir(), "memory-counter-reset-"));
   const dbPath = path.join(workDir, "db");
@@ -1591,9 +1624,9 @@ async function runDedupDecisionLLMCallScenario() {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const prompt = payload.messages?.[1]?.content || "";
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
 
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       extractCalls += 1;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -1612,15 +1645,21 @@ async function runDedupDecisionLLMCallScenario() {
           }, finish_reason: "stop"
         }]
       }));
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+    } else if (
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
+    ) {
       dedupCalls += 1;
+      const verdict = { decision: "skip", match_index: 1, reason: "duplicate" };
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         id: "chatcmpl-test", object: "chat.completion",
         created: Math.floor(Date.now() / 1000), model: "mock-memory-model",
         choices: [{
           index: 0, message: { role: "assistant",
-            content: JSON.stringify({ decision: "skip", match_index: 1, reason: "duplicate" })
+            content: prompt.includes("Decide every candidate independently")
+              ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
+              : JSON.stringify(verdict)
           }, finish_reason: "stop"
         }]
       }));

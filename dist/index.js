@@ -1014,17 +1014,17 @@ async function ensureDailyLogFile(dailyPath, dateStr) {
         await writeFile(dailyPath, `# ${dateStr}\n\n`, "utf-8");
     }
 }
-function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
+export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
     const clipped = conversation.slice(-maxInputChars);
     const errorHints = toolErrorSignals.length > 0
         ? toolErrorSignals
             .map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary} (sig:${e.signatureHash.slice(0, 8)})`)
             .join("\n")
         : "- (none)";
-    return [
-        "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
+    const system = [
+        "You are a memory reflection distiller agent. You distill a completed session into one durable MEMORY REFLECTION entry for an AI assistant system.",
         "",
-        "Output Markdown only. No intro text. No outro text. No extra headings.",
+        "Output Markdown only. Do not wrap the output in a code fence. No intro text. No outro text. No extra headings.",
         "",
         "Use these headings exactly once, in this exact order, with exact spelling:",
         "## Context (session background)",
@@ -1117,7 +1117,8 @@ function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = [
         "",
         "## Derived",
         "- This run showed ...",
-        "",
+    ].join("\n");
+    const user = [
         "Recent tool error signals:",
         errorHints,
         "",
@@ -1126,6 +1127,7 @@ function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = [
         clipped,
         "```",
     ].join("\n");
+    return { system, user };
 }
 function buildReflectionFallbackText() {
     return [
@@ -1201,7 +1203,8 @@ export async function generateReflectionText(params) {
     }
 }
 async function generateReflectionTextUnbounded(params) {
-    const prompt = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
+    const { system: reflectionSystemPrompt, user: reflectionUserPrompt } = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
+    const prompt = `${reflectionSystemPrompt}\n\n${reflectionUserPrompt}`;
     const promptHash = sha256Hex(prompt);
     const tempSessionFile = join(tmpdir(), `memory-reflection-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
     let reflectionText = null;
@@ -4066,10 +4069,15 @@ const memoryLanceDBProPlugin = {
                 const now = new Date(params.timestampMs ?? Date.now());
                 const dateStr = now.toISOString().split("T")[0];
                 const timeStr = now.toISOString().split("T")[1].split(".")[0];
+                // Session key/id stay out of `text`: it is the FTS index surface, and
+                // the `simple` tokenizer splits a key like
+                // `agent:main:cron:<uuid>:run:<uuid>` on its punctuation — so every session
+                // summary ends up indexed under `agent`, `main`, `cron`, `run`. A query
+                // mentioning any of those then BM25-matches every session summary in the
+                // store regardless of content. Both ids are already recorded structurally
+                // in metadata below, so provenance is unaffected.
                 const memoryText = [
                     `Session: ${dateStr} ${timeStr} UTC`,
-                    `Session Key: ${params.sessionKey}`,
-                    `Session ID: ${params.sessionId}`,
                     `Source: ${params.source}`,
                     "",
                     "Conversation Summary:",
