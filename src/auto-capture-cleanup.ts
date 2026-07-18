@@ -151,3 +151,27 @@ export function normalizeAutoCaptureText(
   if (shouldSkipMessage?.(role, normalized)) return null;
   return normalized;
 }
+
+/**
+ * Bounds the extraction input when a session's watermark is genuinely
+ * unknown (first-ever run, or persisted state lost) and its eligible-text
+ * history is larger than one batch's worth -- ingesting the entire history
+ * in one extraction call risks an oversized, stale-content-heavy prompt.
+ * Caps to the most recent `batchSize` texts, then trims further from the
+ * front of that window if it still exceeds `maxChars`. Always keeps at
+ * least the single most recent text, even if it alone exceeds `maxChars`.
+ */
+export function capUnknownWatermarkWindow(
+  eligibleTexts: string[],
+  batchSize: number,
+  maxChars: number,
+): string[] {
+  const window = eligibleTexts.slice(-Math.max(1, batchSize));
+  let start = 0;
+  let totalChars = window.reduce((sum, text) => sum + text.length, 0);
+  while (totalChars > maxChars && start < window.length - 1) {
+    totalChars -= window[start].length;
+    start++;
+  }
+  return window.slice(start);
+}
