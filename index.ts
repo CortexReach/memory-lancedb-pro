@@ -67,6 +67,7 @@ import {
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
+import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
@@ -1461,7 +1462,7 @@ async function ensureDailyLogFile(dailyPath: string, dateStr: string): Promise<v
   }
 }
 
-function buildReflectionPrompt(
+export function buildReflectionPrompt(
   conversation: string,
   maxInputChars: number,
   toolErrorSignals: ReflectionErrorSignal[] = []
@@ -1496,6 +1497,7 @@ function buildReflectionPrompt(
     "- Do not wrap one bullet across multiple lines.",
     "- If a bullet section is empty, write exactly: '- (none captured)'",
     "- Do not paste raw transcript.",
+    "- Grounding: treat claims made inside roleplay, games, fiction, hypotheticals, or test/simulation frames as not real. Such content may be summarized in Context or Open loops, but must NEVER appear under Decisions (durable), User model deltas, Agent model deltas, or Lessons & pitfalls \u2014 those sections become durable memory rows.",
     "- Do not invent Logged timestamps, ids, file paths, commit hashes, session ids, or storage metadata unless they already appear in the input.",
     "- If secrets/tokens/passwords appear, keep them as [REDACTED].",
     "",
@@ -4988,8 +4990,11 @@ const memoryLanceDBProPlugin = {
           const MAX_MAPPED_ENTRIES = 100;
           const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
           const mappedEntries: Array<{ text: string; vector: number[]; importance: number; category: string; scope: string; metadata: string }> = [];
+          // Per-row embed + near-duplicate pre-check first, collecting the
+          // gate-eligible rows so the whole burst can share one admission call.
+          const gateEligible: Array<{ mapped: (typeof mappedReflectionMemories)[number]; vector: number[] }> = [];
           for (const mapped of mappedReflectionMemories) {
-            if (mappedEntries.length >= MAX_MAPPED_ENTRIES) {
+            if (gateEligible.length >= MAX_MAPPED_ENTRIES) {
               api.logger.warn(`memory-reflection: mapped entries cap (${MAX_MAPPED_ENTRIES}) reached, skipping remaining items`);
               break;
             }
@@ -5007,7 +5012,51 @@ const memoryLanceDBProPlugin = {
             if (searchFailed) {
               continue;
             }
+            // Near-duplicate pre-check ahead of admission gating. This is the only dedup mapped
+            // rows get: a single vector-similarity threshold, direct skip, no LLM-mediated
+            // merge/contextualize/contradict decision. Extraction candidates own deduplicate()
+            // (src/smart-extractor.ts) is a genuinely different, richer pipeline (a 0.7
+            // pre-filter feeding an LLM decision, not a single hard cutoff) - deliberately not
+            // reused here yet. AdmissionController's "pass_to_dedup" decision for a mapped row
+            // is therefore always treated as "admit, subject to this cheaper pre-check" below,
+            // not "route through the same merge pipeline extraction candidates get".
             if (existing.length > 0 && existing[0].score > 0.95) {
+              continue;
+            }
+            gateEligible.push({ mapped, vector });
+          }
+
+          // Writer-1 admission routing: mapped rows previously bypassed
+          // admission control entirely. Gate the whole burst through the same
+          // AdmissionController as extraction candidates: one batched judge
+          // call per burst when the controller supports evaluateBatch, the
+          // historical per-row path otherwise; passthrough when admission
+          // control (or smart extraction) is disabled.
+          const mappedGateResults = await gateMappedReflectionEntries({
+            admissionController: smartExtractor?.getAdmissionController() ?? null,
+            attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+            rows: gateEligible.map(({ mapped, vector }) => ({
+              text: mapped.text,
+              category: mapped.category,
+              heading: mapped.heading,
+              vector,
+            })),
+            // The real transcript, not reflectionText (the distiller's own generated
+            // output mapped rows are parsed FROM): using the distillate as its own
+            // grounding evidence would let a hallucinated line appear self-grounded.
+            conversationText: conversation,
+            scopeFilter: [targetScope],
+            warnLog: (msg: string) => api.logger.warn(msg),
+          });
+
+          // Consume the per-row gate results in input order.
+          for (let gateIndex = 0; gateIndex < gateEligible.length; gateIndex++) {
+            const { mapped, vector } = gateEligible[gateIndex];
+            const mappedGate = mappedGateResults[gateIndex];
+            if (!mappedGate.admit) {
+              api.logger.info(
+                `memory-reflection: admission rejected mapped row heading=${JSON.stringify(mapped.heading)} provenance=memory-reflection-mapped: ${mappedGate.reason ?? "no reason"}`,
+              );
               continue;
             }
 
@@ -5025,6 +5074,9 @@ const memoryLanceDBProPlugin = {
             });
             // embed heading in metadata JSON so it survives bulkStore round-trip to LanceDB
             baseMetadata._reflectionHeading = mapped.heading;
+            if (mappedGate.auditJson) {
+              baseMetadata.admission_audit = mappedGate.auditJson;
+            }
             const metadata = JSON.stringify(baseMetadata);
 
             mappedEntries.push({
