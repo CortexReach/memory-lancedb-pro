@@ -74,6 +74,7 @@ import {
   type ConversationTurn,
   buildConversationTurnsForExtraction,
   trimTurnsToUserCap,
+  dedupePairWindow,
 } from "./src/auto-capture-cleanup.js";
 
 // Import smart extraction & lifecycle components
@@ -3926,7 +3927,7 @@ const memoryLanceDBProPlugin = {
           });
           const priorPairTurns = autoCaptureRecentPairTurns.get(sessionKey) || [];
           const pairWindowTurns = trimTurnsToUserCap(
-            [...priorPairTurns, ...thisCallPairTurns],
+            dedupePairWindow([...priorPairTurns, ...thisCallPairTurns]),
             Math.max(minMessages, thisCallPairTurns.filter((turn) => turn.role === "user").length),
           );
           if (thisCallPairTurns.length > 0) {

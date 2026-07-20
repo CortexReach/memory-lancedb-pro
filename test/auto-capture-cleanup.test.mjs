@@ -10,6 +10,7 @@ const {
   formatConversationTranscript,
   buildConversationTurnsForExtraction,
   trimTurnsToUserCap,
+  dedupePairWindow,
 } = jiti("../src/auto-capture-cleanup.ts");
 
 describe("auto-capture cleanup", () => {
@@ -196,5 +197,87 @@ describe("trimTurnsToUserCap (extractMinMessages as a window of pairs)", () => {
       { role: "user", text: "u3" },
       { role: "assistant", text: "a3" },
     ]);
+  });
+});
+
+describe("dedupePairWindow (deferral double-include repair)", () => {
+  it("collapses an identical re-included pair to its later copy (watermark-rollback signature)", () => {
+    const turns = [
+      { role: "user", text: "m2" },
+      { role: "assistant", text: "r2" },
+      { role: "user", text: "m2" },
+      { role: "assistant", text: "r2" },
+      { role: "user", text: "m3" },
+      { role: "assistant", text: "r3" },
+    ];
+    assert.deepEqual(dedupePairWindow(turns), [
+      { role: "user", text: "m2" },
+      { role: "assistant", text: "r2" },
+      { role: "user", text: "m3" },
+      { role: "assistant", text: "r3" },
+    ]);
+  });
+
+  it("drops a flat reply-less duplicate in favor of the pair-shaped copy (ingress-replay signature)", () => {
+    const turns = [
+      { role: "user", text: "m2" },
+      { role: "assistant", text: "r2" },
+      { role: "user", text: "m3" },
+      { role: "assistant", text: "r3" },
+      { role: "user", text: "m2" },
+      { role: "user", text: "m3" },
+    ];
+    assert.deepEqual(dedupePairWindow(turns), [
+      { role: "user", text: "m2" },
+      { role: "assistant", text: "r2" },
+      { role: "user", text: "m3" },
+      { role: "assistant", text: "r3" },
+    ]);
+  });
+
+  it("keeps a legitimately repeated user message whose assistant replies differ", () => {
+    const turns = [
+      { role: "user", text: "yes" },
+      { role: "assistant", text: "first confirmation" },
+      { role: "user", text: "yes" },
+      { role: "assistant", text: "second confirmation" },
+    ];
+    assert.deepEqual(dedupePairWindow(turns), turns);
+  });
+
+  it("prefers the pair-shaped copy even when the flat duplicate comes first", () => {
+    const turns = [
+      { role: "user", text: "m2" },
+      { role: "user", text: "m3" },
+      { role: "user", text: "m2" },
+      { role: "assistant", text: "r2" },
+    ];
+    assert.deepEqual(dedupePairWindow(turns), [
+      { role: "user", text: "m3" },
+      { role: "user", text: "m2" },
+      { role: "assistant", text: "r2" },
+    ]);
+  });
+
+  it("collapses identical flat duplicates to the later copy", () => {
+    const turns = [
+      { role: "user", text: "m2" },
+      { role: "user", text: "m3" },
+      { role: "user", text: "m2" },
+    ];
+    assert.deepEqual(dedupePairWindow(turns), [
+      { role: "user", text: "m3" },
+      { role: "user", text: "m2" },
+    ]);
+  });
+
+  it("passes windows without duplicated user texts through unchanged, including leading assistant turns", () => {
+    const turns = [
+      { role: "assistant", text: "a0" },
+      { role: "user", text: "u1" },
+      { role: "assistant", text: "a1" },
+    ];
+    assert.deepEqual(dedupePairWindow(turns), turns);
+    assert.deepEqual(dedupePairWindow([]), []);
   });
 });

@@ -249,3 +249,73 @@ export function trimTurnsToUserCap(
   }
   return turns.slice(start);
 }
+
+/**
+ * Repairs a pair window that double-preserved deferred turns. A below-threshold
+ * deferral keeps content alive on two independent paths -- the rolling pair
+ * buffer, and the watermark rollback (or pending-ingress re-queue) whose next
+ * slice re-includes the same turns -- so the assembled window can carry the
+ * same exchange twice. Collapse duplicates by user text at pair granularity:
+ * a pair-shaped copy (user turn plus its replies) beats a flat re-queued copy,
+ * copies of an identical exchange collapse to the latest, and a repeated user
+ * text whose replies differ is a real conversation and is kept whole.
+ */
+export function dedupePairWindow(turns: ConversationTurn[]): ConversationTurn[] {
+  interface PairGroup {
+    turns: ConversationTurn[];
+    userText: string | null;
+    replies: string;
+  }
+  const groups: PairGroup[] = [];
+  let current: PairGroup | null = null;
+  for (const turn of turns) {
+    if (turn.role === "user") {
+      current = { turns: [turn], userText: turn.text, replies: "" };
+      groups.push(current);
+    } else if (current) {
+      current.turns.push(turn);
+      current.replies = JSON.stringify(current.turns.slice(1).map((t) => t.text));
+    } else {
+      groups.push({ turns: [turn], userText: null, replies: "" });
+    }
+  }
+
+  const kept: PairGroup[] = [];
+  for (const group of groups) {
+    if (group.userText === null) {
+      kept.push(group);
+      continue;
+    }
+    let prevIndex = -1;
+    for (let i = kept.length - 1; i >= 0; i--) {
+      if (kept[i].userText === group.userText) {
+        prevIndex = i;
+        break;
+      }
+    }
+    if (prevIndex < 0) {
+      kept.push(group);
+      continue;
+    }
+    const prev = kept[prevIndex];
+    const prevPaired = prev.turns.length > 1;
+    const currPaired = group.turns.length > 1;
+    if (currPaired && prevPaired) {
+      if (prev.replies === group.replies) {
+        kept.splice(prevIndex, 1);
+        kept.push(group);
+      } else {
+        kept.push(group);
+      }
+    } else if (currPaired && !prevPaired) {
+      kept.splice(prevIndex, 1);
+      kept.push(group);
+    } else if (!currPaired && prevPaired) {
+      continue;
+    } else {
+      kept.splice(prevIndex, 1);
+      kept.push(group);
+    }
+  }
+  return kept.flatMap((group) => group.turns);
+}
