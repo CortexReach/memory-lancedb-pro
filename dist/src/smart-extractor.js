@@ -278,9 +278,16 @@ export class SmartExtractor {
         const candidates = extraction.candidates;
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
-            if (extraction.status === "ok") {
+            if (extraction.status === "ok" && extraction.rawCandidateCount === 0) {
                 // LLM genuinely returned zero candidates → strongest noise signal → feedback to noise bank
                 this.learnAsNoise(conversationText);
+            }
+            else if (extraction.status === "ok") {
+                // The model DID emit candidates; validation dropped or demoted them
+                // all. That is a policy verdict about those candidates, not evidence
+                // the conversation is noise — learning it as noise would pre-filter
+                // similar real content away from future extractions.
+                this.log(`memory-pro: smart-extractor: skipping noise-bank learning (validation emptied the batch, raw=${extraction.rawCandidateCount})`);
             }
             else {
                 this.debugLog(`memory-pro: smart-extractor: skipping noise-bank learning (status=${extraction.status})`);
@@ -662,8 +669,14 @@ export class SmartExtractor {
                 }
             }
         }
+        if (contradictionDemotedCount > 0) {
+            // At the standard log level so a fully-demoted batch is distinguishable
+            // from "model found nothing" without debug logging (mirrors the
+            // admission-rejection lines).
+            this.log(`memory-lancedb-pro: smart-extractor: batch contradiction demoted ${contradictionDemotedCount} real-tagged durable candidate(s) (register=${conversationRegister}, constructed siblings present)`);
+        }
         this.debugLog(`memory-lancedb-pro: smart-extractor: validation summary register=${conversationRegister}, accepted=${candidates.length}, invalidCategory=${invalidCategoryCount}, shortAbstract=${shortAbstractCount}, noiseAbstract=${noiseAbstractCount}, policyDropped=${policyDroppedCount}, constructedDropped=${constructedDroppedCount}, fictionRegisterDropped=${fictionRegisterDroppedCount}, contradictionDemoted=${contradictionDemotedCount}`);
-        return { status: "ok", candidates };
+        return { status: "ok", candidates, rawCandidateCount: result.memories.length };
     }
     // --------------------------------------------------------------------------
     // Step 2: Dedup + Persist

@@ -4,10 +4,12 @@
  * extractCandidates() can come back with zero candidates for four different
  * reasons: the LLM/gateway call failed outright, the response had an
  * unexpected shape, the LLM genuinely returned an empty memories list, or
- * every parsed candidate was dropped by local validation. Only the latter
- * two are a real "nothing to remember" signal — the first two are failures
- * that must NOT be fed into the noise-prototype bank, or gateway outages
- * silently poison future extraction/recall.
+ * every parsed candidate was dropped/demoted by local validation. ONLY the
+ * genuinely-empty list is a real "nothing to remember" signal. Failures must
+ * not train the bank (gateway outages would poison it), and a
+ * validation-emptied batch must not either: the model DID find candidates
+ * there, so teaching the bank "this conversation is noise" would pre-filter
+ * similar real content away from future extractions.
  */
 
 import { describe, it } from "node:test";
@@ -42,6 +44,7 @@ function makeLlm(behavior) {
       if (behavior === "malformed_non_array") return { memories: "not-an-array" };
       if (behavior === "empty") return { memories: [] };
       if (Array.isArray(behavior)) return { memories: behavior };
+      if (behavior && typeof behavior === "object" && behavior.raw) return behavior.raw;
       throw new Error(`unsupported test behavior: ${behavior}`);
     },
   };
@@ -130,16 +133,69 @@ describe("SmartExtractor noise-bank learning gate", () => {
     assert.equal(noiseBank.learnCalls.length, 1, "a genuine empty list is a real noise signal");
   });
 
-  it("learns noise when every parsed candidate is dropped by local validation", async () => {
+  it("does NOT learn noise when validation drops every parsed candidate (policy verdict, not a noise signal)", async () => {
     const noiseBank = makeNoiseBank();
+    const logs = [];
     // "hi" is a valid category but fails the length>=5 abstract check, so the
-    // parsed response is well-formed yet every candidate is filtered out.
+    // parsed response is well-formed yet every candidate is filtered out. The
+    // model DID emit a candidate, so the conversation must not train the bank.
     const llm = makeLlm([{ category: "preferences", abstract: "hi", overview: "", content: "" }]);
+    const extractor = makeExtractor(makeEmbedder(), llm, makeStore(), { noiseBank, log: (msg) => logs.push(msg) });
+
+    await extractor.extractAndPersist("some conversation text", "s1");
+    await flushMicrotasks();
+
+    assert.equal(noiseBank.learnCalls.length, 0, "a validation-emptied batch must not train the noise bank");
+    assert.ok(
+      logs.some((msg) => msg.includes("skipping noise-bank learning (validation emptied the batch")),
+      "the skip must be visible at the standard log level",
+    );
+  });
+
+  it("does NOT learn noise when the batch contradiction check demotes every candidate", async () => {
+    const noiseBank = makeNoiseBank();
+    // Mixed-register batch with a constructed sibling: the real-tagged durable
+    // is demoted by the batch contradiction check, the constructed one is
+    // dropped by grounding enforcement. Raw output had 2 candidates, so the
+    // conversation (which contains real facts the policy demoted) must not be
+    // fed to the noise bank as a noise exemplar.
+    const llm = makeLlm({
+      raw: {
+        conversation_register: "mixed",
+        memories: [
+          { category: "preferences", abstract: "User loves space operas", overview: "- pref", content: "", grounding: "real" },
+          { category: "events", abstract: "The captain hid the artifact", overview: "- event", content: "", grounding: "constructed" },
+        ],
+      },
+    });
     const extractor = makeExtractor(makeEmbedder(), llm, makeStore(), { noiseBank });
 
     await extractor.extractAndPersist("some conversation text", "s1");
     await flushMicrotasks();
 
-    assert.equal(noiseBank.learnCalls.length, 1, "a validly-parsed-but-empty-after-filtering result is still a real noise signal");
+    assert.equal(noiseBank.learnCalls.length, 0, "a demotion-emptied batch must not train the noise bank");
+  });
+
+  it("logs the batch contradiction demotion at the standard log level, with count and register", async () => {
+    const noiseBank = makeNoiseBank();
+    const logs = [];
+    const llm = makeLlm({
+      raw: {
+        conversation_register: "mixed",
+        memories: [
+          { category: "preferences", abstract: "User loves space operas", overview: "- pref", content: "", grounding: "real" },
+          { category: "events", abstract: "The captain hid the artifact", overview: "- event", content: "", grounding: "constructed" },
+        ],
+      },
+    });
+    const extractor = makeExtractor(makeEmbedder(), llm, makeStore(), { noiseBank, log: (msg) => logs.push(msg) });
+
+    await extractor.extractAndPersist("some conversation text", "s1");
+    await flushMicrotasks();
+
+    const demotionLine = logs.find((msg) => msg.includes("batch contradiction demoted"));
+    assert.ok(demotionLine, "a fully-demoted batch must be distinguishable from 'model found nothing' without debug logging");
+    assert.ok(demotionLine.includes("1"), "the demotion line must carry the demoted count");
+    assert.ok(demotionLine.includes("mixed"), "the demotion line must carry the batch register");
   });
 });
