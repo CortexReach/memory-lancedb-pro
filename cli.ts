@@ -43,6 +43,10 @@ interface CLIContext {
   llmClient?: LlmClient;
   pluginId?: string;
   pluginConfig?: Record<string, unknown>;
+  // Called synchronously after a delete or delete-bulk command actually removes
+  // memories, so the host plugin can invalidate any in-process read caches (e.g.
+  // reflection slice caches) keyed on the affected scope(s) before they go stale.
+  onMemoriesDeleted?: (info: { scopeFilter?: string[] }) => void;
   oauthTestHooks?: {
     openUrl?: (url: string) => void | Promise<void>;
     authorizeUrl?: (url: string) => void | Promise<void>;
@@ -1472,6 +1476,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         const deleted = await context.store.delete(id, scopeFilter);
 
         if (deleted) {
+          context.onMemoriesDeleted?.({ scopeFilter });
           console.log(`Memory ${id} deleted successfully.`);
           printReadConsistencyHint(context.store);
         } else {
@@ -1517,6 +1522,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           console.log(`Would delete from ${stats.totalCount} memories in matching scopes.`);
         } else {
           const deletedCount = await context.store.bulkDelete(options.scope, beforeTimestamp);
+          if (deletedCount > 0) {
+            context.onMemoriesDeleted?.({ scopeFilter: options.scope });
+          }
           console.log(`Deleted ${deletedCount} memories.`);
           printReadConsistencyHint(context.store);
         }

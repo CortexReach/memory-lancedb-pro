@@ -37,6 +37,7 @@ import { parseReflectionMetadata } from "./src/reflection-metadata.js";
 import { extractReflectionLearningGovernanceCandidates, extractInjectableReflectionMappedMemoryItems, isRecallUsed, } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
+import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
@@ -368,6 +369,7 @@ const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_MAX_ENTRIES = 200;
+const DEFAULT_REFLECTION_CACHE_TTL_MS = 15_000;
 // After /new or /reset, the just-closed session may have generated fresh
 // derived deltas. Keep those out of the immediately opened prompt window.
 const DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS = 120_000;
@@ -767,9 +769,14 @@ function asNonEmptyString(value) {
 function isInternalReflectionSessionKey(sessionKey) {
     return typeof sessionKey === "string" && sessionKey.trim().startsWith("temp:memory-reflection");
 }
-// Memory sub-completions (active-memory's embedded recall sub-build, and any :subagent:
-// sub-build) must not re-enter memory prompt injection: they would waste an embedding+vector
-// search per turn, and their injected block can leak into the main prompt via shared session messages.
+// Any :subagent:/:active-memory: sub-build (delegated subagents in general, not only
+// memory-internal ones) is treated as "its context comes from the parent" across every
+// memory-adjacent hook in this file: auto-recall injection, reflection injection, and
+// self-improvement reminders all skip it via this same check (each with its own "skip for
+// sub-agent sessions" comment at its call site), and auto-capture (agent_end) follows the
+// same convention. This is deliberately broader than "memory-internal only"; a subagent's
+// own task-scoped conversation is not treated as an independent, capturable/injectable
+// top-level conversation by this plugin.
 function isMemorySubsessionKey(sessionKey) {
     return typeof sessionKey === "string" && (sessionKey.includes(":subagent:") || sessionKey.includes(":active-memory:"));
 }
@@ -1008,7 +1015,7 @@ async function ensureDailyLogFile(dailyPath, dateStr) {
         await writeFile(dailyPath, `# ${dateStr}\n\n`, "utf-8");
     }
 }
-function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
+export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
     const clipped = conversation.slice(-maxInputChars);
     const errorHints = toolErrorSignals.length > 0
         ? toolErrorSignals
@@ -1039,6 +1046,7 @@ function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = [
         "- Do not wrap one bullet across multiple lines.",
         "- If a bullet section is empty, write exactly: '- (none captured)'",
         "- Do not paste raw transcript.",
+        "- Grounding: treat claims made inside roleplay, games, fiction, hypotheticals, or test/simulation frames as not real. Such content may be summarized in Context or Open loops, but must NEVER appear under Decisions (durable), User model deltas, Agent model deltas, or Lessons & pitfalls \u2014 those sections become durable memory rows.",
         "- Do not invent Logged timestamps, ids, file paths, commit hashes, session ids, or storage metadata unless they already appear in the input.",
         "- If secrets/tokens/passwords appear, keep them as [REDACTED].",
         "",
@@ -1869,6 +1877,11 @@ function _initPluginState(api) {
     const reflectionDerivedBySession = new Map();
     const reflectionDerivedSuppressionBySession = new Map();
     const reflectionByAgentCache = new Map();
+    // Bumped on every invalidateReflectionCachesAfterDelete call. loadAgentReflectionSlices
+    // snapshots this before its awaited store.list() reads and skips caching its result if
+    // it changed mid-flight, so an in-flight read can never publish a stale pre-delete
+    // snapshot back into the cache after the delete already invalidated it.
+    const reflectionByAgentCacheGeneration = { count: 0 };
     const recallHistory = new Map();
     const turnCounter = new Map();
     const autoCaptureSeenTextCount = new Map();
@@ -1895,6 +1908,7 @@ function _initPluginState(api) {
         reflectionDerivedBySession,
         reflectionDerivedSuppressionBySession,
         reflectionByAgentCache,
+        reflectionByAgentCacheGeneration,
         recallHistory,
         turnCounter,
         autoCaptureSeenTextCount,
@@ -2008,7 +2022,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2171,8 +2185,9 @@ const memoryLanceDBProPlugin = {
                 : "<NO_SCOPE_FILTER>";
             const cacheKey = `${agentId}::${scopeKey}`;
             const cached = reflectionByAgentCache.get(cacheKey);
-            if (cached && Date.now() - cached.updatedAt < 15_000)
+            if (cached && Date.now() - cached.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS)
                 return cached;
+            const generationAtStart = reflectionByAgentCacheGeneration.count;
             // Prefer reflection-category rows to avoid full-table reads on bypass callers.
             // Fall back to an uncategorized scan only when the category query produced no
             // agent-owned reflection slices, preserving backward compatibility with mixed-schema stores.
@@ -2201,8 +2216,49 @@ const memoryLanceDBProPlugin = {
             }
             const { invariants, derived } = slices;
             const next = { updatedAt: Date.now(), invariants, derived };
-            reflectionByAgentCache.set(cacheKey, next);
+            // Only cache if no delete invalidated this cacheKey while the awaits above were in
+            // flight (TOCTOU guard); otherwise this late-arriving, possibly-stale read would
+            // silently resurrect a cache entry the delete just cleared.
+            if (reflectionByAgentCacheGeneration.count === generationAtStart) {
+                reflectionByAgentCache.set(cacheKey, next);
+            }
             return next;
+        };
+        // Fast-path invalidation for SAME-PROCESS deletes only: CLI delete/delete-bulk
+        // commands run as a short-lived, separate process from the long-running Gateway
+        // in typical deployments, so this callback firing there does not reach (and
+        // cannot invalidate) the Gateway process own in-memory caches. It only has an
+        // effect when a delete genuinely happens inside this same plugin instance.
+        //
+        // The actual cross-process staleness bound comes from two other layers:
+        //   - DEFAULT_REFLECTION_CACHE_TTL_MS bounds how long either cache below can
+        //     serve stale content after ANY delete, same-process or not (see the read
+        //     sites in loadAgentReflectionSlices and the derived-focus injector).
+        //   - readConsistencyInterval (store config) bounds how long the underlying
+        //     LanceDB table handle can serve stale rows to a fresh query in the first
+        //     place, which is what a TTL-expired cache re-populates from.
+        //
+        // reflectionByAgentCache is keyed "<agentId>::scopes:<sorted,scopes>" (or
+        // "<agentId>::<NO_SCOPE_FILTER>"); drop any entry whose scope set intersects
+        // the deleted scopes, plus every no-scope-filter entry (it spans all scopes).
+        // reflectionDerivedBySession has no cheap scope-to-session mapping, so it is
+        // cleared in full rather than left to expire on its own TTL.
+        const invalidateReflectionCachesAfterDelete = (deletedScopes) => {
+            reflectionByAgentCacheGeneration.count++;
+            const deletedSet = new Set(deletedScopes ?? []);
+            for (const cacheKey of reflectionByAgentCache.keys()) {
+                const sepIdx = cacheKey.indexOf("::");
+                const scopePart = sepIdx === -1 ? "" : cacheKey.slice(sepIdx + 2);
+                if (scopePart === "<NO_SCOPE_FILTER>" || deletedSet.size === 0) {
+                    reflectionByAgentCache.delete(cacheKey);
+                    continue;
+                }
+                const cachedScopes = scopePart.startsWith("scopes:") ? scopePart.slice("scopes:".length).split(",") : [];
+                if (cachedScopes.some((s) => deletedSet.has(s))) {
+                    reflectionByAgentCache.delete(cacheKey);
+                }
+            }
+            reflectionDerivedBySession.clear();
         };
         const pendingRecall = new Map();
         const logReg = isCliMode() ? api.logger.debug : api.logger.info;
@@ -2307,6 +2363,9 @@ const memoryLanceDBProPlugin = {
             mdMirror,
             workspaceBoundary: config.workspaceBoundary,
             selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
+            // Mirrors the CLI context wiring below: keep in-process reflection caches
+            // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
+            onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
         }, {
             enableManagementTools: config.enableManagementTools,
             enableSelfImprovementTools: config.selfImprovement?.enabled === true,
@@ -2346,6 +2405,7 @@ const memoryLanceDBProPlugin = {
             store,
             retriever,
             scopeManager,
+            onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
             migrator,
             embedder,
             llmClient: smartExtractor ? (() => {
@@ -2807,6 +2867,16 @@ const memoryLanceDBProPlugin = {
         if (config.autoCapture !== false) {
             const agentEndAutoCaptureHook = (event, ctx) => {
                 if (!event.success || !event.messages || event.messages.length === 0) {
+                    return;
+                }
+                // Internal memory sub-sessions (the reflection distiller's embedded
+                // temp:memory-reflection run, :subagent:/:active-memory: sub-builds) emit
+                // agent_end too; capturing them would extract memory scaffolding prompts
+                // as if they were conversation. Same guard convention as the sibling
+                // reflection injection hooks.
+                const hookSessionKey = ctx?.sessionKey || event.sessionKey;
+                if (isInternalReflectionSessionKey(hookSessionKey) || isMemorySubsessionKey(hookSessionKey)) {
+                    api.logger.debug(`memory-lancedb-pro: auto-capture skip \u2014 internal memory session '${hookSessionKey}'`);
                     return;
                 }
                 // Fire-and-forget: run capture work in the background so the hook
@@ -3522,7 +3592,8 @@ const memoryLanceDBProPlugin = {
                                 reflectionDerivedSuppressionBySession.delete(sessionKey);
                             const scopes = resolveScopeFilter(scopeManager, agentId);
                             const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
-                            const derivedLines = derivedCache?.derived?.length
+                            const derivedCacheFresh = derivedCache && Date.now() - derivedCache.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS;
+                            const derivedLines = derivedCacheFresh && derivedCache.derived.length
                                 ? derivedCache.derived
                                 : (await loadAgentReflectionSlices(agentId, scopes)).derived;
                             if (derivedLines.length > 0) {
@@ -3835,8 +3906,11 @@ const memoryLanceDBProPlugin = {
                     const MAX_MAPPED_ENTRIES = 100;
                     const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
                     const mappedEntries = [];
+                    // Per-row embed + near-duplicate pre-check first, collecting the
+                    // gate-eligible rows so the whole burst can share one admission call.
+                    const gateEligible = [];
                     for (const mapped of mappedReflectionMemories) {
-                        if (mappedEntries.length >= MAX_MAPPED_ENTRIES) {
+                        if (gateEligible.length >= MAX_MAPPED_ENTRIES) {
                             api.logger.warn(`memory-reflection: mapped entries cap (${MAX_MAPPED_ENTRIES}) reached, skipping remaining items`);
                             break;
                         }
@@ -3853,7 +3927,47 @@ const memoryLanceDBProPlugin = {
                         if (searchFailed) {
                             continue;
                         }
+                        // Near-duplicate pre-check ahead of admission gating. This is the only dedup mapped
+                        // rows get: a single vector-similarity threshold, direct skip, no LLM-mediated
+                        // merge/contextualize/contradict decision. Extraction candidates own deduplicate()
+                        // (src/smart-extractor.ts) is a genuinely different, richer pipeline (a 0.7
+                        // pre-filter feeding an LLM decision, not a single hard cutoff) - deliberately not
+                        // reused here yet. AdmissionController's "pass_to_dedup" decision for a mapped row
+                        // is therefore always treated as "admit, subject to this cheaper pre-check" below,
+                        // not "route through the same merge pipeline extraction candidates get".
                         if (existing.length > 0 && existing[0].score > 0.95) {
+                            continue;
+                        }
+                        gateEligible.push({ mapped, vector });
+                    }
+                    // Writer-1 admission routing: mapped rows previously bypassed
+                    // admission control entirely. Gate the whole burst through the same
+                    // AdmissionController as extraction candidates: one batched judge
+                    // call per burst when the controller supports evaluateBatch, the
+                    // historical per-row path otherwise; passthrough when admission
+                    // control (or smart extraction) is disabled.
+                    const mappedGateResults = await gateMappedReflectionEntries({
+                        admissionController: smartExtractor?.getAdmissionController() ?? null,
+                        attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+                        rows: gateEligible.map(({ mapped, vector }) => ({
+                            text: mapped.text,
+                            category: mapped.category,
+                            heading: mapped.heading,
+                            vector,
+                        })),
+                        // The real transcript, not reflectionText (the distiller's own generated
+                        // output mapped rows are parsed FROM): using the distillate as its own
+                        // grounding evidence would let a hallucinated line appear self-grounded.
+                        conversationText: conversation,
+                        scopeFilter: [targetScope],
+                        warnLog: (msg) => api.logger.warn(msg),
+                    });
+                    // Consume the per-row gate results in input order.
+                    for (let gateIndex = 0; gateIndex < gateEligible.length; gateIndex++) {
+                        const { mapped, vector } = gateEligible[gateIndex];
+                        const mappedGate = mappedGateResults[gateIndex];
+                        if (!mappedGate.admit) {
+                            api.logger.info(`memory-reflection: admission rejected mapped row heading=${JSON.stringify(mapped.heading)} provenance=memory-reflection-mapped: ${mappedGate.reason ?? "no reason"}`);
                             continue;
                         }
                         const importance = mapped.category === "decision" ? 0.85 : 0.8;
@@ -3870,6 +3984,9 @@ const memoryLanceDBProPlugin = {
                         });
                         // embed heading in metadata JSON so it survives bulkStore round-trip to LanceDB
                         baseMetadata._reflectionHeading = mapped.heading;
+                        if (mappedGate.auditJson) {
+                            baseMetadata.admission_audit = mappedGate.auditJson;
+                        }
                         const metadata = JSON.stringify(baseMetadata);
                         mappedEntries.push({
                             text: mapped.text,
@@ -3918,7 +4035,13 @@ const memoryLanceDBProPlugin = {
                         });
                         if (sessionKey && stored.slices.derived.length > 0 && !isSessionBoundaryReflectionAction(action)) {
                             reflectionDerivedBySession.set(sessionKey, {
-                                updatedAt: nowTs,
+                                // Deliberately Date.now(), not nowTs (which mirrors the host-supplied
+                                // event.timestamp and can be skewed/future-dated): this field is a TTL
+                                // bookkeeping mark, and DEFAULT_REFLECTION_CACHE_TTL_MS above compares it
+                                // against a fresh Date.now() on every read. A skewed updatedAt can make
+                                // "Date.now() - updatedAt" go negative, which is always < the TTL, so the
+                                // cache would read as fresh indefinitely until wall-clock time caught up.
+                                updatedAt: Date.now(),
                                 derived: stored.slices.derived,
                             });
                         }
@@ -3991,10 +4114,15 @@ const memoryLanceDBProPlugin = {
                 const now = new Date(params.timestampMs ?? Date.now());
                 const dateStr = now.toISOString().split("T")[0];
                 const timeStr = now.toISOString().split("T")[1].split(".")[0];
+                // Session key/id stay out of `text`: it is the FTS index surface, and
+                // the `simple` tokenizer splits a key like
+                // `agent:main:cron:<uuid>:run:<uuid>` on its punctuation — so every session
+                // summary ends up indexed under `agent`, `main`, `cron`, `run`. A query
+                // mentioning any of those then BM25-matches every session summary in the
+                // store regardless of content. Both ids are already recorded structurally
+                // in metadata below, so provenance is unaffected.
                 const memoryText = [
                     `Session: ${dateStr} ${timeStr} UTC`,
-                    `Session Key: ${params.sessionKey}`,
-                    `Session ID: ${params.sessionId}`,
                     `Source: ${params.source}`,
                     "",
                     "Conversation Summary:",

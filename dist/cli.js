@@ -1196,6 +1196,7 @@ export function registerMemoryCLI(program, context) {
             }
             const deleted = await context.store.delete(id, scopeFilter);
             if (deleted) {
+                context.onMemoriesDeleted?.({ scopeFilter });
                 console.log(`Memory ${id} deleted successfully.`);
                 printReadConsistencyHint(context.store);
             }
@@ -1240,6 +1241,9 @@ export function registerMemoryCLI(program, context) {
             }
             else {
                 const deletedCount = await context.store.bulkDelete(options.scope, beforeTimestamp);
+                if (deletedCount > 0) {
+                    context.onMemoriesDeleted?.({ scopeFilter: options.scope });
+                }
                 console.log(`Deleted ${deletedCount} memories.`);
                 printReadConsistencyHint(context.store);
             }

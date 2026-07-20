@@ -441,6 +441,10 @@ function resolveLegacyDeriveBaseWeight(metadata) {
     }
     return 1;
 }
+// NOTE: this reader currently has no production callers (only tests import
+// it). Mapped rows written by the reflection writer are consumed exclusively
+// through generic semantic recall today; the dedicated injection path this
+// reader was built for was never wired up. Kept for that planned wiring.
 export function loadReflectionMappedRowsFromEntries(params) {
     const now = Number.isFinite(params.now) ? Number(params.now) : Date.now();
     const maxAgeMs = Number.isFinite(params.maxAgeMs)

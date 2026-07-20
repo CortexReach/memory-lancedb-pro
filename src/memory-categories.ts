@@ -31,7 +31,13 @@ export const TOOL_MEMORY_CATEGORIES = [
 export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
 export type LegacyMemoryCategory = (typeof LEGACY_MEMORY_CATEGORIES)[number];
 
-const SMART_TO_STORAGE_CATEGORY: Record<MemoryCategory, LegacyMemoryCategory> = {
+/**
+ * Storage categories that smart registers map onto. "reflection" is minted
+ * only by the reflection writer and is deliberately absent from this map.
+ */
+export type SmartStorageCategory = Exclude<LegacyMemoryCategory, "reflection">;
+
+const SMART_TO_STORAGE_CATEGORY: Record<MemoryCategory, SmartStorageCategory> = {
   profile: "fact",
   preferences: "preference",
   entities: "entity",
@@ -172,7 +178,7 @@ export function resolveCategoryFilterCandidates(requestedCategory: string): stri
 
 export function getStorageCategoryForMemoryCategory(
   category: MemoryCategory,
-): LegacyMemoryCategory {
+): SmartStorageCategory {
   return SMART_TO_STORAGE_CATEGORY[category];
 }
 
