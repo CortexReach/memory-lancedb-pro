@@ -1189,6 +1189,7 @@ export function registerMemoryForgetTool(api, context) {
                     if (memoryId) {
                         const deleted = await context.store.delete(memoryId, scopeFilter);
                         if (deleted) {
+                            context.onMemoriesDeleted?.({ scopeFilter });
                             return {
                                 content: [
                                     { type: "text", text: `Memory ${memoryId} forgotten.` },
@@ -1225,6 +1226,7 @@ export function registerMemoryForgetTool(api, context) {
                         if (results.length === 1 && results[0].score > 0.9) {
                             const deleted = await context.store.delete(results[0].entry.id, scopeFilter);
                             if (deleted) {
+                                context.onMemoriesDeleted?.({ scopeFilter });
                                 return {
                                     content: [
                                         {

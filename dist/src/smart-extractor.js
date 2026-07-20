@@ -7,7 +7,7 @@
  */
 import { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt, } from "./extraction-prompts.js";
 import { AdmissionController, } from "./admission-control.js";
-import { ALWAYS_MERGE_CATEGORIES, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
+import { ALWAYS_MERGE_CATEGORIES, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats, } from "./smart-metadata.js";
 import { isUserMdExclusiveMemory, } from "./workspace-boundary.js";
@@ -196,6 +196,18 @@ export class SmartExtractor {
             config.admissionControl?.enabled === true
                 ? new AdmissionController(this.store, this.llm, config.admissionControl, this.debugLog)
                 : null;
+    }
+    /**
+     * Expose the admission controller so sibling write paths (reflection
+     * mapped rows) gate through the same instance and config as extraction
+     * candidates. Null when admission control is disabled.
+     */
+    getAdmissionController() {
+        return this.admissionController;
+    }
+    /** Whether admitted entries should carry the admission audit in metadata. */
+    shouldPersistAdmissionAudit() {
+        return this.persistAdmissionAudit;
     }
     /**
      * Notify the onPersisted sink (e.g. markdown mirror) after a successful
@@ -1149,23 +1161,17 @@ export class SmartExtractor {
     /**
      * Map 6-category to existing 5-category store type for backward compatibility.
      */
+    /**
+     * Map a smart register onto its legacy storage category, delegating to the
+     * shared SMART_TO_STORAGE_CATEGORY constant (memory-categories) so the
+     * mapping has a single source of truth. Note: "reflection" is a legacy
+     * storage category minted only by the reflection writer and is deliberately
+     * absent from this map; smart extraction never produces reflection rows.
+     * The "other" fallback covers non-union values arriving from untyped
+     * callers at runtime, matching the old switch's default arm.
+     */
     mapToStoreCategory(category) {
-        switch (category) {
-            case "profile":
-                return "fact";
-            case "preferences":
-                return "preference";
-            case "entities":
-                return "entity";
-            case "events":
-                return "decision";
-            case "cases":
-                return "fact";
-            case "patterns":
-                return "other";
-            default:
-                return "other";
-        }
+        return getStorageCategoryForMemoryCategory(category) ?? "other";
     }
     /**
      * Get default importance score by category.

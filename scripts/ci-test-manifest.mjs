@@ -98,6 +98,18 @@ export const CI_TEST_MANIFEST = [
   // Tier 1 memory counter fix
   { group: "core-regression", runner: "node", file: "test/tier1-counters.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-subsession-prompt-hooks.test.mjs", args: ["--test"] },
+  // Reflection distiller sub-session must not receive auto-recall/injected blocks
+  { group: "core-regression", runner: "node", file: "test/reflection-distiller-hook-skip.test.mjs", args: ["--test"] },
+  // register() re-registration hardening (scope cache-miss log/handler dedup)
+  { group: "core-regression", runner: "node", file: "test/register-scope-dedup.test.mjs", args: ["--test"] },
+  // Reflection distiller sub-run must request raw-run semantics (skip foreign before_prompt_build hooks)
+  { group: "core-regression", runner: "node", file: "test/raw-run-distiller-hooks.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/autocapture-watermark-reset.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/autocapture-internal-session-guard.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/memory-categories-storage-map.test.mjs", args: ["--test"] },
+  // Delete/delete-bulk must synchronously invalidate in-process reflection read caches
+  { group: "core-regression", runner: "node", file: "test/delete-invalidate-reflection-caches.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/reflection-mapped-rows-admission.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
