@@ -4054,7 +4054,12 @@ const memoryLanceDBProPlugin = {
                   sessionKey,
                   pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length,
                 );
-                autoCaptureRecentPairTurns.delete(sessionKey);
+                // The rolling pair window is deliberately KEPT here: deleting
+                // it on success meant steady-state extractions (one per turn)
+                // always saw a bare current pair and the window only ever
+                // materialized across deferred or valid-empty turns. The
+                // set-time trim above bounds it; the watermark keeps retained
+                // context turns from re-becoming extraction sources.
                 return; // Smart extraction handled everything
               }
 
@@ -4073,7 +4078,10 @@ const memoryLanceDBProPlugin = {
                 `memory-lancedb-pro: smart extraction produced no persisted memories for agent ${agentId} (created=${stats.created}, merged=${stats.merged}, skipped=${stats.skipped}); falling back to regex capture`,
               );
             } else {
-              api.logger.debug(
+              // INFO, not debug: this is the only signal that a turn was
+              // deferred by the warm-up gate. At debug it is invisible in
+              // default fleet logs and a deferring session reads as a stall.
+              api.logger.info(
                 `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (cumulative=${cumulativeCount} < minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
             }
