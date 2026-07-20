@@ -628,6 +628,107 @@ describe("SmartExtractor batched merge writer", () => {
   });
 });
 
+describe("profile candidates in the batch admission hoist", () => {
+  function makeCountingEmbedder() {
+    const calls = { embed: 0, embedBatch: 0 };
+    return {
+      calls,
+      async embed(text) {
+        calls.embed++;
+        return vectorFor(text);
+      },
+      async embedBatch(texts) {
+        calls.embedBatch++;
+        return (texts || []).map(vectorFor);
+      },
+    };
+  }
+
+  function profileFixture() {
+    return candidateFixture(9, {
+      category: "profile",
+      abstract: "User's name is Sam Rivera",
+      overview: "## Profile\nName on record",
+      content: "the user said their name is Sam Rivera",
+    });
+  }
+
+  it("scores a profile candidate inside the single batched call, with no singular admission call and no extra embed", async () => {
+    const store = makeNeighborStore({ neighbors: false });
+    const embedder = makeCountingEmbedder();
+    const llm = makeBatchLlm({
+      memories: [candidateFixture(1), profileFixture()],
+      onUtilityBatch: (prompt) => {
+        const count = (prompt.match(/^### \d+\. /gm) || []).length;
+        return {
+          results: Array.from({ length: count }, (_, i) => ({ index: i + 1, utility: 0.9, reason: "useful" })),
+        };
+      },
+      // no onUtility: any singular admission-utility call throws loudly
+    });
+    const admissionControl = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "batch" });
+    const extractor = new SmartExtractor(store, embedder, llm, {
+      user: "User",
+      extractMinMessages: 1,
+      extractMaxChars: 8000,
+      defaultScope: "global",
+      admissionControl,
+      admissionController: createAdmissionController(store, llm, admissionControl),
+      log() {},
+      debugLog() {},
+    });
+
+    const stats = await extractor.extractAndPersist("text", "s1", { scope: "global" });
+
+    assert.equal(llm.utilityCalls.length, 1, "one batched utility call must cover the profile candidate too");
+    assert.match(llm.utilityCalls[0], /Sam Rivera/, "the profile candidate must ride the batch prompt");
+    assert.equal(stats.created, 2, "profile and non-profile candidates both persist");
+    assert.equal(embedder.calls.embed, 0, "the profile vector must come from the batch pre-embed, not a singular embed");
+  });
+
+  it("honors a batched reject verdict for a profile candidate without any singular call", async () => {
+    const store = makeNeighborStore({ neighbors: false });
+    const llm = makeBatchLlm({
+      memories: [profileFixture()],
+      onUtilityBatch: () => ({ results: [{ index: 1, utility: 0, reason: "junk" }] }),
+    });
+    const extractor = makeExtractor(store, llm, {
+      admissionControl: normalizeAdmissionControlConfig({
+        enabled: true,
+        utilityMode: "batch",
+        rejectThreshold: 0.99,
+        admitThreshold: 0.995,
+      }),
+    });
+
+    const stats = await extractor.extractAndPersist("text", "s1", { scope: "global" });
+
+    assert.equal(llm.utilityCalls.length, 1, "the reject verdict must come from the batch, not a second call");
+    assert.match(
+      llm.utilityCalls[0],
+      /^### \d+\. profile$/m,
+      "the one utility call must be the BATCH prompt shape carrying the profile block",
+    );
+    assert.equal(stats.rejected, 1, "a batch-rejected profile candidate must count as rejected");
+  });
+
+  it("keeps the profile singular admission call in standalone mode (unchanged)", async () => {
+    const store = makeNeighborStore({ neighbors: false });
+    const llm = makeBatchLlm({
+      memories: [profileFixture()],
+      onUtility: () => ({ utility: 0.9, reason: "useful" }),
+    });
+    const extractor = makeExtractor(store, llm, {
+      admissionControl: normalizeAdmissionControlConfig({ enabled: true, utilityMode: "standalone" }),
+    });
+
+    const stats = await extractor.extractAndPersist("text", "s1", { scope: "global" });
+
+    assert.equal(llm.utilityCalls.length, 1, "standalone mode keeps the in-merge singular call");
+    assert.equal(stats.created, 1);
+  });
+});
+
 describe("batched merge-writer transport slots", () => {
   it("sends the static merge-writer block through the system slot and only the job blocks as the user prompt", async () => {
     const mergeTransportCalls = [];

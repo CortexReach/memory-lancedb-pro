@@ -505,23 +505,22 @@ export class SmartExtractor {
       processableCandidates.push({ index: i, candidate: c });
     }
 
-    // Pre-compute vectors for processable non-profile candidates in a single batch API call
-    // to reduce embedding round-trips from N to 1.
+    // Pre-compute vectors for every processable candidate (profile included:
+    // its always-merge path consumes the vector too) in a single batch API
+    // call to reduce embedding round-trips from N to 1.
     const precomputedVectors = new Map<number, number[]>();
-    const nonProfileToEmbed: { index: number; text: string }[] = [];
+    const candidatesToEmbed: { index: number; text: string }[] = [];
     for (const { index, candidate } of processableCandidates) {
-      if (!ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
-        nonProfileToEmbed.push({ index, text: `${candidate.abstract} ${candidate.content}` });
-      }
+      candidatesToEmbed.push({ index, text: `${candidate.abstract} ${candidate.content}` });
     }
-    if (nonProfileToEmbed.length > 0) {
+    if (candidatesToEmbed.length > 0) {
       try {
-        const batchTexts = nonProfileToEmbed.map((e) => e.text);
+        const batchTexts = candidatesToEmbed.map((e) => e.text);
         const batchVectors = await this.embedder.embedBatch(batchTexts);
-        for (let j = 0; j < nonProfileToEmbed.length; j++) {
+        for (let j = 0; j < candidatesToEmbed.length; j++) {
           const vec = batchVectors[j];
           if (vec && vec.length > 0) {
-            precomputedVectors.set(nonProfileToEmbed[j].index, vec);
+            precomputedVectors.set(candidatesToEmbed[j].index, vec);
           }
         }
       } catch (err) {
@@ -532,16 +531,16 @@ export class SmartExtractor {
     }
 
     // When utilityMode is "batch", score admission utility for every
-    // non-profile candidate in this extraction up front, with one LLM call
-    // per chunk of up to 10 candidates, instead of one call per candidate
-    // inside the sequential processCandidate loop below. Profile candidates
-    // are excluded: they run their own admission check inside
-    // handleProfileMerge, unaffected by batching.
+    // candidate in this extraction up front, with one LLM call per chunk of
+    // up to 10 candidates, instead of one call per candidate inside the
+    // sequential processCandidate loop below. Profile candidates ride the
+    // same batched call (one-call-per-stage topology): handleProfileMerge
+    // consumes the precomputed verdict instead of issuing its own singular
+    // call, falling back to the in-merge evaluation only when no precomputed
+    // verdict exists (standalone mode, or a failed batch).
     const precomputedAdmissions = new Map<number, AdmissionEvaluation>();
     if (this.admissionController && this.config.admissionControl?.utilityMode === "batch") {
-      const batchable = processableCandidates.filter(
-        ({ candidate }) => !ALWAYS_MERGE_CATEGORIES.has(candidate.category),
-      );
+      const batchable = processableCandidates;
       if (batchable.length > 0) {
         const batchItems = batchable.map(({ index, candidate }) => ({
           candidate,
@@ -1038,6 +1037,8 @@ export class SmartExtractor {
         createEntries,
         agentId,
         pendingMerges,
+        precomputedVector,
+        precomputedAdmission,
       );
       if (profileResult === "rejected") {
         stats.rejected = (stats.rejected ?? 0) + 1;
@@ -1495,13 +1496,31 @@ export class SmartExtractor {
     createEntries?: StoreEntry[],
     agentId?: string,
     pendingMerges?: PendingMergeJob[],
+    precomputedVector?: number[],
+    precomputedAdmission?: AdmissionEvaluation,
   ): Promise<"merged" | "created" | "rejected" | "llm-failed" | "queued"> {
     // Find existing profile memory by category
     const embeddingText = `${candidate.abstract} ${candidate.content}`;
-    const vector = await this.embedder.embed(embeddingText);
+    const vector =
+      precomputedVector && precomputedVector.length > 0
+        ? precomputedVector
+        : await this.embedder.embed(embeddingText);
 
-    // Run admission control for profile candidates (they skip the main dedup path)
-    if (!admissionAudit && this.admissionController && vector && vector.length > 0) {
+    // Run admission control for profile candidates (they skip the main dedup
+    // path). A precomputed verdict from the batched hoist wins: profile rides
+    // the same one-call-per-stage batch as every other candidate, and this
+    // in-merge evaluation is the fallback for standalone mode or a failed
+    // batch call.
+    if (!admissionAudit && precomputedAdmission) {
+      if (precomputedAdmission.decision === "reject") {
+        this.log(
+          `memory-pro: smart-extractor: admission rejected profile [${candidate.abstract.slice(0, 60)}] — ${precomputedAdmission.audit.reason}`,
+        );
+        await this.recordRejectedAdmission(candidate, conversationText, sessionKey, targetScope, scopeFilter ?? [targetScope], precomputedAdmission.audit as AdmissionAuditRecord & { decision: "reject" });
+        return "rejected";
+      }
+      admissionAudit = precomputedAdmission.audit;
+    } else if (!admissionAudit && this.admissionController && vector && vector.length > 0) {
       const profileAdmission = await this.admissionController.evaluate({
         candidate,
         candidateVector: vector,
