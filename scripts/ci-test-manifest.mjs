@@ -117,6 +117,7 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/smart-metadata-source-classification.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/scope-owner-leak-hardening.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/isOwnedByAgent.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/reflection-prompt-split.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
