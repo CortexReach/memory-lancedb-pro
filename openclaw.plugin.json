@@ -297,6 +297,11 @@
         "default": false,
         "description": "Enable management/debug tools such as memory_list, memory_stats, and governance-oriented self-improvement review/extract actions"
       },
+      "manualStoreSupersede": {
+        "type": "boolean",
+        "default": false,
+        "description": "Manual-priority store lane: a memory_store that finds a similar existing memory supersedes it instead of being rejected as a duplicate; the manual text always lands verbatim. Off by default to preserve the classic duplicate check."
+      },
       "sessionStrategy": {
         "type": "string",
         "enum": [
@@ -2273,6 +2278,9 @@
       "label": "Management Tools",
       "help": "Enable management/debug tools such as memory_list, memory_stats, and governance-oriented self-improvement review/extract actions.",
       "advanced": true
+    },
+    "manualStoreSupersede": {
+      "help": "Manual memory_store always lands; a similar existing memory is superseded by it instead of blocking the write (fact-key aware). Default off."
     },
     "mdMirror.enabled": {
       "label": "Markdown Mirror",

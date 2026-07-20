@@ -2363,6 +2363,7 @@ const memoryLanceDBProPlugin = {
             mdMirror,
             workspaceBoundary: config.workspaceBoundary,
             selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
+            manualStoreSupersede: config.manualStoreSupersede === true,
             // Mirrors the CLI context wiring below: keep in-process reflection caches
             // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
             onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
@@ -4793,6 +4794,7 @@ export function parsePluginConfig(value) {
         extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
         scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes : undefined,
         enableManagementTools: cfg.enableManagementTools === true,
+        manualStoreSupersede: cfg.manualStoreSupersede === true,
         sessionStrategy,
         selfImprovement: typeof cfg.selfImprovement === "object" && cfg.selfImprovement !== null
             ? {
