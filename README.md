@@ -195,7 +195,9 @@ Done! Your agent now has long-term memory.
 
 ```bash
 # 1) Backup
-openclaw memory-pro export --scope global --output memories-backup.json
+cp -r <your dbPath> <your dbPath>.bak
+#    whole-store copy; `export` caps at --limit 1000 and one --scope,
+#    so it silently drops rows past 1000 and every non-global scope
 # 2) Dry run
 openclaw memory-pro upgrade --dry-run
 # 3) Run upgrade

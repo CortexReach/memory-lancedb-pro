@@ -149,7 +149,9 @@ Deberías ver:
 
 ```bash
 # 1) Respaldo
-openclaw memory-pro export --scope global --output memories-backup.json
+cp -r <your dbPath> <your dbPath>.bak
+#    whole-store copy; `export` caps at --limit 1000 and one --scope,
+#    so it silently drops rows past 1000 and every non-global scope
 # 2) Ejecución de prueba
 openclaw memory-pro upgrade --dry-run
 # 3) Ejecutar actualización
