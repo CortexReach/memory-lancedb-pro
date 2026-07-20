@@ -1574,8 +1574,8 @@ assert.ok(
   "extraction prompt should include the single conversation-turns transcript header",
 );
 assert.ok(
-  assistantContextResult.capturedPrompts.some((p) => /\nAssistant: /.test(p)),
-  "extraction prompt should include an Assistant: turn in the transcript",
+  assistantContextResult.capturedPrompts.some((p) => /<assistant_message>\n/.test(p)),
+  "extraction prompt should include a tag-wrapped assistant turn in the transcript",
 );
 assert.ok(
   assistantContextResult.capturedPrompts.some((p) => p.includes("游泳是很好的运动")),

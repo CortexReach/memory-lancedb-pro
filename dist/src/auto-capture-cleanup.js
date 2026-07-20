@@ -119,15 +119,38 @@ export function normalizeAutoCaptureText(role, text, shouldSkipMessage) {
     return normalized;
 }
 /**
- * Renders turns oldest-first as a continuous "Label: text" transcript, one
- * line per turn, no blank lines or per-turn metadata between them. `userLabel`
- * replaces the generic "User" label when a configured name is known;
- * assistant turns always render as "Assistant" (no per-agent name surface).
+ * Renders turns oldest-first with each message wholly enclosed in
+ * <user_message>/<assistant_message> tags. Line prefixes ("User:") mark only
+ * the first line of a message, so a multi-paragraph assistant reply sheds its
+ * speaker after the first paragraph and the extractor misattributes the rest
+ * to the user; whole-message tags give every line an unambiguous owner. The
+ * `_userLabel` parameter is kept for call-site compatibility -- the user's
+ * display name now travels in the prompt header, not per turn.
  */
-export function formatConversationTranscript(turns, userLabel = "User") {
+export function formatConversationTranscript(turns, _userLabel = "User") {
     return turns
-        .map((turn) => `${turn.role === "user" ? userLabel : "Assistant"}: ${turn.text}`)
+        .map((turn) => turn.role === "user"
+        ? `<user_message>\n${turn.text}\n</user_message>`
+        : `<assistant_message>\n${turn.text}\n</assistant_message>`)
         .join("\n");
+}
+/**
+ * Bounds a tag-wrapped transcript to `maxChars` by keeping the tail and then
+ * snapping the cut to the next opening tag, so the prompt never leads with a
+ * headless half message whose speaker was sliced away.
+ */
+export function trimTranscriptToTagBoundary(transcript, maxChars) {
+    if (transcript.length <= maxChars) {
+        return transcript;
+    }
+    const sliced = transcript.slice(-maxChars);
+    const tagStarts = ["<user_message>", "<assistant_message>"]
+        .map((tag) => sliced.indexOf(tag))
+        .filter((index) => index >= 0);
+    if (tagStarts.length === 0) {
+        return sliced;
+    }
+    return sliced.slice(Math.min(...tagStarts));
 }
 /**
  * Assembles the ordered turn sequence for the extraction prompt's transcript

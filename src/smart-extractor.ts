@@ -17,6 +17,7 @@ import {
 import {
   type ConversationTurn,
   formatConversationTranscript,
+  trimTranscriptToTagBoundary,
 } from "./auto-capture-cleanup.js";
 import {
   AdmissionController,
@@ -794,8 +795,7 @@ export class SmartExtractor {
         ];
 
     const rawTranscript = formatConversationTranscript(turns, user);
-    const transcript =
-      rawTranscript.length > maxChars ? rawTranscript.slice(-maxChars) : rawTranscript;
+    const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
 
     const prompt = buildExtractionPrompt(transcript, user, {
       assistantEligible: this.config.captureAssistantEligible === true,

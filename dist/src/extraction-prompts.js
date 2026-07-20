@@ -6,17 +6,22 @@
  * - buildMergePrompt: Memory merge with three-level structure
  */
 export function buildExtractionPrompt(conversationText, user, options = {}) {
-    const assistantLinesRule = options.assistantEligible
-        ? `- Assistant lines: "Assistant:" lines are eligible sources in this configuration. A candidate may be grounded in an assistant-authored line when it states a concrete durable fact about the user, their entities, or their work that went uncorrected — but never the assistant's own greetings, suggestions, speculation, or self-description. When the same fact has both a user-authored and an assistant-authored source, ground it in the user's line.`
-        : `- Assistant lines: in the Recent conversation turns transcript, "Assistant:" lines are provided only to help you understand what the user is referring to (e.g. "yes exactly, that one"). Do NOT create a candidate whose only support is an assistant line — every candidate must be grounded in a user-authored line. The assistant greeting or addressing the user by a name is NOT the user introducing themselves; the assistant proposing, summarizing, or confirming something is NOT the user asserting it. If the user never stated or explicitly confirmed the fact themselves, do not extract it.`;
+    const assistantBlocksRule = options.assistantEligible
+        ? `- <assistant_message> blocks: eligible sources in this configuration. A candidate may be grounded in an <assistant_message> block when it states a concrete durable fact about the user, their entities, or their work that went uncorrected — but never the assistant's own greetings, suggestions, speculation, or self-description. When the same fact has both a <user_message> and an <assistant_message> source, ground it in the <user_message>, and always attribute assistant-authored statements to the assistant, never to the user.`
+        : `- <assistant_message> blocks: context ONLY, never a source. Use them ONLY to resolve what an ambiguous or obscure <user_message> refers to (e.g. "yes exactly, that one"). Do NOT create a candidate whose support comes from an <assistant_message> block — every candidate must be grounded in <user_message> content. Plans, summaries, preferences, realizations, or mental models that appear only inside an <assistant_message> belong to the assistant; never attribute them to the user, no matter how long or detailed the assistant text is. The assistant greeting or addressing the user by a name is NOT the user introducing themselves; the assistant proposing, summarizing, or confirming something is NOT the user asserting it. If the user never stated or explicitly confirmed the fact in a <user_message>, do not extract it.`;
     return `Analyze the following session context and extract memories worth long-term preservation.
 
 User: ${user}
 
 Target Output Language: auto (detect from recent messages)
 
+## Transcript format
+The conversation below is a sequence of tagged blocks in chronological order:
+- <user_message>...</user_message> wraps ONE message written by the human user. Memories may only be grounded here.
+- <assistant_message>...</assistant_message> wraps ONE reply written by the AI assistant. Every line inside it — every paragraph, list, and heading up to the closing tag — is assistant-authored, never the user's words.
+
 ## Recent conversation turns
-Context for extraction. Extract memory candidates ONLY from user turns. Assistant turns are included so you can resolve references and understand what the user meant; never treat assistant statements as the user's facts, preferences, or decisions.
+Extract memory candidates ONLY from <user_message> blocks. <assistant_message> blocks are context for resolving references; never treat assistant statements as the user's facts, preferences, or decisions.
 ${conversationText}
 
 # Memory Extraction Criteria
@@ -38,7 +43,7 @@ ${conversationText}
 - Raw conversation carryover: quoted or attributed transcript blocks, especially 3+ lines of speaker text, are not memories by themselves. Distill a concrete fact/preference/decision/entity from them or skip.
 - System/runtime artifacts: content containing "System:", compaction notices, model-switch/session-reset traces, tool-call transcripts, raw JSON blobs, or similar internal execution traces must be rejected unless a clean user fact can be extracted.
 - Fragment blobs: mixed filename shards, code snippets, metadata fields, or partial sentences that look like unprocessed context fragments should be skipped rather than preserved.
-${assistantLinesRule}
+${assistantBlocksRule}
 - Atomic memory shape: each stored memory must read like one durable fact, preference, decision, entity state, event, case, or reusable pattern. If a candidate reads like an excerpt, log, or raw transcript, compress it into one atomic statement or skip it.
 - Length/distillation gate: if a candidate is longer than about 200 characters and reads like raw conversation instead of a distilled insight, rewrite it as a single factual statement before storing; if that is not possible, skip it.
 

@@ -58,7 +58,7 @@ describe("auto-capture cleanup", () => {
 // ============================================================================
 
 describe("formatConversationTranscript", () => {
-  it("renders turns oldest-first as continuous User:/Assistant: line-groups with no blank lines between them", () => {
+  it("renders turns oldest-first, each wholly wrapped in speaker tags", () => {
     const turns = [
       { role: "user", text: "my name is Alex" },
       { role: "assistant", text: "nice to meet you, Alex" },
@@ -66,24 +66,18 @@ describe("formatConversationTranscript", () => {
     ];
     assert.equal(
       formatConversationTranscript(turns),
-      "User: my name is Alex\nAssistant: nice to meet you, Alex\nUser: yes exactly, that one",
+      "<user_message>\nmy name is Alex\n</user_message>\n"
+        + "<assistant_message>\nnice to meet you, Alex\n</assistant_message>\n"
+        + "<user_message>\nyes exactly, that one\n</user_message>",
     );
   });
 
-  it("uses the configured user label in place of the generic 'User' label when provided", () => {
+  it("renders identically regardless of the configured user label (the name travels in the prompt header, not per turn)", () => {
     const turns = [
       { role: "user", text: "hi" },
       { role: "assistant", text: "hello" },
     ];
-    assert.equal(
-      formatConversationTranscript(turns, "Alex"),
-      "Alex: hi\nAssistant: hello",
-    );
-  });
-
-  it("falls back to the generic 'User' label when no name is configured", () => {
-    const turns = [{ role: "user", text: "hi" }];
-    assert.equal(formatConversationTranscript(turns), "User: hi");
+    assert.equal(formatConversationTranscript(turns, "Alex"), formatConversationTranscript(turns));
   });
 
   it("returns an empty string for an empty turn list", () => {

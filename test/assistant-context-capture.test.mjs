@@ -87,7 +87,7 @@ function makeExtractor(llm, config = {}) {
 // ============================================================================
 
 describe("SmartExtractor assistant-context marking", () => {
-  it("includes assistant context lines, plainly labeled, inside the single conversation transcript when assistantContextTexts is provided", async () => {
+  it("includes assistant context tag-wrapped inside the single conversation transcript when assistantContextTexts is provided", async () => {
     const llm = makeRecordingLlm();
     const extractor = makeExtractor(llm);
 
@@ -100,7 +100,10 @@ describe("SmartExtractor assistant-context marking", () => {
     const extractCall = llm.calls.find((c) => c.label === "extract-candidates");
     assert.ok(extractCall, "extract-candidates call should have happened");
     assert.match(extractCall.prompt, /## Recent conversation turns/);
-    assert.match(extractCall.prompt, /Assistant: I found two options: the blue mug and the red mug\./);
+    assert.match(
+      extractCall.prompt,
+      /<assistant_message>\nI found two options: the blue mug and the red mug\.\n<\/assistant_message>/,
+    );
     assert.match(extractCall.prompt, /blue mug and the red mug/);
   });
 
@@ -127,8 +130,8 @@ describe("SmartExtractor assistant-context marking", () => {
 
   it("buildExtractionPrompt documents the assistant-context rule (structural check)", () => {
     const prompt = buildExtractionPrompt("some conversation", "test-user");
-    assert.match(prompt, /"Assistant:" lines/);
-    assert.match(prompt, /grounded in a user-authored line/i);
+    assert.match(prompt, /<assistant_message> blocks/);
+    assert.match(prompt, /grounded in <user_message> content/i);
   });
 
   it("renders the conversation transcript under a single header with a description, exactly once", async () => {
@@ -146,11 +149,11 @@ describe("SmartExtractor assistant-context marking", () => {
     assert.equal(headerMatches.length, 1, "the header must appear exactly once");
     assert.match(
       extractCall.prompt,
-      /## Recent conversation turns\nContext for extraction\. Extract memory candidates ONLY from user turns\. Assistant turns are included so you can resolve references and understand what the user meant; never treat assistant statements as the user's facts, preferences, or decisions\.\n/,
+      /## Recent conversation turns\nExtract memory candidates ONLY from <user_message> blocks\. <assistant_message> blocks are context for resolving references; never treat assistant statements as the user's facts, preferences, or decisions\.\n/,
     );
   });
 
-  it("interleaves explicit conversationTurns oldest-first, using the configured user label", async () => {
+  it("interleaves explicit conversationTurns oldest-first as tagged blocks, with the user label in the header", async () => {
     const llm = makeRecordingLlm();
     const extractor = makeExtractor(llm, { user: "Alex" });
 
@@ -169,8 +172,9 @@ describe("SmartExtractor assistant-context marking", () => {
     const extractCall = llm.calls.find((c) => c.label === "extract-candidates");
     assert.match(
       extractCall.prompt,
-      /Alex: my name is Alex\nAssistant: nice to meet you, Alex\nAlex: yes exactly, that one/,
+      /<user_message>\nmy name is Alex\n<\/user_message>\n<assistant_message>\nnice to meet you, Alex\n<\/assistant_message>\n<user_message>\nyes exactly, that one\n<\/user_message>/,
     );
+    assert.match(extractCall.prompt, /User: Alex/);
   });
 });
 
@@ -210,15 +214,15 @@ describe("parsePluginConfig captureAssistant normalization", () => {
 
 describe("captureAssistant-conditional assistant-lines rule", () => {
   const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
-  it("context-only rule by default: assistant lines are disambiguation context, never grounding", () => {
-    const prompt = buildExtractionPrompt("User: hi", "User");
-    assert.match(prompt, /provided only to help you understand/);
+  it("context-only rule by default: assistant blocks are disambiguation context, never grounding", () => {
+    const prompt = buildExtractionPrompt("<user_message>\nhi\n</user_message>", "User");
+    assert.match(prompt, /context ONLY, never a source/);
     assert.doesNotMatch(prompt, /eligible sources in this configuration/);
   });
-  it("captureAssistant true flips the rule: assistant lines become eligible grounding sources", () => {
-    const prompt = buildExtractionPrompt("User: hi", "User", { assistantEligible: true });
+  it("captureAssistant true flips the rule: assistant blocks become eligible grounding sources", () => {
+    const prompt = buildExtractionPrompt("<user_message>\nhi\n</user_message>", "User", { assistantEligible: true });
     assert.match(prompt, /eligible sources in this configuration/);
-    assert.match(prompt, /ground it in the user's line/);
-    assert.doesNotMatch(prompt, /provided only to help you understand/);
+    assert.match(prompt, /ground it in the <user_message>/);
+    assert.doesNotMatch(prompt, /context ONLY, never a source/);
   });
 });
