@@ -246,7 +246,23 @@ export class SmartExtractor {
         const agentId = options.agentId;
         // Step 1: LLM extraction
         const extraction = await this.extractCandidates(conversationText);
-        const candidates = extraction.candidates;
+        let candidates = extraction.candidates;
+        // Echo guard: candidates near-identical to a recent manual
+        // memory_store/memory_update text are echoes of a row that already
+        // exists verbatim -- drop them before any judge/dedup/merge spend.
+        const echoLedger = this.config.manualEchoLedger;
+        if (echoLedger && candidates.length > 0) {
+            const kept = [];
+            for (const candidate of candidates) {
+                if (echoLedger.match(agentId, candidate.content)) {
+                    this.log(`memory-pro: smart-extractor: manual-echo guard dropped candidate (near-identical to a recent manual store) category=${candidate.category} abstract=${JSON.stringify(candidate.abstract.slice(0, 120))}`);
+                }
+                else {
+                    kept.push(candidate);
+                }
+            }
+            candidates = kept;
+        }
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
             if (extraction.status === "ok") {

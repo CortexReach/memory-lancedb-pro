@@ -40,6 +40,7 @@ import {
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
+import { ManualEchoLedger } from "./src/manual-echo-guard.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
 import type { MdMirrorWriter } from "./src/tools.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
@@ -270,6 +271,7 @@ interface PluginConfig {
     agentAccess?: Record<string, string[]>;
   };
   enableManagementTools?: boolean;
+  manualStoreSupersede?: boolean;
   sessionStrategy?: SessionStrategy;
   sessionMemory?: { enabled?: boolean; messageCount?: number };
   selfImprovement?: {
@@ -2339,6 +2341,7 @@ interface PluginSingletonState {
   scopeManager: ReturnType<typeof createScopeManager>;
   migrator: ReturnType<typeof createMigrator>;
   smartExtractor: SmartExtractor | null;
+  manualEchoLedger: ManualEchoLedger;
   mdMirror: MdMirrorWriter | null;
   extractionRateLimiter: ReturnType<typeof createExtractionRateLimiter>;
   // Session Maps — persist across scope refreshes instead of being recreated
@@ -2472,6 +2475,10 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const mdMirror = createMdMirrorWriter(api, config);
 
   let smartExtractor: SmartExtractor | null = null;
+  // Echo guard: shared between the manual store/update tools (record side)
+  // and the smart extractor (drop side); lives here so the tools keep
+  // recording even when smart extraction is disabled.
+  const manualEchoLedger = new ManualEchoLedger();
   if (config.smartExtraction !== false) {
     try {
       const llmAuth = config.llm?.auth || "api-key";
@@ -2513,6 +2520,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
 
       smartExtractor = new SmartExtractor(store, embedder, llmClient, {
         user: "User",
+        manualEchoLedger,
         extractMinMessages: config.extractMinMessages ?? 4,
         extractMaxChars: config.extractMaxChars ?? 8000,
         defaultScope: config.scopes?.default ?? "global",
@@ -2572,6 +2580,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     scopeManager,
     migrator,
     smartExtractor,
+    manualEchoLedger,
     mdMirror,
     extractionRateLimiter,
     reflectionErrorStateBySession,
@@ -2723,6 +2732,7 @@ const memoryLanceDBProPlugin = {
       scopeManager,
       migrator,
       smartExtractor,
+      manualEchoLedger,
       mdMirror,
       decayEngine,
       tierManager,
@@ -3164,6 +3174,8 @@ const memoryLanceDBProPlugin = {
         mdMirror,
         workspaceBoundary: config.workspaceBoundary,
         selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
+        manualStoreSupersede: config.manualStoreSupersede === true,
+        manualEchoLedger,
         // Mirrors the CLI context wiring below: keep in-process reflection caches
         // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
         onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
@@ -6008,6 +6020,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
     scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,
     enableManagementTools: cfg.enableManagementTools === true,
+    manualStoreSupersede: cfg.manualStoreSupersede === true,
     sessionStrategy,
     selfImprovement: typeof cfg.selfImprovement === "object" && cfg.selfImprovement !== null
       ? {

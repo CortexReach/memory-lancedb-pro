@@ -982,8 +982,9 @@ export function registerMemoryStoreTool(api, context) {
                     catch (err) {
                         console.warn(`memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`);
                     }
+                    const manualSupersede = runtimeContext.manualStoreSupersede === true;
                     const duplicateCandidate = existing[0]?.score > 0.98 ? existing[0] : undefined;
-                    if (duplicateCandidate && !force) {
+                    if (duplicateCandidate && !force && !manualSupersede) {
                         return {
                             content: [
                                 {
@@ -1000,13 +1001,32 @@ export function registerMemoryStoreTool(api, context) {
                             },
                         };
                     }
+                    // Manual-priority supersede (manualStoreSupersede): a manual store
+                    // always takes priority — its text lands verbatim, and a similar
+                    // existing row yields to it. Targets, in order: the near-identical
+                    // neighbor the duplicate check used to reject, then an active
+                    // neighbor holding the same fact key at any similarity (the
+                    // update/contradiction shape, e.g. a new value for a versioned
+                    // fact). Anything else falls through to the versioned-band check
+                    // below, and past that stores alongside: a wrong supersede destroys
+                    // a real fact, while a duplicate is fixable noise.
+                    const newFactKey = deriveFactKey(memoryCategory, stripped);
+                    const factKeyCandidate = manualSupersede && !force && newFactKey
+                        ? existing.find((r) => {
+                            const meta = parseSmartMetadata(r.entry.metadata, r.entry);
+                            const neighborKey = meta.fact_key ?? deriveFactKey(meta.memory_category, r.entry.text);
+                            return neighborKey === newFactKey;
+                        })
+                        : undefined;
+                    const manualPriorityTarget = manualSupersede && !force ? duplicateCandidate ?? factKeyCandidate : undefined;
                     // Auto-supersede: if a similar memory exists (0.95-0.98 similarity),
                     // same storage-layer category, and category is eligible, mark the old
                     // one as superseded and store the new one with a supersedes link.
-                    const supersedeCandidate = existing.find((r) => r.score > 0.95 &&
-                        r.score <= 0.98 &&
-                        TEMPORAL_VERSIONED_CATEGORIES.has(memoryCategory) &&
-                        matchesMemoryCategoryFilter(r.entry.category, memoryCategory, r.entry.metadata));
+                    const supersedeCandidate = manualPriorityTarget ??
+                        existing.find((r) => r.score > 0.95 &&
+                            r.score <= 0.98 &&
+                            TEMPORAL_VERSIONED_CATEGORIES.has(memoryCategory) &&
+                            matchesMemoryCategoryFilter(r.entry.category, memoryCategory, r.entry.metadata));
                     if (supersedeCandidate) {
                         const oldEntry = supersedeCandidate.entry;
                         const oldMeta = parseSmartMetadata(oldEntry.metadata, oldEntry);
@@ -1016,7 +1036,10 @@ export function registerMemoryStoreTool(api, context) {
                         // from the old entry (aligns with memory_update supersede path).
                         const newMeta = buildSmartMetadata({ text, category: storageCategory, importance: safeImportance }, {
                             l0_abstract: text,
-                            l1_overview: oldMeta.l1_overview || `- ${text}`,
+                            // A manual-priority supersede replaces the fact's VALUE, so the
+                            // old row's overview is stale by definition; the band case
+                            // keeps the richer inherited overview as before.
+                            l1_overview: manualPriorityTarget ? `- ${text}` : oldMeta.l1_overview || `- ${text}`,
                             l2_content: text,
                             memory_category: oldMeta.memory_category,
                             tier: oldMeta.tier,
@@ -1058,6 +1081,7 @@ export function registerMemoryStoreTool(api, context) {
                             // New record is already the source of truth; log but don't fail
                             console.warn(`memory-pro: failed to patch superseded record ${oldEntry.id.slice(0, 8)}: ${patchErr}`);
                         }
+                        context.manualEchoLedger?.record(agentId, text);
                         // Dual-write to Markdown mirror if enabled
                         if (context.mdMirror) {
                             await context.mdMirror({ text, category: storageCategory, scope: targetScope, timestamp: newEntry.timestamp }, { source: "memory_store", agentId });
@@ -1106,6 +1130,7 @@ export function registerMemoryStoreTool(api, context) {
                             valid_until: validUntil,
                         })),
                     });
+                    context.manualEchoLedger?.record(agentId, text);
                     // Dual-write to Markdown mirror if enabled
                     if (context.mdMirror) {
                         await context.mdMirror({ text, category: storageCategory, scope: targetScope, timestamp: entry.timestamp }, { source: "memory_store", agentId });
@@ -1509,6 +1534,7 @@ export function registerMemoryUpdateTool(api, context) {
                             details: { error: "not_found", id: resolvedId },
                         };
                     }
+                    runtimeContext.manualEchoLedger?.record(agentId, updated.text);
                     return {
                         content: [
                             {

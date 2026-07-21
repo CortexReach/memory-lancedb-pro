@@ -26,6 +26,7 @@ import { createRetriever, normalizeRetrievalConfig, } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
+import { ManualEchoLedger } from "./src/manual-echo-guard.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { parseClawteamScopes, applyClawteamScopes } from "./src/clawteam-scope.js";
@@ -1813,6 +1814,10 @@ function _initPluginState(api) {
     // callback below closes over it.
     const mdMirror = createMdMirrorWriter(api, config);
     let smartExtractor = null;
+    // Echo guard: shared between the manual store/update tools (record side)
+    // and the smart extractor (drop side); lives here so the tools keep
+    // recording even when smart extraction is disabled.
+    const manualEchoLedger = new ManualEchoLedger();
     if (config.smartExtraction !== false) {
         try {
             const llmAuth = config.llm?.auth || "api-key";
@@ -1848,6 +1853,7 @@ function _initPluginState(api) {
             const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
             smartExtractor = new SmartExtractor(store, embedder, llmClient, {
                 user: "User",
+                manualEchoLedger,
                 extractMinMessages: config.extractMinMessages ?? 4,
                 extractMaxChars: config.extractMaxChars ?? 8000,
                 defaultScope: config.scopes?.default ?? "global",
@@ -1902,6 +1908,7 @@ function _initPluginState(api) {
         scopeManager,
         migrator,
         smartExtractor,
+        manualEchoLedger,
         mdMirror,
         extractionRateLimiter,
         reflectionErrorStateBySession,
@@ -2022,7 +2029,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, manualEchoLedger, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2363,6 +2370,8 @@ const memoryLanceDBProPlugin = {
             mdMirror,
             workspaceBoundary: config.workspaceBoundary,
             selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
+            manualStoreSupersede: config.manualStoreSupersede === true,
+            manualEchoLedger,
             // Mirrors the CLI context wiring below: keep in-process reflection caches
             // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
             onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
@@ -4782,6 +4791,7 @@ export function parsePluginConfig(value) {
         extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
         scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes : undefined,
         enableManagementTools: cfg.enableManagementTools === true,
+        manualStoreSupersede: cfg.manualStoreSupersede === true,
         sessionStrategy,
         selfImprovement: typeof cfg.selfImprovement === "object" && cfg.selfImprovement !== null
             ? {
