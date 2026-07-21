@@ -55,9 +55,18 @@ function normalizeLayer(value) {
             return "working";
     }
 }
-function deriveDefaultLayer(source, memoryCategory, state) {
-    if (source === "reflection" || source === "dreaming-engine" || source === "session-summary")
+function deriveDefaultLayer(source, memoryCategory, state, rowType) {
+    // Writer-1 mapped rows carry source "reflection" as provenance only - they
+    // live in the general pool. Deriving layer "reflection" from their source
+    // would hide judge-admitted rows from every recall path (auto-recall
+    // governance and manual recall both exclude that layer). Slice rows
+    // (memory-reflection / memory-reflection-item) still derive "reflection"
+    // and stay recall-excluded by design.
+    const isGeneralPoolReflectionRow = rowType === "memory-reflection-mapped";
+    if (!isGeneralPoolReflectionRow &&
+        (source === "reflection" || source === "dreaming-engine" || source === "session-summary")) {
         return "reflection";
+    }
     if (state === "archived")
         return "archive";
     if (memoryCategory === "profile" ||
@@ -167,13 +176,15 @@ export function parseSmartMetadata(rawMetadata, entry = {}) {
     const invalidatedAt = normalizeOptionalTimestamp(parsed.invalidated_at);
     const fallbackSource = parsed.type === "session-summary"
         ? "session-summary"
-        : parsed.type === "memory-reflection" || parsed.type === "memory-reflection-item"
+        : parsed.type === "memory-reflection" ||
+            parsed.type === "memory-reflection-item" ||
+            parsed.type === "memory-reflection-mapped"
             ? "reflection"
             : "legacy";
     const source = normalizeSource(parsed.source ?? fallbackSource);
     const defaultState = source === "session-summary" ? "archived" : "confirmed";
     const state = normalizeState(parsed.state ?? defaultState);
-    const memoryLayer = normalizeLayer(parsed.memory_layer ?? deriveDefaultLayer(source, memoryCategory, state));
+    const memoryLayer = normalizeLayer(parsed.memory_layer ?? deriveDefaultLayer(source, memoryCategory, state, parsed.type));
     const normalized = {
         ...parsed,
         l0_abstract: l0,

@@ -11,6 +11,7 @@ export function buildReflectionMappedMetadata(params) {
     const defaults = getReflectionMappedDecayDefaults(params.mappedItem.mappedKind);
     return {
         type: "memory-reflection-mapped",
+        source: "reflection",
         reflectionVersion: 4,
         stage: "reflect-store",
         eventId: params.eventId,

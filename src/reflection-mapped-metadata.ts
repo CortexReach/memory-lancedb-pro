@@ -1,10 +1,12 @@
 import type { ReflectionMappedMemoryItem } from "./reflection-slices.js";
+import type { MemorySource } from "./smart-metadata.js";
 
 export type ReflectionMappedKind = "user-model" | "agent-model" | "lesson" | "decision";
 export type ReflectionMappedCategory = "preference" | "fact" | "decision";
 
 export interface ReflectionMappedMetadata {
   type: "memory-reflection-mapped";
+  source: MemorySource;
   reflectionVersion: 4;
   stage: "reflect-store";
   eventId: string;
@@ -63,6 +65,7 @@ export function buildReflectionMappedMetadata(params: {
   const defaults = getReflectionMappedDecayDefaults(params.mappedItem.mappedKind);
   return {
     type: "memory-reflection-mapped",
+    source: "reflection",
     reflectionVersion: 4,
     stage: "reflect-store",
     eventId: params.eventId,
