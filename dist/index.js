@@ -1015,14 +1015,24 @@ async function ensureDailyLogFile(dailyPath, dateStr) {
         await writeFile(dailyPath, `# ${dateStr}\n\n`, "utf-8");
     }
 }
-export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
+// Slot split: system = identity + every static block (task, headings
+// contract, hard rules, section/governance rules, notes, output template);
+// user = only the dynamically generated content (tool error signals + the
+// INPUT transcript fence). Both runners deliver the combined single-slot
+// form today (the embedded raw run does not honor a separate system slot,
+// and the CLI fallback carries a single user message); the parts keep the
+// seam explicit so a host whose runner honors a system slot can deliver
+// them split without changing the prompt text: system + blank line + user
+// reproduces the single-slot form exactly, and the prompt hash is computed
+// over that combined form.
+export function buildReflectionPromptParts(conversation, maxInputChars, toolErrorSignals = []) {
     const clipped = conversation.slice(-maxInputChars);
     const errorHints = toolErrorSignals.length > 0
         ? toolErrorSignals
             .map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary} (sig:${e.signatureHash.slice(0, 8)})`)
             .join("\n")
         : "- (none)";
-    return [
+    const system = [
         "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
         "",
         "Output Markdown only. No intro text. No outro text. No extra headings.",
@@ -1119,7 +1129,8 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         "",
         "## Derived",
         "- This run showed ...",
-        "",
+    ].join("\n");
+    const user = [
         "Recent tool error signals:",
         errorHints,
         "",
@@ -1128,6 +1139,13 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         clipped,
         "```",
     ].join("\n");
+    return { system, user };
+}
+// Combined single-slot form of the distiller prompt: what both runners
+// send today, and what prompt-content tests assert on.
+export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
+    const parts = buildReflectionPromptParts(conversation, maxInputChars, toolErrorSignals);
+    return `${parts.system}\n\n${parts.user}`;
 }
 function buildReflectionFallbackText() {
     return [
@@ -1203,7 +1221,10 @@ export async function generateReflectionText(params) {
     }
 }
 async function generateReflectionTextUnbounded(params) {
-    const prompt = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
+    const promptParts = buildReflectionPromptParts(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
+    // The combined single-slot form: hashed for change detection and sent
+    // as one prompt by both runners (neither has an honored system slot).
+    const prompt = `${promptParts.system}\n\n${promptParts.user}`;
     const promptHash = sha256Hex(prompt);
     const tempSessionFile = join(tmpdir(), `memory-reflection-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
     let reflectionText = null;
