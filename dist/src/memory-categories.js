@@ -58,6 +58,19 @@ export const APPEND_ONLY_CATEGORIES = new Set([
     "events",
     "cases",
 ]);
+/**
+ * Durable categories: governs fiction-register batch enforcement (an
+ * in-fiction batch can never produce durable memories) and the batch
+ * contradiction check. Per-item grounding "constructed" is dropped
+ * unconditionally in every category, so this set does not gate that rule.
+ */
+export const DURABLE_CATEGORIES = new Set([
+    "profile",
+    "preferences",
+    "entities",
+    "cases",
+    "patterns",
+]);
 /** Validate and normalize a category string. */
 export function normalizeCategory(raw) {
     const lower = raw.toLowerCase().trim();

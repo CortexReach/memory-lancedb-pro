@@ -110,6 +110,7 @@ export const CI_TEST_MANIFEST = [
   // Delete/delete-bulk must synchronously invalidate in-process reflection read caches
   { group: "core-regression", runner: "node", file: "test/delete-invalidate-reflection-caches.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/reflection-mapped-rows-admission.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/extraction-grounding-register.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

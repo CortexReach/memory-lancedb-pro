@@ -7,7 +7,7 @@
  */
 import { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt, } from "./extraction-prompts.js";
 import { AdmissionController, } from "./admission-control.js";
-import { ALWAYS_MERGE_CATEGORIES, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
+import { ALWAYS_MERGE_CATEGORIES, DURABLE_CATEGORIES, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats, } from "./smart-metadata.js";
 import { isUserMdExclusiveMemory, } from "./workspace-boundary.js";
@@ -154,6 +154,28 @@ export function stripEnvelopeMetadata(text) {
     cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
     return cleaned.trim();
 }
+function globToRegExp(glob) {
+    const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+    return new RegExp(`^${escaped}$`);
+}
+/**
+ * Resolve the extraction policy for a scope against a scope-glob -> mode map.
+ * Exact-string entries take priority over glob entries; an unmatched scope
+ * (or an absent policy map) defaults to "full".
+ */
+export function resolveExtractionPolicy(scope, policy) {
+    if (!policy)
+        return "full";
+    if (Object.prototype.hasOwnProperty.call(policy, scope)) {
+        return policy[scope];
+    }
+    for (const [glob, mode] of Object.entries(policy)) {
+        if (glob.includes("*") && globToRegExp(glob).test(scope)) {
+            return mode;
+        }
+    }
+    return "full";
+}
 // ============================================================================
 // Constants
 // ============================================================================
@@ -244,14 +266,28 @@ export class SmartExtractor {
             ? options.scopeFilter
             : [targetScope];
         const agentId = options.agentId;
+        // Option C: scope-glob extraction policy — "none" skips extraction
+        // entirely, with zero LLM calls, before grounding is ever considered.
+        const policyMode = resolveExtractionPolicy(targetScope, this.config.extractionPolicy);
+        if (policyMode === "none") {
+            this.log(`memory-pro: smart-extractor: extraction policy "none" for scope ${targetScope}, skipping extraction`);
+            return stats;
+        }
         // Step 1: LLM extraction
-        const extraction = await this.extractCandidates(conversationText);
+        const extraction = await this.extractCandidates(conversationText, policyMode);
         const candidates = extraction.candidates;
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
-            if (extraction.status === "ok") {
+            if (extraction.status === "ok" && extraction.rawCandidateCount === 0) {
                 // LLM genuinely returned zero candidates → strongest noise signal → feedback to noise bank
                 this.learnAsNoise(conversationText);
+            }
+            else if (extraction.status === "ok") {
+                // The model DID emit candidates; validation dropped or demoted them
+                // all. That is a policy verdict about those candidates, not evidence
+                // the conversation is noise — learning it as noise would pre-filter
+                // similar real content away from future extractions.
+                this.log(`memory-pro: smart-extractor: skipping noise-bank learning (validation emptied the batch, raw=${extraction.rawCandidateCount})`);
             }
             else {
                 this.debugLog(`memory-pro: smart-extractor: skipping noise-bank learning (status=${extraction.status})`);
@@ -515,7 +551,7 @@ export class SmartExtractor {
     /**
      * Call LLM to extract candidate memories from conversation text.
      */
-    async extractCandidates(conversationText) {
+    async extractCandidates(conversationText, policyMode = "full") {
         const maxChars = this.config.extractMaxChars ?? 8000;
         const truncated = conversationText.length > maxChars
             ? conversationText.slice(-maxChars)
@@ -536,11 +572,24 @@ export class SmartExtractor {
             return { status: "malformed", candidates: [] };
         }
         this.debugLog(`memory-lancedb-pro: smart-extractor: extract-candidates raw memories=${result.memories.length}`);
+        // Batch-level register signal, judged once per extraction. The model
+        // classifies whole sessions far more reliably than it self-tags single
+        // items, so the register deterministically overrides per-item grounding
+        // wobble below. Missing/unrecognized values fail toward scrutiny
+        // ("mixed"), never toward open.
+        const rawRegister = typeof result.conversation_register === "string"
+            ? result.conversation_register.toLowerCase().trim()
+            : "";
+        const conversationRegister = rawRegister === "real" || rawRegister === "fiction" ? rawRegister : "mixed";
         // Validate and normalize candidates
         const candidates = [];
         let invalidCategoryCount = 0;
         let shortAbstractCount = 0;
         let noiseAbstractCount = 0;
+        let policyDroppedCount = 0;
+        let constructedDroppedCount = 0;
+        let fictionRegisterDroppedCount = 0;
+        let batchHasConstructedTag = false;
         for (const raw of result.memories) {
             if (!raw || typeof raw !== "object") {
                 invalidCategoryCount++;
@@ -567,10 +616,67 @@ export class SmartExtractor {
                 this.debugLog(`memory-lancedb-pro: smart-extractor: dropping candidate due to noise abstract category=${category} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
                 continue;
             }
-            candidates.push({ category, abstract, overview, content });
+            // Option C: scope policy restricts extraction to episodic-only,
+            // independent of grounding — checked before the grounding filter below.
+            if (policyMode === "episodic-only" && category !== "events") {
+                policyDroppedCount++;
+                this.debugLog(`memory-lancedb-pro: smart-extractor: dropping candidate due to episodic-only extraction policy category=${category} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
+                continue;
+            }
+            // Option A / v3: grounding-aware filter. Missing/non-string/unrecognized
+            // per-item values fail open to "real" so a model that ignores the field
+            // can't break extraction. Grounding describes the truth-grounding of the
+            // ASSERTION itself: "real" includes an assertion ABOUT a fiction/game
+            // session (e.g. that it happened); "constructed" is a claim true only
+            // WITHIN the fiction. A constructed-tagged candidate is never stored,
+            // in any category or register — there is no per-extraction cap anymore.
+            const rawGrounding = typeof raw.grounding === "string" ? raw.grounding.toLowerCase().trim() : "";
+            const grounding = rawGrounding === "constructed" ? "constructed" : "real";
+            if (rawGrounding === "constructed") {
+                batchHasConstructedTag = true;
+            }
+            // Register enforcement: an in-fiction batch can never produce durable
+            // memories, whatever the per-item self-tags claim (the per-item tags
+            // are exactly the wobble the batch register exists to override).
+            if (conversationRegister === "fiction" && DURABLE_CATEGORIES.has(category)) {
+                fictionRegisterDroppedCount++;
+                this.debugLog(`memory-lancedb-pro: smart-extractor: dropping durable candidate from fiction-register batch category=${category} grounding=${grounding} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
+                continue;
+            }
+            // Grounding enforcement: a constructed assertion is true only within
+            // the fiction, never about the real world — never stored, regardless
+            // of category or register.
+            if (grounding === "constructed") {
+                constructedDroppedCount++;
+                this.debugLog(`memory-lancedb-pro: smart-extractor: dropping constructed-grounding candidate category=${category} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
+                continue;
+            }
+            candidates.push({ category, abstract, overview, content, grounding, conversationRegister });
         }
-        this.debugLog(`memory-lancedb-pro: smart-extractor: validation summary accepted=${candidates.length}, invalidCategory=${invalidCategoryCount}, shortAbstract=${shortAbstractCount}, noiseAbstract=${noiseAbstractCount}`);
-        return { status: "ok", candidates };
+        // Batch contradiction check: when the batch shows evidence of a
+        // constructed frame (register not "real" AND at least one item the model
+        // itself tagged constructed), surviving real-tagged durables in the same
+        // batch are the classic mislabel shape — fiction items where only the
+        // grounding tag wobbled. Demote them deterministically, no extra LLM call.
+        let contradictionDemotedCount = 0;
+        if (conversationRegister !== "real" && batchHasConstructedTag) {
+            for (let i = candidates.length - 1; i >= 0; i--) {
+                const candidate = candidates[i];
+                if (DURABLE_CATEGORIES.has(candidate.category)) {
+                    contradictionDemotedCount++;
+                    this.debugLog(`memory-lancedb-pro: smart-extractor: demoting real-tagged durable from ${conversationRegister}-register batch with constructed siblings (batch contradiction) category=${candidate.category} abstract=${JSON.stringify(candidate.abstract.slice(0, 120))}`);
+                    candidates.splice(i, 1);
+                }
+            }
+        }
+        if (contradictionDemotedCount > 0) {
+            // At the standard log level so a fully-demoted batch is distinguishable
+            // from "model found nothing" without debug logging (mirrors the
+            // admission-rejection lines).
+            this.log(`memory-lancedb-pro: smart-extractor: batch contradiction demoted ${contradictionDemotedCount} real-tagged durable candidate(s) (register=${conversationRegister}, constructed siblings present)`);
+        }
+        this.debugLog(`memory-lancedb-pro: smart-extractor: validation summary register=${conversationRegister}, accepted=${candidates.length}, invalidCategory=${invalidCategoryCount}, shortAbstract=${shortAbstractCount}, noiseAbstract=${noiseAbstractCount}, policyDropped=${policyDroppedCount}, constructedDropped=${constructedDroppedCount}, fictionRegisterDropped=${fictionRegisterDroppedCount}, contradictionDemoted=${contradictionDemotedCount}`);
+        return { status: "ok", candidates, rawCandidateCount: result.memories.length };
     }
     // --------------------------------------------------------------------------
     // Step 2: Dedup + Persist
@@ -1139,6 +1245,12 @@ export class SmartExtractor {
             suppressed_until_turn: 0,
             memory_temporal_type: classifyTemporal(classifyText),
             valid_until: inferExpiry(classifyText),
+            // Grounding audit trail: which self-tag and batch register this
+            // memory was admitted under. Absent on legacy payloads.
+            ...(candidate.grounding ? { grounding: candidate.grounding } : {}),
+            ...(candidate.conversationRegister
+                ? { conversation_register: candidate.conversationRegister }
+                : {}),
             ...(admissionAudit ? { admission_audit: JSON.stringify(admissionAudit) } : {}),
         }));
         return {
