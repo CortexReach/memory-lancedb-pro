@@ -1081,6 +1081,7 @@ export function registerMemoryStoreTool(api, context) {
                             // New record is already the source of truth; log but don't fail
                             console.warn(`memory-pro: failed to patch superseded record ${oldEntry.id.slice(0, 8)}: ${patchErr}`);
                         }
+                        context.manualEchoLedger?.record(agentId, text);
                         // Dual-write to Markdown mirror if enabled
                         if (context.mdMirror) {
                             await context.mdMirror({ text, category: storageCategory, scope: targetScope, timestamp: newEntry.timestamp }, { source: "memory_store", agentId });
@@ -1129,6 +1130,7 @@ export function registerMemoryStoreTool(api, context) {
                             valid_until: validUntil,
                         })),
                     });
+                    context.manualEchoLedger?.record(agentId, text);
                     // Dual-write to Markdown mirror if enabled
                     if (context.mdMirror) {
                         await context.mdMirror({ text, category: storageCategory, scope: targetScope, timestamp: entry.timestamp }, { source: "memory_store", agentId });
@@ -1532,6 +1534,7 @@ export function registerMemoryUpdateTool(api, context) {
                             details: { error: "not_found", id: resolvedId },
                         };
                     }
+                    runtimeContext.manualEchoLedger?.record(agentId, updated.text);
                     return {
                         content: [
                             {
