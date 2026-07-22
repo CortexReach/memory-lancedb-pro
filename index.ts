@@ -70,7 +70,19 @@ import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.
 import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
+import {
+  type ConversationTurn,
+  MESSAGE_TOOL_DELIVERY_BANNER_PREFIX,
+  anchorTextToRawIngress,
+  buildConversationTurnsForExtraction,
+  dedupePairWindow,
+  formatConversationTranscript,
+  normalizeAutoCaptureText,
+  trimTranscriptToTagBoundary,
+  trimTurnsToUserCap,
+} from "./src/auto-capture-cleanup.js";
+
+const RAW_INGRESS_GLOBAL_KEY = ":global:";
 
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
@@ -263,6 +275,8 @@ interface PluginConfig {
     timeoutMs?: number;
   };
   extractMinMessages?: number;
+  /** Rolling extraction context window in retained user turns (0 = disabled, max 10). */
+  autoCaptureContextTurns?: number;
   extractMaxChars?: number;
   scopes?: {
     default?: string;
@@ -1384,13 +1398,20 @@ function extractTextFromToolResult(result: unknown): string {
   }
 }
 
+// "tagged" (distiller INPUT) wraps each message in speaker tags; "labeled"
+// keeps the legacy `role: text` lines for STORED artifacts (session-summary
+// rows), which must never carry literal speaker tags a later recall could
+// replay into a prompt as fake transcript structure.
+type ConversationTranscriptFormat = "tagged" | "labeled";
+
 function summarizeRecentConversationMessages(
   messages: readonly unknown[],
   messageCount: number,
+  format: ConversationTranscriptFormat = "tagged",
 ): string | null {
   if (!Array.isArray(messages) || messages.length === 0) return null;
 
-  const recent: string[] = [];
+  const recent: ConversationTurn[] = [];
   for (let index = messages.length - 1; index >= 0 && recent.length < messageCount; index--) {
     const raw = messages[index];
     if (!raw || typeof raw !== "object") continue;
@@ -1402,15 +1423,18 @@ function summarizeRecentConversationMessages(
     const text = extractTextContent(msg.content);
     if (!text || shouldSkipReflectionMessage(role, text)) continue;
 
-    recent.push(`${role}: ${redactSecrets(text)}`);
+    recent.push({ role, text: redactSecrets(text) });
   }
 
   if (recent.length === 0) return null;
   recent.reverse();
-  return recent.join("\n");
+  if (format === "labeled") {
+    return recent.map((turn) => `${turn.role}: ${turn.text}`).join("\n");
+  }
+  return formatConversationTranscript(recent);
 }
 
-async function readSessionConversationForReflection(filePath: string, messageCount: number): Promise<string | null> {
+async function readSessionConversationForReflection(filePath: string, messageCount: number, format: ConversationTranscriptFormat = "tagged"): Promise<string | null> {
   try {
     const lines = (await readFile(filePath, "utf-8")).trim().split("\n");
     const messages: unknown[] = [];
@@ -1425,14 +1449,14 @@ async function readSessionConversationForReflection(filePath: string, messageCou
       }
     }
 
-    return summarizeRecentConversationMessages(messages, messageCount);
+    return summarizeRecentConversationMessages(messages, messageCount, format);
   } catch {
     return null;
   }
 }
 
-export async function readSessionConversationWithResetFallback(sessionFilePath: string, messageCount: number): Promise<string | null> {
-  const primary = await readSessionConversationForReflection(sessionFilePath, messageCount);
+export async function readSessionConversationWithResetFallback(sessionFilePath: string, messageCount: number, format: ConversationTranscriptFormat = "tagged"): Promise<string | null> {
+  const primary = await readSessionConversationForReflection(sessionFilePath, messageCount, format);
   if (primary) return primary;
 
   try {
@@ -1445,7 +1469,7 @@ export async function readSessionConversationWithResetFallback(sessionFilePath: 
     );
     if (resetCandidates.length > 0) {
       const latestResetPath = join(dir, resetCandidates[0]);
-      return await readSessionConversationForReflection(latestResetPath, messageCount);
+      return await readSessionConversationForReflection(latestResetPath, messageCount, format);
     }
   } catch {
     // ignore
@@ -1467,7 +1491,7 @@ export function buildReflectionPrompt(
   maxInputChars: number,
   toolErrorSignals: ReflectionErrorSignal[] = []
 ): string {
-  const clipped = conversation.slice(-maxInputChars);
+  const clipped = trimTranscriptToTagBoundary(conversation, maxInputChars);
   const errorHints = toolErrorSignals.length > 0
     ? toolErrorSignals
       .map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary} (sig:${e.signatureHash.slice(0, 8)})`)
@@ -1475,6 +1499,10 @@ export function buildReflectionPrompt(
     : "- (none)";
   return [
     "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
+    "",
+    "The INPUT transcript is a sequence of tagged blocks in chronological order:",
+    "- <user_message>...</user_message> wraps ONE message written by the human user.",
+    "- <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant.",
     "",
     "Output Markdown only. No intro text. No outro text. No extra headings.",
     "",
@@ -1575,9 +1603,7 @@ export function buildReflectionPrompt(
     errorHints,
     "",
     "INPUT:",
-    "```",
     clipped,
-    "```",
   ].join("\n");
 }
 
@@ -2351,7 +2377,9 @@ interface PluginSingletonState {
   turnCounter: Map<string, number>;
   autoCaptureSeenTextCount: Map<string, number>;
   autoCapturePendingIngressTexts: Map<string, string[]>;
+  autoCaptureRecentRawIngress: Map<string, string[]>;
   autoCaptureRecentTexts: Map<string, string[]>;
+  autoCaptureRecentPairTurns: Map<string, ConversationTurn[]>;
 }
 
 interface DreamingSchedulerState {
@@ -2513,6 +2541,8 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
 
       smartExtractor = new SmartExtractor(store, embedder, llmClient, {
         user: "User",
+        captureAssistantEligible: config.captureAssistant === true,
+        contextWindowEnabled: (config.autoCaptureContextTurns ?? 0) > 0,
         extractMinMessages: config.extractMinMessages ?? 4,
         extractMaxChars: config.extractMaxChars ?? 8000,
         defaultScope: config.scopes?.default ?? "global",
@@ -2555,7 +2585,13 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const turnCounter = new Map<string, number>();
   const autoCaptureSeenTextCount = new Map<string, number>();
   const autoCapturePendingIngressTexts = new Map<string, string[]>();
+  // Raw inbound texts as the channel delivered them, pre-composition: the
+  // anchor pool for channel-agnostic injection slicing. Never consumed;
+  // small per-conversation rings plus a global ring under a reserved key
+  // (main-collapsed DM sessions cannot reconstruct the ingress key).
+  const autoCaptureRecentRawIngress = new Map<string, string[]>();
   const autoCaptureRecentTexts = new Map<string, string[]>();
+  const autoCaptureRecentPairTurns = new Map<string, ConversationTurn[]>();
 
   return {
     config,
@@ -2583,7 +2619,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     turnCounter,
     autoCaptureSeenTextCount,
     autoCapturePendingIngressTexts,
+    autoCaptureRecentRawIngress,
     autoCaptureRecentTexts,
+    autoCaptureRecentPairTurns,
   };
 }
 
@@ -2736,7 +2774,9 @@ const memoryLanceDBProPlugin = {
       turnCounter,
       autoCaptureSeenTextCount,
       autoCapturePendingIngressTexts,
+      autoCaptureRecentRawIngress,
       autoCaptureRecentTexts,
+      autoCaptureRecentPairTurns,
     } = singleton;
 
     warnForDisabledChannelPlugin(
@@ -3121,6 +3161,13 @@ const memoryLanceDBProPlugin = {
             queue.push(normalized);
             autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
             pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+            const rawRing = autoCaptureRecentRawIngress.get(conversationKey) || [];
+            rawRing.push(normalized);
+            autoCaptureRecentRawIngress.set(conversationKey, rawRing.slice(-8));
+            const globalRing = autoCaptureRecentRawIngress.get(RAW_INGRESS_GLOBAL_KEY) || [];
+            globalRing.push(normalized);
+            autoCaptureRecentRawIngress.set(RAW_INGRESS_GLOBAL_KEY, globalRing.slice(-24));
+            pruneMapIfOver(autoCaptureRecentRawIngress, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
         }
       } catch (err) {
@@ -3808,9 +3855,39 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`,
           );
 
-          // Extract text content from messages
+          // Extract text content from messages, keeping the role-tagged
+          // message-loop order alongside the flat eligible-text list.
           const eligibleTexts: string[] = [];
+          const messageLoopTurns: ConversationTurn[] = [];
           let skippedAutoCaptureTexts = 0;
+          const captureAssistantEligible = config.captureAssistant === true;
+          const assistantContextOnly =
+            !captureAssistantEligible && (config.autoCaptureContextTurns ?? 0) > 0;
+          const rawAnchorConversationKey = buildAutoCaptureConversationKeyFromSessionKey(sessionKey);
+          const rawAnchorPool = [
+            ...(rawAnchorConversationKey
+              ? autoCaptureRecentRawIngress.get(rawAnchorConversationKey) || []
+              : []),
+            ...(autoCaptureRecentRawIngress.get(RAW_INGRESS_GLOBAL_KEY) || []),
+          ];
+          // Message-tool runs (Slack groups etc.) never auto-deliver the final
+          // assistant text — the real reply left via the message tool, so
+          // assistant texts in this payload are internal monologue, not
+          // conversation. Detected via the host's Delivery banner.
+          const messageToolRun = event.messages.some((msg) => {
+            if (!msg || typeof msg !== "object") return false;
+            const content = (msg as Record<string, unknown>).content;
+            if (typeof content === "string") return content.includes(MESSAGE_TOOL_DELIVERY_BANNER_PREFIX);
+            if (Array.isArray(content)) {
+              return content.some(
+                (block) =>
+                  block && typeof block === "object" &&
+                  typeof (block as Record<string, unknown>).text === "string" &&
+                  ((block as Record<string, unknown>).text as string).includes(MESSAGE_TOOL_DELIVERY_BANNER_PREFIX),
+              );
+            }
+            return false;
+          });
           for (const msg of event.messages) {
             if (!msg || typeof msg !== "object") {
               continue;
@@ -3818,13 +3895,20 @@ const memoryLanceDBProPlugin = {
             const msgObj = msg as Record<string, unknown>;
 
             const role = msgObj.role;
-            const captureAssistant = config.captureAssistant === true;
-            if (
-              role !== "user" &&
-              !(captureAssistant && role === "assistant")
-            ) {
+            const isEligibleRole =
+              role === "user" || (captureAssistantEligible && role === "assistant");
+            const isContextOnlyRole = assistantContextOnly && role === "assistant";
+            if (!isEligibleRole && !isContextOnlyRole) {
               continue;
             }
+            if (role === "assistant" && messageToolRun) {
+              skippedAutoCaptureTexts++;
+              continue;
+            }
+            // Context-only assistant turns join the transcript window but never
+            // the eligible set: they cannot fire the gate, move the watermark,
+            // or ground a memory.
+            const targetTexts = isEligibleRole ? eligibleTexts : null;
 
             const content = msgObj.content;
 
@@ -3833,7 +3917,12 @@ const memoryLanceDBProPlugin = {
               if (!normalized) {
                 skippedAutoCaptureTexts++;
               } else {
-                eligibleTexts.push(normalized);
+                const anchored =
+                  role === "user" && rawAnchorPool.length > 0
+                    ? anchorTextToRawIngress(normalized, rawAnchorPool)
+                    : normalized;
+                targetTexts?.push(anchored);
+                messageLoopTurns.push({ role: role as "user" | "assistant", text: anchored });
               }
               continue;
             }
@@ -3853,7 +3942,12 @@ const memoryLanceDBProPlugin = {
                   if (!normalized) {
                     skippedAutoCaptureTexts++;
                   } else {
-                    eligibleTexts.push(normalized);
+                    const anchored =
+                      role === "user" && rawAnchorPool.length > 0
+                        ? anchorTextToRawIngress(normalized, rawAnchorPool)
+                        : normalized;
+                    targetTexts?.push(anchored);
+                    messageLoopTurns.push({ role: role as "user" | "assistant", text: anchored });
                   }
                 }
               }
@@ -3893,6 +3987,35 @@ const memoryLanceDBProPlugin = {
             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          }
+
+          // Rolling PAIR window sized by autoCaptureContextTurns (0 =
+          // disabled: each extraction sees only its own call's turns, and
+          // nothing is retained between calls). When enabled, this call's
+          // new pairs -- kept user turns with the assistant replies
+          // interleaved in true order -- extend what earlier calls
+          // buffered, bounded to autoCaptureContextTurns user turns (or
+          // this call's own new-user count when larger, so unextracted
+          // user turns are never trimmed out of their own transcript).
+          const thisCallTurns = buildConversationTurnsForExtraction({
+            messageLoopTurns,
+            eligibleTexts,
+            newUserTexts: newTexts,
+          });
+          const contextTurns = config.autoCaptureContextTurns ?? 0;
+          const priorPairTurns =
+            contextTurns > 0
+              ? (autoCaptureRecentPairTurns.get(sessionKey) || []).map((turn) => ({ ...turn, context: true }))
+              : [];
+          const pairWindowTurns = trimTurnsToUserCap(
+            dedupePairWindow([...priorPairTurns, ...thisCallTurns]),
+            Math.max(contextTurns, thisCallTurns.filter((turn) => turn.role === "user").length),
+          );
+          if (contextTurns === 0) {
+            autoCaptureRecentPairTurns.delete(sessionKey);
+          } else if (thisCallTurns.length > 0) {
+            autoCaptureRecentPairTurns.set(sessionKey, pairWindowTurns);
+            pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
           const minMessages = config.extractMinMessages ?? 4;
@@ -3974,12 +4097,18 @@ const memoryLanceDBProPlugin = {
                 `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
               const conversationText = cleanTexts.join("\n");
+              // The pair window is the transcript; user turns the noise
+              // filter dropped stay out of it so they cannot become sources.
+              const noiseDroppedTexts = new Set(texts.filter((text) => !cleanTexts.includes(text)));
+              const finalConversationTurns = pairWindowTurns.filter(
+                (turn) => !(turn.role === "user" && noiseDroppedTexts.has(turn.text)),
+              );
               // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
               let stats: Awaited<ReturnType<typeof smartExtractor.extractAndPersist>> | null = null;
               try {
                 stats = await smartExtractor.extractAndPersist(
                   conversationText, sessionKey,
-                  { scope: defaultScope, scopeFilter: accessibleScopes, agentId },
+                  { scope: defaultScope, scopeFilter: accessibleScopes, agentId, conversationTurns: finalConversationTurns },
                 );
               } catch (err) {
                 api.logger.error(
@@ -4006,6 +4135,11 @@ const memoryLanceDBProPlugin = {
                   sessionKey,
                   pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length,
                 );
+                // The rolling pair window is deliberately retained across
+                // successful extractions: deleting it here would mean
+                // steady-state captures (one extraction per turn) always see
+                // a bare current pair. The set-time trim bounds it; the
+                // watermark keeps retained turns from re-becoming sources.
                 return; // Smart extraction handled everything
               }
 
@@ -5306,9 +5440,9 @@ const memoryLanceDBProPlugin = {
           guard.set(guardKey, now);
 
           const sessionContent =
-            summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount) ??
+            summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount, "labeled") ??
             (typeof event.sessionFile === "string"
-              ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount)
+              ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount, "labeled")
               : null);
 
           if (!sessionContent) {
@@ -6005,6 +6139,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       })()
       : undefined,
     extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+    autoCaptureContextTurns: Math.min(10, Math.max(0, Math.floor(Number(cfg.autoCaptureContextTurns)) || 0)),
     extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
     scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,
     enableManagementTools: cfg.enableManagementTools === true,

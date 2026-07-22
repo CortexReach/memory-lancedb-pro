@@ -433,6 +433,13 @@
         "default": 4,
         "description": "Minimum conversation messages required before smart extraction runs."
       },
+      "autoCaptureContextTurns": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 10,
+        "default": 0,
+        "description": "Rolling context window for auto-capture extraction: how many recent user turns (with their assistant replies) stay in the transcript across extractions as context. 0 disables retention; each extraction then sees only its own call's turns."
+      },
       "extractMaxChars": {
         "type": "integer",
         "minimum": 256,
@@ -1894,6 +1901,11 @@
     "extractMinMessages": {
       "label": "Min Messages for Extraction",
       "help": "Minimum conversation messages before smart extraction triggers",
+      "advanced": true
+    },
+    "autoCaptureContextTurns": {
+      "label": "Auto-Capture Context Turns",
+      "help": "Rolling window of recent user turns (with replies) kept as extraction context; 0 = off",
       "advanced": true
     },
     "extractMaxChars": {

@@ -241,7 +241,7 @@ async function runScenario(mode) {
     llmCalls += 1;
 
     let content;
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("## Recent Conversation")) {
       content = JSON.stringify({
         memories: [
           {
@@ -377,7 +377,7 @@ async function runMultiRoundScenario() {
     const prompt = payload.messages?.[1]?.content || "";
 
     let content;
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("## Recent Conversation")) {
       extractionCall += 1;
       if (extractionCall === 1) {
         content = JSON.stringify({
@@ -1023,7 +1023,7 @@ async function runUserMdExclusiveProfileScenario() {
     const prompt = payload.messages?.[1]?.content || "";
 
     let content = JSON.stringify({ memories: [] });
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("## Recent Conversation")) {
       content = JSON.stringify({
         memories: [
           {
@@ -1121,7 +1121,7 @@ async function runBoundarySkipKeepsRegexFallbackScenario() {
     const prompt = payload.messages?.[1]?.content || "";
 
     let content = JSON.stringify({ memories: [] });
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("## Recent Conversation")) {
       content = JSON.stringify({
         memories: [
           {
@@ -1223,7 +1223,7 @@ async function runInboundMetadataCleanupScenario() {
     llmCalls += 1;
 
     let content;
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("## Recent Conversation")) {
       extractionPrompt = prompt;
       content = JSON.stringify({
         memories: [
@@ -1593,7 +1593,7 @@ async function runDedupDecisionLLMCallScenario() {
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     const prompt = payload.messages?.[1]?.content || "";
 
-    if (prompt.includes("Analyze the following session context")) {
+    if (prompt.includes("## Recent Conversation")) {
       extractCalls += 1;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
