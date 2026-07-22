@@ -66,6 +66,8 @@ function createMockApi(pluginConfig, options = {}) {
 for (const key of [
   "smartExtraction",
   "extractMinMessages",
+  "autoCaptureContextTurns",
+  "autoCaptureGroupChats",
   "extractMaxChars",
   "llm",
   "autoRecallMaxItems",
@@ -101,6 +103,16 @@ assert.equal(
   manifest.configSchema.properties.autoRecallMinRepeated.default,
   8,
   "autoRecallMinRepeated schema default should be conservative",
+);
+assert.equal(
+  manifest.configSchema.properties.autoCaptureContextTurns?.default,
+  0,
+  "autoCaptureContextTurns defaults to 0 (context retention disabled upstream)",
+);
+assert.equal(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.autoCaptureGroupChats ?? {}, "default"),
+  false,
+  "autoCaptureGroupChats declares NO schema default: unset must follow autoCapture instead of materializing a value",
 );
 assert.equal(
   manifest.configSchema.properties.extractMinMessages.default,

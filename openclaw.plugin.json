@@ -433,6 +433,17 @@
         "default": 4,
         "description": "Minimum conversation messages required before smart extraction runs."
       },
+      "autoCaptureContextTurns": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 10,
+        "default": 0,
+        "description": "Rolling context window for auto-capture extraction: how many recent user turns (with their assistant replies) stay in the transcript across extractions as context. 0 disables retention; each extraction then sees only its own call's turns."
+      },
+      "autoCaptureGroupChats": {
+        "type": "boolean",
+        "description": "Auto-capture on group-chat sessions (channels, groups, threads). Unset follows autoCapture, preserving existing behavior. Set false to skip group-chat capture entirely: in multi-party rooms every non-self participant arrives as user-role content, so extraction cannot attribute speakers until per-sender speaker awareness lands."
+      },
       "extractMaxChars": {
         "type": "integer",
         "minimum": 256,
@@ -1894,6 +1905,16 @@
     "extractMinMessages": {
       "label": "Min Messages for Extraction",
       "help": "Minimum conversation messages before smart extraction triggers",
+      "advanced": true
+    },
+    "autoCaptureContextTurns": {
+      "label": "Auto-Capture Context Turns",
+      "help": "Rolling window of recent user turns (with replies) kept as extraction context; 0 = off",
+      "advanced": true
+    },
+    "autoCaptureGroupChats": {
+      "label": "Auto-Capture Group Chats",
+      "help": "Unset follows autoCapture; false skips capture on group-chat sessions (speaker attribution not yet supported)",
       "advanced": true
     },
     "extractMaxChars": {

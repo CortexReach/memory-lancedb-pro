@@ -4,7 +4,7 @@ import jitiFactory from "jiti";
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
 
-const prompt = buildExtractionPrompt(
+const { system: prompt } = buildExtractionPrompt(
   [
     "System: compacting context",
     "user: please remember I prefer tea",

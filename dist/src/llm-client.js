@@ -185,7 +185,7 @@ function createApiKeyClient(config, log, warnLog) {
     });
     let lastError = null;
     return {
-        async completeJson(prompt, label = "generic") {
+        async completeJson(prompt, label = "generic", systemPrompt) {
             lastError = null;
             try {
                 const request = {
@@ -193,7 +193,8 @@ function createApiKeyClient(config, log, warnLog) {
                     messages: [
                         {
                             role: "system",
-                            content: "You are a memory extraction assistant. Always respond with valid JSON only.",
+                            content: systemPrompt ??
+                                "You are a memory extraction assistant. Always respond with valid JSON only.",
                         },
                         { role: "user", content: prompt },
                     ],
@@ -294,7 +295,7 @@ function createOauthClient(config, log, warnLog) {
         return session;
     }
     return {
-        async completeJson(prompt, label = "generic") {
+        async completeJson(prompt, label = "generic", systemPrompt) {
             lastError = null;
             try {
                 const session = await getSession();
@@ -314,7 +315,8 @@ function createOauthClient(config, log, warnLog) {
                         signal,
                         body: JSON.stringify({
                             model: normalizeOauthModel(config.model),
-                            instructions: "You are a memory extraction assistant. Always respond with valid JSON only.",
+                            instructions: systemPrompt ??
+                                "You are a memory extraction assistant. Always respond with valid JSON only.",
                             input: [
                                 {
                                     role: "user",
