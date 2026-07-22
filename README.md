@@ -206,6 +206,62 @@ openclaw memory-pro stats
 
 See `CHANGELOG-v1.1.0.md` for behavior changes and upgrade rationale.
 
+**Turning on Jina task hints on an existing database?**
+
+Task hints are two config keys under the plugin's `embedding` block:
+
+```jsonc
+"memory-lancedb-pro": {
+  "config": {
+    "embedding": {
+      "model": "jina-embeddings-v5-text-small",
+      "taskQuery": "retrieval.query",
+      "taskPassage": "retrieval.passage"
+    }
+  }
+}
+```
+
+They only affect vectors written *after* you set them. Rows already in your store
+were embedded without a task hint, so a query embedded with `retrieval.query` is
+compared against passages that live in a different vector space — you get roughly
+half the benefit, silently.
+
+To fix existing rows, re-embed into a **fresh database and cut over to it**. Do
+**not** re-embed in place: `reembed` writes each row with `table.add()` (append by
+id, not replace), so an in-place run — which is exactly what `--force` unlocks —
+leaves the old vector beside the new one and **doubles every row**; retries pile on
+more. `reembed` refuses same-path runs unless you force it, for this reason.
+
+```bash
+# 0) Stop the gateway so nothing writes mid-migration.
+
+# 1) Back up the whole store — a real filesystem copy of the LanceDB directory.
+#    (Do NOT rely on `memory-pro export`: it defaults to --limit 1000 and a single
+#    --scope, so it silently drops rows past 1000 and every non-global scope.)
+cp -r <your dbPath> <your dbPath>.bak
+
+# 2) In the plugin config, set the task hints AND point `dbPath` at a new, empty
+#    target (e.g. "<your dbPath>-v2"). A fresh target is also what lets you change
+#    `embedding.dimensions`: a new vector width can only go into a new table.
+
+# 3) Dry run — reads the source, prints the row count, writes nothing.
+openclaw memory-pro reembed --source-db <old dbPath> --dry-run
+
+# 4) Re-embed old -> new with the now-current task hints. Source != target, so each
+#    id lands exactly once. Safe to re-run with --skip-existing if interrupted.
+openclaw memory-pro reembed --source-db <old dbPath>
+
+# 5) Verify before trusting the cutover: the "imported" count and
+#    `memory-pro stats` on the new dbPath must equal the dry-run row count.
+openclaw memory-pro stats
+
+# 6) Start the gateway; it now opens the new dbPath.
+```
+
+The same cutover applies whenever you change `embedding.model` or
+`embedding.dimensions` — always re-embed into a fresh `dbPath`, never in place.
+
 </details>
 
 <details>
@@ -220,7 +276,7 @@ Help me connect this memory plugin with the most user-friendly configuration: ht
 
 Requirements:
 1. Set it as the only active memory plugin
-2. Use Jina for embedding
+2. Use Jina for embedding, and set embedding.taskQuery=retrieval.query and embedding.taskPassage=retrieval.passage
 3. Use Jina for reranker
 4. Use gpt-4o-mini for the smart-extraction LLM
 5. Enable autoCapture, autoRecall, smartExtraction

@@ -160,6 +160,60 @@ openclaw memory-pro stats
 
 详见 `CHANGELOG-v1.1.0.md` 了解行为变更和升级说明。
 
+**在已有数据库上启用 Jina task hints？**
+
+Task hints 是插件 `embedding` 配置块下的两个键：
+
+```jsonc
+"memory-lancedb-pro": {
+  "config": {
+    "embedding": {
+      "model": "jina-embeddings-v5-text-small",
+      "taskQuery": "retrieval.query",
+      "taskPassage": "retrieval.passage"
+    }
+  }
+}
+```
+
+它们只影响设置**之后**写入的向量。库里已有的记录是在没有 task hint 的情况下嵌入的，
+因此用 `retrieval.query` 嵌入的查询，会去和另一个向量空间里的 passage 做比较——
+收益大约只剩一半，而且没有任何提示。
+
+要修复已有记录，请**重嵌到一个全新的库并切换过去**。**切勿原地重嵌**：`reembed`
+用 `table.add()` 写入（按 id 追加，而非替换），所以原地运行——也正是 `--force`
+所解锁的——会让旧向量和新向量并存，**每条记录翻倍**，重试还会继续叠加。正因如此，
+`reembed` 默认拒绝源库=目标库，除非你强行 `--force`。
+
+```bash
+# 0) 先停网关，避免迁移过程中有写入。
+
+# 1) 备份整个库——直接对 LanceDB 目录做文件系统级拷贝。
+#    （不要用 `memory-pro export`：它默认 --limit 1000、单一 --scope，
+#      会静默丢掉第 1000 行之后的记录以及所有非 global scope。）
+cp -r <你的 dbPath> <你的 dbPath>.bak
+
+# 2) 在插件配置里设好 task hints，并把 `dbPath` 指向一个新的空目标
+#    （例如 "<你的 dbPath>-v2"）。换新目标也是修改 `embedding.dimensions`
+#      的前提：新的向量维度只能写进新表。
+
+# 3) Dry run——读源库、打印行数、不写入。
+openclaw memory-pro reembed --source-db <旧 dbPath> --dry-run
+
+# 4) 用现在生效的 task hints 把旧库重嵌到新库。源≠目标，每个 id 只落一次。
+#    中断了可加 --skip-existing 安全重跑。
+openclaw memory-pro reembed --source-db <旧 dbPath>
+
+# 5) 切换前先核对：imported 数量、以及新 dbPath 上 `memory-pro stats` 的总数，
+#    都要等于 dry-run 报告的行数。
+openclaw memory-pro stats
+
+# 6) 启动网关，此时它打开的是新 dbPath。
+```
+
+修改 `embedding.model` 或 `embedding.dimensions` 时用同样的切换流程——
+始终重嵌到新的 `dbPath`，绝不原地重嵌。
+
 </details>
 
 <details>
@@ -174,7 +228,7 @@ Help me connect this memory plugin with the most user-friendly configuration: ht
 
 Requirements:
 1. Set it as the only active memory plugin
-2. Use Jina for embedding
+2. Use Jina for embedding, and set embedding.taskQuery=retrieval.query and embedding.taskPassage=retrieval.passage
 3. Use Jina for reranker
 4. Use gpt-4o-mini for the smart-extraction LLM
 5. Enable autoCapture, autoRecall, smartExtraction

@@ -276,7 +276,9 @@ async function testOllamaAbortWithNativeFetch() {
   // Author's analysis: the previous test used withServer() on a random port but hardcoded
   // http://127.0.0.1:11434/v1 for the Embedder — so the request always hit "connection refused"
   // immediately and never touched the slow handler. This test fixes that by:
-  // 1. Binding the mock server directly to 127.0.0.1:11434 (so isOllamaProvider() is true)
+  // 1. Making isOllamaProvider() true via the "/ollama" path alternative of its
+  //    detection regex, on an ephemeral port — a fixed 11434 bind collides with
+  //    a real Ollama install on the host (EADDRINUSE killed the whole chain)
   // 2. Delaying the response by 5 seconds
   // 3. Passing an external AbortSignal that fires after 2 seconds
   // 4. Asserting total time ≈ 2s (proving abort interrupted the slow request)
@@ -285,14 +287,14 @@ async function testOllamaAbortWithNativeFetch() {
   const ABORT_AFTER_MS = 2_000;
   const DIMS = 1024;
 
+  // The Ollama-native route strips the /v1 suffix and posts to /api/embeddings
+  // (verified against the live Embedder: baseURL .../ollama/v1 → /ollama/api/embeddings).
   const server = http.createServer((req, res) => {
-    if (req.url === "/v1/embeddings" && req.method === "POST") {
+    if (req.url === "/ollama/api/embeddings" && req.method === "POST") {
       const timer = setTimeout(() => {
         if (res.writableEnded) return; // already aborted
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          data: [{ embedding: Array.from({ length: DIMS }, () => 0.1), index: 0 }]
-        }));
+        res.end(JSON.stringify({ embedding: Array.from({ length: DIMS }, () => 0.1) }));
       }, SLOW_DELAY_MS);
       req.on("aborted", () => clearTimeout(timer));
       return;
@@ -301,22 +303,23 @@ async function testOllamaAbortWithNativeFetch() {
     res.end("not found");
   });
 
-  // Bind directly to 127.0.0.1:11434 so isOllamaProvider() returns true
-  await new Promise((resolve) => server.listen(11434, "127.0.0.1", resolve));
+  // Ephemeral port; the "/ollama" path segment keeps isOllamaProvider() true
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const mockPort = server.address().port;
 
   try {
     const embedder = new Embedder({
       provider: "openai-compatible",
       apiKey: "test-key",
       model: "mxbai-embed-large",
-      baseURL: "http://127.0.0.1:11434/v1",
+      baseURL: `http://127.0.0.1:${mockPort}/ollama/v1`,
       dimensions: DIMS,
     });
 
     assert.equal(
       embedder.isOllamaProvider ? embedder.isOllamaProvider() : false,
       true,
-      "isOllamaProvider should return true for 127.0.0.1:11434"
+      "isOllamaProvider should return true for an /ollama path baseURL"
     );
 
     const start = Date.now();
@@ -346,8 +349,14 @@ async function testOllamaAbortWithNativeFetch() {
       elapsed < SLOW_DELAY_MS * 0.75,
       `Expected abort ~${ABORT_AFTER_MS}ms, got ${elapsed}ms — abort did NOT interrupt slow request`
     );
+    // Lower bound: an instant failure (wrong mock path → 404, connection refused)
+    // never reached the slow handler, so it proves nothing about abort.
+    assert.ok(
+      elapsed >= ABORT_AFTER_MS * 0.75,
+      `Request failed after only ${elapsed}ms — it never hung on the slow handler, so abort was not exercised`
+    );
 
-    console.log(`  PASSED (aborted in ${elapsed}ms < ${SLOW_DELAY_MS}ms threshold)\n`);
+    console.log(`  PASSED (aborted in ${elapsed}ms, between ${ABORT_AFTER_MS * 0.75}ms and ${SLOW_DELAY_MS * 0.75}ms)\n`);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

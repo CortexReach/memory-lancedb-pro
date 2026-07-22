@@ -174,7 +174,7 @@ Help me connect this memory plugin with the most user-friendly configuration: ht
 
 Requirements:
 1. Set it as the only active memory plugin
-2. Use Jina for embedding
+2. Use Jina for embedding, and set embedding.taskQuery=retrieval.query and embedding.taskPassage=retrieval.passage
 3. Use Jina for reranker
 4. Use gpt-4o-mini for the smart-extraction LLM
 5. Enable autoCapture, autoRecall, smartExtraction
