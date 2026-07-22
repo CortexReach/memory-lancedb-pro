@@ -122,10 +122,10 @@ describe("memory reflection", () => {
 
       const conversation = await readSessionConversationWithResetFallback(sessionPath, 10);
       assert.ok(conversation);
-      assert.match(conversation, /user: Please keep responses concise and factual\./);
-      assert.match(conversation, /assistant: Acknowledged\. I will keep responses concise and factual\./);
+      assert.match(conversation, /<user_message>\nPlease keep responses concise and factual\.\n<\/user_message>/);
+      assert.match(conversation, /<assistant_message>\nAcknowledged\. I will keep responses concise and factual\.\n<\/assistant_message>/);
       assert.doesNotMatch(conversation, /old reset snapshot/);
-      assert.doesNotMatch(conversation, /^user:\s*\/new/m);
+      assert.doesNotMatch(conversation, /\/new/);
     });
   });
 
