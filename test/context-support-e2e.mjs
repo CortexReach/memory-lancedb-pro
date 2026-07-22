@@ -80,7 +80,7 @@ async function runTest() {
         const prompt = payload.messages?.[1]?.content || "";
         let content;
 
-        if (prompt.includes("Analyze the following session context")) {
+        if (prompt.includes("## Recent Conversation")) {
             content = JSON.stringify({
                 memories: [{
                     category: "preferences",

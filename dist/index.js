@@ -40,7 +40,7 @@ import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.
 import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
+import { buildConversationTurnsForExtraction, formatConversationTranscript, normalizeAutoCaptureText, trimTranscriptToTagBoundary, } from "./src/auto-capture-cleanup.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -945,7 +945,7 @@ function extractTextFromToolResult(result) {
         return "";
     }
 }
-function summarizeRecentConversationMessages(messages, messageCount) {
+function summarizeRecentConversationMessages(messages, messageCount, format = "tagged") {
     if (!Array.isArray(messages) || messages.length === 0)
         return null;
     const recent = [];
@@ -960,14 +960,17 @@ function summarizeRecentConversationMessages(messages, messageCount) {
         const text = extractTextContent(msg.content);
         if (!text || shouldSkipReflectionMessage(role, text))
             continue;
-        recent.push(`${role}: ${redactSecrets(text)}`);
+        recent.push({ role, text: redactSecrets(text) });
     }
     if (recent.length === 0)
         return null;
     recent.reverse();
-    return recent.join("\n");
+    if (format === "labeled") {
+        return recent.map((turn) => `${turn.role}: ${turn.text}`).join("\n");
+    }
+    return formatConversationTranscript(recent);
 }
-async function readSessionConversationForReflection(filePath, messageCount) {
+async function readSessionConversationForReflection(filePath, messageCount, format = "tagged") {
     try {
         const lines = (await readFile(filePath, "utf-8")).trim().split("\n");
         const messages = [];
@@ -982,14 +985,14 @@ async function readSessionConversationForReflection(filePath, messageCount) {
                 // ignore JSON parse errors
             }
         }
-        return summarizeRecentConversationMessages(messages, messageCount);
+        return summarizeRecentConversationMessages(messages, messageCount, format);
     }
     catch {
         return null;
     }
 }
-export async function readSessionConversationWithResetFallback(sessionFilePath, messageCount) {
-    const primary = await readSessionConversationForReflection(sessionFilePath, messageCount);
+export async function readSessionConversationWithResetFallback(sessionFilePath, messageCount, format = "tagged") {
+    const primary = await readSessionConversationForReflection(sessionFilePath, messageCount, format);
     if (primary)
         return primary;
     try {
@@ -999,7 +1002,7 @@ export async function readSessionConversationWithResetFallback(sessionFilePath, 
         const resetCandidates = await sortFileNamesByMtimeDesc(dir, files.filter((name) => name.startsWith(resetPrefix)));
         if (resetCandidates.length > 0) {
             const latestResetPath = join(dir, resetCandidates[0]);
-            return await readSessionConversationForReflection(latestResetPath, messageCount);
+            return await readSessionConversationForReflection(latestResetPath, messageCount, format);
         }
     }
     catch {
@@ -1016,7 +1019,7 @@ async function ensureDailyLogFile(dailyPath, dateStr) {
     }
 }
 export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
-    const clipped = conversation.slice(-maxInputChars);
+    const clipped = trimTranscriptToTagBoundary(conversation, maxInputChars);
     const errorHints = toolErrorSignals.length > 0
         ? toolErrorSignals
             .map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary} (sig:${e.signatureHash.slice(0, 8)})`)
@@ -1024,6 +1027,10 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         : "- (none)";
     return [
         "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
+        "",
+        "The INPUT transcript is a sequence of tagged blocks in chronological order:",
+        "- <user_message>...</user_message> wraps ONE message written by the human user.",
+        "- <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant.",
         "",
         "Output Markdown only. No intro text. No outro text. No extra headings.",
         "",
@@ -1124,9 +1131,7 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         errorHints,
         "",
         "INPUT:",
-        "```",
         clipped,
-        "```",
     ].join("\n");
 }
 function buildReflectionFallbackText() {
@@ -1848,6 +1853,7 @@ function _initPluginState(api) {
             const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
             smartExtractor = new SmartExtractor(store, embedder, llmClient, {
                 user: "User",
+                captureAssistantEligible: config.captureAssistant === true,
                 extractMinMessages: config.extractMinMessages ?? 4,
                 extractMaxChars: config.extractMaxChars ?? 8000,
                 defaultScope: config.scopes?.default ?? "global",
@@ -2903,8 +2909,10 @@ const memoryLanceDBProPlugin = {
                             : scopeManager.getDefaultScope(agentId);
                         const sessionKey = ctx?.sessionKey || event.sessionKey || "unknown";
                         api.logger.debug(`memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`);
-                        // Extract text content from messages
+                        // Extract text content from messages, keeping the role-tagged
+                        // message-loop order alongside the flat eligible-text list.
                         const eligibleTexts = [];
+                        const messageLoopTurns = [];
                         let skippedAutoCaptureTexts = 0;
                         for (const msg of event.messages) {
                             if (!msg || typeof msg !== "object") {
@@ -2925,6 +2933,7 @@ const memoryLanceDBProPlugin = {
                                 }
                                 else {
                                     eligibleTexts.push(normalized);
+                                    messageLoopTurns.push({ role: role, text: normalized });
                                 }
                                 continue;
                             }
@@ -2943,6 +2952,7 @@ const memoryLanceDBProPlugin = {
                                         }
                                         else {
                                             eligibleTexts.push(normalized);
+                                            messageLoopTurns.push({ role: role, text: normalized });
                                         }
                                     }
                                 }
@@ -2979,6 +2989,11 @@ const memoryLanceDBProPlugin = {
                             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
                             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
+                        const thisCallTurns = buildConversationTurnsForExtraction({
+                            messageLoopTurns,
+                            eligibleTexts,
+                            newUserTexts: newTexts,
+                        });
                         const minMessages = config.extractMinMessages ?? 4;
                         if (skippedAutoCaptureTexts > 0) {
                             api.logger.debug(`memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`);
@@ -3035,10 +3050,15 @@ const memoryLanceDBProPlugin = {
                             if (cumulativeCount >= minMessages) {
                                 api.logger.debug(`memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`);
                                 const conversationText = cleanTexts.join("\n");
+                                // The tagged transcript is built from this call's turns; user
+                                // turns the noise filter dropped stay out of it so they cannot
+                                // become sources.
+                                const noiseDroppedTexts = new Set(texts.filter((text) => !cleanTexts.includes(text)));
+                                const finalConversationTurns = thisCallTurns.filter((turn) => !(turn.role === "user" && noiseDroppedTexts.has(turn.text)));
                                 // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
                                 let stats = null;
                                 try {
-                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId });
+                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, conversationTurns: finalConversationTurns });
                                 }
                                 catch (err) {
                                     api.logger.error(`memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`);
@@ -4183,9 +4203,9 @@ const memoryLanceDBProPlugin = {
                         return;
                     }
                     guard.set(guardKey, now);
-                    const sessionContent = summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount) ??
+                    const sessionContent = summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount, "labeled") ??
                         (typeof event.sessionFile === "string"
-                            ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount)
+                            ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount, "labeled")
                             : null);
                     if (!sessionContent) {
                         guard.delete(guardKey);
