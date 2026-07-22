@@ -73,9 +73,11 @@ import { isNoise } from "./src/noise-filter.js";
 import {
   type ConversationTurn,
   buildConversationTurnsForExtraction,
+  dedupePairWindow,
   formatConversationTranscript,
   normalizeAutoCaptureText,
   trimTranscriptToTagBoundary,
+  trimTurnsToUserCap,
 } from "./src/auto-capture-cleanup.js";
 
 // Import smart extraction & lifecycle components
@@ -269,6 +271,8 @@ interface PluginConfig {
     timeoutMs?: number;
   };
   extractMinMessages?: number;
+  /** Rolling extraction context window in retained user turns (0 = disabled, max 10). */
+  autoCaptureContextTurns?: number;
   extractMaxChars?: number;
   scopes?: {
     default?: string;
@@ -2370,6 +2374,7 @@ interface PluginSingletonState {
   autoCaptureSeenTextCount: Map<string, number>;
   autoCapturePendingIngressTexts: Map<string, string[]>;
   autoCaptureRecentTexts: Map<string, string[]>;
+  autoCaptureRecentPairTurns: Map<string, ConversationTurn[]>;
 }
 
 interface DreamingSchedulerState {
@@ -2575,6 +2580,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const autoCaptureSeenTextCount = new Map<string, number>();
   const autoCapturePendingIngressTexts = new Map<string, string[]>();
   const autoCaptureRecentTexts = new Map<string, string[]>();
+  const autoCaptureRecentPairTurns = new Map<string, ConversationTurn[]>();
 
   return {
     config,
@@ -2603,6 +2609,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCaptureSeenTextCount,
     autoCapturePendingIngressTexts,
     autoCaptureRecentTexts,
+    autoCaptureRecentPairTurns,
   };
 }
 
@@ -2756,6 +2763,7 @@ const memoryLanceDBProPlugin = {
       autoCaptureSeenTextCount,
       autoCapturePendingIngressTexts,
       autoCaptureRecentTexts,
+      autoCaptureRecentPairTurns,
     } = singleton;
 
     warnForDisabledChannelPlugin(
@@ -3918,11 +3926,31 @@ const memoryLanceDBProPlugin = {
             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
+          // Rolling PAIR window sized by autoCaptureContextTurns (0 =
+          // disabled: each extraction sees only its own call's turns, and
+          // nothing is retained between calls). When enabled, this call's
+          // new pairs -- kept user turns with the assistant replies
+          // interleaved in true order -- extend what earlier calls
+          // buffered, bounded to autoCaptureContextTurns user turns (or
+          // this call's own new-user count when larger, so unextracted
+          // user turns are never trimmed out of their own transcript).
           const thisCallTurns = buildConversationTurnsForExtraction({
             messageLoopTurns,
             eligibleTexts,
             newUserTexts: newTexts,
           });
+          const contextTurns = config.autoCaptureContextTurns ?? 0;
+          const priorPairTurns = contextTurns > 0 ? autoCaptureRecentPairTurns.get(sessionKey) || [] : [];
+          const pairWindowTurns = trimTurnsToUserCap(
+            dedupePairWindow([...priorPairTurns, ...thisCallTurns]),
+            Math.max(contextTurns, thisCallTurns.filter((turn) => turn.role === "user").length),
+          );
+          if (contextTurns === 0) {
+            autoCaptureRecentPairTurns.delete(sessionKey);
+          } else if (thisCallTurns.length > 0) {
+            autoCaptureRecentPairTurns.set(sessionKey, pairWindowTurns);
+            pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          }
 
           const minMessages = config.extractMinMessages ?? 4;
           if (skippedAutoCaptureTexts > 0) {
@@ -4003,11 +4031,10 @@ const memoryLanceDBProPlugin = {
                 `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
               const conversationText = cleanTexts.join("\n");
-              // The tagged transcript is built from this call's turns; user
-              // turns the noise filter dropped stay out of it so they cannot
-              // become sources.
+              // The pair window is the transcript; user turns the noise
+              // filter dropped stay out of it so they cannot become sources.
               const noiseDroppedTexts = new Set(texts.filter((text) => !cleanTexts.includes(text)));
-              const finalConversationTurns = thisCallTurns.filter(
+              const finalConversationTurns = pairWindowTurns.filter(
                 (turn) => !(turn.role === "user" && noiseDroppedTexts.has(turn.text)),
               );
               // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
@@ -4042,6 +4069,11 @@ const memoryLanceDBProPlugin = {
                   sessionKey,
                   pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length,
                 );
+                // The rolling pair window is deliberately retained across
+                // successful extractions: deleting it here would mean
+                // steady-state captures (one extraction per turn) always see
+                // a bare current pair. The set-time trim bounds it; the
+                // watermark keeps retained turns from re-becoming sources.
                 return; // Smart extraction handled everything
               }
 
@@ -6041,6 +6073,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       })()
       : undefined,
     extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+    autoCaptureContextTurns: Math.min(10, Math.max(0, Math.floor(Number(cfg.autoCaptureContextTurns)) || 0)),
     extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
     scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,
     enableManagementTools: cfg.enableManagementTools === true,

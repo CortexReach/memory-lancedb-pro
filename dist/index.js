@@ -40,7 +40,7 @@ import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.
 import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { buildConversationTurnsForExtraction, formatConversationTranscript, normalizeAutoCaptureText, trimTranscriptToTagBoundary, } from "./src/auto-capture-cleanup.js";
+import { buildConversationTurnsForExtraction, dedupePairWindow, formatConversationTranscript, normalizeAutoCaptureText, trimTranscriptToTagBoundary, trimTurnsToUserCap, } from "./src/auto-capture-cleanup.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -1893,6 +1893,7 @@ function _initPluginState(api) {
     const autoCaptureSeenTextCount = new Map();
     const autoCapturePendingIngressTexts = new Map();
     const autoCaptureRecentTexts = new Map();
+    const autoCaptureRecentPairTurns = new Map();
     return {
         config,
         resolvedDbPath,
@@ -1920,6 +1921,7 @@ function _initPluginState(api) {
         autoCaptureSeenTextCount,
         autoCapturePendingIngressTexts,
         autoCaptureRecentTexts,
+        autoCaptureRecentPairTurns,
     };
 }
 export function isAgentOrSessionExcluded(agentId, sessionKey, patterns) {
@@ -2028,7 +2030,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentPairTurns, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2989,11 +2991,29 @@ const memoryLanceDBProPlugin = {
                             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
                             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
+                        // Rolling PAIR window sized by autoCaptureContextTurns (0 =
+                        // disabled: each extraction sees only its own call's turns, and
+                        // nothing is retained between calls). When enabled, this call's
+                        // new pairs -- kept user turns with the assistant replies
+                        // interleaved in true order -- extend what earlier calls
+                        // buffered, bounded to autoCaptureContextTurns user turns (or
+                        // this call's own new-user count when larger, so unextracted
+                        // user turns are never trimmed out of their own transcript).
                         const thisCallTurns = buildConversationTurnsForExtraction({
                             messageLoopTurns,
                             eligibleTexts,
                             newUserTexts: newTexts,
                         });
+                        const contextTurns = config.autoCaptureContextTurns ?? 0;
+                        const priorPairTurns = contextTurns > 0 ? autoCaptureRecentPairTurns.get(sessionKey) || [] : [];
+                        const pairWindowTurns = trimTurnsToUserCap(dedupePairWindow([...priorPairTurns, ...thisCallTurns]), Math.max(contextTurns, thisCallTurns.filter((turn) => turn.role === "user").length));
+                        if (contextTurns === 0) {
+                            autoCaptureRecentPairTurns.delete(sessionKey);
+                        }
+                        else if (thisCallTurns.length > 0) {
+                            autoCaptureRecentPairTurns.set(sessionKey, pairWindowTurns);
+                            pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        }
                         const minMessages = config.extractMinMessages ?? 4;
                         if (skippedAutoCaptureTexts > 0) {
                             api.logger.debug(`memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`);
@@ -3050,11 +3070,10 @@ const memoryLanceDBProPlugin = {
                             if (cumulativeCount >= minMessages) {
                                 api.logger.debug(`memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`);
                                 const conversationText = cleanTexts.join("\n");
-                                // The tagged transcript is built from this call's turns; user
-                                // turns the noise filter dropped stay out of it so they cannot
-                                // become sources.
+                                // The pair window is the transcript; user turns the noise
+                                // filter dropped stay out of it so they cannot become sources.
                                 const noiseDroppedTexts = new Set(texts.filter((text) => !cleanTexts.includes(text)));
-                                const finalConversationTurns = thisCallTurns.filter((turn) => !(turn.role === "user" && noiseDroppedTexts.has(turn.text)));
+                                const finalConversationTurns = pairWindowTurns.filter((turn) => !(turn.role === "user" && noiseDroppedTexts.has(turn.text)));
                                 // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
                                 let stats = null;
                                 try {
@@ -3078,6 +3097,11 @@ const memoryLanceDBProPlugin = {
                                     // consumed history length there instead, so the next turn
                                     // only sees the delta.
                                     autoCaptureSeenTextCount.set(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
+                                    // The rolling pair window is deliberately retained across
+                                    // successful extractions: deleting it here would mean
+                                    // steady-state captures (one extraction per turn) always see
+                                    // a bare current pair. The set-time trim bounds it; the
+                                    // watermark keeps retained turns from re-becoming sources.
                                     return; // Smart extraction handled everything
                                 }
                                 if ((stats.boundarySkipped ?? 0) === 0) {
@@ -4799,6 +4823,7 @@ export function parsePluginConfig(value) {
             })()
             : undefined,
         extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+        autoCaptureContextTurns: Math.min(10, Math.max(0, Math.floor(Number(cfg.autoCaptureContextTurns)) || 0)),
         extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
         scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes : undefined,
         enableManagementTools: cfg.enableManagementTools === true,

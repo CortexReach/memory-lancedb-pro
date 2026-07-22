@@ -210,3 +210,100 @@ export function buildConversationTurnsForExtraction(params) {
     }
     return thisCallTurns;
 }
+/**
+ * Bounds a rolling pair window to at most `maxUserTurns` user turns, keeping
+ * the newest ones with their interleaved assistant replies, and never leaving
+ * an orphan assistant turn ahead of the window's first user turn. The caller
+ * passes max(autoCaptureContextTurns, this call's new user turns), so the
+ * transcript always contains every not-yet-extracted user turn, padded with
+ * earlier still-buffered pairs up to the configured window.
+ */
+export function trimTurnsToUserCap(turns, maxUserTurns) {
+    const cap = Math.max(1, maxUserTurns);
+    let userCount = 0;
+    let start = turns.length;
+    for (let i = turns.length - 1; i >= 0; i--) {
+        if (turns[i].role === "user") {
+            userCount++;
+            if (userCount > cap)
+                break;
+            start = i;
+        }
+    }
+    if (userCount === 0) {
+        // All-assistant window (possible under captureAssistant=true when the
+        // delta carries only assistant turns): no user anchor exists, so keep
+        // the newest `cap` turns instead of silently dropping everything.
+        return turns.slice(-cap);
+    }
+    return turns.slice(start);
+}
+/**
+ * Repairs a pair window that double-preserved deferred turns. A below-threshold
+ * deferral keeps content alive on two independent paths -- the rolling pair
+ * buffer, and the watermark rollback (or pending-ingress re-queue) whose next
+ * slice re-includes the same turns -- so the assembled window can carry the
+ * same exchange twice. Collapse duplicates by user text at pair granularity:
+ * a pair-shaped copy (user turn plus its replies) beats a flat re-queued copy,
+ * copies of an identical exchange collapse to the latest, and a repeated user
+ * text whose replies differ is a real conversation and is kept whole.
+ */
+export function dedupePairWindow(turns) {
+    const groups = [];
+    let current = null;
+    for (const turn of turns) {
+        if (turn.role === "user") {
+            current = { turns: [turn], userText: turn.text, replies: "" };
+            groups.push(current);
+        }
+        else if (current) {
+            current.turns.push(turn);
+            current.replies = JSON.stringify(current.turns.slice(1).map((t) => t.text));
+        }
+        else {
+            groups.push({ turns: [turn], userText: null, replies: "" });
+        }
+    }
+    const kept = [];
+    for (const group of groups) {
+        if (group.userText === null) {
+            kept.push(group);
+            continue;
+        }
+        let prevIndex = -1;
+        for (let i = kept.length - 1; i >= 0; i--) {
+            if (kept[i].userText === group.userText) {
+                prevIndex = i;
+                break;
+            }
+        }
+        if (prevIndex < 0) {
+            kept.push(group);
+            continue;
+        }
+        const prev = kept[prevIndex];
+        const prevPaired = prev.turns.length > 1;
+        const currPaired = group.turns.length > 1;
+        if (currPaired && prevPaired) {
+            if (prev.replies === group.replies) {
+                kept.splice(prevIndex, 1);
+                kept.push(group);
+            }
+            else {
+                kept.push(group);
+            }
+        }
+        else if (currPaired && !prevPaired) {
+            kept.splice(prevIndex, 1);
+            kept.push(group);
+        }
+        else if (!currPaired && prevPaired) {
+            continue;
+        }
+        else {
+            kept.splice(prevIndex, 1);
+            kept.push(group);
+        }
+    }
+    return kept.flatMap((group) => group.turns);
+}
