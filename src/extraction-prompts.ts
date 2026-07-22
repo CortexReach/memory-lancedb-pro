@@ -4,20 +4,64 @@
  * - buildExtractionPrompt: 6-category L0/L1/L2 extraction with few-shot
  * - buildDedupPrompt: CREATE/MERGE/SKIP dedup decision
  * - buildMergePrompt: Memory merge with three-level structure
+ *
+ * buildExtractionPrompt returns a {system, user} pair: instructions,
+ * criteria, and the output-format contract live in `system`; the per-call
+ * conversation transcript lives in `user`.
  */
+
+export interface SplitPrompt {
+  system: string;
+  user: string;
+}
 
 export function buildExtractionPrompt(
   conversationText: string,
   user: string,
-): string {
-  return `Analyze the following session context and extract memories worth long-term preservation.
+  options: { assistantEligible?: boolean; contextWindow?: boolean } = {},
+): SplitPrompt {
+  // Transcript modes, driven by captureAssistant x autoCaptureContextTurns:
+  // - assistantEligible (captureAssistant=true): assistant blocks appear AND are
+  //   valid grounding sources, with attribution rules.
+  // - contextWindow (autoCaptureContextTurns > 0): already-processed turns ride
+  //   along under context_user_message / context_assistant_message tags —
+  //   context only, never sources. With captureAssistant=false every assistant
+  //   turn is context (self messages are never sources).
+  // - neither: assistant lines are excluded from the transcript entirely, so
+  //   the prompt does not describe assistant blocks at all.
+  const assistantEligible = options.assistantEligible === true;
+  const contextWindow = options.contextWindow === true;
+  const assistantContext = !assistantEligible && contextWindow;
+  const assistantFormatBullet = assistantEligible
+    ? `
+- <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant.`
+    : assistantContext
+      ? `
+- <context_assistant_message>...</context_assistant_message> wraps ONE message written by the AI assistant. Context only — use it to resolve what the user meant (pronouns, follow-ups, corrections); it is NEVER a source of memories.`
+      : "";
+  const contextUserBullet = contextWindow
+    ? `
+- <context_user_message>...</context_user_message> wraps a user message that was ALREADY processed by a previous extraction run. Context only — do not extract it again.`
+    : "";
+  const contextAssistantEligibleBullet = contextWindow && assistantEligible
+    ? `
+- <context_assistant_message>...</context_assistant_message> wraps an assistant message that was ALREADY processed by a previous extraction run. Context only.`
+    : "";
+  const userGroundingSuffix = assistantEligible ? "" : " Memories may only be grounded here.";
+  const assistantBlocksRule = assistantEligible
+    ? `
+- <assistant_message> blocks: also valid sources — but only for concrete facts the user did not correct. Skip the assistant's greetings, guesses, and self-description.
+- Attribute every memory to whoever actually said it. When both said it, use the <user_message> version.${contextWindow ? `
+- <context_user_message> and <context_assistant_message> blocks: already processed in previous runs — NEVER extract memories from them again.` : ""}`
+    : assistantContext
+      ? `
+- <context_user_message> and <context_assistant_message> blocks: context only — NEVER extract memories from them. A fact that appears only in a context block must not be stored.`
+      : "";
+  const system = `You are a memory extraction agent. Analyze session context and extract memories worth long-term preservation.
 
-User: ${user}
-
-Target Output Language: auto (detect from recent messages)
-
-## Recent Conversation
-${conversationText}
+## Transcript format
+The conversation is a sequence of tagged blocks in chronological order:
+- <user_message>...</user_message> wraps ONE${contextWindow ? " NEW" : ""} message written by the human user.${userGroundingSuffix}${assistantFormatBullet}${contextUserBullet}${contextAssistantEligibleBullet}
 
 # Memory Extraction Criteria
 
@@ -37,7 +81,7 @@ ${conversationText}
 - Degraded or incomplete references: If the user mentions something vaguely ("that thing I said"), do NOT invent details or create a hollow memory
 - Raw conversation carryover: quoted or attributed transcript blocks, especially 3+ lines of speaker text, are not memories by themselves. Distill a concrete fact/preference/decision/entity from them or skip.
 - System/runtime artifacts: content containing "System:", compaction notices, model-switch/session-reset traces, tool-call transcripts, raw JSON blobs, or similar internal execution traces must be rejected unless a clean user fact can be extracted.
-- Fragment blobs: mixed filename shards, code snippets, metadata fields, or partial sentences that look like unprocessed context fragments should be skipped rather than preserved.
+- Fragment blobs: mixed filename shards, code snippets, metadata fields, or partial sentences that look like unprocessed context fragments should be skipped rather than preserved.${assistantBlocksRule}
 - Atomic memory shape: each stored memory must read like one durable fact, preference, decision, entity state, event, case, or reusable pattern. If a candidate reads like an excerpt, log, or raw transcript, compress it into one atomic statement or skip it.
 - Length/distillation gate: if a candidate is longer than about 200 characters and reads like raw conversation instead of a distilled insight, rewrite it as a single factual statement before storing; if that is not possible, skip it.
 
@@ -134,6 +178,22 @@ Notes:
 - If nothing worth recording, return {"memories": []}
 - Maximum 5 memories per extraction
 - Preferences should be aggregated by topic`;
+
+  // "User: User" with a generic identity confused live agents; the name line
+  // only appears when a real name is configured.
+  const userNameLine = user && user !== "User" ? `User: ${user}\n\n` : "";
+  const userMessage = `${userNameLine}Target Output Language: auto (detect from recent messages)
+
+${
+    assistantEligible
+      ? "Extract memory candidates from <user_message> and <assistant_message> blocks, attributed to their true speaker."
+      : "Extract memory candidates ONLY from <user_message> blocks."
+  }
+
+## Recent Conversation
+${conversationText}`;
+
+  return { system, user: userMessage };
 }
 
 export function buildDedupPrompt(

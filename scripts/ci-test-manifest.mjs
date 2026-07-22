@@ -35,6 +35,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/retriever-neighbor-enrichment.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-memory-lifecycle.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-branches.mjs" },
+  { group: "core-regression", runner: "node", file: "test/extraction-transcript-speaker-tags.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/reflection-tagged-input.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-embed.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-noise-gating.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-capability-runtime.test.mjs" },
@@ -105,6 +107,7 @@ export const CI_TEST_MANIFEST = [
   // Reflection distiller sub-run must request raw-run semantics (skip foreign before_prompt_build hooks)
   { group: "core-regression", runner: "node", file: "test/raw-run-distiller-hooks.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-watermark-reset.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/pair-window-retention.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-internal-session-guard.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/memory-categories-storage-map.test.mjs", args: ["--test"] },
   // Delete/delete-bulk must synchronously invalidate in-process reflection read caches
