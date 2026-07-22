@@ -50,7 +50,7 @@ import {
   recordCompactionRun,
   type CompactionConfig,
 } from "./src/memory-compactor.js";
-import { runWithReflectionTransientRetryOnce } from "./src/reflection-retry.js";
+import { embedWithReflectionTransientRetry, runWithReflectionTransientRetryOnce } from "./src/reflection-retry.js";
 import { resolveReflectionSessionSearchDirs, stripResetSuffix } from "./src/session-recovery.js";
 import {
   storeReflectionToLanceDB,
@@ -4987,6 +4987,17 @@ const memoryLanceDBProPlugin = {
             command: String(event.action || "unknown"),
           });
 
+          // Persistence-path embeds share the generation path's transient-retry
+          // policy: one transient abort must not fail the whole hook after the
+          // reflection md is already on disk.
+          const embedForReflectionPersistence = (text: string, runner: string) =>
+            embedWithReflectionTransientRetry(
+              (value) => embedder.embedPassage(value),
+              text,
+              runner,
+              (level, message) => api.logger[level](message),
+            );
+
           const MAX_MAPPED_ENTRIES = 100;
           const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
           const mappedEntries: Array<{ text: string; vector: number[]; importance: number; category: string; scope: string; metadata: string }> = [];
@@ -4998,7 +5009,15 @@ const memoryLanceDBProPlugin = {
               api.logger.warn(`memory-reflection: mapped entries cap (${MAX_MAPPED_ENTRIES}) reached, skipping remaining items`);
               break;
             }
-            const vector = await embedder.embedPassage(mapped.text);
+            let vector: number[];
+            try {
+              vector = await embedForReflectionPersistence(mapped.text, "mapped-row-embedding");
+            } catch (embedErr) {
+              api.logger.warn(
+                `memory-reflection: mapped row embedding failed after retry, skipping row: ${String(embedErr)}`,
+              );
+              continue;
+            }
             let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
             let searchFailed = false;
             try {
@@ -5123,7 +5142,7 @@ const memoryLanceDBProPlugin = {
               eventId: reflectionEventId,
               sourceReflectionPath: relPath,
               writeLegacyCombined: reflectionWriteLegacyCombined,
-              embedPassage: (text) => embedder.embedPassage(text),
+              embedPassage: (text) => embedForReflectionPersistence(text, "slice-embedding"),
               vectorSearch: (vector, limit, minScore, scopeFilter) =>
                 store.vectorSearch(vector, limit, minScore, scopeFilter),
               store: (entry) => store.store(entry),
@@ -5234,7 +5253,12 @@ const memoryLanceDBProPlugin = {
           params.sessionContent,
         ].join("\n");
 
-        const vector = await embedder.embedPassage(memoryText);
+        const vector = await embedWithReflectionTransientRetry(
+          (value) => embedder.embedPassage(value),
+          memoryText,
+          "session-summary-embedding",
+          (level, message) => api.logger[level](message),
+        );
         await store.store({
           text: memoryText,
           vector,
