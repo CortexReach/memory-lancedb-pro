@@ -118,3 +118,95 @@ export function normalizeAutoCaptureText(role, text, shouldSkipMessage) {
         return null;
     return normalized;
 }
+/**
+ * A literal speaker tag typed INSIDE a message could fake a block boundary
+ * (or defeat tag-boundary trimming, which trusts that literal tags only occur
+ * as real boundaries). Rewritten with guillemets the text stays readable but
+ * can no longer be confused with transcript structure.
+ */
+export function neutralizeSpeakerTagSpoof(text) {
+    return text.replace(/<(\/?)((?:user|assistant)_message)>/g, "‹$1$2›");
+}
+/**
+ * Renders turns oldest-first with each message wholly enclosed in
+ * <user_message>/<assistant_message> tags. Line prefixes ("User:") mark only
+ * the first line of a message, so a multi-paragraph assistant reply sheds its
+ * speaker after the first paragraph and the extractor misattributes the rest
+ * to the user; whole-message tags give every line an unambiguous owner. The
+ * `_userLabel` parameter is kept for call-site compatibility -- the user's
+ * display name travels in the prompt header, not per turn.
+ */
+export function formatConversationTranscript(turns, _userLabel = "User") {
+    return turns
+        .map((turn) => {
+        const tag = turn.role === "user" ? "user_message" : "assistant_message";
+        return `<${tag}>\n${neutralizeSpeakerTagSpoof(turn.text)}\n</${tag}>`;
+    })
+        .join("\n");
+}
+/**
+ * Bounds a tag-wrapped transcript to `maxChars` by keeping the tail and then
+ * snapping the cut to the next opening tag, so the prompt never leads with a
+ * headless half message whose speaker was sliced away.
+ */
+export function trimTranscriptToTagBoundary(transcript, maxChars) {
+    if (transcript.length <= maxChars) {
+        return transcript;
+    }
+    const sliced = transcript.slice(-maxChars);
+    const tagStarts = ["<user_message>", "<assistant_message>"]
+        .map((tag) => sliced.indexOf(tag))
+        .filter((index) => index >= 0);
+    if (tagStarts.length === 0) {
+        return sliced;
+    }
+    return sliced.slice(Math.min(...tagStarts));
+}
+/**
+ * Assembles the ordered turn sequence for the extraction prompt's transcript
+ * from this call's true message-loop order, without recomputing any
+ * eligibility or watermark decision -- it only consumes their already-decided
+ * results.
+ * - `newUserTexts` narrower than `eligibleTexts` (watermark tail-slice): skip
+ *   the already-extracted prefix. The eligibility loop pushes exactly one
+ *   turn per eligible text, so when the counts line up the skip is a plain
+ *   index slice -- deliberately role-agnostic, because under
+ *   captureAssistant=true eligible texts are mixed-role and a user-turn
+ *   counting walk over-skips (it consumes one USER turn per already-seen
+ *   text of ANY role, emptying the transcript).
+ * - Counts misaligned (defensive): fall back to the role-aware walk that
+ *   drops one leading user turn per already-seen text, along with the
+ *   assistant replies of the dropped pairs.
+ * - `newUserTexts` not a tail-slice of `eligibleTexts` at all (pending-ingress
+ *   replay from a different source, no per-message role correlation
+ *   available): fall back to flat user turns for the replayed content.
+ */
+export function buildConversationTurnsForExtraction(params) {
+    const { messageLoopTurns, eligibleTexts, newUserTexts } = params;
+    const isTailSliceOfEligible = newUserTexts.length <= eligibleTexts.length &&
+        eligibleTexts
+            .slice(eligibleTexts.length - newUserTexts.length)
+            .every((text, i) => text === newUserTexts[i]);
+    if (!isTailSliceOfEligible) {
+        return newUserTexts.map((text) => ({ role: "user", text }));
+    }
+    if (messageLoopTurns.length === eligibleTexts.length) {
+        return messageLoopTurns.slice(eligibleTexts.length - newUserTexts.length);
+    }
+    const skipUserCount = eligibleTexts.length - newUserTexts.length;
+    const thisCallTurns = [];
+    let userSeen = 0;
+    for (const turn of messageLoopTurns) {
+        if (turn.role === "user") {
+            userSeen++;
+            if (userSeen <= skipUserCount)
+                continue;
+        }
+        else if (userSeen <= skipUserCount) {
+            // Reply to a dropped (already-extracted) user turn: goes with its pair.
+            continue;
+        }
+        thisCallTurns.push(turn);
+    }
+    return thisCallTurns;
+}

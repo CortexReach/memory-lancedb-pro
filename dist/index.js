@@ -40,7 +40,7 @@ import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.
 import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
+import { buildConversationTurnsForExtraction, normalizeAutoCaptureText, } from "./src/auto-capture-cleanup.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -1848,6 +1848,7 @@ function _initPluginState(api) {
             const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
             smartExtractor = new SmartExtractor(store, embedder, llmClient, {
                 user: "User",
+                captureAssistantEligible: config.captureAssistant === true,
                 extractMinMessages: config.extractMinMessages ?? 4,
                 extractMaxChars: config.extractMaxChars ?? 8000,
                 defaultScope: config.scopes?.default ?? "global",
@@ -2903,8 +2904,10 @@ const memoryLanceDBProPlugin = {
                             : scopeManager.getDefaultScope(agentId);
                         const sessionKey = ctx?.sessionKey || event.sessionKey || "unknown";
                         api.logger.debug(`memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`);
-                        // Extract text content from messages
+                        // Extract text content from messages, keeping the role-tagged
+                        // message-loop order alongside the flat eligible-text list.
                         const eligibleTexts = [];
+                        const messageLoopTurns = [];
                         let skippedAutoCaptureTexts = 0;
                         for (const msg of event.messages) {
                             if (!msg || typeof msg !== "object") {
@@ -2925,6 +2928,7 @@ const memoryLanceDBProPlugin = {
                                 }
                                 else {
                                     eligibleTexts.push(normalized);
+                                    messageLoopTurns.push({ role: role, text: normalized });
                                 }
                                 continue;
                             }
@@ -2943,6 +2947,7 @@ const memoryLanceDBProPlugin = {
                                         }
                                         else {
                                             eligibleTexts.push(normalized);
+                                            messageLoopTurns.push({ role: role, text: normalized });
                                         }
                                     }
                                 }
@@ -2979,6 +2984,11 @@ const memoryLanceDBProPlugin = {
                             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
                             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
+                        const thisCallTurns = buildConversationTurnsForExtraction({
+                            messageLoopTurns,
+                            eligibleTexts,
+                            newUserTexts: newTexts,
+                        });
                         const minMessages = config.extractMinMessages ?? 4;
                         if (skippedAutoCaptureTexts > 0) {
                             api.logger.debug(`memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`);
@@ -3035,10 +3045,15 @@ const memoryLanceDBProPlugin = {
                             if (cumulativeCount >= minMessages) {
                                 api.logger.debug(`memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`);
                                 const conversationText = cleanTexts.join("\n");
+                                // The tagged transcript is built from this call's turns; user
+                                // turns the noise filter dropped stay out of it so they cannot
+                                // become sources.
+                                const noiseDroppedTexts = new Set(texts.filter((text) => !cleanTexts.includes(text)));
+                                const finalConversationTurns = thisCallTurns.filter((turn) => !(turn.role === "user" && noiseDroppedTexts.has(turn.text)));
                                 // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
                                 let stats = null;
                                 try {
-                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId });
+                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, conversationTurns: finalConversationTurns });
                                 }
                                 catch (err) {
                                     api.logger.error(`memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`);
