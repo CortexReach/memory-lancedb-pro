@@ -2157,17 +2157,24 @@ export class MemoryStore {
         await this.ensureInitialized();
         try {
             await this.runWithWriteLock(async () => {
-                // Drop existing FTS index if any
+                // Drop existing FTS index if any. A failed drop is a failed rebuild:
+                // the surviving index makes the creation below a no-op, so reporting
+                // success would claim a rebuild that never happened.
                 const indices = await this.table.listIndices();
+                const dropFailures = [];
                 for (const idx of indices) {
                     if (idx.indexType === "FTS" || idx.columns?.includes("text")) {
+                        const indexName = idx.name || "text";
                         try {
-                            await this.table.dropIndex(idx.name || "text");
+                            await this.table.dropIndex(indexName);
                         }
                         catch (err) {
-                            console.warn(`memory-lancedb-pro: dropIndex(${idx.name || "text"}) failed:`, err);
+                            dropFailures.push(`dropIndex(${indexName}): ${err instanceof Error ? err.message : String(err)}`);
                         }
                     }
+                }
+                if (dropFailures.length > 0) {
+                    throw new Error(dropFailures.join("; "));
                 }
                 // Recreate
                 await this.createFtsIndex(this.table);

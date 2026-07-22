@@ -2131,13 +2131,19 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       }
     });
 
-  // repair-summaries: Detect and fix stale L0/L1/L2 summaries
+  // repair-summaries: report memories whose L0/L1/L2 summaries are missing or
+  // degenerate; --apply fills them with the truncation fallback. Detection is
+  // limited to mechanically reliable shapes: a healthy generated L0 is a
+  // concise abstract that legitimately differs from the raw text, so
+  // text-vs-L0 prefix comparison cannot distinguish stale from generated and
+  // is deliberately not used.
   memory
     .command("repair-summaries")
-    .description("Detect and fix L0/L1/L2 summaries that are inconsistent with text (text updated but summaries not regenerated)")
-    .option("--scope <scope>", "Filter by scope (e.g. agent:bs-intern)")
-    .option("--dry-run", "Preview mode — report stale entries without modifying data", false)
-    .action(async (options: { scope?: string; dryRun: boolean }) => {
+    .description("Report memories with missing or degenerate L0/L1/L2 summaries; --apply fills them from the source text (default is report-only)")
+    .option("--scope <scope>", "Filter by scope (e.g. agent:assistant)")
+    .option("--apply", "Write the repairs (without this flag the command only reports)", false)
+    .option("--dry-run", "Deprecated: report-only is already the default", false)
+    .action(async (options: { scope?: string; apply: boolean; dryRun: boolean }) => {
       try {
         const scopeFilter = options.scope ? [options.scope] : undefined;
 
@@ -2155,33 +2161,45 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
 
         console.log(`Scanned ${allEntries.length} memories${options.scope ? ` (scope: ${options.scope})` : ""}\n`);
 
-        const staleEntries: Array<{ entry: MemoryEntry; l0Prefix: string; textPrefix: string }> = [];
+        const staleEntries: Array<{ entry: MemoryEntry; reason: string }> = [];
 
         for (const entry of allEntries) {
-          const meta = parseSmartMetadata(entry.metadata, entry);
-          const textPrefix = entry.text.slice(0, 60).trim();
-          const l0Prefix = (meta.l0_abstract || "").slice(0, 60).trim();
+          // Judge the RAW stored metadata: parseSmartMetadata backfills
+          // missing levels from the text, which would hide exactly the rows
+          // this command exists to repair.
+          let rawMeta: Record<string, unknown> = {};
+          try {
+            rawMeta = JSON.parse(entry.metadata || "{}") as Record<string, unknown>;
+          } catch {
+            rawMeta = {};
+          }
+          const l0 = (typeof rawMeta.l0_abstract === "string" ? rawMeta.l0_abstract : "").trim();
+          const l1 = (typeof rawMeta.l1_overview === "string" ? rawMeta.l1_overview : "").trim();
+          const l2 = (typeof rawMeta.l2_content === "string" ? rawMeta.l2_content : "").trim();
 
-          if (textPrefix !== l0Prefix) {
-            staleEntries.push({ entry, l0Prefix, textPrefix });
+          if (!l0 || !l1 || !l2) {
+            staleEntries.push({ entry, reason: "missing summary level(s)" });
+          } else if (l0 === l1 && l1 === l2) {
+            // Legacy parse-fallback signature: all three levels collapsed to
+            // one identical string. A generated set always differs by level.
+            staleEntries.push({ entry, reason: "degenerate identical levels" });
           }
         }
 
         if (staleEntries.length === 0) {
-          console.log("No stale summaries found. All L0/L1/L2 are consistent with text.");
+          console.log("No repairable summaries found (no missing or degenerate L0/L1/L2).");
           return;
         }
 
-        console.log(`Found ${staleEntries.length} stale entries:\n`);
+        console.log(`Found ${staleEntries.length} repairable entries:\n`);
 
-        for (const { entry, l0Prefix, textPrefix } of staleEntries) {
-          console.log(`  [${entry.id.slice(0, 8)}] scope=${entry.scope}`);
-          console.log(`    text:  "${textPrefix}..."`);
-          console.log(`    l0:    "${l0Prefix}..."`);
+        for (const { entry, reason } of staleEntries) {
+          console.log(`  [${entry.id.slice(0, 8)}] scope=${entry.scope} (${reason})`);
+          console.log(`    text: "${entry.text.slice(0, 60).trim()}..."`);
         }
 
-        if (options.dryRun) {
-          console.log(`\nDry run complete. ${staleEntries.length} entries would be repaired.`);
+        if (!options.apply || options.dryRun) {
+          console.log(`\nReport only — no data was modified. Re-run with --apply to fill ${staleEntries.length} entr${staleEntries.length === 1 ? "y" : "ies"} from source text.`);
           return;
         }
 
@@ -2206,7 +2224,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           }
         }
 
-        console.log(`\nRepair complete: ${repaired} fixed, ${failed} failed out of ${staleEntries.length} stale.`);
+        console.log(`\nRepair complete: ${repaired} fixed, ${failed} failed out of ${staleEntries.length} repairable.`);
       } catch (error) {
         console.error("repair-summaries failed:", error);
         process.exit(1);
