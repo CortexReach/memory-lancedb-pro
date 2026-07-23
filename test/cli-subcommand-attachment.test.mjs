@@ -53,11 +53,16 @@ async function runRepairSummaries(rows, extraArgs = [], storeOverrides = {}) {
   });
   const logs = [];
   const errors = [];
+  const exitCalls = [];
   const originalLog = console.log;
   const originalError = console.error;
+  const originalExit = process.exit;
   const priorExitCode = process.exitCode;
   console.log = (...parts) => logs.push(parts.join(" "));
   console.error = (...parts) => errors.push(parts.join(" "));
+  process.exit = (code) => {
+    exitCalls.push(code);
+  };
   let exitCode;
   try {
     await program.parseAsync(["node", "cli", "memory-pro", "repair-summaries", ...extraArgs]);
@@ -66,8 +71,9 @@ async function runRepairSummaries(rows, extraArgs = [], storeOverrides = {}) {
     process.exitCode = priorExitCode;
     console.log = originalLog;
     console.error = originalError;
+    process.exit = originalExit;
   }
-  return { updateCalls, logs: logs.join("\n"), errors: errors.join("\n"), exitCode };
+  return { updateCalls, logs: logs.join("\n"), errors: errors.join("\n"), exitCode, exitCalls };
 }
 
 describe("cli subcommand attachment", () => {
@@ -230,6 +236,58 @@ describe("repair-summaries action safety", () => {
     assert.match(logs, /0 fixed, 1 failed/);
     assert.match(errors, /synthetic update failure/);
     assert.equal(exitCode, 1, "a repair that threw must not exit successfully");
+  });
+
+  it("keeps scanning when a row's metadata parses to JSON null instead of aborting the run", async () => {
+    const nullMetaRow = {
+      ...summaryRow({ id: "null-meta-1", text: "synthetic note about the birch bench" }),
+      metadata: "null",
+    };
+
+    const { logs, errors, exitCalls } = await runRepairSummaries([nullMetaRow, missingRow]);
+
+    assert.deepEqual(exitCalls, [], "one damaged row must not abort the whole scan");
+    assert.doesNotMatch(errors, /repair-summaries failed/);
+    assert.match(logs, /Found 2 repairable entries/, "the damaged row and every row after it must both be reported");
+    assert.match(logs, /null-met/);
+    assert.match(logs, /missing-/);
+  });
+
+  it("normalizes null, primitive, and array metadata to missing levels and repairs them under --apply", async () => {
+    const nullMetaRow = {
+      ...summaryRow({ id: "null-meta-2", text: "synthetic note about the birch bench" }),
+      metadata: "null",
+    };
+    const numberMetaRow = {
+      ...summaryRow({ id: "number-meta-1", text: "synthetic note about the slate coaster" }),
+      metadata: "42",
+    };
+    const arrayMetaRow = {
+      ...summaryRow({ id: "array-meta-1", text: "synthetic note about the wicker basket" }),
+      metadata: '["synthetic"]',
+    };
+
+    const { updateCalls, exitCalls, exitCode } = await runRepairSummaries(
+      [nullMetaRow, healthyRow, numberMetaRow, arrayMetaRow],
+      ["--apply"],
+      {
+        async update(id) {
+          return { id };
+        },
+      }
+    );
+
+    assert.deepEqual(exitCalls, []);
+    assert.deepEqual(
+      updateCalls.map((call) => call.id).sort(),
+      ["array-meta-1", "null-meta-2", "number-meta-1"],
+      "every damaged-metadata row is repairable; the healthy row stays untouched"
+    );
+    for (const call of updateCalls) {
+      const meta = JSON.parse(call.patch.metadata);
+      assert.ok(meta.l0_abstract && meta.l1_overview && meta.l2_content, "repair must rebuild all three levels from the source text");
+    }
+    assert.notEqual(exitCode, 1, "a fully successful repair pass must not set a failing exit code");
   });
 });
 

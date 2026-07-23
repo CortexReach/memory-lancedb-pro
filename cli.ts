@@ -11,7 +11,6 @@ import * as readline from "node:readline";
 import JSON5 from "json5";
 import { loadLanceDB, type MemoryEntry, type MemoryStore } from "./src/store.js";
 import {
-  parseSmartMetadata,
   buildSmartMetadata,
   stringifySmartMetadata,
 } from "./src/smart-metadata.js";
@@ -2179,9 +2178,15 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           // Judge the RAW stored metadata: parseSmartMetadata backfills
           // missing levels from the text, which would hide exactly the rows
           // this command exists to repair.
+          // Accept only a non-null, non-array object: JSON.parse("null") (and
+          // primitives/arrays) succeed, so the catch alone cannot normalize a
+          // damaged row, and one bad row must not abort the whole scan.
           let rawMeta: Record<string, unknown> = {};
           try {
-            rawMeta = JSON.parse(entry.metadata || "{}") as Record<string, unknown>;
+            const parsed: unknown = JSON.parse(entry.metadata || "{}");
+            if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+              rawMeta = parsed as Record<string, unknown>;
+            }
           } catch {
             rawMeta = {};
           }
