@@ -88,7 +88,7 @@ function createEmbeddingServer() {
  * - admission-utility prompts (contain "Evaluate whether this candidate")
  *   return `utilityScore`.
  */
-function createLlmServer({ extractionPrompts, extractMemories, utilityScore = 0.9 }) {
+function createLlmServer({ extractionPrompts, extractMemories, utilityScore = 0.9, extractionGate }) {
   let extractCalls = 0;
   return http.createServer(async (req, res) => {
     const chunks = [];
@@ -102,6 +102,9 @@ function createLlmServer({ extractionPrompts, extractMemories, utilityScore = 0.
     } else if (prompt.includes("## Recent Conversation")) {
       extractionPrompts.push(prompt);
       extractCalls += 1;
+      if (typeof extractionGate === "function") {
+        await extractionGate(prompt, extractCalls);
+      }
       const memories = typeof extractMemories === "function" ? extractMemories(extractCalls) : extractMemories;
       content = JSON.stringify({ memories });
     } else {
@@ -746,6 +749,90 @@ describe("terminal flush of deferred captures at session_end", () => {
 
     await fireSessionEnd(harness, hook, { sessionKey: "agent:agent-two:main", agentId: "agent-two" });
     assert.equal(extractionPrompts.length, 0, "nothing deferred means nothing to flush");
+  });
+
+  it("serializes the terminal flush behind its own session's in-flight extraction under concurrent sessions", async () => {
+    const A_MARKER = "synthetic gearbox ratio preference alpha";
+    let releaseGate;
+    const gate = new Promise((resolve) => {
+      releaseGate = resolve;
+    });
+    // Swap in an LLM server whose extraction responses hang while the gate is
+    // held, but only for session A's marker text; session B stays fast.
+    await new Promise((resolve) => llmServer.close(resolve));
+    llmServer = createLlmServer({
+      extractionPrompts,
+      extractMemories: (n) => [{
+        category: "preferences",
+        abstract: `Synthetic interleave marker ${n}`,
+        overview: `## Preference\n- Interleave marker ${n}`,
+        content: `User stated synthetic interleave marker ${n}.`,
+      }],
+      extractionGate: async (prompt) => {
+        if (prompt.includes(A_MARKER)) {
+          await gate;
+        }
+      },
+    });
+    await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: flushConfig() });
+      memoryLanceDBProPlugin.register(harness.api);
+      const hook = getAutoCaptureHook(harness.eventHandlers);
+      const ctxA = { sessionKey: "agent:agent-one:synthchat:convA", agentId: "agent-one" };
+      const ctxB = { sessionKey: "agent:agent-two:synthchat:convB", agentId: "agent-two" };
+      const aHistory = [
+        `I prefer ${A_MARKER} for all my synthetic projects.`,
+        "Second synthetic note about duck-themed editor fonts.",
+        "Third synthetic note about four-space indentation.",
+        "Fourth synthetic note about tiling window layouts.",
+      ];
+
+      // A turn 1: below threshold, defers the marker text for a terminal flush.
+      await fireAgentEnd(hook, userMessages(aHistory[0]), ctxA);
+      assert.equal(extractionPrompts.length, 0, "A's first turn must stay below the threshold");
+
+      // A turn 2: the full history crosses the threshold; the extraction hangs
+      // on the gate while A's deferred texts are not yet consumed.
+      hook({ success: true, messages: userMessages(...aHistory) }, ctxA);
+      const waitDeadline = Date.now() + 2000;
+      while (!extractionPrompts.some((p) => p.includes(A_MARKER))) {
+        assert.ok(Date.now() < waitDeadline, "timed out waiting for A's extraction to reach the LLM server");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      // B: a concurrent session extracts and completes while A hangs.
+      await fireAgentEnd(hook, userMessages(
+        "B synthetic note one about badge printer trays.",
+        "B synthetic note two about lobby plant watering.",
+        "B synthetic note three about kettle descaling.",
+        "B synthetic note four about stapler refills.",
+      ), ctxB);
+      assert.equal(extractionPrompts.length, 2, "A held and B completed must be the only extractions so far");
+
+      // A's session_end arrives while A's extraction is still in flight. It
+      // must wait for A's own run, not for B's already-settled run.
+      for (const { handler } of harness.eventHandlers.get("session_end") || []) {
+        handler({}, ctxA);
+      }
+      const flushSeam = hook.__lastRun;
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      assert.equal(
+        extractionPrompts.length,
+        2,
+        "the terminal flush must not run while the same session's extraction is in flight",
+      );
+
+      releaseGate();
+      await flushSeam;
+
+      const aPrompts = extractionPrompts.filter((p) => p.includes(A_MARKER));
+      assert.equal(aPrompts.length, 1, "A's deferred text must be extracted exactly once");
+      assert.equal(extractionPrompts.length, 2, "the terminal flush must find nothing left to re-extract");
+    } finally {
+      releaseGate();
+    }
   });
 });
 

@@ -2360,6 +2360,7 @@ interface PluginSingletonState {
   autoCaptureCountedPendingCount: Map<string, number>;
   autoCaptureRecentTexts: Map<string, string[]>;
   autoCaptureDeferredFlushTexts: Map<string, string[]>;
+  autoCaptureInFlightRuns: Map<string, Set<Promise<void>>>;
   captureAdmissionController: () => AdmissionController | null;
   captureAdmissionAudit: () => boolean;
   admissionRejectionAuditWriter: ((entry: AdmissionRejectionAuditEntry) => Promise<void>) | null;
@@ -2604,6 +2605,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const autoCaptureCountedPendingCount = new Map<string, number>();
   const autoCaptureRecentTexts = new Map<string, string[]>();
   const autoCaptureDeferredFlushTexts = new Map<string, string[]>();
+  const autoCaptureInFlightRuns = new Map<string, Set<Promise<void>>>();
 
   return {
     config,
@@ -2634,6 +2636,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCaptureCountedPendingCount,
     autoCaptureRecentTexts,
     autoCaptureDeferredFlushTexts,
+    autoCaptureInFlightRuns,
     captureAdmissionController,
     captureAdmissionAudit,
     admissionRejectionAuditWriter,
@@ -2792,6 +2795,7 @@ const memoryLanceDBProPlugin = {
       autoCaptureCountedPendingCount,
       autoCaptureRecentTexts,
       autoCaptureDeferredFlushTexts,
+      autoCaptureInFlightRuns,
       captureAdmissionController,
       captureAdmissionAudit,
       admissionRejectionAuditWriter,
@@ -3820,6 +3824,14 @@ const memoryLanceDBProPlugin = {
         __lastRun?: Promise<void>;
       };
 
+      const awaitSessionCaptureRuns = (key: string): Promise<void> => {
+        const runs = autoCaptureInFlightRuns.get(key);
+        if (!runs || runs.size === 0) {
+          return Promise.resolve();
+        }
+        return Promise.allSettled([...runs]).then(() => {});
+      };
+
       const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = (event, ctx) => {
         const isTerminalFlush = (event as any).__autoCaptureTerminalFlush === true;
         if (!event.success || (!isTerminalFlush && (!event.messages || event.messages.length === 0))) {
@@ -3838,6 +3850,8 @@ const memoryLanceDBProPlugin = {
           );
           return;
         }
+
+        const captureRunKey = typeof hookSessionKey === "string" && hookSessionKey ? hookSessionKey : "unknown";
 
         // Fire-and-forget: run capture work in the background so the hook
         // returns immediately and does not hold the session lock.  Blocking
@@ -4392,7 +4406,18 @@ const memoryLanceDBProPlugin = {
           api.logger.warn(`memory-lancedb-pro: capture failed: ${String(err)}`);
         }
         })();
-        agentEndAutoCaptureHook.__lastRun = backgroundRun;
+        const sessionRuns = autoCaptureInFlightRuns.get(captureRunKey) ?? new Set<Promise<void>>();
+        autoCaptureInFlightRuns.set(captureRunKey, sessionRuns);
+        const trackedRun: Promise<void> = backgroundRun.catch(() => {}).then(() => {
+          sessionRuns.delete(trackedRun);
+          if (sessionRuns.size === 0 && autoCaptureInFlightRuns.get(captureRunKey) === sessionRuns) {
+            autoCaptureInFlightRuns.delete(captureRunKey);
+          }
+        });
+        sessionRuns.add(trackedRun);
+        // Test-synchronization seam only: flush coordination reads
+        // autoCaptureInFlightRuns for the session's own key, never this slot.
+        agentEndAutoCaptureHook.__lastRun = trackedRun;
         void backgroundRun;
       };
 
@@ -4401,23 +4426,24 @@ const memoryLanceDBProPlugin = {
       // A session that ends below extractMinMessages would otherwise strand its
       // deferred texts (requeued ingress or rolled-back history) forever, losing
       // even an explicit one-turn remember request. Consume them exactly once at
-      // session end, serialized behind any in-flight capture run.
+      // session end, serialized behind the SAME session's in-flight capture runs
+      // (a single global slot let concurrent sessions overwrite each other, so a
+      // flush could run before its own session's work recorded deferred state).
       api.on("session_end", (event: any, ctx: any) => {
         const flushSessionKey = ctx?.sessionKey || (event as any)?.sessionKey || "";
         if (!flushSessionKey || typeof flushSessionKey !== "string") {
           return;
         }
-        const priorRun = agentEndAutoCaptureHook.__lastRun ?? Promise.resolve();
-        const flushRun = priorRun
-          .catch(() => {})
+        const flushRun = awaitSessionCaptureRuns(flushSessionKey)
           .then(() => {
             agentEndAutoCaptureHook(
               { success: true, messages: [], sessionKey: flushSessionKey, __autoCaptureTerminalFlush: true },
               ctx,
             );
-            return agentEndAutoCaptureHook.__lastRun;
+            return awaitSessionCaptureRuns(flushSessionKey);
           })
           .then(() => {});
+        // Test-synchronization seam only (see the agent_end tail).
         agentEndAutoCaptureHook.__lastRun = flushRun;
       });
     }
