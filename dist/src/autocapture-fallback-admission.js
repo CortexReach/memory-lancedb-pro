@@ -11,6 +11,20 @@
  */
 import { resolveToolMemoryCategory } from "./memory-categories.js";
 /**
+ * The candidate shape a regex-fallback capture is scored under: the legacy
+ * store category mapped onto its smart register. Shared with callers that
+ * persist rejection audits so both sides describe the same candidate.
+ */
+export function buildFallbackCandidate(text, storeCategory) {
+    const { memoryCategory } = resolveToolMemoryCategory(storeCategory);
+    return {
+        category: memoryCategory,
+        abstract: text,
+        overview: `- ${text}`,
+        content: text,
+    };
+}
+/**
  * Gate one regex-fallback capture through admission control.
  *
  * - No controller (admission disabled, or smart extraction off so no
@@ -32,16 +46,10 @@ export async function gateRegexFallbackCapture(params) {
     if (!params.admissionController) {
         return { admit: true };
     }
-    const { memoryCategory } = resolveToolMemoryCategory(params.storeCategory);
     let evaluation;
     try {
         evaluation = await params.admissionController.evaluate({
-            candidate: {
-                category: memoryCategory,
-                abstract: params.text,
-                overview: `- ${params.text}`,
-                content: params.text,
-            },
+            candidate: buildFallbackCandidate(params.text, params.storeCategory),
             candidateVector: params.vector,
             conversationText: params.conversationText,
             scopeFilter: params.scopeFilter,
@@ -67,7 +75,11 @@ export async function gateRegexFallbackCapture(params) {
         };
     }
     if (evaluation.decision === "reject") {
-        return { admit: false, reason: evaluation.audit.reason };
+        return {
+            admit: false,
+            reason: evaluation.audit.reason,
+            rejectedAudit: evaluation.audit,
+        };
     }
     return {
         admit: true,
