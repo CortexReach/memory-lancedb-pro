@@ -10,7 +10,7 @@
  * control is disabled.
  */
 
-import type { AdmissionEvaluation } from "./admission-control.js";
+import type { AdmissionAuditRecord, AdmissionEvaluation } from "./admission-control.js";
 import { resolveToolMemoryCategory } from "./memory-categories.js";
 
 export interface FallbackAdmissionGate {
@@ -27,6 +27,26 @@ export interface FallbackGateResult {
   reason?: string;
   /** Serialized audit (with provenance) to persist in the row's metadata. */
   auditJson?: string;
+  /** Full audit record for a rejection, so callers can persist rejected audits. */
+  rejectedAudit?: AdmissionAuditRecord & { decision: "reject" };
+}
+
+/**
+ * The candidate shape a regex-fallback capture is scored under: the legacy
+ * store category mapped onto its smart register. Shared with callers that
+ * persist rejection audits so both sides describe the same candidate.
+ */
+export function buildFallbackCandidate(
+  text: string,
+  storeCategory: string,
+): import("./memory-categories.js").CandidateMemory {
+  const { memoryCategory } = resolveToolMemoryCategory(storeCategory);
+  return {
+    category: memoryCategory,
+    abstract: text,
+    overview: `- ${text}`,
+    content: text,
+  };
 }
 
 /**
@@ -61,16 +81,10 @@ export async function gateRegexFallbackCapture(params: {
     return { admit: true };
   }
 
-  const { memoryCategory } = resolveToolMemoryCategory(params.storeCategory);
   let evaluation: AdmissionEvaluation;
   try {
     evaluation = await params.admissionController.evaluate({
-      candidate: {
-        category: memoryCategory,
-        abstract: params.text,
-        overview: `- ${params.text}`,
-        content: params.text,
-      },
+      candidate: buildFallbackCandidate(params.text, params.storeCategory),
       candidateVector: params.vector,
       conversationText: params.conversationText,
       scopeFilter: params.scopeFilter,
@@ -98,7 +112,11 @@ export async function gateRegexFallbackCapture(params: {
   }
 
   if (evaluation.decision === "reject") {
-    return { admit: false, reason: evaluation.audit.reason };
+    return {
+      admit: false,
+      reason: evaluation.audit.reason,
+      rejectedAudit: evaluation.audit as AdmissionAuditRecord & { decision: "reject" },
+    };
   }
 
   return {

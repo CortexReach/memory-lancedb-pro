@@ -67,7 +67,7 @@ import {
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
-import { gateRegexFallbackCapture } from "./src/autocapture-fallback-admission.js";
+import { buildFallbackCandidate, gateRegexFallbackCapture } from "./src/autocapture-fallback-admission.js";
 import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
@@ -103,6 +103,7 @@ import {
   resolveRejectedAuditFilePath,
   type AdmissionControlConfig,
   type AdmissionRejectionAuditEntry,
+  AdmissionController,
 } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
@@ -1290,6 +1291,10 @@ export function buildAutoCaptureConversationKeyFromIngress(
  * the second colon as the conversation key, or null if the format
  * does not match.
  */
+function autoCaptureRetainedTextCap(minMessages: number): number {
+  return Math.max(6, minMessages);
+}
+
 function buildAutoCaptureConversationKeyFromSessionKey(sessionKey: string): string | null {
   const trimmed = sessionKey.trim();
   if (!trimmed) return null;
@@ -2352,7 +2357,12 @@ interface PluginSingletonState {
   turnCounter: Map<string, number>;
   autoCaptureSeenTextCount: Map<string, number>;
   autoCapturePendingIngressTexts: Map<string, string[]>;
+  autoCaptureCountedPendingCount: Map<string, number>;
   autoCaptureRecentTexts: Map<string, string[]>;
+  autoCaptureDeferredFlushTexts: Map<string, string[]>;
+  captureAdmissionController: () => AdmissionController | null;
+  captureAdmissionAudit: () => boolean;
+  admissionRejectionAuditWriter: ((entry: AdmissionRejectionAuditEntry) => Promise<void>) | null;
 }
 
 interface DreamingSchedulerState {
@@ -2472,28 +2482,30 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   // callback below closes over it.
   const mdMirror = createMdMirrorWriter(api, config);
 
-  let smartExtractor: SmartExtractor | null = null;
-  if (config.smartExtraction !== false) {
-    try {
-      const llmAuth = config.llm?.auth || "api-key";
-      const llmApiKey = llmAuth === "oauth"
-        ? undefined
-        : config.llm?.apiKey
-          ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
-          : resolveFirstApiKey(api, config.embedding.apiKey);
-      const llmBaseURL = llmAuth === "oauth"
-        ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
-        : config.llm?.baseURL
-          ? resolveEnvVars(config.llm.baseURL)
-          : config.embedding.baseURL;
-      const llmModel = config.llm?.model || "openai/gpt-oss-120b";
-      const llmOauthPath = llmAuth === "oauth"
-        ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
-        : undefined;
-      const llmOauthProvider = llmAuth === "oauth" ? config.llm?.oauthProvider : undefined;
-      const llmTimeoutMs = resolveLlmTimeoutMs(config);
+  const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
 
-      const llmClient = createLlmClient({
+  const buildMemoryLlmClient = () => {
+    const llmAuth = config.llm?.auth || "api-key";
+    const llmApiKey = llmAuth === "oauth"
+      ? undefined
+      : config.llm?.apiKey
+        ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
+        : resolveFirstApiKey(api, config.embedding.apiKey);
+    const llmBaseURL = llmAuth === "oauth"
+      ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
+      : config.llm?.baseURL
+        ? resolveEnvVars(config.llm.baseURL)
+        : config.embedding.baseURL;
+    const llmModel = config.llm?.model || "openai/gpt-oss-120b";
+    const llmOauthPath = llmAuth === "oauth"
+      ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
+      : undefined;
+    const llmOauthProvider = llmAuth === "oauth" ? config.llm?.oauthProvider : undefined;
+    const llmTimeoutMs = resolveLlmTimeoutMs(config);
+    return {
+      llmModel,
+      llmTimeoutMs,
+      llmClient: createLlmClient({
         auth: llmAuth,
         apiKey: llmApiKey,
         model: llmModel,
@@ -2503,14 +2515,19 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         timeoutMs: llmTimeoutMs,
         log: (msg: string) => api.logger.debug(msg),
         warnLog: (msg: string) => api.logger.warn(msg),
-      });
+      }),
+    };
+  };
+
+  let smartExtractor: SmartExtractor | null = null;
+  if (config.smartExtraction !== false) {
+    try {
+      const { llmClient, llmModel, llmTimeoutMs } = buildMemoryLlmClient();
 
       const noiseBank = new NoisePrototypeBank((msg: string) => api.logger.debug(msg));
       noiseBank.init(embedder).catch((err) =>
         api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
       );
-
-      const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
 
       smartExtractor = new SmartExtractor(store, embedder, llmClient, {
         user: "User",
@@ -2538,6 +2555,34 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     }
   }
 
+  // admissionControl.enabled is a supported configuration on its own: without
+  // this, disabling smart extraction (or its init failing) silently dropped the
+  // admission gate from the regex fallback and mapped-reflection paths.
+  let fallbackAdmissionController: AdmissionController | null = null;
+  let fallbackPersistAdmissionAudit = false;
+  if (!smartExtractor && config.admissionControl?.enabled === true) {
+    try {
+      fallbackAdmissionController = new AdmissionController(
+        store,
+        buildMemoryLlmClient().llmClient,
+        config.admissionControl,
+        (msg: string) => api.logger.debug(msg),
+      );
+      fallbackPersistAdmissionAudit = config.admissionControl.auditMetadata !== false;
+      api.logger.info(
+        "memory-lancedb-pro: admission control constructed for capture fallbacks (smart extraction inactive)",
+      );
+    } catch (err) {
+      api.logger.warn(
+        `memory-lancedb-pro: fallback admission init failed, captures stay ungated: ${String(err)}`,
+      );
+    }
+  }
+  const captureAdmissionController = () =>
+    smartExtractor?.getAdmissionController() ?? fallbackAdmissionController;
+  const captureAdmissionAudit = () =>
+    smartExtractor ? smartExtractor.shouldPersistAdmissionAudit() : fallbackPersistAdmissionAudit;
+
   const extractionRateLimiter = createExtractionRateLimiter({
     maxExtractionsPerHour: config.extractionThrottle?.maxExtractionsPerHour,
   });
@@ -2556,7 +2601,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const turnCounter = new Map<string, number>();
   const autoCaptureSeenTextCount = new Map<string, number>();
   const autoCapturePendingIngressTexts = new Map<string, string[]>();
+  const autoCaptureCountedPendingCount = new Map<string, number>();
   const autoCaptureRecentTexts = new Map<string, string[]>();
+  const autoCaptureDeferredFlushTexts = new Map<string, string[]>();
 
   return {
     config,
@@ -2584,7 +2631,12 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     turnCounter,
     autoCaptureSeenTextCount,
     autoCapturePendingIngressTexts,
+    autoCaptureCountedPendingCount,
     autoCaptureRecentTexts,
+    autoCaptureDeferredFlushTexts,
+    captureAdmissionController,
+    captureAdmissionAudit,
+    admissionRejectionAuditWriter,
   };
 }
 
@@ -2737,7 +2789,12 @@ const memoryLanceDBProPlugin = {
       turnCounter,
       autoCaptureSeenTextCount,
       autoCapturePendingIngressTexts,
+      autoCaptureCountedPendingCount,
       autoCaptureRecentTexts,
+      autoCaptureDeferredFlushTexts,
+      captureAdmissionController,
+      captureAdmissionAudit,
+      admissionRejectionAuditWriter,
     } = singleton;
 
     warnForDisabledChannelPlugin(
@@ -3120,7 +3177,10 @@ const memoryLanceDBProPlugin = {
           } else {
             const queue = autoCapturePendingIngressTexts.get(conversationKey) || [];
             queue.push(normalized);
-            autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
+            autoCapturePendingIngressTexts.set(
+              conversationKey,
+              queue.slice(-autoCaptureRetainedTextCap(config.extractMinMessages ?? 4)),
+            );
             pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
         }
@@ -3761,7 +3821,8 @@ const memoryLanceDBProPlugin = {
       };
 
       const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = (event, ctx) => {
-        if (!event.success || !event.messages || event.messages.length === 0) {
+        const isTerminalFlush = (event as any).__autoCaptureTerminalFlush === true;
+        if (!event.success || (!isTerminalFlush && (!event.messages || event.messages.length === 0))) {
           return;
         }
 
@@ -3812,7 +3873,7 @@ const memoryLanceDBProPlugin = {
           // Extract text content from messages
           const eligibleTexts: string[] = [];
           let skippedAutoCaptureTexts = 0;
-          for (const msg of event.messages) {
+          for (const msg of event.messages ?? []) {
             if (!msg || typeof msg !== "object") {
               continue;
             }
@@ -3865,21 +3926,45 @@ const memoryLanceDBProPlugin = {
           const pendingIngressTexts = conversationKey
             ? [...(autoCapturePendingIngressTexts.get(conversationKey) || [])]
             : [];
+          // Requeued texts were counted on the turn that deferred them; only the
+          // tail beyond this marker is new ingress. Recounting the whole snapshot
+          // inflated the counter (1, 3, 6 for three unique messages).
+          const alreadyCountedPending = conversationKey
+            ? Math.min(autoCaptureCountedPendingCount.get(conversationKey) ?? 0, pendingIngressTexts.length)
+            : 0;
           if (conversationKey) {
             autoCapturePendingIngressTexts.delete(conversationKey);
+            autoCaptureCountedPendingCount.delete(conversationKey);
           }
 
           const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
           let newTexts = eligibleTexts;
+          let newlyObservedCount = eligibleTexts.length;
           if (pendingIngressTexts.length > 0) {
             newTexts = pendingIngressTexts;
+            newlyObservedCount = pendingIngressTexts.length - alreadyCountedPending;
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
+            newlyObservedCount = newTexts.length;
           }
           // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
-          const cumulativeCount = previousSeenCount + newTexts.length;
+          const cumulativeCount = previousSeenCount + newlyObservedCount;
           autoCaptureSeenTextCount.set(sessionKey, cumulativeCount);
           pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+
+          if (isTerminalFlush) {
+            const deferredFlushTexts = autoCaptureDeferredFlushTexts.get(sessionKey) || [];
+            autoCaptureDeferredFlushTexts.delete(sessionKey);
+            autoCaptureSeenTextCount.delete(sessionKey);
+            const flushTexts = [...new Set([...pendingIngressTexts, ...deferredFlushTexts])];
+            if (flushTexts.length === 0) {
+              return;
+            }
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture terminal flush of ${flushTexts.length} deferred text(s) for agent ${agentId}`,
+            );
+            newTexts = flushTexts;
+          }
 
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
           let texts = newTexts;
@@ -3890,7 +3975,9 @@ const memoryLanceDBProPlugin = {
           ) {
             texts = [...priorRecentTexts.slice(-1), ...texts];
           }
-          if (newTexts.length > 0) {
+          if (isTerminalFlush) {
+            autoCaptureRecentTexts.delete(sessionKey);
+          } else if (newTexts.length > 0) {
             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
@@ -3970,7 +4057,7 @@ const memoryLanceDBProPlugin = {
               );
               return;
             }
-            if (cumulativeCount >= minMessages) {
+            if (cumulativeCount >= minMessages || isTerminalFlush) {
               api.logger.debug(
                 `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
@@ -3990,6 +4077,10 @@ const memoryLanceDBProPlugin = {
               }
               // Charge rate limiter only after successful extraction
               extractionRateLimiter.recordExtraction();
+              // The extractor has now seen every deferred history text (the
+              // rolled-back cursor re-included them), so a later terminal
+              // flush must not re-extract them.
+              autoCaptureDeferredFlushTexts.delete(sessionKey);
               if (stats.created > 0 || stats.merged > 0) {
                 api.logger.info(
                   `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`,
@@ -4041,15 +4132,33 @@ const memoryLanceDBProPlugin = {
               // here: only the counter advanced, so by the time it crossed
               // minMessages on a later turn, every earlier deferred turn's text was
               // already gone.
+              const retainedCap = autoCaptureRetainedTextCap(minMessages);
               if (pendingIngressTexts.length === 0) {
                 autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
+                // History content lives in the session transcript, which is gone
+                // once the session ends: retain the deferred texts so a terminal
+                // flush can still consume them.
+                autoCaptureDeferredFlushTexts.set(
+                  sessionKey,
+                  [...(autoCaptureDeferredFlushTexts.get(sessionKey) || []), ...newTexts].slice(-retainedCap),
+                );
+                pruneMapIfOver(autoCaptureDeferredFlushTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
               } else if (conversationKey) {
-                const requeuedIngressTexts = [
+                const mergedIngressTexts = [
                   ...pendingIngressTexts,
                   ...(autoCapturePendingIngressTexts.get(conversationKey) || []),
-                ].slice(-6);
+                ];
+                const requeuedIngressTexts = mergedIngressTexts.slice(-retainedCap);
+                const evictedCount = mergedIngressTexts.length - requeuedIngressTexts.length;
                 autoCapturePendingIngressTexts.set(conversationKey, requeuedIngressTexts);
+                // Everything in pendingIngressTexts is counted by now; eviction
+                // drops oldest (counted) entries first.
+                autoCaptureCountedPendingCount.set(
+                  conversationKey,
+                  Math.max(0, pendingIngressTexts.length - evictedCount),
+                );
                 pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                pruneMapIfOver(autoCaptureCountedPendingCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
               }
               api.logger.debug(
                 `memory-lancedb-pro: auto-capture deferred below-threshold turn for agent ${agentId}; regex fallback skipped (smart extraction enabled)`,
@@ -4145,8 +4254,8 @@ const memoryLanceDBProPlugin = {
             // passthrough when it is disabled (or when smart extraction is
             // off, in which case no controller instance exists to borrow).
             const fallbackGate = await gateRegexFallbackCapture({
-              admissionController: smartExtractor?.getAdmissionController() ?? null,
-              attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+              admissionController: captureAdmissionController(),
+              attachAudit: captureAdmissionAudit(),
               text,
               storeCategory: category,
               vector,
@@ -4158,6 +4267,24 @@ const memoryLanceDBProPlugin = {
               api.logger.info(
                 `memory-lancedb-pro: admission rejected regex-fallback capture "${text.slice(0, 40)}" provenance=auto-capture-regex-fallback: ${fallbackGate.reason ?? "no reason"}`,
               );
+              if (admissionRejectionAuditWriter && fallbackGate.rejectedAudit) {
+                try {
+                  await admissionRejectionAuditWriter({
+                    version: "amac-v1",
+                    rejected_at: Date.now(),
+                    session_key: sessionKey,
+                    target_scope: defaultScope,
+                    scope_filter: accessibleScopes ?? [defaultScope],
+                    candidate: buildFallbackCandidate(text, category),
+                    audit: fallbackGate.rejectedAudit,
+                    conversation_excerpt: texts.join("\n").slice(-1200),
+                  });
+                } catch (auditErr) {
+                  api.logger.warn(
+                    `memory-lancedb-pro: regex-fallback rejected audit write failed: ${String(auditErr)}`,
+                  );
+                }
+              }
               continue;
             }
 
@@ -4270,6 +4397,29 @@ const memoryLanceDBProPlugin = {
       };
 
       api.on("agent_end", agentEndAutoCaptureHook);
+
+      // A session that ends below extractMinMessages would otherwise strand its
+      // deferred texts (requeued ingress or rolled-back history) forever, losing
+      // even an explicit one-turn remember request. Consume them exactly once at
+      // session end, serialized behind any in-flight capture run.
+      api.on("session_end", (event: any, ctx: any) => {
+        const flushSessionKey = ctx?.sessionKey || (event as any)?.sessionKey || "";
+        if (!flushSessionKey || typeof flushSessionKey !== "string") {
+          return;
+        }
+        const priorRun = agentEndAutoCaptureHook.__lastRun ?? Promise.resolve();
+        const flushRun = priorRun
+          .catch(() => {})
+          .then(() => {
+            agentEndAutoCaptureHook(
+              { success: true, messages: [], sessionKey: flushSessionKey, __autoCaptureTerminalFlush: true },
+              ctx,
+            );
+            return agentEndAutoCaptureHook.__lastRun;
+          })
+          .then(() => {});
+        agentEndAutoCaptureHook.__lastRun = flushRun;
+      });
     }
 
     // ========================================================================
@@ -5102,8 +5252,8 @@ const memoryLanceDBProPlugin = {
           // historical per-row path otherwise; passthrough when admission
           // control (or smart extraction) is disabled.
           const mappedGateResults = await gateMappedReflectionEntries({
-            admissionController: smartExtractor?.getAdmissionController() ?? null,
-            attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+            admissionController: captureAdmissionController(),
+            attachAudit: captureAdmissionAudit(),
             rows: gateEligible.map(({ mapped, vector }) => ({
               text: mapped.text,
               category: mapped.category,

@@ -23,7 +23,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,6 +42,7 @@ const pluginModule = jiti("../index.ts");
 const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
 const resetRegistration = pluginModule.resetRegistration ?? (() => {});
 const { gateRegexFallbackCapture } = jiti("../src/autocapture-fallback-admission.ts");
+const { MemoryStore } = jiti("../src/store.ts");
 // One-hot embeddings can land arbitrary texts near noise prototypes; force
 // the bank off for determinism.
 const { NoisePrototypeBank } = jiti("../src/noise-prototypes.ts");
@@ -483,5 +484,384 @@ describe("gateRegexFallbackCapture (Path 2 unit)", () => {
     });
     assert.equal(result.admit, true);
     assert.equal(result.auditJson, undefined);
+  });
+});
+
+describe("standalone admission when smart extraction is off (Path 3)", () => {
+  let workspaceDir;
+  let embeddingServer;
+  let llmServer;
+  let extractionPrompts;
+  let utilityScore;
+
+  beforeEach(async () => {
+    workspaceDir = mkdtempSync(path.join(tmpdir(), "fallback-standalone-"));
+    extractionPrompts = [];
+    utilityScore = 0;
+    embeddingServer = createEmbeddingServer();
+    llmServer = http.createServer((req, res) => {
+      createLlmServer({ extractionPrompts, extractMemories: [], utilityScore }).emit("request", req, res);
+    });
+    await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+    resetRegistration();
+  });
+
+  afterEach(async () => {
+    resetRegistration();
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  function offConfig(admissionControl) {
+    return {
+      dbPath: path.join(workspaceDir, "db"),
+      autoCapture: true,
+      autoRecall: false,
+      smartExtraction: false,
+      extractionThrottle: { skipLowValue: false, maxExtractionsPerHour: 200 },
+      sessionCompression: { enabled: false },
+      selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      embedding: {
+        apiKey: "test-api-key",
+        model: "mock-embedding-model",
+        baseURL: `http://127.0.0.1:${embeddingServer.address().port}/v1`,
+        dimensions: EMBEDDING_DIMENSIONS,
+      },
+      llm: {
+        apiKey: "test-api-key",
+        model: "mock-memory-model",
+        baseURL: `http://127.0.0.1:${llmServer.address().port}`,
+      },
+      admissionControl,
+    };
+  }
+
+  it("admission-rejects fallback captures with smartExtraction=false (previously an unconditional bypass) and persists the rejected audit", async () => {
+    utilityScore = 0;
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: offConfig({
+        enabled: true,
+        preset: "balanced",
+        persistRejectedAudits: true,
+        typePriors: { profile: 0.01, preferences: 0.01, entities: 0.01, events: 0.01, cases: 0.01, patterns: 0.01 },
+      }),
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+
+    await fireAgentEnd(hook, userMessages(PREFERENCE_TEXT), { sessionKey: "agent:agent-two:main", agentId: "agent-two" });
+
+    assert.ok(
+      harness.logs.info.some((l) => l.includes("admission control constructed for capture fallbacks")),
+      "the standalone controller must be constructed when smart extraction is off",
+    );
+    assert.ok(
+      harness.logs.info.some((l) => l.includes("admission rejected regex-fallback capture")),
+      "the fallback capture must be admission-rejected without a SmartExtractor to borrow from",
+    );
+    assert.ok(
+      !harness.logs.info.some((l) => l.includes("auto-captured")),
+      "a rejected fallback capture must not be stored",
+    );
+
+    const auditFile = path.join(workspaceDir, "admission-audit", "rejections.jsonl");
+    assert.ok(existsSync(auditFile), "the rejected admission audit must be persisted for fallback rejections");
+    const auditContent = readFileSync(auditFile, "utf8");
+    assert.ok(auditContent.includes('"decision":"reject"'), "the persisted audit must carry the reject decision");
+    assert.ok(
+      auditContent.includes("synthetic tabs over spaces"),
+      "the persisted audit must describe the rejected fallback candidate",
+    );
+  });
+
+  it("stores fallback captures the standalone controller admits", async () => {
+    utilityScore = 0.9;
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: offConfig({
+        enabled: true,
+        preset: "balanced",
+        typePriors: { profile: 0.9, preferences: 0.9, entities: 0.9, events: 0.9, cases: 0.9, patterns: 0.9 },
+      }),
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+
+    await fireAgentEnd(hook, userMessages(PREFERENCE_TEXT), { sessionKey: "agent:agent-two:main", agentId: "agent-two" });
+
+    assert.ok(
+      !harness.logs.info.some((l) => l.includes("admission rejected regex-fallback capture")),
+      "an admitted capture must not be rejected",
+    );
+    assert.ok(
+      harness.logs.info.some((l) => l.includes("auto-captured 1 memories")),
+      "an admitted fallback capture must still be stored",
+    );
+  });
+});
+
+describe("terminal flush of deferred captures at session_end", () => {
+  let workspaceDir;
+  let embeddingServer;
+  let llmServer;
+  let extractionPrompts;
+
+  beforeEach(async () => {
+    workspaceDir = mkdtempSync(path.join(tmpdir(), "fallback-flush-"));
+    extractionPrompts = [];
+    embeddingServer = createEmbeddingServer();
+    llmServer = createLlmServer({
+      extractionPrompts,
+      extractMemories: (n) => [{
+        category: "preferences",
+        abstract: `Synthetic flush marker number ${n}`,
+        overview: `## Preference\n- Flush marker ${n}`,
+        content: `User stated synthetic flush marker number ${n}.`,
+      }],
+    });
+    await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+    resetRegistration();
+  });
+
+  afterEach(async () => {
+    resetRegistration();
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  function flushConfig(overrides = {}) {
+    return {
+      dbPath: path.join(workspaceDir, "db"),
+      autoCapture: true,
+      autoRecall: false,
+      smartExtraction: true,
+      extractMinMessages: 4,
+      sessionStrategy: "none",
+      extractionThrottle: { skipLowValue: false, maxExtractionsPerHour: 200 },
+      sessionCompression: { enabled: false },
+      selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      embedding: {
+        apiKey: "test-api-key",
+        model: "mock-embedding-model",
+        baseURL: `http://127.0.0.1:${embeddingServer.address().port}/v1`,
+        dimensions: EMBEDDING_DIMENSIONS,
+      },
+      llm: {
+        apiKey: "test-api-key",
+        model: "mock-memory-model",
+        baseURL: `http://127.0.0.1:${llmServer.address().port}`,
+      },
+      ...overrides,
+    };
+  }
+
+  async function fireSessionEnd(harness, hook, ctx) {
+    for (const { handler } of harness.eventHandlers.get("session_end") || []) {
+      handler({}, ctx);
+    }
+    const run = hook.__lastRun;
+    if (run && typeof run.then === "function") {
+      await run;
+    }
+  }
+
+  const REMEMBER_TEXT = "Please remember that my synthetic badge code is Duckhouse-77.";
+
+  it("flushes a one-turn ingress session's deferred remember request exactly once (storage level)", async () => {
+    const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: flushConfig() });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    const messageReceivedHooks = (harness.eventHandlers.get("message_received") || []).map((h) => h.handler);
+    const ingressCtx = { channelId: "synthchat", conversationId: "conv1" };
+    const sessionCtx = { sessionKey: "agent:agent-two:synthchat:conv1", agentId: "agent-two" };
+
+    for (const handler of messageReceivedHooks) {
+      handler({ content: REMEMBER_TEXT, from: "agent-two" }, ingressCtx);
+    }
+    await fireAgentEnd(hook, userMessages("(assistant turn placeholder)"), sessionCtx);
+    assert.equal(extractionPrompts.length, 0, "a one-turn session must stay below the threshold");
+
+    await fireSessionEnd(harness, hook, sessionCtx);
+    assert.equal(extractionPrompts.length, 1, "session_end must flush the deferred text through extraction");
+    assert.ok(
+      extractionPrompts[0].includes(REMEMBER_TEXT),
+      "the flushed extraction input must contain the deferred remember request",
+    );
+
+    await fireSessionEnd(harness, hook, sessionCtx);
+    assert.equal(extractionPrompts.length, 1, "a second session_end must not re-flush (exactly-once)");
+
+    const verifyStore = new MemoryStore({ dbPath: path.join(workspaceDir, "db"), vectorDim: EMBEDDING_DIMENSIONS });
+    const rows = await verifyStore.list(undefined, undefined, 50, 0);
+    const flushed = rows.filter((row) => String(row.text ?? "").includes("Synthetic flush marker"));
+    assert.equal(flushed.length, 1, "exactly one memory row may exist for the flushed request");
+  });
+
+  it("flushes deferred history texts at session end", async () => {
+    const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: flushConfig() });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    const ctx = { sessionKey: "agent:agent-two:main", agentId: "agent-two" };
+
+    await fireAgentEnd(hook, userMessages(PREFERENCE_TEXT, SECOND_TEXT), ctx);
+    assert.equal(extractionPrompts.length, 0, "two texts stay below minMessages=4");
+
+    await fireSessionEnd(harness, hook, ctx);
+    assert.equal(extractionPrompts.length, 1, "session_end must flush the deferred history texts");
+    assert.ok(extractionPrompts[0].includes(PREFERENCE_TEXT));
+    assert.ok(extractionPrompts[0].includes(SECOND_TEXT));
+  });
+
+  it("does not re-extract history a threshold extraction already consumed", async () => {
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: flushConfig({ extractMinMessages: 2 }),
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    const ctx = { sessionKey: "agent:agent-two:main", agentId: "agent-two" };
+
+    await fireAgentEnd(hook, userMessages(PREFERENCE_TEXT), ctx);
+    assert.equal(extractionPrompts.length, 0, "turn 1 defers below the threshold");
+    await fireAgentEnd(hook, userMessages(PREFERENCE_TEXT, SECOND_TEXT), ctx);
+    assert.equal(extractionPrompts.length, 1, "turn 2 extracts at the threshold");
+
+    await fireSessionEnd(harness, hook, ctx);
+    assert.equal(
+      extractionPrompts.length,
+      1,
+      "session_end must not re-extract deferred texts an earlier extraction already consumed",
+    );
+  });
+
+  it("no-ops a session_end with nothing deferred", async () => {
+    const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: flushConfig() });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+
+    await fireSessionEnd(harness, hook, { sessionKey: "agent:agent-two:main", agentId: "agent-two" });
+    assert.equal(extractionPrompts.length, 0, "nothing deferred means nothing to flush");
+  });
+});
+
+describe("unique-ingress counting toward extractMinMessages", () => {
+  let workspaceDir;
+  let embeddingServer;
+  let llmServer;
+  let extractionPrompts;
+
+  beforeEach(async () => {
+    workspaceDir = mkdtempSync(path.join(tmpdir(), "fallback-counting-"));
+    extractionPrompts = [];
+    embeddingServer = createEmbeddingServer();
+    llmServer = createLlmServer({
+      extractionPrompts,
+      extractMemories: (n) => [{
+        category: "preferences",
+        abstract: `Synthetic counting marker number ${n}`,
+        overview: `## Preference\n- Counting marker ${n}`,
+        content: `User stated synthetic counting marker number ${n}.`,
+      }],
+    });
+    await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+    resetRegistration();
+  });
+
+  afterEach(async () => {
+    resetRegistration();
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  function countingConfig(extractMinMessages) {
+    return {
+      dbPath: path.join(workspaceDir, "db"),
+      autoCapture: true,
+      autoRecall: false,
+      smartExtraction: true,
+      extractMinMessages,
+      sessionStrategy: "none",
+      extractionThrottle: { skipLowValue: false, maxExtractionsPerHour: 200 },
+      sessionCompression: { enabled: false },
+      selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      embedding: {
+        apiKey: "test-api-key",
+        model: "mock-embedding-model",
+        baseURL: `http://127.0.0.1:${embeddingServer.address().port}/v1`,
+        dimensions: EMBEDDING_DIMENSIONS,
+      },
+      llm: {
+        apiKey: "test-api-key",
+        model: "mock-memory-model",
+        baseURL: `http://127.0.0.1:${llmServer.address().port}`,
+      },
+    };
+  }
+
+  function ingressTexts(count) {
+    return Array.from({ length: count }, (_, idx) => `Synthetic unique ingress note number ${idx + 1} about topic ${String.fromCharCode(65 + idx)}.`);
+  }
+
+  async function runIngressTurns(harness, hook, texts) {
+    const messageReceivedHooks = (harness.eventHandlers.get("message_received") || []).map((h) => h.handler);
+    const ingressCtx = { channelId: "synthchat", conversationId: "conv1" };
+    const sessionCtx = { sessionKey: "agent:agent-two:synthchat:conv1", agentId: "agent-two" };
+    const promptCountAfterTurn = [];
+    for (const text of texts) {
+      for (const handler of messageReceivedHooks) {
+        handler({ content: text, from: "agent-two" }, ingressCtx);
+      }
+      await fireAgentEnd(hook, userMessages("(assistant turn placeholder)"), sessionCtx);
+      promptCountAfterTurn.push(extractionPrompts.length);
+    }
+    return promptCountAfterTurn;
+  }
+
+  it("counts each requeued ingress text once: three unique messages extract on turn 3, not turn 2", async () => {
+    const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: countingConfig(3) });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    const texts = ingressTexts(3);
+
+    const promptCounts = await runIngressTurns(harness, hook, texts);
+    assert.deepEqual(
+      promptCounts,
+      [0, 0, 1],
+      "recounting the requeued snapshot (1, 3, 6) would fire extraction on turn 2; unique counting fires on turn 3",
+    );
+    for (const text of texts) {
+      assert.equal(
+        extractionPrompts[0].split(text).length - 1,
+        1,
+        `each deferred text must appear exactly once in the extraction input: ${text.slice(0, 40)}`,
+      );
+    }
+  });
+
+  it("retains at least extractMinMessages deferred texts, so high thresholds do not evict deferred content", async () => {
+    const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: countingConfig(8) });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    const texts = ingressTexts(8);
+
+    const promptCounts = await runIngressTurns(harness, hook, texts);
+    assert.deepEqual(
+      promptCounts,
+      [0, 0, 0, 0, 0, 0, 0, 1],
+      "eight unique ingress texts must reach the threshold exactly on turn 8",
+    );
+    for (const text of texts) {
+      assert.ok(
+        extractionPrompts[0].includes(text),
+        `the six-entry retention cap must not evict deferred text: ${text.slice(0, 40)}`,
+      );
+    }
   });
 });
