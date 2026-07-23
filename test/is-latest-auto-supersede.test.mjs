@@ -79,6 +79,28 @@ function makeMockStore() {
       const patched = buildSmartMetadata(entry, patch);
       entry.metadata = stringifySmartMetadata(patched);
     },
+    // In-memory mirror of MemoryStore.storeSuperseding: re-runs discovery,
+    // stores the new row, patches each target in place, reports confirmed ids.
+    async storeSuperseding({ entry, discoverTargets, finalizeEntryMetadata, buildTargetPatch }) {
+      const targets = await discoverTargets();
+      const stored = await this.store({
+        ...entry,
+        metadata: finalizeEntryMetadata ? finalizeEntryMetadata(targets) : entry.metadata,
+      });
+      const supersededIds = [];
+      const invalidationFailures = [];
+      for (const target of targets) {
+        const existing = entries.get(target.id);
+        if (!existing) {
+          invalidationFailures.push({ id: target.id, reason: "row not found" });
+          continue;
+        }
+        const patched = buildSmartMetadata(existing, buildTargetPatch(existing, stored.id));
+        existing.metadata = stringifySmartMetadata(patched);
+        supersededIds.push(target.id);
+      }
+      return { entry: stored, supersededIds, invalidationFailures };
+    },
     hasFtsSupport: false,
   };
 }

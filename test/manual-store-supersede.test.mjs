@@ -23,10 +23,16 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { registerAllMemoryTools } = jiti("../src/tools.ts");
+const { MemoryStore } = jiti("../src/store.ts");
+const { parseSmartMetadata, isMemoryActiveAt, deriveFactKey } = jiti("../src/smart-metadata.ts");
+const { classifyTemporal, inferExpiry } = jiti("../src/temporal-classifier.ts");
 
 function createToolSet(context) {
   const creators = new Map();
@@ -69,7 +75,7 @@ function neighborRow({ id = "old-1", text, category = "preference", score, factK
   };
 }
 
-function makeContext({ neighbors = [], rows, manualStoreSupersede } = {}) {
+function makeContext({ neighbors = [], rows, manualStoreSupersede, patchBehavior } = {}) {
   const storedEntries = [];
   const patchCalls = [];
   // Production-shaped store double: vectorSearch honors the caller's limit and
@@ -110,6 +116,35 @@ function makeContext({ neighbors = [], rows, manualStoreSupersede } = {}) {
       async patchMetadata(id, patch, scopeFilter) {
         patchCalls.push({ id, patch, scopeFilter });
         return null;
+      },
+      // Production-shaped double of MemoryStore.storeSuperseding: re-runs the
+      // caller's discovery, stores the new row, applies each target patch, and
+      // reports CONFIRMED invalidations only. patchBehavior lets tests model
+      // null returns, throws, and partial success.
+      async storeSuperseding({ entry, discoverTargets, finalizeEntryMetadata, buildTargetPatch, scopeFilter }) {
+        const targets = await discoverTargets();
+        const stored = { ...entry, id: `new-${storedEntries.length + 1}`, timestamp: Date.now() };
+        if (finalizeEntryMetadata) {
+          stored.metadata = finalizeEntryMetadata(targets);
+        }
+        storedEntries.push(stored);
+        const supersededIds = [];
+        const invalidationFailures = [];
+        for (const target of targets) {
+          try {
+            const patch = buildTargetPatch(target, stored.id);
+            patchCalls.push({ id: target.id, patch, scopeFilter });
+            const outcome = patchBehavior ? await patchBehavior(target, patch) : { ...target };
+            if (outcome == null) {
+              invalidationFailures.push({ id: target.id, reason: "update persisted no row" });
+            } else {
+              supersededIds.push(target.id);
+            }
+          } catch (err) {
+            invalidationFailures.push({ id: target.id, reason: err instanceof Error ? err.message : String(err) });
+          }
+        }
+        return { entry: stored, supersededIds, invalidationFailures };
       },
     },
     embedder: {
@@ -298,5 +333,185 @@ describe("manual memory_store always-store supersede semantics", () => {
     assert.equal(storedEntries.length, 1);
     assert.equal(storedEntries[0].text, input);
     assert.equal(patchCalls.length, 1);
+  });
+
+  it("reports only CONFIRMED invalidations: a null patch outcome is a failure, not a superseded id", async () => {
+    const { context, storedEntries } = makeContext({
+      manualStoreSupersede: true,
+      neighbors: [
+        neighborRow({ id: "old-a", text: "favorite drink: Coca-Cola", score: 0.6, factKey: "preferences:favorite drink" }),
+        neighborRow({ id: "old-b", text: "favorite drink: ayran", score: 0.55, factKey: "preferences:favorite drink" }),
+      ],
+      patchBehavior: async (target) => (target.id === "old-b" ? null : { ...target }),
+    });
+    const tools = createToolSet(context);
+    const store = tools.get("memory_store");
+
+    const res = await store.execute(null, { text: "favorite drink: tea", category: "preference" });
+
+    assert.equal(res.details.action, "superseded");
+    assert.equal(storedEntries.length, 1, "the manual row always lands");
+    assert.deepEqual(res.details.supersededIds, ["old-a"], "only the confirmed invalidation may be reported");
+    assert.equal(res.details.invalidationFailures.length, 1);
+    assert.equal(res.details.invalidationFailures[0].id, "old-b");
+    assert.match(res.details.invalidationFailures[0].reason, /persisted no row/);
+    assert.match(res.content[0].text, /1 invalidation\(s\) failed/);
+  });
+
+  it("reports a thrown patch as a failure and keeps supersededId null when nothing is confirmed", async () => {
+    const { context, storedEntries } = makeContext({
+      manualStoreSupersede: true,
+      neighbors: [neighborRow({ text: "favorite drink: Coca-Cola", score: 0.99, factKey: "preferences:favorite drink" })],
+      patchBehavior: async () => {
+        throw new Error("synthetic patch failure");
+      },
+    });
+    const tools = createToolSet(context);
+    const store = tools.get("memory_store");
+
+    const res = await store.execute(null, { text: "favorite drink: tea", category: "preference" });
+
+    assert.equal(res.details.action, "superseded");
+    assert.equal(storedEntries.length, 1, "the manual row always lands");
+    assert.deepEqual(res.details.supersededIds, [], "an unconfirmed invalidation must not be reported as superseded");
+    assert.equal(res.details.supersededId, null);
+    assert.equal(res.details.invalidationFailures.length, 1);
+    assert.match(res.details.invalidationFailures[0].reason, /synthetic patch failure/);
+  });
+
+  it("builds canonical metadata from the REQUESTED category and fact key, not a foreign-category near-duplicate", async () => {
+    const foreignDonor = neighborRow({
+      id: "foreign-1",
+      text: "favorite drink: tea ceremony is my hobby",
+      category: "entity",
+      memoryCategory: "profile",
+      score: 0.99,
+      factKey: "profile:owner hobby",
+    });
+    const donorMeta = JSON.parse(foreignDonor.entry.metadata);
+    donorMeta.tier = "core";
+    foreignDonor.entry.metadata = JSON.stringify(donorMeta);
+    const { context, storedEntries, patchCalls } = makeContext({
+      manualStoreSupersede: true,
+      neighbors: [foreignDonor],
+    });
+    const tools = createToolSet(context);
+    const store = tools.get("memory_store");
+
+    const input = "favorite drink: tea";
+    const res = await store.execute(null, { text: input, category: "preference" });
+
+    assert.equal(res.details.action, "superseded", "the near-identical row is still superseded");
+    const meta = JSON.parse(storedEntries[0].metadata);
+    assert.equal(meta.memory_category, "preferences", "the requested category is canonical");
+    assert.equal(meta.fact_key, deriveFactKey("preferences", input), "the NEW fact key is canonical, never the donor's");
+    assert.notEqual(meta.fact_key, "profile:owner hobby");
+    assert.notEqual(meta.tier, "core", "tier must not be inherited from a foreign-category donor");
+    assert.equal(meta.memory_temporal_type, classifyTemporal(input), "temporal classification must survive the supersede branch");
+    assert.equal(meta.valid_until, inferExpiry(input), "temporal expiry must survive the supersede branch");
+    assert.equal(patchCalls.length, 1);
+    assert.equal(
+      patchCalls[0].patch.fact_key,
+      undefined,
+      "a foreign-category target must not be backfilled with the new fact key",
+    );
+  });
+});
+
+describe("manual supersede commits atomically at the store layer (real store)", () => {
+  function makeRealContext(dir) {
+    const store = new MemoryStore({ dbPath: dir, vectorDim: 3 });
+    const context = {
+      agentId: "main",
+      workspaceDir: "/tmp",
+      mdMirror: null,
+      manualStoreSupersede: true,
+      scopeManager: {
+        getAccessibleScopes: (agentId) => ["global", `agent:${agentId}`],
+        getScopeFilter: (agentId) => ["global", `agent:${agentId}`],
+        isAccessible: (scope, agentId) => ["global", `agent:${agentId}`].includes(scope),
+        getDefaultScope: (agentId) => `agent:${agentId}`,
+      },
+      retriever: {
+        getConfig() {
+          return { mode: "hybrid" };
+        },
+      },
+      store,
+      embedder: {
+        // Every "favorite drink" text embeds identically, so concurrent writers
+        // see each other's rows as near-identical same-key neighbors.
+        async embedPassage() {
+          return [1, 0, 0];
+        },
+      },
+    };
+    return { context, store };
+  }
+
+  it("two concurrent same-key writers leave exactly ONE active row (locked recheck supersedes the earlier replacement)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "supersede-atomic-"));
+    const { context, store } = makeRealContext(dir);
+    try {
+      const factKey = deriveFactKey("preferences", "favorite drink: cola");
+      await store.store({
+        text: "favorite drink: cola",
+        vector: [1, 0, 0],
+        category: "preference",
+        scope: "agent:main",
+        importance: 0.7,
+        metadata: JSON.stringify({
+          memory_category: "preferences",
+          fact_key: factKey,
+          source: "manual",
+          state: "confirmed",
+          l0_abstract: "favorite drink: cola",
+        }),
+      });
+
+      // Barrier: both writers finish their ADVISORY discovery before either
+      // commits, forcing the interleaving the lock must survive. Later calls
+      // (the locked rechecks) pass through freely.
+      const realVectorSearch = store.vectorSearch.bind(store);
+      let arrivals = 0;
+      let release;
+      const gate = new Promise((resolve) => {
+        release = resolve;
+      });
+      store.vectorSearch = async (...args) => {
+        arrivals += 1;
+        if (arrivals <= 2) {
+          if (arrivals === 2) release();
+          await gate;
+        }
+        return realVectorSearch(...args);
+      };
+
+      const tools = createToolSet(context);
+      const storeTool = tools.get("memory_store");
+      const [resA, resB] = await Promise.all([
+        storeTool.execute(null, { text: "favorite drink: tea", category: "preference" }),
+        storeTool.execute(null, { text: "favorite drink: coffee", category: "preference" }),
+      ]);
+      store.vectorSearch = realVectorSearch;
+
+      assert.equal(resA.details.action, "superseded");
+      assert.equal(resB.details.action, "superseded");
+
+      const rows = await store.list(undefined, undefined, 100, 0);
+      const now = Date.now();
+      const activeSameKey = rows.filter((row) => {
+        const meta = parseSmartMetadata(row.metadata, row);
+        const key = meta.fact_key ?? deriveFactKey(meta.memory_category, row.text);
+        return key === factKey && isMemoryActiveAt(meta, now);
+      });
+      assert.equal(
+        activeSameKey.length,
+        1,
+        `exactly one active row may hold the fact key after concurrent writers (got: ${activeSameKey.map((row) => row.text).join(" | ")})`,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

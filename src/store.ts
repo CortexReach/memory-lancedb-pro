@@ -2385,130 +2385,142 @@ export class MemoryStore {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
-    return this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
-      // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
-      // from older stores (for example "mem-md-..." or "data-pointer-...").
-      const uuidRegex =
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      const prefixRegex = /^[0-9a-f]{8,}$/i;
-      const isFullId = uuidRegex.test(id);
-      const isPrefix = !isFullId && prefixRegex.test(id);
-      const isLegacyStableId = !isFullId && !isPrefix && isLegacyStableMemoryId(id);
+    return this.runWithWriteLock(() => this.runSerializedUpdate(() => this.performUpdate(id, updates, scopeFilter)));
+  }
 
-      if (!isFullId && !isPrefix && !isLegacyStableId) {
-        throw new Error(`Invalid memory ID format: ${id}`);
-      }
+  /**
+   * Core of update(): resolve the row, apply the patch, and persist via
+   * delete + re-add with rollback. Must be called while already holding the
+   * write lock and the serialized-update queue: update() wraps it, and the
+   * supersede commit path calls it from inside its own atomic section.
+   */
+  private async performUpdate(
+    id: string,
+    updates: MemoryUpdatePatch,
+    scopeFilter?: string[],
+  ): Promise<MemoryEntry | null> {
+    // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
+    // from older stores (for example "mem-md-..." or "data-pointer-...").
+    const uuidRegex =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const prefixRegex = /^[0-9a-f]{8,}$/i;
+    const isFullId = uuidRegex.test(id);
+    const isPrefix = !isFullId && prefixRegex.test(id);
+    const isLegacyStableId = !isFullId && !isPrefix && isLegacyStableMemoryId(id);
 
-      let rows: any[];
-      if (isFullId || isLegacyStableId) {
-        // Legacy IDs use exact string match like full UUIDs.
-        const safeId = escapeSqlLiteral(id);
-        rows = await this.table!.query()
-          .where(`id = '${safeId}'`)
-          .limit(1)
-          .toArray();
-      } else {
-        // Prefix match
-        const all = await this.table!.query()
-          .select([
-            "id",
-            "text",
-            "vector",
-            "category",
-            "scope",
-            "importance",
-            "timestamp",
-            "metadata",
-          ])
-          .limit(1000)
-          .toArray();
-        rows = all.filter((r: any) => (r.id as string).startsWith(id));
-        if (rows.length > 1) {
-          throw new Error(
-            `Ambiguous prefix "${id}" matches ${rows.length} memories. Use a longer prefix or full ID.`,
-          );
-        }
-      }
+    if (!isFullId && !isPrefix && !isLegacyStableId) {
+      throw new Error(`Invalid memory ID format: ${id}`);
+    }
 
-      if (rows.length === 0) return null;
-
-      const row = rows[0];
-      const rowScope = (row.scope as string | undefined) ?? "global";
-
-      // Check scope permissions
-      if (
-        scopeFilter &&
-        scopeFilter.length > 0 &&
-        !scopeFilter.includes(rowScope)
-      ) {
-        throw new Error(`Memory ${id} is outside accessible scopes`);
-      }
-
-      const original: MemoryEntry = {
-        id: row.id as string,
-        text: row.text as string,
-        vector: Array.from(row.vector as Iterable<number>),
-        category: row.category as MemoryEntry["category"],
-        scope: rowScope,
-        importance: clampImportance(Number(row.importance)),
-        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-        metadata: (row.metadata as string) || "{}",
-      };
-
-      // Build updated entry, preserving original timestamp
-      const updated: MemoryEntry = {
-        ...original,
-        text: updates.text ?? original.text,
-        vector: updates.vector ?? original.vector,
-        category: updates.category ?? original.category,
-        scope: rowScope,
-        // F3 fix (PR #828 follow-up): clamp importance on update path so
-        // update() callers cannot persist out-of-range values.
-        importance: clampImportance(
-          updates.importance ?? original.importance,
-        ),
-        timestamp: original.timestamp, // preserve original
-        metadata: updates.metadata ?? original.metadata,
-      };
-
-      // LanceDB doesn't support in-place update; delete + re-add.
-      // Serialize updates per store instance to avoid stale rollback races.
-      // If the add fails after delete, attempt best-effort recovery without
-      // overwriting a newer concurrent successful update.
-      const rollbackCandidate =
-        (await this.getById(original.id).catch(() => null)) ?? original;
-      const resolvedId = escapeSqlLiteral(row.id as string);
-      await this.table!.delete(`id = '${resolvedId}'`);
-      try {
-        await this.table!.add([updated]);
-      } catch (addError) {
-        const current = await this.getById(original.id).catch(() => null);
-        if (current) {
-          throw new Error(
-            `Failed to update memory ${id}: write failed after delete, but an existing record was preserved. ` +
-            `Write error: ${addError instanceof Error ? addError.message : String(addError)}`,
-          );
-        }
-
-        try {
-          await this.table!.add([rollbackCandidate]);
-        } catch (rollbackError) {
-          throw new Error(
-            `Failed to update memory ${id}: write failed after delete, and rollback also failed. ` +
-            `Write error: ${addError instanceof Error ? addError.message : String(addError)}. ` +
-            `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
-          );
-        }
-
+    let rows: any[];
+    if (isFullId || isLegacyStableId) {
+      // Legacy IDs use exact string match like full UUIDs.
+      const safeId = escapeSqlLiteral(id);
+      rows = await this.table!.query()
+        .where(`id = '${safeId}'`)
+        .limit(1)
+        .toArray();
+    } else {
+      // Prefix match
+      const all = await this.table!.query()
+        .select([
+          "id",
+          "text",
+          "vector",
+          "category",
+          "scope",
+          "importance",
+          "timestamp",
+          "metadata",
+        ])
+        .limit(1000)
+        .toArray();
+      rows = all.filter((r: any) => (r.id as string).startsWith(id));
+      if (rows.length > 1) {
         throw new Error(
-          `Failed to update memory ${id}: write failed after delete, latest available record restored. ` +
+          `Ambiguous prefix "${id}" matches ${rows.length} memories. Use a longer prefix or full ID.`,
+        );
+      }
+    }
+
+    if (rows.length === 0) return null;
+
+    const row = rows[0];
+    const rowScope = (row.scope as string | undefined) ?? "global";
+
+    // Check scope permissions
+    if (
+      scopeFilter &&
+      scopeFilter.length > 0 &&
+      !scopeFilter.includes(rowScope)
+    ) {
+      throw new Error(`Memory ${id} is outside accessible scopes`);
+    }
+
+    const original: MemoryEntry = {
+      id: row.id as string,
+      text: row.text as string,
+      vector: Array.from(row.vector as Iterable<number>),
+      category: row.category as MemoryEntry["category"],
+      scope: rowScope,
+      importance: clampImportance(Number(row.importance)),
+      timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+      metadata: (row.metadata as string) || "{}",
+    };
+
+    // Build updated entry, preserving original timestamp
+    const updated: MemoryEntry = {
+      ...original,
+      text: updates.text ?? original.text,
+      vector: updates.vector ?? original.vector,
+      category: updates.category ?? original.category,
+      scope: rowScope,
+      // F3 fix (PR #828 follow-up): clamp importance on update path so
+      // update() callers cannot persist out-of-range values.
+      importance: clampImportance(
+        updates.importance ?? original.importance,
+      ),
+      timestamp: original.timestamp, // preserve original
+      metadata: updates.metadata ?? original.metadata,
+    };
+
+    // LanceDB doesn't support in-place update; delete + re-add.
+    // Serialize updates per store instance to avoid stale rollback races.
+    // If the add fails after delete, attempt best-effort recovery without
+    // overwriting a newer concurrent successful update.
+    const rollbackCandidate =
+      (await this.getById(original.id).catch(() => null)) ?? original;
+    const resolvedId = escapeSqlLiteral(row.id as string);
+    await this.table!.delete(`id = '${resolvedId}'`);
+    try {
+      await this.table!.add([updated]);
+    } catch (addError) {
+      const current = await this.getById(original.id).catch(() => null);
+      if (current) {
+        throw new Error(
+          `Failed to update memory ${id}: write failed after delete, but an existing record was preserved. ` +
           `Write error: ${addError instanceof Error ? addError.message : String(addError)}`,
         );
       }
 
-      this.noteDataModification();
-      return updated;
-    }));
+      try {
+        await this.table!.add([rollbackCandidate]);
+      } catch (rollbackError) {
+        throw new Error(
+          `Failed to update memory ${id}: write failed after delete, and rollback also failed. ` +
+          `Write error: ${addError instanceof Error ? addError.message : String(addError)}. ` +
+          `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+
+      throw new Error(
+        `Failed to update memory ${id}: write failed after delete, latest available record restored. ` +
+        `Write error: ${addError instanceof Error ? addError.message : String(addError)}`,
+      );
+    }
+
+    this.noteDataModification();
+    return updated;
   }
 
   private async runSerializedUpdate<T>(action: () => Promise<T>): Promise<T> {
@@ -2541,6 +2553,83 @@ export class MemoryStore {
       { metadata: stringifySmartMetadata(metadata) },
       scopeFilter,
     );
+  }
+
+  /**
+   * Atomic supersede-and-store: re-discovers the target rows, inserts the new
+   * row, and invalidates every confirmed target inside ONE write-lock +
+   * serialized-update section. The caller's advisory discovery only decides
+   * whether to enter this path; the target set that actually commits is the
+   * one discovered here, so two concurrent same-key writers converge on a
+   * single active row (the second writer's recheck sees the first writer's
+   * replacement and supersedes it) instead of leaving both replacements
+   * standing.
+   *
+   * Only CONFIRMED invalidations are reported in supersededIds; a null or
+   * throwing patch lands in invalidationFailures instead of being silently
+   * counted as success.
+   */
+  async storeSuperseding(options: {
+    entry: Omit<MemoryEntry, "id" | "timestamp">;
+    discoverTargets: () => Promise<MemoryEntry[]>;
+    finalizeEntryMetadata?: (targets: MemoryEntry[]) => string;
+    buildTargetPatch: (target: MemoryEntry, newEntryId: string) => MetadataPatch;
+    scopeFilter?: string[];
+  }): Promise<{
+    entry: MemoryEntry;
+    supersededIds: string[];
+    invalidationFailures: Array<{ id: string; reason: string }>;
+  }> {
+    await this.ensureInitialized();
+    const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+      const targets = await options.discoverTargets();
+
+      const fullEntry: MemoryEntry = {
+        ...options.entry,
+        id: randomUUID(),
+        timestamp: Date.now(),
+        metadata: options.finalizeEntryMetadata
+          ? options.finalizeEntryMetadata(targets)
+          : options.entry.metadata || "{}",
+        importance: clampImportance(Number(options.entry.importance)),
+      } as MemoryEntry;
+      await this.table!.add([fullEntry]);
+
+      const supersededIds: string[] = [];
+      const invalidationFailures: Array<{ id: string; reason: string }> = [];
+      for (const target of targets) {
+        try {
+          const existing = await this.getById(target.id, options.scopeFilter);
+          if (!existing) {
+            invalidationFailures.push({
+              id: target.id,
+              reason: "row not found or outside accessible scopes at commit time",
+            });
+            continue;
+          }
+          const metadata = buildSmartMetadata(existing, options.buildTargetPatch(existing, fullEntry.id));
+          const updated = await this.performUpdate(
+            target.id,
+            { metadata: stringifySmartMetadata(metadata) },
+            options.scopeFilter,
+          );
+          if (updated == null) {
+            invalidationFailures.push({ id: target.id, reason: "update persisted no row" });
+          } else {
+            supersededIds.push(target.id);
+          }
+        } catch (err) {
+          invalidationFailures.push({
+            id: target.id,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      return { entry: fullEntry, supersededIds, invalidationFailures };
+    }));
+    this.noteDataModification();
+    return result;
   }
 
   async bulkDelete(scopeFilter: string[], beforeTimestamp?: number): Promise<number> {
