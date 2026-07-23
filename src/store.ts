@@ -865,6 +865,13 @@ export class MemoryStore {
     }
   }
 
+  private async checkoutLatestTableForWrite(): Promise<void> {
+    const table = this.table as (LanceDB.Table & { checkoutLatest?: () => Promise<void> }) | null;
+    if (typeof table?.checkoutLatest === "function") {
+      await table.checkoutLatest();
+    }
+  }
+
   private async scheduleStartupIndexCatchUp(): Promise<void> {
     try {
       const table = this.table;
@@ -2204,6 +2211,7 @@ export class MemoryStore {
 
     let settledResults: MemoryBulkUpdateResult[] | null = null;
     const applyBatch = () => this.runSerializedUpdate(async () => {
+      await this.checkoutLatestTableForWrite();
       const results = new Map<number, MemoryBulkUpdateResult>();
       const pending: Array<ManualRecallMetadataUpdate & { inputIndex: number }> = [];
       const seenUpdates = new Set<string>();

@@ -325,6 +325,60 @@ describe("MemoryStore write queue", () => {
     }
   });
 
+  it("refreshes the table under the write lock before merging recall metadata", async () => {
+    const { store: writer, dir } = makeStore();
+    let reader;
+    try {
+      const now = Date.now();
+      const entry = await writer.store({
+        ...makeEntry(1),
+        metadata: JSON.stringify({
+          access_count: 0,
+          last_accessed_at: now - 2_000,
+          last_confirmed_use_at: now - 2_000,
+        }),
+      });
+
+      reader = new MemoryStore({ dbPath: dir, vectorDim: 3 });
+      assert.equal(JSON.parse((await reader.getById(entry.id)).metadata).access_count, 0);
+
+      const [first] = await writer.applyManualRecallMetadataBatch([{
+        id: entry.id,
+        expectedScope: "global",
+        accessCountDelta: 1,
+        accessedAt: now - 1_000,
+        governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
+      }]);
+      assert.ok(first.entry);
+
+      const [second] = await reader.applyManualRecallMetadataBatch([{
+        id: entry.id,
+        expectedScope: "global",
+        accessCountDelta: 1,
+        accessedAt: now,
+        governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
+      }]);
+      assert.ok(second.entry);
+
+      const consistentReader = new MemoryStore({
+        dbPath: dir,
+        vectorDim: 3,
+        readConsistencyInterval: 0,
+      });
+      try {
+        const metadata = JSON.parse((await consistentReader.getById(entry.id)).metadata);
+        assert.equal(metadata.access_count, 2);
+        assert.equal(metadata.last_accessed_at, now);
+      } finally {
+        await consistentReader.destroy();
+      }
+    } finally {
+      await reader?.destroy().catch(() => {});
+      await writer.destroy().catch(() => {});
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("preserves governance fields changed after the queued manual recall", async () => {
     const { store, dir } = makeStore();
     let queue;

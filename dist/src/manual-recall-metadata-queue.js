@@ -22,7 +22,7 @@ function mergePending(current, incoming, attempts = 0) {
         accessCountDelta: (current?.accessCountDelta ?? 0) + incoming.accessCountDelta,
         accessedAt: Math.max(current?.accessedAt ?? 0, incoming.accessedAt),
         governanceSnapshot: latestGovernanceSnapshot,
-        attempts: Math.max(current?.attempts ?? 0, attempts),
+        attempts: current ? Math.min(current.attempts, attempts) : attempts,
     };
 }
 /**

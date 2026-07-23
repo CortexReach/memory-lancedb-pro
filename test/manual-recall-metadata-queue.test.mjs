@@ -144,6 +144,54 @@ test("fresh enqueue traffic does not bypass retry backoff", async () => {
   await queue.drain();
 });
 
+test("fresh enqueue traffic keeps an independent retry budget", async () => {
+  const calls = [];
+  const warnings = [];
+  const queue = new ManualRecallMetadataQueue({
+    async applyManualRecallMetadataBatch(updates) {
+      calls.push(updates.map(({ accessCountDelta }) => accessCountDelta));
+      return updates.map((update) => ({
+        id: update.id,
+        entry: null,
+        error: "simulated repeated failure",
+      }));
+    },
+  }, {
+    debounceMs: 60_000,
+    maxRetries: 1,
+    retryDelayMs: () => 60_000,
+    warn: (message) => warnings.push(message),
+  });
+
+  queue.enqueue([{
+    id: "same-memory",
+    expectedScope: "global",
+    accessCountDelta: 1,
+    accessedAt: 100,
+    governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
+  }]);
+  await queue.flush();
+  assert.deepEqual(queue.getPendingUpdates().map(({ accessCountDelta }) => accessCountDelta), [1]);
+
+  queue.enqueue([{
+    id: "same-memory",
+    expectedScope: "global",
+    accessCountDelta: 1,
+    accessedAt: 200,
+    governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
+  }]);
+  await queue.flush();
+
+  assert.deepEqual(calls, [[1], [2]]);
+  assert.deepEqual(
+    queue.getPendingUpdates().map(({ accessCountDelta }) => accessCountDelta),
+    [2],
+    "the fresh merged delta should not be dropped on the older delta's final attempt",
+  );
+  assert.equal(warnings.filter((message) => /after 1 retries/.test(message)).length, 0);
+  await queue.drain();
+});
+
 test("process beforeExit catches same-store work across repeated later-listener microtasks", async () => {
   const dir = mkdtempSync(join(tmpdir(), "memory-lancedb-pro-exit-drain-"));
   const childScript = `

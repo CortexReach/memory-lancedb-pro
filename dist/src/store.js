@@ -672,6 +672,12 @@ export class MemoryStore {
             void this.foldIndices("write-threshold");
         }
     }
+    async checkoutLatestTableForWrite() {
+        const table = this.table;
+        if (typeof table?.checkoutLatest === "function") {
+            await table.checkoutLatest();
+        }
+    }
     async scheduleStartupIndexCatchUp() {
         try {
             const table = this.table;
@@ -1799,6 +1805,7 @@ export class MemoryStore {
             return [];
         let settledResults = null;
         const applyBatch = () => this.runSerializedUpdate(async () => {
+            await this.checkoutLatestTableForWrite();
             const results = new Map();
             const pending = [];
             const seenUpdates = new Set();
