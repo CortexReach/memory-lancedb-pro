@@ -1917,6 +1917,7 @@ function _initPluginState(api) {
     const autoCaptureCountedPendingCount = new Map();
     const autoCaptureRecentTexts = new Map();
     const autoCaptureDeferredFlushTexts = new Map();
+    const autoCaptureInFlightRuns = new Map();
     return {
         config,
         resolvedDbPath,
@@ -1946,6 +1947,7 @@ function _initPluginState(api) {
         autoCaptureCountedPendingCount,
         autoCaptureRecentTexts,
         autoCaptureDeferredFlushTexts,
+        autoCaptureInFlightRuns,
         captureAdmissionController,
         captureAdmissionAudit,
         admissionRejectionAuditWriter,
@@ -2057,7 +2059,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTexts, autoCaptureDeferredFlushTexts, captureAdmissionController, captureAdmissionAudit, admissionRejectionAuditWriter, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTexts, autoCaptureDeferredFlushTexts, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, admissionRejectionAuditWriter, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2900,6 +2902,13 @@ const memoryLanceDBProPlugin = {
         }
         // Auto-capture: analyze and store important information after agent ends
         if (config.autoCapture !== false) {
+            const awaitSessionCaptureRuns = (key) => {
+                const runs = autoCaptureInFlightRuns.get(key);
+                if (!runs || runs.size === 0) {
+                    return Promise.resolve();
+                }
+                return Promise.allSettled([...runs]).then(() => { });
+            };
             const agentEndAutoCaptureHook = (event, ctx) => {
                 const isTerminalFlush = event.__autoCaptureTerminalFlush === true;
                 if (!event.success || (!isTerminalFlush && (!event.messages || event.messages.length === 0))) {
@@ -2915,6 +2924,7 @@ const memoryLanceDBProPlugin = {
                     api.logger.debug(`memory-lancedb-pro: auto-capture skip \u2014 internal memory session '${hookSessionKey}'`);
                     return;
                 }
+                const captureRunKey = typeof hookSessionKey === "string" && hookSessionKey ? hookSessionKey : "unknown";
                 // Fire-and-forget: run capture work in the background so the hook
                 // returns immediately and does not hold the session lock.  Blocking
                 // here causes downstream channel deliveries (e.g. Telegram) to be
@@ -3356,27 +3366,39 @@ const memoryLanceDBProPlugin = {
                         api.logger.warn(`memory-lancedb-pro: capture failed: ${String(err)}`);
                     }
                 })();
-                agentEndAutoCaptureHook.__lastRun = backgroundRun;
+                const sessionRuns = autoCaptureInFlightRuns.get(captureRunKey) ?? new Set();
+                autoCaptureInFlightRuns.set(captureRunKey, sessionRuns);
+                const trackedRun = backgroundRun.catch(() => { }).then(() => {
+                    sessionRuns.delete(trackedRun);
+                    if (sessionRuns.size === 0 && autoCaptureInFlightRuns.get(captureRunKey) === sessionRuns) {
+                        autoCaptureInFlightRuns.delete(captureRunKey);
+                    }
+                });
+                sessionRuns.add(trackedRun);
+                // Test-synchronization seam only: flush coordination reads
+                // autoCaptureInFlightRuns for the session's own key, never this slot.
+                agentEndAutoCaptureHook.__lastRun = trackedRun;
                 void backgroundRun;
             };
             api.on("agent_end", agentEndAutoCaptureHook);
             // A session that ends below extractMinMessages would otherwise strand its
             // deferred texts (requeued ingress or rolled-back history) forever, losing
             // even an explicit one-turn remember request. Consume them exactly once at
-            // session end, serialized behind any in-flight capture run.
+            // session end, serialized behind the SAME session's in-flight capture runs
+            // (a single global slot let concurrent sessions overwrite each other, so a
+            // flush could run before its own session's work recorded deferred state).
             api.on("session_end", (event, ctx) => {
                 const flushSessionKey = ctx?.sessionKey || event?.sessionKey || "";
                 if (!flushSessionKey || typeof flushSessionKey !== "string") {
                     return;
                 }
-                const priorRun = agentEndAutoCaptureHook.__lastRun ?? Promise.resolve();
-                const flushRun = priorRun
-                    .catch(() => { })
+                const flushRun = awaitSessionCaptureRuns(flushSessionKey)
                     .then(() => {
                     agentEndAutoCaptureHook({ success: true, messages: [], sessionKey: flushSessionKey, __autoCaptureTerminalFlush: true }, ctx);
-                    return agentEndAutoCaptureHook.__lastRun;
+                    return awaitSessionCaptureRuns(flushSessionKey);
                 })
                     .then(() => { });
+                // Test-synchronization seam only (see the agent_end tail).
                 agentEndAutoCaptureHook.__lastRun = flushRun;
             });
         }
