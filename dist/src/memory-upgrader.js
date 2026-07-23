@@ -30,7 +30,7 @@ function parseMetadata(metadata) {
         return null;
     }
 }
-function isCurrentReflectionMemory(entry) {
+export function isCurrentReflectionMemory(entry) {
     if (entry.category === "reflection")
         return true;
     const meta = parseMetadata(entry.metadata);

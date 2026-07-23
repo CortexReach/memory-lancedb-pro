@@ -10,7 +10,7 @@ import JSON5 from "json5";
 import { loadLanceDB } from "./src/store.js";
 import { buildSmartMetadata, stringifySmartMetadata, } from "./src/smart-metadata.js";
 import { createRetriever } from "./src/retriever.js";
-import { createMemoryUpgrader } from "./src/memory-upgrader.js";
+import { createMemoryUpgrader, isCurrentReflectionMemory } from "./src/memory-upgrader.js";
 import { getDefaultOauthModelForProvider, getOAuthProviderLabel, isOauthModelSupported, listOAuthProviders, normalizeOauthModel, normalizeOAuthProviderId, performOAuthLogin, } from "./src/llm-oauth.js";
 // ============================================================================
 // Utility Functions
@@ -1801,6 +1801,14 @@ export function registerMemoryCLI(program, context) {
             console.log(`Scanned ${allEntries.length} memories${options.scope ? ` (scope: ${options.scope})` : ""}\n`);
             const staleEntries = [];
             for (const entry of allEntries) {
+                // Current reflection rows (memory-reflection / -event / -item /
+                // -mapped types and category "reflection") intentionally omit
+                // L0/L1/L2; the upgrader excludes them with this same predicate.
+                // Repairing them would rewrite valid reflection metadata with
+                // truncation fallbacks.
+                if (isCurrentReflectionMemory(entry)) {
+                    continue;
+                }
                 // Judge the RAW stored metadata: parseSmartMetadata backfills
                 // missing levels from the text, which would hide exactly the rows
                 // this command exists to repair.
@@ -1815,12 +1823,12 @@ export function registerMemoryCLI(program, context) {
                 const l1 = (typeof rawMeta.l1_overview === "string" ? rawMeta.l1_overview : "").trim();
                 const l2 = (typeof rawMeta.l2_content === "string" ? rawMeta.l2_content : "").trim();
                 if (!l0 || !l1 || !l2) {
-                    staleEntries.push({ entry, reason: "missing summary level(s)" });
+                    staleEntries.push({ entry, reason: "missing summary level(s)", levels: { l0, l1, l2 } });
                 }
                 else if (l0 === l1 && l1 === l2) {
                     // Legacy parse-fallback signature: all three levels collapsed to
                     // one identical string. A generated set always differs by level.
-                    staleEntries.push({ entry, reason: "degenerate identical levels" });
+                    staleEntries.push({ entry, reason: "degenerate identical levels", levels: { l0, l1, l2 } });
                 }
             }
             if (staleEntries.length === 0) {
@@ -1839,17 +1847,26 @@ export function registerMemoryCLI(program, context) {
             // Apply repairs
             let repaired = 0;
             let failed = 0;
-            for (const { entry } of staleEntries) {
+            for (const { entry, reason, levels } of staleEntries) {
                 try {
-                    // Rebuild L0/L1/L2 using truncation fallback from buildSmartMetadata
+                    // A degenerate set (all three collapsed to one string) is replaced
+                    // whole; otherwise fill ONLY the missing levels so valid generated
+                    // summaries survive the repair.
+                    const replaceAll = reason === "degenerate identical levels";
                     const rebuilt = buildSmartMetadata(entry, {
-                        l0_abstract: entry.text,
-                        l1_overview: `- ${entry.text}`,
-                        l2_content: entry.text,
+                        l0_abstract: replaceAll ? entry.text : levels.l0 || entry.text,
+                        l1_overview: replaceAll ? `- ${entry.text}` : levels.l1 || `- ${entry.text}`,
+                        l2_content: replaceAll ? entry.text : levels.l2 || entry.text,
                     });
                     const newMetadataStr = stringifySmartMetadata(rebuilt);
-                    await context.store.update(entry.id, { metadata: newMetadataStr }, scopeFilter);
-                    repaired++;
+                    const updated = await context.store.update(entry.id, { metadata: newMetadataStr }, scopeFilter);
+                    if (updated == null) {
+                        failed++;
+                        console.error(`  Failed to repair ${entry.id.slice(0, 8)}: update returned no entry (row missing or outside the scope filter)`);
+                    }
+                    else {
+                        repaired++;
+                    }
                 }
                 catch (err) {
                     failed++;
@@ -1857,6 +1874,9 @@ export function registerMemoryCLI(program, context) {
                 }
             }
             console.log(`\nRepair complete: ${repaired} fixed, ${failed} failed out of ${staleEntries.length} repairable.`);
+            if (failed > 0) {
+                process.exitCode = 1;
+            }
         }
         catch (error) {
             console.error("repair-summaries failed:", error);
