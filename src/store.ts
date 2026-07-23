@@ -29,6 +29,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchesMemoryCategoryFilter, resolveCategoryFilterCandidates } from "./memory-categories.js";
 import {
+  drainManualRecallMetadata,
+  ManualRecallMetadataBatchSettledError,
+} from "./manual-recall-metadata-queue.js";
+import {
   RedisLockAcquisitionError,
   RedisLockLeaseIntegrityError,
   RedisLockManager,
@@ -97,6 +101,19 @@ export interface MemoryBulkUpdateResult {
   id: string;
   entry: MemoryEntry | null;
   error?: string;
+  retryable?: boolean;
+}
+
+export interface ManualRecallMetadataUpdate {
+  id: string;
+  expectedScope: string;
+  accessCountDelta: number;
+  accessedAt: number;
+  governanceSnapshot: {
+    badRecallCount: number;
+    suppressedUntilTurn: number;
+    suppressedUntilMs?: number;
+  };
 }
 
 export interface ImportEntryOptions {
@@ -848,6 +865,13 @@ export class MemoryStore {
     }
   }
 
+  private async checkoutLatestTableForWrite(): Promise<void> {
+    const table = this.table as (LanceDB.Table & { checkoutLatest?: () => Promise<void> }) | null;
+    if (typeof table?.checkoutLatest === "function") {
+      await table.checkoutLatest();
+    }
+  }
+
   private async scheduleStartupIndexCatchUp(): Promise<void> {
     try {
       const table = this.table;
@@ -1540,6 +1564,8 @@ export class MemoryStore {
    * @public
    */
   async destroy(): Promise<void> {
+    await drainManualRecallMetadata(this);
+
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
@@ -2167,6 +2193,283 @@ export class MemoryStore {
       scopeCounts,
       categoryCounts,
     };
+  }
+
+  /**
+   * Merge coalesced manual-recall reinforcement into exact IDs under one lock.
+   *
+   * The row read and metadata merge both happen after the write lock is held,
+   * so concurrent recall events cannot overwrite a newer counter/timestamp
+   * snapshot. `expectedScope` preserves the authorization decision made by the
+   * retrieval path without widening the caller's readable scopes.
+   */
+  async applyManualRecallMetadataBatch(
+    updates: ManualRecallMetadataUpdate[],
+  ): Promise<MemoryBulkUpdateResult[]> {
+    await this.ensureInitialized();
+    if (updates.length === 0) return [];
+
+    let settledResults: MemoryBulkUpdateResult[] | null = null;
+    const applyBatch = () => this.runSerializedUpdate(async () => {
+      await this.checkoutLatestTableForWrite();
+      const results = new Map<number, MemoryBulkUpdateResult>();
+      const pending: Array<ManualRecallMetadataUpdate & { inputIndex: number }> = [];
+      const seenUpdates = new Set<string>();
+
+      updates.forEach((candidate, inputIndex) => {
+        const updateKey = `${candidate.id}\u0000${candidate.expectedScope}`;
+        const isValidId =
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(candidate.id) ||
+          isLegacyStableMemoryId(candidate.id);
+        if (!isValidId) {
+          results.set(inputIndex, {
+            id: String(candidate.id),
+            entry: null,
+            error: `Invalid exact memory ID: ${String(candidate.id)}`,
+            retryable: false,
+          });
+          return;
+        }
+        if (seenUpdates.has(updateKey)) {
+          results.set(inputIndex, {
+            id: candidate.id,
+            entry: null,
+            error: `Duplicate exact memory ID and scope: ${candidate.id} (${candidate.expectedScope})`,
+            retryable: false,
+          });
+          return;
+        }
+        if (!Number.isInteger(candidate.accessCountDelta) || candidate.accessCountDelta <= 0) {
+          results.set(inputIndex, {
+            id: candidate.id,
+            entry: null,
+            error: `Invalid accessCountDelta for ${candidate.id}`,
+            retryable: false,
+          });
+          return;
+        }
+        if (!Number.isFinite(candidate.accessedAt) || candidate.accessedAt <= 0) {
+          results.set(inputIndex, {
+            id: candidate.id,
+            entry: null,
+            error: `Invalid accessedAt for ${candidate.id}`,
+            retryable: false,
+          });
+          return;
+        }
+        seenUpdates.add(updateKey);
+        pending.push({ ...candidate, inputIndex });
+      });
+
+      for (let i = 0; i < pending.length; i += MemoryStore.MAX_BATCH_SIZE) {
+        const chunk = pending.slice(i, i + MemoryStore.MAX_BATCH_SIZE);
+        const whereClause = chunk
+          .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
+          .join(" OR ");
+        let rows: any[];
+        try {
+          rows = whereClause.length > 0
+            ? await this.table!.query().where(`(${whereClause})`).toArray()
+            : [];
+        } catch (queryError) {
+          const queryMessage = queryError instanceof Error ? queryError.message : String(queryError);
+          for (const candidate of chunk) {
+            results.set(candidate.inputIndex, {
+              id: candidate.id,
+              entry: null,
+              error: `Failed to read recall metadata for ${candidate.id}: ${queryMessage}`,
+              retryable: true,
+            });
+          }
+          continue;
+        }
+        const rowsById = new Map<string, any>();
+        for (const row of rows) rowsById.set(row.id as string, row);
+
+        const originals: MemoryEntry[] = [];
+        const updatedEntries: MemoryEntry[] = [];
+        const updatedInputIndices: number[] = [];
+
+        for (const candidate of chunk) {
+          const row = rowsById.get(candidate.id);
+          if (!row) {
+            results.set(candidate.inputIndex, { id: candidate.id, entry: null });
+            continue;
+          }
+
+          const rowScope = (row.scope as string | undefined) ?? "global";
+          if (rowScope !== candidate.expectedScope) {
+            results.set(candidate.inputIndex, {
+              id: candidate.id,
+              entry: null,
+              error:
+                `Memory ${candidate.id} scope changed from ` +
+                `${candidate.expectedScope} to ${rowScope}`,
+              retryable: false,
+            });
+            continue;
+          }
+
+          const original: MemoryEntry = {
+            id: row.id as string,
+            text: row.text as string,
+            vector: Array.from(row.vector as Iterable<number>),
+            category: row.category as MemoryEntry["category"],
+            scope: rowScope,
+            importance: clampImportance(Number(row.importance)),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+            metadata: (row.metadata as string) || "{}",
+          };
+          const current = parseSmartMetadata(original.metadata, original);
+          const accessedAt = Math.max(current.last_accessed_at, candidate.accessedAt);
+          const confirmedAt = Math.max(
+            current.last_confirmed_use_at ?? 0,
+            candidate.accessedAt,
+          );
+          const snapshot = candidate.governanceSnapshot;
+          const governanceUnchanged = snapshot !== undefined &&
+            current.bad_recall_count === snapshot.badRecallCount &&
+            current.suppressed_until_turn === snapshot.suppressedUntilTurn &&
+            current.suppressed_until_ms === snapshot.suppressedUntilMs;
+          const governanceReset = governanceUnchanged
+            ? {
+                bad_recall_count: 0,
+                suppressed_until_turn: 0,
+                suppressed_until_ms: 0,
+              }
+            : {};
+          const metadata = stringifySmartMetadata(buildSmartMetadata(original, {
+            access_count: current.access_count + candidate.accessCountDelta,
+            last_accessed_at: accessedAt,
+            last_confirmed_use_at: confirmedAt,
+            ...governanceReset,
+          }));
+
+          originals.push(original);
+          updatedEntries.push({ ...original, metadata });
+          updatedInputIndices.push(candidate.inputIndex);
+        }
+
+        if (updatedEntries.length === 0) continue;
+
+        const mergeWhereClause = updatedEntries
+          .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
+          .join(" OR ");
+        const classifyUncertainMerge = async (reason: string): Promise<void> => {
+          let dataMayHaveChanged = false;
+          let rowsAfterFailure: any[];
+          try {
+            rowsAfterFailure = await this.table!.query()
+              .where(`(${mergeWhereClause})`)
+              .toArray();
+          } catch (recoveryError) {
+            this.noteDataModification();
+            const recoveryMessage = recoveryError instanceof Error
+              ? recoveryError.message
+              : String(recoveryError);
+            for (let index = 0; index < updatedEntries.length; index++) {
+              results.set(updatedInputIndices[index], {
+                id: updatedEntries[index].id,
+                entry: null,
+                error:
+                  `Atomic recall metadata merge failed for ${updatedEntries[index].id}: ` +
+                  `${reason}. Commit state could not be verified: ${recoveryMessage}`,
+                retryable: false,
+              });
+            }
+            return;
+          }
+
+          const rowsAfterFailureById = new Map<string, any>();
+          for (const row of rowsAfterFailure) rowsAfterFailureById.set(row.id as string, row);
+          for (let index = 0; index < updatedEntries.length; index++) {
+            const original = originals[index];
+            const updatedEntry = updatedEntries[index];
+            const row = rowsAfterFailureById.get(updatedEntry.id);
+            const rowScope = (row?.scope as string | undefined) ?? "global";
+            const persistedMetadata = typeof row?.metadata === "string" ? row.metadata : "{}";
+            if (row && rowScope === updatedEntry.scope && persistedMetadata === updatedEntry.metadata) {
+              dataMayHaveChanged = true;
+              results.set(updatedInputIndices[index], {
+                id: updatedEntry.id,
+                entry: updatedEntry,
+              });
+              continue;
+            }
+            if (row && rowScope === original.scope && persistedMetadata === original.metadata) {
+              results.set(updatedInputIndices[index], {
+                id: original.id,
+                entry: null,
+                error: `Atomic recall metadata merge failed for ${original.id}: ${reason}`,
+                retryable: true,
+              });
+              continue;
+            }
+            results.set(updatedInputIndices[index], {
+              id: updatedEntry.id,
+              entry: null,
+              error:
+                `Atomic recall metadata merge failed for ${updatedEntry.id}: ${reason}. ` +
+                `Persisted state no longer matches either the original or updated row`,
+              retryable: false,
+            });
+            dataMayHaveChanged = true;
+          }
+          if (dataMayHaveChanged) this.noteDataModification();
+        };
+
+        try {
+          const mergeResult = await this.table!
+            .mergeInsert("id")
+            .whenMatchedUpdateAll({
+              where:
+                "target.scope = source.scope OR " +
+                "(target.scope IS NULL AND source.scope = 'global')",
+            })
+            .execute(updatedEntries);
+          if (mergeResult.numUpdatedRows !== updatedEntries.length) {
+            await classifyUncertainMerge(
+              `updated ${mergeResult.numUpdatedRows} of ${updatedEntries.length} expected rows`,
+            );
+            continue;
+          }
+          this.noteDataModification();
+          for (let index = 0; index < updatedEntries.length; index++) {
+            results.set(updatedInputIndices[index], {
+              id: updatedEntries[index].id,
+              entry: updatedEntries[index],
+            });
+          }
+        } catch (writeError) {
+          const writeMessage = writeError instanceof Error ? writeError.message : String(writeError);
+          await classifyUncertainMerge(writeMessage);
+        }
+      }
+
+      settledResults = updates.map((candidate, inputIndex) =>
+        results.get(inputIndex) ?? {
+          id: candidate.id,
+          entry: null,
+          error: `Memory ${candidate.id} was not processed`,
+          retryable: false,
+        },
+      );
+      return settledResults;
+    });
+
+    try {
+      return await this.runWithWriteLock(applyBatch);
+    } catch (error) {
+      if (settledResults !== null) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new ManualRecallMetadataBatchSettledError(
+          `Manual recall metadata batch settled before the write lock failed: ${message}`,
+          settledResults,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
   }
 
   /**

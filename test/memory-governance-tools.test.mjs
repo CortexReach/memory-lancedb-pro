@@ -4,6 +4,7 @@ import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { registerAllMemoryTools } = jiti("../src/tools.ts");
+const { flushManualRecallMetadataForTest } = jiti("../src/manual-recall-metadata-queue.ts");
 
 function createToolSet(context) {
   const creators = new Map();
@@ -26,7 +27,7 @@ function createToolSet(context) {
 describe("memory governance tools", () => {
   it("fails soft for inaccessible read-only recall scopes", async () => {
     const recallScopeFilters = [];
-    const patchCalls = [];
+    const metadataBatches = [];
     const context = {
       agentId: "main",
       workspaceDir: "/tmp",
@@ -62,9 +63,9 @@ describe("memory governance tools", () => {
         async count() {
           return 1;
         },
-        async patchMetadata(id, patch, scopeFilter) {
-          patchCalls.push({ id, patch, scopeFilter });
-          return null;
+        async applyManualRecallMetadataBatch(updates) {
+          metadataBatches.push(updates);
+          return updates.map((update) => ({ id: update.id, entry: { id: update.id } }));
         },
       },
       embedder: { async embedPassage() { return [0.1, 0.2, 0.3]; } },
@@ -77,6 +78,7 @@ describe("memory governance tools", () => {
       query: "coffee",
       scope: "current_conversation",
     });
+    await flushManualRecallMetadataForTest(context.store);
 
     const expectedScopes = ["global", "agent:main", "reflection:agent:main"];
     assert.deepEqual(recallScopeFilters[0], expectedScopes);
@@ -84,7 +86,19 @@ describe("memory governance tools", () => {
     assert.equal(res.details.ignoredScope, "current_conversation");
     assert.deepEqual(res.details.accessibleScopes, expectedScopes);
     assert.equal(res.details.count, 1);
-    assert.deepEqual(patchCalls[0].scopeFilter, expectedScopes);
+    assert.deepEqual(
+      metadataBatches[0].map(({ id, expectedScope, accessCountDelta }) => ({
+        id,
+        expectedScope,
+        accessCountDelta,
+      })),
+      [{ id: "recall-memory-1", expectedScope: "agent:main", accessCountDelta: 1 }],
+    );
+    assert.deepEqual(metadataBatches[0][0].governanceSnapshot, {
+      badRecallCount: 0,
+      suppressedUntilTurn: 0,
+      suppressedUntilMs: undefined,
+    });
   });
 
   it("keeps inaccessible write scopes hard-denied", async () => {

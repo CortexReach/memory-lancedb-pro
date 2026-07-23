@@ -26,6 +26,7 @@ const {
   MemoryStore,
   __setLockfileModuleForTests,
 } = jiti("../src/store.ts");
+const { ManualRecallMetadataQueue } = jiti("../src/manual-recall-metadata-queue.ts");
 const { parsePluginConfig } = jiti("../index.ts");
 
 const tempDirs = [];
@@ -547,6 +548,62 @@ describe("RedisLockManager", () => {
 });
 
 describe("MemoryStore Redis fail-closed locking", () => {
+  it("does not retry a settled recall after Redis reports lease integrity loss", async () => {
+    const dbPath = tempDbPath();
+    const warnings = [];
+    const store = new MemoryStore({ dbPath, vectorDim: 3 });
+    let queue;
+    try {
+      const entry = await store.store({
+        text: "redis post-commit recall",
+        vector: [0.1, 0.2, 0.3],
+        category: "fact",
+        scope: "global",
+        importance: 0.7,
+        metadata: "{}",
+      });
+      store.redisLock = new RedisLockManager({
+        url: "redis://localhost:6379",
+        ttlMs: 1_000,
+        acquireTimeoutMs: 20,
+        retryDelayMs: 1,
+      }, {
+        async set() {
+          return "OK";
+        },
+        async eval() {
+          return 0;
+        },
+      });
+      queue = new ManualRecallMetadataQueue(store, {
+        debounceMs: 60_000,
+        retryDelayMs: () => 60_000,
+        maxRetries: 1,
+        warn: (message) => warnings.push(message),
+      });
+      queue.enqueue([{
+        id: entry.id,
+        expectedScope: "global",
+        accessCountDelta: 1,
+        accessedAt: Date.now(),
+        governanceSnapshot: {
+          badRecallCount: 0,
+          suppressedUntilTurn: 0,
+        },
+      }]);
+
+      await queue.flush();
+
+      const metadata = JSON.parse((await store.getById(entry.id)).metadata);
+      assert.equal(metadata.access_count, 1);
+      assert.deepEqual(queue.getPendingUpdates(), []);
+      assert.ok(warnings.some((message) => /lock failed after the batch settled/.test(message)));
+    } finally {
+      if (queue) await queue.drain();
+      await store.destroy().catch(() => {});
+    }
+  });
+
   it("fails closed instead of falling back to file locking when Redis is unavailable", async () => {
     const dbPath = tempDbPath();
     let fileLocks = 0;
