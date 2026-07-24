@@ -112,6 +112,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/reflection-mapped-rows-admission.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/reflection-embed-transient-retry.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-metadata-source-classification.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/autocapture-fallback-gating.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

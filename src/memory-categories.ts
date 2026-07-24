@@ -113,6 +113,13 @@ export type ExtractionStats = {
   boundarySkipped?: number;
   supported?: number; // context-aware support count
   superseded?: number; // temporal fact replacements
+  /**
+   * True when the candidate extraction never produced a usable result (null or
+   * malformed LLM completion). Distinguishes "the LLM judged nothing worth
+   * storing" (a definitive zero) from "the LLM never answered" — callers must
+   * not consume deferred input on the latter.
+   */
+  extractionFailed?: boolean;
 };
 
 /** Validate and normalize a category string. */

@@ -414,6 +414,7 @@ export class SmartExtractor {
         this.debugLog(
           `memory-pro: smart-extractor: skipping noise-bank learning (status=${extraction.status})`,
         );
+        stats.extractionFailed = true;
       }
       return stats;
     }

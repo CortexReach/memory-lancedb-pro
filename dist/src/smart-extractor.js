@@ -255,6 +255,7 @@ export class SmartExtractor {
             }
             else {
                 this.debugLog(`memory-pro: smart-extractor: skipping noise-bank learning (status=${extraction.status})`);
+                stats.extractionFailed = true;
             }
             return stats;
         }
