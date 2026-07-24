@@ -283,9 +283,26 @@ describe("SmartExtractor grounding-aware extraction (Option A, v3)", () => {
 
     assert.match(prompt, /grounding/i);
     assert.match(prompt, /"real"\s*\|\s*"constructed"|real.*constructed/i);
-    assert.match(prompt, /about-the-fiction is real/i, "the v3 about/within one-line rule must be present");
-    assert.match(prompt, /within-the-fiction/i, "the within-the-fiction definition of constructed must be present");
+    assert.match(prompt, /about-the-hypothetical is real/i, "the generalized about/within one-line rule must be present");
+    assert.match(prompt, /within-the-hypothetical/i, "the within-the-hypothetical definition of constructed must be present");
+    assert.doesNotMatch(prompt, /about-the-fiction is real/i, "the game-flavored v3 phrasing must be gone");
     assert.doesNotMatch(prompt, /at most one/i, "the per-extraction constructed cap must be fully removed from the prompt");
+  });
+
+  it("the unsure tie-break defaults to constructed, never real (best-effort lane axiom)", async () => {
+    const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
+    const prompt = buildExtractionPrompt("some conversation", "test-user");
+
+    assert.match(
+      prompt,
+      /genuinely unsure about a single item, default to "constructed"/,
+      "an unsure item must default to constructed: auto-capture is best-effort, and a wrongly-stored fact is worse than a lost capture",
+    );
+    assert.doesNotMatch(
+      prompt,
+      /genuinely unsure about a single item, default to "real"/,
+      "the old default-to-real tie-break must be gone",
+    );
   });
 });
 
@@ -429,8 +446,11 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
     await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
 
     const categories = persistedCategories(store);
-    assert.ok(!categories.includes("profile"), "real-tagged durable must be demoted in a mixed-register batch with constructed siblings");
-    assert.deepEqual(categories, ["events"], "only the real aside survives: the constructed plot event is dropped unconditionally (v3), profile demoted by contradiction check");
+    // This mock LLM answers only extract-candidates, so the per-item rejudge
+    // this shape now fires is unavailable — the pipeline must fail CLOSED and
+    // demote the suspect durable exactly like the retired batch-wide wipe.
+    assert.ok(!categories.includes("profile"), "real-tagged durable must be demoted when the rejudge is unavailable (fail-closed)");
+    assert.deepEqual(categories, ["events"], "only the real aside survives: the constructed plot event is dropped unconditionally (v3), profile demoted by the fail-closed fallback");
   });
 
   it("register 'real' fully trusts per-item tags for durables, but still drops a constructed-tagged item regardless of register", async () => {
@@ -515,7 +535,13 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
 
     assert.match(prompt, /conversation_register/);
     assert.match(prompt, /"real\|mixed\|fiction"/);
-    assert.match(prompt, /self-consistency/i, "the batch self-consistency instruction must be present");
+    assert.match(
+      prompt,
+      /Check before you answer \(only when the register is "fiction" or "mixed"\)/,
+      "the scoped pre-answer check must be present",
+    );
+    assert.match(prompt, /name to yourself the factual stretch/, "the stretch-naming self-check must be present");
+    assert.doesNotMatch(prompt, /self-consistency/i, "the v3 self-consistency wording is replaced by the scoped check");
     assert.doesNotMatch(prompt, /storage rule applied after tagging/i, "the deleted per-extraction cap language must not remain in the prompt");
   });
 });
