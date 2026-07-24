@@ -4163,7 +4163,11 @@ const memoryLanceDBProPlugin = {
           // trigger the store.store() fallback (which would create duplicate rows).
           if (capturedEntries.length > 0) {
             try {
-              await store.bulkStore(capturedEntries);
+              await store.bulkStore(capturedEntries, ({ index, reason }) => {
+                api.logger.warn(
+                  `memory-lancedb-pro: auto-capture bulkStore dropped entry ${index}: ${reason}`,
+                );
+              });
               api.logger.info(
                 `memory-lancedb-pro: auto-captured ${capturedEntries.length} memories for agent ${agentId} in scope ${defaultScope} (bulkStore)`,
               );
@@ -4720,7 +4724,23 @@ const memoryLanceDBProPlugin = {
         const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<string, unknown>;
         const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
         let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
-        const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
+        const parsedAgentId = parseAgentIdFromSessionKey(sessionKey);
+        // An unattributable sessionKey must not masquerade as "main": that fallback
+        // used to drive main-specific session recovery, reflection execution, event
+        // identity, and mdMirror writes into the main agent's workspace. No validated
+        // identity means no agent-specific work at all.
+        if (!parsedAgentId) {
+          api.logger.info(
+            `memory-reflection: command:${action} skipped (unattributable sessionKey=${sessionKey ?? "(none)"}); no agent identity, skipping recovery/execution/persistence/mirroring`,
+          );
+          return;
+        }
+        const sourceAgentId = parsedAgentId;
+        // Ownership written into persisted reflection metadata must never be minted as
+        // "main" when the sessionKey fails to resolve to a real agent, that would silently
+        // misattribute the reflection to (and make it inheritable by) an unrelated agent.
+        // isOwnedByAgent() treats an empty owner as non-inheritable.
+        const ownerAgentId = parsedAgentId;
         const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
         if (isSessionBoundaryReflectionAction(action)) {
           const now = Date.now();
@@ -4879,7 +4899,16 @@ const memoryLanceDBProPlugin = {
           const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
           const targetScope = isSystemBypassId(sourceAgentId)
             ? config.scopes?.default ?? "global"
-            : scopeManager.getDefaultScope(sourceAgentId);
+            : parsedAgentId
+              ? scopeManager.getDefaultScope(sourceAgentId)
+              // A session that never resolved to a real agent must not be routed into
+              // main's default scope: ownerAgentId is already blanked for exactly this
+              // case so the row is not inheritable via isOwnedByAgent(), but a plain
+              // scope-filtered read (list/vectorSearch/etc. with no ownership check)
+              // would still see it if it landed in "agent:main". Route it into a scope
+              // no agent's getAccessibleScopes() ever grants instead, so it stays
+              // findable by an unrestricted/admin read but invisible to every agent.
+              : "unattributed:reflection";
           const toolErrorSignals = sessionKey
             ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
             : [];
@@ -5083,7 +5112,7 @@ const memoryLanceDBProPlugin = {
             const baseMetadata = buildReflectionMappedMetadata({
               mappedItem: mapped,
               eventId: reflectionEventId,
-              agentId: sourceAgentId,
+              agentId: ownerAgentId,
               sessionKey,
               sessionId: currentSessionId || "unknown",
               runAt: nowTs,
@@ -5108,7 +5137,11 @@ const memoryLanceDBProPlugin = {
             });
           }
           if (mappedEntries.length > 0) {
-            const storedEntries = await store.bulkStore(mappedEntries);
+            const storedEntries = await store.bulkStore(mappedEntries, ({ index, reason }) => {
+              api.logger.warn(
+                `memory-lancedb-pro: import bulkStore dropped entry ${index}: ${reason}`,
+              );
+            });
             if (mdMirror) {
               for (const stored of storedEntries) {
                 // retrieve heading from metadata JSON — critical when bulkStore filters entries
@@ -5133,7 +5166,7 @@ const memoryLanceDBProPlugin = {
               reflectionText,
               sessionKey,
               sessionId: currentSessionId || "unknown",
-              agentId: sourceAgentId,
+              agentId: ownerAgentId,
               command: String(event.action || "unknown"),
               scope: targetScope,
               toolErrorSignals,

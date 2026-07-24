@@ -694,7 +694,9 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
         if (typeof ctx.store.bulkStore === "function") {
             try {
                 bulkStoreCalls++;
-                await ctx.store.bulkStore(entries);
+                await ctx.store.bulkStore(entries, ({ index, reason }) => {
+                    console.warn(`  [import-markdown] dropped invalid entry ${index}: ${reason}`);
+                });
                 console.log(`  [import] stored batch ${bulkStoreCalls} (${entries.length} entries, total: ${imported + entries.length})`);
                 return { imported: entries.length, skipped: 0 };
             }
@@ -1840,6 +1842,49 @@ export function registerMemoryCLI(program, context) {
         }
         catch (error) {
             console.error("repair-summaries failed:", error);
+            process.exit(1);
+        }
+    });
+    // repair-scopes: migration path for legacy NULL/blank-scope rows that the
+    // scope hardening makes invisible to every scoped reader. Must attach to
+    // the `memory` group: the host routes only `memory-pro <sub>`, so a command
+    // chained off the root program is unreachable in production.
+    memory
+        .command("repair-scopes")
+        .description("Detect legacy NULL/blank-scope rows (invisible to scoped readers) and reassign them to an explicit scope")
+        .option("--target-scope <scope>", "Scope assigned to legacy rows on --apply", "global")
+        .option("--apply", "Apply the reassignment (default: report only)", false)
+        .action(async (options) => {
+        try {
+            const legacy = await context.store.findLegacyScopeRows(100000);
+            console.log(`Found ${legacy.length} legacy row(s) with NULL/blank scope${legacy.length > 0 ? ":" : "."}`);
+            for (const entry of legacy.slice(0, 20)) {
+                console.log(`  ${String(entry.id).slice(0, 8)}  ${String(entry.text).slice(0, 60)}`);
+            }
+            if (legacy.length > 20) {
+                console.log(`  ... and ${legacy.length - 20} more`);
+            }
+            if (!options.apply) {
+                if (legacy.length > 0) {
+                    console.log(`\nReport-only mode. Re-run with --apply to assign scope "${options.targetScope}".`);
+                }
+                return;
+            }
+            const { repaired, failed, skipped, unrecovered } = await context.store.repairLegacyScopes(options.targetScope);
+            console.log(`\nRepair complete: ${repaired} reassigned to "${options.targetScope}", ${skipped} skipped (changed or removed since discovery), ${failed} failed.`);
+            if (unrecovered.length > 0) {
+                console.error(`\n${unrecovered.length} row(s) could not be restored after a failed replacement write. ` +
+                    "Full row content follows (JSON, one per line) so the data is not lost:");
+                for (const entry of unrecovered) {
+                    console.error(JSON.stringify(entry));
+                }
+            }
+            if (failed > 0 || unrecovered.length > 0) {
+                process.exitCode = 1;
+            }
+        }
+        catch (error) {
+            console.error("repair-scopes failed:", error);
             process.exit(1);
         }
     });
