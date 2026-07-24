@@ -99,8 +99,141 @@ function recoverJsonFromReasoning<T>(reasoningText: string | undefined): T | nul
   }
 }
 
+/**
+ * Per-model-family rules for disabling thinking/reasoning in JSON extraction
+ * requests. Different providers honor different request-body parameter shapes,
+ * and the same model can require a different parameter depending on which
+ * endpoint hosts it — e.g. `deepseek-v4-flash` uses
+ * `chat_template_kwargs.enable_thinking=false` on Aliyun DashScope but
+ * `thinking.type="disabled"` on DeepSeek's own API.
+ *
+ * Each rule maps a model-name pattern to a list of provider entries; the first
+ * entry whose `baseURL` pattern matches the configured base URL wins, with a
+ * `default` entry as the fallback for unknown aggregators (most vLLM-based
+ * aggregators follow the DashScope `chat_template_kwargs` convention).
+ *
+ * When no rule matches, no parameter is injected and the
+ * `recoverJsonFromReasoning` fallback (PR #914) handles models that stream
+ * their answer only into a reasoning field.
+ *
+ * Parameters are sourced from each provider's official API documentation:
+ *  - DashScope (qwen3/qwq/deepseek-r1/deepseek-v4): chat_template_kwargs.enable_thinking — verified
+ *  - DeepSeek official (deepseek-v4-pro/flash): thinking.type=disabled — api-docs.deepseek.com
+ *  - Zhipu GLM-4.6/GLM-Z1: thinking.type=disabled — docs.bigmodel.cn
+ *  - Volcano Ark doubao-thinking/seed: thinking.type=disabled — docs.volcengine.com (OpenAI-compat /api/v3)
+ *  - Moonshot Kimi K1.5/K2: thinking.type=disabled — platform.kimi.com
+ *  - MiniMax M2/abab: thinking_budget=0 — api.minimax.chat
+ *  - Tencent Hunyuan T1/Turbo-S: enable_thinking=false — cloud.tencent.com
+ *  - StepFun step-3/step-2: thinking=false — developer.stepfun.com
+ */
+interface ReasoningDisableProviderEntry {
+  /** Matched against the configured baseURL (case-insensitive). "default" = fallback. */
+  baseURL: RegExp | "default";
+  params: Record<string, unknown>;
+}
+
+interface ReasoningDisableRule {
+  modelPattern: RegExp;
+  providers: ReasoningDisableProviderEntry[];
+}
+
+const REASONING_DISABLE_RULES: ReasoningDisableRule[] = [
+  {
+    // Qwen3 / QwQ — DashScope chat_template_kwargs (verified). vLLM-based
+    // aggregators (SiliconFlow, etc.) follow the same convention.
+    modelPattern: /qwen3|qwq/i,
+    providers: [
+      { baseURL: "default", params: { chat_template_kwargs: { enable_thinking: false } } },
+    ],
+  },
+  {
+    // DeepSeek V4 / R1 family.
+    //  - DashScope (Aliyun) hosts deepseek-v4-flash and uses chat_template_kwargs
+    //    (verified, issue #929 — reasoning drops to 0, completion tokens -82%).
+    //  - DeepSeek's own API (api.deepseek.com) uses thinking.type=disabled for
+    //    v4-pro/v4-flash. deepseek-reasoner (R1) on the official API is a pure
+    //    reasoning model and cannot disable thinking.
+    modelPattern: /deepseek.*(v\d|r1)/i,
+    providers: [
+      { baseURL: /dashscope|aliyun/i, params: { chat_template_kwargs: { enable_thinking: false } } },
+      { baseURL: /deepseek\.com/i, params: { thinking: { type: "disabled" } } },
+      { baseURL: "default", params: { chat_template_kwargs: { enable_thinking: false } } },
+    ],
+  },
+  {
+    // Zhipu GLM-4.6 / GLM-Z1 — thinking.type=disabled (docs.bigmodel.cn).
+    modelPattern: /glm.*(4\.6|z1)|glm.*thinking/i,
+    providers: [
+      { baseURL: "default", params: { thinking: { type: "disabled" } } },
+    ],
+  },
+  {
+    // Volcano Ark doubao thinking/seed models — thinking.type=disabled on the
+    // OpenAI-compatible /api/v3/chat/completions endpoint (docs.volcengine.com).
+    // Non-thinking variants (doubao-1.5-pro, etc.) are intentionally excluded.
+    modelPattern: /doubao.*(thinking|seed)/i,
+    providers: [
+      { baseURL: "default", params: { thinking: { type: "disabled" } } },
+    ],
+  },
+  {
+    // Moonshot Kimi K1.5 / K2 — thinking.type=disabled (platform.kimi.com).
+    // Note: kimi-k2.7-code cannot disable thinking.
+    modelPattern: /kimi.*k[12]|kimi.*thinking/i,
+    providers: [
+      { baseURL: "default", params: { thinking: { type: "disabled" } } },
+    ],
+  },
+  {
+    // MiniMax M2 / abab — thinking_budget=0 (api.minimax.chat).
+    modelPattern: /minimax.*m2|abab/i,
+    providers: [
+      { baseURL: "default", params: { thinking_budget: 0 } },
+    ],
+  },
+  {
+    // Tencent Hunyuan T1 / Turbo-S — enable_thinking=false (cloud.tencent.com).
+    modelPattern: /hunyuan.*(t1|turbo)/i,
+    providers: [
+      { baseURL: "default", params: { enable_thinking: false } },
+    ],
+  },
+  {
+    // StepFun step-3 / step-2 — thinking=false (developer.stepfun.com).
+    modelPattern: /step-[32]/i,
+    providers: [
+      { baseURL: "default", params: { thinking: false } },
+    ],
+  },
+];
+
+/**
+ * Build the request-body parameters that disable thinking/reasoning for the
+ * given model on the given provider endpoint, or `null` if the model is not a
+ * known reasoning model. The provider (baseURL) is consulted so that models
+ * hosted on different endpoints receive the correct parameter shape.
+ */
+function buildDisableReasoningParams(
+  model: string,
+  baseURL?: string,
+): Record<string, unknown> | null {
+  for (const rule of REASONING_DISABLE_RULES) {
+    if (!rule.modelPattern.test(model)) continue;
+    let defaultParams: Record<string, unknown> | null = null;
+    for (const entry of rule.providers) {
+      if (entry.baseURL === "default") {
+        defaultParams = entry.params;
+      } else if (baseURL && entry.baseURL.test(baseURL)) {
+        return entry.params;
+      }
+    }
+    return defaultParams;
+  }
+  return null;
+}
+
 function shouldDisableReasoningForJson(model: string): boolean {
-  return /qwen3|deepseek.*r1|qwq/i.test(model);
+  return buildDisableReasoningParams(model) !== null;
 }
 
 /** Restrict a call label to header-safe characters (labels are internal literals). */
@@ -246,9 +379,7 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
             { role: "user", content: prompt },
           ],
           temperature: 0.1,
-          ...(shouldDisableReasoningForJson(config.model)
-            ? { chat_template_kwargs: { enable_thinking: false } }
-            : {}),
+          ...(buildDisableReasoningParams(config.model, config.baseURL) ?? {}),
         };
 
         // Transmit the internal call label as a request header so gateway-side
@@ -486,4 +617,4 @@ export function createLlmClient(config: LlmClientConfig): LlmClient {
   return createApiKeyClient(config, log, warnLog);
 }
 
-export { extractJsonFromResponse, repairCommonJson, shouldDisableReasoningForJson, stripReasoningTrace };
+export { buildDisableReasoningParams, extractJsonFromResponse, repairCommonJson, shouldDisableReasoningForJson, stripReasoningTrace };
