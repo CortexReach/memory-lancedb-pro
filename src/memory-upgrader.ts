@@ -92,7 +92,7 @@ function parseMetadata(metadata: string | undefined): Record<string, unknown> | 
   }
 }
 
-function isCurrentReflectionMemory(entry: MemoryEntry): boolean {
+export function isCurrentReflectionMemory(entry: MemoryEntry): boolean {
   if (entry.category === "reflection") return true;
   const meta = parseMetadata(entry.metadata);
   return typeof meta?.type === "string" && CURRENT_REFLECTION_METADATA_TYPES.has(meta.type);
