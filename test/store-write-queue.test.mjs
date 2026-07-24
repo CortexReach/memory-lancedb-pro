@@ -816,6 +816,72 @@ describe("MemoryStore write queue", () => {
     }
   });
 
+  it("refreshes before classifying an independent-handle post-commit merge error", async () => {
+    const { store: writer, dir } = makeStore();
+    let reader;
+    let queue;
+    let readerTable;
+    let originalMergeInsert;
+    try {
+      const entry = await writer.store(makeEntry(1));
+      reader = new MemoryStore({ dbPath: dir, vectorDim: 3 });
+      assert.equal(JSON.parse((await reader.getById(entry.id)).metadata).access_count ?? 0, 0);
+
+      readerTable = reader.table;
+      originalMergeInsert = readerTable.mergeInsert.bind(readerTable);
+      readerTable.mergeInsert = (...args) => {
+        const builder = writer.table.mergeInsert(...args);
+        return {
+          whenMatchedUpdateAll(options) {
+            const matchedBuilder = builder.whenMatchedUpdateAll(options);
+            return {
+              async execute(entries) {
+                await matchedBuilder.execute(entries);
+                throw new Error("simulated independent-handle post-commit merge failure");
+              },
+            };
+          },
+        };
+      };
+
+      queue = new ManualRecallMetadataQueue(reader, {
+        debounceMs: 60_000,
+        retryDelayMs: () => 0,
+        warn: () => {},
+      });
+      queue.enqueue([{
+        id: entry.id,
+        expectedScope: "global",
+        accessCountDelta: 1,
+        accessedAt: 100,
+        governanceSnapshot: EMPTY_GOVERNANCE_SNAPSHOT,
+      }]);
+
+      await queue.flush();
+      assert.deepEqual(queue.getPendingUpdates(), []);
+
+      readerTable.mergeInsert = originalMergeInsert;
+      await queue.flush();
+      const consistentReader = new MemoryStore({
+        dbPath: dir,
+        vectorDim: 3,
+        readConsistencyInterval: 0,
+      });
+      try {
+        const metadata = JSON.parse((await consistentReader.getById(entry.id)).metadata);
+        assert.equal(metadata.access_count, 1);
+      } finally {
+        await consistentReader.destroy();
+      }
+    } finally {
+      if (readerTable && originalMergeInsert) readerTable.mergeInsert = originalMergeInsert;
+      if (queue) await queue.drain();
+      await reader?.destroy().catch(() => {});
+      await writer.destroy().catch(() => {});
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("updates legacy null-scope rows as global without inserting a duplicate", async () => {
     const { store, dir } = makeStore();
     try {

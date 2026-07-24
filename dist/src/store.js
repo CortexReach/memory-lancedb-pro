@@ -1942,6 +1942,7 @@ export class MemoryStore {
                     let dataMayHaveChanged = false;
                     let rowsAfterFailure;
                     try {
+                        await this.checkoutLatestTableForWrite();
                         rowsAfterFailure = await this.table.query()
                             .where(`(${mergeWhereClause})`)
                             .toArray();
