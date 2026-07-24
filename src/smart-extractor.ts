@@ -52,6 +52,11 @@ import {
 import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
 import { inferAtomicBrandItemPreferenceSlot } from "./preference-slots.js";
 import { batchDedup } from "./batch-dedup.js";
+import {
+  type ConversationTurn,
+  formatConversationTranscript,
+  trimTranscriptToTagBoundary,
+} from "./auto-capture-cleanup.js";
 
 type StoreEntry = Omit<import("./store.js").MemoryEntry, "id" | "timestamp">;
 type PendingSupersedeInvalidation = {
@@ -292,6 +297,8 @@ export interface SmartExtractorConfig {
   onAdmissionRejected?: (entry: AdmissionRejectionAuditEntry) => Promise<void> | void;
   /** Optional sink invoked after a memory is successfully created or merged (e.g. markdown mirror). */
   onPersisted?: (entry: PersistedMemoryEntry, meta: PersistedMemoryMeta) => Promise<void> | void;
+  /** Assistant turns are capture-eligible sources (captureAssistant=true): flips the prompt's assistant-block rule. */
+  captureAssistantEligible?: boolean;
 }
 
 export interface ExtractPersistOptions {
@@ -307,6 +314,13 @@ export interface ExtractPersistOptions {
   scopeFilter?: string[];
   /** Agent identifier forwarded to onPersisted, resolved the same way callers resolve it for other sinks. */
   agentId?: string;
+  /**
+   * This call's conversation as ordered, role-tagged turns. When provided,
+   * the extraction prompt renders each turn wholly wrapped in
+   * <user_message>/<assistant_message> tags instead of prompting on the flat
+   * joined text, so every line has an unambiguous speaker.
+   */
+  conversationTurns?: ConversationTurn[];
 }
 
 export class SmartExtractor {
@@ -402,7 +416,7 @@ export class SmartExtractor {
     const agentId = options.agentId;
 
     // Step 1: LLM extraction
-    const extraction = await this.extractCandidates(conversationText);
+    const extraction = await this.extractCandidates(conversationText, options.conversationTurns);
     const candidates = extraction.candidates;
 
     if (candidates.length === 0) {
@@ -755,20 +769,26 @@ export class SmartExtractor {
    */
   private async extractCandidates(
     conversationText: string,
+    conversationTurns?: ConversationTurn[],
   ): Promise<ExtractCandidatesResult> {
     const maxChars = this.config.extractMaxChars ?? 8000;
-    const truncated =
-      conversationText.length > maxChars
-        ? conversationText.slice(-maxChars)
-        : conversationText;
+    const user = this.config.user ?? "User";
 
     // Strip platform envelope metadata injected by OpenClaw channels
     // (e.g. "System: [2026-03-18 14:21:36 GMT+8] Feishu[default] DM | ou_...")
-    // These pollute extraction if treated as conversation content.
-    const cleaned = stripEnvelopeMetadata(truncated);
+    // These pollute extraction if treated as conversation content. Callers
+    // without per-message turns fall back to one user block over the flat
+    // joined text.
+    const turns: ConversationTurn[] = conversationTurns?.length
+      ? conversationTurns.map((turn) => ({ ...turn, text: stripEnvelopeMetadata(turn.text) }))
+      : [{ role: "user", text: stripEnvelopeMetadata(conversationText) }];
 
-    const user = this.config.user ?? "User";
-    const prompt = buildExtractionPrompt(cleaned, user);
+    const rawTranscript = formatConversationTranscript(turns, user);
+    const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
+
+    const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
+      assistantEligible: this.config.captureAssistantEligible === true,
+    });
 
     const result = await this.llm.completeJson<{
       memories: Array<{
@@ -777,7 +797,7 @@ export class SmartExtractor {
         overview: string;
         content: string;
       }>;
-    }>(prompt, "extract-candidates");
+    }>(userPrompt, "extract-candidates", system);
 
     if (!result) {
       this.debugLog(

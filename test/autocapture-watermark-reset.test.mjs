@@ -259,3 +259,110 @@ describe("auto-capture watermark after successful extraction (history flow)", ()
     }
   });
 });
+
+describe("tagged extraction transcript mirrors the final text sequence", () => {
+  let workspaceDir;
+  let embeddingServer;
+  let llmServer;
+  let extractionPrompts;
+
+  beforeEach(async () => {
+    workspaceDir = mkdtempSync(path.join(tmpdir(), "tagged-transcript-"));
+    extractionPrompts = [];
+    embeddingServer = createEmbeddingServer();
+    llmServer = createLlmServer(extractionPrompts);
+    await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+    resetRegistration();
+  });
+
+  afterEach(async () => {
+    resetRegistration();
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  function buildHarness(extraConfig = {}) {
+    const embeddingPort = embeddingServer.address().port;
+    const llmPort = llmServer.address().port;
+    return createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        autoCapture: true,
+        autoRecall: false,
+        smartExtraction: true,
+        extractMinMessages: 1,
+        extractionThrottle: { skipLowValue: false, maxExtractionsPerHour: 200 },
+        sessionCompression: { enabled: false },
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+        embedding: {
+          apiKey: "test-api-key",
+          model: "mock-embedding-model",
+          baseURL: `http://127.0.0.1:${embeddingPort}/v1`,
+          dimensions: EMBEDDING_DIMENSIONS,
+        },
+        llm: {
+          apiKey: "test-api-key",
+          model: "mock-memory-model",
+          baseURL: `http://127.0.0.1:${llmPort}`,
+        },
+        ...extraConfig,
+      },
+    });
+  }
+
+  const FACT_TEXT = "my synthetic locker combination for the gym is 4491, in case it comes up.";
+
+  it("the remember-this flow delivers BOTH the prior fact and the command to the real extraction prompt, inside tagged turns", async () => {
+    const harness = buildHarness();
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    const ctx = { sessionKey: "agent:agent-two:main", agentId: "agent-two" };
+
+    await fireAgentEnd(hook, userMessages(FACT_TEXT), ctx);
+    assert.equal(extractionPrompts.length, 1, "turn 1 must extract the fact");
+
+    await fireAgentEnd(hook, userMessages(FACT_TEXT, "remember this"), ctx);
+    assert.equal(extractionPrompts.length, 2, "turn 2 must extract the remember command");
+
+    const prompt = extractionPrompts[1];
+    assert.ok(
+      prompt.includes(FACT_TEXT),
+      "the referenced prior fact must reach the extraction prompt, not just the remember command",
+    );
+    assert.ok(prompt.includes("remember this"), "the command itself must be present");
+    assert.match(
+      prompt,
+      /<user_message>[^<]*locker combination[^<]*<\/user_message>/,
+      "the prior fact must appear as a properly tagged user turn",
+    );
+  });
+
+  it("session compression governs the tagged transcript: dropped texts stay out of the tagged turns", async () => {
+    const filler = ("today we walked through the deployment steps in exhaustive detail and then " +
+      "revisited every one of them again for completeness. ").repeat(30);
+    const keeperFirst = "my synthetic workshop shelf label is Brasswing, that is the one to quote.";
+    const keeperLast = "and the synthetic loading dock gate code is 7734, noting it for the record.";
+
+    const harness = buildHarness({
+      sessionCompression: { enabled: true },
+      extractMaxChars: 400,
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    const ctx = { sessionKey: "agent:agent-two:main", agentId: "agent-two" };
+
+    await fireAgentEnd(hook, userMessages(keeperFirst, filler, keeperLast), ctx);
+    assert.equal(extractionPrompts.length, 1, "the turn must extract");
+
+    const prompt = extractionPrompts[0];
+    assert.ok(prompt.includes("Brasswing"), "the kept first text must be present");
+    assert.ok(prompt.includes("7734"), "the kept last text must be present");
+    assert.ok(
+      !prompt.includes("exhaustive detail"),
+      "a compression-dropped text must not reach the prompt through the tagged transcript",
+    );
+  });
+});

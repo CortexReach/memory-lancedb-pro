@@ -14,6 +14,7 @@ import { isUserMdExclusiveMemory, } from "./workspace-boundary.js";
 import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
 import { inferAtomicBrandItemPreferenceSlot } from "./preference-slots.js";
 import { batchDedup } from "./batch-dedup.js";
+import { formatConversationTranscript, trimTranscriptToTagBoundary, } from "./auto-capture-cleanup.js";
 // ============================================================================
 // Envelope Metadata Stripping
 // ============================================================================
@@ -245,7 +246,7 @@ export class SmartExtractor {
             : [targetScope];
         const agentId = options.agentId;
         // Step 1: LLM extraction
-        const extraction = await this.extractCandidates(conversationText);
+        const extraction = await this.extractCandidates(conversationText, options.conversationTurns);
         const candidates = extraction.candidates;
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
@@ -515,18 +516,23 @@ export class SmartExtractor {
     /**
      * Call LLM to extract candidate memories from conversation text.
      */
-    async extractCandidates(conversationText) {
+    async extractCandidates(conversationText, conversationTurns) {
         const maxChars = this.config.extractMaxChars ?? 8000;
-        const truncated = conversationText.length > maxChars
-            ? conversationText.slice(-maxChars)
-            : conversationText;
+        const user = this.config.user ?? "User";
         // Strip platform envelope metadata injected by OpenClaw channels
         // (e.g. "System: [2026-03-18 14:21:36 GMT+8] Feishu[default] DM | ou_...")
-        // These pollute extraction if treated as conversation content.
-        const cleaned = stripEnvelopeMetadata(truncated);
-        const user = this.config.user ?? "User";
-        const prompt = buildExtractionPrompt(cleaned, user);
-        const result = await this.llm.completeJson(prompt, "extract-candidates");
+        // These pollute extraction if treated as conversation content. Callers
+        // without per-message turns fall back to one user block over the flat
+        // joined text.
+        const turns = conversationTurns?.length
+            ? conversationTurns.map((turn) => ({ ...turn, text: stripEnvelopeMetadata(turn.text) }))
+            : [{ role: "user", text: stripEnvelopeMetadata(conversationText) }];
+        const rawTranscript = formatConversationTranscript(turns, user);
+        const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
+        const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
+            assistantEligible: this.config.captureAssistantEligible === true,
+        });
+        const result = await this.llm.completeJson(userPrompt, "extract-candidates", system);
         if (!result) {
             this.debugLog("memory-lancedb-pro: smart-extractor: extract-candidates returned null");
             return { status: "llm_failure", candidates: [] };
