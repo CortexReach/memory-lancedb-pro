@@ -575,6 +575,144 @@ async function runTest() {
         await new Promise((r) => setTimeout(r, 250));
         assert.equal(noiseLearnCalls, 1, "a genuinely empty extraction must still feed the noise bank");
 
+        // ----------------------------------------------------------------
+        // 10. Fiction register + judge failure: an event tagged "real" is a
+        //     persistence bypass, because events are not durable and so are
+        //     never dropped by the fiction-register rule. Without a positive
+        //     verdict the item is an in-fiction plot beat as far as we know,
+        //     so it must fail closed. (Upstream review, exact-head probe:
+        //     an in-story boarding event persisted as a real event.)
+        // ----------------------------------------------------------------
+        console.log("Test 10: fiction register + failed judge drops an unconfirmed event...");
+        reset();
+        extractionResponse = {
+            conversation_register: "fiction",
+            memories: [
+                {
+                    category: "events",
+                    abstract: "Boarded the night train to the capital",
+                    overview: "## Event\n- Boarded the night train",
+                    content: "Boarded the night train to the capital before the storm closed the pass.",
+                    grounding: "real",
+                },
+                {
+                    category: "preferences",
+                    abstract: "Prefers the window seat in the dining car",
+                    overview: "## Preference\n- Window seat",
+                    content: "Prefers the window seat in the dining car.",
+                    grounding: "constructed",
+                },
+            ],
+        };
+        rejudgeResponse = "malformed";
+        await extractor.extractAndPersist("scenario ten text", "s10", { scope: "s10", scopeFilter: ["s10"] });
+        const rows10 = await listTexts("s10");
+        assert.equal(rows10.length, 0, "an unconfirmed in-fiction event must not be persisted");
+        assert.ok(
+            logs.some((l) => l.includes("unconfirmed judge-gated candidate")),
+            "the judge-gated drop must announce itself",
+        );
+
+        console.log("Test 10b: fiction register + judge confirmation keeps an about-fiction event...");
+        reset();
+        rejudgeResponse = {
+            conversation_register: "fiction",
+            results: [
+                { index: 1, grounding: "real", reason: "a true note about the session itself" },
+                { index: 2, grounding: "constructed", reason: "a prop inside the story" },
+            ],
+        };
+        extractionResponse = {
+            conversation_register: "fiction",
+            memories: [
+                {
+                    category: "events",
+                    abstract: "Ran a three-hour tabletop session on Sunday",
+                    overview: "## Event\n- Three-hour tabletop session",
+                    content: "Ran a three-hour tabletop session on Sunday evening.",
+                    grounding: "real",
+                },
+                {
+                    category: "preferences",
+                    abstract: "Prefers the window seat in the dining car",
+                    overview: "## Preference\n- Window seat",
+                    content: "Prefers the window seat in the dining car.",
+                    grounding: "constructed",
+                },
+            ],
+        };
+        await extractor.extractAndPersist("scenario ten-b text", "s10b", { scope: "s10b", scopeFilter: ["s10b"] });
+        const rows10b = await listTexts("s10b");
+        assert.equal(rows10b.length, 1, "a judge-confirmed about-fiction event survives");
+        assert.ok(rows10b[0].includes("tabletop"), "the surviving row is the session note");
+
+        // ----------------------------------------------------------------
+        // 11. Coverage precedes the register. A partial verdict that claims
+        //     "real" must not disable the quarantine for the indices it never
+        //     answered. (Upstream review, exact-head probe: an unadjudicated
+        //     hypothetical preference persisted.)
+        // ----------------------------------------------------------------
+        console.log("Test 11: a partial verdict claiming 'real' cannot disable quarantine...");
+        reset();
+        extractionResponse = {
+            conversation_register: "mixed",
+            memories: [
+                {
+                    category: "preferences",
+                    abstract: "Would take the mountain route if money were no object",
+                    overview: "## Preference\n- Hypothetical mountain route",
+                    content: "Says they would take the mountain route if money were no object.",
+                    grounding: "real",
+                },
+                {
+                    category: "cases",
+                    abstract: "Resolved a stuck freight booking last spring",
+                    overview: "## Case\n- Freight booking resolved",
+                    content: "Resolved a stuck freight booking last spring.",
+                    grounding: "constructed",
+                },
+            ],
+        };
+        rejudgeResponse = {
+            conversation_register: "real",
+            results: [
+                { index: 2, grounding: "constructed", reason: "only this one answered" },
+            ],
+        };
+        await extractor.extractAndPersist("scenario eleven text", "s11", { scope: "s11", scopeFilter: ["s11"] });
+        const rows11 = await listTexts("s11");
+        assert.equal(rows11.length, 0, "the unadjudicated real-tagged durable must stay quarantined");
+        assert.ok(
+            logs.some((l) => l.includes("refusing register relax")),
+            "the refusal to relax the register on partial coverage must be logged",
+        );
+
+        console.log("Test 11b: duplicate indices do not fake complete coverage...");
+        reset();
+        rejudgeResponse = {
+            conversation_register: "real",
+            results: [
+                { index: 2, grounding: "constructed", reason: "answered" },
+                { index: 2, grounding: "constructed", reason: "answered again" },
+            ],
+        };
+        await extractor.extractAndPersist("scenario eleven-b text", "s11b", { scope: "s11b", scopeFilter: ["s11b"] });
+        const rows11b = await listTexts("s11b");
+        assert.equal(rows11b.length, 0, "duplicates collapse, so coverage stays incomplete and quarantine holds");
+
+        console.log("Test 11c: complete coverage may still relax the register...");
+        reset();
+        rejudgeResponse = {
+            conversation_register: "real",
+            results: [
+                { index: 1, grounding: "real", reason: "a genuine stated preference" },
+                { index: 2, grounding: "real", reason: "a real past case" },
+            ],
+        };
+        await extractor.extractAndPersist("scenario eleven-c text", "s11c", { scope: "s11c", scopeFilter: ["s11c"] });
+        const rows11c = await listTexts("s11c");
+        assert.equal(rows11c.length, 2, "a complete verdict is trusted and both real items persist");
+
         console.log("\nAll grounding-rejudge tests passed.");
     } finally {
         await new Promise(r => llmServer.close(r));

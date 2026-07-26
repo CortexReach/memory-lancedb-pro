@@ -105,6 +105,25 @@ export const DURABLE_CATEGORIES = new Set<MemoryCategory>([
   "patterns",
 ]);
 
+/**
+ * Judge-gated categories: not durable, but ambiguous enough inside a
+ * fiction-register batch that the per-item self-tag cannot be trusted.
+ * An event may be an assertion ABOUT a fiction session ("we played for three
+ * hours") or one from WITHIN it ("boarded the train to the capital"); both
+ * arrive tagged grounding="real" when the model mis-registers the second.
+ * In a fiction batch these survive only on positive grounding-judge
+ * confirmation, so a missing, partial, or failed verdict fails closed.
+ * Durable categories are dropped outright and never reach this gate.
+ */
+export const FICTION_JUDGED_CATEGORIES = new Set<MemoryCategory>(["events"]);
+
+/** Register strictness ordering; a rejudge verdict may tighten, never relax, on partial coverage. */
+export const REGISTER_STRICTNESS: Record<ConversationRegister, number> = {
+  real: 0,
+  mixed: 1,
+  fiction: 2,
+};
+
 /** A candidate memory extracted from conversation by LLM. */
 export type CandidateMemory = {
   category: MemoryCategory;

@@ -31,6 +31,8 @@ import {
   type MemoryCategory,
   ALWAYS_MERGE_CATEGORIES,
   DURABLE_CATEGORIES,
+  FICTION_JUDGED_CATEGORIES,
+  REGISTER_STRICTNESS,
   getStorageCategoryForMemoryCategory,
   MERGE_SUPPORTED_CATEGORIES,
   MEMORY_CATEGORIES,
@@ -889,6 +891,14 @@ export class SmartExtractor {
       const cat = normalizeCategory(m.category ?? "");
       return !!cat && DURABLE_CATEGORIES.has(cat);
     });
+    // Judge-gated categories only need a verdict where the gate enforces, i.e.
+    // a fiction register. Counting them in a mixed batch would fire the judge
+    // on shapes that stay coherent, for no enforcement benefit.
+    const hasRealTaggedJudgeGated = rawItems.some((m) => {
+      if (isRawConstructed(m)) return false;
+      const cat = normalizeCategory(m.category ?? "");
+      return !!cat && FICTION_JUDGED_CATEGORIES.has(cat);
+    });
 
     // The cells are defined on the register the model ASSERTED — a missing or
     // unrecognized register is no assertion, so legacy payloads keep the
@@ -906,12 +916,17 @@ export class SmartExtractor {
       } else if (
         conversationRegister !== "real" &&
         rawConstructedCount > 0 &&
-        hasRealTaggedDurable
+        (hasRealTaggedDurable ||
+          (conversationRegister === "fiction" && hasRealTaggedJudgeGated))
       ) {
         rejudgeCell = "constructed-sibling-durables";
       }
     }
 
+    // Raw items the grounding judge positively confirmed as "real". Only a
+    // confirmed item may pass the fiction-register gate for judge-gated
+    // categories below: absence of a verdict is never confirmation.
+    const judgeConfirmedReal = new Set<object>();
     let rejudgeFailedClosed = false;
     if (rejudgeCell) {
       this.debugLog(
@@ -943,7 +958,7 @@ export class SmartExtractor {
         let retagged = 0;
         const adjudicated = new Set<number>();
         for (const r of verdictResults) {
-          if (!r || typeof r.index !== "number") continue;
+          if (!r || typeof r.index !== "number" || !Number.isInteger(r.index)) continue;
           const item = rawItems[r.index - 1];
           if (!item) continue;
           const g =
@@ -952,7 +967,18 @@ export class SmartExtractor {
           if ((isRawConstructed(item) ? "constructed" : "real") !== g) retagged++;
           item.grounding = g;
           adjudicated.add(r.index - 1);
+          if (g === "real") judgeConfirmedReal.add(item);
+          else judgeConfirmedReal.delete(item);
         }
+        // Coverage must be validated BEFORE the reviewer's register is
+        // accepted. `adjudicated` only ever receives unique, integral,
+        // in-range indices carrying a usable grounding, so its size matching
+        // the candidate count is exactly "complete, unique, valid coverage";
+        // a partial, duplicated, fractional, out-of-range, or invalid verdict
+        // leaves it short. Accepting a register from such a verdict would
+        // silently disable the quarantine below for every index the judge
+        // never answered.
+        const coverageComplete = adjudicated.size === rawItems.length;
         const verdictRegister =
           typeof verdict.conversation_register === "string"
             ? verdict.conversation_register.toLowerCase().trim()
@@ -963,7 +989,16 @@ export class SmartExtractor {
           verdictRegister === "fiction" ||
           verdictRegister === "mixed"
         ) {
-          conversationRegister = verdictRegister;
+          // On incomplete coverage the asserted register stands, except that a
+          // STRICTER verdict register is always honoured: refusing to relax is
+          // the fail-closed property, refusing to tighten would be the reverse.
+          if (coverageComplete || REGISTER_STRICTNESS[verdictRegister] > REGISTER_STRICTNESS[conversationRegister]) {
+            conversationRegister = verdictRegister;
+          } else {
+            this.debugLog(
+              `memory-lancedb-pro: smart-extractor: grounding-rejudge verdict coverage incomplete (${adjudicated.size}/${rawItems.length}) — refusing register relax ${conversationRegister}->${verdictRegister}`,
+            );
+          }
         }
         // Coverage check: the judge is instructed to adjudicate every index.
         // An index it omitted (or answered with an unusable grounding) keeps
@@ -1068,6 +1103,26 @@ export class SmartExtractor {
         fictionRegisterDroppedCount++;
         this.debugLog(
           `memory-lancedb-pro: smart-extractor: dropping durable candidate from fiction-register batch category=${category} grounding=${grounding} abstract=${JSON.stringify(abstract.slice(0, 120))}`,
+        );
+        continue;
+      }
+
+      // Judge-gated categories in a fiction batch: an event may be an
+      // assertion ABOUT the fiction session ("we played for three hours",
+      // legitimately real) or an event from WITHIN it ("boarded the train",
+      // constructed). The per-item self-tag cannot be trusted to tell those
+      // apart in a fiction register — that wobble is the whole reason the
+      // register overrides items — so the candidate survives only on a
+      // positive grounding-judge confirmation. No verdict, an omitted index,
+      // or a failed judge all fail closed here.
+      if (
+        conversationRegister === "fiction" &&
+        FICTION_JUDGED_CATEGORIES.has(category) &&
+        !judgeConfirmedReal.has(raw)
+      ) {
+        fictionRegisterDroppedCount++;
+        this.debugLog(
+          `memory-lancedb-pro: smart-extractor: dropping unconfirmed judge-gated candidate from fiction-register batch category=${category} grounding=${grounding} abstract=${JSON.stringify(abstract.slice(0, 120))}`,
         );
         continue;
       }

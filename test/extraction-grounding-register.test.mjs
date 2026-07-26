@@ -62,10 +62,13 @@ function makeEmbedder(dims = 97) {
  * call returns; `conversationRegister` (optional) is the batch-level
  * conversation_register field — omitted to simulate legacy payloads.
  */
-function makeLlm(memories, conversationRegister) {
+function makeLlm(memories, conversationRegister, rejudgeVerdict) {
   let extractCandidatesCalls = 0;
   return {
     async completeJson(_prompt, mode) {
+      // Judge-gated categories need a positive grounding verdict to survive a
+      // fiction batch; a stub with no verdict is the judge-unavailable case.
+      if (mode === "grounding-rejudge") return rejudgeVerdict ?? null;
       if (mode !== "extract-candidates") return null;
       extractCandidatesCalls++;
       return conversationRegister
@@ -398,7 +401,16 @@ const MISLABELED_FICTION_CANDIDATES = [
 describe("SmartExtractor batch register signal (grounding v2)", () => {
   it("register 'fiction' drops ALL durable candidates even when their per-item tags say 'real'", async () => {
     const store = makeStore();
-    const llm = makeLlm(MISLABELED_FICTION_CANDIDATES, "fiction");
+    // Judge confirms the about-the-fiction events note; the mislabeled
+    // durables are dropped by the register rule before any verdict matters.
+    const llm = makeLlm(MISLABELED_FICTION_CANDIDATES, "fiction", {
+      conversation_register: "fiction",
+      results: [
+        { index: 1, grounding: "constructed", reason: "within-the-fiction canon" },
+        { index: 2, grounding: "constructed", reason: "within-the-fiction canon" },
+        { index: 3, grounding: "real", reason: "a true note that the session happened" },
+      ],
+    });
     const extractor = makeExtractor(makeEmbedder(), llm, store);
 
     const stats = await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
@@ -412,7 +424,25 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
     assert.equal(stats.created, 1);
   });
 
-  it("register 'fiction' no longer caps events notes — real session-events notes all survive (v3: cap removed)", async () => {
+  it("register 'fiction' drops even the events note when the grounding judge is unavailable", async () => {
+    const store = makeStore();
+    // No rejudge verdict: an events candidate in a fiction batch may be an
+    // in-fiction plot beat mistagged "real", and nothing confirmed otherwise,
+    // so it fails closed rather than persisting as a real event.
+    const llm = makeLlm(MISLABELED_FICTION_CANDIDATES, "fiction");
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    const stats = await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    assert.deepEqual(
+      persistedCategories(store),
+      [],
+      "an unconfirmed events candidate must not survive a fiction-register batch",
+    );
+    assert.equal(stats.created, 0);
+  });
+
+  it("register 'fiction' no longer caps events notes — judge-confirmed session-events notes all survive (v3: cap removed)", async () => {
     const store = makeStore();
     const llm = makeLlm(
       [
@@ -423,12 +453,19 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
         },
       ],
       "fiction",
+      {
+        conversation_register: "fiction",
+        results: [
+          { index: 1, grounding: "real", reason: "a true note that the session happened" },
+          { index: 2, grounding: "real", reason: "a true note about the bonus round" },
+        ],
+      },
     );
     const extractor = makeExtractor(makeEmbedder(), llm, store);
 
     await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
 
-    assert.equal(persistedCategories(store).length, 2, "both real session-events notes survive; the v2 one-per-extraction cap no longer applies");
+    assert.equal(persistedCategories(store).length, 2, "both confirmed session-events notes survive; the v2 one-per-extraction cap no longer applies");
   });
 
   it("register 'mixed' with a constructed sibling demotes real-tagged durables (batch contradiction check) and drops the constructed sibling itself", async () => {
