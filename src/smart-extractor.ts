@@ -882,6 +882,13 @@ export class SmartExtractor {
     const rawItems = result.memories.filter(
       (m): m is (typeof result.memories)[number] => !!m && typeof m === "object",
     );
+    // Verdicts are held HERE, never written back into the LLM response. The
+    // response object graph belongs to the client and may outlive the call
+    // (any caching or fixture-returning client shares it across invocations),
+    // so mutating it leaks one extraction's verdict into the next.
+    const rawItemIndex = new Map<object, number>();
+    rawItems.forEach((m, i) => rawItemIndex.set(m, i));
+    const judgedGrounding: Array<CandidateGrounding | undefined> = new Array(rawItems.length);
     const isRawConstructed = (m: { grounding?: string }): boolean =>
       typeof m.grounding === "string" && m.grounding.toLowerCase().trim() === "constructed";
     const rawConstructedCount = rawItems.filter(isRawConstructed).length;
@@ -900,14 +907,23 @@ export class SmartExtractor {
       return !!cat && FICTION_JUDGED_CATEGORIES.has(cat);
     });
 
-    // The cells are defined on the register the model ASSERTED — a missing or
-    // unrecognized register is no assertion, so legacy payloads keep the
-    // deterministic legacy path below instead of burning a judge call.
+    // Most cells are defined on the register the model ASSERTED — a missing or
+    // unrecognized register is no assertion, so legacy payloads stay on the
+    // deterministic path. The one exception is the constructed-sibling shape:
+    // there the deterministic path is the batch-wide durable wipe, which
+    // deletes independently-supported real facts alongside the suspect ones —
+    // exactly the over-drop the per-item rejudge exists to replace. Attempting
+    // the judge there strictly dominates: it can only rescue rows, and a
+    // failed or malformed verdict still falls through to the same wipe.
     const registerAsserted =
       rawRegister === "real" || rawRegister === "fiction" || rawRegister === "mixed";
     let rejudgeCell: string | null = null;
-    if (registerAsserted && rawItems.length > 0) {
-      if (conversationRegister === "real" && rawRealCount === 0) {
+    if (rawItems.length > 0) {
+      if (!registerAsserted) {
+        if (rawConstructedCount > 0 && hasRealTaggedDurable) {
+          rejudgeCell = "unasserted-constructed-sibling-durables";
+        }
+      } else if (conversationRegister === "real" && rawRealCount === 0) {
         rejudgeCell = "real-zero-real";
       } else if (conversationRegister === "mixed" && rawConstructedCount === 0) {
         rejudgeCell = "mixed-zero-constructed";
@@ -923,10 +939,10 @@ export class SmartExtractor {
       }
     }
 
-    // Raw items the grounding judge positively confirmed as "real". Only a
+    // Item indices the grounding judge positively confirmed as "real". Only a
     // confirmed item may pass the fiction-register gate for judge-gated
     // categories below: absence of a verdict is never confirmation.
-    const judgeConfirmedReal = new Set<object>();
+    const judgeConfirmedReal = new Set<number>();
     let rejudgeFailedClosed = false;
     if (rejudgeCell) {
       this.debugLog(
@@ -965,10 +981,10 @@ export class SmartExtractor {
             typeof r.grounding === "string" ? r.grounding.toLowerCase().trim() : "";
           if (g !== "real" && g !== "constructed") continue;
           if ((isRawConstructed(item) ? "constructed" : "real") !== g) retagged++;
-          item.grounding = g;
+          judgedGrounding[r.index - 1] = g;
           adjudicated.add(r.index - 1);
-          if (g === "real") judgeConfirmedReal.add(item);
-          else judgeConfirmedReal.delete(item);
+          if (g === "real") judgeConfirmedReal.add(r.index - 1);
+          else judgeConfirmedReal.delete(r.index - 1);
         }
         // Coverage must be validated BEFORE the reviewer's register is
         // accepted. `adjudicated` only ever receives unique, integral,
@@ -1014,7 +1030,7 @@ export class SmartExtractor {
             if (isRawConstructed(item)) continue;
             const cat = normalizeCategory(item.category ?? "");
             if (!cat || !DURABLE_CATEGORIES.has(cat)) continue;
-            item.grounding = "constructed";
+            judgedGrounding[i] = "constructed";
             uncoveredDemoted++;
           }
         }
@@ -1091,10 +1107,15 @@ export class SmartExtractor {
       // session (e.g. that it happened); "constructed" is a claim true only
       // WITHIN the fiction. A constructed-tagged candidate is never stored,
       // in any category or register — there is no per-extraction cap anymore.
+      // A grounding-judge verdict, when one exists for this item, is final and
+      // supersedes the self-tag; it is held out-of-band rather than written
+      // back into the response object.
+      const rawItemPosition = rawItemIndex.get(raw);
       const rawGrounding =
         typeof raw.grounding === "string" ? raw.grounding.toLowerCase().trim() : "";
       const grounding: CandidateGrounding =
-        rawGrounding === "constructed" ? "constructed" : "real";
+        (rawItemPosition === undefined ? undefined : judgedGrounding[rawItemPosition]) ??
+        (rawGrounding === "constructed" ? "constructed" : "real");
 
       // Register enforcement: an in-fiction batch can never produce durable
       // memories, whatever the per-item self-tags claim (the per-item tags
@@ -1118,7 +1139,7 @@ export class SmartExtractor {
       if (
         conversationRegister === "fiction" &&
         FICTION_JUDGED_CATEGORIES.has(category) &&
-        !judgeConfirmedReal.has(raw)
+        !(rawItemPosition !== undefined && judgeConfirmedReal.has(rawItemPosition))
       ) {
         fictionRegisterDroppedCount++;
         this.debugLog(
@@ -1147,8 +1168,14 @@ export class SmartExtractor {
     // quarantine — demote surviving real-tagged durables — remains for two
     // shapes only: the rejudge itself failed, or a legacy payload asserted no
     // register at all while tagging constructed siblings.
+    // Only the shapes the judge was never asked about land here; the
+    // unasserted constructed-sibling shape now goes to the judge first and
+    // falls back through rejudgeFailedClosed when that judge cannot answer.
     const legacyContradiction =
-      !registerAsserted && conversationRegister !== "real" && rawConstructedCount > 0;
+      !registerAsserted &&
+      !rejudgeCell &&
+      conversationRegister !== "real" &&
+      rawConstructedCount > 0;
     let contradictionDemotedCount = 0;
     if (rejudgeFailedClosed || legacyContradiction) {
       for (let i = candidates.length - 1; i >= 0; i--) {

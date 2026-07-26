@@ -424,6 +424,33 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
     assert.equal(stats.created, 1);
   });
 
+  it("the rejudge never mutates the LLM response objects it was handed", async () => {
+    // The response object graph belongs to the client. A client that caches or
+    // returns shared objects (every fixture-returning double in this file does)
+    // would otherwise carry one extraction's verdict into the next, and a
+    // regression test whose fixture was silently retagged stops exercising the
+    // branch it is named for while still passing.
+    const fixture = MISLABELED_FICTION_CANDIDATES.map((c) => ({ ...c }));
+    const before = fixture.map((c) => c.grounding);
+    const llm = makeLlm(fixture, "fiction", {
+      conversation_register: "fiction",
+      results: [
+        { index: 1, grounding: "constructed", reason: "within-the-fiction canon" },
+        { index: 2, grounding: "constructed", reason: "within-the-fiction canon" },
+        { index: 3, grounding: "real", reason: "a true note that the session happened" },
+      ],
+    });
+    const extractor = makeExtractor(makeEmbedder(), llm, makeStore());
+
+    await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    assert.deepEqual(
+      fixture.map((c) => c.grounding),
+      before,
+      "verdicts must be held out-of-band, never written back into the response",
+    );
+  });
+
   it("register 'fiction' drops even the events note when the grounding judge is unavailable", async () => {
     const store = makeStore();
     // No rejudge verdict: an events candidate in a fiction batch may be an
