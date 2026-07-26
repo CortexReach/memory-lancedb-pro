@@ -2226,6 +2226,19 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .option("--apply", "Apply the reassignment (default: report only)", false)
     .action(async (options: { targetScope: string; apply: boolean }) => {
       try {
+        // Validate through the normal scope validator up front: a typo here
+        // would strand every repaired row in a scope no reader resolves,
+        // recreating the invisibility this command exists to fix.
+        const targetScope = String(options.targetScope ?? "").trim();
+        if (!context.scopeManager.validateScope(targetScope)) {
+          console.error(
+            `repair-scopes: invalid --target-scope "${options.targetScope}": not a defined scope or built-in pattern ` +
+            "(global, agent:<id>, custom:<name>, project:<id>, user:<id>, reflection:agent:<id>). " +
+            "Rows assigned to an unknown scope would be unreachable to every reader.",
+          );
+          process.exitCode = 1;
+          return;
+        }
         const legacy = await context.store.findLegacyScopeRows(100000);
         console.log(`Found ${legacy.length} legacy row(s) with NULL/blank scope${legacy.length > 0 ? ":" : "."}`);
         for (const entry of legacy.slice(0, 20)) {
@@ -2236,12 +2249,12 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         }
         if (!options.apply) {
           if (legacy.length > 0) {
-            console.log(`\nReport-only mode. Re-run with --apply to assign scope "${options.targetScope}".`);
+            console.log(`\nReport-only mode. Re-run with --apply to assign scope "${targetScope}".`);
           }
           return;
         }
-        const { repaired, failed, skipped, unrecovered } = await context.store.repairLegacyScopes(options.targetScope);
-        console.log(`\nRepair complete: ${repaired} reassigned to "${options.targetScope}", ${skipped} skipped (changed or removed since discovery), ${failed} failed.`);
+        const { repaired, failed, skipped, unrecovered } = await context.store.repairLegacyScopes(targetScope);
+        console.log(`\nRepair complete: ${repaired} reassigned to "${targetScope}", ${skipped} skipped (changed or removed since discovery), ${failed} failed.`);
         if (unrecovered.length > 0) {
           console.error(
             `\n${unrecovered.length} row(s) could not be restored after a failed replacement write. ` +

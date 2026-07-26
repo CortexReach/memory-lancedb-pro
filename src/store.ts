@@ -1684,9 +1684,20 @@ export class MemoryStore {
       );
     }
 
+    // Same fail-closed contract as store(): a missing or whitespace-only
+    // scope must never be silently converted into globally visible data.
+    // Legacy callers assign an explicit scope (migrate falls back to its
+    // default scope); genuinely scope-less legacy rows are repair-scopes'
+    // job, not an import-time coercion.
+    if (!hasValidEntryScope(entry.scope)) {
+      throw new Error(
+        "importEntry requires a non-empty scope: scope-less rows are invisible to scoped readers (assign an explicit scope, or leave legacy rows to repair-scopes)",
+      );
+    }
+
     const full: MemoryEntry = {
       ...entry,
-      scope: hasValidEntryScope(entry.scope) ? entry.scope.trim() : "global",
+      scope: entry.scope.trim(),
       importance: options.legacy
         ? normalizeLegacyImportance(entry.importance)
         : clampImportance(entry.importance),
@@ -2649,7 +2660,36 @@ export class MemoryStore {
       .where("scope IS NULL OR scope = ''")
       .limit(limit)
       .toArray();
-    return rows.map((row: Record<string, unknown>) => this.materializeLegacyScopeRow(row));
+    const legacy = rows.map((row: Record<string, unknown>) => this.materializeLegacyScopeRow(row));
+
+    // Whitespace-only scopes are invalid under the public write validator, so
+    // they are exactly as invisible to scoped readers as NULL and '' — repair
+    // must discover them too. Lance's SQL pushdown rejects trim(), so project
+    // only id+scope over the remaining rows and filter client-side, then
+    // materialize the (rare) hits individually with their full content.
+    if (legacy.length < limit) {
+      const scopedRows = await this.table!
+        .query()
+        .select(["id", "scope"])
+        .where("scope IS NOT NULL AND scope != ''")
+        .toArray();
+      const whitespaceIds = scopedRows
+        .filter((row: Record<string, unknown>) =>
+          typeof row.scope === "string" && (row.scope as string).trim() === "")
+        .map((row: Record<string, unknown>) => String(row.id))
+        .slice(0, limit - legacy.length);
+      for (const id of whitespaceIds) {
+        const full = await this.table!
+          .query()
+          .where(`id = '${escapeSqlLiteral(id)}'`)
+          .limit(1)
+          .toArray();
+        if (full.length > 0) {
+          legacy.push(this.materializeLegacyScopeRow(full[0] as Record<string, unknown>));
+        }
+      }
+    }
+    return legacy;
   }
 
   async repairLegacyScopes(targetScope: string): Promise<{ repaired: number; failed: number; skipped: number; unrecovered: MemoryEntry[] }> {
@@ -2670,12 +2710,22 @@ export class MemoryStore {
           // be neither overwritten with the snapshot nor reassigned to the
           // target scope, and a concurrently deleted row must not be
           // resurrected.
+          //
+          // The lock serializes writers; it does NOT advance this handle's
+          // cached table version, so a re-read through a stale handle can
+          // still validate against a snapshot that predates another
+          // connection's update. Check out the latest version under the lock
+          // before validating. If the refresh fails, this throw fails the row
+          // (reported in `failed`) instead of writing from a stale snapshot.
+          await this.table!.checkoutLatest();
           const safeId = escapeSqlLiteral(candidate.id);
           const currentRows = await this.table!.query().where(`id = '${safeId}'`).limit(1).toArray();
           if (currentRows.length === 0) return "skipped" as const;
           const currentRaw = currentRows[0] as Record<string, unknown>;
           const currentScope = currentRaw.scope as string | null | undefined;
-          if (currentScope != null && currentScope !== "") return "skipped" as const;
+          // Whitespace-only counts as still-legacy, matching the discovery
+          // query and the public write validator.
+          if (currentScope != null && currentScope.trim() !== "") return "skipped" as const;
           const row = this.materializeLegacyScopeRow(currentRaw);
           const replacement: MemoryEntry = { ...row, scope: targetScope.trim() };
           await this.table!.delete(`id = '${safeId}'`);

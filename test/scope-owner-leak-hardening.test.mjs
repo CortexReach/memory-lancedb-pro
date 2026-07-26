@@ -663,6 +663,9 @@ describe("(e) legacy-scope repair is BigInt-safe and recoverable", () => {
     try {
       await store.ensureInitialized();
       const realTable = store.table;
+      // Covers both query shapes findLegacyScopeRows now issues: the legacy
+      // NULL/'' pushdown (where -> limit -> toArray) and the whitespace-scope
+      // projection (select -> where -> toArray, returning none here).
       store.table = {
         query: () => ({
           where: () => ({
@@ -677,6 +680,11 @@ describe("(e) legacy-scope repair is BigInt-safe and recoverable", () => {
                 timestamp: 9223372036854775807n,
                 metadata: "{}",
               }],
+            }),
+          }),
+          select: () => ({
+            where: () => ({
+              toArray: async () => [],
             }),
           }),
         }),
@@ -815,19 +823,26 @@ describe("(g) upsert and importEntry persist the canonical trimmed scope", () =>
     }
   });
 
-  it("importEntry() trims a padded scope and maps blank or whitespace-only scopes to global", async () => {
+  it("importEntry() trims a padded scope and rejects blank or whitespace-only scopes outright", async () => {
     const { store, dir } = makeStore();
     try {
       await store.importEntry({ id: "import-padded", text: "padded import", vector: [1, 0, 0], category: "fact", scope: "  agent-b ", importance: 0.5, timestamp: Date.now(), metadata: "{}" });
-      await store.importEntry({ id: "import-blank", text: "whitespace-only import", vector: [0, 1, 0], category: "fact", scope: "   ", importance: 0.5, timestamp: Date.now(), metadata: "{}" });
 
       const padded = await store.getById("import-padded", ["agent-b"]);
       assert.ok(padded, "a padded import scope must canonicalize to the trimmed scope");
       assert.equal(padded.scope, "agent-b");
 
-      const blank = await store.getById("import-blank", ["global"]);
-      assert.ok(blank, "a whitespace-only import scope must fall back to global, not persist as an invisible row");
-      assert.equal(blank.scope, "global");
+      // Fail-closed like store(): silently coercing a blank scope to "global"
+      // turned invisible data into globally visible data at import time.
+      for (const blankScope of [undefined, "", "   "]) {
+        await assert.rejects(
+          () => store.importEntry({ id: "import-blank", text: "whitespace-only import", vector: [0, 1, 0], category: "fact", scope: blankScope, importance: 0.5, timestamp: Date.now(), metadata: "{}" }),
+          /non-empty scope/,
+          `scope ${JSON.stringify(blankScope)} must be rejected, not coerced to global`,
+        );
+      }
+      const blank = await store.getById("import-blank");
+      assert.equal(blank, null, "no row may be written for a rejected import");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -914,12 +929,63 @@ describe("(h) repairLegacyScopes re-validates each row under the write lock", ()
   });
 });
 
+describe("(h2) repair validates against the LATEST table version, not this handle's snapshot", () => {
+  it("a second connection's update is neither overwritten nor reassigned (two-handle, default read consistency)", async () => {
+    const { store: storeA, dir } = makeStore();
+    const storeB = new MemoryStore({ dbPath: dir, vectorDim: 3 });
+    try {
+      await seedLegacyRow(storeA, { id: "two-handle-row", text: "legacy text at discovery", vector: [1, 0, 0], category: "fact", scope: null });
+      // Warm A's cached table handle on the current version, then write the
+      // row's real scope through an INDEPENDENT connection. With the default
+      // (unset) read-consistency interval, A's handle does not see B's write
+      // on its own — the negative control in read-consistency-interval.test.mjs
+      // pins that — so only an explicit under-lock refresh can save the row.
+      assert.equal((await storeA.findLegacyScopeRows()).length, 1);
+      await storeB.upsert({ id: "two-handle-row", text: "updated by the second connection", vector: [1, 0, 0], category: "fact", scope: "agent-live", importance: 0.5, timestamp: Date.now(), metadata: "{}" });
+
+      const outcome = await storeA.repairLegacyScopes("global");
+
+      assert.equal(outcome.repaired, 0, "a row scoped by another connection must not be repaired");
+      assert.equal(outcome.skipped, 1, "the concurrently scoped row must be skipped");
+      const current = await storeB.getById("two-handle-row", ["agent-live"]);
+      assert.ok(current, "the second connection's write must survive the repair pass");
+      assert.equal(current.text, "updated by the second connection", "repair must not restore the stale snapshot text");
+      const leaked = await storeB.getById("two-handle-row", ["global"]);
+      assert.equal(leaked, null, "the row must not be reassigned to the target scope");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("whitespace-only scopes are discoverable and repairable as legacy rows", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, { id: "ws-scope-row", text: "whitespace scope row", vector: [1, 0, 0], category: "fact", scope: "   " });
+      await store.store({ text: "properly scoped row", vector: [0, 1, 0], category: "fact", scope: "agent-a", importance: 0.5, metadata: "{}" });
+
+      const found = await store.findLegacyScopeRows();
+      assert.equal(found.length, 1, "a whitespace-only scope is invalid under the write validator and must be discoverable");
+      assert.equal(found[0].id, "ws-scope-row");
+
+      const outcome = await store.repairLegacyScopes("global");
+      assert.equal(outcome.repaired, 1, "the whitespace-scoped row must be repairable");
+      const repaired = await store.getById("ws-scope-row", ["global"]);
+      assert.ok(repaired, "the repaired row must be visible under the target scope");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("(i) repair-scopes command wiring", () => {
   function buildCliProgram(storeStubs) {
     const { createMemoryCLI } = jiti("../cli.ts");
+    const { createScopeManager } = jiti("../src/scopes.ts");
     const program = new Command();
     program.exitOverride();
-    createMemoryCLI({ store: storeStubs, retriever: {}, scopeManager: {}, migrator: {} })({ program });
+    // The real scope manager IS the wiring under test: --target-scope now
+    // routes through its validateScope, so a stub {} would mask the contract.
+    createMemoryCLI({ store: storeStubs, retriever: {}, scopeManager: createScopeManager(), migrator: {} })({ program });
     return program;
   }
 
@@ -967,5 +1033,27 @@ describe("(i) repair-scopes command wiring", () => {
       async repairLegacyScopes() { return { repaired: 1, failed: 0, skipped: 1, unrecovered: [] }; },
     }, ["--apply"]);
     assert.notEqual(clean.exitCode, 1, "a clean repair (skips included) must not fail the exit code");
+  });
+
+  it("rejects a --target-scope the scope validator does not recognize, before touching the store", async () => {
+    let discoveryCalls = 0;
+    let repairCalls = 0;
+    const result = await runRepairScopes({
+      async findLegacyScopeRows() { discoveryCalls += 1; return []; },
+      async repairLegacyScopes() { repairCalls += 1; return { repaired: 0, failed: 0, skipped: 0, unrecovered: [] }; },
+    }, ["--apply", "--target-scope", "definitely not a scope"]);
+
+    assert.equal(result.exitCode, 1, "an unknown target scope must fail the command");
+    assert.match(result.errors, /invalid --target-scope/, "the error must name the rejected scope option");
+    assert.equal(repairCalls, 0, "no repair may run against an unreachable scope");
+    assert.equal(discoveryCalls, 0, "validation happens before any store access");
+  });
+
+  it("accepts built-in scope patterns such as agent:<id>", async () => {
+    const result = await runRepairScopes({
+      async findLegacyScopeRows() { return []; },
+      async repairLegacyScopes() { return { repaired: 0, failed: 0, skipped: 0, unrecovered: [] }; },
+    }, ["--apply", "--target-scope", "agent:live"]);
+    assert.notEqual(result.exitCode, 1, "a built-in pattern scope must validate");
   });
 });
