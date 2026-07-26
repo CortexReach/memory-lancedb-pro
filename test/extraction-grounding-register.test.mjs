@@ -517,18 +517,192 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
     assert.deepEqual(categories, ["events"], "only the real aside survives: the constructed plot event is dropped unconditionally (v3), profile demoted by the fail-closed fallback");
   });
 
-  it("register 'real' fully trusts per-item tags for durables, but still drops a constructed-tagged item regardless of register", async () => {
+  it("register 'real' trusts per-item tags when nothing contradicts them, and still drops a constructed-tagged item", async () => {
     const store = makeStore();
-    const llm = makeLlm(
-      [FACTUAL_CANDIDATES[0], CONSTRUCTED_PLOT_EVENT],
-      "real",
+    const llm = makeLlm([FACTUAL_CANDIDATES[0]], "real");
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist("mostly factual conversation", "s1");
+
+    assert.deepEqual(
+      persistedCategories(store),
+      ["preferences"],
+      "an asserted-real batch with no constructed sibling needs no adjudication",
     );
+    assert.equal(llm.extractCandidatesCalls, 1, "and it costs exactly one LLM call");
+  });
+
+  it("asserted 'real' with a constructed sibling no longer trusts the durable: an unavailable judge fails closed", async () => {
+    const store = makeStore();
+    // Contradictory batch: the register claims ordinary conversation while one
+    // item is tagged true only inside a fiction. The stub answers no rejudge.
+    const llm = makeLlm([FACTUAL_CANDIDATES[0], CONSTRUCTED_PLOT_EVENT], "real");
     const extractor = makeExtractor(makeEmbedder(), llm, store);
 
     await extractor.extractAndPersist("mostly factual conversation with a brief game", "s1");
 
-    const categories = persistedCategories(store);
-    assert.deepEqual(categories, ["preferences"], "durable real-tagged preference survives; the constructed-tagged item is dropped even though the register is 'real'");
+    assert.deepEqual(
+      persistedCategories(store),
+      [],
+      "the real-tagged durable must not persist unadjudicated beside a constructed sibling",
+    );
+  });
+
+  it("asserted 'real' with a constructed sibling persists the durable once the judge confirms it", async () => {
+    const store = makeStore();
+    const llm = makeLlm([FACTUAL_CANDIDATES[0], CONSTRUCTED_PLOT_EVENT], "real", {
+      conversation_register: "real",
+      results: [
+        { index: 1, grounding: "real" },
+        { index: 2, grounding: "constructed" },
+      ],
+    });
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist("mostly factual conversation with a brief game", "s1");
+
+    assert.deepEqual(
+      persistedCategories(store),
+      ["preferences"],
+      "a complete verdict confirming the durable keeps it; the cell is adjudication, not a wipe",
+    );
+  });
+
+  it("a duplicate-index verdict is applied in no part: [1,1,2] for two candidates cannot relax the register", async () => {
+    const store = makeStore();
+    const llm = makeLlm([MISLABELED_FICTION_CANDIDATES[0], CONSTRUCTED_PLOT_EVENT], "mixed", {
+      conversation_register: "real",
+      results: [
+        { index: 1, grounding: "real" },
+        { index: 1, grounding: "real" },
+        { index: 2, grounding: "constructed" },
+      ],
+    });
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    assert.ok(
+      !persistedCategories(store).includes("profile"),
+      "a duplicated index must not count as coverage and must not license a register relax",
+    );
+  });
+
+  it("an extra-row verdict is applied in no part: [1,2,3] for two candidates cannot relax the register", async () => {
+    const store = makeStore();
+    const llm = makeLlm([MISLABELED_FICTION_CANDIDATES[0], CONSTRUCTED_PLOT_EVENT], "mixed", {
+      conversation_register: "real",
+      results: [
+        { index: 1, grounding: "real" },
+        { index: 2, grounding: "constructed" },
+        { index: 3, grounding: "real" },
+      ],
+    });
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    assert.ok(
+      !persistedCategories(store).includes("profile"),
+      "an out-of-range extra row invalidates the whole response",
+    );
+  });
+
+  it("a fractional index invalidates the whole verdict", async () => {
+    const store = makeStore();
+    const llm = makeLlm([MISLABELED_FICTION_CANDIDATES[0], CONSTRUCTED_PLOT_EVENT], "mixed", {
+      conversation_register: "real",
+      results: [
+        { index: 1.5, grounding: "real" },
+        { index: 2, grounding: "constructed" },
+      ],
+    });
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    assert.ok(
+      !persistedCategories(store).includes("profile"),
+      "a non-integral index fails the whole response closed",
+    );
+  });
+
+  it("a complete verdict is honoured whatever order its rows arrive in", async () => {
+    const store = makeStore();
+    const llm = makeLlm([MISLABELED_FICTION_CANDIDATES[0], CONSTRUCTED_PLOT_EVENT], "mixed", {
+      conversation_register: "real",
+      results: [
+        { index: 2, grounding: "constructed" },
+        { index: 1, grounding: "real" },
+      ],
+    });
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    assert.ok(
+      persistedCategories(store).includes("profile"),
+      "reordered but complete coverage must still be applied, otherwise the judge can never rescue anything",
+    );
+  });
+
+  it("a numeric-string index is normalized, not treated as malformed", async () => {
+    const store = makeStore();
+    const llm = makeLlm([FACTUAL_CANDIDATES[0], CONSTRUCTED_PLOT_EVENT], "real", {
+      conversation_register: "real",
+      results: [
+        { index: "1", grounding: "real" },
+        { index: 2, grounding: "constructed" },
+      ],
+    });
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist("mostly factual conversation with a brief game", "s1");
+
+    assert.deepEqual(
+      persistedCategories(store),
+      ["preferences"],
+      "row-type variance must not discard a semantically complete verdict",
+    );
+  });
+
+  it("a grounding carrying a qualifier or trailing punctuation is normalized to its token", async () => {
+    const store = makeStore();
+    const llm = makeLlm([FACTUAL_CANDIDATES[0], CONSTRUCTED_PLOT_EVENT], "real", {
+      conversation_register: "real",
+      results: [
+        { index: 1, grounding: "real." },
+        { index: 2, grounding: "constructed (in-story)" },
+      ],
+    });
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist("mostly factual conversation with a brief game", "s1");
+
+    assert.deepEqual(
+      persistedCategories(store),
+      ["preferences"],
+      "a decorated but unambiguous grounding must be read as its enum token",
+    );
+  });
+
+  it("an ambiguous or negated grounding still invalidates the whole verdict", async () => {
+    const store = makeStore();
+    const llm = makeLlm([MISLABELED_FICTION_CANDIDATES[0], CONSTRUCTED_PLOT_EVENT], "mixed", {
+      conversation_register: "real",
+      results: [
+        { index: 1, grounding: "not real" },
+        { index: 2, grounding: "constructed" },
+      ],
+    });
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    assert.ok(
+      !persistedCategories(store).includes("profile"),
+      "normalization must read leading tokens only, never guess at a negated or unrecognized value",
+    );
   });
 
   it("missing register (legacy payload) with no constructed tags behaves exactly as before", async () => {

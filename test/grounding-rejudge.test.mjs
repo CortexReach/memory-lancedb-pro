@@ -486,10 +486,13 @@ async function runTest() {
         );
 
         // ----------------------------------------------------------------
-        // 8. Partial verdict: adjudicated items follow the judge; an index
-        //    the judge omitted keeps no benefit of the doubt.
+        // 8. Partial verdict: applied in NO part. A response that does not
+        //    adjudicate every candidate exactly once cannot be trusted for
+        //    the rows it does carry either, so none of it is committed and
+        //    every real-tagged durable is quarantined (reviewer ask,
+        //    2026-07-26: validate the whole response, then commit atomically).
         // ----------------------------------------------------------------
-        console.log("Test 8: a partial verdict quarantines only the omitted durable...");
+        console.log("Test 8: a partial verdict is applied in no part...");
         reset();
         extractionResponse = {
             conversation_register: "mixed",
@@ -520,9 +523,13 @@ async function runTest() {
         await extractor.extractAndPersist("scenario eight text", "s8", { scope: "s8", scopeFilter: ["s8"] });
         assert.equal(rejudgeCalls, 1, "rejudge must fire exactly once");
         const rows8 = await listTexts("s8");
-        assert.equal(rows8.length, 1, "only the judge-confirmed durable may be stored");
-        assert.ok(rows8[0].includes("pier"), "the adjudicated real durable survives");
+        assert.equal(rows8.length, 0, "a partial verdict commits nothing: both durables are quarantined");
+        assert.ok(!rows8.some((t) => t.includes("pier")), "even the row the judge did answer is not committed from an incomplete response");
         assert.ok(!rows8.some((t) => t.includes("barometer")), "the omitted durable must be quarantined");
+        assert.ok(
+            logs.some((l) => l.includes("grounding-rejudge verdict malformed")),
+            "the whole-response rejection must announce itself in the log",
+        );
 
         // ----------------------------------------------------------------
         // 9. Noise-bank guard: a batch emptied by grounding drops must NOT
