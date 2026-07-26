@@ -2242,6 +2242,14 @@ export class MemoryStore {
         let failed = 0;
         let skipped = 0;
         const unrecovered = [];
+        // A systemic failure (version refresh unavailable, lock unacquirable,
+        // storage errors) must be distinguishable from per-row races: log the
+        // per-row reason (bounded), and stop hammering the cross-process lock
+        // once failures are clearly not row-specific. Unattempted rows stay
+        // legacy, so a later run rediscovers them.
+        const MAX_LOGGED_FAILURES = 20;
+        const MAX_CONSECUTIVE_FAILURES = 10;
+        let consecutiveFailures = 0;
         for (const candidate of legacyRows) {
             try {
                 const outcome = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
@@ -2276,14 +2284,32 @@ export class MemoryStore {
                         await this.table.add([replacement]);
                     }
                     catch (addError) {
+                        // Commit-then-reject: the add can persist and STILL surface an
+                        // error (post-commit step failure, retried conflict where the
+                        // retry landed). Re-read before rolling back — blindly re-adding
+                        // the original would leave two rows under the same id.
+                        let landed = null;
                         try {
-                            await this.table.add([{ ...row }]);
+                            const postRows = await this.table.query().where(`id = '${safeId}'`).limit(1).toArray();
+                            landed = postRows.length > 0 ? postRows[0] : null;
                         }
                         catch {
-                            // Both the replacement and the rollback write failed after the
-                            // delete, so the row is no longer in the table. Surface its full
-                            // content to the caller instead of silently losing the data.
-                            unrecovered.push({ ...row });
+                            landed = null;
+                        }
+                        const landedScope = typeof landed?.scope === "string" ? landed.scope.trim() : "";
+                        if (landedScope === targetScope.trim()) {
+                            return "repaired";
+                        }
+                        if (landed === null) {
+                            try {
+                                await this.table.add([{ ...row }]);
+                            }
+                            catch {
+                                // Both the replacement and the rollback write failed after the
+                                // delete, so the row is no longer in the table. Surface its full
+                                // content to the caller instead of silently losing the data.
+                                unrecovered.push({ ...row });
+                            }
                         }
                         throw addError;
                     }
@@ -2293,9 +2319,24 @@ export class MemoryStore {
                     repaired += 1;
                 else
                     skipped += 1;
+                consecutiveFailures = 0;
             }
-            catch {
+            catch (rowError) {
                 failed += 1;
+                consecutiveFailures += 1;
+                if (failed <= MAX_LOGGED_FAILURES) {
+                    console.warn(`repairLegacyScopes: row ${String(candidate.id).slice(0, 8)} failed: ${rowError instanceof Error ? rowError.message : String(rowError)}`);
+                }
+                else if (failed === MAX_LOGGED_FAILURES + 1) {
+                    console.warn("repairLegacyScopes: further per-row failure logs suppressed");
+                }
+                if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                    const unattempted = legacyRows.length - repaired - failed - skipped;
+                    console.error(`repairLegacyScopes: aborting after ${consecutiveFailures} consecutive failures — the cause looks systemic, not row-specific. ` +
+                        `${unattempted} row(s) unattempted; they remain legacy and discoverable by the next run. ` +
+                        `Last failure: ${rowError instanceof Error ? rowError.message : String(rowError)}`);
+                    break;
+                }
             }
         }
         if (repaired > 0)

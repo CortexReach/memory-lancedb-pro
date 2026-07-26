@@ -914,11 +914,12 @@ export async function runImportMarkdown(
     if (typeof ctx.store.bulkStore === "function") {
       try {
         bulkStoreCalls++;
-        await ctx.store.bulkStore(entries, ({ index, reason }) => {
+        const persisted = await ctx.store.bulkStore(entries, ({ index, reason }) => {
           console.warn(`  [import-markdown] dropped invalid entry ${index}: ${reason}`);
         });
-        console.log(`  [import] stored batch ${bulkStoreCalls} (${entries.length} entries, total: ${imported + entries.length})`);
-        return { imported: entries.length, skipped: 0 };
+        const persistedCount = Array.isArray(persisted) ? persisted.length : entries.length;
+        console.log(`  [import] stored batch ${bulkStoreCalls} (${persistedCount}/${entries.length} entries, total: ${imported + persistedCount})`);
+        return { imported: persistedCount, skipped: entries.length - persistedCount };
       } catch (err) {
         console.warn(`  [import-markdown] batch store failed (${err}); retrying entries individually`);
         errorCount++;
@@ -1903,6 +1904,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         let processed = 0;
         let imported = 0;
         let skipped = 0;
+        let scopeless = 0;
 
         for (let i = 0; i < rows.length; i += batchSize) {
           const batch = rows.slice(i, i + batchSize);
@@ -1928,12 +1930,24 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
               }
             }
 
+            // Never launder a missing/blank scope into "global": that would
+            // promote rows invisible to every scoped reader into data every
+            // agent can see, bypassing importEntry's fail-closed contract.
+            const rowScope = typeof row.scope === "string" ? row.scope.trim() : "";
+            if (!rowScope) {
+              scopeless++;
+              if (scopeless <= 20) {
+                console.warn(`  Skipping scope-less legacy row ${id.slice(0, 8)}: assign scopes in the source store (memory-pro repair-scopes) and re-run.`);
+              }
+              continue;
+            }
+
             const entry: MemoryEntry = {
               id,
               text: String(row.text),
               vector,
               category: (row.category as any) || "other",
-              scope: (row.scope as string | undefined) || "global",
+              scope: rowScope,
               importance: (row.importance != null) ? Number(row.importance) : 0.7,
               timestamp: (row.timestamp != null) ? Number(row.timestamp) : Date.now(),
               metadata: typeof row.metadata === "string" ? row.metadata : "{}",
@@ -1948,7 +1962,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           }
         }
 
-        console.log(`Re-embed completed: ${imported} imported, ${skipped} skipped (processed=${processed}).`);
+        console.log(`Re-embed completed: ${imported} imported, ${skipped} skipped, ${scopeless} scope-less legacy row(s) left for repair-scopes (processed=${processed}).`);
       } catch (error) {
         console.error("Re-embed failed:", error);
         process.exit(1);
@@ -2223,8 +2237,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .command("repair-scopes")
     .description("Detect legacy NULL/blank-scope rows (invisible to scoped readers) and reassign them to an explicit scope")
     .option("--target-scope <scope>", "Scope assigned to legacy rows on --apply", "global")
+    .option("--allow-new-scope", "Allow a --target-scope that is not globally defined in scope config (built-in patterns like agent:<id> for an id this config has never seen)", false)
     .option("--apply", "Apply the reassignment (default: report only)", false)
-    .action(async (options: { targetScope: string; apply: boolean }) => {
+    .action(async (options: { targetScope: string; allowNewScope: boolean; apply: boolean }) => {
       try {
         // Validate through the normal scope validator up front: a typo here
         // would strand every repaired row in a scope no reader resolves,
@@ -2235,6 +2250,20 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
             `repair-scopes: invalid --target-scope "${options.targetScope}": not a defined scope or built-in pattern ` +
             "(global, agent:<id>, custom:<name>, project:<id>, user:<id>, reflection:agent:<id>). " +
             "Rows assigned to an unknown scope would be unreachable to every reader.",
+          );
+          process.exitCode = 1;
+          return;
+        }
+        // Format validation alone cannot catch a well-formed typo: "agent:mian"
+        // matches the agent:<id> built-in pattern, yet reassigned rows would
+        // sit in a scope no configured reader resolves AND stop being
+        // discoverable as legacy. Novel scopes need explicit intent.
+        const knownScopes = new Set(["global", ...context.scopeManager.getAllScopes()]);
+        if (!knownScopes.has(targetScope) && !options.allowNewScope) {
+          console.error(
+            `repair-scopes: --target-scope "${targetScope}" is well-formed but not defined in scope config. ` +
+            "A typo here would strand every repaired row in a scope no reader resolves, and the rows would no longer be discoverable as legacy. " +
+            "Pass --allow-new-scope to confirm this scope is intended.",
           );
           process.exitCode = 1;
           return;

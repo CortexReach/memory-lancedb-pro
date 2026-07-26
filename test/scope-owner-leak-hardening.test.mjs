@@ -977,6 +977,77 @@ describe("(h2) repair validates against the LATEST table version, not this handl
   });
 });
 
+describe("(h3) repair failure diagnostics and lifecycle", () => {
+  it("logs per-row reasons and aborts after consecutive systemic failures instead of hammering the lock", async () => {
+    const { store, dir } = makeStore();
+    try {
+      for (let i = 0; i < 15; i++) {
+        await seedLegacyRow(store, { id: `sys-fail-${String(i).padStart(2, "0")}`, text: `legacy row ${i}`, vector: [1, 0, 0], category: "fact", scope: null });
+      }
+      await store.ensureInitialized();
+      store.table.checkoutLatest = async () => { throw new Error("SYSTEMIC: version refresh unavailable"); };
+
+      const warnings = [];
+      const errors = [];
+      const originalWarn = console.warn;
+      const originalError = console.error;
+      console.warn = (...parts) => warnings.push(parts.join(" "));
+      console.error = (...parts) => errors.push(parts.join(" "));
+      let outcome;
+      try {
+        outcome = await store.repairLegacyScopes("global");
+      } finally {
+        console.warn = originalWarn;
+        console.error = originalError;
+      }
+
+      assert.equal(outcome.repaired, 0);
+      assert.equal(outcome.failed, 10, "the pass must abort after the consecutive-failure threshold, not run all 15 rows");
+      assert.ok(
+        warnings.some((w) => w.includes("SYSTEMIC: version refresh unavailable")),
+        "the per-row failure reason must be logged, not swallowed",
+      );
+      assert.ok(
+        errors.some((e) => e.includes("aborting after") && e.includes("unattempted")),
+        "the abort must announce itself and the unattempted remainder",
+      );
+      const remaining = await store.findLegacyScopeRows();
+      assert.equal(remaining.length, 15, "unattempted rows must remain legacy and discoverable for the next run");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a commit-then-reject add as repaired instead of rolling back into a duplicate id", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, { id: "commit-reject-row", text: "legacy commit-reject row", vector: [1, 0, 0], category: "fact", scope: null });
+      await store.ensureInitialized();
+      const realAdd = store.table.add.bind(store.table);
+      let armed = true;
+      store.table.add = async (rows) => {
+        const result = await realAdd(rows);
+        if (armed) {
+          armed = false;
+          throw new Error("post-commit step failed after the write landed");
+        }
+        return result;
+      };
+
+      const outcome = await store.repairLegacyScopes("global");
+
+      assert.equal(outcome.repaired, 1, "a write that landed must count as repaired even when the client saw an error");
+      assert.equal(outcome.failed, 0);
+      assert.equal(outcome.unrecovered.length, 0);
+      const rows = await store.table.query().where("id = 'commit-reject-row'").toArray();
+      assert.equal(rows.length, 1, "the row must not be duplicated by a blind rollback re-add");
+      assert.equal(rows[0].scope, "global");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("(i) repair-scopes command wiring", () => {
   function buildCliProgram(storeStubs) {
     const { createMemoryCLI } = jiti("../cli.ts");
@@ -1049,11 +1120,28 @@ describe("(i) repair-scopes command wiring", () => {
     assert.equal(discoveryCalls, 0, "validation happens before any store access");
   });
 
-  it("accepts built-in scope patterns such as agent:<id>", async () => {
+  it("requires --allow-new-scope for a well-formed scope the config has never defined", async () => {
+    let repairCalls = 0;
+    const withoutFlag = await runRepairScopes({
+      async findLegacyScopeRows() { return []; },
+      async repairLegacyScopes() { repairCalls += 1; return { repaired: 0, failed: 0, skipped: 0, unrecovered: [] }; },
+    }, ["--apply", "--target-scope", "agent:mian"]);
+    assert.equal(withoutFlag.exitCode, 1, "a well-formed but never-defined scope is exactly the typo shape (agent:mian)");
+    assert.match(withoutFlag.errors, /--allow-new-scope/, "the error must name the confirmation flag");
+    assert.equal(repairCalls, 0);
+
+    const withFlag = await runRepairScopes({
+      async findLegacyScopeRows() { return []; },
+      async repairLegacyScopes() { return { repaired: 0, failed: 0, skipped: 0, unrecovered: [] }; },
+    }, ["--apply", "--target-scope", "agent:live", "--allow-new-scope"]);
+    assert.notEqual(withFlag.exitCode, 1, "an explicitly confirmed novel scope must proceed");
+  });
+
+  it("the default global target needs no confirmation flag", async () => {
     const result = await runRepairScopes({
       async findLegacyScopeRows() { return []; },
       async repairLegacyScopes() { return { repaired: 0, failed: 0, skipped: 0, unrecovered: [] }; },
-    }, ["--apply", "--target-scope", "agent:live"]);
-    assert.notEqual(result.exitCode, 1, "a built-in pattern scope must validate");
+    }, ["--apply"]);
+    assert.notEqual(result.exitCode, 1, "global is always a defined destination");
   });
 });
