@@ -192,7 +192,16 @@ const FACTUAL_CANDIDATES = [
 describe("SmartExtractor grounding-aware extraction (Option A, v3)", () => {
   it("drops constructed candidates from a game transcript, keeping only the real session-events note", async () => {
     const store = makeStore();
-    const llm = makeLlm(GAME_CANDIDATES);
+    // The constructed siblings make this a contradiction batch, so the
+    // real-tagged events note is judge-gated: adjudication must be available
+    // for it to survive. The verdict below confirms exactly the note.
+    const llm = makeLlm(GAME_CANDIDATES, undefined, {
+      results: [
+        { index: 1, grounding: "constructed" },
+        { index: 2, grounding: "constructed" },
+        { index: 3, grounding: "real" },
+      ],
+    });
     const extractor = makeExtractor(makeEmbedder(), llm, store);
 
     const stats = await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
@@ -223,7 +232,17 @@ describe("SmartExtractor grounding-aware extraction (Option A, v3)", () => {
 
   it("keeps a genuine real first-person aside stated during play (false-positive guard)", async () => {
     const store = makeStore();
-    const llm = makeLlm([...GAME_CANDIDATES, REAL_ASIDE_CANDIDATE]);
+    // Same contradiction batch: both real-tagged events entries are judge-gated,
+    // and the verdict confirms both, so the guard still proves the real content
+    // is not over-dropped when adjudication is available.
+    const llm = makeLlm([...GAME_CANDIDATES, REAL_ASIDE_CANDIDATE], undefined, {
+      results: [
+        { index: 1, grounding: "constructed" },
+        { index: 2, grounding: "constructed" },
+        { index: 3, grounding: "real" },
+        { index: 4, grounding: "real" },
+      ],
+    });
     const extractor = makeExtractor(makeEmbedder(), llm, store);
 
     await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
@@ -250,6 +269,7 @@ describe("SmartExtractor grounding-aware extraction (Option A, v3)", () => {
     const stats = await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
 
     const metas = store.bulkStoreCalls.flat().map((e) => JSON.parse(e.metadata || "{}"));
+    assert.ok(metas.length > 0, "the confirmed real row must actually persist, so the invariant is not vacuous");
     assert.ok(metas.every((m) => m.grounding !== "constructed"), "no persisted row may carry grounding: constructed");
     assert.deepEqual(persistedCategories(store), ["events"], "only the real session-events note survives; every constructed-tagged candidate is dropped regardless of category");
     assert.equal(stats.created, 1);
@@ -514,7 +534,11 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
     // this shape now fires is unavailable — the pipeline must fail CLOSED and
     // demote the suspect durable exactly like the retired batch-wide wipe.
     assert.ok(!categories.includes("profile"), "real-tagged durable must be demoted when the rejudge is unavailable (fail-closed)");
-    assert.deepEqual(categories, ["events"], "only the real aside survives: the constructed plot event is dropped unconditionally (v3), profile demoted by the fail-closed fallback");
+    // Judge-gated categories (events) are adjudicated in a constructed-sibling
+    // batch too, not only under a fiction register, so with no judge available
+    // the real aside fails closed alongside the durable. The sibling test above
+    // supplies a verdict and shows the aside surviving on confirmation.
+    assert.deepEqual(categories, [], "with no adjudication available, the constructed sibling is dropped outright and both the durable and the judge-gated aside fail closed");
   });
 
   it("register 'real' trusts per-item tags when nothing contradicts them, and still drops a constructed-tagged item", async () => {
@@ -646,6 +670,101 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
     );
   });
 
+  // A real-tagged in-story event is the judge-gated shape, and events are not
+  // durable, so a contradiction cell keyed only on durables never fired for it:
+  // a constructed sibling plus a real-tagged plot event persisted the event with
+  // zero rejudge calls. Judge-gated categories now arm those cells too, and need
+  // a positive verdict before persisting whenever a constructed sibling is present.
+  const MISTAGGED_PLOT_EVENT = {
+    category: "events",
+    abstract: "the captain surrendered the cargo hold",
+    overview: "## In-story plot beat\n- Cargo hold surrendered",
+    content: "In the roleplay, the captain surrendered the cargo hold to the boarding party.",
+    grounding: "real",
+  };
+  const CONSTRUCTED_SIBLING = {
+    category: "cases",
+    abstract: "the pirate crew negotiated a ransom",
+    overview: "## In-story detail\n- Ransom negotiated",
+    content: "In the roleplay, the pirate crew negotiated a ransom for the cargo.",
+    grounding: "constructed",
+  };
+
+  it("an asserted-real batch with a constructed sibling adjudicates a real-tagged in-story event", async () => {
+    const store = makeStore();
+    const llm = makeLlm([MISTAGGED_PLOT_EVENT, CONSTRUCTED_SIBLING], "real");
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    assert.ok(
+      !persistedCategories(store).includes("events"),
+      "an unconfirmed real-tagged event beside a constructed sibling must not persist",
+    );
+  });
+
+  it("an omitted register with a constructed sibling adjudicates a real-tagged in-story event", async () => {
+    const store = makeStore();
+    const llm = makeLlm([MISTAGGED_PLOT_EVENT, CONSTRUCTED_SIBLING]);
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    assert.ok(
+      !persistedCategories(store).includes("events"),
+      "a legacy payload carrying the same contradiction must adjudicate too",
+    );
+  });
+
+  it("a judge that confirms the event keeps it, so the cell adjudicates rather than wipes", async () => {
+    const store = makeStore();
+    const llm = makeLlm([MISTAGGED_PLOT_EVENT, CONSTRUCTED_SIBLING], "real", {
+      conversation_register: "real",
+      results: [
+        { index: 1, grounding: "real" },
+        { index: 2, grounding: "constructed" },
+      ],
+    });
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    assert.ok(
+      persistedCategories(store).includes("events"),
+      "a positively confirmed event must survive",
+    );
+  });
+
+  it("a decorated first-pass grounding is read as its token, not as permissive real", async () => {
+    const store = makeStore();
+    const decorated = { ...CONSTRUCTED_PLOT_EVENT, grounding: "constructed (in-story)" };
+    const llm = makeLlm([decorated], "real");
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    assert.deepEqual(
+      persistedCategories(store),
+      [],
+      "a decorated constructed tag must not fail open into a stored real memory",
+    );
+  });
+
+  it("a decorated first-pass register keeps its scrutiny level", async () => {
+    const store = makeStore();
+    // "fiction (roleplay)" previously fell through to mixed, which does not drop
+    // durables, so decorating the register relaxed the strictest gate.
+    const llm = makeLlm([MISLABELED_FICTION_CANDIDATES[0]], "fiction (roleplay)");
+    const extractor = makeExtractor(makeEmbedder(), llm, store);
+
+    await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
+
+    assert.ok(
+      !persistedCategories(store).includes("profile"),
+      "a decorated fiction register must still drop durable candidates",
+    );
+  });
+
   it("a numeric-string index is normalized, not treated as malformed", async () => {
     const store = makeStore();
     const llm = makeLlm([FACTUAL_CANDIDATES[0], CONSTRUCTED_PLOT_EVENT], "real", {
@@ -742,10 +861,10 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
     const categories = persistedCategories(store);
     assert.deepEqual(
       categories,
-      ["events"],
-      "a constructed sibling arms the wipe even when conversation_register is missing entirely",
+      [],
+      "a constructed sibling arms the wipe even when conversation_register is missing entirely, and with no adjudication available the judge-gated aside fails closed with it",
     );
-    assert.equal(stats.created, 1);
+    assert.equal(stats.created, 0);
   });
 
   it("propagates grounding and conversation_register into stored metadata", async () => {
