@@ -365,3 +365,80 @@ describe("Unattributable sessionKey — no main masquerade, no mirroring", () =>
     );
   });
 });
+
+describe("Group-chat reflection toggle (memoryReflection.includeGroupChats)", () => {
+  let workDir;
+
+  beforeEach(() => {
+    workDir = mkdtempSync(path.join(tmpdir(), "cmd-reflect-group-"));
+    resetRegistration();
+  });
+
+  afterEach(() => {
+    resetRegistration();
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  async function invokeWithConfig(sessionKey, includeGroupChats) {
+    const pluginConfig = makePluginConfig(workDir);
+    if (includeGroupChats !== undefined) {
+      pluginConfig.memoryReflection.includeGroupChats = includeGroupChats;
+    }
+    const harness = createPluginApiHarness({ resolveRoot: workDir, pluginConfig });
+    memoryLanceDBProPlugin.register(harness.api);
+
+    const hooks = harness.eventHandlers.get("command:new") || [];
+    assert.ok(hooks.length > 0, "expected a command:new hook");
+    const event = {
+      sessionKey,
+      action: "command:new",
+      context: {
+        cfg: harness.api.pluginConfig,
+        sessionEntry: { sessionId: "test-session", sessionFile: undefined },
+      },
+    };
+    Object.defineProperty(event.context, "agentId", {
+      value: "main",
+      writable: true,
+      enumerable: true,
+    });
+    await hooks[0].handler(event, { sessionKey, agentId: "main" });
+    return harness.logs;
+  }
+
+  const groupKey = "agent:main:slack:group:g0example1";
+  const channelKey = "agent:main:slack:channel:c0example1";
+  const dmKey = "agent:main:main";
+
+  it("skips reflection generation for a :group: session when disabled", async () => {
+    const logs = await invokeWithConfig(groupKey, false);
+    assert.ok(
+      logs.some(([, msg]) => msg.includes("group-chat reflection disabled")),
+      "the hook must log the group-chat toggle skip",
+    );
+  });
+
+  it("skips reflection generation for a :channel: session when disabled", async () => {
+    const logs = await invokeWithConfig(channelKey, false);
+    assert.ok(
+      logs.some(([, msg]) => msg.includes("group-chat reflection disabled")),
+      "the hook must log the group-chat toggle skip for channel keys",
+    );
+  });
+
+  it("still reflects non-group sessions when the toggle is disabled", async () => {
+    const logs = await invokeWithConfig(dmKey, false);
+    assert.ok(
+      !logs.some(([, msg]) => msg.includes("group-chat reflection disabled")),
+      "a non-group session must not trip the group-chat toggle",
+    );
+  });
+
+  it("keeps group-chat reflection enabled by default", async () => {
+    const logs = await invokeWithConfig(groupKey, undefined);
+    assert.ok(
+      !logs.some(([, msg]) => msg.includes("group-chat reflection disabled")),
+      "the default (toggle absent) must not skip group sessions",
+    );
+  });
+});
