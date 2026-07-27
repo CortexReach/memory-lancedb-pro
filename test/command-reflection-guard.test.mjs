@@ -9,7 +9,7 @@
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "os";
 import path from "path";
 import { fileURLToPath } from "node:url";
@@ -310,5 +310,58 @@ describe("runMemoryReflection — invalid agentId guard", () => {
         `old-session reflection should not be suppressed by the fresh empty-session guard; got ${JSON.stringify(harness.logs)}`,
       );
     });
+  });
+});
+
+describe("Unattributable sessionKey — no main masquerade, no mirroring", () => {
+  let workDir;
+
+  beforeEach(() => {
+    workDir = mkdtempSync(path.join(tmpdir(), "cmd-reflect-unattr-"));
+    resetRegistration();
+  });
+
+  afterEach(() => {
+    resetRegistration();
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("skips reflection entirely for a non-agent sessionKey even with mdMirror enabled", async () => {
+    const mirrorDir = path.join(workDir, "md-mirror");
+    const harness = createPluginApiHarness({
+      resolveRoot: workDir,
+      pluginConfig: {
+        ...makePluginConfig(workDir),
+        mdMirror: { enabled: true, dir: mirrorDir },
+      },
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+
+    const hooks = harness.eventHandlers.get("command:new") || [];
+    assert.ok(hooks.length > 0, "expected a command:new hook");
+
+    const sessionKey = "webchat:room:synthetic-1";
+    const event = {
+      sessionKey,
+      action: "command:new",
+      context: {
+        cfg: harness.api.pluginConfig,
+        sessionEntry: { sessionId: "test-session", sessionFile: undefined },
+      },
+    };
+    await hooks[0].handler(event, { sessionKey, agentId: undefined });
+
+    assert.ok(
+      harness.logs.some(([, msg]) => msg.includes("unattributable sessionKey")),
+      "the hook must log the unattributable skip",
+    );
+    assert.ok(
+      !harness.logs.some(([, msg]) => msg.includes('agentId=main') || msg.includes('agent "main"')),
+      "no path may fall back to the main agent identity",
+    );
+    assert.ok(
+      !existsSync(mirrorDir) || readdirSync(mirrorDir).length === 0,
+      "mdMirror must not write anything for an unattributable session",
+    );
   });
 });

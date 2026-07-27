@@ -257,11 +257,19 @@ export function buildAutoRecallRerankCostWarning(config, retrievalConfig = norma
 function resolveLlmTimeoutMs(config) {
     return parsePositiveInt(config.llm?.timeoutMs) ?? 30000;
 }
+/**
+ * Hook identity: an explicit agent id, else the id parsed out of the session
+ * key, else NULL. There is deliberately no "main" fallback. A synthesized
+ * identity passes agent-id validation (main is a declared agent) and then
+ * resolves MAIN's scopes, so an unattributable session would read and write
+ * main's private content. Callers must skip agent-specific work on null.
+ */
 function resolveHookAgentId(explicitAgentId, sessionKey) {
     const trimmedExplicit = explicitAgentId?.trim();
-    return (trimmedExplicit && trimmedExplicit.length > 0
-        ? trimmedExplicit
-        : parseAgentIdFromSessionKey(sessionKey)) || "main";
+    if (trimmedExplicit && trimmedExplicit.length > 0)
+        return trimmedExplicit;
+    const fromSessionKey = parseAgentIdFromSessionKey(sessionKey)?.trim();
+    return fromSessionKey && fromSessionKey.length > 0 ? fromSessionKey : null;
 }
 // Detect when agentId came from a chat_id / user: source (e.g. "657229412030480397").
 // These are numeric Discord/Telegram IDs mistakenly used as agent IDs and cause
@@ -2484,7 +2492,7 @@ const memoryLanceDBProPlugin = {
                 // - If autoRecallIncludeAgents is set: ONLY these agents receive auto-recall
                 // - Else if autoRecallExcludeAgents is set: all agents EXCEPT these receive auto-recall
                 const agentId = resolveHookAgentId(ctx?.agentId, event.sessionKey);
-                if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+                if (!agentId || isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
                     api.logger.debug?.(`memory-lancedb-pro: auto-recall skipped \u2014 invalid agentId format '${agentId}'`);
                     return;
                 }
@@ -2528,7 +2536,7 @@ const memoryLanceDBProPlugin = {
                 const recallWork = async () => {
                     // Determine agent ID and accessible scopes
                     const agentId = resolveHookAgentId(ctx?.agentId, event.sessionKey);
-                    if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+                    if (!agentId || isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
                         api.logger.debug?.(`memory-lancedb-pro: auto-recall skip \u2014 invalid agentId '${agentId}'`);
                         return undefined;
                     }
@@ -2893,7 +2901,7 @@ const memoryLanceDBProPlugin = {
                         }
                         // Determine agent ID and default scope
                         const agentId = resolveHookAgentId(ctx?.agentId, event.sessionKey);
-                        if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+                        if (!agentId || isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
                             api.logger.debug(`memory-lancedb-pro: auto-capture skip \u2014 invalid agentId '${agentId}'`);
                             return;
                         }
@@ -3176,7 +3184,9 @@ const memoryLanceDBProPlugin = {
                         // trigger the store.store() fallback (which would create duplicate rows).
                         if (capturedEntries.length > 0) {
                             try {
-                                await store.bulkStore(capturedEntries);
+                                await store.bulkStore(capturedEntries, ({ index, reason }) => {
+                                    api.logger.warn(`memory-lancedb-pro: auto-capture bulkStore dropped entry ${index}: ${reason}`);
+                                });
                                 api.logger.info(`memory-lancedb-pro: auto-captured ${capturedEntries.length} memories for agent ${agentId} in scope ${defaultScope} (bulkStore)`);
                             }
                             catch (err) {
@@ -3543,7 +3553,7 @@ const memoryLanceDBProPlugin = {
                 try {
                     pruneReflectionSessionState();
                     const agentId = resolveHookAgentId(typeof ctx.agentId === "string" ? ctx.agentId : undefined, sessionKey);
-                    if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+                    if (!agentId || isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
                         api.logger.debug?.(`memory-lancedb-pro: reflection inheritance skip \u2014 invalid agentId '${agentId}'`);
                         return;
                     }
@@ -3574,7 +3584,7 @@ const memoryLanceDBProPlugin = {
                 if (isInternalReflectionSessionKey(sessionKey))
                     return;
                 const agentId = resolveHookAgentId(typeof ctx.agentId === "string" ? ctx.agentId : undefined, sessionKey);
-                if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+                if (!agentId || isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
                     api.logger.debug?.(`memory-lancedb-pro: reflection derived+error skip \u2014 invalid agentId '${agentId}'`);
                     return;
                 }
@@ -3673,7 +3683,21 @@ const memoryLanceDBProPlugin = {
                 const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {});
                 const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
                 let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
-                const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
+                const parsedAgentId = parseAgentIdFromSessionKey(sessionKey);
+                // An unattributable sessionKey must not masquerade as "main": that fallback
+                // used to drive main-specific session recovery, reflection execution, event
+                // identity, and mdMirror writes into the main agent's workspace. No validated
+                // identity means no agent-specific work at all.
+                if (!parsedAgentId) {
+                    api.logger.info(`memory-reflection: command:${action} skipped (unattributable sessionKey=${sessionKey ?? "(none)"}); no agent identity, skipping recovery/execution/persistence/mirroring`);
+                    return;
+                }
+                const sourceAgentId = parsedAgentId;
+                // Ownership written into persisted reflection metadata must never be minted as
+                // "main" when the sessionKey fails to resolve to a real agent, that would silently
+                // misattribute the reflection to (and make it inheritable by) an unrelated agent.
+                // isOwnedByAgent() treats an empty owner as non-inheritable.
+                const ownerAgentId = parsedAgentId;
                 const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
                 if (isSessionBoundaryReflectionAction(action)) {
                     const now = Date.now();
@@ -3806,9 +3830,11 @@ const memoryLanceDBProPlugin = {
                     const timeHms = timeIso.split(".")[0];
                     const timeCompact = timeIso.replace(/[:.]/g, "");
                     const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
-                    const targetScope = isSystemBypassId(sourceAgentId)
-                        ? config.scopes?.default ?? "global"
-                        : scopeManager.getDefaultScope(sourceAgentId);
+                    // Attribution is guaranteed here: the unattributable-sessionKey early
+                    // return above skips reflection outright (quarantine-by-skip), and
+                    // parseAgentIdFromSessionKey rejects bypass ids, so sourceAgentId is
+                    // always a real agent and its default scope is the only destination.
+                    const targetScope = scopeManager.getDefaultScope(sourceAgentId);
                     const toolErrorSignals = sessionKey
                         ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
                         : [];
@@ -3985,7 +4011,7 @@ const memoryLanceDBProPlugin = {
                         const baseMetadata = buildReflectionMappedMetadata({
                             mappedItem: mapped,
                             eventId: reflectionEventId,
-                            agentId: sourceAgentId,
+                            agentId: ownerAgentId,
                             sessionKey,
                             sessionId: currentSessionId || "unknown",
                             runAt: nowTs,
@@ -4009,7 +4035,9 @@ const memoryLanceDBProPlugin = {
                         });
                     }
                     if (mappedEntries.length > 0) {
-                        const storedEntries = await store.bulkStore(mappedEntries);
+                        const storedEntries = await store.bulkStore(mappedEntries, ({ index, reason }) => {
+                            api.logger.warn(`memory-lancedb-pro: import bulkStore dropped entry ${index}: ${reason}`);
+                        });
                         if (mdMirror) {
                             for (const stored of storedEntries) {
                                 // retrieve heading from metadata JSON — critical when bulkStore filters entries
@@ -4031,7 +4059,7 @@ const memoryLanceDBProPlugin = {
                             reflectionText,
                             sessionKey,
                             sessionId: currentSessionId || "unknown",
-                            agentId: sourceAgentId,
+                            agentId: ownerAgentId,
                             command: String(event.action || "unknown"),
                             scope: targetScope,
                             toolErrorSignals,
@@ -4174,7 +4202,7 @@ const memoryLanceDBProPlugin = {
                 try {
                     const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
                     const agentId = resolveHookAgentId(typeof ctx.agentId === "string" ? ctx.agentId : undefined, sessionKey);
-                    if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+                    if (!agentId || isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
                         api.logger.debug?.(`session-memory [before_reset]: skip \u2014 invalid agentId '${agentId}'`);
                         return;
                     }
@@ -4215,6 +4243,10 @@ const memoryLanceDBProPlugin = {
                 catch (err) {
                     const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
                     const agentId = resolveHookAgentId(typeof ctx.agentId === "string" ? ctx.agentId : undefined, sessionKey);
+                    if (!agentId) {
+                        api.logger.warn(`session-memory: failed to save: ${String(err)}`);
+                        return;
+                    }
                     const defaultScope = isSystemBypassId(agentId)
                         ? config.scopes?.default ?? "global"
                         : scopeManager.getDefaultScope(agentId);

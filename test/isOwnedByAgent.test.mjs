@@ -3,7 +3,10 @@ import { describe, it } from "node:test";
 import assert from "node:assert";
 
 // Import from production source — NOT a local copy
-import { isOwnedByAgent } from "../src/reflection-store.ts";
+import jitiFactory from "jiti";
+
+const jiti = jitiFactory(import.meta.url, { interopDefault: true });
+const { isOwnedByAgent } = jiti("../src/reflection-store.ts");
 
 describe("isOwnedByAgent — derived ownership fix (Issue #448)", () => {
   describe("itemKind === 'derived' (memory-reflection-item)", () => {
@@ -26,8 +29,8 @@ describe("isOwnedByAgent — derived ownership fix (Issue #448)", () => {
   });
 
   describe("itemKind === 'invariant' (maintain fallback)", () => {
-    it("main's invariant -> sub-agent visible", () => {
-      assert.strictEqual(isOwnedByAgent({ itemKind: "invariant", agentId: "main" }, "sub-agent-A"), true);
+    it("main's invariant -> sub-agent NOT visible (hardening: no more universal main inheritance)", () => {
+      assert.strictEqual(isOwnedByAgent({ itemKind: "invariant", agentId: "main" }, "sub-agent-A"), false);
     });
     it("agent-x's invariant -> agent-x visible", () => {
       assert.strictEqual(isOwnedByAgent({ itemKind: "invariant", agentId: "agent-x" }, "agent-x"), true);
@@ -38,8 +41,8 @@ describe("isOwnedByAgent — derived ownership fix (Issue #448)", () => {
   });
 
   describe("legacy / mapped (no itemKind — maintain fallback)", () => {
-    it("main legacy -> sub-agent visible", () => {
-      assert.strictEqual(isOwnedByAgent({ agentId: "main" }, "sub-agent-A"), true);
+    it("main legacy -> sub-agent NOT visible (hardening: no more universal main inheritance)", () => {
+      assert.strictEqual(isOwnedByAgent({ agentId: "main" }, "sub-agent-A"), false);
     });
     it("agent-x legacy -> agent-x visible", () => {
       assert.strictEqual(isOwnedByAgent({ agentId: "agent-x" }, "agent-x"), true);
@@ -66,7 +69,8 @@ describe("isOwnedByAgent — derived ownership fix (Issue #448)", () => {
   describe("itemKind undefined（不存在 → legacy fallback 相容）", () => {
     // itemKind 不存在（undefined）等同 legacy/mapped row，維持原本的 main fallback 行為
     it("itemKind = undefined → 走 legacy fallback（main → sub 看得見）", () => {
-      assert.strictEqual(isOwnedByAgent({ itemKind: undefined, agentId: "main" }, "sub-agent-A"), true);
+      // hardening: main no longer has universal inheritance over sub-agents (was: true)
+      assert.strictEqual(isOwnedByAgent({ itemKind: undefined, agentId: "main" }, "sub-agent-A"), false);
     });
   });
 });

@@ -14,6 +14,7 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/config-session-strategy-migration.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/scope-access-undefined.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/reflection-bypass-hook.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/reflection-unattributed-session-read.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-scope-filter.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/store-empty-scope-filter.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/store-write-queue.test.mjs", args: ["--test"] },
@@ -114,6 +115,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/reflection-mapped-rows-admission.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/reflection-embed-transient-retry.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-metadata-source-classification.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/scope-owner-leak-hardening.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/isOwnedByAgent.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

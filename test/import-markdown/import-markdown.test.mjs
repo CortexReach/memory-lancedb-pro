@@ -270,7 +270,7 @@ describe("import-markdown CLI", () => {
       assert.match(output, /\[skip\] too short \[logging-summary-test\]: no/);
       assert.match(output, /\[skip\] dedup \[logging-summary-test\]: Duplicate log entry/);
       assert.match(output, /\[import\] embedded batch 1 \(1 entries\)/);
-      assert.match(output, /\[import\] stored batch 1 \(1 entries, total: 1\)/);
+      assert.match(output, /\[import\] stored batch 1 \(1\/1 entries, total: 1\)/);
       assert.match(output, /Memory Import Status:/);
       assert.match(output, /• Files found: 1/);
       assert.match(output, /• Entries processed: 3/);

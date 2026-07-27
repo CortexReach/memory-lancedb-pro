@@ -375,7 +375,8 @@ export function isOwnedByAgent(metadata, agentId) {
     const itemKind = metadata.itemKind;
     // itemKind 只存在於 memory-reflection-item（derived | invariant）
     // legacy (memory-reflection) 和 mapped (memory-reflection-mapped) 沒有 itemKind（為 undefined）
-    // 因此 undefined !== "derived"，會走 main fallback（維護相容性）
+    // therefore undefined !== "derived", falls through to the legacy/invariant branch
+    // below, which now requires an exact owner match (no more universal main fallback)
     // 若是 derived 項目（memory-reflection-item）：不做 main fallback，
     //   且 derived 不允許空白 owner（空白 owner 的 derived 應完全不可見，防止洩漏）
     // itemKind 必須是 string type，否則會錯誤進入 derived 分支
@@ -390,16 +391,20 @@ export function isOwnedByAgent(metadata, agentId) {
             return owner === agentId;
         }
         // itemKind 是字串，但既不是 "derived" 也不是 "invariant"（malformed）→ fail closed
-        // invariant 走下面 legacy fallback 相容路徑（允許 main fallback）
+        // invariant falls through to the legacy fallback path below, which now
+        // requires an exact owner match (no more universal main fallback)
     }
     else if (itemKind !== undefined) {
         // itemKind 存在但不是 string（null / number / object 等）→ fail closed
         return false;
     }
-    // Invariant / legacy / mapped / undefined itemKind：允許空的 owner 通行，維護舊的 main fallback
+    // Invariant / legacy / mapped / undefined itemKind: blank owner and legacy "main"
+    // attribution are no longer treated as universally inheritable. Ownership must match
+    // the requesting agent exactly; blank/legacy rows without a real owner are not
+    // inheritable by anyone (prevents leaking pre-ownership rows to every agent).
     if (!owner)
-        return true;
-    return owner === agentId || owner === "main";
+        return false;
+    return owner === agentId;
 }
 function toStringArray(value) {
     if (!Array.isArray(value))
