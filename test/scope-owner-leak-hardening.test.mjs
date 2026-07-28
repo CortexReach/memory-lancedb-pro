@@ -1145,3 +1145,142 @@ describe("(i) repair-scopes command wiring", () => {
     assert.notEqual(result.exitCode, 1, "global is always a defined destination");
   });
 });
+
+describe("(j) repair-scopes unrecovered reporting follow-ups", () => {
+  function buildRecoveryCliProgram(storeStubs) {
+    const { createMemoryCLI } = jiti("../cli.ts");
+    const { createScopeManager } = jiti("../src/scopes.ts");
+    const program = new Command();
+    program.exitOverride();
+    createMemoryCLI({ store: storeStubs, retriever: {}, scopeManager: createScopeManager(), migrator: {} })({ program });
+    return program;
+  }
+
+  async function runRepairScopes(storeStubs, extraArgs = []) {
+    const program = buildRecoveryCliProgram(storeStubs);
+    const logs = [];
+    const errors = [];
+    const originalLog = console.log;
+    const originalError = console.error;
+    const priorExitCode = process.exitCode;
+    console.log = (...parts) => logs.push(parts.join(" "));
+    console.error = (...parts) => errors.push(parts.join(" "));
+    let exitCode;
+    try {
+      await program.parseAsync(["node", "cli", "memory-pro", "repair-scopes", ...extraArgs]);
+    } finally {
+      exitCode = process.exitCode;
+      process.exitCode = priorExitCode;
+      console.log = originalLog;
+      console.error = originalError;
+    }
+    return { logs: logs.join("\n"), errors: errors.join("\n"), exitCode };
+  }
+
+  it("a rollback write that persists but still errors is not reported unrecovered", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, {
+        id: "55555555-5555-4555-8555-555555555555",
+        text: "legacy row whose rollback commits and still errors",
+        vector: [0.1, 0.2, 0.3],
+        category: "fact",
+        scope: null,
+      });
+
+      const originalAdd = store.table.add.bind(store.table);
+      let call = 0;
+      store.table.add = async (rows) => {
+        call += 1;
+        if (call === 1) {
+          // Replacement write: fail without landing anything.
+          throw new Error("synthetic replacement add failure");
+        }
+        // Rollback write: commit-then-reject — persist the rows, then error.
+        await originalAdd(rows);
+        throw new Error("synthetic rollback commit-then-reject");
+      };
+
+      const result = await store.repairLegacyScopes("global");
+      assert.equal(result.repaired, 0);
+      assert.equal(result.failed, 1, "the repair itself still counts as failed");
+      assert.equal(
+        result.unrecovered.length,
+        0,
+        "a rollback that actually persisted must not be reported as unrecovered",
+      );
+
+      const legacy = await store.findLegacyScopeRows();
+      assert.ok(
+        legacy.some((row) => row.id === "55555555-5555-4555-8555-555555555555"),
+        "the rolled-back row must still exist as a legacy NULL-scope row",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes unrecovered rows to a recovery file and keeps full row content off stderr", async () => {
+    const { mkdtempSync, readFileSync, existsSync, readdirSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const workDir = mkdtempSync(join(tmpdir(), "repair-recovery-"));
+    try {
+      const dbPath = join(workDir, "db");
+      const lostRow = {
+        id: "66666666-6666-4666-8666-666666666666",
+        text: "sensitive memory text that must stay out of shared logs",
+        vector: [0.11, 0.22, 0.33, 0.44],
+        category: "fact",
+        scope: "global",
+        metadata: JSON.stringify({ agentId: "agent-one" }),
+      };
+      const { errors, exitCode } = await runRepairScopes({
+        dbPath,
+        async findLegacyScopeRows() { return [{ id: lostRow.id, text: lostRow.text }]; },
+        async repairLegacyScopes() { return { repaired: 0, failed: 1, skipped: 0, unrecovered: [lostRow] }; },
+      }, ["--apply"]);
+
+      assert.equal(exitCode, 1);
+      assert.match(errors, /Full row content saved to /);
+      assert.match(errors, /66666666\s+scope=global\s+sensitive memory text/);
+      assert.ok(!errors.includes('"vector"'), "stderr must not carry the raw JSON row dump when the recovery file was written");
+
+      const recoveryFile = readdirSync(workDir).find((name) => name.startsWith("db-unrecovered-") && name.endsWith(".json"));
+      assert.ok(recoveryFile, `expected a recovery file next to the db path, saw: ${readdirSync(workDir).join(", ")}`);
+      assert.ok(existsSync(join(workDir, recoveryFile)));
+      const saved = JSON.parse(readFileSync(join(workDir, recoveryFile), "utf8"));
+      assert.equal(saved.length, 1);
+      assert.deepEqual(saved[0], lostRow, "the recovery file must preserve the complete row, vector included");
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the full stderr dump when the recovery file cannot be written", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const workDir = mkdtempSync(join(tmpdir(), "repair-recovery-fallback-"));
+    try {
+      const dbPath = join(workDir, "missing-parent", "nested", "db");
+      const lostRow = {
+        id: "77777777-7777-4777-8777-777777777777",
+        text: "row preserved via the stderr fallback",
+        vector: [0.5, 0.6],
+        category: "fact",
+        scope: "global",
+        metadata: "{}",
+      };
+      const { errors, exitCode } = await runRepairScopes({
+        dbPath,
+        async findLegacyScopeRows() { return [{ id: lostRow.id, text: lostRow.text }]; },
+        async repairLegacyScopes() { return { repaired: 0, failed: 1, skipped: 0, unrecovered: [lostRow] }; },
+      }, ["--apply"]);
+
+      assert.equal(exitCode, 1);
+      assert.match(errors, /recovery file could not be written/);
+      assert.ok(errors.includes(JSON.stringify(lostRow)), "the fallback must dump the complete row so the data is not lost");
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+});

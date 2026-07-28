@@ -3063,10 +3063,23 @@ export class MemoryStore {
               try {
                 await this.table!.add([{ ...row }]);
               } catch {
-                // Both the replacement and the rollback write failed after the
-                // delete, so the row is no longer in the table. Surface its full
-                // content to the caller instead of silently losing the data.
-                unrecovered.push({ ...row });
+                // The rollback write shares the replacement add's
+                // commit-then-reject hazard: it can persist and still error.
+                // Confirm absence before declaring the row lost; a failed
+                // confirmation read stays fail-closed and still reports it.
+                let rolledBack = false;
+                try {
+                  const rollbackRows = await this.table!.query().where(`id = '${safeId}'`).limit(1).toArray();
+                  rolledBack = rollbackRows.length > 0;
+                } catch {
+                  rolledBack = false;
+                }
+                if (!rolledBack) {
+                  // Both writes genuinely failed after the delete, so the row
+                  // is no longer in the table. Surface its full content to the
+                  // caller instead of silently losing the data.
+                  unrecovered.push({ ...row });
+                }
               }
             }
             throw addError;
