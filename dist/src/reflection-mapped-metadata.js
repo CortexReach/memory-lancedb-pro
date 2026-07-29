@@ -1,3 +1,4 @@
+import { getStorageCategoryForMemoryCategory, } from "./memory-categories.js";
 const REFLECTION_MAPPED_DECAY_DEFAULTS = {
     decision: { midpointDays: 45, k: 0.25, baseWeight: 1.1, quality: 1 },
     "user-model": { midpointDays: 21, k: 0.3, baseWeight: 1, quality: 0.95 },
@@ -28,6 +29,17 @@ const REFLECTION_MAPPED_MEMORY_CATEGORY = {
 };
 export function getReflectionMappedMemoryCategory(kind) {
     return REFLECTION_MAPPED_MEMORY_CATEGORY[kind];
+}
+/**
+ * The stored row's `category` column speaks the legacy storage vocabulary
+ * (MemoryEntry["category"]); the six-category taxonomy value lives only in
+ * `metadata.memory_category`. Deriving the column through the central
+ * smart-to-storage mapping keeps every direct consumer of the column
+ * (compaction's plurality vote, read-time reverse mapping, category filters)
+ * on values it actually understands.
+ */
+export function getReflectionMappedStorageCategory(kind) {
+    return getStorageCategoryForMemoryCategory(REFLECTION_MAPPED_MEMORY_CATEGORY[kind]);
 }
 export function buildReflectionMappedMetadata(params) {
     const defaults = getReflectionMappedDecayDefaults(params.mappedItem.mappedKind);

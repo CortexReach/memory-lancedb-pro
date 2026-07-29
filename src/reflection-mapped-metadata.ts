@@ -1,5 +1,9 @@
 import type { ReflectionMappedMemoryItem } from "./reflection-slices.js";
-import type { MemoryCategory } from "./memory-categories.js";
+import {
+  getStorageCategoryForMemoryCategory,
+  type MemoryCategory,
+  type SmartStorageCategory,
+} from "./memory-categories.js";
 import type { MemorySource } from "./smart-metadata.js";
 
 export type ReflectionMappedKind = "user-model" | "agent-model" | "lesson" | "decision";
@@ -78,6 +82,20 @@ const REFLECTION_MAPPED_MEMORY_CATEGORY: Record<ReflectionMappedKind, MemoryCate
 
 export function getReflectionMappedMemoryCategory(kind: ReflectionMappedKind): MemoryCategory {
   return REFLECTION_MAPPED_MEMORY_CATEGORY[kind];
+}
+
+/**
+ * The stored row's `category` column speaks the legacy storage vocabulary
+ * (MemoryEntry["category"]); the six-category taxonomy value lives only in
+ * `metadata.memory_category`. Deriving the column through the central
+ * smart-to-storage mapping keeps every direct consumer of the column
+ * (compaction's plurality vote, read-time reverse mapping, category filters)
+ * on values it actually understands.
+ */
+export function getReflectionMappedStorageCategory(
+  kind: ReflectionMappedKind,
+): SmartStorageCategory {
+  return getStorageCategoryForMemoryCategory(REFLECTION_MAPPED_MEMORY_CATEGORY[kind]);
 }
 
 export function buildReflectionMappedMetadata(params: {

@@ -36,13 +36,16 @@ function makeStore(rows) {
   return {
     rows,
     updates,
-    async list() {
-      return rows;
+    async list(_scopeFilter, _category, limit = 20, offset = 0) {
+      return rows.slice(offset, offset + limit);
     },
     async update(id, patch) {
       updates.push({ id, patch });
       const row = rows.find((r) => r.id === id);
-      if (row) row.metadata = patch.metadata ?? row.metadata;
+      if (row) {
+        row.metadata = patch.metadata ?? row.metadata;
+        row.category = patch.category ?? row.category;
+      }
       return true;
     },
   };
@@ -164,5 +167,76 @@ describe("memory-pro upgrade: mapped-row category normalization", () => {
 
     await upgrader.normalizeMappedRowCategories({ scopeFilter: ["global"] });
     assert.deepEqual(capturedScope, ["global"]);
+  });
+
+  it("pages the whole store instead of stopping at a single fixed-size page", async () => {
+    const rows = ["a", "b", "c", "d", "e"].map((suffix) => mappedRow(`decision-${suffix}`, "decision"));
+    const store = makeStore(rows);
+    const seenPages = [];
+    const originalList = store.list.bind(store);
+    store.list = async (scopeFilter, category, limit, offset) => {
+      seenPages.push({ limit, offset });
+      return originalList(scopeFilter, category, limit, offset);
+    };
+    const upgrader = createMemoryUpgrader(store, null, { log: () => {} });
+
+    const result = await upgrader.normalizeMappedRowCategories({ pageSize: 2 });
+
+    assert.equal(result.totalMapped, 5);
+    assert.equal(result.normalized, 5);
+    assert.deepEqual(
+      seenPages,
+      [
+        { limit: 2, offset: 0 },
+        { limit: 2, offset: 2 },
+        { limit: 2, offset: 4 },
+      ],
+      "the scan must keep requesting pages until a short page signals the end",
+    );
+  });
+
+  it("repairs a six-category value left in the storage column even when the stamp is already correct", async () => {
+    // Pre-contract-fix builds wrote the six-category vocabulary straight into
+    // the legacy-typed column. The backfill must move the column back to the
+    // legacy storage vocabulary while keeping the stamp.
+    const row = mappedRow("agent-model-sixcat", "agent-model", { memory_category: "patterns" });
+    row.category = "patterns";
+    const store = makeStore([row]);
+    const upgrader = createMemoryUpgrader(store, null, { log: () => {} });
+
+    const result = await upgrader.normalizeMappedRowCategories();
+
+    assert.equal(result.normalized, 1);
+    assert.equal(store.updates.length, 1);
+    assert.equal(store.updates[0].patch.category, "other");
+    assert.equal(row.category, "other");
+    assert.equal(JSON.parse(row.metadata).memory_category, "patterns");
+  });
+
+  it("builds each patch from a fresh read so concurrent metadata writes survive", async () => {
+    const staleRow = mappedRow("decision-stale", "decision");
+    const store = makeStore([staleRow]);
+    // Simulate a concurrent writer landing between the scan and the write:
+    // getById serves a newer metadata face carrying a bumped access counter.
+    store.getById = async (id) => {
+      const row = store.rows.find((r) => r.id === id);
+      if (!row) return null;
+      return {
+        ...row,
+        metadata: JSON.stringify({ ...JSON.parse(row.metadata), access_count: 7 }),
+      };
+    };
+    const upgrader = createMemoryUpgrader(store, null, { log: () => {} });
+
+    const result = await upgrader.normalizeMappedRowCategories();
+
+    assert.equal(result.normalized, 1);
+    const written = JSON.parse(store.updates[0].patch.metadata);
+    assert.equal(written.memory_category, "cases");
+    assert.equal(
+      written.access_count,
+      7,
+      "the patch must be built from the freshly re-read metadata, not the scan snapshot",
+    );
   });
 });

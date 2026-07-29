@@ -66,7 +66,7 @@ import {
   isRecallUsed,
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
-import { buildReflectionMappedMetadata, getReflectionMappedMemoryCategory } from "./src/reflection-mapped-metadata.js";
+import { buildReflectionMappedMetadata, getReflectionMappedMemoryCategory, getReflectionMappedStorageCategory } from "./src/reflection-mapped-metadata.js";
 import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
@@ -5085,7 +5085,7 @@ const memoryLanceDBProPlugin = {
             attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
             rows: gateEligible.map(({ mapped, vector }) => ({
               text: mapped.text,
-              category: mapped.category,
+              mappedKind: mapped.mappedKind,
               heading: mapped.heading,
               vector,
             })),
@@ -5131,7 +5131,7 @@ const memoryLanceDBProPlugin = {
               text: mapped.text,
               vector,
               importance,
-              category: getReflectionMappedMemoryCategory(mapped.mappedKind) as MemoryEntry["category"],
+              category: getReflectionMappedStorageCategory(mapped.mappedKind),
               scope: targetScope,
               metadata,
             });

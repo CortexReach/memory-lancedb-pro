@@ -11,7 +11,7 @@ process.env.NODE_PATH = [
 Module._initPaths();
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
-const { buildReflectionMappedMetadata } = jiti("../src/reflection-mapped-metadata.ts");
+const { buildReflectionMappedMetadata, getReflectionMappedStorageCategory } = jiti("../src/reflection-mapped-metadata.ts");
 const { buildReflectionItemPayloads } = jiti("../src/reflection-item-store.ts");
 const { parseSmartMetadata } = jiti("../src/smart-metadata.ts");
 
@@ -100,6 +100,29 @@ describe("reflection-mapped write-time memory_category stamping", () => {
     const parsed = parseSmartMetadata(entry.metadata, entry);
     assert.equal(parsed.memory_category, "cases");
     assert.notEqual(parsed.memory_category, "preferences");
+  });
+});
+
+describe("reflection-mapped storage-column vocabulary contract", () => {
+  it("derives the stored category column in the legacy storage vocabulary for every kind", () => {
+    // entry.category speaks the legacy storage vocabulary; the six-category
+    // taxonomy value lives only in metadata.memory_category. These pins go
+    // through the central smart-to-storage mapping, so a table change upstream
+    // fails loudly here instead of silently shifting stored vocabularies.
+    assert.equal(getReflectionMappedStorageCategory("user-model"), "preference");
+    assert.equal(getReflectionMappedStorageCategory("agent-model"), "other");
+    assert.equal(getReflectionMappedStorageCategory("lesson"), "fact");
+    assert.equal(getReflectionMappedStorageCategory("decision"), "fact");
+  });
+
+  it("never emits a six-category value for the column", () => {
+    const SIX = ["profile", "preferences", "entities", "events", "cases", "patterns"];
+    for (const kind of ["user-model", "agent-model", "lesson", "decision"]) {
+      assert.ok(
+        !SIX.includes(getReflectionMappedStorageCategory(kind)),
+        `storage category for ${kind} must be legacy vocabulary`,
+      );
+    }
   });
 });
 

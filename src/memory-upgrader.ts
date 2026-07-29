@@ -20,6 +20,7 @@ import type { MemoryTier } from "./memory-categories.js";
 import { buildSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 import {
   getReflectionMappedMemoryCategory,
+  getReflectionMappedStorageCategory,
   type ReflectionMappedKind,
 } from "./reflection-mapped-metadata.js";
 
@@ -58,6 +59,9 @@ export interface CategoryNormalizationOptions {
   dryRun?: boolean;
   /** Scope filter — only normalize memories in these scopes */
   scopeFilter?: string[];
+  /** Rows fetched per scan page (default: 1000). The scan pages the whole
+   * store, so normalization is not capped by any single-page limit. */
+  pageSize?: number;
 }
 
 export interface CategoryNormalizationResult {
@@ -288,6 +292,7 @@ export class MemoryUpgrader {
   ): Promise<CategoryNormalizationResult> {
     const dryRun = options.dryRun ?? false;
     const scopeFilter = options.scopeFilter;
+    const pageSize = Math.max(1, options.pageSize ?? 1000);
 
     const result: CategoryNormalizationResult = {
       totalMapped: 0,
@@ -296,39 +301,90 @@ export class MemoryUpgrader {
       errors: [],
     };
 
-    const allMemories = await this.store.list(scopeFilter, undefined, 10000, 0);
+    // Phase 1 — paged scan. Pages the whole store (list sorts newest-first;
+    // no single-page cap), keeping only ids plus the scan-time snapshot as a
+    // fallback payload. A row is "already correct" only when BOTH faces hold:
+    // the stamped metadata value and the legacy-vocabulary storage column.
+    const targets: Array<{ entry: MemoryEntry; meta: Record<string, unknown> }> = [];
+    for (let offset = 0; ; offset += pageSize) {
+      const page = await this.store.list(scopeFilter, undefined, pageSize, offset);
+      for (const entry of page) {
+        const meta = parseMetadata(entry.metadata);
+        if (!meta || meta.type !== "memory-reflection-mapped") continue;
+        if (!isReflectionMappedKind(meta.mappedKind)) continue;
 
-    const toNormalize: Array<{ entry: MemoryEntry; meta: Record<string, unknown>; expected: MemoryCategory }> = [];
-    for (const entry of allMemories) {
-      const meta = parseMetadata(entry.metadata);
-      if (!meta || meta.type !== "memory-reflection-mapped") continue;
-      if (!isReflectionMappedKind(meta.mappedKind)) continue;
-
-      result.totalMapped++;
-      const expected = getReflectionMappedMemoryCategory(meta.mappedKind);
-      if (meta.memory_category === expected) {
-        result.alreadyCorrect++;
-        continue;
+        result.totalMapped++;
+        const expected = getReflectionMappedMemoryCategory(meta.mappedKind);
+        const expectedStorage = getReflectionMappedStorageCategory(meta.mappedKind);
+        if (meta.memory_category === expected && entry.category === expectedStorage) {
+          result.alreadyCorrect++;
+          continue;
+        }
+        targets.push({ entry, meta });
       }
-      toNormalize.push({ entry, meta, expected });
+      if (page.length < pageSize) break;
     }
 
-    if (dryRun || toNormalize.length === 0) {
-      result.normalized = toNormalize.length;
+    if (dryRun || targets.length === 0) {
+      result.normalized = targets.length;
       return result;
     }
 
-    const prepared: PreparedUpgrade[] = toNormalize.map(({ entry, meta, expected }) => ({
-      entry,
-      updates: {
-        metadata: JSON.stringify({ ...meta, memory_category: expected }),
-      },
-    }));
+    // Phase 2 — chunked fresh-read + write. The store's update paths replace
+    // metadata all-or-nothing, so a patch built from the scan snapshot would
+    // silently roll back any concurrent metadata write (access counters,
+    // admission audits, tier changes) that landed after the scan. Re-reading
+    // each row immediately before building its patch shrinks that window from
+    // scan-to-write to per-chunk milliseconds; stores without getById fall
+    // back to the scan snapshot (test doubles, minimal adapters).
+    const storeWithGetById = this.store as MemoryStore & {
+      getById?: (id: string, scopeFilter?: string[]) => Promise<MemoryEntry | null>;
+    };
+    const canRefetch = typeof storeWithGetById.getById === "function";
+    const chunkSize = 100;
+    for (let start = 0; start < targets.length; start += chunkSize) {
+      const chunk = targets.slice(start, start + chunkSize);
+      const prepared: PreparedUpgrade[] = [];
+      for (const target of chunk) {
+        let entry = target.entry;
+        let meta = target.meta;
+        if (canRefetch) {
+          try {
+            const fresh = await storeWithGetById.getById!(target.entry.id, scopeFilter);
+            if (!fresh) continue; // deleted since the scan — nothing to normalize
+            const freshMeta = parseMetadata(fresh.metadata);
+            if (!freshMeta || freshMeta.type !== "memory-reflection-mapped") continue;
+            if (!isReflectionMappedKind(freshMeta.mappedKind)) continue;
+            entry = fresh;
+            meta = freshMeta;
+          } catch (err) {
+            result.errors.push(
+              `re-read failed for ${target.entry.id}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            continue;
+          }
+        }
 
-    const writeResult = { upgraded: 0, errors: [] as string[] };
-    await this.writePreparedBatch(prepared, writeResult, scopeFilter);
-    result.normalized = writeResult.upgraded;
-    result.errors = writeResult.errors;
+        const expected = getReflectionMappedMemoryCategory(meta.mappedKind as ReflectionMappedKind);
+        const expectedStorage = getReflectionMappedStorageCategory(meta.mappedKind as ReflectionMappedKind);
+        if (meta.memory_category === expected && entry.category === expectedStorage) {
+          result.alreadyCorrect++;
+          continue;
+        }
+        const updates: MemoryUpdatePatch = {
+          metadata: JSON.stringify({ ...meta, memory_category: expected }),
+        };
+        if (entry.category !== expectedStorage) {
+          updates.category = expectedStorage;
+        }
+        prepared.push({ entry, updates });
+      }
+
+      const writeResult = { upgraded: 0, errors: [] as string[] };
+      await this.writePreparedBatch(prepared, writeResult, scopeFilter);
+      result.normalized += writeResult.upgraded;
+      result.errors.push(...writeResult.errors);
+    }
 
     return result;
   }

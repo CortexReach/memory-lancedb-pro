@@ -20,30 +20,11 @@
  */
 
 import type { AdmissionEvaluation } from "./admission-control.js";
-import type { CandidateMemory, MemoryCategory } from "./memory-categories.js";
-
-/**
- * Admission typePriors are keyed by the six smart registers, but mapped rows
- * carry legacy store categories. Score them under the smart register that
- * matches their shape: user-model/agent-model deltas are preference-shaped
- * statements about the human or the assistant ("preference"), lessons are
- * symptom/cause/fix/prevention pairs ("fact" here, cases-shaped), and
- * decisions are episodic records of something decided ("events").
- */
-export function mapReflectionMappedCategoryToSmartRegister(
-  category: string,
-): MemoryCategory {
-  switch (category) {
-    case "preference":
-      return "preferences";
-    case "fact":
-      return "cases";
-    case "decision":
-      return "events";
-    default:
-      return "events";
-  }
-}
+import type { CandidateMemory } from "./memory-categories.js";
+import {
+  getReflectionMappedMemoryCategory,
+  type ReflectionMappedKind,
+} from "./reflection-mapped-metadata.js";
 
 interface MappedReflectionGateItem {
   candidate: CandidateMemory;
@@ -75,7 +56,7 @@ export interface MappedReflectionGateResult {
 /** One mapped row's gate-relevant fields, in distillate order. */
 export interface MappedReflectionEntryInput {
   text: string;
-  category: string;
+  mappedKind: ReflectionMappedKind;
   heading: string;
   vector: number[];
 }
@@ -87,7 +68,11 @@ function buildGateItem(
 ): MappedReflectionGateItem {
   return {
     candidate: {
-      category: mapReflectionMappedCategoryToSmartRegister(row.category),
+      // Admission typePriors are keyed by the six smart registers. Scoring
+      // reads the SAME kind→category table the persisted memory_category
+      // stamp comes from (reflection-mapped-metadata.ts) so the register a
+      // row is judged under always matches the register it is stored under.
+      category: getReflectionMappedMemoryCategory(row.mappedKind),
       abstract: row.text,
       overview: `## ${row.heading}`,
       content: row.text,
@@ -220,7 +205,7 @@ export async function gateMappedReflectionEntry(params: {
   admissionController: MappedReflectionAdmissionGate | null;
   attachAudit: boolean;
   text: string;
-  category: string;
+  mappedKind: ReflectionMappedKind;
   heading: string;
   vector: number[];
   /**
@@ -238,7 +223,7 @@ export async function gateMappedReflectionEntry(params: {
     rows: [
       {
         text: params.text,
-        category: params.category,
+        mappedKind: params.mappedKind,
         heading: params.heading,
         vector: params.vector,
       },
