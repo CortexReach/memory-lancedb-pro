@@ -485,6 +485,147 @@ describe("memory reflection", () => {
       assert.equal(meta.usedFallback, true);
     });
 
+    it("fires onPersisted for event and slice item rows, not for the legacy combined row", async () => {
+      const storedEntries = [];
+      const persisted = [];
+
+      const result = await storeReflectionToLanceDB({
+        reflectionText: [
+          "## Invariants",
+          "- Always confirm assumptions before changing files.",
+          "## Derived",
+          "- Next run verify reflection persistence with targeted tests.",
+        ].join("\n"),
+        sessionKey: "agent:main:session:mirror",
+        sessionId: "mirror",
+        agentId: "main",
+        command: "command:reset",
+        scope: "global",
+        toolErrorSignals: [],
+        runAt: 1_700_500_000_000,
+        usedFallback: false,
+        embedPassage: async (text) => [text.length],
+        vectorSearch: async () => [],
+        store: async (entry) => {
+          storedEntries.push(entry);
+          return { ...entry, id: `id-${storedEntries.length}`, timestamp: 1_700_500_000_000 };
+        },
+        onPersisted: async (entry, kind) => {
+          persisted.push({ entry, kind });
+        },
+      });
+
+      assert.deepEqual(result.storedKinds, ["event", "item-invariant", "item-derived", "combined-legacy"]);
+      assert.equal(storedEntries.length, 4);
+
+      assert.deepEqual(persisted.map((p) => p.kind), ["event", "item-invariant", "item-derived"]);
+
+      const eventCall = persisted.find((p) => p.kind === "event");
+      assert.ok(eventCall);
+      assert.equal(eventCall.entry.category, "reflection");
+      assert.equal(eventCall.entry.scope, "global");
+      assert.equal(eventCall.entry.timestamp, 1_700_500_000_000);
+      assert.match(eventCall.entry.text, /^reflection-event/);
+      assert.ok(eventCall.entry.text.includes("\n"), "event text should be the raw multi-line key=value form at the mint site");
+
+      const invariantCall = persisted.find((p) => p.kind === "item-invariant");
+      assert.equal(invariantCall.entry.text, "Always confirm assumptions before changing files.");
+
+      const derivedCall = persisted.find((p) => p.kind === "item-derived");
+      assert.equal(derivedCall.entry.text, "Next run verify reflection persistence with targeted tests.");
+    });
+
+    it("does not fail storage when onPersisted is absent", async () => {
+      const storedEntries = [];
+      const result = await storeReflectionToLanceDB({
+        reflectionText: "## Invariants\n- Always run tests after edits.",
+        sessionKey: "agent:main:session:noop",
+        sessionId: "noop",
+        agentId: "main",
+        command: "command:reset",
+        scope: "global",
+        toolErrorSignals: [],
+        runAt: 1_700_600_000_000,
+        usedFallback: false,
+        writeLegacyCombined: false,
+        embedPassage: async (text) => [text.length],
+        vectorSearch: async () => [],
+        store: async (entry) => {
+          storedEntries.push(entry);
+          return { ...entry, id: `id-${storedEntries.length}`, timestamp: 1_700_600_000_000 };
+        },
+      });
+
+      assert.deepEqual(result.storedKinds, ["event", "item-invariant"]);
+    });
+
+    it("does not abort remaining stores when onPersisted throws", async () => {
+      const storedEntries = [];
+      const persistedCalls = [];
+      const result = await storeReflectionToLanceDB({
+        reflectionText: [
+          "## Invariants",
+          "- Always run tests after edits.",
+          "## Derived",
+          "- Next run double-check the mirror callback contract.",
+        ].join("\n"),
+        sessionKey: "agent:main:session:throwing",
+        sessionId: "throwing",
+        agentId: "main",
+        command: "command:reset",
+        scope: "global",
+        toolErrorSignals: [],
+        runAt: 1_700_800_000_000,
+        usedFallback: false,
+        writeLegacyCombined: false,
+        embedPassage: async (text) => [text.length],
+        vectorSearch: async () => [],
+        store: async (entry) => {
+          storedEntries.push(entry);
+          return { ...entry, id: `id-${storedEntries.length}`, timestamp: 1_700_800_000_000 };
+        },
+        onPersisted: async (_entry, kind) => {
+          persistedCalls.push(kind);
+          throw new Error(`boom for ${kind}`);
+        },
+      });
+
+      assert.deepEqual(result.storedKinds, ["event", "item-invariant", "item-derived"]);
+      assert.equal(storedEntries.length, 3);
+      assert.deepEqual(persistedCalls, ["event", "item-invariant", "item-derived"]);
+    });
+
+    it("mirrors the event row's multi-line text as a single line using the existing mdMirror collapse contract", async () => {
+      let eventEntry = null;
+      await storeReflectionToLanceDB({
+        reflectionText: "## Invariants\n- Keep the daily journal append-only.",
+        sessionKey: "agent:main:session:oneline",
+        sessionId: "oneline",
+        agentId: "main",
+        command: "command:reset",
+        scope: "global",
+        toolErrorSignals: [{ signatureHash: "cafef00d" }],
+        runAt: 1_700_700_000_000,
+        usedFallback: false,
+        writeLegacyCombined: false,
+        embedPassage: async (text) => [text.length],
+        vectorSearch: async () => [],
+        store: async (entry) => ({ ...entry, id: "id-event", timestamp: 1_700_700_000_000 }),
+        onPersisted: async (entry, kind) => {
+          if (kind === "event") eventEntry = entry;
+        },
+      });
+
+      assert.ok(eventEntry);
+      assert.ok(eventEntry.text.includes("\n"), "sanity check: mint site emits multi-line event text");
+
+      // Same one-line collapse formula createMdMirrorWriter applies at index.ts:2135
+      // (`entry.text.replace(/\n/g, " ").slice(0, 500)`) before appending to the daily file.
+      const mirroredLine = eventEntry.text.replace(/\n/g, " ").slice(0, 500);
+      assert.equal(mirroredLine.includes("\n"), false);
+      assert.match(mirroredLine, /^reflection-event · global eventId=refl-.* session=oneline agent=main command=command:reset usedFallback=false$/);
+    });
+
     it("sanitizes returned slices used for same-session derived injection cache", () => {
       const { slices } = buildReflectionStorePayloads({
         reflectionText: [
