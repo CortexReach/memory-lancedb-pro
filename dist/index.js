@@ -36,7 +36,7 @@ import { storeReflectionToLanceDB, loadAgentReflectionSlicesFromEntries, DEFAULT
 import { parseReflectionMetadata } from "./src/reflection-metadata.js";
 import { extractReflectionLearningGovernanceCandidates, extractInjectableReflectionMappedMemoryItems, isRecallUsed, } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
-import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
+import { buildReflectionMappedMetadata, getReflectionMappedStorageCategory } from "./src/reflection-mapped-metadata.js";
 import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
@@ -3988,7 +3988,7 @@ const memoryLanceDBProPlugin = {
                         attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
                         rows: gateEligible.map(({ mapped, vector }) => ({
                             text: mapped.text,
-                            category: mapped.category,
+                            mappedKind: mapped.mappedKind,
                             heading: mapped.heading,
                             vector,
                         })),
@@ -4007,7 +4007,7 @@ const memoryLanceDBProPlugin = {
                             api.logger.info(`memory-reflection: admission rejected mapped row heading=${JSON.stringify(mapped.heading)} provenance=memory-reflection-mapped: ${mappedGate.reason ?? "no reason"}`);
                             continue;
                         }
-                        const importance = mapped.category === "decision" ? 0.85 : 0.8;
+                        const importance = mapped.mappedKind === "decision" ? 0.85 : 0.8;
                         const baseMetadata = buildReflectionMappedMetadata({
                             mappedItem: mapped,
                             eventId: reflectionEventId,
@@ -4029,7 +4029,7 @@ const memoryLanceDBProPlugin = {
                             text: mapped.text,
                             vector,
                             importance,
-                            category: mapped.category,
+                            category: getReflectionMappedStorageCategory(mapped.mappedKind),
                             scope: targetScope,
                             metadata,
                         });

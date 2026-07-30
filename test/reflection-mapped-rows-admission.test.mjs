@@ -28,10 +28,10 @@ const jiti = jitiFactory(import.meta.url, {
 });
 
 const {
-  mapReflectionMappedCategoryToSmartRegister,
   gateMappedReflectionEntry,
   gateMappedReflectionEntries,
 } = jiti("../src/reflection-mapped-admission.ts");
+const { getReflectionMappedMemoryCategory, getReflectionMappedStorageCategory } = jiti("../src/reflection-mapped-metadata.ts");
 const { AdmissionController, ADMISSION_CONTROL_PRESETS } = jiti("../src/admission-control.ts");
 
 const REFLECTION_TEXT = [
@@ -41,19 +41,19 @@ const REFLECTION_TEXT = [
   "- Decision: keep the deploy branch cut from a fresh master.",
 ].join("\n");
 
-describe("mapReflectionMappedCategoryToSmartRegister", () => {
-  it("maps legacy mapped categories onto the smart registers admission priors use", () => {
-    assert.equal(mapReflectionMappedCategoryToSmartRegister("preference"), "preferences");
-    assert.equal(mapReflectionMappedCategoryToSmartRegister("fact"), "cases");
-    assert.equal(mapReflectionMappedCategoryToSmartRegister("decision"), "events");
-    assert.equal(mapReflectionMappedCategoryToSmartRegister("unknown-legacy"), "events", "unknown categories take the lowest-prior durable-free register");
+describe("admission register derivation (single source with the persisted stamp)", () => {
+  it("scores every mapped kind under exactly the register its memory_category stamp uses", () => {
+    assert.equal(getReflectionMappedMemoryCategory("user-model"), "preferences");
+    assert.equal(getReflectionMappedMemoryCategory("agent-model"), "patterns");
+    assert.equal(getReflectionMappedMemoryCategory("lesson"), "cases");
+    assert.equal(getReflectionMappedMemoryCategory("decision"), "cases");
   });
 });
 
 describe("gateMappedReflectionEntry", () => {
   const baseParams = {
     text: "Operator prefers streaming test reporters for long suites.",
-    category: "preference",
+    mappedKind: "user-model",
     heading: "User model deltas (about the human)",
     vector: [1, 0, 0],
     conversationText: REFLECTION_TEXT,
@@ -199,19 +199,19 @@ describe("gateMappedReflectionEntries (batched burst)", () => {
   const rows = [
     {
       text: "Operator prefers streaming test reporters for long suites.",
-      category: "preference",
+      mappedKind: "user-model",
       heading: "User model deltas (about the human)",
       vector: [1, 0, 0],
     },
     {
       text: "Symptom: flaky port bind. Cause: parallel suites. Fix: ephemeral ports.",
-      category: "fact",
+      mappedKind: "lesson",
       heading: "Lessons & pitfalls",
       vector: [0, 1, 0],
     },
     {
       text: "Decision: keep the deploy branch cut from a fresh master.",
-      category: "decision",
+      mappedKind: "decision",
       heading: "Decisions (durable)",
       vector: [0, 0, 1],
     },
@@ -257,7 +257,11 @@ describe("gateMappedReflectionEntries (batched burst)", () => {
     assert.equal(seenItems.length, 3);
     assert.equal(seenItems[0].candidate.category, "preferences");
     assert.equal(seenItems[1].candidate.category, "cases");
-    assert.equal(seenItems[2].candidate.category, "events");
+    assert.equal(
+      seenItems[2].candidate.category,
+      "cases",
+      "decision rows are judged under the same register their memory_category stamp uses",
+    );
     for (const item of seenItems) {
       assert.equal(item.conversationText, REFLECTION_TEXT);
       assert.deepEqual(item.scopeFilter, ["global"]);
@@ -433,7 +437,7 @@ describe("production pipeline: parse distillate -> gate -> bulkStore (end to end
     const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
     const gateRows = mappedReflectionMemories.map((mapped) => ({
       text: mapped.text,
-      category: mapped.category,
+      mappedKind: mapped.mappedKind,
       heading: mapped.heading,
       vector: [1, 0, 0],
     }));
@@ -454,7 +458,7 @@ describe("production pipeline: parse distillate -> gate -> bulkStore (end to end
         rejections.push({ text: mapped.text, reason: gate.reason });
         continue;
       }
-      mappedEntries.push({ text: mapped.text, category: mapped.category, metadata: JSON.stringify({ admission_audit: gate.auditJson }) });
+      mappedEntries.push({ text: mapped.text, category: getReflectionMappedStorageCategory(mapped.mappedKind), metadata: JSON.stringify({ admission_audit: gate.auditJson }) });
     }
     if (mappedEntries.length > 0) {
       await store.bulkStore(mappedEntries);

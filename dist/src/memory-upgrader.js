@@ -13,6 +13,13 @@
  *   4. Write prepared patches in a batch where the store supports it
  */
 import { buildSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import { getReflectionMappedMemoryCategory, getReflectionMappedStorageCategory, } from "./reflection-mapped-metadata.js";
+function isReflectionMappedKind(value) {
+    return (value === "user-model" ||
+        value === "agent-model" ||
+        value === "lesson" ||
+        value === "decision");
+}
 const CURRENT_REFLECTION_METADATA_TYPES = new Set([
     "memory-reflection",
     "memory-reflection-event",
@@ -159,6 +166,110 @@ export class MemoryUpgrader {
         return { total: allMemories.length, legacy, byCategory };
     }
     /**
+     * One-shot, opt-in pass that re-stamps `memory_category` on existing
+     * reflection-mapped rows using the same write-time mapping new rows get
+     * (see `getReflectionMappedMemoryCategory`). Reflection-mapped rows are
+     * intentionally excluded from `isLegacyMemory`/`upgrade()` — this is a
+     * separate, narrower pass that touches only that one field on rows whose
+     * `type` is `memory-reflection-mapped`, and only when the stamped value is
+     * missing or wrong. Safe to run repeatedly: a row already carrying the
+     * correct value is left untouched, so a second run is a no-op.
+     */
+    async normalizeMappedRowCategories(options = {}) {
+        const dryRun = options.dryRun ?? false;
+        const scopeFilter = options.scopeFilter;
+        const pageSize = Math.max(1, options.pageSize ?? 1000);
+        const result = {
+            totalMapped: 0,
+            normalized: 0,
+            alreadyCorrect: 0,
+            errors: [],
+        };
+        // Phase 1 — paged scan. Pages the whole store (list sorts newest-first;
+        // no single-page cap), keeping only ids plus the scan-time snapshot as a
+        // fallback payload. A row is "already correct" only when BOTH faces hold:
+        // the stamped metadata value and the legacy-vocabulary storage column.
+        const targets = [];
+        for (let offset = 0;; offset += pageSize) {
+            const page = await this.store.list(scopeFilter, undefined, pageSize, offset);
+            for (const entry of page) {
+                const meta = parseMetadata(entry.metadata);
+                if (!meta || meta.type !== "memory-reflection-mapped")
+                    continue;
+                if (!isReflectionMappedKind(meta.mappedKind))
+                    continue;
+                result.totalMapped++;
+                const expected = getReflectionMappedMemoryCategory(meta.mappedKind);
+                const expectedStorage = getReflectionMappedStorageCategory(meta.mappedKind);
+                if (meta.memory_category === expected && entry.category === expectedStorage) {
+                    result.alreadyCorrect++;
+                    continue;
+                }
+                targets.push({ entry, meta });
+            }
+            if (page.length < pageSize)
+                break;
+        }
+        if (dryRun || targets.length === 0) {
+            result.normalized = targets.length;
+            return result;
+        }
+        // Phase 2 — chunked fresh-read + write. The store's update paths replace
+        // metadata all-or-nothing, so a patch built from the scan snapshot would
+        // silently roll back any concurrent metadata write (access counters,
+        // admission audits, tier changes) that landed after the scan. Re-reading
+        // each row immediately before building its patch shrinks that window from
+        // scan-to-write to per-chunk milliseconds; stores without getById fall
+        // back to the scan snapshot (test doubles, minimal adapters).
+        const storeWithGetById = this.store;
+        const canRefetch = typeof storeWithGetById.getById === "function";
+        const chunkSize = 100;
+        for (let start = 0; start < targets.length; start += chunkSize) {
+            const chunk = targets.slice(start, start + chunkSize);
+            const prepared = [];
+            for (const target of chunk) {
+                let entry = target.entry;
+                let meta = target.meta;
+                if (canRefetch) {
+                    try {
+                        const fresh = await storeWithGetById.getById(target.entry.id, scopeFilter);
+                        if (!fresh)
+                            continue; // deleted since the scan — nothing to normalize
+                        const freshMeta = parseMetadata(fresh.metadata);
+                        if (!freshMeta || freshMeta.type !== "memory-reflection-mapped")
+                            continue;
+                        if (!isReflectionMappedKind(freshMeta.mappedKind))
+                            continue;
+                        entry = fresh;
+                        meta = freshMeta;
+                    }
+                    catch (err) {
+                        result.errors.push(`re-read failed for ${target.entry.id}: ${err instanceof Error ? err.message : String(err)}`);
+                        continue;
+                    }
+                }
+                const expected = getReflectionMappedMemoryCategory(meta.mappedKind);
+                const expectedStorage = getReflectionMappedStorageCategory(meta.mappedKind);
+                if (meta.memory_category === expected && entry.category === expectedStorage) {
+                    result.alreadyCorrect++;
+                    continue;
+                }
+                const updates = {
+                    metadata: JSON.stringify({ ...meta, memory_category: expected }),
+                };
+                if (entry.category !== expectedStorage) {
+                    updates.category = expectedStorage;
+                }
+                prepared.push({ entry, updates });
+            }
+            const writeResult = { upgraded: 0, errors: [] };
+            await this.writePreparedBatch(prepared, writeResult, scopeFilter);
+            result.normalized += writeResult.upgraded;
+            result.errors.push(...writeResult.errors);
+        }
+        return result;
+    }
+    /**
      * Main upgrade entry point.
      * Scans all memories, filters legacy ones, and enriches them.
      */
@@ -298,6 +409,8 @@ export class MemoryUpgrader {
     }
     /**
      * Persist a prepared batch with one store-level batch call when available.
+     * Takes the narrow slice of the result shape it actually mutates so both
+     * `UpgradeResult` and `CategoryNormalizationResult` can reuse it.
      */
     async writePreparedBatch(prepared, result, scopeFilter) {
         if (prepared.length === 0)
