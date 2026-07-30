@@ -137,8 +137,8 @@ describe("ManualEchoLedger", () => {
 
   it("buckets undefined agent ids together", () => {
     const ledger = new ManualEchoLedger();
-    ledger.record(undefined, "standing desk height is 104cm");
-    assert.ok(ledger.match(undefined, "the standing desk height is 104cm"));
+    ledger.record(undefined, "kneeling chair height is 104cm");
+    assert.ok(ledger.match(undefined, "the kneeling chair height is 104cm"));
   });
 
   it("caps the ring and evicts the oldest entry", () => {
