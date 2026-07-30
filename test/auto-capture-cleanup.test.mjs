@@ -77,7 +77,7 @@ describe("stripGroupChannelScaffold (message-tool channel payloads)", () => {
     const input = [
       DELIVERY_BANNER_LONG,
       "Chat history since last reply (untrusted, for context):",
-      "#1784700000.100200 Wed 2026-07-22 10:42:15 GMT+3 sam.rivera: hey folks! hows your day going?",
+      "#1784700000.100200 Wed 2026-07-22 10:42:15 GMT+3 sam.rivera: morning crew! anything new on the board?",
       "#1784700001.200300 Wed 2026-07-22 10:42:40 GMT+3 lee.chen: all good over here",
       "",
       "agent-two is here and ready to help",
