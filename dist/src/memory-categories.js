@@ -58,6 +58,36 @@ export const APPEND_ONLY_CATEGORIES = new Set([
     "events",
     "cases",
 ]);
+/**
+ * Durable categories: governs fiction-register batch enforcement (an
+ * in-fiction batch can never produce durable memories) and the batch
+ * contradiction check. Per-item grounding "constructed" is dropped
+ * unconditionally in every category, so this set does not gate that rule.
+ */
+export const DURABLE_CATEGORIES = new Set([
+    "profile",
+    "preferences",
+    "entities",
+    "cases",
+    "patterns",
+]);
+/**
+ * Judge-gated categories: not durable, but ambiguous enough inside a
+ * fiction-register batch that the per-item self-tag cannot be trusted.
+ * An event may be an assertion ABOUT a fiction session ("we played for three
+ * hours") or one from WITHIN it ("boarded the train to the capital"); both
+ * arrive tagged grounding="real" when the model mis-registers the second.
+ * In a fiction batch these survive only on positive grounding-judge
+ * confirmation, so a missing, partial, or failed verdict fails closed.
+ * Durable categories are dropped outright and never reach this gate.
+ */
+export const FICTION_JUDGED_CATEGORIES = new Set(["events"]);
+/** Register strictness ordering; a rejudge verdict may tighten, never relax, on partial coverage. */
+export const REGISTER_STRICTNESS = {
+    real: 0,
+    mixed: 1,
+    fiction: 2,
+};
 /** Validate and normalize a category string. */
 export function normalizeCategory(raw) {
     const lower = raw.toLowerCase().trim();

@@ -118,6 +118,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/scope-owner-leak-hardening.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/isOwnedByAgent.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/typed-array-vector-fetch.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/extraction-grounding-register.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/grounding-rejudge.test.mjs", args: [] },
 ];
 
 export function getEntriesForGroup(group) {

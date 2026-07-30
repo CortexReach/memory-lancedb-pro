@@ -80,12 +80,60 @@ export const APPEND_ONLY_CATEGORIES = new Set<MemoryCategory>([
 /** Memory tier levels for lifecycle management. */
 export type MemoryTier = "core" | "working" | "peripheral";
 
+/** Per-candidate conversational grounding self-tag from extraction. */
+export type CandidateGrounding = "real" | "constructed";
+
+/**
+ * Batch-level register judgment for the whole extraction input:
+ * "real" ordinary conversation, "fiction" an in-character/game/roleplay
+ * frame, "mixed" both interleaved. Judged once per extraction batch —
+ * more stable than the per-item grounding tags.
+ */
+export type ConversationRegister = "real" | "mixed" | "fiction";
+
+/**
+ * Durable categories: governs fiction-register batch enforcement (an
+ * in-fiction batch can never produce durable memories) and the batch
+ * contradiction check. Per-item grounding "constructed" is dropped
+ * unconditionally in every category, so this set does not gate that rule.
+ */
+export const DURABLE_CATEGORIES = new Set<MemoryCategory>([
+  "profile",
+  "preferences",
+  "entities",
+  "cases",
+  "patterns",
+]);
+
+/**
+ * Judge-gated categories: not durable, but ambiguous enough inside a
+ * fiction-register batch that the per-item self-tag cannot be trusted.
+ * An event may be an assertion ABOUT a fiction session ("we played for three
+ * hours") or one from WITHIN it ("boarded the train to the capital"); both
+ * arrive tagged grounding="real" when the model mis-registers the second.
+ * In a fiction batch these survive only on positive grounding-judge
+ * confirmation, so a missing, partial, or failed verdict fails closed.
+ * Durable categories are dropped outright and never reach this gate.
+ */
+export const FICTION_JUDGED_CATEGORIES = new Set<MemoryCategory>(["events"]);
+
+/** Register strictness ordering; a rejudge verdict may tighten, never relax, on partial coverage. */
+export const REGISTER_STRICTNESS: Record<ConversationRegister, number> = {
+  real: 0,
+  mixed: 1,
+  fiction: 2,
+};
+
 /** A candidate memory extracted from conversation by LLM. */
 export type CandidateMemory = {
   category: MemoryCategory;
   abstract: string; // L0: one-sentence index
   overview: string; // L1: structured markdown summary
   content: string; // L2: full narrative
+  /** Absent on legacy payloads: treat as "real" (fail open per item). */
+  grounding?: CandidateGrounding;
+  /** Batch register the candidate was extracted under; absent on legacy payloads. */
+  conversationRegister?: ConversationRegister;
 };
 
 /** Dedup decision from LLM. */
