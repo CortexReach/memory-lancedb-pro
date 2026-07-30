@@ -24,12 +24,12 @@ describe("AdmissionController over the host transport", () => {
     const evaluation = await controller.evaluate({
       candidate: {
         category: "preferences",
-        abstract: "Favorite soda: Coca-Cola",
+        abstract: "Favorite soda: Fizzwick",
         overview: "",
         content: "",
       },
       candidateVector: [],
-      conversationText: "I love Coca-Cola",
+      conversationText: "I love Fizzwick",
       scopeFilter: [],
       now: 1_752_000_000_000,
     });
