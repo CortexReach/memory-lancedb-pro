@@ -227,8 +227,8 @@ describe("memory consolidate: item 8 staleness guard", () => {
     const rows = [
       makeRow({ abstract: "Coffee order: oat milk latte", factKey: "preferences:coffee order", vector: [1, 0, 0, 0], timestamp: ts }),
       makeRow({ abstract: "Coffee order: oat milk latte, extra hot", factKey: "preferences:coffee order", vector: [1, 0, 0, 0], timestamp: ts + 1 }),
-      makeRow({ abstract: "Desk setup: standing desk", factKey: "preferences:desk setup", vector: [0, 1, 0, 0], timestamp: ts + 2 }),
-      makeRow({ abstract: "Desk setup: standing desk, oak top", factKey: "preferences:desk setup", vector: [0, 1, 0, 0], timestamp: ts + 3 }),
+      makeRow({ abstract: "Desk setup: kneeling chair", factKey: "preferences:desk setup", vector: [0, 1, 0, 0], timestamp: ts + 2 }),
+      makeRow({ abstract: "Desk setup: kneeling chair, oak top", factKey: "preferences:desk setup", vector: [0, 1, 0, 0], timestamp: ts + 3 }),
     ];
     const store = makeFakeStore(rows);
     const completeJson = async (_prompt, label) => {

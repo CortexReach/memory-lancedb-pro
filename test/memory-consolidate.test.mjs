@@ -133,7 +133,7 @@ describe("memory consolidate: clustering", () => {
     // same boat (confirmed against the real deriveFactKey, not a hypothetical).
     const original = buildConsolidateCandidate(
       makeRow({
-        abstract: "Favorite soda: Coca-Cola",
+        abstract: "Favorite soda: Fizzwick",
         vector: [1, 0, 0, 0],
         factKey: "preferences:favorite soda",
         source: "auto-capture",
@@ -141,7 +141,7 @@ describe("memory consolidate: clustering", () => {
     );
     const mappedDuplicate = buildConsolidateCandidate(
       makeRow({
-        abstract: "User prefers Coca-Cola as their favorite soft drink",
+        abstract: "User prefers Fizzwick as their favorite soft drink",
         vector: [1, 0, 0, 0],
         factKey: undefined,
         source: "reflection",
@@ -152,8 +152,8 @@ describe("memory consolidate: clustering", () => {
         // Deliberately low cosine (orthogonal vector) to simulate an embedder
         // that separates the reversal from its originals, and a free-text
         // wording whose derived fact_key ("preferences:user has stopped
-        // drinking coca-cola") does not match "preferences:favorite soda".
-        abstract: "User has stopped drinking Coca-Cola",
+        // drinking fizzwick") does not match "preferences:favorite soda".
+        abstract: "User has stopped drinking Fizzwick",
         vector: [0, 0, 0, 1],
         factKey: undefined,
         source: "manual",
@@ -178,8 +178,8 @@ describe("memory consolidate: clustering", () => {
   });
 
   it("does not transitively chain two unrelated near-duplicate pairs together through a moderately-similar bridge pair", () => {
-    // Live dry-run found 8-row grab-bag clusters mixing weekly planning,
-    // standing desks, and roleplay notes -- none of these rows are
+    // Live dry-run found 8-row grab-bag clusters mixing inbox review,
+    // kneeling chairs, and roleplay notes -- none of these rows are
     // reversal-shaped, so this is pure cosine transitivity chaining:
     // A1~A2 direct link, A2~B1 direct link (the "bridge"), B1~B2 direct link,
     // so union-find would glue all four into one cluster even though A1/A2
@@ -187,39 +187,39 @@ describe("memory consolidate: clustering", () => {
     // computed exactly (15/25/40/45-degree unit vectors), not guessed:
     // A1-A2=0.966, A2-B1=0.906 (the bridge, well above 0.86), B1-B2=0.996,
     // A1-B1=0.766, A1-B2=0.707 (both well below 0.86).
-    const A1 = buildConsolidateCandidate(makeRow({ abstract: "Prefers Sunday evening weekly planning.", vector: [1, 0], factKey: undefined }));
-    const A2 = buildConsolidateCandidate(makeRow({ abstract: "User now does weekly planning on Sunday evenings.", vector: [0.9659258262890683, 0.25881904510252074], factKey: undefined }));
-    const B1 = buildConsolidateCandidate(makeRow({ abstract: "Experimenting this month with a standing desk for back comfort.", vector: [0.766044443118978, 0.6427876096865393], factKey: undefined }));
-    const B2 = buildConsolidateCandidate(makeRow({ abstract: "Testing a standing desk setup this month to help with back pain.", vector: [0.7071067811865476, 0.7071067811865475], factKey: undefined }));
+    const A1 = buildConsolidateCandidate(makeRow({ abstract: "Prefers Thursday morning inbox review.", vector: [1, 0], factKey: undefined }));
+    const A2 = buildConsolidateCandidate(makeRow({ abstract: "User now does inbox review on Thursday mornings.", vector: [0.9659258262890683, 0.25881904510252074], factKey: undefined }));
+    const B1 = buildConsolidateCandidate(makeRow({ abstract: "Experimenting this month with a kneeling chair for posture comfort.", vector: [0.766044443118978, 0.6427876096865393], factKey: undefined }));
+    const B2 = buildConsolidateCandidate(makeRow({ abstract: "Testing a kneeling chair setup this month to help with posture strain.", vector: [0.7071067811865476, 0.7071067811865475], factKey: undefined }));
 
     const clusters = clusterConsolidateCandidates([A1, A2, B1, B2], 0.86);
-    assert.equal(clusters.length, 2, "the weekly-planning pair and the standing-desk pair must stay as two separate clusters");
+    assert.equal(clusters.length, 2, "the inbox-review pair and the kneeling-chair pair must stay as two separate clusters");
     const sorted = clusters.map((c) => c.slice().sort()).sort((x, y) => x[0] - y[0]);
     assert.deepEqual(sorted, [[0, 1], [2, 3]]);
   });
 
-  it("does not let a long multi-topic reversal narrative bridge a tight cola cluster to unrelated desk rows (paraphrased live shape)", () => {
+  it("does not let a long multi-topic reversal narrative bridge a tight fizzwick cluster to unrelated easel rows (paraphrased live shape)", () => {
     // Paraphrased from the live cluster-4 grab bag: a tight favorite-drink +
     // reversal pair should stay together, but a long narrative row that also
     // happens to mention "quit" (reversal-shaped) and touches several other
-    // topics at once must not bridge in the unrelated desk-move rows via
+    // topics at once must not bridge in the unrelated easel-move rows via
     // incidental keyword overlap.
     const favorite = buildConsolidateCandidate(
-      makeRow({ abstract: "User's favorite drink is Coca-Cola.", vector: [1, 0, 0], factKey: "preferences:favorite drink" })
+      makeRow({ abstract: "User's favorite drink is Fizzwick.", vector: [1, 0, 0], factKey: "preferences:favorite drink" })
     );
     const reversalShort = buildConsolidateCandidate(
-      makeRow({ abstract: "User will no longer drink cola", vector: [0, 0, 1], factKey: undefined })
+      makeRow({ abstract: "User will no longer drink fizzwick", vector: [0, 0, 1], factKey: undefined })
     );
     const longNarrative = buildConsolidateCandidate(
       makeRow({
         abstract:
-          "User quit drinking Coca-Cola after the fridge explosion incident. Decided to redesign their room and moved their desk from a dark corner to next to the window for natural light and better productivity.",
+          "User stopped drinking Fizzwick after the juicer meltdown incident. Decided to reorganize their studio and moved their easel from the storage nook to beside the balcony door for natural light and better productivity.",
         vector: [0, 1, 0],
         factKey: undefined,
       })
     );
     const deskMove = buildConsolidateCandidate(
-      makeRow({ abstract: "User will move their desk to sit directly next to the window for natural light.", vector: [0, 1, 0], factKey: undefined })
+      makeRow({ abstract: "User will move their easel to sit directly beside the balcony door for morning light.", vector: [0, 1, 0], factKey: undefined })
     );
 
     const clusters = clusterConsolidateCandidates([favorite, reversalShort, longNarrative, deskMove], 0.86);
@@ -229,7 +229,7 @@ describe("memory consolidate: clustering", () => {
     assert.ok(colaCluster.includes(1), "the short reversal must join the favorite-drink row");
     assert.ok(
       !colaCluster.includes(3),
-      "the unrelated desk-move row must not be glued into the cola cluster through the long narrative row"
+      "the unrelated easel-move row must not be glued into the fizzwick cluster through the long narrative row"
     );
   });
 
@@ -256,7 +256,7 @@ describe("memory consolidate: clustering", () => {
       makeRow({ abstract: "No longer drinks cola", vector: [0, 0, 0, 1], factKey: undefined, source: "manual" })
     );
     const unrelated = buildConsolidateCandidate(
-      makeRow({ abstract: "Prefers a standing desk for back comfort", vector: [1, 1, 0, 0], factKey: "preferences:desk setup", source: "manual" })
+      makeRow({ abstract: "Prefers a kneeling chair for back comfort", vector: [1, 1, 0, 0], factKey: "preferences:desk setup", source: "manual" })
     );
 
     const clusters = clusterConsolidateCandidates(
@@ -268,7 +268,7 @@ describe("memory consolidate: clustering", () => {
     assert.deepEqual(
       clusters[0].slice().sort(),
       [0, 1, 2, 3],
-      "all 3 cross-lane duplicates and the contradiction must land in the SAME cluster; the unrelated desk row must stay out"
+      "all 3 cross-lane duplicates and the contradiction must land in the SAME cluster; the unrelated easel row must stay out"
     );
   });
 });
@@ -706,8 +706,8 @@ describe("memory consolidate: deterministic verdicts", () => {
     const rows = [
       makeRow({ abstract: "Coffee order: oat milk latte", content: "x", factKey: "preferences:coffee order", vector: [1, 0, 0], timestamp: ts }),
       makeRow({ abstract: "Coffee order: oat milk latte, extra hot", content: "y", factKey: "preferences:coffee order", vector: [1, 0, 0], timestamp: ts + 1 }),
-      makeRow({ abstract: "Desk setup: standing desk", content: "z", factKey: "preferences:desk setup", vector: [0, 1, 0], timestamp: ts + 2 }),
-      makeRow({ abstract: "Desk setup: standing desk, oak top", content: "w", factKey: "preferences:desk setup", vector: [0, 1, 0], timestamp: ts + 3 }),
+      makeRow({ abstract: "Desk setup: kneeling chair", content: "z", factKey: "preferences:desk setup", vector: [0, 1, 0], timestamp: ts + 2 }),
+      makeRow({ abstract: "Desk setup: kneeling chair, oak top", content: "w", factKey: "preferences:desk setup", vector: [0, 1, 0], timestamp: ts + 3 }),
     ];
 
     // A deterministic stand-in for a temperature-0 LLM: a pure function of
@@ -1057,9 +1057,9 @@ describe("memory consolidate: orchestration", () => {
     // leaving the append-only row alone -- not skip the whole cluster.
     const ts = 1_700_000_000_000;
     const rows = [
-      makeRow({ category: "preference", memoryCategory: "preferences", abstract: "Reading lamp preference: warm white, bookshelf side.", factKey: "preferences:reading lamp", vector: [1, 0], timestamp: ts }),
-      makeRow({ category: "decision", memoryCategory: "events", abstract: "Reading lamp finalized: warm white, positioned on the bookshelf side.", factKey: "events:reading lamp", vector: [1, 0], timestamp: ts + 1 }),
-      makeRow({ category: "preference", memoryCategory: "preferences", abstract: "Prefers warm white lighting on the bookshelf side for reading.", factKey: "preferences:reading lamp", vector: [1, 0], timestamp: ts + 2 }),
+      makeRow({ category: "preference", memoryCategory: "preferences", abstract: "Room fan preference: low speed, cabinet side.", factKey: "preferences:room fan", vector: [1, 0], timestamp: ts }),
+      makeRow({ category: "decision", memoryCategory: "events", abstract: "Room fan finalized: low speed, positioned on the cabinet side.", factKey: "events:room fan", vector: [1, 0], timestamp: ts + 1 }),
+      makeRow({ category: "preference", memoryCategory: "preferences", abstract: "Prefers a low fan speed on the cabinet side for focus.", factKey: "preferences:room fan", vector: [1, 0], timestamp: ts + 2 }),
     ];
     const store = makeFakeStore(rows);
     const completeJson = async () => ({
@@ -1106,8 +1106,8 @@ describe("memory consolidate: orchestration", () => {
       makeRow({ abstract: "Coffee order: oat milk latte, extra hot", factKey: "preferences:coffee order", vector: [1, 0, 0, 0], timestamp: ts + 1 }),
     ];
     const supersedeRows = [
-      makeRow({ abstract: "Desk setup: standing desk", factKey: "preferences:desk setup", vector: [0, 1, 0, 0], timestamp: ts + 2 }),
-      makeRow({ abstract: "Desk setup: no longer using a standing desk", factKey: "preferences:desk setup", vector: [0, 1, 0, 0], timestamp: ts + 3 }),
+      makeRow({ abstract: "Desk setup: kneeling chair", factKey: "preferences:desk setup", vector: [0, 1, 0, 0], timestamp: ts + 2 }),
+      makeRow({ abstract: "Desk setup: no longer using a kneeling chair", factKey: "preferences:desk setup", vector: [0, 1, 0, 0], timestamp: ts + 3 }),
     ];
     const rows = [...mergeRows, ...supersedeRows];
     const store = makeFakeStore(rows);
@@ -1167,9 +1167,9 @@ describe("memory consolidate: orchestration", () => {
       // Cluster B: unrelated tea duplicates
       makeRow({ abstract: "Tea order: chamomile", factKey: "preferences:tea order", vector: [0, 1, 0, 0], timestamp: ts + 2 }),
       makeRow({ abstract: "Tea order: chamomile, no sugar", factKey: "preferences:tea order", vector: [0, 1, 0, 0], timestamp: ts + 3 }),
-      // Cluster C: unrelated desk duplicates
-      makeRow({ abstract: "Desk setup: standing desk", factKey: "preferences:desk setup", vector: [0, 0, 1, 0], timestamp: ts + 4 }),
-      makeRow({ abstract: "Desk setup: standing desk, oak top", factKey: "preferences:desk setup", vector: [0, 0, 1, 0], timestamp: ts + 5 }),
+      // Cluster C: unrelated easel duplicates
+      makeRow({ abstract: "Desk setup: kneeling chair", factKey: "preferences:desk setup", vector: [0, 0, 1, 0], timestamp: ts + 4 }),
+      makeRow({ abstract: "Desk setup: kneeling chair, oak top", factKey: "preferences:desk setup", vector: [0, 0, 1, 0], timestamp: ts + 5 }),
     ];
     const store = makeFakeStore(rows);
     let decideCallCount = 0;
