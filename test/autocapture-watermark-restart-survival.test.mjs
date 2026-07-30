@@ -288,7 +288,7 @@ describe("auto-capture watermark survives a simulated process restart", () => {
       "My synthetic editor theme of choice is called Marmalade Night.",
     ];
     const TURN_3_TEXTS = [
-      "My synthetic standing desk motor brand is called Elevar.",
+      "My synthetic kneeling chair motor brand is called Elevar.",
       "I label synthetic backup drives with constellation names.",
     ];
 
