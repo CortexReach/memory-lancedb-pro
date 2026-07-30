@@ -1910,10 +1910,40 @@ export function registerMemoryCLI(program, context) {
             const { repaired, failed, skipped, unrecovered } = await context.store.repairLegacyScopes(targetScope);
             console.log(`\nRepair complete: ${repaired} reassigned to "${targetScope}", ${skipped} skipped (changed or removed since discovery), ${failed} failed.`);
             if (unrecovered.length > 0) {
-                console.error(`\n${unrecovered.length} row(s) could not be restored after a failed replacement write. ` +
-                    "Full row content follows (JSON, one per line) so the data is not lost:");
-                for (const entry of unrecovered) {
-                    console.error(JSON.stringify(entry));
+                // Full rows (text, metadata, vectors) go to a recovery file next to
+                // the db, not to stderr; stderr gets a bounded summary. The full
+                // stderr dump remains only as the fallback when the file cannot be
+                // written, so the data is never lost either way.
+                const dbPathForRecovery = typeof context.store.dbPath === "string" && context.store.dbPath.trim() !== ""
+                    ? context.store.dbPath
+                    : null;
+                let savedTo = null;
+                if (dbPathForRecovery) {
+                    const recoveryPath = `${dbPathForRecovery.replace(/[\\/]+$/, "")}-unrecovered-${Date.now()}.json`;
+                    try {
+                        await writeFile(recoveryPath, JSON.stringify(unrecovered, null, 2), "utf8");
+                        savedTo = recoveryPath;
+                    }
+                    catch {
+                        savedTo = null;
+                    }
+                }
+                if (savedTo) {
+                    console.error(`\n${unrecovered.length} row(s) could not be restored after a failed replacement write. ` +
+                        `Full row content saved to ${savedTo}; summary:`);
+                    for (const entry of unrecovered.slice(0, 20)) {
+                        console.error(`  ${String(entry.id).slice(0, 8)}  scope=${entry.scope ?? "NULL"}  ${String(entry.text).replace(/\s+/g, " ").slice(0, 60)}`);
+                    }
+                    if (unrecovered.length > 20) {
+                        console.error(`  ... and ${unrecovered.length - 20} more (all in the recovery file)`);
+                    }
+                }
+                else {
+                    console.error(`\n${unrecovered.length} row(s) could not be restored after a failed replacement write, ` +
+                        "and the recovery file could not be written. Full row content follows (JSON, one per line) so the data is not lost:");
+                    for (const entry of unrecovered) {
+                        console.error(JSON.stringify(entry));
+                    }
                 }
             }
             if (failed > 0 || unrecovered.length > 0) {
