@@ -1178,14 +1178,17 @@ function splitProviderModel(modelRef: string): { provider?: string; model?: stri
 
 /**
  * When modelRef is a bare name (no / prefix), infer provider from baseURL.
- * Use "." + suffix to prevent fake-minimax.io subdomain spoofing.
+ * Use "." + suffix to prevent host spoofing (e.g. fake-minimax.io). Both
+ * MiniMax regional endpoints (minimax.io / minimaxi.com) map to the same
+ * "minimax" provider id used by the explicit modelRef path (e.g.
+ * "minimax/MiniMax-M3"), so a bare model name resolves consistently.
  */
 export function inferProviderFromBaseURL(baseURL: string | undefined): string | undefined {
   if (!baseURL) return undefined;
   try {
     const url = new URL(baseURL);
     const hostname = url.hostname.toLowerCase();
-    if (hostname.endsWith(".minimax.io")) return "minimax-portal";
+    if (hostname.endsWith(".minimax.io") || hostname.endsWith(".minimaxi.com")) return "minimax";
     if (hostname.endsWith(".openai.com")) return "openai";
     if (hostname.endsWith(".anthropic.com")) return "anthropic";
     return undefined;
