@@ -322,6 +322,7 @@ export class SmartExtractor {
             }
             else {
                 this.debugLog(`memory-pro: smart-extractor: skipping noise-bank learning (status=${extraction.status})`);
+                stats.extractionFailed = true;
             }
             return stats;
         }
@@ -415,6 +416,14 @@ export class SmartExtractor {
                 this.log("memory-pro: smart-extractor: supersede invalidation skipped because bulkStore() did not return created entries");
             }
         }
+        stats.settledOutcomes =
+            stats.created +
+                stats.merged +
+                stats.skipped +
+                (stats.rejected ?? 0) +
+                (stats.supported ?? 0) +
+                (stats.superseded ?? 0) >
+                0;
         return stats;
     }
     // --------------------------------------------------------------------------

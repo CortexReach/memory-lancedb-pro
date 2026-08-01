@@ -123,6 +123,7 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/typed-array-vector-fetch.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/extraction-grounding-register.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/grounding-rejudge.test.mjs", args: [] },
+  { group: "core-regression", runner: "node", file: "test/autocapture-fallback-gating.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

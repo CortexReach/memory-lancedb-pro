@@ -96,7 +96,7 @@ describe("SmartExtractor noise-bank learning gate", () => {
     const stats = await extractor.extractAndPersist("some conversation text", "s1");
     await flushMicrotasks();
 
-    assert.deepEqual(stats, { created: 0, merged: 0, skipped: 0, boundarySkipped: 0 });
+    assert.deepEqual(stats, { created: 0, merged: 0, skipped: 0, boundarySkipped: 0, extractionFailed: true });
     assert.equal(noiseBank.learnCalls.length, 0, "gateway/model failure must not train the noise bank");
   });
 

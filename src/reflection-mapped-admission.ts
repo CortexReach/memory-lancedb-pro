@@ -138,6 +138,8 @@ function buildGateResult(
  */
 export async function gateMappedReflectionEntries(params: {
   admissionController: MappedReflectionAdmissionGate | null;
+  /** True when admissionControl.enabled is set: a missing controller then means init failed, not "disabled". */
+  admissionRequired?: boolean;
   attachAudit: boolean;
   rows: MappedReflectionEntryInput[];
   /**
@@ -155,6 +157,14 @@ export async function gateMappedReflectionEntries(params: {
     return [];
   }
   if (!admissionController) {
+    if (params.admissionRequired) {
+      // Enabled-but-unavailable is an init failure, not "disabled": failing
+      // open here would silently restore the ungated writer-1 bypass for
+      // every burst until restart.
+      const reason = "admission control is enabled but no controller is available (initialization failed); failing closed";
+      params.warnLog?.(`memory-reflection: mapped-row burst rejected: ${reason}`);
+      return rows.map(() => ({ admit: false, reason }));
+    }
     return rows.map(() => ({ admit: true }));
   }
 
@@ -203,6 +213,8 @@ export async function gateMappedReflectionEntries(params: {
  */
 export async function gateMappedReflectionEntry(params: {
   admissionController: MappedReflectionAdmissionGate | null;
+  /** True when admissionControl.enabled is set: a missing controller then means init failed, not "disabled". */
+  admissionRequired?: boolean;
   attachAudit: boolean;
   text: string;
   mappedKind: ReflectionMappedKind;
@@ -219,6 +231,7 @@ export async function gateMappedReflectionEntry(params: {
 }): Promise<MappedReflectionGateResult> {
   const [result] = await gateMappedReflectionEntries({
     admissionController: params.admissionController,
+    admissionRequired: params.admissionRequired,
     attachAudit: params.attachAudit,
     rows: [
       {

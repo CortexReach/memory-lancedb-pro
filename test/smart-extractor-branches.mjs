@@ -711,8 +711,11 @@ assert.ok(
 assert.ok(
   prependedRecallResult.logs.some((entry) => entry[1].includes("preview=\"请记住我的饮品偏好是乌龙茶。\"")),
 );
+// Below-threshold turns with smart extraction enabled are deferred instead of
+// handed to the raw regex fallback (fallback gating): the stripped user text
+// is carried by the cursor to the next turn's extraction input.
 assert.ok(
-  prependedRecallResult.logs.some((entry) => entry[1].includes("regex fallback found 1 capturable text(s)")),
+  prependedRecallResult.logs.some((entry) => entry[1].includes("regex fallback skipped")),
 );
 
 async function runInboundMetadataWrappedScenario() {
@@ -800,9 +803,10 @@ assert.ok(
     entry[1].includes('preview="请记住我的饮品偏好是乌龙茶"')
   ),
 );
+// Same deferral as above: below-threshold turn, regex fallback skipped.
 assert.ok(
   inboundMetadataWrappedResult.logs.some((entry) =>
-    entry[1].includes("regex fallback found 1 capturable text(s)")
+    entry[1].includes("regex fallback skipped")
   ),
 );
 
