@@ -93,7 +93,7 @@ describe("buildDedupPrompt system/user split", () => {
     assert.match(system, /context_label/);
   });
 
-  // Live-fleet trace (terry, 2026-07-18): the judge invented a category wall
+  // Live-fleet trace (2026-07-18): the judge invented a category wall
   // ("existing similar memories are patterns, not preferences -> CREATE").
   // Every category mention in the prompt is a restriction (events/cases
   // verdict gate, preferences/entities supersede scoping), so the model
