@@ -3182,9 +3182,14 @@ const memoryLanceDBProPlugin = {
     // effect when a delete genuinely happens inside this same plugin instance.
     //
     // The actual cross-process staleness bound comes from two other layers:
-    //   - DEFAULT_REFLECTION_CACHE_TTL_MS bounds how long either cache below can
-    //     serve stale content after ANY delete, same-process or not (see the read
-    //     sites in loadAgentReflectionSlices and the derived-focus injector).
+    //   - DEFAULT_REFLECTION_CACHE_TTL_MS bounds staleness measured from the
+    //     LAST DB READ, not from cache priming: the derived-focus injector
+    //     falls back to loadAgentReflectionSlices when its session cache is
+    //     stale, and that fallback keeps its own independently-clocked TTL
+    //     cache. Two caches in series mean a delete can keep being served for
+    //     up to one full TTL after whichever cache last re-read the DB (see
+    //     the read sites in loadAgentReflectionSlices and the derived-focus
+    //     injector).
     //   - readConsistencyInterval (store config) bounds how long the underlying
     //     LanceDB table handle can serve stale rows to a fresh query in the first
     //     place, which is what a TTL-expired cache re-populates from.
@@ -5979,6 +5984,10 @@ const memoryLanceDBProPlugin = {
           }
 
           if (reflectionStoreToLanceDB) {
+            // Mirror of loadAgentReflectionSlices' TOCTOU guard: a delete's
+            // invalidation while the awaits below are in flight must not be
+            // undone by the late reflectionDerivedBySession.set further down.
+            const derivedGenerationAtStart = reflectionByAgentCacheGeneration.count;
             const stored = await storeReflectionToLanceDB({
               reflectionText,
               sessionKey,
@@ -6012,7 +6021,12 @@ const memoryLanceDBProPlugin = {
                   }
                 : undefined,
             });
-            if (sessionKey && stored.slices.derived.length > 0 && !isSessionBoundaryReflectionAction(action)) {
+            if (
+              sessionKey &&
+              stored.slices.derived.length > 0 &&
+              !isSessionBoundaryReflectionAction(action) &&
+              reflectionByAgentCacheGeneration.count === derivedGenerationAtStart
+            ) {
               reflectionDerivedBySession.set(sessionKey, {
                 // Deliberately Date.now(), not nowTs (which mirrors the host-supplied
                 // event.timestamp and can be skewed/future-dated): this field is a TTL
