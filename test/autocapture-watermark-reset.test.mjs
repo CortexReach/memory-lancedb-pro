@@ -232,7 +232,7 @@ describe("auto-capture watermark after successful extraction (history flow)", ()
     });
     memoryLanceDBProPlugin.register(harness.api);
     const hook = getAutoCaptureHook(harness.eventHandlers);
-    const ctx = { sessionKey: "agent:dave:main", agentId: "dave" };
+    const ctx = { sessionKey: "agent:agent-one:main", agentId: "agent-one" };
 
     // Turn 1: agent_end carries the full history so far (2 texts).
     // cumulative=2 >= minMessages=2 -> extraction runs and succeeds.
@@ -314,8 +314,8 @@ describe("auto-capture watermark invalidation on session renewal", () => {
 
     // Session A: two texts, extraction fires, watermark now counts them.
     await fireAgentEnd(hook, userMessages(...TURN_1_TEXTS), {
-      sessionKey: "agent:dave:main",
-      agentId: "dave",
+      sessionKey: "agent:agent-one:main",
+      agentId: "agent-one",
       sessionId: "session-aaa",
     });
     assert.equal(extractionPrompts.length, 1, "session A must extract");
@@ -324,8 +324,8 @@ describe("auto-capture watermark invalidation on session renewal", () => {
     // the same SIZE as the stale cursor. Without invalidation the payload
     // reads as already-seen and is silently swallowed.
     await fireAgentEnd(hook, userMessages(...TURN_2_TEXTS), {
-      sessionKey: "agent:dave:main",
-      agentId: "dave",
+      sessionKey: "agent:agent-one:main",
+      agentId: "agent-one",
       sessionId: "session-bbb",
     });
     assert.equal(extractionPrompts.length, 2, "the renewed session's first payload must extract, not be swallowed");
@@ -343,7 +343,7 @@ describe("auto-capture watermark invalidation on session renewal", () => {
     const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: makeConfig() });
     memoryLanceDBProPlugin.register(harness.api);
     const hook = getAutoCaptureHook(harness.eventHandlers);
-    const ctx = { sessionKey: "agent:dave:main", agentId: "dave", sessionId: "session-aaa" };
+    const ctx = { sessionKey: "agent:agent-one:main", agentId: "agent-one", sessionId: "session-aaa" };
 
     await fireAgentEnd(hook, userMessages(...TURN_1_TEXTS), ctx);
     await fireAgentEnd(hook, userMessages(...TURN_1_TEXTS, ...TURN_2_TEXTS), ctx);
@@ -363,7 +363,7 @@ describe("auto-capture watermark invalidation on session renewal", () => {
     const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: makeConfig() });
     memoryLanceDBProPlugin.register(harness.api);
     const hook = getAutoCaptureHook(harness.eventHandlers);
-    const ctx = { sessionKey: "agent:dave:main", agentId: "dave" };
+    const ctx = { sessionKey: "agent:agent-one:main", agentId: "agent-one" };
 
     await fireAgentEnd(hook, userMessages(...TURN_1_TEXTS), ctx);
     await fireAgentEnd(hook, userMessages(...TURN_1_TEXTS, ...TURN_2_TEXTS), ctx);
@@ -380,7 +380,7 @@ describe("auto-capture watermark invalidation on session renewal", () => {
     const first = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: config });
     memoryLanceDBProPlugin.register(first.api);
     const firstHook = getAutoCaptureHook(first.eventHandlers);
-    const ctx = { sessionKey: "agent:dave:main", agentId: "dave", sessionId: "session-aaa" };
+    const ctx = { sessionKey: "agent:agent-one:main", agentId: "agent-one", sessionId: "session-aaa" };
 
     await fireAgentEnd(firstHook, userMessages(...TURN_1_TEXTS), ctx);
     assert.equal(extractionPrompts.length, 1);
