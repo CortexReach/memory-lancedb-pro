@@ -10,15 +10,10 @@ import path from "node:path";
 import * as readline from "node:readline";
 import JSON5 from "json5";
 import { loadLanceDB, type MemoryEntry, type MemoryStore } from "./src/store.js";
-import {
-  parseSmartMetadata,
-  buildSmartMetadata,
-  stringifySmartMetadata,
-} from "./src/smart-metadata.js";
 import { createRetriever, type MemoryRetriever } from "./src/retriever.js";
 import type { MemoryScopeManager } from "./src/scopes.js";
 import type { MemoryMigrator } from "./src/migrate.js";
-import { createMemoryUpgrader } from "./src/memory-upgrader.js";
+import { createMemoryUpgrader, isCurrentReflectionMemory } from "./src/memory-upgrader.js";
 import type { LlmClient } from "./src/llm-client.js";
 import {
   getDefaultOauthModelForProvider,
@@ -2154,7 +2149,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     });
 
   // reindex-fts: Rebuild FTS index
-  program
+  memory
     .command("reindex-fts")
     .description("Rebuild the BM25 full-text search index")
     .action(async () => {
@@ -2174,13 +2169,52 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       }
     });
 
-  // repair-summaries: Detect and fix stale L0/L1/L2 summaries
-  program
+  // Judge the RAW stored metadata: parseSmartMetadata backfills missing
+  // levels from the text, which would hide exactly the rows the repair
+  // exists to fix. Accept only a non-null, non-array object: JSON.parse
+  // ("null") and primitives/arrays succeed, so the catch alone cannot
+  // normalize a damaged row, and one bad row must not abort a scan. Shared
+  // by the scan and the locked apply-time recheck so both judge identically.
+  function judgeSummaryLevels(
+    entry: MemoryEntry,
+  ): { reason: string; levels: { l0: string; l1: string; l2: string } } | null {
+    let rawMeta: Record<string, unknown> = {};
+    try {
+      const parsed: unknown = JSON.parse(entry.metadata || "{}");
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        rawMeta = parsed as Record<string, unknown>;
+      }
+    } catch {
+      rawMeta = {};
+    }
+    const l0 = (typeof rawMeta.l0_abstract === "string" ? rawMeta.l0_abstract : "").trim();
+    const l1 = (typeof rawMeta.l1_overview === "string" ? rawMeta.l1_overview : "").trim();
+    const l2 = (typeof rawMeta.l2_content === "string" ? rawMeta.l2_content : "").trim();
+
+    if (!l0 || !l1 || !l2) {
+      return { reason: "missing summary level(s)", levels: { l0, l1, l2 } };
+    }
+    if (l0 === l1 && l1 === l2) {
+      // Legacy parse-fallback signature: all three levels collapsed to one
+      // identical string. A generated set always differs by level.
+      return { reason: "degenerate identical levels", levels: { l0, l1, l2 } };
+    }
+    return null;
+  }
+
+  // repair-summaries: report memories whose L0/L1/L2 summaries are missing or
+  // degenerate; --apply fills them with the truncation fallback. Detection is
+  // limited to mechanically reliable shapes: a healthy generated L0 is a
+  // concise abstract that legitimately differs from the raw text, so
+  // text-vs-L0 prefix comparison cannot distinguish stale from generated and
+  // is deliberately not used.
+  memory
     .command("repair-summaries")
-    .description("Detect and fix L0/L1/L2 summaries that are inconsistent with text (text updated but summaries not regenerated)")
-    .option("--scope <scope>", "Filter by scope (e.g. agent:bs-intern)")
-    .option("--dry-run", "Preview mode — report stale entries without modifying data", false)
-    .action(async (options: { scope?: string; dryRun: boolean }) => {
+    .description("Report memories with missing or degenerate L0/L1/L2 summaries; --apply fills them from the source text (default is report-only)")
+    .option("--scope <scope>", "Filter by scope (e.g. agent:assistant)")
+    .option("--apply", "Write the repairs (without this flag the command only reports)", false)
+    .option("--dry-run", "Deprecated: report-only is already the default", false)
+    .action(async (options: { scope?: string; apply: boolean; dryRun: boolean }) => {
       try {
         const scopeFilter = options.scope ? [options.scope] : undefined;
 
@@ -2198,58 +2232,92 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
 
         console.log(`Scanned ${allEntries.length} memories${options.scope ? ` (scope: ${options.scope})` : ""}\n`);
 
-        const staleEntries: Array<{ entry: MemoryEntry; l0Prefix: string; textPrefix: string }> = [];
+        const staleEntries: Array<{
+          entry: MemoryEntry;
+          reason: string;
+          levels: { l0: string; l1: string; l2: string };
+        }> = [];
 
         for (const entry of allEntries) {
-          const meta = parseSmartMetadata(entry.metadata, entry);
-          const textPrefix = entry.text.slice(0, 60).trim();
-          const l0Prefix = (meta.l0_abstract || "").slice(0, 60).trim();
-
-          if (textPrefix !== l0Prefix) {
-            staleEntries.push({ entry, l0Prefix, textPrefix });
+          // Current reflection rows (memory-reflection / -event / -item /
+          // -mapped types and category "reflection") intentionally omit
+          // L0/L1/L2; the upgrader excludes them with this same predicate.
+          // Repairing them would rewrite valid reflection metadata with
+          // truncation fallbacks.
+          if (isCurrentReflectionMemory(entry)) {
+            continue;
+          }
+          const verdict = judgeSummaryLevels(entry);
+          if (verdict) {
+            staleEntries.push({ entry, reason: verdict.reason, levels: verdict.levels });
           }
         }
 
         if (staleEntries.length === 0) {
-          console.log("No stale summaries found. All L0/L1/L2 are consistent with text.");
+          console.log("No repairable summaries found (no missing or degenerate L0/L1/L2).");
           return;
         }
 
-        console.log(`Found ${staleEntries.length} stale entries:\n`);
+        console.log(`Found ${staleEntries.length} repairable entries:\n`);
 
-        for (const { entry, l0Prefix, textPrefix } of staleEntries) {
-          console.log(`  [${entry.id.slice(0, 8)}] scope=${entry.scope}`);
-          console.log(`    text:  "${textPrefix}..."`);
-          console.log(`    l0:    "${l0Prefix}..."`);
+        for (const { entry, reason } of staleEntries) {
+          console.log(`  [${entry.id.slice(0, 8)}] scope=${entry.scope} (${reason})`);
+          console.log(`    text: "${entry.text.slice(0, 60).trim()}..."`);
         }
 
-        if (options.dryRun) {
-          console.log(`\nDry run complete. ${staleEntries.length} entries would be repaired.`);
+        if (!options.apply || options.dryRun) {
+          console.log(`\nReport only — no data was modified. Re-run with --apply to fill ${staleEntries.length} entr${staleEntries.length === 1 ? "y" : "ies"} from source text.`);
           return;
         }
 
-        // Apply repairs
+        // Apply repairs atomically per row: the store re-reads the CURRENT
+        // row under its write lock and merges only the summary fields, so a
+        // gateway update landing between scan and apply (access counters,
+        // lifecycle state, relations) survives instead of being reverted by
+        // a document rebuilt from the scan snapshot.
         let repaired = 0;
+        let skipped = 0;
         let failed = 0;
 
         for (const { entry } of staleEntries) {
           try {
-            // Rebuild L0/L1/L2 using truncation fallback from buildSmartMetadata
-            const rebuilt = buildSmartMetadata(entry, {
-              l0_abstract: entry.text,
-              l1_overview: `- ${entry.text}`,
-              l2_content: entry.text,
-            });
-            const newMetadataStr = stringifySmartMetadata(rebuilt);
-            await context.store.update(entry.id, { metadata: newMetadataStr }, scopeFilter);
-            repaired++;
+            const result = await context.store.transformMetadata(entry.id, (current) => {
+              // Re-judge on the fresh row: it may have been healed or
+              // rewritten since the scan, and the scan's verdict must not
+              // outlive the state it judged.
+              const verdict = judgeSummaryLevels(current);
+              if (!verdict) {
+                return null;
+              }
+              // A degenerate set (all three collapsed to one string) is
+              // replaced whole; otherwise fill ONLY the missing levels so
+              // valid generated summaries survive the repair.
+              const replaceAll = verdict.reason === "degenerate identical levels";
+              return {
+                l0_abstract: replaceAll ? current.text : verdict.levels.l0 || current.text,
+                l1_overview: replaceAll ? `- ${current.text}` : verdict.levels.l1 || `- ${current.text}`,
+                l2_content: replaceAll ? current.text : verdict.levels.l2 || current.text,
+              };
+            }, scopeFilter);
+            if (result.outcome === "updated") {
+              repaired++;
+            } else if (result.outcome === "unchanged") {
+              skipped++;
+              console.log(`  Skipped ${entry.id.slice(0, 8)}: healthy at apply time (repaired concurrently)`);
+            } else {
+              failed++;
+              console.error(`  Failed to repair ${entry.id.slice(0, 8)}: update returned no entry (row missing or outside the scope filter)`);
+            }
           } catch (err) {
             failed++;
             console.error(`  Failed to repair ${entry.id.slice(0, 8)}: ${err}`);
           }
         }
 
-        console.log(`\nRepair complete: ${repaired} fixed, ${failed} failed out of ${staleEntries.length} stale.`);
+        console.log(`\nRepair complete: ${repaired} fixed, ${failed} failed${skipped > 0 ? `, ${skipped} skipped (healthy at apply time)` : ""} out of ${staleEntries.length} repairable.`);
+        if (failed > 0) {
+          process.exitCode = 1;
+        }
       } catch (error) {
         console.error("repair-summaries failed:", error);
         process.exit(1);

@@ -131,6 +131,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/admission-control-prompt-shape.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-merge-accounting.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/admission-utility-veto.test.mjs", args: ["--test"] },
+  { group: "cli-smoke", runner: "node", file: "test/cli-subcommand-attachment.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
