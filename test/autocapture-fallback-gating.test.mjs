@@ -1442,7 +1442,11 @@ describe("settled zero-persisted outcomes are consumed, not retried", () => {
         content = JSON.stringify({ memories });
       } else {
         counters.dedup += 1;
-        content = JSON.stringify(dedupDecision ?? { decision: "create", reason: "mock" });
+        // The batched dedup decider reads an indexed results array while the
+        // single-call path reads the top-level fields; serving both shapes in
+        // one payload keeps every scenario valid on either pipeline.
+        const single = dedupDecision ?? { decision: "create", reason: "mock" };
+        content = JSON.stringify({ ...single, results: [{ index: 1, ...single }] });
       }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({

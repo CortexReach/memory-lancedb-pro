@@ -531,7 +531,8 @@ describe("buildReflectionPrompt grounding discipline", () => {
   it("instructs the distiller to keep in-fiction claims out of the mapped (durable) sections", () => {
     const { buildReflectionPrompt } = jiti("../index.ts");
     assert.equal(typeof buildReflectionPrompt, "function", "buildReflectionPrompt must be exported for prompt-content tests");
-    const prompt = buildReflectionPrompt("conversation text", 4000, []);
+    const built = buildReflectionPrompt("conversation text", 4000, []);
+    const prompt = typeof built === "string" ? built : `${built.system}\n\n${built.user}`;
 
     assert.match(prompt, /roleplay/i);
     assert.match(prompt, /not real/i);

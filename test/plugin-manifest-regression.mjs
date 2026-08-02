@@ -201,6 +201,15 @@ assert.ok(
   "llm.apiKey should accept OpenClaw SecretRef objects",
 );
 assert.ok(
+  manifest.configSchema.properties.admissionControl.properties.utilityMode.enum.includes("batch"),
+  "admissionControl.utilityMode schema should declare the batch utility mode",
+);
+assert.equal(
+  manifest.configSchema.properties.admissionControl.properties.utilityMode.default,
+  "standalone",
+  "admissionControl.utilityMode schema default should remain standalone (batch is opt-in)",
+);
+assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties, "dreaming"),
   "configSchema should declare dreaming so the plugin can own the OpenClaw memory slot",
 );

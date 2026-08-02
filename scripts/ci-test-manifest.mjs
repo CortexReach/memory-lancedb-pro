@@ -124,6 +124,13 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/extraction-grounding-register.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/grounding-rejudge.test.mjs", args: [] },
   { group: "core-regression", runner: "node", file: "test/autocapture-fallback-gating.test.mjs", args: ["--test"] },
+  { group: "llm-clients-and-auth", runner: "node", file: "test/prompt-architecture.test.mjs", args: ["--test"] },
+  { group: "llm-clients-and-auth", runner: "node", file: "test/extraction-category-rubric.test.mjs" },
+  { group: "core-regression", runner: "node", file: "test/admission-control-batch-utility.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-admission.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/admission-control-prompt-shape.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/smart-extractor-merge-accounting.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/admission-utility-veto.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

@@ -70,6 +70,18 @@ function makeExtractor(store) {
           match_index: 1,
         };
       }
+      if (mode === "dedup-decision-batch") {
+        return {
+          results: [
+            {
+              index: 1,
+              decision: "supersede",
+              reason: "newer preference replaces older preference",
+              match_index: 1,
+            },
+          ],
+        };
+      }
       throw new Error(`unexpected mode: ${mode}`);
     },
   };
