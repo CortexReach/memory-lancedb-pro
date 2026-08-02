@@ -161,6 +161,23 @@ export type ExtractionStats = {
   boundarySkipped?: number;
   supported?: number; // context-aware support count
   superseded?: number; // temporal fact replacements
+  /**
+   * True when the candidate extraction never produced a usable result (null or
+   * malformed LLM completion). Distinguishes "the LLM judged nothing worth
+   * storing" (a definitive zero) from "the LLM never answered" — callers must
+   * not consume deferred input on the latter.
+   */
+  extractionFailed?: boolean;
+  /**
+   * True when at least one candidate reached a definitive pipeline verdict
+   * (create, merge, admission reject, dedup skip, support, or supersede).
+   * A zero-persisted run with settled outcomes is CONSUMED input, not a
+   * retryable one: requeuing it re-runs extraction and admission on the same
+   * snapshot, duplicates rejection audits or support evidence, and charges
+   * the rate limiter again. Absent/false means the run was barren (no
+   * candidates) or failed — the only retryable shapes.
+   */
+  settledOutcomes?: boolean;
 };
 
 /** Validate and normalize a category string. */
