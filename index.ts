@@ -68,7 +68,7 @@ import {
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata, getReflectionMappedMemoryCategory, getReflectionMappedStorageCategory } from "./src/reflection-mapped-metadata.js";
 import { buildFallbackCandidate, gateRegexFallbackCapture } from "./src/autocapture-fallback-admission.js";
-import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
+import { gateMappedReflectionEntries, resolveMappedRowAdmissionController } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
@@ -77,7 +77,7 @@ import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
 import { NoisePrototypeBank } from "./src/noise-prototypes.js";
-import { createLlmClient } from "./src/llm-client.js";
+import { createLlmClient, normalizeDirectModelRef } from "./src/llm-client.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
 import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
@@ -99,7 +99,9 @@ import {
   type WorkspaceBoundaryConfig,
 } from "./src/workspace-boundary.js";
 import {
+  createAdmissionController,
   normalizeAdmissionControlConfig,
+  resolveAdmissionModel,
   resolveRejectedAuditFilePath,
   type AdmissionControlConfig,
   type AdmissionRejectionAuditEntry,
@@ -263,6 +265,8 @@ interface PluginConfig {
     oauthProvider?: string;
     oauthPath?: string;
     timeoutMs?: number;
+    /** Reasoning effort for memory LLM calls (e.g. low | medium | high). Sent only when set; unset leaves the provider default. */
+    thinkLevel?: string;
   };
   extractMinMessages?: number;
   extractMaxChars?: number;
@@ -2375,6 +2379,7 @@ interface PluginSingletonState {
   autoCaptureInFlightRuns: Map<string, Set<Promise<void>>>;
   captureAdmissionController: () => AdmissionController | null;
   captureAdmissionAudit: () => boolean;
+  captureReflectionAdmissionController: () => AdmissionController | null;
   admissionRejectionAuditWriter: ((entry: AdmissionRejectionAuditEntry) => Promise<void>) | null;
 }
 
@@ -2515,87 +2520,146 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
       : undefined;
     const llmOauthProvider = llmAuth === "oauth" ? config.llm?.oauthProvider : undefined;
     const llmTimeoutMs = resolveLlmTimeoutMs(config);
-    return {
-      llmModel,
-      llmTimeoutMs,
-      llmClient: createLlmClient({
+    const makeClientForModel = (
+      model: string,
+      thinkLevel: string | undefined = config.llm?.thinkLevel,
+    ) =>
+      createLlmClient({
         auth: llmAuth,
         apiKey: llmApiKey,
-        model: llmModel,
+        model,
         baseURL: llmBaseURL,
         oauthProvider: llmOauthProvider,
         oauthPath: llmOauthPath,
         timeoutMs: llmTimeoutMs,
         log: (msg: string) => api.logger.debug(msg),
         warnLog: (msg: string) => api.logger.warn(msg),
-      }),
+        thinkLevel,
+      });
+    return {
+      llmModel,
+      llmTimeoutMs,
+      llmClient: makeClientForModel(llmModel),
+      makeClientForModel,
     };
   };
 
+  // Admission control is constructed independently of SmartExtractor (one
+  // controller, injected) so gating works the same for extraction, the regex
+  // fallback, and mapped-reflection rows whether or not smart extraction is
+  // enabled. admissionControl.enabled remains a supported configuration on
+  // its own.
   let smartExtractor: SmartExtractor | null = null;
-  if (config.smartExtraction !== false) {
+  let admissionController: AdmissionController | null = null;
+  let admissionControllerReflectionLane: AdmissionController | null = null;
+  if (config.smartExtraction !== false || config.admissionControl?.enabled === true) {
     try {
-      const { llmClient, llmModel, llmTimeoutMs } = buildMemoryLlmClient();
+      const { llmClient, llmModel, llmTimeoutMs, makeClientForModel } = buildMemoryLlmClient();
 
-      const noiseBank = new NoisePrototypeBank((msg: string) => api.logger.debug(msg));
-      noiseBank.init(embedder).catch((err) =>
-        api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
-      );
-
-      smartExtractor = new SmartExtractor(store, embedder, llmClient, {
-        user: "User",
-        extractMinMessages: config.extractMinMessages ?? 4,
-        extractMaxChars: config.extractMaxChars ?? 8000,
-        batchChunkSize: config.batchChunkSize,
-        defaultScope: config.scopes?.default ?? "global",
-        workspaceBoundary: config.workspaceBoundary,
+      // Model resolution for admission calls: explicit admissionControl.model
+      // override > lane affinity (the reflection lane resolves the
+      // memoryReflection model and, with affinity on, its thinkLevel) >
+      // global default. See resolveAdmissionModel().
+      const reflectionModelForAdmission = asNonEmptyString(config.memoryReflection?.model);
+      const admissionModelExtraction = resolveAdmissionModel({
         admissionControl: config.admissionControl,
-        onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
-        onPersisted: mdMirror ?? undefined,
-        log: (msg: string) => api.logger.info(msg),
-        debugLog: (msg: string) => api.logger.debug(msg),
-        noiseBank,
+        lane: "other",
+        globalModel: llmModel,
+        reflectionModel: reflectionModelForAdmission,
       });
+      const admissionModelReflection = resolveAdmissionModel({
+        admissionControl: config.admissionControl,
+        lane: "reflection",
+        globalModel: llmModel,
+        reflectionModel: reflectionModelForAdmission,
+      });
+      const globalThinkLevel = config.llm?.thinkLevel;
+      const laneAffinity = config.admissionControl?.modelAffinity === "lane";
+      const reflectionThinkLevel = laneAffinity
+        ? (asNonEmptyString(config.memoryReflection?.thinkLevel) ?? globalThinkLevel)
+        : globalThinkLevel;
+      const admissionClientFor = (model: string, thinkLevel: string | undefined) => {
+        const directModel = normalizeDirectModelRef(model);
+        return directModel === llmModel && thinkLevel === globalThinkLevel
+          ? llmClient
+          : makeClientForModel(directModel, thinkLevel);
+      };
 
-      (isCliMode() ? api.logger.debug : api.logger.info)(
-        "memory-lancedb-pro: smart extraction enabled (LLM model: "
-        + llmModel
-        + ", timeoutMs: "
-        + llmTimeoutMs
-        + ", noise bank: ON)",
-      );
-    } catch (err) {
-      api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
-    }
-  }
-
-  // admissionControl.enabled is a supported configuration on its own: without
-  // this, disabling smart extraction (or its init failing) silently dropped the
-  // admission gate from the regex fallback and mapped-reflection paths.
-  let fallbackAdmissionController: AdmissionController | null = null;
-  let fallbackPersistAdmissionAudit = false;
-  if (!smartExtractor && config.admissionControl?.enabled === true) {
-    try {
-      fallbackAdmissionController = new AdmissionController(
+      // The plugin-level batchChunkSize knob bounds the batch-utility stage
+      // too; it is injected here rather than parsed from the admissionControl
+      // section so one knob governs every batched stage.
+      const admissionConfigWithChunk = {
+        ...config.admissionControl,
+        batchChunkSize: config.batchChunkSize,
+      };
+      admissionController = createAdmissionController(
         store,
-        buildMemoryLlmClient().llmClient,
-        config.admissionControl,
+        admissionClientFor(admissionModelExtraction, globalThinkLevel),
+        admissionConfigWithChunk,
         (msg: string) => api.logger.debug(msg),
       );
-      fallbackPersistAdmissionAudit = config.admissionControl.auditMetadata !== false;
-      api.logger.info(
-        "memory-lancedb-pro: admission control constructed for capture fallbacks (smart extraction inactive)",
-      );
+      // modelAffinity "lane": the mapped-reflection admission judge rides the
+      // reflection lane's model (and thinkLevel); "global" keeps every lane
+      // on the plugin llm, judge included, sharing one controller instance.
+      admissionControllerReflectionLane =
+        admissionModelReflection === admissionModelExtraction && reflectionThinkLevel === globalThinkLevel
+          ? admissionController
+          : createAdmissionController(
+              store,
+              admissionClientFor(admissionModelReflection, reflectionThinkLevel),
+              admissionConfigWithChunk,
+              (msg: string) => api.logger.debug(msg),
+            );
+      if (admissionController && config.smartExtraction === false) {
+        api.logger.info(
+          "memory-lancedb-pro: admission control constructed for capture fallbacks (smart extraction inactive)",
+        );
+      }
+
+      if (config.smartExtraction !== false) {
+        const noiseBank = new NoisePrototypeBank((msg: string) => api.logger.debug(msg));
+        noiseBank.init(embedder).catch((err) =>
+          api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
+        );
+
+        smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+          user: "User",
+          extractMinMessages: config.extractMinMessages ?? 4,
+          extractMaxChars: config.extractMaxChars ?? 8000,
+          batchChunkSize: config.batchChunkSize,
+          defaultScope: config.scopes?.default ?? "global",
+          workspaceBoundary: config.workspaceBoundary,
+          admissionControl: config.admissionControl,
+          admissionController,
+          onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
+          onPersisted: mdMirror ?? undefined,
+          log: (msg: string) => api.logger.info(msg),
+          debugLog: (msg: string) => api.logger.debug(msg),
+          noiseBank,
+        });
+
+        (isCliMode() ? api.logger.debug : api.logger.info)(
+          "memory-lancedb-pro: smart extraction enabled (LLM model: "
+          + llmModel
+          + ", timeoutMs: "
+          + llmTimeoutMs
+          + ", noise bank: ON)",
+        );
+      }
     } catch (err) {
-      api.logger.error(
-        `memory-lancedb-pro: fallback admission init failed; admission-gated captures FAIL CLOSED until init succeeds: ${String(err)}`,
-      );
+      if (config.smartExtraction !== false) {
+        api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+      } else {
+        api.logger.error(
+          `memory-lancedb-pro: fallback admission init failed; admission-gated captures FAIL CLOSED until init succeeds: ${String(err)}`,
+        );
+      }
     }
   }
-  const captureAdmissionController = () =>
-    smartExtractor?.getAdmissionController() ?? fallbackAdmissionController;
+  const captureAdmissionController = () => admissionController;
   const captureAdmissionAudit = () =>
-    smartExtractor ? smartExtractor.shouldPersistAdmissionAudit() : fallbackPersistAdmissionAudit;
+    admissionController !== null && config.admissionControl?.auditMetadata !== false;
+  const captureReflectionAdmissionController = () => admissionControllerReflectionLane;
 
   const extractionRateLimiter = createExtractionRateLimiter({
     maxExtractionsPerHour: config.extractionThrottle?.maxExtractionsPerHour,
@@ -2654,6 +2718,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCaptureInFlightRuns,
     captureAdmissionController,
     captureAdmissionAudit,
+    captureReflectionAdmissionController,
     admissionRejectionAuditWriter,
   };
 }
@@ -2813,6 +2878,7 @@ const memoryLanceDBProPlugin = {
       autoCaptureInFlightRuns,
       captureAdmissionController,
       captureAdmissionAudit,
+      captureReflectionAdmissionController,
       admissionRejectionAuditWriter,
     } = singleton;
 
@@ -3130,7 +3196,7 @@ const memoryLanceDBProPlugin = {
     const logReg = isCliMode() ? api.logger.debug : api.logger.info;
     if (isFirstRegistration) {
       logReg(
-        `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
+        `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'}, admissionControl: ${captureAdmissionController() ? 'ON' : 'OFF'})`
       );
       logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
     }
@@ -5497,7 +5563,10 @@ const memoryLanceDBProPlugin = {
           // historical per-row path otherwise; passthrough when admission
           // control (or smart extraction) is disabled.
           const mappedGateResults = await gateMappedReflectionEntries({
-            admissionController: captureAdmissionController(),
+            admissionController: resolveMappedRowAdmissionController(
+              captureReflectionAdmissionController(),
+              captureAdmissionController(),
+            ),
             admissionRequired: config.admissionControl?.enabled === true,
             attachAudit: captureAdmissionAudit(),
             rows: gateEligible.map(({ mapped, vector }) => ({

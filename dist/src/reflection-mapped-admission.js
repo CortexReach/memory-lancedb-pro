@@ -18,6 +18,15 @@
  * reasons, and audit records are identical either way — only the LLM call
  * topology differs.
  */
+/**
+ * Which AdmissionController gates a mapped reflection row: the dedicated
+ * reflection-lane controller when lane affinity built one, otherwise the
+ * base controller shared with extraction. Both may be null (admission
+ * disabled), which the gate treats as passthrough.
+ */
+export function resolveMappedRowAdmissionController(reflectionLaneController, baseController) {
+    return reflectionLaneController ?? baseController;
+}
 import { getReflectionMappedMemoryCategory, } from "./reflection-mapped-metadata.js";
 function buildGateItem(row, conversationText, scopeFilter) {
     return {
