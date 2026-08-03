@@ -22,10 +22,29 @@
  * builders is a defect.
  */
 import { CATEGORY_TAXONOMY, DEDUP_JUDGE_IDENTITY, EXTRACTION_AGENT_IDENTITY, MERGE_WRITER_IDENTITY, formatCandidateBlock, formatExistingMemoriesSection, formatMemoryFieldLines, jsonShape, } from "./prompt-blocks.js";
-export function buildExtractionPrompt(conversationText, user) {
-    const assistantLinesRule = `- Assistant lines: in the Recent conversation turns transcript, "Assistant:" lines are provided only to help you understand what the user is referring to (e.g. "yes exactly, that one"). Do NOT create a candidate whose only support is an assistant line — every candidate must be grounded in a user-authored line. The assistant greeting or addressing the user by a name is NOT the user introducing themselves; the assistant proposing, summarizing, or confirming something is NOT the user asserting it. If the user never stated or explicitly confirmed the fact themselves, do not extract it.`;
-    ;
+export function buildExtractionPrompt(conversationText, user, options = {}) {
+    // Transcript modes, driven by captureAssistant:
+    // - assistantEligible (captureAssistant=true): assistant blocks appear in
+    //   the transcript AND are valid grounding sources, with attribution rules.
+    // - default (captureAssistant=false): assistant lines are excluded from the
+    //   transcript entirely, so the prompt does not describe assistant blocks
+    //   at all.
+    const assistantEligible = options.assistantEligible === true;
+    const assistantFormatBullet = assistantEligible
+        ? `
+- <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant.`
+        : "";
+    const userGroundingSuffix = assistantEligible ? "" : " Memories may only be grounded here.";
+    const assistantBlocksRule = assistantEligible
+        ? `
+- <assistant_message> blocks: also valid sources — but only for concrete facts the user did not correct. Skip the assistant's greetings, guesses, and self-description.
+- Attribute every memory to whoever actually said it. When both said it, use the <user_message> version.`
+        : "";
     const system = `${EXTRACTION_AGENT_IDENTITY} Analyze session context and extract memories worth long-term preservation.
+
+## Transcript format
+The conversation is a sequence of tagged blocks in chronological order:
+- <user_message>...</user_message> wraps ONE message written by the human user.${userGroundingSuffix}${assistantFormatBullet}
 
 # Memory Extraction Criteria
 
@@ -45,8 +64,7 @@ export function buildExtractionPrompt(conversationText, user) {
 - Degraded or incomplete references: If the user mentions something vaguely ("that thing I said"), do NOT invent details or create a hollow memory
 - Raw conversation carryover: quoted or attributed transcript blocks, especially 3+ lines of speaker text, are not memories by themselves. Distill a concrete profile detail, preference, entity state, event, case, or pattern from them, or skip.
 - System/runtime artifacts: content containing "System:", compaction notices, model-switch/session-reset traces, tool-call transcripts, raw JSON blobs, or similar internal execution traces must be rejected unless a clean user fact can be extracted.
-- Fragment blobs: mixed filename shards, code snippets, metadata fields, or partial sentences that look like unprocessed context fragments should be skipped rather than preserved.
-${assistantLinesRule}
+- Fragment blobs: mixed filename shards, code snippets, metadata fields, or partial sentences that look like unprocessed context fragments should be skipped rather than preserved.${assistantBlocksRule}
 - Atomic memory shape: each stored memory must read like one durable fact, preference, decision, entity state, event, case, or reusable pattern. If a candidate reads like an excerpt, log, or raw transcript, compress it into one atomic statement, or skip it.
 - Length/distillation gate: if a candidate is longer than about 200 characters and reads like raw conversation instead of a distilled insight, rewrite it as a single factual statement before storing; if that is not possible, skip it.
 
@@ -239,14 +257,19 @@ Notes:
 - Maximum 5 memories per extraction
 - Preferences should be aggregated by topic
 - Always set the top-level "conversation_register" field, and tag every memory's "grounding" field, per the Conversational Grounding rules above`;
-    const userMessage = `User: ${user}
+    // "User: User" with a generic identity confused live agents; the name line
+    // only appears when a real name is configured.
+    const userNameLine = user && user !== "User" ? `User: ${user}\n\n` : "";
+    const userMessage = `${userNameLine}Target Output Language: auto (detect from recent messages)
 
-Target Output Language: auto (detect from recent messages)
+Read the conversation below in chronological order, top to bottom, and understand it as a whole before extracting anything. Interpret every message through your understanding of the full conversation, not in isolation.
+
+${assistantEligible
+        ? "Extract memory candidates from <user_message> and <assistant_message> blocks, attributed to their true speaker."
+        : "Extract memory candidates ONLY from <user_message> blocks."}
 
 ## Recent Conversation
-\`\`\`
-${conversationText}
-\`\`\``;
+${conversationText}`;
     return { system, user: userMessage };
 }
 export function buildDedupPrompt(candidate, existingMemories) {

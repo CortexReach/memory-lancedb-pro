@@ -106,6 +106,34 @@ describe("compressTexts", () => {
     assert.equal(result.dropped, 0);
   });
 
+  it("reports kept indices into the input for every path", () => {
+    const withinBudget = compressTexts(["hello", "world"], 10000);
+    assert.deepEqual(withinBudget.keptIndices, [0, 1]);
+
+    const empty = compressTexts([], 1000);
+    assert.deepEqual(empty.keptIndices, []);
+
+    const texts = [
+      "A".repeat(100),
+      "B".repeat(100),
+      "C".repeat(100),
+      "D".repeat(100),
+      "E".repeat(100),
+    ];
+    const compressed = compressTexts(texts, 250);
+    assert.ok(compressed.dropped > 0);
+    assert.equal(compressed.keptIndices.length, compressed.texts.length);
+    compressed.keptIndices.forEach((keptIndex, position) => {
+      assert.equal(texts[keptIndex], compressed.texts[position]);
+      if (position > 0) {
+        assert.ok(
+          keptIndex > compressed.keptIndices[position - 1],
+          "kept indices ascend chronologically",
+        );
+      }
+    });
+  });
+
   it("enforces budget: output chars <= maxChars", () => {
     const texts = [
       "A".repeat(100),

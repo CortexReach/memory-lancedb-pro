@@ -178,6 +178,7 @@ export type ExtractionStats = {
    * candidates) or failed — the only retryable shapes.
    */
   settledOutcomes?: boolean;
+  skippedNoInput?: boolean; // nothing extractable survived stripping/bounding: no LLM call was made
 };
 
 /** Validate and normalize a category string. */

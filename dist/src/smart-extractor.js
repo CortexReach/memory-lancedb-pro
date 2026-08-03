@@ -14,6 +14,7 @@ import { isUserMdExclusiveMemory, } from "./workspace-boundary.js";
 import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
 import { inferAtomicBrandItemPreferenceSlot } from "./preference-slots.js";
 import { batchDedup } from "./batch-dedup.js";
+import { buildBoundedTranscriptWithStats, } from "./auto-capture-cleanup.js";
 // ============================================================================
 // Envelope Metadata Stripping
 // ============================================================================
@@ -144,15 +145,88 @@ export function stripEnvelopeMetadata(text) {
     let cleaned = result.join("\n");
     // 1. Strip "System: [timestamp] Channel..." lines
     cleaned = cleaned.replace(/^System:\s*\[[\d\-: +GMT]+\]\s+\S+\[.*?\].*$/gm, "");
-    // 2. Strip labeled metadata sections with their JSON code blocks
-    //    e.g. "Conversation info (untrusted metadata):\n```json\n{...}\n```"
-    cleaned = cleaned.replace(/(?:Conversation info|Sender|Replied message)\s*\(untrusted[^)]*\):\s*```json\s*\{[\s\S]*?\}\s*```/g, "");
-    // 3. Strip any remaining JSON blocks that look like envelope metadata
-    //    (contain message_id and sender_id fields)
-    cleaned = cleaned.replace(/```json\s*(?=\{[\s\S]*?"message_id"\s*:)(?=\{[\s\S]*?"sender_id"\s*:)\{[\s\S]*?\}\s*```/g, "");
+    // 2+3. Strip labeled metadata sections and standalone envelope JSON blocks
+    //      via a forward fence scan. Every check is scoped to one fenced
+    //      block, so cost stays linear in the input; the regexes this replaces
+    //      rescanned toward end-of-input for every fence (superlinear on
+    //      fence-dense messages) and could strip a keyless block whenever the
+    //      envelope keys appeared anywhere later in the text.
+    cleaned = stripEnvelopeJsonBlocks(cleaned);
     // 4. Collapse excessive blank lines left by removals
     cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
     return cleaned.trim();
+}
+// Label immediately preceding a fenced block that marks it as channel
+// metadata. Tested against a short bounded tail slice, never the whole text.
+const ENVELOPE_SECTION_LABEL_RE = /(?:Conversation info|Sender|Replied message)\s*\(untrusted[^)]*\):\s*$/;
+const ENVELOPE_LABEL_LOOKBEHIND_CHARS = 160;
+/**
+ * True when the body is one balanced JSON object. Brace counting skips JSON
+ * string literals and their escapes, so an unpaired brace inside a string
+ * value (ordinary chat text, an emoticon) cannot shield an envelope block
+ * from stripping. A body this check rejects is left in place — for a
+ * stripper, the exposure direction — so it stays as permissive as one-object
+ * bodies allow.
+ */
+function isSingleObjectBody(body) {
+    const trimmed = body.trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}"))
+        return false;
+    let depth = 0;
+    let inString = false;
+    for (let i = 0; i < trimmed.length; i++) {
+        const ch = trimmed[i];
+        if (inString) {
+            if (ch === "\\")
+                i++;
+            else if (ch === '"')
+                inString = false;
+            continue;
+        }
+        if (ch === '"')
+            inString = true;
+        else if (ch === "{")
+            depth++;
+        else if (ch === "}") {
+            depth--;
+            if (depth < 0)
+                return false;
+            if (depth === 0 && i < trimmed.length - 1)
+                return false;
+        }
+    }
+    return depth === 0 && !inString;
+}
+function stripEnvelopeJsonBlocks(text) {
+    const opener = "```json";
+    let out = "";
+    let cursor = 0;
+    while (true) {
+        const fenceStart = text.indexOf(opener, cursor);
+        if (fenceStart === -1)
+            break;
+        const bodyStart = fenceStart + opener.length;
+        const fenceClose = text.indexOf("```", bodyStart);
+        if (fenceClose === -1)
+            break;
+        const blockEnd = fenceClose + 3;
+        const body = text.slice(bodyStart, fenceClose);
+        let stripFrom = -1;
+        if (isSingleObjectBody(body)) {
+            const lookbehindStart = Math.max(cursor, fenceStart - ENVELOPE_LABEL_LOOKBEHIND_CHARS);
+            const label = ENVELOPE_SECTION_LABEL_RE.exec(text.slice(lookbehindStart, fenceStart));
+            if (label) {
+                stripFrom = fenceStart - label[0].length;
+            }
+            else if (/"message_id"\s*:/.test(body) && /"sender_id"\s*:/.test(body)) {
+                stripFrom = fenceStart;
+            }
+        }
+        out += text.slice(cursor, stripFrom === -1 ? blockEnd : stripFrom);
+        cursor = blockEnd;
+    }
+    out += text.slice(cursor);
+    return out;
 }
 function globToRegExp(glob) {
     const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
@@ -320,10 +394,14 @@ export class SmartExtractor {
             return stats;
         }
         // Step 1: LLM extraction
-        const extraction = await this.extractCandidates(conversationText, policyMode);
+        const extraction = await this.extractCandidates(conversationText, policyMode, options.conversationTurns, options.protectedPrefixTurns);
         const candidates = extraction.candidates;
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
+            if (extraction.status === "empty_input") {
+                // No LLM call was made, so the caller's rate limiter must not be charged.
+                stats.skippedNoInput = true;
+            }
             if (extraction.status === "ok" && !extraction.groundingOrPolicyDropped) {
                 // LLM genuinely returned zero candidates → strongest noise signal → feedback to noise bank
                 this.learnAsNoise(conversationText);
@@ -622,16 +700,29 @@ export class SmartExtractor {
      * Uses batch embedding to reduce API round-trips from N to 1.
      */
     async filterNoiseByEmbedding(texts) {
-        const staticFiltered = texts.filter((text) => {
-            const noisy = isMetaFrustrationNoise(text);
-            if (noisy) {
+        return (await this.filterNoiseByEmbeddingWithIndices(texts)).texts;
+    }
+    /**
+     * Same filter, but also reports which input positions survived, so callers
+     * that track per-text provenance (turn attribution) can follow a surviving
+     * text back to the exact copy it came from.
+     */
+    async filterNoiseByEmbeddingWithIndices(texts) {
+        const staticFiltered = [];
+        const staticKeptIndices = [];
+        for (let inputIndex = 0; inputIndex < texts.length; inputIndex++) {
+            const text = texts[inputIndex];
+            if (isMetaFrustrationNoise(text)) {
                 this.debugLog(`memory-lancedb-pro: smart-extractor: static noise filtered: ${text.slice(0, 80)}`);
+                continue;
             }
-            return !noisy;
-        });
+            staticFiltered.push(text);
+            staticKeptIndices.push(inputIndex);
+        }
         const noiseBank = this.config.noiseBank;
-        if (!noiseBank || !noiseBank.initialized)
-            return staticFiltered;
+        if (!noiseBank || !noiseBank.initialized) {
+            return { texts: staticFiltered, keptIndices: staticKeptIndices };
+        }
         // Partition: short/long texts bypass noise check; mid-length need embedding
         const SHORT_THRESHOLD = 8;
         const LONG_THRESHOLD = 300;
@@ -652,7 +743,7 @@ export class SmartExtractor {
             }
             catch {
                 // Batch failed — pass all through
-                return staticFiltered.slice();
+                return { texts: staticFiltered.slice(), keptIndices: staticKeptIndices.slice() };
             }
         }
         const result = new Array(staticFiltered.length);
@@ -681,7 +772,16 @@ export class SmartExtractor {
         // Compact: remove undefined slots (filtered-out entries).
         // Use explicit undefined check rather than filter(Boolean) to preserve
         // empty strings that were legitimately in bypass slots.
-        return result.filter((x) => x !== undefined);
+        const keptTexts = [];
+        const keptIndices = [];
+        for (let slot = 0; slot < result.length; slot++) {
+            const survivor = result[slot];
+            if (survivor !== undefined) {
+                keptTexts.push(survivor);
+                keptIndices.push(staticKeptIndices[slot]);
+            }
+        }
+        return { texts: keptTexts, keptIndices };
     }
     /**
      * Feed back conversation text to the noise prototype bank.
@@ -709,17 +809,58 @@ export class SmartExtractor {
     /**
      * Call LLM to extract candidate memories from conversation text.
      */
-    async extractCandidates(conversationText, policyMode = "full") {
+    async extractCandidates(conversationText, policyMode = "full", conversationTurns, protectedPrefixTurns) {
         const maxChars = this.config.extractMaxChars ?? 8000;
-        const truncated = conversationText.length > maxChars
-            ? conversationText.slice(-maxChars)
-            : conversationText;
+        const user = this.config.user ?? "User";
         // Strip platform envelope metadata injected by OpenClaw channels
         // (e.g. "System: [2026-03-18 14:21:36 GMT+8] Feishu[default] DM | ou_...")
-        // These pollute extraction if treated as conversation content.
-        const cleaned = stripEnvelopeMetadata(truncated);
-        const user = this.config.user ?? "User";
-        const { system, user: userPrompt } = buildExtractionPrompt(cleaned, user);
+        // These pollute extraction if treated as conversation content. Callers
+        // without per-message turns fall back to one user block over the flat
+        // joined text.
+        const strippedTurns = conversationTurns?.length
+            ? conversationTurns.map((turn) => ({ ...turn, text: stripEnvelopeMetadata(turn.text) }))
+            : [{ role: "user", text: stripEnvelopeMetadata(conversationText) }];
+        // A turn may consist of nothing but channel envelope; its stripped text
+        // is empty, and rendering it would show the model a contentless speaker
+        // block while spending transcript budget. Re-apply the upstream
+        // emptiness contract: drop empty turns, skip the call if none survive.
+        const protectedInputTurns = Math.min(Math.max(Math.trunc(protectedPrefixTurns ?? 0), 0), conversationTurns?.length ? strippedTurns.length : 0);
+        const turns = [];
+        let protectedKeptTurns = 0;
+        for (let i = 0; i < strippedTurns.length; i++) {
+            if (strippedTurns[i].text.trim().length === 0)
+                continue;
+            turns.push(strippedTurns[i]);
+            if (i < protectedInputTurns)
+                protectedKeptTurns++;
+        }
+        if (turns.length === 0) {
+            this.debugLog("memory-lancedb-pro: smart-extractor: every turn stripped to envelope metadata; skipping extraction");
+            return { status: "empty_input", candidates: [] };
+        }
+        // extractMaxChars is an absolute ceiling on the transcript, exactly as it
+        // was for the flat-text path's slice(-maxChars). The turn-aware walk
+        // keeps whole recent turns and tail-slices only the oldest partial one,
+        // so truncation preserves attribution without ever exceeding the cap.
+        // One pass renders the turns and reports the untruncated length, so the
+        // over-budget case does not render the whole delta a second time.
+        const { transcript, fullLength, protectedPrefixKept } = buildBoundedTranscriptWithStats(turns, maxChars, { protectedPrefixTurns: protectedKeptTurns });
+        if (transcript.length < fullLength) {
+            this.debugLog(`memory-lancedb-pro: smart-extractor: transcript bounded to extractMaxChars=${maxChars} (${fullLength - transcript.length} of ${fullLength} rendered chars dropped)`);
+        }
+        if (protectedKeptTurns > 0 && !protectedPrefixKept) {
+            this.log(`memory-lancedb-pro: smart-extractor: extractMaxChars=${maxChars} is too small to carry the prepended referent; extracting without it`);
+        }
+        // Bounding can drop every turn when the budget sits below one turn's tag
+        // envelope; prompting on an empty transcript wastes the call and its
+        // zero-candidate reply would mistrain the noise bank.
+        if (transcript.trim().length === 0) {
+            this.debugLog("memory-lancedb-pro: smart-extractor: transcript empty after bounding; skipping extraction");
+            return { status: "empty_input", candidates: [] };
+        }
+        const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
+            assistantEligible: this.config.captureAssistantEligible === true,
+        });
         const result = await this.llm.completeJson(userPrompt, "extract-candidates", system);
         if (!result) {
             this.debugLog("memory-lancedb-pro: smart-extractor: extract-candidates returned null");
@@ -835,7 +976,7 @@ export class SmartExtractor {
         let rejudgeFailedClosed = false;
         if (rejudgeCell) {
             this.debugLog(`memory-lancedb-pro: smart-extractor: grounding-rejudge fired cell=${rejudgeCell} register=${conversationRegister} candidates=${rawItems.length}`);
-            const rejudgePrompt = buildGroundingRejudgePrompt(cleaned, conversationRegister, rawItems.map((m, i) => ({
+            const rejudgePrompt = buildGroundingRejudgePrompt(transcript, conversationRegister, rawItems.map((m, i) => ({
                 index: i + 1,
                 category: String(m.category ?? ""),
                 abstract: String(m.abstract ?? "").trim().slice(0, 200),

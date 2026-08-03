@@ -31,6 +31,8 @@ export interface CompressResult {
   dropped: number;
   /** Total chars in output */
   totalChars: number;
+  /** Input indices of the selected texts, ascending (parallel to `texts`) */
+  keptIndices: number[];
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +179,7 @@ export function compressTexts(
   const minScoreToKeep = options.minScoreToKeep ?? 0.3;
 
   if (texts.length === 0) {
-    return { texts: [], scored: [], dropped: 0, totalChars: 0 };
+    return { texts: [], scored: [], dropped: 0, totalChars: 0, keptIndices: [] };
   }
 
   // Score everything
@@ -193,6 +195,7 @@ export function compressTexts(
       scored,
       dropped: 0,
       totalChars: allChars,
+      keptIndices: texts.map((_text, index) => index),
     };
   }
 
@@ -273,6 +276,7 @@ export function compressTexts(
     scored,
     dropped: texts.length - sortedIndices.length,
     totalChars,
+    keptIndices: sortedIndices,
   };
 }
 
