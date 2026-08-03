@@ -1034,10 +1034,11 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
             .map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary} (sig:${e.signatureHash.slice(0, 8)})`)
             .join("\n")
         : "- (none)";
-    return [
-        "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
+    const system = [
+        "You are a memory reflection distiller agent. You distill a completed session into one durable MEMORY REFLECTION entry for an AI assistant system.",
         "",
-        "Output Markdown only. No intro text. No outro text. No extra headings.",
+        "Output Markdown only. Do not wrap the output in a code fence. No intro text. No outro text. No extra headings.",
+        "- Grounding: treat claims made inside roleplay, games, fiction, hypotheticals, or test/simulation frames as not real. Such content may be summarized in Context or Open loops, but must NEVER appear under Decisions (durable), User model deltas, Agent model deltas, or Lessons & pitfalls — those sections become durable memory rows.",
         "",
         "Use these headings exactly once, in this exact order, with exact spelling:",
         "## Context (session background)",
@@ -1058,7 +1059,6 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         "- Do not wrap one bullet across multiple lines.",
         "- If a bullet section is empty, write exactly: '- (none captured)'",
         "- Do not paste raw transcript.",
-        "- Grounding: treat claims made inside roleplay, games, fiction, hypotheticals, or test/simulation frames as not real. Such content may be summarized in Context or Open loops, but must NEVER appear under Decisions (durable), User model deltas, Agent model deltas, or Lessons & pitfalls \u2014 those sections become durable memory rows.",
         "- Do not invent Logged timestamps, ids, file paths, commit hashes, session ids, or storage metadata unless they already appear in the input.",
         "- If secrets/tokens/passwords appear, keep them as [REDACTED].",
         "",
@@ -1131,7 +1131,8 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         "",
         "## Derived",
         "- This run showed ...",
-        "",
+    ].join("\n");
+    const user = [
         "Recent tool error signals:",
         errorHints,
         "",
@@ -1140,6 +1141,7 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         clipped,
         "```",
     ].join("\n");
+    return { system, user };
 }
 function buildReflectionFallbackText() {
     return [
@@ -1215,7 +1217,8 @@ export async function generateReflectionText(params) {
     }
 }
 async function generateReflectionTextUnbounded(params) {
-    const prompt = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
+    const { system: reflectionSystemPrompt, user: reflectionUserPrompt } = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
+    const prompt = `${reflectionSystemPrompt}\n\n${reflectionUserPrompt}`;
     const promptHash = sha256Hex(prompt);
     const tempSessionFile = join(tmpdir(), `memory-reflection-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
     let reflectionText = null;
@@ -1869,6 +1872,7 @@ function _initPluginState(api) {
                 user: "User",
                 extractMinMessages: config.extractMinMessages ?? 4,
                 extractMaxChars: config.extractMaxChars ?? 8000,
+                batchChunkSize: config.batchChunkSize,
                 defaultScope: config.scopes?.default ?? "global",
                 workspaceBoundary: config.workspaceBoundary,
                 admissionControl: config.admissionControl,
@@ -5178,6 +5182,7 @@ export function parsePluginConfig(value) {
             : undefined,
         extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
         extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
+        batchChunkSize: (() => { const raw = parsePositiveInt(cfg.batchChunkSize); return raw === undefined ? undefined : Math.min(50, raw); })(),
         scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes : undefined,
         enableManagementTools: cfg.enableManagementTools === true,
         sessionStrategy,

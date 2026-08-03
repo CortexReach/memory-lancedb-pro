@@ -22,6 +22,8 @@ import jitiFactory from "jiti";
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { SmartExtractor, resolveExtractionPolicy } = jiti("../src/smart-extractor.ts");
 
+const flatPrompt = (p) => (typeof p === "string" ? p : `${p.system}\n\n${p.user}`);
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -302,7 +304,7 @@ describe("SmartExtractor grounding-aware extraction (Option A, v3)", () => {
 
   it("buildExtractionPrompt documents the v3 grounding contract (structural check)", async () => {
     const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
-    const prompt = buildExtractionPrompt("some conversation", "test-user");
+    const prompt = flatPrompt(buildExtractionPrompt("some conversation", "test-user"));
 
     assert.match(prompt, /grounding/i);
     assert.match(prompt, /"real"\s*\|\s*"constructed"|real.*constructed/i);
@@ -314,7 +316,7 @@ describe("SmartExtractor grounding-aware extraction (Option A, v3)", () => {
 
   it("the unsure tie-break defaults to constructed, never real (best-effort lane axiom)", async () => {
     const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
-    const prompt = buildExtractionPrompt("some conversation", "test-user");
+    const prompt = flatPrompt(buildExtractionPrompt("some conversation", "test-user"));
 
     assert.match(
       prompt,
@@ -888,7 +890,7 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
 
   it("buildExtractionPrompt documents the batch register contract (structural check)", () => {
     const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
-    const prompt = buildExtractionPrompt("some conversation", "test-user");
+    const prompt = flatPrompt(buildExtractionPrompt("some conversation", "test-user"));
 
     assert.match(prompt, /conversation_register/);
     assert.match(prompt, /"real\|mixed\|fiction"/);
@@ -993,9 +995,9 @@ describe("AdmissionController grounding awareness (grounding v2)", () => {
   it("buildUtilityPrompt interpolates grounding and names all six registers (structural check)", async () => {
     const llm = {
       prompts: [],
-      async completeJson(prompt, mode) {
+      async completeJson(prompt, mode, systemPrompt) {
         if (mode === "admission-utility") {
-          this.prompts.push(prompt);
+          this.prompts.push([systemPrompt, prompt].filter(Boolean).join("\n\n"));
           return { utility: 0.5, reason: "mock" };
         }
         return null;
