@@ -41,7 +41,7 @@ import { buildFallbackCandidate, gateRegexFallbackCapture } from "./src/autocapt
 import { gateMappedReflectionEntries, resolveMappedRowAdmissionController } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { buildConversationTurnsForExtraction, formatConversationTranscript, neutralizeSpeakerTagSpoof, nextAutoCaptureMessageId, normalizeAutoCaptureText, reconcileTurnsWithKeptTexts, } from "./src/auto-capture-cleanup.js";
+import { buildConversationTurnsForExtraction, dedupePairWindow, formatConversationTranscript, neutralizeSpeakerTagSpoof, nextAutoCaptureMessageId, normalizeAutoCaptureText, reconcileTurnsWithKeptTexts, trimTurnsToUserCap, } from "./src/auto-capture-cleanup.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter, stripEnvelopeMetadata } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -2110,6 +2110,8 @@ function _initPluginState(api) {
     const autoCaptureRecentTurns = new Map();
     const autoCaptureDeferredFlushTurns = new Map();
     const autoCaptureSessionIdToKey = new Map();
+    const autoCaptureSessionIds = new Map();
+    const autoCaptureRecentPairTurns = new Map();
     const autoCaptureInFlightRuns = new Map();
     return {
         config,
@@ -2141,6 +2143,8 @@ function _initPluginState(api) {
         autoCaptureRecentTurns,
         autoCaptureDeferredFlushTurns,
         autoCaptureSessionIdToKey,
+        autoCaptureSessionIds,
+        autoCaptureRecentPairTurns,
         autoCaptureInFlightRuns,
         captureAdmissionController,
         captureAdmissionAudit,
@@ -2254,7 +2258,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, admissionRejectionAuditWriter, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureSessionIds, autoCaptureRecentPairTurns, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, admissionRejectionAuditWriter, } = singleton;
         const learnAutoCaptureSessionAlias = (sessionId, sessionKey) => {
             if (typeof sessionId !== "string" || !sessionId
                 || typeof sessionKey !== "string" || !sessionKey
@@ -3640,7 +3644,36 @@ const memoryLanceDBProPlugin = {
                                 // texts the selectors dropped back into extraction. Kept indices
                                 // pin each surviving copy to its own turn; occurrence counting
                                 // stays as the fallback when positional alignment is unavailable.
-                                const finalConversationTurns = reconcileTurnsWithKeptTexts(thisCallTurns, cleanTexts, cleanTurnIndices);
+                                let finalConversationTurns = reconcileTurnsWithKeptTexts(thisCallTurns, cleanTexts, cleanTurnIndices);
+                                // Rolling PAIR window sized by autoCaptureContextTurns (0 =
+                                // disabled: each extraction sees only its own call's turns, and
+                                // nothing is retained between calls). When enabled, this call's
+                                // reconciled pairs extend what earlier calls buffered, bounded
+                                // to autoCaptureContextTurns user turns (or this call's own
+                                // new-user count when larger, so unextracted user turns are
+                                // never trimmed out of their own transcript). The buffer holds
+                                // the FILTERED window, so selector-dropped texts can never
+                                // re-enter a later transcript as retained context. A remember
+                                // flow (prepended referent) bypasses the prepend for its own
+                                // call: the extractor's protected-prefix contract counts
+                                // referent turns from position zero.
+                                const contextTurns = config.autoCaptureContextTurns ?? 0;
+                                if (contextTurns > 0 && rememberPrependedTurns.length === 0) {
+                                    const priorPairTurns = autoCaptureRecentPairTurns.get(sessionKey) || [];
+                                    finalConversationTurns = trimTurnsToUserCap(dedupePairWindow([...priorPairTurns, ...finalConversationTurns]), Math.max(contextTurns, finalConversationTurns.filter((turn) => turn.role === "user").length));
+                                }
+                                if (contextTurns === 0) {
+                                    autoCaptureRecentPairTurns.delete(sessionKey);
+                                }
+                                else if (thisCallTurns.length > 0) {
+                                    // Deliberately retained across successful extractions:
+                                    // deleting it here would mean steady-state captures (one
+                                    // extraction per turn) always see a bare current pair. The
+                                    // set-time trim bounds it; the watermark keeps retained
+                                    // turns from re-becoming sources.
+                                    autoCaptureRecentPairTurns.set(sessionKey, finalConversationTurns);
+                                    pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                                }
                                 // The referent is the OLDEST turn of the prepended window, which is
                                 // exactly what the extractor's newest-first budget walk sacrifices
                                 // first, so it needs a guaranteed share. Only the referent RUN gets
@@ -5708,6 +5741,7 @@ export function parsePluginConfig(value) {
             })()
             : undefined,
         extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+        autoCaptureContextTurns: Math.min(10, Math.max(0, Math.floor(Number(cfg.autoCaptureContextTurns)) || 0)),
         extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
         batchChunkSize: (() => { const raw = parsePositiveInt(cfg.batchChunkSize); return raw === undefined ? undefined : Math.min(50, raw); })(),
         scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes : undefined,

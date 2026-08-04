@@ -74,11 +74,13 @@ import { isNoise } from "./src/noise-filter.js";
 import {
   type ConversationTurn,
   buildConversationTurnsForExtraction,
+  dedupePairWindow,
   formatConversationTranscript,
   neutralizeSpeakerTagSpoof,
   nextAutoCaptureMessageId,
   normalizeAutoCaptureText,
   reconcileTurnsWithKeptTexts,
+  trimTurnsToUserCap,
 } from "./src/auto-capture-cleanup.js";
 
 // Import smart extraction & lifecycle components
@@ -280,6 +282,8 @@ interface PluginConfig {
     thinkLevel?: string;
   };
   extractMinMessages?: number;
+  /** Rolling extraction context window in retained user turns (0 = disabled, max 10). */
+  autoCaptureContextTurns?: number;
   extractMaxChars?: number;
   batchChunkSize?: number;
   scopes?: {
@@ -2507,6 +2511,9 @@ interface PluginSingletonState {
   autoCaptureRecentTurns: Map<string, ConversationTurn[]>;
   autoCaptureDeferredFlushTurns: Map<string, ConversationTurn[]>;
   autoCaptureSessionIdToKey: Map<string, string>;
+
+  autoCaptureSessionIds: Map<string, string>;
+  autoCaptureRecentPairTurns: Map<string, ConversationTurn[]>;
   autoCaptureInFlightRuns: Map<string, Set<Promise<void>>>;
   captureAdmissionController: () => AdmissionController | null;
   captureAdmissionAudit: () => boolean;
@@ -2844,6 +2851,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const autoCaptureRecentTurns = new Map<string, ConversationTurn[]>();
   const autoCaptureDeferredFlushTurns = new Map<string, ConversationTurn[]>();
   const autoCaptureSessionIdToKey = new Map<string, string>();
+
+  const autoCaptureSessionIds = new Map<string, string>();
+  const autoCaptureRecentPairTurns = new Map<string, ConversationTurn[]>();
   const autoCaptureInFlightRuns = new Map<string, Set<Promise<void>>>();
 
   return {
@@ -2876,6 +2886,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCaptureRecentTurns,
     autoCaptureDeferredFlushTurns,
     autoCaptureSessionIdToKey,
+
+    autoCaptureSessionIds,
+    autoCaptureRecentPairTurns,
     autoCaptureInFlightRuns,
     captureAdmissionController,
     captureAdmissionAudit,
@@ -3035,7 +3048,9 @@ const memoryLanceDBProPlugin = {
       autoCaptureCountedPendingCount,
       autoCaptureRecentTurns,
       autoCaptureDeferredFlushTurns,
-    autoCaptureSessionIdToKey,
+      autoCaptureSessionIdToKey,
+      autoCaptureSessionIds,
+      autoCaptureRecentPairTurns,
       autoCaptureInFlightRuns,
       captureAdmissionController,
       captureAdmissionAudit,
@@ -4707,7 +4722,38 @@ const memoryLanceDBProPlugin = {
               // texts the selectors dropped back into extraction. Kept indices
               // pin each surviving copy to its own turn; occurrence counting
               // stays as the fallback when positional alignment is unavailable.
-              const finalConversationTurns = reconcileTurnsWithKeptTexts(thisCallTurns, cleanTexts, cleanTurnIndices);
+              let finalConversationTurns = reconcileTurnsWithKeptTexts(thisCallTurns, cleanTexts, cleanTurnIndices);
+              // Rolling PAIR window sized by autoCaptureContextTurns (0 =
+              // disabled: each extraction sees only its own call's turns, and
+              // nothing is retained between calls). When enabled, this call's
+              // reconciled pairs extend what earlier calls buffered, bounded
+              // to autoCaptureContextTurns user turns (or this call's own
+              // new-user count when larger, so unextracted user turns are
+              // never trimmed out of their own transcript). The buffer holds
+              // the FILTERED window, so selector-dropped texts can never
+              // re-enter a later transcript as retained context. A remember
+              // flow (prepended referent) bypasses the prepend for its own
+              // call: the extractor's protected-prefix contract counts
+              // referent turns from position zero.
+              const contextTurns = config.autoCaptureContextTurns ?? 0;
+              if (contextTurns > 0 && rememberPrependedTurns.length === 0) {
+                const priorPairTurns = autoCaptureRecentPairTurns.get(sessionKey) || [];
+                finalConversationTurns = trimTurnsToUserCap(
+                  dedupePairWindow([...priorPairTurns, ...finalConversationTurns]),
+                  Math.max(contextTurns, finalConversationTurns.filter((turn) => turn.role === "user").length),
+                );
+              }
+              if (contextTurns === 0) {
+                autoCaptureRecentPairTurns.delete(sessionKey);
+              } else if (thisCallTurns.length > 0) {
+                // Deliberately retained across successful extractions:
+                // deleting it here would mean steady-state captures (one
+                // extraction per turn) always see a bare current pair. The
+                // set-time trim bounds it; the watermark keeps retained
+                // turns from re-becoming sources.
+                autoCaptureRecentPairTurns.set(sessionKey, finalConversationTurns);
+                pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+              }
               // The referent is the OLDEST turn of the prepended window, which is
               // exactly what the extractor's newest-first budget walk sacrifices
               // first, so it needs a guaranteed share. Only the referent RUN gets
@@ -7124,6 +7170,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       })()
       : undefined,
     extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+    autoCaptureContextTurns: Math.min(10, Math.max(0, Math.floor(Number(cfg.autoCaptureContextTurns)) || 0)),
     extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
     batchChunkSize: (() => { const raw = parsePositiveInt(cfg.batchChunkSize); return raw === undefined ? undefined : Math.min(50, raw); })(),
     scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,
