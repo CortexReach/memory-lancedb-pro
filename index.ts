@@ -523,17 +523,54 @@ function parseAstChunkingConfig(value: unknown): ChunkerAstConfig | undefined {
 
 // Like parsePositiveInt but allows 0. Used for fields where 0 is a meaningful
 // "disabled" sentinel (e.g. autoRecallBadRecallDecayMs=0 disables decay).
-function parseNonNegativeInt(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
-    return Math.floor(value);
+function parseNonNegativeInt(value: unknown, fieldPath?: string): number | undefined {
+  // Missing: optional field — return undefined so caller's ?? default applies
+  if (value === undefined) return undefined;
+
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      const msg = `must be a finite number, got ${String(value)}`;
+      if (fieldPath) throw new Error(`${fieldPath}: ${msg}`);
+      return undefined;
+    }
+    if (!Number.isInteger(value)) {
+      const msg = `must be an integer, got ${value}`;
+      if (fieldPath) throw new Error(`${fieldPath}: ${msg}`);
+      return undefined;
+    }
+    if (value < 0) {
+      const msg = `must be >= 0, got ${value}`;
+      if (fieldPath) throw new Error(`${fieldPath}: ${msg}`);
+      return undefined;
+    }
+    return value;
   }
+
   if (typeof value === "string") {
     const s = value.trim();
-    if (!s) return undefined;
+    if (!s) {
+      if (fieldPath) throw new Error(`${fieldPath}: must be a non-negative integer`);
+      return undefined;
+    }
     const resolved = resolveEnvVars(s);
+    // When fieldPath is provided, only accept env-var reference strings
+    // (e.g. "${MY_VAR}"). Plain numeric strings are rejected — the config
+    // schema already catches them at the gateway level.
+    if (fieldPath && resolved === s) {
+      const n = Number(resolved);
+      if (Number.isFinite(n) && n >= 0 && Number.isInteger(n))
+        throw new Error(`${fieldPath}: must be a number, got string "${s}"`);
+      throw new Error(`${fieldPath}: must be a non-negative integer`);
+    }
     const n = Number(resolved);
-    if (Number.isFinite(n) && n >= 0) return Math.floor(n);
+    if (Number.isFinite(n) && n >= 0 && Number.isInteger(n)) return n;
+    if (fieldPath) throw new Error(`${fieldPath}: must be a non-negative integer`);
+    return undefined;
   }
+
+  // Reject all other types when fieldPath provided (null, boolean, object, array)
+  const msg = `must be a non-negative integer, got ${typeof value}`;
+  if (fieldPath) throw new Error(`${fieldPath}: ${msg}`);
   return undefined;
 }
 
@@ -6290,7 +6327,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   const storageAutoCleanupRaw = typeof storageMaintenanceRaw?.autoCleanup === "object" && storageMaintenanceRaw.autoCleanup !== null
     ? storageMaintenanceRaw.autoCleanup as Record<string, unknown>
     : null;
-  const readConsistencyIntervalSecondsRaw = parseNonNegativeInt(storageMaintenanceRaw?.readConsistencyIntervalSeconds);
+  const readConsistencyIntervalSecondsRaw = parseNonNegativeInt(
+    storageMaintenanceRaw?.readConsistencyIntervalSeconds,
+    "plugins.entries.memory-lancedb-pro.config.storageMaintenance.readConsistencyIntervalSeconds"
+  );
   const lockingRaw = typeof cfg.locking === "object" && cfg.locking !== null
     ? cfg.locking as Record<string, unknown>
     : null;
