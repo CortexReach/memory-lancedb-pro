@@ -45,6 +45,7 @@ import {
   type WorkspaceBoundaryConfig,
 } from "./workspace-boundary.js";
 import { isSuppressed as isTier1Suppressed } from "./auto-recall-tier1.js";
+import type { ManualEchoLedger } from "./manual-echo-guard.js";
 import { enqueueManualRecallMetadata } from "./manual-recall-metadata-queue.js";
 
 // ============================================================================
@@ -78,6 +79,9 @@ interface ToolContext {
   // row supersedes it instead of being rejected as a duplicate; the manual
   // text always lands verbatim.
   manualStoreSupersede?: boolean;
+  // Echo guard: manual store/update texts are recorded here so
+  // auto-capture extraction can drop near-identical echo candidates.
+  manualEchoLedger?: ManualEchoLedger;
   // Mirrors MemoryCliContext's onMemoriesDeleted (cli.ts): lets the host invalidate
   // in-process reflection caches after a live delete, not just CLI delete/delete-bulk.
   onMemoriesDeleted?: (info: { scopeFilter?: string[] }) => void;
@@ -1695,6 +1699,8 @@ export function registerMemoryStoreTool(
               );
             }
 
+            context.manualEchoLedger?.record(agentId, text);
+
             // Dual-write to Markdown mirror if enabled
             if (context.mdMirror) {
               await context.mdMirror(
@@ -1785,6 +1791,8 @@ export function registerMemoryStoreTool(
               ),
             ),
           });
+
+          context.manualEchoLedger?.record(agentId, text);
 
           // Dual-write to Markdown mirror if enabled
           if (context.mdMirror) {
@@ -2248,6 +2256,8 @@ export function registerMemoryUpdateTool(
               details: { error: "not_found", id: resolvedId },
             };
           }
+
+          context.manualEchoLedger?.record(agentId, updated.text);
 
           return {
             content: [
