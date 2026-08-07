@@ -4,6 +4,22 @@
  */
 import OpenAI from "openai";
 import { buildOauthEndpoint, extractOutputTextFromSse, loadOAuthSession, needsRefresh, normalizeOauthModel, refreshOAuthSession, saveOAuthSession, } from "./llm-oauth.js";
+/**
+ * Strips a core-style provider prefix (e.g. "openrouter/anthropic/claude-...")
+ * down to the bare "<vendor>/<model>" form a direct OpenRouter-compatible API
+ * needs. Any other prefix, or a string with no "/", passes through unchanged.
+ */
+export function normalizeDirectModelRef(modelRef) {
+    const trimmed = modelRef.trim();
+    const idx = trimmed.indexOf("/");
+    if (idx <= 0)
+        return trimmed;
+    const provider = trimmed.slice(0, idx).trim().toLowerCase();
+    if (provider !== "openrouter")
+        return trimmed;
+    const rest = trimmed.slice(idx + 1).trim();
+    return rest || trimmed;
+}
 const DEFAULT_SYSTEM_PROMPT = "You are a memory extraction assistant. Always respond with valid JSON only.";
 /**
  * Extract JSON from an LLM response that may be wrapped in markdown fences
@@ -201,6 +217,9 @@ function createApiKeyClient(config, log, warnLog) {
                     temperature: 0.1,
                     ...(shouldDisableReasoningForJson(config.model)
                         ? { chat_template_kwargs: { enable_thinking: false } }
+                        : {}),
+                    ...(config.thinkLevel?.trim()
+                        ? { reasoning: { effort: config.thinkLevel.trim() } }
                         : {}),
                 };
                 // Transmit the internal call label as a request header so gateway-side
@@ -411,7 +430,16 @@ function createOauthClient(config, log, warnLog) {
         },
     };
 }
+/**
+ * Resolves the canonical llm.thinkLevel value. Blank/whitespace-only values
+ * count as unset, so an accidentally-materialized empty string can never
+ * masquerade as "the user actually set it".
+ */
+export function resolveThinkLevel(config) {
+    return config.thinkLevel?.trim() || undefined;
+}
 export function createLlmClient(config) {
+    config = { ...config, thinkLevel: resolveThinkLevel(config) };
     const log = config.log ?? (() => { });
     const warnLog = config.warnLog;
     if (config.auth === "oauth") {

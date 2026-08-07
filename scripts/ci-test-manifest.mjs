@@ -3,6 +3,7 @@ export const CI_TEST_GROUPS = [
   "core-regression",
   "storage-and-schema",
   "llm-clients-and-auth",
+  { group: "llm-clients-and-auth", runner: "node", file: "test/llm-thinklevel.test.mjs", args: ["--test"] },
   "packaging-and-workflow",
 ];
 
@@ -131,6 +132,11 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/admission-control-prompt-shape.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-merge-accounting.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/admission-utility-veto.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/admission-lane-model-affinity.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/admission-model-resolution.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/admission-controller-standalone.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/smart-extractor-admission-controller-injection.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/admission-without-smart-extraction.test.mjs", args: ["--test"] },
   { group: "cli-smoke", runner: "node", file: "test/cli-subcommand-attachment.test.mjs", args: ["--test"] },
 ];
 

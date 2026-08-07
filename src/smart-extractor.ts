@@ -397,6 +397,14 @@ export interface SmartExtractorConfig {
   workspaceBoundary?: WorkspaceBoundaryConfig;
   /** Optional admission-control governance layer before downstream dedup/persistence. */
   admissionControl?: AdmissionControlConfig;
+  /**
+   * Pre-built admission controller, constructed independently of the
+   * extractor (e.g. by createAdmissionController) so admission gating works
+   * the same whether or not smart extraction itself is enabled. When
+   * provided, this instance is used as-is; the extractor never builds its
+   * own. Null/omitted means admission control is unavailable.
+   */
+  admissionController?: AdmissionController | null;
   /** Optional scope-glob -> extraction policy map (Option C). Unmatched scopes default to "full". */
   extractionPolicy?: Record<string, ExtractionPolicyMode>;
   /** Optional sink for durable reject-audit logging. */
@@ -458,19 +466,7 @@ export class SmartExtractor {
       config.admissionControl.auditMetadata !== false;
     this.onAdmissionRejected = config.onAdmissionRejected;
     this.onPersisted = config.onPersisted;
-    this.admissionController =
-      config.admissionControl?.enabled === true
-        ? new AdmissionController(
-            this.store,
-            this.llm,
-            // The plugin-level batchChunkSize knob bounds the batch-utility
-            // stage too; it is injected here rather than parsed from the
-            // admissionControl section so one knob governs every batched
-            // stage.
-            { ...config.admissionControl, batchChunkSize: config.batchChunkSize },
-            this.debugLog,
-          )
-        : null;
+    this.admissionController = config.admissionController ?? null;
   }
 
   /**

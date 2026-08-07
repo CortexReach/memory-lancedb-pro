@@ -7,7 +7,6 @@
  */
 import { buildExtractionPrompt, buildDedupPrompt, buildGroundingRejudgePrompt, buildMergePrompt, buildBatchDedupPrompt, buildBatchMergePrompt, } from "./extraction-prompts.js";
 import { formatExistingMemoryEntry } from "./prompt-blocks.js";
-import { AdmissionController, } from "./admission-control.js";
 import { ALWAYS_MERGE_CATEGORIES, DURABLE_CATEGORIES, FICTION_JUDGED_CATEGORIES, REGISTER_STRICTNESS, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats, } from "./smart-metadata.js";
@@ -264,15 +263,7 @@ export class SmartExtractor {
                 config.admissionControl.auditMetadata !== false;
         this.onAdmissionRejected = config.onAdmissionRejected;
         this.onPersisted = config.onPersisted;
-        this.admissionController =
-            config.admissionControl?.enabled === true
-                ? new AdmissionController(this.store, this.llm, 
-                // The plugin-level batchChunkSize knob bounds the batch-utility
-                // stage too; it is injected here rather than parsed from the
-                // admissionControl section so one knob governs every batched
-                // stage.
-                { ...config.admissionControl, batchChunkSize: config.batchChunkSize }, this.debugLog)
-                : null;
+        this.admissionController = config.admissionController ?? null;
     }
     /**
      * Expose the admission controller so sibling write paths (reflection

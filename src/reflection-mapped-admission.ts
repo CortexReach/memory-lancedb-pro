@@ -19,7 +19,20 @@
  * topology differs.
  */
 
-import type { AdmissionEvaluation } from "./admission-control.js";
+import type { AdmissionEvaluation, AdmissionController } from "./admission-control.js";
+
+/**
+ * Which AdmissionController gates a mapped reflection row: the dedicated
+ * reflection-lane controller when lane affinity built one, otherwise the
+ * base controller shared with extraction. Both may be null (admission
+ * disabled), which the gate treats as passthrough.
+ */
+export function resolveMappedRowAdmissionController(
+  reflectionLaneController: AdmissionController | null,
+  baseController: AdmissionController | null,
+): AdmissionController | null {
+  return reflectionLaneController ?? baseController;
+}
 import type { CandidateMemory } from "./memory-categories.js";
 import {
   getReflectionMappedMemoryCategory,

@@ -1129,7 +1129,11 @@ export class MemoryRetriever {
         this.decayEngine.applySearchBoost(scored);
         const reranked = results.map((result, index) => ({
             ...result,
-            score: clamp01(scored[index].score, result.score * 0.3),
+            // Corpus rows carry the source file's mtime as their timestamp;
+            // reference material must not decay like conversation memory.
+            score: (result.entry.id ?? "").startsWith("corpus:")
+                ? result.score
+                : clamp01(scored[index].score, result.score * 0.3),
         }));
         return reranked.sort((a, b) => b.score - a.score);
     }
@@ -1145,6 +1149,12 @@ export class MemoryRetriever {
         if (!anchor || anchor <= 0)
             return results;
         const normalized = results.map((r) => {
+            // Canonical corpus chunks are line-span document chunks: their length is
+            // a property of the chunker, not of entry quality. Normalising them by
+            // length double-penalises reference material (chunk size is already
+            // bounded by the indexer).
+            if ((r.entry.id ?? "").startsWith("corpus:"))
+                return r;
             const charLen = r.entry.text.length;
             const ratio = charLen / anchor;
             // No penalty for entries at or below anchor length.
@@ -1177,6 +1187,9 @@ export class MemoryRetriever {
             return results;
         const now = Date.now();
         const decayed = results.map((r) => {
+            // Reference chunks keep file mtimes — do not age them.
+            if ((r.entry.id ?? "").startsWith("corpus:"))
+                return r;
             const ts = r.entry.timestamp && r.entry.timestamp > 0 ? r.entry.timestamp : now;
             const ageDays = (now - ts) / 86_400_000;
             // Access reinforcement: frequently recalled memories decay slower

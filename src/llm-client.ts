@@ -14,6 +14,21 @@ import {
   saveOAuthSession,
 } from "./llm-oauth.js";
 
+/**
+ * Strips a core-style provider prefix (e.g. "openrouter/anthropic/claude-...")
+ * down to the bare "<vendor>/<model>" form a direct OpenRouter-compatible API
+ * needs. Any other prefix, or a string with no "/", passes through unchanged.
+ */
+export function normalizeDirectModelRef(modelRef: string): string {
+  const trimmed = modelRef.trim();
+  const idx = trimmed.indexOf("/");
+  if (idx <= 0) return trimmed;
+  const provider = trimmed.slice(0, idx).trim().toLowerCase();
+  if (provider !== "openrouter") return trimmed;
+  const rest = trimmed.slice(idx + 1).trim();
+  return rest || trimmed;
+}
+
 export interface LlmClientConfig {
   apiKey?: string;
   model: string;
@@ -25,6 +40,16 @@ export interface LlmClientConfig {
   log?: (msg: string) => void;
   /** Warn-level logger for user-visible failures (timeouts, retries, network errors). */
   warnLog?: (msg: string) => void;
+  /**
+   * Reasoning effort requested from the model, e.g. "low" | "medium" |
+   * "high". Canonical config key (llm.thinkLevel), named for consistency
+   * with memoryReflection.thinkLevel. Sent only when explicitly configured
+   * (as reasoning: {effort: ...}, the OpenRouter-compatible shape); when
+   * unset, no reasoning parameter is sent at all, letting the provider's
+   * own default apply. Resolved from raw config by resolveThinkLevel before
+   * the client reads it.
+   */
+  thinkLevel?: string;
 }
 
 const DEFAULT_SYSTEM_PROMPT =
@@ -255,6 +280,9 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
           ...(shouldDisableReasoningForJson(config.model)
             ? { chat_template_kwargs: { enable_thinking: false } }
             : {}),
+          ...(config.thinkLevel?.trim()
+            ? { reasoning: { effort: config.thinkLevel.trim() } }
+            : {}),
         };
 
         // Transmit the internal call label as a request header so gateway-side
@@ -482,7 +510,19 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
   };
 }
 
+/**
+ * Resolves the canonical llm.thinkLevel value. Blank/whitespace-only values
+ * count as unset, so an accidentally-materialized empty string can never
+ * masquerade as "the user actually set it".
+ */
+export function resolveThinkLevel(
+  config: Pick<LlmClientConfig, "thinkLevel">,
+): string | undefined {
+  return config.thinkLevel?.trim() || undefined;
+}
+
 export function createLlmClient(config: LlmClientConfig): LlmClient {
+  config = { ...config, thinkLevel: resolveThinkLevel(config) };
   const log = config.log ?? (() => {});
   const warnLog = config.warnLog;
   if (config.auth === "oauth") {

@@ -466,6 +466,19 @@
             "default": "balanced",
             "description": "Named admission tuning preset. Explicit admissionControl fields still override the selected preset."
           },
+          "model": {
+            "type": "string",
+            "description": "Optional absolute override: when set, every admission LLM call uses this model, regardless of modelAffinity."
+          },
+          "modelAffinity": {
+            "type": "string",
+            "enum": [
+              "global",
+              "lane"
+            ],
+            "default": "global",
+            "description": "lane routes reflection-mapped admission calls to memoryReflection.model instead of the global llm model; global uses the plugin's global llm model for every lane."
+          },
           "utilityMode": {
             "type": "string",
             "enum": [
@@ -1585,6 +1598,10 @@
             "type": "integer",
             "minimum": 500,
             "default": 30000
+          },
+          "thinkLevel": {
+            "type": "string",
+            "description": "Reasoning effort requested from the model, e.g. low, medium, high. Sent only when explicitly configured (as the OpenRouter-compatible reasoning effort field); when unset, no reasoning parameter is sent and the provider's own default applies. Deliberately no JSON-schema default: a schema default gets materialized into the plugin config upstream on at least one OpenClaw host config-loading path, indistinguishably from a genuine user value."
           }
         }
       },
