@@ -1506,6 +1506,11 @@
               "type": "string"
             },
             "description": "Agent/session patterns excluded from reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
+          },
+          "includeGroupChats": {
+            "type": "boolean",
+            "default": true,
+            "description": "Run the reflection distiller for group-chat sessions (session keys carrying a :group: or :channel: segment). Default true; set false to skip reflection generation on group channels."
           }
         }
       },
@@ -2260,6 +2265,11 @@
     "memoryReflection.maxConcurrentRuns": {
       "label": "Reflection Max Concurrent Runs",
       "help": "Max concurrent reflection runs across all agents (reflections queue in per-agent lanes). Default 1 keeps reflections serialized; raise to allow parallel reflections.",
+      "advanced": true
+    },
+    "memoryReflection.includeGroupChats": {
+      "label": "Reflect Group Chats",
+      "help": "Run the reflection distiller for group-chat sessions (:group:/:channel: session keys). Default true; set false to skip reflection generation on group channels.",
       "advanced": true
     },
     "memoryReflection.messageCount": {

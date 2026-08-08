@@ -778,6 +778,9 @@ function asNonEmptyString(value) {
 function isInternalReflectionSessionKey(sessionKey) {
     return typeof sessionKey === "string" && sessionKey.trim().startsWith("temp:memory-reflection");
 }
+function isGroupChatSessionKey(sessionKey) {
+    return typeof sessionKey === "string" && /:(group|channel):/i.test(sessionKey);
+}
 // Any :subagent:/:active-memory: sub-build (delegated subagents in general, not only
 // memory-internal ones) is treated as "its context comes from the parent" across every
 // memory-adjacent hook in this file: auto-recall injection, reflection injection, and
@@ -4406,6 +4409,13 @@ const memoryLanceDBProPlugin = {
                     api.logger.debug?.(`memory-reflection: command hook skipped (excluded agent=${sourceAgentId}, sessionKey=${sessionKey ?? "(none)"})`);
                     return;
                 }
+                // Group-chat opt-out (memoryReflection.includeGroupChats=false): the
+                // distiller input for multi-party sessions misattributes speakers, so
+                // operators can skip reflection generation on group channels entirely.
+                if (config.memoryReflection?.includeGroupChats === false && isGroupChatSessionKey(sessionKey)) {
+                    api.logger.info(`memory-reflection: command:${action} skipped (group-chat reflection disabled, sessionKey=${sessionKey ?? "(none)"})`);
+                    return;
+                }
                 let emptyEventGuardKey;
                 const isBoundaryAction = isSessionBoundaryReflectionAction(action);
                 if (isBoundaryAction) {
@@ -5566,6 +5576,7 @@ export function parsePluginConfig(value) {
                 excludeAgents: Array.isArray(memoryReflectionRaw.excludeAgents)
                     ? memoryReflectionRaw.excludeAgents.filter((id) => typeof id === "string" && id.trim() !== "")
                     : undefined,
+                includeGroupChats: memoryReflectionRaw.includeGroupChats !== false,
             }
             : {
                 enabled: sessionStrategy === "memoryReflection",
@@ -5582,6 +5593,7 @@ export function parsePluginConfig(value) {
                 serialCooldownMs: DEFAULT_SERIAL_GUARD_COOLDOWN_MS,
                 maxConcurrentRuns: DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS,
                 excludeAgents: undefined,
+                includeGroupChats: true,
             },
         sessionMemory: typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
             ? {
