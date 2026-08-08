@@ -71,10 +71,16 @@ import { buildFallbackCandidate, gateRegexFallbackCapture } from "./src/autocapt
 import { gateMappedReflectionEntries, resolveMappedRowAdmissionController } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
+import {
+  type ConversationTurn,
+  buildConversationTurnsForExtraction,
+  nextAutoCaptureMessageId,
+  normalizeAutoCaptureText,
+  reconcileTurnsWithKeptTexts,
+} from "./src/auto-capture-cleanup.js";
 
 // Import smart extraction & lifecycle components
-import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
+import { SmartExtractor, createExtractionRateLimiter, stripEnvelopeMetadata } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
 import { NoisePrototypeBank } from "./src/noise-prototypes.js";
 import { createLlmClient, normalizeDirectModelRef } from "./src/llm-client.js";
@@ -1261,6 +1267,28 @@ function shouldSkipReflectionMessage(role: string, text: string): boolean {
 }
 
 const AUTO_CAPTURE_MAP_MAX_ENTRIES = 2000;
+
+// The remember window is agent-scoped even when the host hands multiple
+// agents the same literal session key (session.scope="global"), so one
+// agent's recents never feed another agent's extraction prompt.
+const REMEMBER_WINDOW_KEY_SEPARATOR = "\u0000";
+function rememberWindowKey(agentId: string, sessionKey: string): string {
+  return `${agentId}${REMEMBER_WINDOW_KEY_SEPARATOR}${sessionKey}`;
+}
+
+// A remember referent must carry real content: a turn that strips to pure
+// channel envelope reads as a user turn here but renders empty downstream,
+// so anchoring or pinning on it silently loses the fact. Run-extension
+// walks never test substance on purpose: an envelope block in the middle
+// of a multi-block message shares the message's id, so the id-scoped run
+// crosses it without breaking.
+function isSubstantiveUserReferent(turn: ConversationTurn): boolean {
+  return (
+    turn.role === "user" &&
+    !isExplicitRememberCommand(turn.text) &&
+    stripEnvelopeMetadata(turn.text).trim().length > 0
+  );
+}
 // Guard: skip texts > 5000 chars to prevent embedding API errors (issue #417 Fix #3)
 const MAX_MESSAGE_LENGTH = 5000;
 const AUTO_CAPTURE_EXPLICIT_REMEMBER_RE =
@@ -2374,8 +2402,8 @@ interface PluginSingletonState {
   autoCaptureSeenTextCount: Map<string, number>;
   autoCapturePendingIngressTexts: Map<string, string[]>;
   autoCaptureCountedPendingCount: Map<string, number>;
-  autoCaptureRecentTexts: Map<string, string[]>;
-  autoCaptureDeferredFlushTexts: Map<string, string[]>;
+  autoCaptureRecentTurns: Map<string, ConversationTurn[]>;
+  autoCaptureDeferredFlushTurns: Map<string, ConversationTurn[]>;
   autoCaptureSessionIdToKey: Map<string, string>;
   autoCaptureInFlightRuns: Map<string, Set<Promise<void>>>;
   captureAdmissionController: () => AdmissionController | null;
@@ -2625,6 +2653,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
 
         smartExtractor = new SmartExtractor(store, embedder, llmClient, {
           user: "User",
+          captureAssistantEligible: config.captureAssistant === true,
           extractMinMessages: config.extractMinMessages ?? 4,
           extractMaxChars: config.extractMaxChars ?? 8000,
           batchChunkSize: config.batchChunkSize,
@@ -2681,8 +2710,8 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const autoCaptureSeenTextCount = new Map<string, number>();
   const autoCapturePendingIngressTexts = new Map<string, string[]>();
   const autoCaptureCountedPendingCount = new Map<string, number>();
-  const autoCaptureRecentTexts = new Map<string, string[]>();
-  const autoCaptureDeferredFlushTexts = new Map<string, string[]>();
+  const autoCaptureRecentTurns = new Map<string, ConversationTurn[]>();
+  const autoCaptureDeferredFlushTurns = new Map<string, ConversationTurn[]>();
   const autoCaptureSessionIdToKey = new Map<string, string>();
   const autoCaptureInFlightRuns = new Map<string, Set<Promise<void>>>();
 
@@ -2713,8 +2742,8 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCaptureSeenTextCount,
     autoCapturePendingIngressTexts,
     autoCaptureCountedPendingCount,
-    autoCaptureRecentTexts,
-    autoCaptureDeferredFlushTexts,
+    autoCaptureRecentTurns,
+    autoCaptureDeferredFlushTurns,
     autoCaptureSessionIdToKey,
     autoCaptureInFlightRuns,
     captureAdmissionController,
@@ -2873,8 +2902,8 @@ const memoryLanceDBProPlugin = {
       autoCaptureSeenTextCount,
       autoCapturePendingIngressTexts,
       autoCaptureCountedPendingCount,
-      autoCaptureRecentTexts,
-      autoCaptureDeferredFlushTexts,
+      autoCaptureRecentTurns,
+      autoCaptureDeferredFlushTurns,
     autoCaptureSessionIdToKey,
       autoCaptureInFlightRuns,
       captureAdmissionController,
@@ -3921,6 +3950,72 @@ const memoryLanceDBProPlugin = {
 
     // Auto-capture: analyze and store important information after agent ends
     if (config.autoCapture !== false) {
+      // The remember-this recents window would otherwise survive a session
+      // reset and prepend pre-reset turns into the fresh session's first
+      // remember command. The pending-ingress queue is deliberately NOT
+      // cleared here: it is conversation-scoped and shared by every agent
+      // bound to the conversation, and the rollover-triggering inbound is
+      // already queued when an idle/daily session_end fires, so a
+      // per-agent boundary wipe would discard other agents' backlog or
+      // the very message being processed. It stays bounded as before
+      // (per-conversation slice(-6) + pruneMapIfOver).
+      //
+      // Session-end lifecycle classifier shared by the remember-window sweep
+      // below and the terminal ingress flush: explicit terminal reasons
+      // always end the conversation, known rollover reasons always continue
+      // it, and an unrecognized or absent reason ends it only when no
+      // successor is announced.
+      const isTerminalSessionBoundary = (event: any): boolean => {
+        const reason = typeof event?.reason === "string" ? event.reason : "";
+        const isTerminalReason =
+          reason === "new" ||
+          reason === "reset" ||
+          reason === "deleted" ||
+          reason === "shutdown" ||
+          reason === "restart";
+        if (isTerminalReason) return true;
+        const isRolloverReason =
+          reason === "idle" || reason === "daily" || reason === "compaction";
+        const announcesSuccessor = Boolean(
+          event?.nextSessionId || event?.nextSessionKey,
+        );
+        return !(isRolloverReason || announcesSuccessor);
+      };
+      api.on(
+        "session_end",
+        (event: any, ctx: any) => {
+          // The host rolls sessions mid-conversation (idle/daily budgets,
+          // compaction) under the SAME sessionKey: those emissions carry a
+          // rollover reason plus the successor's nextSessionId, and wiping
+          // there would drop the remember window at exactly the moment the
+          // referent left the visible transcript. /new and /reset ALSO
+          // announce a successor, so successor presence alone cannot
+          // discriminate: explicit terminal reasons always wipe, known
+          // rollover reasons always keep, and an unrecognized or absent
+          // reason keeps only when a successor is announced.
+          if (!isTerminalSessionBoundary(event)) {
+            return;
+          }
+          const endedSessionKey = ctx?.sessionKey || "";
+          if (endedSessionKey) {
+            // A session_end context cannot name the agent that wrote the
+            // window: the host rebuilds its agentId from the session key
+            // and falls back to the DEFAULT agent on unparseable keys
+            // (the shared literal "global" key among them), so a
+            // targeted delete misses the writer. A terminal boundary
+            // ends the session for every agent riding the key; sweep
+            // every window under it.
+            const sessionSuffix = REMEMBER_WINDOW_KEY_SEPARATOR + endedSessionKey;
+            for (const windowKey of [...autoCaptureRecentTurns.keys()]) {
+              if (windowKey.endsWith(sessionSuffix)) {
+                autoCaptureRecentTurns.delete(windowKey);
+              }
+            }
+          }
+        },
+        { priority: 10 },
+      );
+
       type AgentEndAutoCaptureHook = {
         (event: any, ctx: any): void;
         __lastRun?: Promise<void>;
@@ -3934,8 +4029,34 @@ const memoryLanceDBProPlugin = {
         return Promise.allSettled([...runs]).then(() => {});
       };
 
+      // Deferred-flush state carries role-bearing turns, not flat strings: a
+      // terminal flush rebuilds its extraction transcript from these, and the
+      // turn builder's no-correlation fallback would otherwise re-tag every
+      // deferred assistant text as a user turn.
+      const dedupeTurnsByText = (turns: ConversationTurn[]): ConversationTurn[] => {
+        const seenTexts = new Set<string>();
+        const deduped: ConversationTurn[] = [];
+        for (const turn of turns) {
+          if (seenTexts.has(turn.text)) continue;
+          seenTexts.add(turn.text);
+          deduped.push(turn);
+        }
+        return deduped;
+      };
+      const turnsForTexts = (turns: ConversationTurn[], texts: string[]): ConversationTurn[] => {
+        const wantedTexts = new Set(texts);
+        return turns.filter((turn) => wantedTexts.has(turn.text));
+      };
+
       const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = (event, ctx) => {
         const isTerminalFlush = (event as any).__autoCaptureTerminalFlush === true;
+        // The flush runs for EVERY session_end reason (continuation rollovers
+        // flush their queued/deferred ingress too); whether the boundary
+        // actually ends the conversation arrives as a separate flag, and a
+        // flush without one is treated as terminal (fail-safe for direct
+        // invocations).
+        const isTerminalBoundary =
+          isTerminalFlush && (event as any).__autoCaptureTerminalBoundary !== false;
         if (!event.success || (!isTerminalFlush && (!event.messages || event.messages.length === 0))) {
           return;
         }
@@ -3990,8 +4111,10 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`,
           );
 
-          // Extract text content from messages
+          // Extract text content from messages, keeping the role-tagged
+          // message-loop order alongside the flat eligible-text list.
           const eligibleTexts: string[] = [];
+          const messageLoopTurns: ConversationTurn[] = [];
           let skippedAutoCaptureTexts = 0;
           for (const msg of event.messages ?? []) {
             if (!msg || typeof msg !== "object") {
@@ -4009,6 +4132,7 @@ const memoryLanceDBProPlugin = {
             }
 
             const content = msgObj.content;
+            const messageId = nextAutoCaptureMessageId();
 
             if (typeof content === "string") {
               const normalized = normalizeAutoCaptureText(role, content, shouldSkipReflectionMessage);
@@ -4016,6 +4140,7 @@ const memoryLanceDBProPlugin = {
                 skippedAutoCaptureTexts++;
               } else {
                 eligibleTexts.push(normalized);
+                messageLoopTurns.push({ role: role as "user" | "assistant", text: normalized, messageId });
               }
               continue;
             }
@@ -4036,6 +4161,7 @@ const memoryLanceDBProPlugin = {
                     skippedAutoCaptureTexts++;
                   } else {
                     eligibleTexts.push(normalized);
+                    messageLoopTurns.push({ role: role as "user" | "assistant", text: normalized, messageId });
                   }
                 }
               }
@@ -4074,7 +4200,9 @@ const memoryLanceDBProPlugin = {
             // deliver a fresh same-length window of new content. Compare the
             // ordered tail against the texts the previous run recorded; only a
             // matching tail is treated as the same snapshot and consumed.
-            const recentForIdentity = autoCaptureRecentTexts.get(sessionKey) || [];
+            const recentForIdentity = (
+              autoCaptureRecentTurns.get(rememberWindowKey(agentId, sessionKey)) || []
+            ).map((turn) => turn.text);
             const identityDepth = Math.min(recentForIdentity.length, eligibleTexts.length, 6);
             const identicalSnapshot =
               identityDepth > 0 &&
@@ -4090,35 +4218,176 @@ const memoryLanceDBProPlugin = {
           autoCaptureSeenTextCount.set(sessionKey, cumulativeCount);
           pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
 
+          let terminalFlushTurns: ConversationTurn[] | null = null;
           if (isTerminalFlush) {
-            const deferredFlushTexts = autoCaptureDeferredFlushTexts.get(sessionKey) || [];
-            autoCaptureDeferredFlushTexts.delete(sessionKey);
+            const deferredFlushTurns = autoCaptureDeferredFlushTurns.get(sessionKey) || [];
+            autoCaptureDeferredFlushTurns.delete(sessionKey);
             autoCaptureSeenTextCount.delete(sessionKey);
-            const flushTexts = [...new Set([...pendingIngressTexts, ...deferredFlushTexts])];
-            if (flushTexts.length === 0) {
+            // Deferred turns keep their original roles and message ids;
+            // pending ingress is user-authored by construction. Dedup by
+            // text with first occurrence winning, mirroring the previous
+            // string-set union.
+            const flushTurns = dedupeTurnsByText([
+              ...pendingIngressTexts.map(
+                (text): ConversationTurn => ({
+                  role: "user",
+                  text,
+                  messageId: nextAutoCaptureMessageId(),
+                }),
+              ),
+              ...deferredFlushTurns,
+            ]);
+            if (flushTurns.length === 0) {
               return;
             }
             api.logger.debug(
-              `memory-lancedb-pro: auto-capture terminal flush of ${flushTexts.length} deferred text(s) for agent ${agentId}`,
+              `memory-lancedb-pro: auto-capture terminal flush of ${flushTurns.length} deferred turn(s) for agent ${agentId}`,
             );
-            newTexts = flushTexts;
+            terminalFlushTurns = flushTurns;
+            newTexts = flushTurns.map((turn) => turn.text);
           }
 
-          const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
-          let texts = newTexts;
+          // A terminal flush replays stored turns whose roles are already
+          // known; the builder's no-correlation fallback would re-tag them
+          // all as user turns.
+          let thisCallTurns = terminalFlushTurns ?? buildConversationTurnsForExtraction({
+            messageLoopTurns,
+            eligibleTexts,
+            newUserTexts: newTexts,
+          });
+
+          // The deferral cursor rollback re-sweeps earlier deferred messages
+          // into a later turn's delta. When that delta ends in an explicit
+          // remember command, the re-swept texts (exactly those already
+          // sitting in the deferred-flush bucket) are dropped from this run:
+          // a distinct older message must never get its first extraction
+          // smuggled in by an unrelated remember; the command's referent
+          // comes from the tagged recent-turns window instead. Messages
+          // genuinely delivered alongside the command are not in the bucket
+          // and stay in the delta. Dropped texts remain deposited for their
+          // own consumer (a later plain turn via the rolled-back cursor, or
+          // the terminal flush).
+          const deltaUserTurns = thisCallTurns.filter((turn) => turn.role === "user");
+          const deltaTailUserTurn = deltaUserTurns[deltaUserTurns.length - 1];
           if (
-            texts.length === 1 &&
-            isExplicitRememberCommand(texts[0]) &&
-            priorRecentTexts.length > 0
+            deltaUserTurns.length > 1 &&
+            deltaTailUserTurn &&
+            isExplicitRememberCommand(deltaTailUserTurn.text)
           ) {
-            texts = [...priorRecentTexts.slice(-1), ...texts];
+            const deferredSweep = new Set(
+              (autoCaptureDeferredFlushTurns.get(sessionKey) || []).map((turn) => turn.text),
+            );
+            const droppedTexts = new Set(
+              newTexts.filter(
+                (text) => text !== deltaTailUserTurn.text && deferredSweep.has(text),
+              ),
+            );
+            if (droppedTexts.size > 0) {
+              thisCallTurns = thisCallTurns.filter((turn) => !droppedTexts.has(turn.text));
+              newTexts = newTexts.filter((text) => !droppedTexts.has(text));
+              api.logger.debug(
+                `memory-lancedb-pro: auto-capture narrowed a remember command run past ${droppedTexts.size} re-swept deferred text(s) for agent ${agentId}`,
+              );
+            }
           }
-          if (isTerminalFlush) {
-            autoCaptureRecentTexts.delete(sessionKey);
+
+          const priorRecentTurns =
+            autoCaptureRecentTurns.get(rememberWindowKey(agentId, sessionKey)) || [];
+          let texts = newTexts;
+          // The remember-this flow prepends recent prior turns to both the flat
+          // extraction input and the tagged transcript, each with its original
+          // speaker role. Detection counts USER turns, so an assistant ack in
+          // the same delta (captureAssistant) stays transparent. The prepend
+          // window runs from the nearest user-authored turn to the end of the
+          // recents (the positionally last turn may itself be an assistant ack
+          // of the fact being remembered; a multi-block assistant reply is
+          // several turns, so the scan is bounded only by the recents cap).
+          // With no user turn in the window, the last turn alone is the
+          // referent. The "unknown" session-key fallback is unattributable and
+          // shared, so it never receives a prepend from another session.
+          const rememberPrependedTurns: ConversationTurn[] = [];
+          const newUserTurns = thisCallTurns.filter((turn) => turn.role === "user");
+          if (
+            sessionKey !== "unknown" &&
+            newUserTurns.length === 1 &&
+            isExplicitRememberCommand(newUserTurns[0].text) &&
+            priorRecentTurns.length > 0
+          ) {
+            let lastUserIndex = -1;
+            for (let i = priorRecentTurns.length - 1; i >= 0; i--) {
+              if (isSubstantiveUserReferent(priorRecentTurns[i])) {
+                lastUserIndex = i;
+                break;
+              }
+            }
+            let windowStart = lastUserIndex >= 0 ? lastUserIndex : priorRecentTurns.length - 1;
+            // A multi-block user message lands as adjacent user turns; the
+            // referent is the whole contiguous run, not just its newest block.
+            // Adjacency alone cannot prove same-message: without
+            // captureAssistant, DISTINCT user messages are adjacent here too,
+            // so the run extends only across blocks sharing the referent's
+            // messageId, and turns without one never extend it.
+            const referentMessageId =
+              lastUserIndex >= 0 ? priorRecentTurns[lastUserIndex].messageId : undefined;
+            while (
+              lastUserIndex >= 0 &&
+              windowStart > 0 &&
+              referentMessageId !== undefined &&
+              priorRecentTurns[windowStart - 1].role === "user" &&
+              priorRecentTurns[windowStart - 1].messageId === referentMessageId &&
+              !isExplicitRememberCommand(priorRecentTurns[windowStart - 1].text)
+            ) {
+              windowStart--;
+            }
+            rememberPrependedTurns.push(...priorRecentTurns.slice(windowStart));
+            texts = [...rememberPrependedTurns.map((turn) => turn.text), ...texts];
+            thisCallTurns = [...rememberPrependedTurns, ...thisCallTurns];
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture remember-this prepended ${rememberPrependedTurns.length} prior turn(s) [${rememberPrependedTurns.map((turn) => turn.role).join(",")}] for agent ${agentId}`,
+            );
+          }
+          if (isTerminalBoundary) {
+            autoCaptureRecentTurns.delete(rememberWindowKey(agentId, sessionKey));
           } else if (newTexts.length > 0) {
-            const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
-            autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
-            pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+            const newRecentTurns = thisCallTurns.slice(rememberPrependedTurns.length);
+            const combinedRecentTurns = [...priorRecentTurns, ...newRecentTurns];
+            let nextRecentTurns = combinedRecentTurns.slice(-6);
+            // A window-filling burst of assistant turns (a multi-block reply
+            // under captureAssistant) would evict the very user fact the next
+            // remember command needs; pin the newest substantive user turn at
+            // the front of the window instead of losing it.
+            const windowHasSubstantiveUserTurn = nextRecentTurns.some((turn) =>
+              isSubstantiveUserReferent(turn),
+            );
+            if (!windowHasSubstantiveUserTurn) {
+              for (let turnIndex = combinedRecentTurns.length - 7; turnIndex >= 0; turnIndex--) {
+                const droppedTurn = combinedRecentTurns[turnIndex];
+                if (isSubstantiveUserReferent(droppedTurn)) {
+                  // The dropped turn may be one block of a multi-block user
+                  // message; pin the whole contiguous run so the referent
+                  // survives intact, and shrink the retained tail to keep
+                  // the window bounded.
+                  let runStart = turnIndex;
+                  while (
+                    runStart > 0 &&
+                    droppedTurn.messageId !== undefined &&
+                    combinedRecentTurns[runStart - 1].role === "user" &&
+                    combinedRecentTurns[runStart - 1].messageId === droppedTurn.messageId &&
+                    !isExplicitRememberCommand(combinedRecentTurns[runStart - 1].text)
+                  ) {
+                    runStart--;
+                  }
+                  const pinnedRun = combinedRecentTurns.slice(runStart, turnIndex + 1).slice(-6);
+                  const tailBudget = 6 - pinnedRun.length;
+                  nextRecentTurns = tailBudget > 0
+                    ? [...pinnedRun, ...combinedRecentTurns.slice(-tailBudget)]
+                    : pinnedRun;
+                  break;
+                }
+              }
+            }
+            autoCaptureRecentTurns.set(rememberWindowKey(agentId, sessionKey), nextRecentTurns);
+            pruneMapIfOver(autoCaptureRecentTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
           const minMessages = config.extractMinMessages ?? 4;
@@ -4165,6 +4434,10 @@ const memoryLanceDBProPlugin = {
             }
           }
 
+          // Positions in thisCallTurns of each entry in texts, carried
+          // through every selector below so turn attribution follows the
+          // exact copy that survived (texts mirrors thisCallTurns on entry).
+          let keptTurnIndices = texts.map((_text, index) => index);
           // ----------------------------------------------------------------
           // Feature 1: Session compression — prioritize high-signal texts
           // ----------------------------------------------------------------
@@ -4178,6 +4451,7 @@ const memoryLanceDBProPlugin = {
                 `memory-lancedb-pro: session compression for agent ${agentId}: dropped ${compressed.dropped}/${texts.length} texts (${compressed.totalChars} chars kept)`,
               );
               texts = compressed.texts;
+              keptTurnIndices = compressed.keptIndices.map((textIndex) => keptTurnIndices[textIndex]);
             }
           }
 
@@ -4188,10 +4462,13 @@ const memoryLanceDBProPlugin = {
           const restoreConsumedCaptureState = () => {
             const retainedCap = autoCaptureRetainedTextCap(minMessages);
             if (isTerminalFlush) {
-              const restored = [...new Set([...newTexts, ...(autoCaptureDeferredFlushTexts.get(sessionKey) || [])])].slice(-retainedCap);
+              const restored = dedupeTurnsByText([
+                ...turnsForTexts(thisCallTurns, newTexts),
+                ...(autoCaptureDeferredFlushTurns.get(sessionKey) || []),
+              ]).slice(-retainedCap);
               if (restored.length > 0) {
-                autoCaptureDeferredFlushTexts.set(sessionKey, restored);
-                pruneMapIfOver(autoCaptureDeferredFlushTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                autoCaptureDeferredFlushTurns.set(sessionKey, restored);
+                pruneMapIfOver(autoCaptureDeferredFlushTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
               }
               return;
             }
@@ -4228,11 +4505,14 @@ const memoryLanceDBProPlugin = {
             }
             if (pendingIngressTexts.length === 0) {
               const retainedCap = autoCaptureRetainedTextCap(minMessages);
-              autoCaptureDeferredFlushTexts.set(
+              autoCaptureDeferredFlushTurns.set(
                 sessionKey,
-                [...(autoCaptureDeferredFlushTexts.get(sessionKey) || []), ...newTexts].slice(-retainedCap),
+                [
+                  ...(autoCaptureDeferredFlushTurns.get(sessionKey) || []),
+                  ...turnsForTexts(thisCallTurns, newTexts),
+                ].slice(-retainedCap),
               );
-              pruneMapIfOver(autoCaptureDeferredFlushTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+              pruneMapIfOver(autoCaptureDeferredFlushTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
               return;
             }
             restoreConsumedCaptureState();
@@ -4245,7 +4525,9 @@ const memoryLanceDBProPlugin = {
           // ----------------------------------------------------------------
           if (smartExtractor) {
             // Pre-filter: embedding-based noise detection (language-agnostic)
-            const cleanTexts = await smartExtractor.filterNoiseByEmbedding(texts);
+            const noiseFiltered = await smartExtractor.filterNoiseByEmbeddingWithIndices(texts);
+            const cleanTexts = noiseFiltered.texts;
+            const cleanTurnIndices = noiseFiltered.keptIndices.map((textIndex) => keptTurnIndices[textIndex]);
             if (cleanTexts.length === 0) {
               api.logger.debug(
                 `memory-lancedb-pro: all texts filtered as embedding noise for agent ${agentId}`,
@@ -4273,12 +4555,47 @@ const memoryLanceDBProPlugin = {
                 `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount}, minMessages=${minMessages}, explicitRemember=${hasExplicitRememberReferent}, cleanTexts=${cleanTexts.length})`,
               );
               const conversationText = cleanTexts.join("\n");
+              // The tagged transcript must mirror the FINAL extraction input:
+              // a turn of either role appears in it only if its text survived
+              // every upstream selector (session compression and the embedding
+              // noise filter alike) -- otherwise the tagged prompt smuggles
+              // texts the selectors dropped back into extraction. Kept indices
+              // pin each surviving copy to its own turn; occurrence counting
+              // stays as the fallback when positional alignment is unavailable.
+              const finalConversationTurns = reconcileTurnsWithKeptTexts(thisCallTurns, cleanTexts, cleanTurnIndices);
+              // The referent is the OLDEST turn of the prepended window, which is
+              // exactly what the extractor's newest-first budget walk sacrifices
+              // first, so it needs a guaranteed share. Only the referent RUN gets
+              // it: protecting the whole window would spend that share on the
+              // replies that follow the fact and evict the fact anyway.
+              let referentRunLength = 0;
+              while (
+                referentRunLength < rememberPrependedTurns.length &&
+                isSubstantiveUserReferent(rememberPrependedTurns[referentRunLength])
+              ) {
+                referentRunLength++;
+              }
+              if (referentRunLength === 0 && rememberPrependedTurns.length > 0) {
+                // No user-authored referent in the window: the prepend fell back to
+                // its single newest turn, whatever the role, and that is the referent.
+                referentRunLength = 1;
+              }
+              // Reconciliation returns the same turn objects, so identity counts
+              // how many referent turns actually survived into the transcript.
+              const referentTurnSet = new Set(rememberPrependedTurns.slice(0, referentRunLength));
+              let protectedPrefixTurns = 0;
+              while (
+                protectedPrefixTurns < finalConversationTurns.length &&
+                referentTurnSet.has(finalConversationTurns[protectedPrefixTurns])
+              ) {
+                protectedPrefixTurns++;
+              }
               // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
               let stats: Awaited<ReturnType<typeof smartExtractor.extractAndPersist>> | null = null;
               try {
                 stats = await smartExtractor.extractAndPersist(
                   conversationText, sessionKey,
-                  { scope: defaultScope, scopeFilter: accessibleScopes, agentId },
+                  { scope: defaultScope, scopeFilter: accessibleScopes, agentId, conversationTurns: finalConversationTurns, protectedPrefixTurns },
                 );
               } catch (err) {
                 api.logger.error(
@@ -4294,8 +4611,11 @@ const memoryLanceDBProPlugin = {
                 restoreConsumedCaptureState();
                 return;
               }
-              // Charge rate limiter only after successful extraction
-              extractionRateLimiter.recordExtraction();
+              // Charge rate limiter only after a successful extraction that
+              // actually called the model.
+              if (!stats.skippedNoInput) {
+                extractionRateLimiter.recordExtraction();
+              }
               // Retire ONLY the texts this run handed to the extractor. Two
               // agent_end runs of one session can overlap (the hook is
               // fire-and-forget by design and nothing serializes them), so a
@@ -4313,12 +4633,12 @@ const memoryLanceDBProPlugin = {
                 hasExplicitRememberReferent && cumulativeCount < minMessages && !isTerminalFlush;
               if (persistedSomething || !admittedOnlyByExplicitRemember) {
                 const consumedTexts = new Set(texts);
-                const remainingDeferred = (autoCaptureDeferredFlushTexts.get(sessionKey) || [])
-                  .filter((text) => !consumedTexts.has(text));
+                const remainingDeferred = (autoCaptureDeferredFlushTurns.get(sessionKey) || [])
+                  .filter((turn) => !consumedTexts.has(turn.text));
                 if (remainingDeferred.length === 0) {
-                  autoCaptureDeferredFlushTexts.delete(sessionKey);
+                  autoCaptureDeferredFlushTurns.delete(sessionKey);
                 } else {
-                  autoCaptureDeferredFlushTexts.set(sessionKey, remainingDeferred);
+                  autoCaptureDeferredFlushTurns.set(sessionKey, remainingDeferred);
                 }
               }
               if (stats.created > 0 || stats.merged > 0) {
@@ -4398,11 +4718,14 @@ const memoryLanceDBProPlugin = {
                 // History content lives in the session transcript, which is gone
                 // once the session ends: retain the deferred texts so a terminal
                 // flush can still consume them.
-                autoCaptureDeferredFlushTexts.set(
+                autoCaptureDeferredFlushTurns.set(
                   sessionKey,
-                  [...(autoCaptureDeferredFlushTexts.get(sessionKey) || []), ...newTexts].slice(-retainedCap),
+                  [
+                    ...(autoCaptureDeferredFlushTurns.get(sessionKey) || []),
+                    ...turnsForTexts(thisCallTurns, newTexts),
+                  ].slice(-retainedCap),
                 );
-                pruneMapIfOver(autoCaptureDeferredFlushTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                pruneMapIfOver(autoCaptureDeferredFlushTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
               } else if (conversationKey) {
                 const mergedIngressTexts = [
                   ...pendingIngressTexts,
@@ -4697,7 +5020,13 @@ const memoryLanceDBProPlugin = {
         const flushRun = awaitSessionCaptureRuns(flushSessionKey)
           .then(() => {
             agentEndAutoCaptureHook(
-              { success: true, messages: [], sessionKey: flushSessionKey, __autoCaptureTerminalFlush: true },
+              {
+                success: true,
+                messages: [],
+                sessionKey: flushSessionKey,
+                __autoCaptureTerminalFlush: true,
+                __autoCaptureTerminalBoundary: isTerminalSessionBoundary(event),
+              },
               ctx,
             );
             return awaitSessionCaptureRuns(flushSessionKey);

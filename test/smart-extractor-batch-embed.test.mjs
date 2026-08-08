@@ -217,6 +217,37 @@ describe("SmartExtractor batch embedding paths", () => {
     assert.strictEqual(calls.embed, 0, "static filter should not call embed without a noise bank");
   });
 
+  it("reports surviving input indices through both filter stages", async () => {
+    const { embedder } = makeCountingEmbedder();
+    const llm = makeLlm([]);
+    const store = makeStore();
+
+    const noiseBank = {
+      initialized: true,
+      // The mock embedder encodes the first char code at vector position 0.
+      isNoise(vec) {
+        return vec.length > 0 && vec[0] === "N".charCodeAt(0) / 255;
+      },
+      learn(_vec) {},
+    };
+    const extractor = makeExtractor(embedder, llm, store, { noiseBank });
+
+    const inputTexts = [
+      "you never remember anything I say", // static noise -> dropped
+      "My favorite editor is Zed because it keeps the interface quiet.", // embedded, kept
+      "N" + "x".repeat(40), // embedded, flagged as noise -> dropped
+      "ok", // short bypass, kept
+    ];
+
+    const { texts, keptIndices } =
+      await extractor.filterNoiseByEmbeddingWithIndices(inputTexts);
+    assert.deepStrictEqual(texts, [
+      "My favorite editor is Zed because it keeps the interface quiet.",
+      "ok",
+    ]);
+    assert.deepStrictEqual(keptIndices, [1, 3]);
+  });
+
   // --------------------------------------------------------------------------
   // Test 3: Batch pre-compute for non-profile candidates uses embedBatch
   // --------------------------------------------------------------------------

@@ -128,7 +128,7 @@ export function compressTexts(texts, maxChars, options = {}) {
     const minTexts = options.minTexts ?? DEFAULT_MIN_TEXTS;
     const minScoreToKeep = options.minScoreToKeep ?? 0.3;
     if (texts.length === 0) {
-        return { texts: [], scored: [], dropped: 0, totalChars: 0 };
+        return { texts: [], scored: [], dropped: 0, totalChars: 0, keptIndices: [] };
     }
     // Score everything
     const scored = texts.map((t, i) => scoreText(t, i));
@@ -141,6 +141,7 @@ export function compressTexts(texts, maxChars, options = {}) {
             scored,
             dropped: 0,
             totalChars: allChars,
+            keptIndices: texts.map((_text, index) => index),
         };
     }
     // Build selected set starting with first and last
@@ -212,6 +213,7 @@ export function compressTexts(texts, maxChars, options = {}) {
         scored,
         dropped: texts.length - sortedIndices.length,
         totalChars,
+        keptIndices: sortedIndices,
     };
 }
 // ---------------------------------------------------------------------------

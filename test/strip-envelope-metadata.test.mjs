@@ -396,4 +396,73 @@ describe("stripEnvelopeMetadata", () => {
     const result = stripEnvelopeMetadata(input);
     assert.equal(result, "");
   });
+
+  // -----------------------------------------------------------------------
+  // Fence scanning: linear cost and block-local key matching
+  // -----------------------------------------------------------------------
+  it("preserves an unterminated json fence", () => {
+    const input = 'Some prose first.\n```json\n{"note": "no closing fence here"';
+    const result = stripEnvelopeMetadata(input);
+    assert.ok(result.includes('"no closing fence here"'));
+  });
+
+  it("keeps a keyless json block even when envelope keys appear later in the text", () => {
+    const input = [
+      "```json",
+      '{"note": "synthetic content block, not an envelope"}',
+      "```",
+      'Later prose mentions "message_id": and "sender_id": as plain text.',
+    ].join("\n");
+    const result = stripEnvelopeMetadata(input);
+    assert.ok(
+      result.includes("synthetic content block"),
+      "a block without envelope keys inside it must survive regardless of trailing text",
+    );
+  });
+
+  it("still strips a standalone envelope block among keyless neighbors", () => {
+    const input = [
+      "```json",
+      '{"recipe": "synthetic soup"}',
+      "```",
+      "```json",
+      '{"message_id": "m-1", "sender_id": "s-2", "chat": "synthetic"}',
+      "```",
+      "real conversation line stays.",
+    ].join("\n");
+    const result = stripEnvelopeMetadata(input);
+    assert.ok(result.includes("synthetic soup"), "keyless block preserved");
+    assert.ok(!result.includes("m-1"), "envelope block stripped");
+    assert.ok(result.includes("real conversation line stays."));
+  });
+
+  it("strips an envelope block whose string values carry an unpaired brace", () => {
+    const input = [
+      "```json",
+      '{"message_id": "m-7", "sender_id": "s-8", "text": "smile :}"}',
+      "```",
+      "prose stays.",
+    ].join("\n");
+    const result = stripEnvelopeMetadata(input);
+    assert.ok(!result.includes("m-7"), "a brace inside a JSON string must not shield the block");
+    assert.ok(result.includes("prose stays."));
+  });
+
+  it("stays linear on fence-dense input", () => {
+    const fence = '```json\n{"note": "synthetic block without envelope keys"}\n```\n';
+    const filler = "prose line about synthetic topics.\n";
+    // The trailing prose mentions both envelope keys, so a scan that searches
+    // past the fence boundary pays the full remaining-input cost per fence.
+    const big =
+      (filler + fence).repeat(4000) +
+      'closing prose mentions "message_id": and "sender_id": in passing.';
+    const startedAt = performance.now();
+    const result = stripEnvelopeMetadata(big);
+    const elapsedMs = performance.now() - startedAt;
+    assert.ok(result.includes("synthetic block without envelope keys"));
+    assert.ok(
+      elapsedMs < 300,
+      `stripEnvelopeMetadata must stay near-linear on fence-dense input (took ${elapsedMs.toFixed(0)}ms for ${big.length} chars)`,
+    );
+  });
 });
