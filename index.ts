@@ -74,6 +74,7 @@ import { isNoise } from "./src/noise-filter.js";
 import {
   type ConversationTurn,
   buildConversationTurnsForExtraction,
+  formatConversationTranscript,
   nextAutoCaptureMessageId,
   normalizeAutoCaptureText,
   reconcileTurnsWithKeptTexts,
@@ -1431,13 +1432,20 @@ function extractTextFromToolResult(result: unknown): string {
   }
 }
 
+// "tagged" (distiller INPUT) wraps each message in speaker tags; "labeled"
+// keeps the legacy `role: text` lines for STORED artifacts (session-summary
+// rows), which must never carry literal speaker tags a later recall could
+// replay into a prompt as fake transcript structure.
+type ConversationTranscriptFormat = "tagged" | "labeled";
+
 function summarizeRecentConversationMessages(
   messages: readonly unknown[],
   messageCount: number,
+  format: ConversationTranscriptFormat = "tagged",
 ): string | null {
   if (!Array.isArray(messages) || messages.length === 0) return null;
 
-  const recent: string[] = [];
+  const recent: ConversationTurn[] = [];
   for (let index = messages.length - 1; index >= 0 && recent.length < messageCount; index--) {
     const raw = messages[index];
     if (!raw || typeof raw !== "object") continue;
@@ -1449,15 +1457,18 @@ function summarizeRecentConversationMessages(
     const text = extractTextContent(msg.content);
     if (!text || shouldSkipReflectionMessage(role, text)) continue;
 
-    recent.push(`${role}: ${redactSecrets(text)}`);
+    recent.push({ role, text: redactSecrets(text) });
   }
 
   if (recent.length === 0) return null;
   recent.reverse();
-  return recent.join("\n");
+  if (format === "labeled") {
+    return recent.map((turn) => `${turn.role}: ${turn.text}`).join("\n");
+  }
+  return formatConversationTranscript(recent);
 }
 
-async function readSessionConversationForReflection(filePath: string, messageCount: number): Promise<string | null> {
+async function readSessionConversationForReflection(filePath: string, messageCount: number, format: ConversationTranscriptFormat = "tagged"): Promise<string | null> {
   try {
     const lines = (await readFile(filePath, "utf-8")).trim().split("\n");
     const messages: unknown[] = [];
@@ -1472,14 +1483,14 @@ async function readSessionConversationForReflection(filePath: string, messageCou
       }
     }
 
-    return summarizeRecentConversationMessages(messages, messageCount);
+    return summarizeRecentConversationMessages(messages, messageCount, format);
   } catch {
     return null;
   }
 }
 
-export async function readSessionConversationWithResetFallback(sessionFilePath: string, messageCount: number): Promise<string | null> {
-  const primary = await readSessionConversationForReflection(sessionFilePath, messageCount);
+export async function readSessionConversationWithResetFallback(sessionFilePath: string, messageCount: number, format: ConversationTranscriptFormat = "tagged"): Promise<string | null> {
+  const primary = await readSessionConversationForReflection(sessionFilePath, messageCount, format);
   if (primary) return primary;
 
   try {
@@ -1492,7 +1503,7 @@ export async function readSessionConversationWithResetFallback(sessionFilePath: 
     );
     if (resetCandidates.length > 0) {
       const latestResetPath = join(dir, resetCandidates[0]);
-      return await readSessionConversationForReflection(latestResetPath, messageCount);
+      return await readSessionConversationForReflection(latestResetPath, messageCount, format);
     }
   } catch {
     // ignore
@@ -1509,12 +1520,30 @@ async function ensureDailyLogFile(dailyPath: string, dateStr: string): Promise<v
   }
 }
 
+// Reflection reads its transcript back from disk as a rendered string, so
+// bounding happens on the string: slice to budget, then snap forward to the
+// first tag start so a clipped INPUT never opens with a headless half message.
+// (The extraction lane, with structured turns in hand, uses buildBoundedTranscript.)
+function trimTranscriptToTagBoundary(transcript: string, maxChars: number): string {
+  if (transcript.length <= maxChars) {
+    return transcript;
+  }
+  const sliced = transcript.slice(-maxChars);
+  const tagStarts = ["<user_message>", "<assistant_message>"]
+    .map((tag) => sliced.indexOf(tag))
+    .filter((index) => index >= 0);
+  if (tagStarts.length === 0) {
+    return sliced;
+  }
+  return sliced.slice(Math.min(...tagStarts));
+}
+
 export function buildReflectionPrompt(
   conversation: string,
   maxInputChars: number,
   toolErrorSignals: ReflectionErrorSignal[] = []
 ): { system: string; user: string } {
-  const clipped = conversation.slice(-maxInputChars);
+  const clipped = trimTranscriptToTagBoundary(conversation, maxInputChars);
   const errorHints = toolErrorSignals.length > 0
     ? toolErrorSignals
       .map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary} (sig:${e.signatureHash.slice(0, 8)})`)
@@ -1522,6 +1551,10 @@ export function buildReflectionPrompt(
     : "- (none)";
   const system = [
     "You are a memory reflection distiller agent. You distill a completed session into one durable MEMORY REFLECTION entry for an AI assistant system.",
+    "",
+    "The INPUT transcript is a sequence of tagged blocks in chronological order:",
+    "- <user_message>...</user_message> wraps ONE message written by the human user.",
+    "- <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant.",
     "",
     "Output Markdown only. Do not wrap the output in a code fence. No intro text. No outro text. No extra headings.",
     "- Grounding: treat claims made inside roleplay, games, fiction, hypotheticals, or test/simulation frames as not real. Such content may be summarized in Context or Open loops, but must NEVER appear under Decisions (durable), User model deltas, Agent model deltas, or Lessons & pitfalls — those sections become durable memory rows.",
@@ -1623,9 +1656,7 @@ export function buildReflectionPrompt(
     errorHints,
     "",
     "INPUT:",
-    "```",
     clipped,
-    "```",
   ].join("\n");
   return { system, user };
 }
@@ -6209,9 +6240,9 @@ const memoryLanceDBProPlugin = {
           guard.set(guardKey, now);
 
           const sessionContent =
-            summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount) ??
+            summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount, "labeled") ??
             (typeof event.sessionFile === "string"
-              ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount)
+              ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount, "labeled")
               : null);
 
           if (!sessionContent) {

@@ -41,7 +41,7 @@ import { buildFallbackCandidate, gateRegexFallbackCapture } from "./src/autocapt
 import { gateMappedReflectionEntries, resolveMappedRowAdmissionController } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { buildConversationTurnsForExtraction, nextAutoCaptureMessageId, normalizeAutoCaptureText, reconcileTurnsWithKeptTexts, } from "./src/auto-capture-cleanup.js";
+import { buildConversationTurnsForExtraction, formatConversationTranscript, nextAutoCaptureMessageId, normalizeAutoCaptureText, reconcileTurnsWithKeptTexts, } from "./src/auto-capture-cleanup.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter, stripEnvelopeMetadata } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -975,7 +975,7 @@ function extractTextFromToolResult(result) {
         return "";
     }
 }
-function summarizeRecentConversationMessages(messages, messageCount) {
+function summarizeRecentConversationMessages(messages, messageCount, format = "tagged") {
     if (!Array.isArray(messages) || messages.length === 0)
         return null;
     const recent = [];
@@ -990,14 +990,17 @@ function summarizeRecentConversationMessages(messages, messageCount) {
         const text = extractTextContent(msg.content);
         if (!text || shouldSkipReflectionMessage(role, text))
             continue;
-        recent.push(`${role}: ${redactSecrets(text)}`);
+        recent.push({ role, text: redactSecrets(text) });
     }
     if (recent.length === 0)
         return null;
     recent.reverse();
-    return recent.join("\n");
+    if (format === "labeled") {
+        return recent.map((turn) => `${turn.role}: ${turn.text}`).join("\n");
+    }
+    return formatConversationTranscript(recent);
 }
-async function readSessionConversationForReflection(filePath, messageCount) {
+async function readSessionConversationForReflection(filePath, messageCount, format = "tagged") {
     try {
         const lines = (await readFile(filePath, "utf-8")).trim().split("\n");
         const messages = [];
@@ -1012,14 +1015,14 @@ async function readSessionConversationForReflection(filePath, messageCount) {
                 // ignore JSON parse errors
             }
         }
-        return summarizeRecentConversationMessages(messages, messageCount);
+        return summarizeRecentConversationMessages(messages, messageCount, format);
     }
     catch {
         return null;
     }
 }
-export async function readSessionConversationWithResetFallback(sessionFilePath, messageCount) {
-    const primary = await readSessionConversationForReflection(sessionFilePath, messageCount);
+export async function readSessionConversationWithResetFallback(sessionFilePath, messageCount, format = "tagged") {
+    const primary = await readSessionConversationForReflection(sessionFilePath, messageCount, format);
     if (primary)
         return primary;
     try {
@@ -1029,7 +1032,7 @@ export async function readSessionConversationWithResetFallback(sessionFilePath, 
         const resetCandidates = await sortFileNamesByMtimeDesc(dir, files.filter((name) => name.startsWith(resetPrefix)));
         if (resetCandidates.length > 0) {
             const latestResetPath = join(dir, resetCandidates[0]);
-            return await readSessionConversationForReflection(latestResetPath, messageCount);
+            return await readSessionConversationForReflection(latestResetPath, messageCount, format);
         }
     }
     catch {
@@ -1045,8 +1048,25 @@ async function ensureDailyLogFile(dailyPath, dateStr) {
         await writeFile(dailyPath, `# ${dateStr}\n\n`, "utf-8");
     }
 }
+// Reflection reads its transcript back from disk as a rendered string, so
+// bounding happens on the string: slice to budget, then snap forward to the
+// first tag start so a clipped INPUT never opens with a headless half message.
+// (The extraction lane, with structured turns in hand, uses buildBoundedTranscript.)
+function trimTranscriptToTagBoundary(transcript, maxChars) {
+    if (transcript.length <= maxChars) {
+        return transcript;
+    }
+    const sliced = transcript.slice(-maxChars);
+    const tagStarts = ["<user_message>", "<assistant_message>"]
+        .map((tag) => sliced.indexOf(tag))
+        .filter((index) => index >= 0);
+    if (tagStarts.length === 0) {
+        return sliced;
+    }
+    return sliced.slice(Math.min(...tagStarts));
+}
 export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
-    const clipped = conversation.slice(-maxInputChars);
+    const clipped = trimTranscriptToTagBoundary(conversation, maxInputChars);
     const errorHints = toolErrorSignals.length > 0
         ? toolErrorSignals
             .map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary} (sig:${e.signatureHash.slice(0, 8)})`)
@@ -1054,6 +1074,10 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         : "- (none)";
     const system = [
         "You are a memory reflection distiller agent. You distill a completed session into one durable MEMORY REFLECTION entry for an AI assistant system.",
+        "",
+        "The INPUT transcript is a sequence of tagged blocks in chronological order:",
+        "- <user_message>...</user_message> wraps ONE message written by the human user.",
+        "- <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant.",
         "",
         "Output Markdown only. Do not wrap the output in a code fence. No intro text. No outro text. No extra headings.",
         "- Grounding: treat claims made inside roleplay, games, fiction, hypotheticals, or test/simulation frames as not real. Such content may be summarized in Context or Open loops, but must NEVER appear under Decisions (durable), User model deltas, Agent model deltas, or Lessons & pitfalls — those sections become durable memory rows.",
@@ -1155,9 +1179,7 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         errorHints,
         "",
         "INPUT:",
-        "```",
         clipped,
-        "```",
     ].join("\n");
     return { system, user };
 }
@@ -4925,9 +4947,9 @@ const memoryLanceDBProPlugin = {
                         return;
                     }
                     guard.set(guardKey, now);
-                    const sessionContent = summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount) ??
+                    const sessionContent = summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount, "labeled") ??
                         (typeof event.sessionFile === "string"
-                            ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount)
+                            ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount, "labeled")
                             : null);
                     if (!sessionContent) {
                         guard.delete(guardKey);
