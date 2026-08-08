@@ -581,23 +581,32 @@ export class CanonicalCorpusIndexer {
       staleDeleted: 0,
       errors: [],
     };
-    // Change detection: toMemoryEntry() stores corpus_content_sha256 on every
-    // chunk, but nothing read it back — so every sync re-embedded and
-    // re-upserted the entire corpus. With lastSyncAt resetting per process,
-    // each gateway restart rewrote all chunks, and every upsert pass creates a
-    // new LanceDB version set (~1GB of version growth per restart on a
-    // 2,505-chunk corpus, unreclaimable same-day because runStorageMaintenance
-    // clamps retention to >= 1 day). Bulk-load the stored hashes once and skip
-    // chunks whose content is unchanged. Skipped chunks still land in
+    // Change detection: toMemoryEntry() stores corpus_content_sha256 and
+    // corpus_document_sha256 on every chunk, but nothing read it back — so
+    // every sync re-embedded and re-upserted the entire corpus. With
+    // lastSyncAt resetting per process, each gateway restart rewrote all
+    // chunks, and every upsert pass creates a new LanceDB version set (~1GB
+    // of version growth per restart on a 2,505-chunk corpus, unreclaimable
+    // same-day because runStorageMaintenance clamps retention to >= 1 day).
+    // Bulk-load the stored hashes once and skip chunks whose content hash AND
+    // document hash both match. The document hash catches edits elsewhere in
+    // the file that shift a chunk's line range even when its text is unchanged,
+    // preventing stale citation metadata. Skipped chunks still land in
     // expectedIds, so cleanupStaleCorpusEntries() will not delete them.
-    const existingCorpusHashes = new Map<string, string>();
+    type ExistingChunkRef = { contentSha256: string; documentSha256: string };
+    const existingChunks = new Map<string, ExistingChunkRef>();
     try {
       const refs = (await this.params.store.listCorpusEntryRefs?.()) ?? [];
       for (const ref of refs) {
         try {
           const parsedMeta: unknown = JSON.parse(ref.metadata ?? "{}");
-          if (isRecord(parsedMeta) && typeof parsedMeta.corpus_content_sha256 === "string") {
-            existingCorpusHashes.set(ref.id, parsedMeta.corpus_content_sha256);
+          if (isRecord(parsedMeta)
+            && typeof parsedMeta.corpus_content_sha256 === "string"
+            && typeof parsedMeta.corpus_document_sha256 === "string") {
+            existingChunks.set(ref.id, {
+              contentSha256: parsedMeta.corpus_content_sha256,
+              documentSha256: parsedMeta.corpus_document_sha256,
+            });
           }
         } catch {
           // Unparseable metadata: treat as changed.
@@ -606,9 +615,31 @@ export class CanonicalCorpusIndexer {
     } catch {
       // If the store cannot be listed, fall back to a full reindex.
     }
+    const newDocumentHashes = new Map<string, string>();
+    for (const chunk of chunks) {
+      const docKey = buildDocumentKey({
+        workspaceDir: chunk.doc.workspaceDir,
+        agentId: chunk.doc.agentId,
+        source: chunk.doc.source,
+        relativePath: chunk.doc.relativePath,
+      });
+      if (!newDocumentHashes.has(docKey)) {
+        newDocumentHashes.set(docKey, sha256(chunk.doc.content));
+      }
+    }
     for (const chunk of chunks) {
       try {
-        if (existingCorpusHashes.get(buildCorpusId(chunk)) === sha256(chunk.text)) {
+        const chunkId = buildCorpusId(chunk);
+        const existing = existingChunks.get(chunkId);
+        const newDocHash = newDocumentHashes.get(buildDocumentKey({
+          workspaceDir: chunk.doc.workspaceDir,
+          agentId: chunk.doc.agentId,
+          source: chunk.doc.source,
+          relativePath: chunk.doc.relativePath,
+        }))!;
+        if (existing
+          && existing.contentSha256 === sha256(chunk.text)
+          && existing.documentSha256 === newDocHash) {
           this.setPathCache(chunk.doc.workspaceDir, chunk.doc.relativePath, {
             absolutePath: chunk.doc.absolutePath,
             source: chunk.doc.source,
