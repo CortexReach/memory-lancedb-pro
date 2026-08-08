@@ -36,7 +36,7 @@ import { storeReflectionToLanceDB, loadAgentReflectionSlicesFromEntries, DEFAULT
 import { parseReflectionMetadata } from "./src/reflection-metadata.js";
 import { extractReflectionLearningGovernanceCandidates, extractInjectableReflectionMappedMemoryItems, isRecallUsed, } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
-import { buildReflectionMappedMetadata, getReflectionMappedStorageCategory } from "./src/reflection-mapped-metadata.js";
+import { buildReflectionMappedMetadata, getReflectionMappedMemoryCategory, getReflectionMappedStorageCategory } from "./src/reflection-mapped-metadata.js";
 import { buildFallbackCandidate, gateRegexFallbackCapture } from "./src/autocapture-fallback-admission.js";
 import { gateMappedReflectionEntries, resolveMappedRowAdmissionController } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
@@ -4619,8 +4619,9 @@ const memoryLanceDBProPlugin = {
                     const MAX_MAPPED_ENTRIES = 100;
                     const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
                     const mappedEntries = [];
-                    // Per-row embed + near-duplicate pre-check first, collecting the
-                    // gate-eligible rows so the whole burst can share one admission call.
+                    const mappedGatedItems = [];
+                    // Per-row embed first, collecting the gate-eligible rows so the
+                    // whole burst can share one admission call.
                     const gateEligible = [];
                     for (const mapped of mappedReflectionMemories) {
                         if (gateEligible.length >= MAX_MAPPED_ENTRIES) {
@@ -4635,28 +4636,24 @@ const memoryLanceDBProPlugin = {
                             api.logger.warn(`memory-reflection: mapped row embedding failed after retry, skipping row: ${String(embedErr)}`);
                             continue;
                         }
-                        let existing = [];
-                        let searchFailed = false;
-                        try {
-                            existing = await store.vectorSearch(vector, 1, 0.1, [targetScope]);
-                        }
-                        catch (err) {
-                            api.logger.warn(`memory-reflection: mapped memory duplicate pre-check failed, skip store: ${String(err)}`);
-                            searchFailed = true;
-                        }
-                        if (searchFailed) {
-                            continue;
-                        }
-                        // Near-duplicate pre-check ahead of admission gating. This is the only dedup mapped
-                        // rows get: a single vector-similarity threshold, direct skip, no LLM-mediated
-                        // merge/contextualize/contradict decision. Extraction candidates own deduplicate()
-                        // (src/smart-extractor.ts) is a genuinely different, richer pipeline (a 0.7
-                        // pre-filter feeding an LLM decision, not a single hard cutoff) - deliberately not
-                        // reused here yet. AdmissionController's "pass_to_dedup" decision for a mapped row
-                        // is therefore always treated as "admit, subject to this cheaper pre-check" below,
-                        // not "route through the same merge pipeline extraction candidates get".
-                        if (existing.length > 0 && existing[0].score > 0.95) {
-                            continue;
+                        // Extractor-backed runs take the SAME dedup/merge pipeline
+                        // extraction candidates get (persistGatedCandidates below), so no
+                        // bespoke similarity cutoff runs here. The no-extractor fallback
+                        // keeps the historical near-duplicate pre-check, downgraded from
+                        // fail-closed to fail-open: a search blip stores the row (worst
+                        // case a later burst merges the duplicate) instead of silently
+                        // dropping it.
+                        if (!smartExtractor) {
+                            let existing = [];
+                            try {
+                                existing = await store.vectorSearch(vector, 1, 0.1, [targetScope]);
+                            }
+                            catch (err) {
+                                api.logger.warn(`memory-reflection: mapped memory duplicate pre-check failed, storing without pre-check: ${String(err)}`);
+                            }
+                            if (existing.length > 0 && existing[0].score > 0.95) {
+                                continue;
+                            }
                         }
                         gateEligible.push({ mapped, vector });
                     }
@@ -4709,14 +4706,61 @@ const memoryLanceDBProPlugin = {
                             baseMetadata.admission_audit = mappedGate.auditJson;
                         }
                         const metadata = JSON.stringify(baseMetadata);
-                        mappedEntries.push({
-                            text: mapped.text,
-                            vector,
-                            importance,
-                            category: getReflectionMappedStorageCategory(mapped.mappedKind),
-                            scope: targetScope,
-                            metadata,
+                        if (smartExtractor) {
+                            // Uniform pipeline: judge (done above) -> dedup -> merge-writer,
+                            // identical to extraction candidates. The entry builder keeps
+                            // the reflection metadata on CREATE-shaped verdicts.
+                            mappedGatedItems.push({
+                                candidate: {
+                                    category: getReflectionMappedMemoryCategory(mapped.mappedKind),
+                                    abstract: mapped.text,
+                                    overview: `## ${mapped.heading}`,
+                                    content: mapped.text,
+                                },
+                                vector,
+                                buildEntry: (v) => ({
+                                    text: mapped.text,
+                                    vector: v,
+                                    importance,
+                                    category: getReflectionMappedStorageCategory(mapped.mappedKind),
+                                    scope: targetScope,
+                                    metadata,
+                                }),
+                            });
+                        }
+                        else {
+                            mappedEntries.push({
+                                text: mapped.text,
+                                vector,
+                                importance,
+                                category: getReflectionMappedStorageCategory(mapped.mappedKind),
+                                scope: targetScope,
+                                metadata,
+                            });
+                        }
+                    }
+                    if (smartExtractor && mappedGatedItems.length > 0) {
+                        const gatedResult = await smartExtractor.persistGatedCandidates(mappedGatedItems, {
+                            sessionKey,
+                            targetScope,
+                            scopeFilter: [targetScope],
+                            agentId: ownerAgentId,
+                            conversationText: conversation,
                         });
+                        api.logger.info(`memory-reflection: mapped rows through uniform pipeline: ${gatedResult.createdEntries.length} created, ${gatedResult.stats.merged} merged, ${gatedResult.stats.skipped} skipped`);
+                        if (mdMirror) {
+                            for (const stored of gatedResult.createdEntries) {
+                                let heading = "unknown";
+                                try {
+                                    const storedMeta = stored.metadata ? JSON.parse(stored.metadata) : {};
+                                    heading = storedMeta._reflectionHeading ?? "unknown";
+                                }
+                                catch {
+                                    api.logger.warn(`memory-reflection: failed to parse stored metadata for entry ${stored.id}, using "unknown"`);
+                                }
+                                await mdMirror({ text: stored.text, category: stored.category, scope: stored.scope, timestamp: stored.timestamp }, { source: `reflection:${heading}`, agentId: sourceAgentId });
+                            }
+                        }
                     }
                     if (mappedEntries.length > 0) {
                         const storedEntries = await store.bulkStore(mappedEntries, ({ index, reason }) => {

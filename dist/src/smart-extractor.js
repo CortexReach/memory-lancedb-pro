@@ -15,6 +15,24 @@ import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
 import { inferAtomicBrandItemPreferenceSlot } from "./preference-slots.js";
 import { batchDedup } from "./batch-dedup.js";
 import { buildBoundedTranscriptWithStats, } from "./auto-capture-cleanup.js";
+/**
+ * The caller's own admission audit, as carried inside an externally-built
+ * entry's metadata. Used by the gated-candidate lane so downstream verdict
+ * handling persists the real gate record, never a synthetic marker.
+ */
+function parseEntryAdmissionAudit(entry) {
+    const raw = entry.metadata;
+    if (typeof raw !== "string" || raw.length === 0) {
+        return undefined;
+    }
+    try {
+        const meta = JSON.parse(raw);
+        return meta.admission_control ?? undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
 // ============================================================================
 // Envelope Metadata Stripping
 // ============================================================================
@@ -621,6 +639,118 @@ export class SmartExtractor {
                 (stats.superseded ?? 0) >
                 0;
         return stats;
+    }
+    /**
+     * Uniform-pipeline entry for candidates whose extraction AND admission
+     * already happened in another lane (the reflection writer's mapped rows:
+     * distilled by the reflection model, gated by gateMappedReflectionEntries).
+     * From here on they take exactly the extraction candidates' path --
+     * batched dedup decider, verdict handling, batched merge writer, bulk
+     * create -- so a duplicate mapped row MERGES into its target instead of
+     * landing beside it.
+     *
+     * Each item supplies its own store-entry builder: a CREATE-shaped verdict
+     * persists the caller's entry (reflection metadata intact), while
+     * merge/supersede/support/contextualize/contradict operate on existing
+     * rows through the shared machinery. Callers own persistence
+     * notifications for created rows (the returned entries), keeping their
+     * lane-specific journal labels.
+     */
+    async persistGatedCandidates(items, options) {
+        const stats = { created: 0, merged: 0, skipped: 0, boundarySkipped: 0 };
+        const sessionKey = options.sessionKey ?? "reflection";
+        const targetScope = options.targetScope;
+        const scopeFilter = options.scopeFilter ?? [targetScope];
+        const conversationText = options.conversationText ?? "";
+        for (const item of items) {
+            const prebuilt = item.buildEntry(item.vector);
+            this.externalEntryBuilders.set(item.candidate, {
+                build: item.buildEntry,
+                prebuilt,
+                audit: parseEntryAdmissionAudit(prebuilt),
+            });
+        }
+        // Admission already ran in the caller's gate; the evaluation handed to
+        // processCandidate only tells it not to score again. Its audit is the
+        // CALLER'S OWN record (parsed from the built entry) — never a synthetic
+        // stub — so anything persisted downstream carries the real gate audit.
+        const preGatedFor = (candidate) => ({
+            decision: "pass_to_dedup",
+            audit: this.externalEntryBuilders.get(candidate)?.audit,
+        });
+        // Same-burst near-duplicate guard: unlike the extraction route, gated
+        // items arrive pre-vectorized, so batch-internal dedup runs directly on
+        // the caller's vectors. Duplicates inside one burst collapse to their
+        // first occurrence instead of creating twin rows.
+        let surviving = items;
+        try {
+            const dedupResult = batchDedup(items.map((it) => it.candidate.abstract), items.map((it) => it.vector || []));
+            if (dedupResult.duplicateIndices.length > 0) {
+                surviving = dedupResult.survivingIndices.map((idx) => items[idx]);
+                stats.skipped += dedupResult.duplicateIndices.length;
+                this.log(`memory-pro: smart-extractor: gated-candidate batchDedup dropped ${dedupResult.duplicateIndices.length} same-burst near-duplicate(s), ${surviving.length} survivor(s)`);
+            }
+        }
+        catch (err) {
+            this.log(`memory-pro: smart-extractor: gated-candidate batchDedup failed, proceeding without: ${String(err)}`);
+        }
+        const precomputedDedups = new Map();
+        const dedupLlmItems = [];
+        for (let i = 0; i < surviving.length; i++) {
+            const { candidate, vector } = surviving[i];
+            try {
+                const prefilter = await this.dedupPrefilter(candidate, vector, scopeFilter);
+                if (prefilter.shortCircuit) {
+                    precomputedDedups.set(i, prefilter.shortCircuit);
+                }
+                else {
+                    dedupLlmItems.push({ index: i, candidate, topSimilar: prefilter.topSimilar });
+                }
+            }
+            catch (err) {
+                this.log(`memory-pro: smart-extractor: gated-candidate dedup pre-filter failed, deferring to inline dedup: ${String(err)}`);
+            }
+        }
+        if (dedupLlmItems.length > 0) {
+            const verdicts = await this.llmDedupDecisionBatch(dedupLlmItems);
+            dedupLlmItems.forEach((item, i) => {
+                precomputedDedups.set(item.index, verdicts[i]);
+            });
+        }
+        const createEntries = [];
+        const pendingSupersedeInvalidations = [];
+        const pendingMerges = [];
+        for (let i = 0; i < surviving.length; i++) {
+            const { candidate, vector } = surviving[i];
+            try {
+                await this.processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, vector, createEntries, pendingSupersedeInvalidations, options.agentId, preGatedFor(candidate), precomputedDedups.get(i), pendingMerges);
+            }
+            catch (err) {
+                this.log(`memory-pro: smart-extractor: failed to process gated candidate [${candidate.category}]: ${String(err)}`);
+                // Fail open: this candidate already passed the caller's admission
+                // gate, so a processing failure (dedup search, verdict handling)
+                // must not silently drop it — store the caller-built row as-is.
+                const ext = this.externalEntryBuilders.get(candidate);
+                if (ext) {
+                    createEntries.push(ext.prebuilt ?? ext.build(vector));
+                    stats.created++;
+                    this.log(`memory-pro: smart-extractor: fail-open create for gated candidate after processing failure [${candidate.category}]`);
+                }
+            }
+        }
+        await this.flushPendingMerges(pendingMerges, stats, createEntries);
+        let createdEntries = [];
+        if (createEntries.length > 0) {
+            const stored = await this.bulkStoreAndValidate(createEntries);
+            if (stored) {
+                createdEntries = stored;
+                await this.applyPendingSupersedeInvalidations(stored, pendingSupersedeInvalidations);
+            }
+            else if (pendingSupersedeInvalidations.length > 0) {
+                this.log("memory-pro: smart-extractor: gated-candidate supersede invalidation skipped because bulkStore() did not return created entries");
+            }
+        }
+        return { stats, createdEntries };
     }
     // --------------------------------------------------------------------------
     // Embedding Noise Pre-Filter
@@ -1711,16 +1841,35 @@ export class SmartExtractor {
      * itself fails degrades every job in that chunk the same way. Never
      * throws, never fans back out into per-job LLM calls.
      */
-    async flushPendingMerges(pendingMerges, stats) {
+    async flushPendingMerges(pendingMerges, stats, createEntries) {
         if (pendingMerges.length === 0) {
             return;
         }
+        // Extraction-lane additions degrade like the single-call merge failure
+        // path (nothing persisted, target untouched). Externally-gated additions
+        // must NOT disappear on a degraded merge: they already passed the
+        // caller's admission gate and were previously direct-stored, so they
+        // fall back to a create built from the caller's own entry.
+        const failOpenAdditions = (job, why) => {
+            if (!createEntries) {
+                return;
+            }
+            for (const addition of job.additions) {
+                const ext = this.externalEntryBuilders.get(addition.candidate);
+                if (ext?.prebuilt) {
+                    createEntries.push(ext.prebuilt);
+                    stats.created++;
+                    this.log(`memory-pro: smart-extractor: merge ${why} — falling back to create for gated candidate [${addition.candidate.category}]`);
+                }
+            }
+        };
         const contents = await this.llmMergeContentBatch(pendingMerges);
         for (let i = 0; i < pendingMerges.length; i++) {
             const job = pendingMerges[i];
             const merged = contents[i];
             if (!merged) {
                 this.log("memory-pro: smart-extractor: merge LLM failed, skipping merge");
+                failOpenAdditions(job, "generation failed");
                 continue;
             }
             try {
@@ -1729,6 +1878,7 @@ export class SmartExtractor {
             }
             catch (err) {
                 this.log(`memory-pro: smart-extractor: failed to apply merged content for ${job.matchId.slice(0, 8)}: ${String(err)}`);
+                failOpenAdditions(job, "apply failed");
             }
         }
     }
@@ -1844,7 +1994,15 @@ export class SmartExtractor {
         const factKey = existingMeta.fact_key ?? deriveFactKey(candidate.category, candidate.abstract);
         const storeCategory = this.mapToStoreCategory(candidate.category);
         const supersedeClassifyText = candidate.content || candidate.abstract;
-        const entry = {
+        const entry = this.externalVerdictEntry(candidate, {
+            state: "confirmed",
+            valid_from: now,
+            fact_key: factKey,
+            supersedes: matchId,
+            relations: appendRelation([], { type: "supersedes", targetId: matchId }),
+            memory_temporal_type: classifyTemporal(supersedeClassifyText),
+            valid_until: inferExpiry(supersedeClassifyText),
+        }) ?? {
             text: candidate.abstract,
             vector,
             category: storeCategory,
@@ -1962,7 +2120,11 @@ export class SmartExtractor {
             contexts: contextLabel ? [contextLabel] : [],
             relations: [{ type: "contextualizes", targetId: matchId }],
         }, admissionAudit));
-        const entry_c = {
+        const entry_c = this.externalVerdictEntry(candidate, {
+            state: "confirmed",
+            contexts: contextLabel ? [contextLabel] : [],
+            relations: [{ type: "contextualizes", targetId: matchId }],
+        }) ?? {
             text: candidate.abstract,
             vector,
             category: storeCategory,
@@ -2014,7 +2176,11 @@ export class SmartExtractor {
             contexts: contextLabel ? [contextLabel] : [],
             relations: [{ type: "contradicts", targetId: matchId }],
         }, admissionAudit));
-        const entry_d = {
+        const entry_d = this.externalVerdictEntry(candidate, {
+            state: "confirmed",
+            contexts: contextLabel ? [contextLabel] : [],
+            relations: [{ type: "contradicts", targetId: matchId }],
+        }) ?? {
             text: candidate.abstract,
             vector,
             category: storeCategory,
@@ -2035,10 +2201,47 @@ export class SmartExtractor {
     // Store Helper
     // --------------------------------------------------------------------------
     /**
+     * Entry-shape overrides for candidates persisted on behalf of another
+     * lane (persistGatedCandidates): the reflection writer supplies its own
+     * store entry (reflection metadata, decay model, importance) while the
+     * dedup/merge pipeline stays byte-identical to extraction's. Keyed by
+     * candidate object identity, so extraction's own candidates can never
+     * collide with an external lane's builders.
+     */
+    externalEntryBuilders = new WeakMap();
+    /**
+     * Verdict rows for externally-gated candidates must originate from the
+     * caller's own entry — reflection provenance, heading, mapped kind, decay
+     * model, importance, and admission audit all live there — with only the
+     * verdict-specific fields layered on top. Returns null for ordinary
+     * extraction candidates, which keep the auto-capture shape.
+     */
+    externalVerdictEntry(candidate, overlay) {
+        const ext = this.externalEntryBuilders.get(candidate);
+        if (!ext?.prebuilt) {
+            return null;
+        }
+        const base = ext.prebuilt;
+        let meta = {};
+        if (typeof base.metadata === "string" && base.metadata.length > 0) {
+            try {
+                meta = JSON.parse(base.metadata);
+            }
+            catch {
+                meta = {};
+            }
+        }
+        return { ...base, metadata: JSON.stringify({ ...meta, ...overlay }) };
+    }
+    /**
      * Build a memory entry from candidate data (without writing).
      * Used by batch creation to reduce lock acquisitions.
      */
     buildStoreEntry(candidate, vector, sessionKey, targetScope, admissionAudit) {
+        const external = this.externalEntryBuilders.get(candidate);
+        if (external) {
+            return external.prebuilt ?? external.build(vector);
+        }
         const storeCategory = this.mapToStoreCategory(candidate.category);
         const classifyText = candidate.content || candidate.abstract;
         const metadata = stringifySmartMetadata(buildSmartMetadata({
