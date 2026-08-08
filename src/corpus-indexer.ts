@@ -217,6 +217,18 @@ export function resolveCanonicalCorpusWorkspaces(cfg: unknown, homeDir = homedir
     add(entry.workspace ?? entry.workspaceDir ?? entry.cwd, entry.id);
   }
 
+  // OpenClaw stores agents as an object keyed by agent id under `agents.entries`
+  // (not an array under `agents.list`). Without this, the loop above matches
+  // nothing on current OpenClaw configs and the function silently falls back to
+  // the single default workspace, so per-agent workspaces are never indexed.
+  const entries = isRecord(agents?.entries) ? agents.entries : undefined;
+  if (entries) {
+    for (const [entryAgentId, entry] of Object.entries(entries)) {
+      if (!isRecord(entry)) continue;
+      add(entry.workspace ?? entry.workspaceDir ?? entry.cwd, entryAgentId);
+    }
+  }
+
   const defaults = isRecord(agents?.defaults) ? agents.defaults : undefined;
   add(defaults?.workspace ?? defaults?.workspaceDir ?? defaults?.cwd, "main");
 

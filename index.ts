@@ -6542,6 +6542,28 @@ const memoryLanceDBProPlugin = {
         // Fire-and-forget: allow gateway to start serving immediately.
         setTimeout(() => void runStartupChecks(), 0);
 
+        // Canonical corpus: nothing else invokes canonicalCorpusIndexer.sync().
+        // Its only call sites are inside the memory capability (search()/sync()),
+        // which the host reaches via getActiveMemorySearchManager — but agent
+        // searches resolve to this plugin's own memory_search/memory_get tools
+        // and bypass the capability, so with canonicalCorpus.enabled the index
+        // silently stayed empty. Kick one sync at service start; sync() checks
+        // canonicalCorpus.enabled itself, rate-limits via syncIntervalMs, and
+        // de-duplicates concurrent runs, so this is safe and cheap when current.
+        setTimeout(() => void (async () => {
+          try {
+            const corpusStats = await canonicalCorpusIndexer.sync({ reason: "startup" });
+            api.logger.info(
+              `memory-lancedb-pro: canonical corpus startup sync — indexed ${corpusStats.indexed}/${corpusStats.chunks} chunk(s) ` +
+              `from ${corpusStats.documents} document(s); ${corpusStats.staleDeleted} stale removed`,
+            );
+          } catch (err) {
+            api.logger.warn(
+              `memory-lancedb-pro: canonical corpus startup sync failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        })(), 0);
+
         // Check for legacy memories that could be upgraded
         setTimeout(async () => {
           try {
