@@ -95,9 +95,10 @@ assert.deepEqual(
     chunks: stats.chunks,
     indexed: stats.indexed,
     skipped: stats.skipped,
+    unchanged: stats.unchanged,
     staleDeleted: stats.staleDeleted,
   },
-  { documents: 4, chunks: 4, indexed: 4, skipped: 0, staleDeleted: 0 },
+  { documents: 4, chunks: 4, indexed: 4, skipped: 0, unchanged: 0, staleDeleted: 0 },
 );
 assert.equal(captured.byId.size, 4, "sync should upsert one LanceDB entry per canonical chunk");
 assert.ok(captured.entries.every((entry) => entry.id.startsWith("corpus:")), "canonical entries should use deterministic corpus IDs");
@@ -162,9 +163,79 @@ assert.equal(
 const secondSync = await indexer.sync({ reason: "interval-check" });
 assert.deepEqual(
   secondSync,
-  { documents: 0, chunks: 0, indexed: 0, skipped: 0, staleDeleted: 0, errors: [] },
+  { documents: 0, chunks: 0, indexed: 0, skipped: 0, unchanged: 0, staleDeleted: 0, errors: [] },
   "sync interval should avoid redundant indexing",
 );
+
+// --- Two-sync regression: force sync should skip unchanged chunks ---
+// The first force-sync indexed all 4 chunks. A second force-sync should
+// read back the stored hashes, find all 4 unchanged, and skip embedding +
+// upsert entirely. This proves the skip path works and that skipped chunks
+// remain in the expectedIds set (no stale deletion).
+let regenEmbedCalls = 0;
+let regenUpsertCalls = 0;
+const regenCapture = createCaptureStore();
+// Seed the regen store with the entries from the first sync so listCorpusEntryRefs returns them
+for (const entry of captured.entries) {
+  regenCapture.store.upsert(entry);
+}
+const regenIndexer = new CanonicalCorpusIndexer({
+  store: {
+    upsert(entry) { regenUpsertCalls++; return regenCapture.store.upsert(entry); },
+    deleteExactId(id) { return regenCapture.store.deleteExactId(id); },
+    listCorpusEntryRefs() { return regenCapture.store.listCorpusEntryRefs(); },
+  },
+  embedder: {
+    async embedPassage() { regenEmbedCalls++; return [0, 0, 0, 0]; },
+  },
+  getConfig: () => parseCanonicalCorpusConfig({
+    syncIntervalMs: 60_000,
+    maxSessionFilesPerAgent: 5,
+  }),
+  getOpenClawConfig: () => ({ agents: { defaults: { workspace: workspaceDir } } }),
+  homeDir,
+});
+const regenStats = await regenIndexer.sync({ reason: "regression-force", force: true });
+assert.equal(regenStats.indexed, 0, "force sync should skip all unchanged chunks (no embedding, no upsert)");
+assert.equal(regenStats.unchanged, 4, "force sync should report all 4 chunks as unchanged");
+assert.equal(regenStats.staleDeleted, 0, "unchanged chunks should not be treated as stale");
+assert.equal(regenEmbedCalls, 0, "no embedding calls should be made for unchanged chunks");
+assert.equal(regenUpsertCalls, 0, "no upsert calls should be made for unchanged chunks");
+
+// --- Document fingerprint change: editing a file should reindex its chunks ---
+// Append a line to MEMORY.md, changing the document hash. Even if a chunk's
+// own text is unchanged, the document hash mismatch forces a reindex so
+// citation metadata (line ranges) stays fresh.
+writeFileSync(
+  path.join(workspaceDir, "MEMORY.md"),
+  "# Memory\n\nThe user prefers grounded citations.\n\nNew line appended for test.\n",
+  "utf8",
+);
+let docChangeEmbedCalls = 0;
+const docChangeCapture = createCaptureStore();
+// Seed with entries from the first sync (old document hash)
+for (const entry of captured.entries) {
+  docChangeCapture.store.upsert(entry);
+}
+const docChangeIndexer = new CanonicalCorpusIndexer({
+  store: {
+    upsert(entry) { docChangeEmbedCalls++; return docChangeCapture.store.upsert(entry); },
+    deleteExactId(id) { return docChangeCapture.store.deleteExactId(id); },
+    listCorpusEntryRefs() { return docChangeCapture.store.listCorpusEntryRefs(); },
+  },
+  embedder: {
+    async embedPassage() { docChangeEmbedCalls++; return [1, 0, 0, 0]; },
+  },
+  getConfig: () => parseCanonicalCorpusConfig({
+    syncIntervalMs: 60_000,
+    maxSessionFilesPerAgent: 5,
+  }),
+  getOpenClawConfig: () => ({ agents: { defaults: { workspace: workspaceDir } } }),
+  homeDir,
+});
+const docChangeStats = await docChangeIndexer.sync({ reason: "doc-edit-test", force: true });
+assert.ok(docChangeStats.indexed > 0, "document hash change should trigger reindex of its chunks");
+assert.ok(docChangeEmbedCalls > 0, "document hash change should trigger embedding calls");
 
 const largeWorkspaceDir = path.join(tempRoot, "large-workspace");
 const largeMemoryDir = path.join(largeWorkspaceDir, "memory");
