@@ -2250,6 +2250,71 @@ export class MemoryStore {
       .slice(offset, offset + limit);
   }
 
+  /**
+   * Bounded candidate scan for fact-key collision discovery. Unlike list(),
+   * which materializes and sorts the entire matching scope on every call,
+   * this pushes a hard row limit into the database query and never sorts.
+   * Deliberately NO content-based narrowing: an effective fact key can come
+   * from an explicit metadata field in any valid JSON layout (spaced colons,
+   * unicode escapes), from a stamped memory category in the same layouts, or
+   * be derived from the legacy storage category column plus row text when
+   * metadata is empty — so any serialization-layout pattern (LIKE on raw
+   * JSON) can exclude a valid candidate and silently break the collision
+   * set's completeness. Completeness therefore comes from the scope itself:
+   * every in-scope row is a candidate, the caller's bound keeps the scan
+   * finite, and an over-bound scope is an explicit rejection rather than a
+   * narrowed guess. Exact normalized-key comparison and active-row filtering
+   * stay with the caller.
+   * Returns at most bound + 1 rows so the caller can detect an over-bound
+   * candidate set without this method ever fetching an unbounded one.
+   */
+  async listFactKeyCandidates(
+    scopeFilter: string[],
+    bound: number,
+  ): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
+
+    const conditions: string[] = [];
+    if (scopeFilter.length > 0) {
+      const scopeConditions = scopeFilter
+        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .join(" OR ");
+      conditions.push(`(${scopeConditions})`);
+    }
+
+    const applyConditions = (query: any) =>
+      conditions.length > 0
+        ? query.where(conditions.join(" AND ")).limit(bound + 1)
+        : query.limit(bound + 1);
+
+    const results = await this.queryRowsWithProjectionFallback(
+      applyConditions,
+      [
+        "id",
+        "text",
+        "category",
+        "scope",
+        "importance",
+        "timestamp",
+        "metadata",
+      ],
+    );
+
+    return results.map(
+      (row): MemoryEntry => ({
+        id: row.id as string,
+        text: row.text as string,
+        vector: [],
+        category: row.category as MemoryEntry["category"],
+        scope: (row.scope as string | undefined) ?? "global",
+        importance: clampImportance(Number(row.importance)),
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+        metadata: (row.metadata as string) || "{}",
+      }),
+    );
+  }
+
   private async queryRowsWithProjectionFallback(
     applyFilters: (query: any) => any,
     columns: string[],
@@ -2822,8 +2887,9 @@ export class MemoryStore {
 
   /**
    * The locked body of update(). Callers must already hold the write lock
-   * and the serialized-update slot; transformMetadata composes it with a
-   * fresh read-decide step under the same lock.
+   * and the serialized-update slot: update() wraps it, transformMetadata
+   * composes it with a fresh read-decide step under the same lock, and the
+   * supersede commit path calls it from inside its own atomic section.
    */
   private async performUpdateLocked(
     id: string,
@@ -3172,6 +3238,103 @@ export class MemoryStore {
     return { repaired, failed, skipped, unrecovered };
   }
 
+
+  /**
+   * Force the open table handle onto the latest committed version. A nonzero
+   * readConsistencyInterval lets reads serve a snapshot up to that many
+   * seconds stale; a locked read-modify-write section must observe every
+   * commit that preceded its lock acquisition, so it re-syncs first. A sync
+   * failure propagates: proceeding on a possibly-stale snapshot would
+   * silently reintroduce the staleness this guard exists to close.
+   */
+  private async syncTableToLatest(): Promise<void> {
+    const table = this.table as unknown as { checkoutLatest?: () => Promise<void> } | null;
+    if (table && typeof table.checkoutLatest === "function") {
+      await table.checkoutLatest();
+    }
+  }
+
+  /**
+   * Atomic supersede-and-store: re-discovers the target rows, inserts the new
+   * row, and invalidates every confirmed target inside ONE write-lock +
+   * serialized-update section. The caller's advisory discovery only decides
+   * whether to enter this path; the target set that actually commits is the
+   * one discovered here, so two concurrent same-key writers converge on a
+   * single active row (the second writer's recheck sees the first writer's
+   * replacement and supersedes it) instead of leaving both replacements
+   * standing.
+   *
+   * Only CONFIRMED invalidations are reported in supersededIds; a null or
+   * throwing patch lands in invalidationFailures instead of being silently
+   * counted as success.
+   */
+  async storeSuperseding(options: {
+    entry: Omit<MemoryEntry, "id" | "timestamp">;
+    discoverTargets: () => Promise<MemoryEntry[]>;
+    finalizeEntryMetadata?: (targets: MemoryEntry[]) => string;
+    buildTargetPatch: (target: MemoryEntry, newEntryId: string) => MetadataPatch;
+    scopeFilter?: string[];
+  }): Promise<{
+    entry: MemoryEntry;
+    supersededIds: string[];
+    invalidationFailures: Array<{ id: string; reason: string }>;
+  }> {
+    await this.ensureInitialized();
+    const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+      // The cross-process lock serializes writers but does not refresh this
+      // handle's read snapshot: with a second store instance and a nonzero
+      // readConsistencyInterval, the locked re-discovery could miss the
+      // preceding writer's commit and leave both replacements active.
+      await this.syncTableToLatest();
+      const targets = await options.discoverTargets();
+
+      const fullEntry: MemoryEntry = {
+        ...options.entry,
+        id: randomUUID(),
+        timestamp: Date.now(),
+        metadata: options.finalizeEntryMetadata
+          ? options.finalizeEntryMetadata(targets)
+          : options.entry.metadata || "{}",
+        importance: clampImportance(Number(options.entry.importance)),
+      } as MemoryEntry;
+      await this.table!.add([fullEntry]);
+
+      const supersededIds: string[] = [];
+      const invalidationFailures: Array<{ id: string; reason: string }> = [];
+      for (const target of targets) {
+        try {
+          const existing = await this.getById(target.id, options.scopeFilter);
+          if (!existing) {
+            invalidationFailures.push({
+              id: target.id,
+              reason: "row not found or outside accessible scopes at commit time",
+            });
+            continue;
+          }
+          const metadata = buildSmartMetadata(existing, options.buildTargetPatch(existing, fullEntry.id));
+          const updated = await this.performUpdateLocked(
+            target.id,
+            { metadata: stringifySmartMetadata(metadata) },
+            options.scopeFilter,
+          );
+          if (updated == null) {
+            invalidationFailures.push({ id: target.id, reason: "update persisted no row" });
+          } else {
+            supersededIds.push(target.id);
+          }
+        } catch (err) {
+          invalidationFailures.push({
+            id: target.id,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      return { entry: fullEntry, supersededIds, invalidationFailures };
+    }));
+    this.noteDataModification();
+    return result;
+  }
   async bulkDelete(scopeFilter: string[], beforeTimestamp?: number): Promise<number> {
     await this.ensureInitialized();
 
