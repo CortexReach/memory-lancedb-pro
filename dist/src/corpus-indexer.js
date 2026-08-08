@@ -438,10 +438,10 @@ export class CanonicalCorpusIndexer {
     async sync(options = {}) {
         const config = this.params.getConfig();
         if (!config.enabled)
-            return { documents: 0, chunks: 0, indexed: 0, skipped: 0, staleDeleted: 0, errors: [] };
+            return { documents: 0, chunks: 0, indexed: 0, skipped: 0, unchanged: 0, staleDeleted: 0, errors: [] };
         const now = Date.now();
         if (!options.force && this.lastSyncAt > 0 && now - this.lastSyncAt < config.syncIntervalMs) {
-            return { documents: 0, chunks: 0, indexed: 0, skipped: 0, staleDeleted: 0, errors: [] };
+            return { documents: 0, chunks: 0, indexed: 0, skipped: 0, unchanged: 0, staleDeleted: 0, errors: [] };
         }
         if (this.syncPromise)
             return this.syncPromise;
@@ -462,11 +462,65 @@ export class CanonicalCorpusIndexer {
             chunks: chunks.length,
             indexed: 0,
             skipped: 0,
+            unchanged: 0,
             staleDeleted: 0,
             errors: [],
         };
+        const existingChunks = new Map();
+        try {
+            const refs = (await this.params.store.listCorpusEntryRefs?.()) ?? [];
+            for (const ref of refs) {
+                try {
+                    const parsedMeta = JSON.parse(ref.metadata ?? "{}");
+                    if (isRecord(parsedMeta)
+                        && typeof parsedMeta.corpus_content_sha256 === "string"
+                        && typeof parsedMeta.corpus_document_sha256 === "string") {
+                        existingChunks.set(ref.id, {
+                            contentSha256: parsedMeta.corpus_content_sha256,
+                            documentSha256: parsedMeta.corpus_document_sha256,
+                        });
+                    }
+                }
+                catch {
+                    // Unparseable metadata: treat as changed.
+                }
+            }
+        }
+        catch {
+            // If the store cannot be listed, fall back to a full reindex.
+        }
+        const newDocumentHashes = new Map();
+        for (const chunk of chunks) {
+            const docKey = buildDocumentKey({
+                workspaceDir: chunk.doc.workspaceDir,
+                agentId: chunk.doc.agentId,
+                source: chunk.doc.source,
+                relativePath: chunk.doc.relativePath,
+            });
+            if (!newDocumentHashes.has(docKey)) {
+                newDocumentHashes.set(docKey, sha256(chunk.doc.content));
+            }
+        }
         for (const chunk of chunks) {
             try {
+                const chunkId = buildCorpusId(chunk);
+                const existing = existingChunks.get(chunkId);
+                const newDocHash = newDocumentHashes.get(buildDocumentKey({
+                    workspaceDir: chunk.doc.workspaceDir,
+                    agentId: chunk.doc.agentId,
+                    source: chunk.doc.source,
+                    relativePath: chunk.doc.relativePath,
+                }));
+                if (existing
+                    && existing.contentSha256 === sha256(chunk.text)
+                    && existing.documentSha256 === newDocHash) {
+                    this.setPathCache(chunk.doc.workspaceDir, chunk.doc.relativePath, {
+                        absolutePath: chunk.doc.absolutePath,
+                        source: chunk.doc.source,
+                    });
+                    stats.unchanged++;
+                    continue;
+                }
                 const vector = await this.params.embedder.embedPassage(chunk.text);
                 await this.params.store.upsert(toMemoryEntry(chunk, vector));
                 this.setPathCache(chunk.doc.workspaceDir, chunk.doc.relativePath, {
@@ -494,7 +548,7 @@ export class CanonicalCorpusIndexer {
         });
         this.lastSyncAt = Date.now();
         if (stats.indexed > 0 || stats.staleDeleted > 0) {
-            this.params.log?.(`memory-lancedb-pro: indexed ${stats.indexed}/${stats.chunks} canonical corpus chunk(s), deleted ${stats.staleDeleted} stale chunk(s) (${reason})`);
+            this.params.log?.(`memory-lancedb-pro: indexed ${stats.indexed}/${stats.chunks} canonical corpus chunk(s) (${stats.unchanged} unchanged), deleted ${stats.staleDeleted} stale chunk(s) (${reason})`);
         }
         if (stats.errors.length > 0) {
             this.params.warn?.(`memory-lancedb-pro: canonical corpus indexing skipped ${stats.skipped} chunk(s): ${stats.errors.slice(0, 3).join(" | ")}`);
