@@ -33,6 +33,11 @@ describe("inferProviderFromBaseURL - PR #713 regression", () => {
       const result = inferProviderFromBaseURL("https://api.anthropic.com");
       assert.strictEqual(result, "anthropic");
     });
+
+    it("baseURL with orcarouter.ai returns orcarouter", () => {
+      const result = inferProviderFromBaseURL("https://api.orcarouter.ai/v1");
+      assert.strictEqual(result, "orcarouter");
+    });
   });
 
   describe("edge cases", () => {

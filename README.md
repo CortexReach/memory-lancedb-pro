@@ -683,6 +683,22 @@ Notes for `llm.auth: "oauth"`:
 - `auth login` snapshots the previous api-key `llm` config next to the OAuth file, and `auth logout` restores that snapshot when available.
 - Switching from `api-key` to `oauth` does not automatically carry over `llm.baseURL`. Set it manually in OAuth mode only when you intentionally want a custom ChatGPT/Codex-compatible backend.
 
+**Gateway (OpenAI-compatible) `llm` config — e.g. [OrcaRouter](https://www.orcarouter.ai):**
+
+The plugin's LLM client accepts any OpenAI-compatible gateway via `llm.baseURL` + `llm.apiKey`. When pointing at a gateway, use its namespaced model id — for OrcaRouter that is `orcarouter/auto` (the adaptive auto-router) or a provider-prefixed id such as `anthropic/claude-sonnet-4.6`. A bare model name is rejected by OrcaRouter, so keep the `orcarouter/` or vendor prefix intact:
+
+```json
+{
+  "llm": {
+    "auth": "api-key",
+    "apiKey": "${ORCAROUTER_API_KEY}",
+    "baseURL": "https://api.orcarouter.ai/v1",
+    "model": "orcarouter/auto",
+    "timeoutMs": 30000
+  }
+}
+```
+
 </details>
 
 <details>
