@@ -446,10 +446,23 @@ export class MemoryUpgrader {
       ? legacyMemories.slice(0, limit)
       : legacyMemories;
 
-    for (let i = 0; i < toProcess.length; i += batchSize) {
-      const batch = toProcess.slice(i, i + batchSize);
+    // An empty id makes store.update() reject the record on every single
+    // run. Retrying the same residue produced ~2700 identical ERROR lines
+    // per day in a long-lived deployment.
+    const hasId = (e: MemoryEntry) => String(e.id ?? "").trim() !== "";
+    const unusable = toProcess.filter((e) => !hasId(e));
+    const upgradable = toProcess.filter(hasId);
+    if (unusable.length > 0) {
       this.log(
-        `memory-upgrader: processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(toProcess.length / batchSize)} (${batch.length} memories)`,
+        `memory-upgrader: skipping ${unusable.length} legacy memories with an empty id ` +
+          `(cannot be updated in place — needs an id-repair pass)`,
+      );
+    }
+
+    for (let i = 0; i < upgradable.length; i += batchSize) {
+      const batch = upgradable.slice(i, i + batchSize);
+      this.log(
+        `memory-upgrader: processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(upgradable.length / batchSize)} (${batch.length} memories)`,
       );
 
       const prepared: PreparedUpgrade[] = [];

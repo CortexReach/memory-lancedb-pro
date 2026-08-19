@@ -2627,7 +2627,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
       : config.llm?.baseURL
         ? resolveEnvVars(config.llm.baseURL)
         : config.embedding.baseURL;
-    const llmModel = config.llm?.model || "openai/gpt-oss-120b";
+    const llmModel = config.llm?.model || "groq/openai/gpt-oss-120b";
     const llmOauthPath = llmAuth === "oauth"
       ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
       : undefined;
@@ -3525,7 +3525,7 @@ const memoryLanceDBProPlugin = {
             return createLlmClient({
               auth: llmAuth,
               apiKey: llmApiKey,
-              model: config.llm?.model || "openai/gpt-oss-120b",
+              model: config.llm?.model || "groq/openai/gpt-oss-120b",
               baseURL: llmBaseURL,
               oauthProvider: llmOauthProvider,
               oauthPath: llmOauthPath,
@@ -5315,6 +5315,12 @@ const memoryLanceDBProPlugin = {
           const content = await loadSelfImprovementReminderContent(workspaceDir);
           bootstrapFiles.push({
             path: "SELF_IMPROVEMENT_REMINDER.md",
+            // "name" is required: the core bootstrap budget checker
+            // (dist/bootstrap-budget-*.js) calls name.toLowerCase() unguarded
+            // once bootstrapTotalMaxChars overflows. An entry without "name"
+            // kills every agent turn before the model call ("Embedded agent
+            // failed before reply"). "virtual" does not protect against it.
+            name: "SELF_IMPROVEMENT_REMINDER",
             content,
             virtual: true,
           });
@@ -6643,19 +6649,30 @@ const memoryLanceDBProPlugin = {
         // Fire-and-forget: allow gateway to start serving immediately.
         setTimeout(() => void runStartupChecks(), 0);
 
-        // Check for legacy memories that could be upgraded
+        // Legacy memories used to be merely counted here, with a log line
+        // asking a human to run 'openclaw memory-pro upgrade' — which nobody
+        // ever did (observed: 54% of entries stuck without smart metadata,
+        // semantically degraded). Run the upgrade automatically instead.
+        // noLlm=true: plain text shortening; safe without a working extractor.
+        // limit keeps the first pass from blocking gateway startup; the rest
+        // is drained across subsequent starts.
         setTimeout(async () => {
           try {
-            const upgrader = createMemoryUpgrader(store, null);
+            const upgrader = createMemoryUpgrader(store, null, {
+              log: (msg: string) => api.logger.info(msg),
+            });
             const counts = await upgrader.countLegacy();
             if (counts.legacy > 0) {
               api.logger.info(
-                `memory-lancedb-pro: found ${counts.legacy} legacy memories (of ${counts.total} total) that can be upgraded to the new smart memory format. ` +
-                `Run 'openclaw memory-pro upgrade' to convert them.`
+                `memory-lancedb-pro: ${counts.legacy} legacy memories of ${counts.total} — starting auto-upgrade (noLlm)`,
+              );
+              const res = await upgrader.upgrade({ noLlm: true, batchSize: 50, limit: 500 });
+              api.logger.info(
+                `memory-lancedb-pro: auto-upgrade finished: ${JSON.stringify(res)}`,
               );
             }
-          } catch {
-            // Non-critical: silently ignore
+          } catch (err) {
+            api.logger.warn(`memory-lancedb-pro: auto-upgrade failed: ${String(err)}`);
           }
         }, 5_000);
 
