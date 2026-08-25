@@ -4,7 +4,29 @@ import { afterEach, describe, it } from "node:test";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
-const { createLlmClient, shouldDisableReasoningForJson, stripReasoningTrace } = jiti("../src/llm-client.ts");
+const { createLlmClient, normalizeDirectModelRef, shouldDisableReasoningForJson, stripReasoningTrace } = jiti("../src/llm-client.ts");
+
+describe("normalizeDirectModelRef", () => {
+  it("strips a core-style openrouter/<vendor>/<model> ref to the bare <vendor>/<model> form", () => {
+    assert.equal(normalizeDirectModelRef("openrouter/anthropic/claude-opus-4-8"), "anthropic/claude-opus-4-8");
+  });
+
+  it("strips a namespaced orcarouter/<vendor>/<model> ref to the bare <vendor>/<model> form", () => {
+    assert.equal(normalizeDirectModelRef("orcarouter/anthropic/claude-sonnet-4.6"), "anthropic/claude-sonnet-4.6");
+  });
+
+  it("keeps orcarouter/auto prefixed (OrcaRouter rejects the bare auto id)", () => {
+    assert.equal(normalizeDirectModelRef("orcarouter/auto"), "orcarouter/auto");
+  });
+
+  it("passes a bare <vendor>/<model> ref through unchanged", () => {
+    assert.equal(normalizeDirectModelRef("anthropic/claude-sonnet-4.6"), "anthropic/claude-sonnet-4.6");
+  });
+
+  it("passes an unrelated provider prefix through unchanged", () => {
+    assert.equal(normalizeDirectModelRef("openai/gpt-4o"), "openai/gpt-4o");
+  });
+});
 
 describe("LLM api-key client", () => {
   let server;

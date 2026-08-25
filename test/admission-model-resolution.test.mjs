@@ -101,6 +101,56 @@ describe("resolveAdmissionModel", () => {
     assert.equal(reflection, "anthropic/claude-opus-4-8");
   });
 
+  it("normalizes a core-style orcarouter/<vendor>/<model> reflection model to the bare <vendor>/<model> form the OrcaRouter-direct client needs", () => {
+    const admissionControl = normalizeAdmissionControlConfig({ enabled: true, modelAffinity: "lane" });
+
+    const reflection = resolveAdmissionModel({
+      admissionControl,
+      lane: "reflection",
+      globalModel: "global-model",
+      reflectionModel: "orcarouter/anthropic/claude-sonnet-4.6",
+    });
+
+    assert.equal(reflection, "anthropic/claude-sonnet-4.6");
+  });
+
+  it("keeps the orcarouter/auto router model prefixed (OrcaRouter rejects the bare auto id)", () => {
+    const admissionControl = normalizeAdmissionControlConfig({ enabled: true, modelAffinity: "lane" });
+
+    const reflection = resolveAdmissionModel({
+      admissionControl,
+      lane: "reflection",
+      globalModel: "global-model",
+      reflectionModel: "orcarouter/auto",
+    });
+
+    assert.equal(reflection, "orcarouter/auto");
+  });
+
+  it("normalizes an explicit orcarouter admissionControl.model override the same way as lane-resolved models", () => {
+    const admissionControl = normalizeAdmissionControlConfig({
+      enabled: true,
+      modelAffinity: "lane",
+      model: "orcarouter/anthropic/claude-sonnet-4.6",
+    });
+
+    const other = resolveAdmissionModel({
+      admissionControl,
+      lane: "other",
+      globalModel: "global-model",
+      reflectionModel: "reflection-model",
+    });
+    const reflection = resolveAdmissionModel({
+      admissionControl,
+      lane: "reflection",
+      globalModel: "global-model",
+      reflectionModel: "reflection-model",
+    });
+
+    assert.equal(other, "anthropic/claude-sonnet-4.6");
+    assert.equal(reflection, "anthropic/claude-sonnet-4.6");
+  });
+
   it("passes a bare <vendor>/<model> reflection model through unchanged", () => {
     const admissionControl = normalizeAdmissionControlConfig({ enabled: true, modelAffinity: "lane" });
 

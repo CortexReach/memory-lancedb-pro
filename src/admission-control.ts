@@ -688,15 +688,30 @@ export type AdmissionLane = "reflection" | "other";
  * Strip that literal "openrouter/" prefix so both forms reach this plugin's
  * direct client correctly; a bare "<vendor>/<model>" or an "@preset/<name>"
  * alias already work against OpenRouter unchanged, so they pass through.
+ *
+ * The same mirror applies to the "orcarouter/" gateway prefix: a namespaced
+ * "orcarouter/<vendor>/<model>" id strips to "<vendor>/<model>", while the
+ * auto-router "orcarouter/auto" keeps its prefix (OrcaRouter rejects the
+ * bare "auto" id with 503 model_not_found).
  */
 export function normalizeAdmissionModelRef(modelRef: string): string {
   const trimmed = modelRef.trim();
   const idx = trimmed.indexOf("/");
   if (idx <= 0) return trimmed;
   const provider = trimmed.slice(0, idx).trim().toLowerCase();
-  if (provider !== "openrouter") return trimmed;
-  const rest = trimmed.slice(idx + 1).trim();
-  return rest || trimmed;
+  if (provider === "openrouter") {
+    const rest = trimmed.slice(idx + 1).trim();
+    return rest || trimmed;
+  }
+  if (provider === "orcarouter") {
+    const rest = trimmed.slice(idx + 1).trim();
+    // OrcaRouter requires a namespaced model id. A remainder that still
+    // carries a "<vendor>/" prefix (e.g. orcarouter/anthropic/claude-...)
+    // can drop the gateway prefix; a bare remainder (e.g. "auto") must keep
+    // "orcarouter/" or OrcaRouter returns 503 model_not_found.
+    return rest.includes("/") ? rest : trimmed;
+  }
+  return trimmed;
 }
 
 /**

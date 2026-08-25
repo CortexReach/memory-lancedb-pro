@@ -17,16 +17,29 @@ import {
 /**
  * Strips a core-style provider prefix (e.g. "openrouter/anthropic/claude-...")
  * down to the bare "<vendor>/<model>" form a direct OpenRouter-compatible API
- * needs. Any other prefix, or a string with no "/", passes through unchanged.
+ * needs. Also recognizes the "orcarouter/" gateway prefix: a namespaced
+ * "orcarouter/<vendor>/<model>" id strips to "<vendor>/<model>", while the
+ * auto-router "orcarouter/auto" keeps its prefix (OrcaRouter rejects the bare
+ * "auto" id). Any other prefix, or a string with no "/", passes through.
  */
 export function normalizeDirectModelRef(modelRef: string): string {
   const trimmed = modelRef.trim();
   const idx = trimmed.indexOf("/");
   if (idx <= 0) return trimmed;
   const provider = trimmed.slice(0, idx).trim().toLowerCase();
-  if (provider !== "openrouter") return trimmed;
-  const rest = trimmed.slice(idx + 1).trim();
-  return rest || trimmed;
+  if (provider === "openrouter") {
+    const rest = trimmed.slice(idx + 1).trim();
+    return rest || trimmed;
+  }
+  if (provider === "orcarouter") {
+    const rest = trimmed.slice(idx + 1).trim();
+    // OrcaRouter requires a namespaced model id. A remainder that still
+    // carries a "<vendor>/" prefix (e.g. orcarouter/anthropic/claude-...)
+    // can drop the gateway prefix; a bare remainder (e.g. "auto") must keep
+    // "orcarouter/" or OrcaRouter returns 503 model_not_found.
+    return rest.includes("/") ? rest : trimmed;
+  }
+  return trimmed;
 }
 
 export interface LlmClientConfig {

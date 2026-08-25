@@ -763,6 +763,8 @@ export function inferProviderFromBaseURL(baseURL) {
             return "openai";
         if (hostname.endsWith(".anthropic.com"))
             return "anthropic";
+        if (hostname.endsWith(".orcarouter.ai"))
+            return "orcarouter";
         return undefined;
     }
     catch {

@@ -215,6 +215,44 @@ describe("admission lane model affinity", () => {
     );
   });
 
+  it("normalizes a namespaced orcarouter/<vendor>/<model> reflection model and keeps orcarouter/auto for the direct client", () => {
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: baseConfig(workspaceDir, {
+        admissionControl: { enabled: true, modelAffinity: "lane" },
+        memoryReflection: { model: "orcarouter/anthropic/claude-sonnet-4.6" },
+      }),
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+
+    assert.ok(
+      requestedModels.includes("anthropic/claude-sonnet-4.6"),
+      "orcarouter/<vendor>/<model> must strip to the bare <vendor>/<model> id a direct OrcaRouter call accepts",
+    );
+    assert.ok(
+      !requestedModels.includes("orcarouter/anthropic/claude-sonnet-4.6"),
+      "the raw core-style orcarouter ref must never reach a direct client",
+    );
+  });
+
+  it("keeps the orcarouter/auto router model prefixed for the direct client", () => {
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: baseConfig(workspaceDir, {
+        admissionControl: { enabled: true, modelAffinity: "lane" },
+        memoryReflection: { model: "orcarouter/auto" },
+      }),
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+
+    assert.ok(
+      requestedModels.includes("orcarouter/auto"),
+      "OrcaRouter rejects the bare auto id, so orcarouter/auto must reach the direct client intact",
+    );
+  });
+
   it("lets an explicit admissionControl.model override beat lane affinity on every admission lane", () => {
     const harness = createPluginApiHarness({
       resolveRoot: workspaceDir,

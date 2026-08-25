@@ -1206,6 +1206,7 @@ export function inferProviderFromBaseURL(baseURL: string | undefined): string | 
     if (hostname.endsWith(".minimax.io")) return "minimax-portal";
     if (hostname.endsWith(".openai.com")) return "openai";
     if (hostname.endsWith(".anthropic.com")) return "anthropic";
+    if (hostname.endsWith(".orcarouter.ai")) return "orcarouter";
     return undefined;
   } catch {
     return undefined;
