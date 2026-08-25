@@ -713,7 +713,11 @@ export class MemoryStore {
     try {
       const stat = await statAsync(lockArtifactPath);
       const ageMs = Date.now() - stat.mtimeMs;
-      const staleThresholdMs = 5 * 60 * 1000;
+      // A 5min threshold let autoRecall wait up to ~41s on an orphaned lock
+      // (measured ageMs=403847). A legitimate write holds the lock for
+      // seconds; proper-lockfile stale=10s kicks in below. 30s is
+      // conservative and ends the stall.
+      const staleThresholdMs = 30 * 1000;
       if (ageMs > staleThresholdMs) {
         try {
           if (stat.isDirectory()) {
@@ -736,7 +740,10 @@ export class MemoryStore {
       retries: {
         retries: 10,
         factor: 2,
-        minTimeout: 1000, // James 保守設定：避免高負載下過度密集重試
+        // was 1000: three concurrent patchMetadata calls in auto-recall cost a
+        // reproducible ~3s of idle waiting (1s + 2s minimum backoff) and ate
+        // the 8s recall budget. The lock is really held for ~200ms.
+        minTimeout: 50, // James 保守設定：避免高負載下過度密集重試
         maxTimeout: 30000, // James 保守設定：支撐更久的 event loop 阻塞
       },
       stale: 10000, // 10 秒後視為 stale，觸發 ECOMPROMISED callback

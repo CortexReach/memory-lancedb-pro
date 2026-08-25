@@ -1208,9 +1208,13 @@ export class Embedder {
     } catch (error) {
       // Check if this is a context length exceeded error and try chunking
       const errorMsg = error instanceof Error ? error.message : String(error);
-      const isContextError = /context|too long|exceed|length/i.test(errorMsg);
+      const isContextError = /context.{0,30}(length|limit|window|size)|too long|max.{0,10}token|exceed.{0,15}token|input.{0,15}too.{0,15}large/i.test(errorMsg);
 
-      if (isContextError && this._autoChunk) {
+      // Strings under ~512 chars cannot exceed any real embedding model's
+      // context window. If embedding failed for a short string the error is
+      // something else (auth, network, model not found) — chunking it would
+      // trigger an infinite reduction loop.
+      if (isContextError && this._autoChunk && text.length >= 512) {
         return this.embedChunkedText(
           inputText,
           task,
@@ -1296,9 +1300,13 @@ export class Embedder {
       // separately. Some providers reject only the aggregate batch size while
       // accepting each item unchanged.
       const errorMsg = error instanceof Error ? error.message : String(error);
-      const isContextError = /context|too long|exceed|length/i.test(errorMsg);
+      const isContextError = /context.{0,30}(length|limit|window|size)|too long|max.{0,10}token|exceed.{0,15}token|input.{0,15}too.{0,15}large/i.test(errorMsg);
 
-      if (isContextError && this._autoChunk) {
+      // A batch under ~512 chars total cannot exceed any real embedding
+      // model's context window. If it failed anyway the error is something
+      // else (auth, network, model not found) — the per-item retry would just
+      // repeat the same failure for every item.
+      if (isContextError && this._autoChunk && validTexts.reduce((n, t) => n + t.length, 0) >= 512) {
         try {
           console.log(`Batch embedding failed with context error, retrying items individually...`);
 
