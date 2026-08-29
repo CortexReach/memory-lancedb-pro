@@ -41,7 +41,7 @@ import { buildFallbackCandidate, gateRegexFallbackCapture } from "./src/autocapt
 import { gateMappedReflectionEntries, resolveMappedRowAdmissionController } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { buildConversationTurnsForExtraction, dedupePairWindow, formatConversationTranscript, neutralizeSpeakerTagSpoof, nextAutoCaptureMessageId, normalizeAutoCaptureText, reconcileTurnsWithKeptTexts, trimTurnsToUserCap, } from "./src/auto-capture-cleanup.js";
+import { buildConversationTurnsForExtraction, dedupePairWindow, weaveContextOnlyAssistantTurns, formatConversationTranscript, neutralizeSpeakerTagSpoof, nextAutoCaptureMessageId, normalizeAutoCaptureText, reconcileTurnsWithKeptTexts, trimTurnsToUserCap, } from "./src/auto-capture-cleanup.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter, stripEnvelopeMetadata } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -2110,7 +2110,6 @@ function _initPluginState(api) {
     const autoCaptureRecentTurns = new Map();
     const autoCaptureDeferredFlushTurns = new Map();
     const autoCaptureSessionIdToKey = new Map();
-    const autoCaptureSessionIds = new Map();
     const autoCaptureRecentPairTurns = new Map();
     const autoCaptureInFlightRuns = new Map();
     return {
@@ -2143,7 +2142,6 @@ function _initPluginState(api) {
         autoCaptureRecentTurns,
         autoCaptureDeferredFlushTurns,
         autoCaptureSessionIdToKey,
-        autoCaptureSessionIds,
         autoCaptureRecentPairTurns,
         autoCaptureInFlightRuns,
         captureAdmissionController,
@@ -2258,7 +2256,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureSessionIds, autoCaptureRecentPairTurns, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, admissionRejectionAuditWriter, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureRecentPairTurns, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, admissionRejectionAuditWriter, } = singleton;
         const learnAutoCaptureSessionAlias = (sessionId, sessionKey) => {
             if (typeof sessionId !== "string" || !sessionId
                 || typeof sessionKey !== "string" || !sessionKey
@@ -3188,6 +3186,7 @@ const memoryLanceDBProPlugin = {
                             autoCaptureRecentTurns.delete(windowKey);
                         }
                     }
+                    autoCaptureRecentPairTurns.delete(endedSessionKey);
                 }
             }, { priority: 10 });
             const awaitSessionCaptureRuns = (key) => {
@@ -3270,6 +3269,14 @@ const memoryLanceDBProPlugin = {
                         // message-loop order alongside the flat eligible-text list.
                         const eligibleTexts = [];
                         const messageLoopTurns = [];
+                        // Assistant replies collected as CONTEXT when captureAssistant is
+                        // off but the rolling pair window is on: they ride the transcript
+                        // and the retained window (the prompt's source-eligibility rules
+                        // already restrict extraction to <user_message> blocks in that
+                        // mode) without ever entering eligibleTexts, so every
+                        // watermark/count invariant over eligible texts is untouched.
+                        const contextOnlyAssistantReplies = [];
+                        const contextWindowOn = (config.autoCaptureContextTurns ?? 0) > 0;
                         let skippedAutoCaptureTexts = 0;
                         for (const msg of event.messages ?? []) {
                             if (!msg || typeof msg !== "object") {
@@ -3278,8 +3285,10 @@ const memoryLanceDBProPlugin = {
                             const msgObj = msg;
                             const role = msgObj.role;
                             const captureAssistant = config.captureAssistant === true;
+                            const assistantAsContextOnly = role === "assistant" && !captureAssistant && contextWindowOn;
                             if (role !== "user" &&
-                                !(captureAssistant && role === "assistant")) {
+                                !(captureAssistant && role === "assistant") &&
+                                !assistantAsContextOnly) {
                                 continue;
                             }
                             const content = msgObj.content;
@@ -3288,6 +3297,12 @@ const memoryLanceDBProPlugin = {
                                 const normalized = normalizeAutoCaptureText(role, content, shouldSkipReflectionMessage);
                                 if (!normalized) {
                                     skippedAutoCaptureTexts++;
+                                }
+                                else if (assistantAsContextOnly) {
+                                    contextOnlyAssistantReplies.push({
+                                        anchorMessageId: messageLoopTurns.length > 0 ? messageLoopTurns[messageLoopTurns.length - 1].messageId : null,
+                                        turn: { role: "assistant", text: normalized, messageId },
+                                    });
                                 }
                                 else {
                                     eligibleTexts.push(normalized);
@@ -3307,6 +3322,12 @@ const memoryLanceDBProPlugin = {
                                         const normalized = normalizeAutoCaptureText(role, text, shouldSkipReflectionMessage);
                                         if (!normalized) {
                                             skippedAutoCaptureTexts++;
+                                        }
+                                        else if (assistantAsContextOnly) {
+                                            contextOnlyAssistantReplies.push({
+                                                anchorMessageId: messageLoopTurns.length > 0 ? messageLoopTurns[messageLoopTurns.length - 1].messageId : null,
+                                                turn: { role: "assistant", text: normalized, messageId },
+                                            });
                                         }
                                         else {
                                             eligibleTexts.push(normalized);
@@ -3468,6 +3489,7 @@ const memoryLanceDBProPlugin = {
                         }
                         if (isTerminalBoundary) {
                             autoCaptureRecentTurns.delete(rememberWindowKey(agentId, sessionKey));
+                            autoCaptureRecentPairTurns.delete(sessionKey);
                         }
                         else if (newTexts.length > 0) {
                             const newRecentTurns = thisCallTurns.slice(rememberPrependedTurns.length);
@@ -3645,6 +3667,11 @@ const memoryLanceDBProPlugin = {
                                 // pin each surviving copy to its own turn; occurrence counting
                                 // stays as the fallback when positional alignment is unavailable.
                                 let finalConversationTurns = reconcileTurnsWithKeptTexts(thisCallTurns, cleanTexts, cleanTurnIndices);
+                                // Context-only assistant replies rejoin the reconciled sequence
+                                // right after their surviving anchor turns, so the transcript
+                                // (and the retained window below) carries the assistant side of
+                                // each pair even under the default captureAssistant=false.
+                                finalConversationTurns = weaveContextOnlyAssistantTurns(finalConversationTurns, contextOnlyAssistantReplies);
                                 // Rolling PAIR window sized by autoCaptureContextTurns (0 =
                                 // disabled: each extraction sees only its own call's turns, and
                                 // nothing is retained between calls). When enabled, this call's
@@ -3658,9 +3685,19 @@ const memoryLanceDBProPlugin = {
                                 // call: the extractor's protected-prefix contract counts
                                 // referent turns from position zero.
                                 const contextTurns = config.autoCaptureContextTurns ?? 0;
+                                const priorPairTurns = contextTurns > 0 ? (autoCaptureRecentPairTurns.get(sessionKey) || []) : [];
+                                // A remember flow bypasses the window prepend for its own
+                                // transcript (the protected-prefix contract counts referent
+                                // turns from position zero), but the ACCUMULATED window must
+                                // survive it: its stored update always composes the prior
+                                // window with this call's own turns, never with the
+                                // remember-shaped transcript.
+                                const rememberPrependedIds = new Set(rememberPrependedTurns.map((turn) => turn.messageId));
+                                const currentCallWindowTurns = rememberPrependedTurns.length === 0
+                                    ? finalConversationTurns
+                                    : finalConversationTurns.filter((turn) => !rememberPrependedIds.has(turn.messageId));
                                 if (contextTurns > 0 && rememberPrependedTurns.length === 0) {
-                                    const priorPairTurns = autoCaptureRecentPairTurns.get(sessionKey) || [];
-                                    finalConversationTurns = trimTurnsToUserCap(dedupePairWindow([...priorPairTurns, ...finalConversationTurns]), Math.max(contextTurns, finalConversationTurns.filter((turn) => turn.role === "user").length));
+                                    finalConversationTurns = trimTurnsToUserCap(dedupePairWindow([...priorPairTurns, ...finalConversationTurns], priorPairTurns.length), Math.max(contextTurns, finalConversationTurns.filter((turn) => turn.role === "user").length));
                                 }
                                 if (contextTurns === 0) {
                                     autoCaptureRecentPairTurns.delete(sessionKey);
@@ -3671,7 +3708,10 @@ const memoryLanceDBProPlugin = {
                                     // extraction per turn) always see a bare current pair. The
                                     // set-time trim bounds it; the watermark keeps retained
                                     // turns from re-becoming sources.
-                                    autoCaptureRecentPairTurns.set(sessionKey, finalConversationTurns);
+                                    const nextStoredWindow = rememberPrependedTurns.length === 0
+                                        ? finalConversationTurns
+                                        : trimTurnsToUserCap(dedupePairWindow([...priorPairTurns, ...currentCallWindowTurns], priorPairTurns.length), Math.max(contextTurns, currentCallWindowTurns.filter((turn) => turn.role === "user").length));
+                                    autoCaptureRecentPairTurns.set(sessionKey, nextStoredWindow);
                                     pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                                 }
                                 // The referent is the OLDEST turn of the prepended window, which is
