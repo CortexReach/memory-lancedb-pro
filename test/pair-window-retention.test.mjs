@@ -302,3 +302,133 @@ describe("pair-window retention across successful extractions", () => {
     assert.ok(!second.includes(U2) && !second.includes(U1), "absent knob means no retained context");
   });
 });
+
+describe("pair-window review regressions: assistant context, current repeats, remember retention", () => {
+  let workspaceDir;
+  let embeddingServer;
+  let llmServer;
+  let extractionPrompts;
+  let basePluginConfig;
+
+  beforeEach(async () => {
+    resetRegistration();
+    workspaceDir = mkdtempSync(path.join(tmpdir(), "pair-window-review-"));
+    extractionPrompts = [];
+    embeddingServer = createEmbeddingServer();
+    llmServer = createLlmServer(extractionPrompts);
+    await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+    basePluginConfig = {
+      dbPath: path.join(workspaceDir, "memory-db"),
+      autoCapture: true,
+      autoRecall: false,
+      smartExtraction: true,
+      extractMinMessages: 2,
+      autoCaptureContextTurns: 2,
+      extractionThrottle: { skipLowValue: false, maxExtractionsPerHour: 200 },
+      sessionCompression: { enabled: false },
+      selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      embedding: {
+        apiKey: "test-key",
+        model: "mock-embedding-model",
+        baseURL: `http://127.0.0.1:${embeddingServer.address().port}/v1`,
+        dimensions: EMBEDDING_DIMENSIONS,
+      },
+      llm: {
+        apiKey: "test-key",
+        model: "mock-memory-model",
+        baseURL: `http://127.0.0.1:${llmServer.address().port}`,
+      },
+    };
+  });
+
+  function registerWith(overrides) {
+    resetRegistration();
+    const harness = createPluginApiHarness({
+      pluginConfig: { ...basePluginConfig, ...overrides },
+      resolveRoot: workspaceDir,
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    return getAutoCaptureHook(harness.eventHandlers);
+  }
+
+  afterEach(async () => {
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  it("carries assistant replies as transcript context under the DEFAULT captureAssistant setting", async () => {
+    const hook = registerWith({});
+    const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+
+    await fireAgentEnd(hook, turnMessages(4), ctx);
+    assert.equal(extractionPrompts.length, 1);
+    assert.ok(
+      extractionPrompts[0].includes("<assistant_message>") && extractionPrompts[0].includes(A2),
+      "the current call's assistant replies must appear as context with captureAssistant unset",
+    );
+
+    await fireAgentEnd(hook, turnMessages(6), ctx);
+    assert.equal(extractionPrompts.length, 2);
+    assert.ok(
+      extractionPrompts[1].includes(A2),
+      "the RETAINED pair must include its assistant reply in the next prompt (rolling window carries pairs, not bare user turns)",
+    );
+    assert.ok(
+      extractionPrompts[1].includes(A3),
+      "the current call's own reply rides as context too",
+    );
+  });
+
+  it("keeps a legitimate current-call repeat of a prior pair's user text", async () => {
+    const hook = registerWith({ autoCaptureContextTurns: 3 });
+    const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+
+    await fireAgentEnd(hook, [
+      { role: "user", content: U1 },
+      { role: "assistant", content: A1 },
+      { role: "user", content: U2 },
+    ], ctx);
+    assert.equal(extractionPrompts.length, 1);
+
+    await fireAgentEnd(hook, [
+      { role: "user", content: U1 },
+      { role: "assistant", content: A1 },
+      { role: "user", content: U2 },
+      { role: "user", content: U1 },
+    ], ctx);
+    assert.equal(extractionPrompts.length, 2, "the repeat turn should extract");
+    const occurrences = extractionPrompts[1].split(U1).length - 1;
+    assert.ok(
+      occurrences >= 2,
+      `a user intentionally repeating a prior pair's text must stay in its own extraction (wanted the prior pair AND the current repeat, got ${occurrences} occurrence(s))`,
+    );
+    assert.ok(
+      extractionPrompts[1].lastIndexOf(U1) > extractionPrompts[1].indexOf(U2),
+      "the current repeat must appear as the NEWEST turn (after the retained pairs), proving the current occurrence survived rather than only the prior pair",
+    );
+  });
+
+  it("preserves the accumulated window across a remember flow instead of overwriting it with the remember transcript", async () => {
+    const hook = registerWith({ autoCaptureContextTurns: 4 });
+    const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+
+    await fireAgentEnd(hook, turnMessages(6), ctx);
+    assert.equal(extractionPrompts.length, 1);
+
+    await fireAgentEnd(hook, [...turnMessages(6), { role: "user", content: "remember this" }], ctx);
+    assert.equal(extractionPrompts.length, 2, "the remember flow should extract");
+
+    await fireAgentEnd(
+      hook,
+      [...turnMessages(6), { role: "user", content: "remember this" }, { role: "user", content: U4 }],
+      ctx,
+    );
+    assert.equal(extractionPrompts.length, 3);
+    assert.ok(
+      extractionPrompts[2].includes(U2),
+      "older retained pairs must survive a remember call: the remember-shaped transcript may not replace the accumulated window",
+    );
+  });
+});
