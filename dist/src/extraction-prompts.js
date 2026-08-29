@@ -45,6 +45,7 @@ export function buildExtractionPrompt(conversationText, user, options = {}) {
 ## Transcript format
 The conversation is a sequence of tagged blocks in chronological order:
 - <user_message>...</user_message> wraps ONE message written by the human user.${userGroundingSuffix}${assistantFormatBullet}
+- <context_only_user_turn>...</context_only_user_turn> and <context_only_assistant_turn>...</context_only_assistant_turn> wrap PRIOR-CONTEXT turns retained only so you can resolve references in the current messages. Context blocks are NEVER memory sources: do not produce any candidate grounded solely in a context_only block. Their content was already considered when it was current.
 
 # Memory Extraction Criteria
 
