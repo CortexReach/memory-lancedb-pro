@@ -477,23 +477,25 @@ export function trimTurnsToUserCap(
  * copies of an identical exchange collapse to the latest, and a repeated user
  * text whose replies differ is a real conversation and is kept whole.
  */
-export function dedupePairWindow(turns: ConversationTurn[]): ConversationTurn[] {
+export function dedupePairWindow(turns: ConversationTurn[], priorBoundary: number = turns.length): ConversationTurn[] {
   interface PairGroup {
     turns: ConversationTurn[];
     userText: string | null;
     replies: string;
+    fromPriorWindow: boolean;
   }
   const groups: PairGroup[] = [];
   let current: PairGroup | null = null;
-  for (const turn of turns) {
+  for (let index = 0; index < turns.length; index++) {
+    const turn = turns[index];
     if (turn.role === "user") {
-      current = { turns: [turn], userText: turn.text, replies: "" };
+      current = { turns: [turn], userText: turn.text, replies: "", fromPriorWindow: index < priorBoundary };
       groups.push(current);
     } else if (current) {
       current.turns.push(turn);
       current.replies = JSON.stringify(current.turns.slice(1).map((t) => t.text));
     } else {
-      groups.push({ turns: [turn], userText: null, replies: "" });
+      groups.push({ turns: [turn], userText: null, replies: "", fromPriorWindow: index < priorBoundary });
     }
   }
 
@@ -528,6 +530,14 @@ export function dedupePairWindow(turns: ConversationTurn[]): ConversationTurn[] 
       kept.splice(prevIndex, 1);
       kept.push(group);
     } else if (!currPaired && prevPaired) {
+      // A reply-less repeat is only replay noise when both copies come from
+      // the same origin. A CURRENT-call user turn repeating a PRIOR-window
+      // pair is a human intentionally saying the same thing again: keep the
+      // current occurrence alongside the prior exchange instead of silently
+      // deleting the newest input from its own extraction.
+      if (!group.fromPriorWindow && prev.fromPriorWindow) {
+        kept.push(group);
+      }
       continue;
     } else {
       kept.splice(prevIndex, 1);
@@ -535,6 +545,51 @@ export function dedupePairWindow(turns: ConversationTurn[]): ConversationTurn[] 
     }
   }
   return kept.flatMap((group) => group.turns);
+}
+
+/**
+ * Weaves context-only assistant replies (collected when captureAssistant is
+ * off but the rolling pair window is on) back into the reconciled turn
+ * sequence, directly after the surviving turn they replied to. A context
+ * reply whose anchor turn was dropped by an upstream selector is dropped with
+ * it: a reply without its user turn is noise, never context. Entries with a
+ * null anchor (a leading reply with no prior turn in the payload) weave at
+ * the front in arrival order.
+ */
+export function weaveContextOnlyAssistantTurns(
+  turns: ConversationTurn[],
+  contextReplies: Array<{ anchorMessageId: ConversationTurn["messageId"] | null; turn: ConversationTurn }>,
+): ConversationTurn[] {
+  if (contextReplies.length === 0) {
+    return turns;
+  }
+  const result = [...turns];
+  let frontCursor = 0;
+  const insertAfterByAnchor = new Map<ConversationTurn["messageId"], number>();
+  for (const { anchorMessageId, turn } of contextReplies) {
+    if (anchorMessageId === null) {
+      result.splice(frontCursor, 0, turn);
+      frontCursor++;
+      continue;
+    }
+    let insertAt = insertAfterByAnchor.get(anchorMessageId);
+    if (insertAt === undefined) {
+      let anchorIndex = -1;
+      for (let i = result.length - 1; i >= 0; i--) {
+        if (result[i].messageId === anchorMessageId) {
+          anchorIndex = i;
+          break;
+        }
+      }
+      if (anchorIndex < 0) {
+        continue;
+      }
+      insertAt = anchorIndex + 1;
+    }
+    result.splice(insertAt, 0, turn);
+    insertAfterByAnchor.set(anchorMessageId, insertAt + 1);
+  }
+  return result;
 }
 
 /**
