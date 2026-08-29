@@ -2111,6 +2111,7 @@ function _initPluginState(api) {
     const autoCaptureDeferredFlushTurns = new Map();
     const autoCaptureSessionIdToKey = new Map();
     const autoCaptureRecentPairTurns = new Map();
+    const autoCapturePairWindowEpoch = new Map();
     const autoCaptureInFlightRuns = new Map();
     return {
         config,
@@ -2143,6 +2144,7 @@ function _initPluginState(api) {
         autoCaptureDeferredFlushTurns,
         autoCaptureSessionIdToKey,
         autoCaptureRecentPairTurns,
+        autoCapturePairWindowEpoch,
         autoCaptureInFlightRuns,
         captureAdmissionController,
         captureAdmissionAudit,
@@ -2256,7 +2258,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureRecentPairTurns, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, admissionRejectionAuditWriter, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureRecentPairTurns, autoCapturePairWindowEpoch, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, admissionRejectionAuditWriter, } = singleton;
         const learnAutoCaptureSessionAlias = (sessionId, sessionKey) => {
             if (typeof sessionId !== "string" || !sessionId
                 || typeof sessionKey !== "string" || !sessionKey
@@ -3171,7 +3173,14 @@ const memoryLanceDBProPlugin = {
                 if (!isTerminalSessionBoundary(event)) {
                     return;
                 }
-                const endedSessionKey = ctx?.sessionKey || "";
+                // Resolve the same logical key the flush resolves: a session_end
+                // may deliver only the lifecycle sessionId; the alias map learned
+                // at capture time maps it back to the sessionKey the windows were
+                // written under.
+                const endedSessionId = ctx?.sessionId || event?.sessionId;
+                const endedSessionKey = ctx?.sessionKey ||
+                    (typeof endedSessionId === "string" ? autoCaptureSessionIdToKey.get(endedSessionId) : undefined) ||
+                    "";
                 if (endedSessionKey) {
                     // A session_end context cannot name the agent that wrote the
                     // window: the host rebuilds its agentId from the session key
@@ -3180,13 +3189,27 @@ const memoryLanceDBProPlugin = {
                     // targeted delete misses the writer. A terminal boundary
                     // ends the session for every agent riding the key; sweep
                     // every window under it.
-                    const sessionSuffix = REMEMBER_WINDOW_KEY_SEPARATOR + endedSessionKey;
-                    for (const windowKey of [...autoCaptureRecentTurns.keys()]) {
-                        if (windowKey.endsWith(sessionSuffix)) {
-                            autoCaptureRecentTurns.delete(windowKey);
+                    const sweepSessionWindows = () => {
+                        const sessionSuffix = REMEMBER_WINDOW_KEY_SEPARATOR + endedSessionKey;
+                        for (const windowKey of [...autoCaptureRecentTurns.keys()]) {
+                            if (windowKey.endsWith(sessionSuffix)) {
+                                autoCaptureRecentTurns.delete(windowKey);
+                            }
                         }
-                    }
-                    autoCaptureRecentPairTurns.delete(endedSessionKey);
+                        for (const windowKey of [...autoCaptureRecentPairTurns.keys()]) {
+                            if (windowKey.endsWith(sessionSuffix)) {
+                                autoCapturePairWindowEpoch.set(windowKey, (autoCapturePairWindowEpoch.get(windowKey) ?? 0) + 1);
+                                autoCaptureRecentPairTurns.delete(windowKey);
+                            }
+                        }
+                    };
+                    // Synchronous teardown first (a next capture must never see the
+                    // ended session's windows), then a second pass once every
+                    // in-flight run for the key has settled: a straggler that read
+                    // its window before this boundary may only re-store between the
+                    // two passes, and the epoch bump makes its store a no-op anyway.
+                    sweepSessionWindows();
+                    void awaitSessionCaptureRuns(endedSessionKey).then(sweepSessionWindows);
                 }
             }, { priority: 10 });
             const awaitSessionCaptureRuns = (key) => {
@@ -3301,7 +3324,7 @@ const memoryLanceDBProPlugin = {
                                 else if (assistantAsContextOnly) {
                                     contextOnlyAssistantReplies.push({
                                         anchorMessageId: messageLoopTurns.length > 0 ? messageLoopTurns[messageLoopTurns.length - 1].messageId : null,
-                                        turn: { role: "assistant", text: normalized, messageId },
+                                        turn: { role: "assistant", text: normalized, messageId, contextOnly: true },
                                     });
                                 }
                                 else {
@@ -3326,7 +3349,7 @@ const memoryLanceDBProPlugin = {
                                         else if (assistantAsContextOnly) {
                                             contextOnlyAssistantReplies.push({
                                                 anchorMessageId: messageLoopTurns.length > 0 ? messageLoopTurns[messageLoopTurns.length - 1].messageId : null,
-                                                turn: { role: "assistant", text: normalized, messageId },
+                                                turn: { role: "assistant", text: normalized, messageId, contextOnly: true },
                                             });
                                         }
                                         else {
@@ -3489,7 +3512,9 @@ const memoryLanceDBProPlugin = {
                         }
                         if (isTerminalBoundary) {
                             autoCaptureRecentTurns.delete(rememberWindowKey(agentId, sessionKey));
-                            autoCaptureRecentPairTurns.delete(sessionKey);
+                            const terminalPairKey = rememberWindowKey(agentId, sessionKey);
+                            autoCapturePairWindowEpoch.set(terminalPairKey, (autoCapturePairWindowEpoch.get(terminalPairKey) ?? 0) + 1);
+                            autoCaptureRecentPairTurns.delete(terminalPairKey);
                         }
                         else if (newTexts.length > 0) {
                             const newRecentTurns = thisCallTurns.slice(rememberPrependedTurns.length);
@@ -3685,7 +3710,19 @@ const memoryLanceDBProPlugin = {
                                 // call: the extractor's protected-prefix contract counts
                                 // referent turns from position zero.
                                 const contextTurns = config.autoCaptureContextTurns ?? 0;
-                                const priorPairTurns = contextTurns > 0 ? (autoCaptureRecentPairTurns.get(sessionKey) || []) : [];
+                                // The rolling window is keyed by agent AND session (the shared
+                                // literal keys "global"/"unknown" otherwise bleed one agent's
+                                // transcript into another agent's extraction and its scope).
+                                // Unattributable captures get no retention at all.
+                                const pairWindowKey = agentId && agentId !== "unknown" ? rememberWindowKey(agentId, sessionKey) : null;
+                                const pairWindowEpochAtRead = pairWindowKey ? (autoCapturePairWindowEpoch.get(pairWindowKey) ?? 0) : 0;
+                                // Retained turns re-enter later transcripts as CONTEXT ONLY:
+                                // they render as context_only blocks the extraction prompt
+                                // forbids sourcing candidates from, so an old fact cannot be
+                                // re-extracted or crowd the candidate limit.
+                                const priorPairTurns = contextTurns > 0 && pairWindowKey
+                                    ? (autoCaptureRecentPairTurns.get(pairWindowKey) || []).map((turn) => ({ ...turn, contextOnly: true }))
+                                    : [];
                                 // A remember flow bypasses the window prepend for its own
                                 // transcript (the protected-prefix contract counts referent
                                 // turns from position zero), but the ACCUMULATED window must
@@ -3696,23 +3733,30 @@ const memoryLanceDBProPlugin = {
                                 const currentCallWindowTurns = rememberPrependedTurns.length === 0
                                     ? finalConversationTurns
                                     : finalConversationTurns.filter((turn) => !rememberPrependedIds.has(turn.messageId));
-                                if (contextTurns > 0 && rememberPrependedTurns.length === 0) {
+                                if (contextTurns > 0 && pairWindowKey && rememberPrependedTurns.length === 0) {
                                     finalConversationTurns = trimTurnsToUserCap(dedupePairWindow([...priorPairTurns, ...finalConversationTurns], priorPairTurns.length), Math.max(contextTurns, finalConversationTurns.filter((turn) => turn.role === "user").length));
                                 }
-                                if (contextTurns === 0) {
-                                    autoCaptureRecentPairTurns.delete(sessionKey);
+                                if (contextTurns === 0 && pairWindowKey) {
+                                    autoCapturePairWindowEpoch.set(pairWindowKey, pairWindowEpochAtRead + 1);
+                                    autoCaptureRecentPairTurns.delete(pairWindowKey);
                                 }
-                                else if (thisCallTurns.length > 0) {
+                                else if (contextTurns > 0 && pairWindowKey && thisCallTurns.length > 0) {
                                     // Deliberately retained across successful extractions:
                                     // deleting it here would mean steady-state captures (one
                                     // extraction per turn) always see a bare current pair. The
                                     // set-time trim bounds it; the watermark keeps retained
-                                    // turns from re-becoming sources.
+                                    // turns from re-becoming sources. The epoch guard skips the
+                                    // store when a newer capture or a terminal cleanup won the
+                                    // race since this run read its window.
                                     const nextStoredWindow = rememberPrependedTurns.length === 0
                                         ? finalConversationTurns
                                         : trimTurnsToUserCap(dedupePairWindow([...priorPairTurns, ...currentCallWindowTurns], priorPairTurns.length), Math.max(contextTurns, currentCallWindowTurns.filter((turn) => turn.role === "user").length));
-                                    autoCaptureRecentPairTurns.set(sessionKey, nextStoredWindow);
-                                    pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                                    if ((autoCapturePairWindowEpoch.get(pairWindowKey) ?? 0) === pairWindowEpochAtRead) {
+                                        autoCapturePairWindowEpoch.set(pairWindowKey, pairWindowEpochAtRead + 1);
+                                        autoCaptureRecentPairTurns.set(pairWindowKey, nextStoredWindow);
+                                        pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                                        pruneMapIfOver(autoCapturePairWindowEpoch, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                                    }
                                 }
                                 // The referent is the OLDEST turn of the prepended window, which is
                                 // exactly what the extractor's newest-first budget walk sacrifices

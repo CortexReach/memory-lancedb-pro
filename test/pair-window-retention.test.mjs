@@ -365,8 +365,8 @@ describe("pair-window review regressions: assistant context, current repeats, re
     await fireAgentEnd(hook, turnMessages(4), ctx);
     assert.equal(extractionPrompts.length, 1);
     assert.ok(
-      extractionPrompts[0].includes("<assistant_message>") && extractionPrompts[0].includes(A2),
-      "the current call's assistant replies must appear as context with captureAssistant unset",
+      extractionPrompts[0].includes(`<context_only_assistant_turn>\n${A2}`),
+      "the current call's assistant replies must appear as context_only blocks with captureAssistant unset",
     );
 
     await fireAgentEnd(hook, turnMessages(6), ctx);
@@ -378,6 +378,86 @@ describe("pair-window review regressions: assistant context, current repeats, re
     assert.ok(
       extractionPrompts[1].includes(A3),
       "the current call's own reply rides as context too",
+    );
+  });
+
+  it("renders retained turns as context_only blocks the prompt forbids sourcing from, keeping the current turn a normal source", async () => {
+    const hook = registerWith({});
+    const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+
+    await fireAgentEnd(hook, turnMessages(4), ctx);
+    await fireAgentEnd(hook, turnMessages(6), ctx);
+    assert.equal(extractionPrompts.length, 2);
+    const second = extractionPrompts[1];
+    assert.ok(
+      second.includes(`<context_only_user_turn>\n${U2}`) || second.includes(`<context_only_user_turn>\n` ) && second.indexOf(U2) > second.indexOf("<context_only_user_turn>"),
+      "the retained user turn must render inside a context_only_user_turn block, not as a normal source block",
+    );
+    assert.ok(
+      second.includes(`<user_message>\n${U3}`),
+      "the current call's user turn stays a normal <user_message> source block",
+    );
+    assert.ok(
+      second.includes("Context blocks are NEVER memory sources"),
+      "the prompt must carry the context-block non-source rule",
+    );
+  });
+
+  it("isolates rolling windows between agents sharing a literal session key", async () => {
+    const hook = registerWith({ extractMinMessages: 1 });
+    const AGENT_ONE_FACT = "synthetic isolation fact from the first agent about copper pipes";
+    const AGENT_TWO_FACT = "synthetic isolation fact from the second agent about tin roofs";
+
+    await fireAgentEnd(hook, [{ role: "user", content: AGENT_ONE_FACT }], { sessionKey: "global", agentId: "agent-one" });
+    await fireAgentEnd(hook, [{ role: "user", content: AGENT_TWO_FACT }], { sessionKey: "global", agentId: "agent-two" });
+
+    const secondPrompt = extractionPrompts[extractionPrompts.length - 1];
+    assert.ok(secondPrompt.includes(AGENT_TWO_FACT), "the second agent's own turn must extract");
+    assert.ok(
+      !secondPrompt.includes(AGENT_ONE_FACT),
+      "one agent's retained transcript must never enter another agent's extraction (shared literal session key)",
+    );
+  });
+
+  it("disables retention entirely for unattributable captures instead of sharing a fallback key", async () => {
+    const hook = registerWith({ extractMinMessages: 1 });
+    const FIRST_FACT = "synthetic unattributable fact about walnut shelving";
+    const SECOND_FACT = "synthetic unattributable fact about cedar panels";
+
+    await fireAgentEnd(hook, [{ role: "user", content: FIRST_FACT }], { sessionKey: "global", agentId: "unknown" });
+    await fireAgentEnd(
+      hook,
+      [{ role: "user", content: FIRST_FACT }, { role: "user", content: SECOND_FACT }],
+      { sessionKey: "global", agentId: "unknown" },
+    );
+
+    const secondPrompt = extractionPrompts[extractionPrompts.length - 1];
+    assert.ok(secondPrompt.includes(SECOND_FACT));
+    assert.ok(
+      !secondPrompt.includes(`<context_only_user_turn>\n${FIRST_FACT}`),
+      "an unattributable capture must not retain a rolling window at all",
+    );
+  });
+
+  it("keeps the current user turn when a trailing context reply exceeds the transcript budget", async () => {
+    const hook = registerWith({ extractMinMessages: 1, extractMaxChars: 600 });
+    const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+    const CURRENT_FACT = "synthetic budget fact about the juniper cabinet finish";
+    const hugeReply = "acknowledged with an extremely long synthetic elaboration. ".repeat(40);
+
+    await fireAgentEnd(
+      hook,
+      [
+        { role: "user", content: CURRENT_FACT },
+        { role: "assistant", content: hugeReply },
+      ],
+      ctx,
+    );
+
+    const prompt = extractionPrompts[extractionPrompts.length - 1];
+    assert.ok(
+      prompt.includes(CURRENT_FACT),
+      "the current user SOURCE turn must survive the budget even when a context reply alone exceeds it",
     );
   });
 

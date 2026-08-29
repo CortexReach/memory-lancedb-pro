@@ -165,6 +165,23 @@ export interface ConversationTurn {
    * without a source message get fresh ids and therefore never extend a run.
    */
   messageId?: number;
+  /**
+   * Marks a turn as PRIOR CONTEXT rather than an extraction source: retained
+   * rolling-window turns and captureAssistant-off assistant replies. Context
+   * turns render as <context_only_user_turn>/<context_only_assistant_turn>
+   * blocks the extraction prompt forbids grounding candidates in, and the
+   * transcript budget truncates or drops them before any source turn.
+   */
+  contextOnly?: boolean;
+}
+
+function turnTags(turn: Pick<ConversationTurn, "role" | "contextOnly">): { open: string; close: string } {
+  if (turn.contextOnly === true) {
+    const tag = turn.role === "user" ? "context_only_user_turn" : "context_only_assistant_turn";
+    return { open: `<${tag}>`, close: `</${tag}>` };
+  }
+  const tag = turn.role === "user" ? "user_message" : "assistant_message";
+  return { open: `<${tag}>`, close: `</${tag}>` };
 }
 
 let autoCaptureMessageIdCounter = 0;
@@ -321,8 +338,8 @@ export function formatConversationTranscript(
 ): string {
   return turns
     .map((turn) => {
-      const tag = turn.role === "user" ? "user_message" : "assistant_message";
-      return `<${tag}>\n${neutralizeSpeakerTagSpoof(turn.text)}\n</${tag}>`;
+      const { open, close } = turnTags(turn);
+      return `${open}\n${neutralizeSpeakerTagSpoof(turn.text)}\n${close}`;
     })
     .join("\n");
 }
@@ -350,15 +367,93 @@ export function buildBoundedTranscriptWithStats(
   maxChars: number,
   options: { protectedPrefixTurns?: number } = {},
 ): { transcript: string; fullLength: number; protectedPrefixKept: boolean } {
-  const blocks = turns.map((turn) => ({
-    open: turn.role === "user" ? "<user_message>" : "<assistant_message>",
-    close: turn.role === "user" ? "</user_message>" : "</assistant_message>",
-    text: neutralizeSpeakerTagSpoof(turn.text),
-  }));
+  const blocks = turns.map((turn) => {
+    const tags = turnTags(turn);
+    return {
+      open: tags.open,
+      close: tags.close,
+      text: neutralizeSpeakerTagSpoof(turn.text),
+      contextOnly: turn.contextOnly === true,
+    };
+  });
   const rendered = blocks.map((block) => `${block.open}\n${block.text}\n${block.close}`);
   const full = rendered.join("\n");
   if (full.length <= maxChars) {
     return { transcript: full, fullLength: full.length, protectedPrefixKept: true };
+  }
+  // Source turns own the budget: an over-budget transcript first keeps as
+  // many SOURCE turns as fit (newest-first, the pre-context behavior), and
+  // only the leftover goes to context-only blocks. A single oversized
+  // trailing context reply can therefore never evict the current user turn
+  // it was meant to contextualize.
+  if (blocks.some((block) => block.contextOnly)) {
+    const prefixCount = Math.min(
+      Math.max(Math.trunc(options.protectedPrefixTurns ?? 0), 0),
+      blocks.length,
+    );
+    const protectedSourceIndices: number[] = [];
+    const tailSourceIndices: number[] = [];
+    const contextIndices: number[] = [];
+    blocks.forEach((block, i) => {
+      if (block.contextOnly) {
+        contextIndices.push(i);
+      } else if (i < prefixCount) {
+        protectedSourceIndices.push(i);
+      } else {
+        tailSourceIndices.push(i);
+      }
+    });
+    // A protected referent prefix keeps its fair-share guarantee against the
+    // OTHER source turns; context blocks never bid for either share.
+    let keptSources: Map<number, string>;
+    if (protectedSourceIndices.length > 0 && tailSourceIndices.length > 0) {
+      const available = maxChars - 1;
+      const half = Math.floor(available / 2);
+      const prefixLength = protectedSourceIndices.map((i) => rendered[i]).join("\n").length;
+      const tailLength = tailSourceIndices.map((i) => rendered[i]).join("\n").length;
+      let prefixBudget: number;
+      let tailBudget: number;
+      if (prefixLength <= half) {
+        prefixBudget = prefixLength;
+        tailBudget = available - prefixLength;
+      } else if (tailLength <= available - half) {
+        tailBudget = tailLength;
+        prefixBudget = available - tailLength;
+      } else {
+        prefixBudget = half;
+        tailBudget = available - half;
+      }
+      keptSources = new Map([
+        ...keepRenderedTailByIndices(blocks, rendered, protectedSourceIndices, prefixBudget),
+        ...keepRenderedTailByIndices(blocks, rendered, tailSourceIndices, tailBudget),
+      ]);
+    } else {
+      keptSources = keepRenderedTailByIndices(
+        blocks,
+        rendered,
+        [...protectedSourceIndices, ...tailSourceIndices],
+        maxChars,
+      );
+    }
+    let used = 0;
+    for (const renderedBlock of keptSources.values()) {
+      used += renderedBlock.length + (used > 0 ? 1 : 0);
+    }
+    const keptContext = keepRenderedTailByIndices(
+      blocks,
+      rendered,
+      contextIndices,
+      Math.max(0, maxChars - used - (keptSources.size > 0 ? 1 : 0)),
+    );
+    const orderedKept = [...keptSources, ...keptContext]
+      .sort((a, b) => a[0] - b[0])
+      .map(([, renderedBlock]) => renderedBlock);
+    const keptProtected = protectedSourceIndices.some((i) => keptSources.has(i));
+    return {
+      transcript: orderedKept.join("\n"),
+      fullLength: full.length,
+      protectedPrefixKept: protectedSourceIndices.length === 0 ? keptSources.size > 0 || blocks.every((b) => b.contextOnly) : keptProtected,
+    };
   }
   const protectedCount = Math.min(
     Math.max(Math.trunc(options.protectedPrefixTurns ?? 0), 0),
@@ -402,6 +497,39 @@ export function buildBoundedTranscriptWithStats(
     fullLength: full.length,
     protectedPrefixKept: keptPrefix.length > 0,
   };
+}
+
+/**
+ * keepRenderedTail generalized to an arbitrary ascending index subset:
+ * keeps the maximal TAIL of the subset (newest-first walk) within `budget`,
+ * tail-slicing the oldest kept block's text, and returns kept index →
+ * rendered block so the caller can re-interleave subsets in original order.
+ */
+function keepRenderedTailByIndices(
+  blocks: Array<{ open: string; close: string; text: string }>,
+  rendered: string[],
+  indices: number[],
+  budget: number,
+): Map<number, string> {
+  const kept = new Map<number, string>();
+  let total = 0;
+  for (let k = indices.length - 1; k >= 0; k--) {
+    const i = indices[k];
+    const joinCost = kept.size > 0 ? 1 : 0;
+    if (total + rendered[i].length + joinCost <= budget) {
+      kept.set(i, rendered[i]);
+      total += rendered[i].length + joinCost;
+      continue;
+    }
+    const envelope = blocks[i].open.length + blocks[i].close.length + 2 + joinCost;
+    const room = budget - total - envelope;
+    if (room > 0) {
+      const tail = blocks[i].text.slice(blocks[i].text.length - room);
+      kept.set(i, `${blocks[i].open}\n${tail}\n${blocks[i].close}`);
+    }
+    break;
+  }
+  return kept;
 }
 
 /**
