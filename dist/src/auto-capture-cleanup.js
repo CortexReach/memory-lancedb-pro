@@ -312,11 +312,15 @@ export function buildBoundedTranscriptWithStats(turns, maxChars, options = {}) {
         const protectedSourceIndices = [];
         const tailSourceIndices = [];
         const contextIndices = [];
+        // The protected prefix counts SOURCE turns: woven context blocks are
+        // transparent to it, so a null-anchored context reply sitting at index 0
+        // can never absorb (and thereby void) the referent's protected slot.
+        let sourceSeen = 0;
         blocks.forEach((block, i) => {
             if (block.contextOnly) {
                 contextIndices.push(i);
             }
-            else if (i < prefixCount) {
+            else if (sourceSeen++ < prefixCount) {
                 protectedSourceIndices.push(i);
             }
             else {
@@ -551,12 +555,16 @@ export function dedupePairWindow(turns, priorBoundary = turns.length) {
             kept.push(group);
         }
         else if (!currPaired && prevPaired) {
-            // A reply-less repeat is only replay noise when both copies come from
-            // the same origin. A CURRENT-call user turn repeating a PRIOR-window
-            // pair is a human intentionally saying the same thing again: keep the
-            // current occurrence alongside the prior exchange instead of silently
-            // deleting the newest input from its own extraction.
-            if (!group.fromPriorWindow && prev.fromPriorWindow) {
+            // A reply-less repeat is only replay noise when it is itself a PRIOR-
+            // window copy (the double-preserve class this repair exists for). A
+            // CURRENT-call repeat is a human intentionally saying the same thing
+            // again -- whether the earlier pair sits in the prior window or in this
+            // same call -- and the watermark advances through its text either way,
+            // so dropping it would silently delete the newest input from its own
+            // extraction. The messageId guard still collapses a literal echo of
+            // the SAME turn replayed twice into one slice.
+            if (!group.fromPriorWindow &&
+                (prev.fromPriorWindow || group.turns[0].messageId !== prev.turns[0].messageId)) {
                 kept.push(group);
             }
             continue;
@@ -608,6 +616,25 @@ export function weaveContextOnlyAssistantTurns(turns, contextReplies) {
         insertAfterByAnchor.set(anchorMessageId, insertAt + 1);
     }
     return result;
+}
+/**
+ * Counts the protected referent prefix over SOURCE turns only. The referent
+ * run a remember flow prepends must keep its budget guarantee even when
+ * `weaveContextOnlyAssistantTurns` placed a context-only block ahead of or
+ * between referent turns -- context blocks are transparent here, mirroring
+ * how `buildBoundedTranscriptWithStats` spends the protected count on source
+ * blocks alone. The scan still stops at the first non-referent SOURCE turn.
+ */
+export function countProtectedReferentPrefix(turns, referentTurns) {
+    let count = 0;
+    for (const turn of turns) {
+        if (turn.contextOnly === true)
+            continue;
+        if (!referentTurns.has(turn))
+            break;
+        count++;
+    }
+    return count;
 }
 /**
  * Assembles the ordered turn sequence for the extraction prompt's transcript
