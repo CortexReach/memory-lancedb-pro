@@ -1487,8 +1487,16 @@ export function registerMemoryForgetTool(api, context) {
                                 details: resolved.details ?? { error: "not_found", id: memoryId },
                             };
                         }
+                        const forgottenRow = context.manualEchoLedger
+                            ? await context.store.getById(resolved.id, scopeFilter).catch(() => null)
+                            : null;
                         const deleted = await context.store.delete(resolved.id, scopeFilter);
                         if (deleted) {
+                            // A forgotten fact must not keep suppressing its own
+                            // re-statement through the echo ledger.
+                            if (forgottenRow?.text) {
+                                context.manualEchoLedger?.invalidate(agentId, forgottenRow.text);
+                            }
                             context.onMemoriesDeleted?.({ scopeFilter });
                             return {
                                 content: [
@@ -1526,6 +1534,7 @@ export function registerMemoryForgetTool(api, context) {
                         if (results.length === 1 && results[0].score > 0.9) {
                             const deleted = await context.store.delete(results[0].entry.id, scopeFilter);
                             if (deleted) {
+                                context.manualEchoLedger?.invalidate(agentId, results[0].entry.text);
                                 context.onMemoriesDeleted?.({ scopeFilter });
                                 return {
                                     content: [
@@ -1711,6 +1720,11 @@ export function registerMemoryUpdateTool(api, context) {
                                 // New record is already the source of truth; log but don't fail
                                 console.warn(`memory-pro: failed to patch superseded record ${resolvedId.slice(0, 8)}: ${patchErr}`);
                             }
+                            // The superseding write succeeded: this text will echo through
+                            // the same turn's auto-capture extraction exactly like a plain
+                            // manual store, so it must be recorded on this early-return
+                            // path too.
+                            context.manualEchoLedger?.record(agentId, text);
                             return {
                                 content: [
                                     {

@@ -735,10 +735,17 @@ export class SmartExtractor {
     // memory_store/memory_update text are echoes of a row that already
     // exists verbatim -- drop them before any judge/dedup/merge spend.
     const echoLedger = this.config.manualEchoLedger;
+    let echoDropped = 0;
     if (echoLedger && candidates.length > 0) {
       const kept: CandidateMemory[] = [];
       for (const candidate of candidates) {
         if (echoLedger.match(agentId, candidate.content)) {
+          // An echo drop is a SETTLED outcome (the fact already exists as
+          // the manual row), so it counts as skipped: an echo-only batch
+          // must consume its input instead of deferring for a retry that
+          // would re-run the same extraction.
+          echoDropped += 1;
+          stats.skipped += 1;
           this.log(
             `memory-pro: smart-extractor: manual-echo guard dropped candidate (near-identical to a recent manual store) category=${candidate.category} abstract=${JSON.stringify(candidate.abstract.slice(0, 120))}`,
           );
@@ -751,6 +758,9 @@ export class SmartExtractor {
 
     if (candidates.length === 0) {
       this.log("memory-pro: smart-extractor: no memories extracted");
+      if (echoDropped > 0) {
+        stats.settledOutcomes = true;
+      }
       if (extraction.status === "empty_input") {
         // No LLM call was made, so the caller's rate limiter must not be charged.
         stats.skippedNoInput = true;

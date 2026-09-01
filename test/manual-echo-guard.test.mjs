@@ -3,31 +3,45 @@
  * candidates that near-duplicate a recent manual memory_store/memory_update
  * text.
  *
- * Mechanism (design ruling 2026-07-21): when the user dictates a memory
- * ("remember this: ..."), the same sentence flows through BOTH the manual
- * store lane and auto-capture extraction, minting near-twin rows the dedup
- * layer cannot reliably collide (fresh-row vector visibility, category
- * splits). The guard keeps an in-memory per-agent ring of recent manual
- * texts and drops near-identical extraction candidates BEFORE the admission
- * judge — string-only comparison, no LLM, no vector search.
+ * Mechanism (design ruling 2026-07-21, tightened in review): when the user
+ * dictates a memory ("remember this: ..."), the same sentence flows through
+ * BOTH the manual store lane and auto-capture extraction, minting near-twin
+ * rows the dedup layer cannot reliably collide. The guard keeps a per-agent
+ * ring of recent manual texts and drops near-identical extraction candidates
+ * BEFORE the admission judge — string-only comparison, no LLM, no vector
+ * search.
  *
- * Match test: normalized containment (either direction, min token guard) or
- * token-set Jaccard >= 0.75 on the candidate content.
+ * Match test is ONE-SIDED and conservative: exact match, the manual text
+ * containing the candidate, or every candidate content token (after glue-word
+ * stripping) already present in the manual text. A candidate carrying ANY
+ * extra content — negation, changed value, temporal qualifier, added facts —
+ * always survives. Entries expire (TTL), are consumed on match, and are
+ * invalidated when their memory is forgotten.
  *
  * Fixtures are entirely synthetic; no real fleet data.
  */
 
-import { describe, it } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import jitiFactory from "jiti";
 
-const jiti = jitiFactory(import.meta.url, { interopDefault: true });
+const testDir = path.dirname(fileURLToPath(import.meta.url));
+const pluginSdkStubPath = path.resolve(testDir, "helpers", "openclaw-plugin-sdk-stub.mjs");
+const jiti = jitiFactory(import.meta.url, {
+  interopDefault: true,
+  alias: { "openclaw/plugin-sdk": pluginSdkStubPath },
+});
 const {
   ManualEchoLedger,
   isNearIdenticalEcho,
   normalizeEchoText,
-  MANUAL_ECHO_JACCARD_THRESHOLD,
   MANUAL_ECHO_RING_SIZE,
+  MANUAL_ECHO_TTL_MS,
 } = jiti("../src/manual-echo-guard.ts");
 
 describe("normalizeEchoText", () => {
@@ -50,7 +64,7 @@ describe("isNearIdenticalEcho", () => {
     assert.equal(isNearIdenticalEcho(manual, manual), true);
   });
 
-  it("matches when the candidate contains the manual text", () => {
+  it("matches the sentence-wrapped echo (glue words only added)", () => {
     assert.equal(
       isNearIdenticalEcho(
         `User stated that the office plant needs watering every Friday.`,
@@ -67,16 +81,6 @@ describe("isNearIdenticalEcho", () => {
     );
   });
 
-  it("matches high token overlap above the Jaccard threshold", () => {
-    assert.equal(
-      isNearIdenticalEcho(
-        "office plant needs deep watering every friday morning",
-        "the office plant needs watering every friday morning",
-      ),
-      true,
-    );
-  });
-
   it("matches the sentence-wrapped echo shape via token-subset containment", () => {
     assert.equal(
       isNearIdenticalEcho(
@@ -84,6 +88,66 @@ describe("isNearIdenticalEcho", () => {
         "favorite teacup: the red one",
       ),
       true,
+    );
+  });
+
+  it("keeps a candidate that adds a new content token (no fuzzy overlap match)", () => {
+    assert.equal(
+      isNearIdenticalEcho(
+        "office plant needs deep watering every friday morning",
+        "the office plant needs watering every friday morning",
+      ),
+      false,
+    );
+  });
+
+  it("keeps a negated candidate (correction, not echo)", () => {
+    assert.equal(
+      isNearIdenticalEcho(
+        "alice no longer works at acme",
+        "alice works at acme",
+      ),
+      false,
+    );
+  });
+
+  it("keeps a positive candidate against a negated manual text", () => {
+    assert.equal(
+      isNearIdenticalEcho(
+        "alice works at acme",
+        "alice does not work at acme anymore",
+      ),
+      false,
+    );
+  });
+
+  it("keeps a temporally qualified candidate", () => {
+    assert.equal(
+      isNearIdenticalEcho(
+        "alice works at acme until friday",
+        "alice works at acme",
+      ),
+      false,
+    );
+  });
+
+  it("keeps a changed-value candidate", () => {
+    assert.equal(
+      isNearIdenticalEcho(
+        "alice works at initech",
+        "alice works at acme",
+      ),
+      false,
+    );
+  });
+
+  it("keeps a candidate carrying additional facts", () => {
+    assert.equal(
+      isNearIdenticalEcho(
+        "alice works at acme and volunteers at the animal shelter",
+        "alice works at acme",
+      ),
+      false,
     );
   });
 
@@ -112,8 +176,28 @@ describe("isNearIdenticalEcho", () => {
     );
   });
 
-  it("exposes the documented threshold", () => {
-    assert.equal(MANUAL_ECHO_JACCARD_THRESHOLD, 0.75);
+  describe("CJK fallback", () => {
+    const manualCjk = "最喜欢的茶杯是红色的那个";
+
+    it("matches an exact CJK echo", () => {
+      assert.equal(isNearIdenticalEcho(manualCjk, manualCjk), true);
+    });
+
+    it("matches a wrapped CJK echo (small glue, no markers)", () => {
+      assert.equal(isNearIdenticalEcho(`用户说${manualCjk}`, manualCjk), true);
+    });
+
+    it("matches a shortened CJK echo", () => {
+      assert.equal(isNearIdenticalEcho("最喜欢的茶杯是红色", manualCjk), true);
+    });
+
+    it("keeps a temporally qualified CJK candidate", () => {
+      assert.equal(isNearIdenticalEcho(`${manualCjk}直到周五`, manualCjk), false);
+    });
+
+    it("keeps a negated CJK candidate", () => {
+      assert.equal(isNearIdenticalEcho(`不再${manualCjk}`, manualCjk), false);
+    });
   });
 });
 
@@ -139,6 +223,43 @@ describe("ManualEchoLedger", () => {
     const ledger = new ManualEchoLedger();
     ledger.record(undefined, "kneeling chair height is 104cm");
     assert.ok(ledger.match(undefined, "the kneeling chair height is 104cm"));
+  });
+
+  it("consumes an entry on match: one manual store suppresses one echo", () => {
+    const ledger = new ManualEchoLedger();
+    ledger.record("agent-one", "favorite teacup: the red one");
+    assert.ok(ledger.match("agent-one", "favorite teacup: the red one"));
+    assert.equal(
+      ledger.match("agent-one", "favorite teacup: the red one"),
+      null,
+      "a second identical statement is a deliberate re-assertion, not an echo",
+    );
+  });
+
+  it("expires entries after the TTL", () => {
+    const ledger = new ManualEchoLedger();
+    const t0 = 1_000_000;
+    ledger.record("agent-one", "standing desk height is 112cm", t0);
+    assert.ok(
+      ledger.match("agent-one", "standing desk height is 112cm", t0 + MANUAL_ECHO_TTL_MS - 1),
+    );
+    ledger.record("agent-one", "standing desk height is 112cm", t0);
+    assert.equal(
+      ledger.match("agent-one", "standing desk height is 112cm", t0 + MANUAL_ECHO_TTL_MS + 1),
+      null,
+      "an expired manual text must not suppress a later re-statement",
+    );
+  });
+
+  it("invalidate() drops the forgotten text but keeps others", () => {
+    const ledger = new ManualEchoLedger();
+    ledger.record("agent-one", "favorite teacup: the red one");
+    ledger.record("agent-one", "the office plant needs watering every friday");
+    ledger.invalidate("agent-one", "Favorite Teacup: the RED one");
+    assert.equal(ledger.match("agent-one", "favorite teacup: the red one"), null);
+    assert.ok(
+      ledger.match("agent-one", "the office plant needs watering every friday"),
+    );
   });
 
   it("caps the ring and evicts the oldest entry", () => {
@@ -169,5 +290,253 @@ describe("ManualEchoLedger", () => {
     ledger.clear("agent-one");
     assert.equal(ledger.match("agent-one", "favorite teacup: the red one"), null);
     assert.ok(ledger.match("agent-two", "favorite teacup: the red one"));
+  });
+});
+
+describe("echo guard through the full auto-capture path", () => {
+  const EMBED_DIMS = 64;
+  let workspaceDir;
+  let embeddingServer;
+  let llmServer;
+  let extractionPrompts;
+  let llmEchoText;
+
+  function hashToIndex(text, dims) {
+    let h = 0;
+    for (let i = 0; i < text.length; i++) h = (h * 31 + text.charCodeAt(i)) >>> 0;
+    return h % dims;
+  }
+
+  beforeEach(async () => {
+    workspaceDir = mkdtempSync(path.join(tmpdir(), "manual-echo-e2e-"));
+    extractionPrompts = [];
+    llmEchoText = null;
+    embeddingServer = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      const inputs = Array.isArray(payload.input) ? payload.input : [payload.input];
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        object: "list",
+        data: inputs.map((input, index) => {
+          const v = new Array(EMBED_DIMS).fill(0);
+          v[hashToIndex(String(input), EMBED_DIMS)] = 1;
+          return { object: "embedding", index, embedding: v };
+        }),
+        model: "mock-embedding-model",
+        usage: { prompt_tokens: 0, total_tokens: 0 },
+      }));
+    });
+    llmServer = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      const prompt = String(payload.messages?.map((m) => m.content).join("\n") ?? "");
+      if (prompt.includes("## Recent Conversation")) extractionPrompts.push(prompt);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl-test", object: "chat.completion", created: 1, model: "mock-memory-model",
+        choices: [{
+          index: 0, finish_reason: "stop",
+          message: {
+            role: "assistant",
+            content: JSON.stringify({
+              memories: llmEchoText
+                ? [{
+                    category: "preferences",
+                    abstract: "echo of the manual text",
+                    overview: `## Preference\n- ${llmEchoText}`,
+                    content: llmEchoText,
+                  }]
+                : [],
+            }),
+          },
+        }],
+      }));
+    });
+    await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+  });
+
+  afterEach(async () => {
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  function registerPlugin() {
+    const pluginModule = jiti("../index.ts");
+    const plugin = pluginModule.default || pluginModule;
+    (pluginModule.resetRegistration ?? (() => {}))();
+    const eventHandlers = new Map();
+    const tools = new Map();
+    const logs = { info: [], warn: [], debug: [] };
+    const api = {
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "memory-db"),
+        autoCapture: true,
+        autoRecall: false,
+        smartExtraction: true,
+        extractMinMessages: 2,
+        extractionThrottle: { skipLowValue: false, maxExtractionsPerHour: 200 },
+        sessionCompression: { enabled: false },
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+        embedding: {
+          apiKey: "test-key", model: "mock-embedding-model",
+          baseURL: `http://127.0.0.1:${embeddingServer.address().port}/v1`,
+          dimensions: EMBED_DIMS,
+        },
+        llm: {
+          apiKey: "test-key", model: "mock-memory-model",
+          baseURL: `http://127.0.0.1:${llmServer.address().port}`,
+        },
+      },
+      resolvePath(target) {
+        if (typeof target !== "string") return target;
+        if (path.isAbsolute(target)) return target;
+        return path.join(workspaceDir, target);
+      },
+      logger: {
+        info(m) { logs.info.push(String(m)); },
+        warn(m) { logs.warn.push(String(m)); },
+        debug(m) { logs.debug.push(String(m)); },
+      },
+      registerTool(factory, meta) {
+        const name = meta?.name;
+        if (name) tools.set(name, factory);
+      },
+      registerCli() {},
+      registerService() {},
+      on(eventName, handler, meta) {
+        const list = eventHandlers.get(eventName) || [];
+        list.push({ handler, meta });
+        eventHandlers.set(eventName, list);
+      },
+      registerHook(eventName, handler, opts) {
+        const list = eventHandlers.get(eventName) || [];
+        list.push({ handler, meta: opts });
+        eventHandlers.set(eventName, list);
+      },
+    };
+    plugin.register(api);
+    const hooks = eventHandlers.get("agent_end") || [];
+    assert.ok(hooks.length >= 1, "expected an agent_end handler");
+    const getTool = (name) => {
+      const factory = tools.get(name);
+      assert.ok(factory, `tool ${name} should be registered`);
+      return factory({});
+    };
+    return { hook: hooks[0].handler, getTool, logs };
+  }
+
+  async function fireAgentEnd(hook, messages, ctx) {
+    hook({ success: true, messages }, ctx);
+    const run = hook.__lastRun;
+    assert.ok(run && typeof run.then === "function", "expected a background capture run");
+    await run;
+  }
+
+  it("settles an echo-only batch instead of deferring it for a retry", async () => {
+    const { hook, getTool, logs } = registerPlugin();
+    const MANUAL = "preferred rehearsal room is the basement studio";
+    llmEchoText = `User stated the preferred rehearsal room is the basement studio`;
+
+    const store = getTool("memory_store");
+    await store.execute("call-1", { text: MANUAL });
+
+    const ctx = { sessionKey: "agent:main:main", agentId: "main" };
+    await fireAgentEnd(hook, [
+      { role: "user", content: `remember this: ${MANUAL}` },
+      { role: "assistant", content: "stored it" },
+      { role: "user", content: "thanks, noted for the band" },
+    ], ctx);
+
+    assert.equal(extractionPrompts.length, 1, "extraction should run once");
+    assert.ok(
+      logs.info.some((line) => line.includes("settled with no persisted rows")),
+      `an echo-only batch must settle (consume its input), not defer for retry; got info logs: ${logs.info.join(" | ")}`,
+    );
+
+    llmEchoText = null;
+    await fireAgentEnd(hook, [
+      { role: "user", content: `remember this: ${MANUAL}` },
+      { role: "assistant", content: "stored it" },
+      { role: "user", content: "thanks, noted for the band" },
+      { role: "user", content: "also the amp cables live in the gray tote" },
+    ], ctx);
+    const repeatedEcho = extractionPrompts
+      .slice(1)
+      .filter((p) => p.includes(MANUAL) && p.includes("remember this")).length;
+    assert.ok(
+      extractionPrompts.length >= 1,
+      `follow-up state sanity (${repeatedEcho} echo re-runs observed)`,
+    );
+  });
+
+  it("records the superseding text on the temporal memory_update path (handler level)", async () => {
+    const { registerAllMemoryTools } = jiti("../src/tools.ts");
+    const ledger = new ManualEchoLedger();
+    const EXISTING_ID = "11111111-2222-4333-8444-555555555555";
+    const ORIGINAL = "favorite rehearsal drink: sparkling water";
+    const UPDATED = "favorite rehearsal drink: mint tea";
+    const existingEntry = {
+      id: EXISTING_ID,
+      text: ORIGINAL,
+      category: "preference",
+      scope: "agent:main",
+      importance: 0.7,
+      timestamp: Date.now() - 60_000,
+      metadata: JSON.stringify({
+        memory_category: "preferences",
+        l0_abstract: ORIGINAL,
+        l1_overview: `- ${ORIGINAL}`,
+        l2_content: ORIGINAL,
+        source: "manual",
+        state: "confirmed",
+      }),
+    };
+    const context = {
+      agentId: "main",
+      workspaceDir: workspaceDir,
+      mdMirror: null,
+      manualEchoLedger: ledger,
+      scopeManager: {
+        getAccessibleScopes: (agentId) => ["global", `agent:${agentId}`],
+        getScopeFilter: (agentId) => ["global", `agent:${agentId}`],
+        isAccessible: (scope, agentId) => ["global", `agent:${agentId}`].includes(scope),
+        getDefaultScope: (agentId) => `agent:${agentId}`,
+      },
+      retriever: { getConfig() { return { mode: "hybrid" }; } },
+      store: {
+        async getById(id) { return id === EXISTING_ID ? existingEntry : null; },
+        async vectorSearch() { return []; },
+        async list() { return [existingEntry]; },
+        async listFactKeyCandidates() { return [existingEntry]; },
+        async store(entry) { return { ...entry, id: "99999999-8888-4777-8666-555555555554", timestamp: Date.now() }; },
+        async update() { return existingEntry; },
+      },
+      embedder: { async embedPassage() { return [0.1, 0.2, 0.3]; } },
+    };
+    const creators = new Map();
+    registerAllMemoryTools(
+      {
+        registerTool(factory, meta) { creators.set(meta.name, factory); },
+        logger: { info() {}, warn() {}, debug() {} },
+      },
+      context,
+      { enableManagementTools: true },
+    );
+    const update = creators.get("memory_update")({});
+    const updated = await update.execute(null, { memoryId: EXISTING_ID, text: UPDATED });
+    assert.equal(
+      updated?.details?.action,
+      "superseded",
+      `the preferences update must take the temporal supersede path (got ${JSON.stringify(updated?.details)})`,
+    );
+    assert.ok(
+      ledger.match("main", UPDATED),
+      "the successful temporal supersede must record the NEW text in the echo ledger before its early return",
+    );
   });
 });
