@@ -84,14 +84,18 @@ function tokenList(normalized: string): string[] {
   return normalized.split(" ").filter((t) => t.length > 0);
 }
 
-function contentTokens(normalized: string): Set<string> {
-  const out = new Set<string>();
+function orderedContentTokens(normalized: string): string[] {
+  const out: string[] = [];
   for (const token of tokenList(normalized)) {
     if (token.length <= 1 && !CJK_RE.test(token)) continue;
     if (ECHO_STOPWORDS.has(token)) continue;
-    out.add(token);
+    out.push(token);
   }
   return out;
+}
+
+function contentTokens(normalized: string): Set<string> {
+  return new Set(orderedContentTokens(normalized));
 }
 
 function markerAsymmetry(aTokens: string[], bTokens: string[]): boolean {
@@ -107,21 +111,49 @@ function containsCjkMarker(fragment: string): boolean {
   return CJK_MARKER_FRAGMENTS.some((marker) => fragment.includes(marker));
 }
 
+/**
+ * The ONLY residual a wrapped CJK echo may carry: reporting glue and
+ * particles. Anything else in the residual — a marker, a verb, a new fact
+ * like 并养猫 — is substantive content, and "short and marker-free" was
+ * provably not enough to exclude it.
+ */
+const CJK_WRAPPER_GLUE_FRAGMENTS = [
+  "用户说", "用户", "说过", "说", "提到", "表示", "了", "的", "是",
+  "ユーザーは", "ユーザー", "と言った", "と言いました", "です", "ます",
+  "사용자는", "사용자", "라고", "입니다",
+];
+
+function isCjkGlueOnly(residual: string): boolean {
+  let rest = residual;
+  for (let pass = 0; pass < 8 && rest.length > 0; pass++) {
+    const before = rest;
+    for (const glue of CJK_WRAPPER_GLUE_FRAGMENTS) {
+      while (rest.includes(glue)) rest = rest.replace(glue, "");
+    }
+    if (rest === before) break;
+  }
+  return rest.length === 0;
+}
+
 function isCjkEcho(candidate: string, manual: string): boolean {
   const cand = candidate.replace(/\s+/g, "");
   const man = manual.replace(/\s+/g, "");
   if (cand.length === 0 || man.length === 0) return false;
   if (cand === man) return true;
-  // Shortened echo: the candidate re-states a piece of the manual text and
-  // adds nothing. Length-gated so tiny fragments cannot over-match.
-  if (cand.length >= MIN_CJK_CONTAINMENT_CHARS && man.includes(cand)) return true;
-  // Wrapped echo: the candidate is the manual text plus a small amount of
-  // glue ("用户说…"). Allowed only when the residual is short AND carries no
-  // negation/temporal marker, so a qualified or corrected statement
-  // ("…直到周五", "不再…") is never treated as an echo.
+  // Shortened echo: the candidate re-states a piece of the manual text. The
+  // REMOVED part must carry no marker: stripping 用户不 off 用户不喜欢喝茶和咖啡
+  // yields the OPPOSITE claim, not an echo of it.
+  if (cand.length >= MIN_CJK_CONTAINMENT_CHARS && man.includes(cand)) {
+    const removed = man.replace(cand, "");
+    return !containsCjkMarker(removed);
+  }
+  // Wrapped echo: the candidate is the manual text plus reporting glue
+  // (用户说…). The residual must consist ONLY of known glue fragments —
+  // being short and marker-free is not enough, since a three-character
+  // residual can be a brand-new fact (并养猫).
   if (man.length >= MIN_CJK_CONTAINMENT_CHARS && cand.includes(man)) {
     const residual = cand.replace(man, "");
-    return residual.length <= MAX_CJK_WRAPPER_RESIDUAL_CHARS && !containsCjkMarker(residual);
+    return residual.length <= MAX_CJK_WRAPPER_RESIDUAL_CHARS && isCjkGlueOnly(residual);
   }
   return false;
 }
@@ -152,14 +184,27 @@ export function isNearIdenticalEcho(candidateText: string, manualText: string): 
 
   // Wrap echo: the extractor sentence-wraps the dictated fact ("favorite
   // teacup: the red one" -> "User stated their favorite teacup is the red
-  // one"). After glue-word stripping, EVERY candidate content token must
-  // already be in the manual text — one-sided by design, so a candidate
+  // one"). After glue-word stripping, the candidate's content tokens must
+  // appear in the manual text IN THE SAME RELATIVE ORDER (an ordered
+  // subsequence, not a bag-of-words subset): set membership alone would
+  // collapse "alice reports to bob" onto "bob reports to alice" and discard
+  // the reversed relationship. One-sided by design either way — a candidate
   // with any extra content token (changed value, qualifier, added fact) is
   // new information and survives.
-  const candidateContent = contentTokens(candidate);
-  if (candidateContent.size === 0) return false;
-  for (const token of candidateContent) {
-    if (!manualContent.has(token)) return false;
+  const candidateContentList = orderedContentTokens(candidate);
+  if (candidateContentList.length === 0) return false;
+  const manualContentList = orderedContentTokens(manual);
+  let cursor = 0;
+  for (const token of candidateContentList) {
+    let found = -1;
+    for (let i = cursor; i < manualContentList.length; i++) {
+      if (manualContentList[i] === token) {
+        found = i;
+        break;
+      }
+    }
+    if (found < 0) return false;
+    cursor = found + 1;
   }
   return true;
 }
@@ -197,20 +242,25 @@ export class ManualEchoLedger {
     const key = agentId?.trim() || DEFAULT_AGENT_BUCKET;
     const ring = this.byAgent.get(key);
     if (!ring || ring.length === 0) return null;
+    // `live` is a fresh array, so every outcome below must PERSIST it: an
+    // in-place splice of an unpersisted copy would leave the Map holding the
+    // matched entry and let one manual store suppress repeated re-statements
+    // for its whole TTL (review round 2, finding 1).
     const live = ring.filter((e) => now - e.at < MANUAL_ECHO_TTL_MS);
-    if (live.length !== ring.length) {
-      if (live.length === 0) {
-        this.byAgent.delete(key);
-        return null;
-      }
-      this.byAgent.set(key, live);
+    if (live.length === 0) {
+      this.byAgent.delete(key);
+      return null;
     }
     for (let i = live.length - 1; i >= 0; i--) {
       if (isNearIdenticalEcho(candidateText, live[i].text)) {
         const [hit] = live.splice(i, 1);
         if (live.length === 0) this.byAgent.delete(key);
+        else this.byAgent.set(key, live);
         return hit.text;
       }
+    }
+    if (live.length !== ring.length) {
+      this.byAgent.set(key, live);
     }
     return null;
   }
@@ -235,5 +285,30 @@ export class ManualEchoLedger {
 
   clear(agentId: string | undefined): void {
     this.byAgent.delete(agentId?.trim() || DEFAULT_AGENT_BUCKET);
+  }
+
+  /**
+   * Deletion-lane invalidation when the deleter cannot name the writing
+   * agent (CLI delete by id): the fact is gone from the store, so no bucket
+   * may keep suppressing its re-statement.
+   */
+  invalidateEverywhere(text: string): void {
+    if (typeof text !== "string" || text.trim().length === 0) return;
+    const target = normalizeEchoText(text);
+    for (const [key, ring] of [...this.byAgent.entries()]) {
+      const kept = ring.filter((e) => normalizeEchoText(e.text) !== target);
+      if (kept.length === 0) this.byAgent.delete(key);
+      else if (kept.length !== ring.length) this.byAgent.set(key, kept);
+    }
+  }
+
+  /**
+   * Wholesale reset for bulk deletion lanes, where pre-fetching every
+   * deleted row's text would defeat the point of a bulk delete. Clearing is
+   * fail-open: the worst case is one uncaught echo (a duplicate row for
+   * dedup), never a lost memory.
+   */
+  clearAll(): void {
+    this.byAgent.clear();
   }
 }

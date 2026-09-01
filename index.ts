@@ -3502,7 +3502,10 @@ const memoryLanceDBProPlugin = {
         workspaceBoundary: config.workspaceBoundary,
         selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
         manualStoreSupersede: config.manualStoreSupersede === true,
-        manualEchoLedger,
+        // The echo ledger only ever matters when smart extraction can echo a
+        // manual store back; leaving it out otherwise also spares
+        // memory_forget its pre-delete getById fetch.
+        manualEchoLedger: smartExtractor ? manualEchoLedger : undefined,
         // Mirrors the CLI context wiring below: keep in-process reflection caches
         // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
         onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
@@ -3556,6 +3559,7 @@ const memoryLanceDBProPlugin = {
         store,
         retriever,
         scopeManager,
+        manualEchoLedger: smartExtractor ? manualEchoLedger : undefined,
         onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
         migrator,
         embedder,

@@ -44,6 +44,10 @@ interface CLIContext {
   // memories, so the host plugin can invalidate any in-process read caches (e.g.
   // reflection slice caches) keyed on the affected scope(s) before they go stale.
   onMemoriesDeleted?: (info: { scopeFilter?: string[] }) => void;
+  // Manual-store echo ledger (present only while smart extraction is enabled):
+  // the deletion lanes must drop a deleted row's suppression state, so a
+  // forgotten fact can never keep suppressing its own re-statement.
+  manualEchoLedger?: import("./src/manual-echo-guard.js").ManualEchoLedger;
   oauthTestHooks?: {
     openUrl?: (url: string) => void | Promise<void>;
     authorizeUrl?: (url: string) => void | Promise<void>;
@@ -1477,9 +1481,19 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           scopeFilter = [options.scope];
         }
 
+        // Fetched before the delete (afterwards the row is gone), only when a
+        // ledger is wired: the deleted text's echo suppression must not
+        // outlive the row (targeted invalidation across every agent bucket,
+        // since the CLI cannot name the writing agent).
+        const deletedRow = context.manualEchoLedger
+          ? await context.store.getById(id, scopeFilter).catch(() => null)
+          : null;
         const deleted = await context.store.delete(id, scopeFilter);
 
         if (deleted) {
+          if (deletedRow?.text) {
+            context.manualEchoLedger?.invalidateEverywhere(deletedRow.text);
+          }
           context.onMemoriesDeleted?.({ scopeFilter });
           console.log(`Memory ${id} deleted successfully.`);
           printReadConsistencyHint(context.store);
@@ -1527,6 +1541,10 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         } else {
           const deletedCount = await context.store.bulkDelete(options.scope, beforeTimestamp);
           if (deletedCount > 0) {
+            // Pre-fetching every deleted row's text would defeat the point of
+            // a bulk delete; clearing the whole ledger is fail-open (worst
+            // case: one uncaught echo lands as a duplicate for dedup).
+            context.manualEchoLedger?.clearAll();
             context.onMemoriesDeleted?.({ scopeFilter: options.scope });
           }
           console.log(`Deleted ${deletedCount} memories.`);

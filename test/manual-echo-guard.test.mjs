@@ -198,6 +198,22 @@ describe("isNearIdenticalEcho", () => {
     it("keeps a negated CJK candidate", () => {
       assert.equal(isNearIdenticalEcho(`不再${manualCjk}`, manualCjk), false);
     });
+
+    it("keeps a shortened CJK candidate whose removed residual carried the negation", () => {
+      assert.equal(
+        isNearIdenticalEcho("喜欢喝茶和咖啡", "用户不喜欢喝茶和咖啡"),
+        false,
+        "stripping the negated wrapper off the manual text yields the OPPOSITE claim, never an echo",
+      );
+    });
+
+    it("keeps a wrapped CJK candidate whose residual is a new fact, not glue", () => {
+      assert.equal(
+        isNearIdenticalEcho("我住在北京市海淀区并养猫", "我住在北京市海淀区"),
+        false,
+        "a short marker-free residual can still be a brand-new fact; only known glue may wrap an echo",
+      );
+    });
   });
 });
 
@@ -281,6 +297,55 @@ describe("ManualEchoLedger", () => {
     const ledger = new ManualEchoLedger();
     ledger.record("agent-one", "   ");
     assert.equal(ledger.match("agent-one", "   "), null);
+  });
+
+  it("keeps a reversed relationship (order-preserving containment)", () => {
+    assert.equal(
+      isNearIdenticalEcho("Alice reports to Bob", "Bob reports to Alice"),
+      false,
+      "bag-of-words containment would collapse the reversed relationship",
+    );
+    assert.equal(
+      isNearIdenticalEcho("User stated that Alice reports to Bob", "Alice reports to Bob"),
+      true,
+      "the same-order wrap echo must still collapse",
+    );
+  });
+
+  it("consume persists with MULTIPLE live entries: one hit removes exactly the matched entry", () => {
+    const ledger = new ManualEchoLedger();
+    ledger.record("agent-one", "the office plant needs watering every friday");
+    ledger.record("agent-one", "favorite teacup: the red one");
+    assert.ok(ledger.match("agent-one", "favorite teacup: the red one"), "first hit consumes the teacup entry");
+    assert.equal(
+      ledger.match("agent-one", "favorite teacup: the red one"),
+      null,
+      "the consumed entry must be gone FROM THE MAP, not just from a detached copy",
+    );
+    assert.ok(
+      ledger.match("agent-one", "the office plant needs watering every friday"),
+      "the other live entry must survive the first consume",
+    );
+  });
+
+  it("invalidateEverywhere() drops the text from every agent bucket", () => {
+    const ledger = new ManualEchoLedger();
+    ledger.record("agent-one", "favorite teacup: the red one");
+    ledger.record("agent-two", "favorite teacup: the red one");
+    ledger.record("agent-two", "the office plant needs watering every friday");
+    ledger.invalidateEverywhere("Favorite Teacup: the RED one");
+    assert.equal(ledger.match("agent-one", "favorite teacup: the red one"), null);
+    assert.equal(ledger.match("agent-two", "favorite teacup: the red one"), null);
+    assert.ok(ledger.match("agent-two", "the office plant needs watering every friday"));
+  });
+
+  it("clearAll() empties every bucket (bulk-delete lane)", () => {
+    const ledger = new ManualEchoLedger();
+    ledger.record("agent-one", "favorite teacup: the red one");
+    ledger.record("agent-two", "the office plant needs watering every friday");
+    ledger.clearAll();
+    assert.equal(ledger.match("agent-one", "favorite teacup: the red one"), null);
+    assert.equal(ledger.match("agent-two", "the office plant needs watering every friday"), null);
   });
 
   it("clear() empties one agent's ring only", () => {
