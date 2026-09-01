@@ -78,6 +78,7 @@ import {
   buildConversationTurnsForExtraction,
   dedupePairWindow,
   weaveContextOnlyAssistantTurns,
+  countProtectedReferentPrefix,
   formatConversationTranscript,
   neutralizeSpeakerTagSpoof,
   nextAutoCaptureMessageId,
@@ -1217,6 +1218,31 @@ function pruneMapIfOver<K, V>(map: Map<K, V>, maxEntries: number): void {
   for (let i = 0; i < excess; i++) {
     const key = iter.next().value;
     if (key !== undefined) map.delete(key);
+  }
+}
+
+/**
+ * Coupled eviction for the pair-window epoch map. An epoch entry may only
+ * leave once its window is gone: deleting the counter while a retained
+ * window survives would reset the generation and let a stale in-flight
+ * store pass the epoch guard. Window-less entries evict first (oldest
+ * first); only if the map is somehow still over do oldest window+epoch
+ * pairs leave TOGETHER, so guard and guarded state always go in one step.
+ */
+function prunePairWindowEpochsCoupled(
+  epochs: Map<string, number>,
+  windows: Map<string, unknown>,
+  maxEntries: number,
+): void {
+  if (epochs.size <= maxEntries) return;
+  for (const key of [...epochs.keys()]) {
+    if (epochs.size <= maxEntries) return;
+    if (!windows.has(key)) epochs.delete(key);
+  }
+  for (const key of [...epochs.keys()]) {
+    if (epochs.size <= maxEntries) return;
+    windows.delete(key);
+    epochs.delete(key);
   }
 }
 
@@ -4098,7 +4124,7 @@ const memoryLanceDBProPlugin = {
             // targeted delete misses the writer. A terminal boundary
             // ends the session for every agent riding the key; sweep
             // every window under it.
-            const sweepSessionWindows = () => {
+            const sweepSessionWindows = (finalPass: boolean) => {
               const sessionSuffix = REMEMBER_WINDOW_KEY_SEPARATOR + endedSessionKey;
               for (const windowKey of [...autoCaptureRecentTurns.keys()]) {
                 if (windowKey.endsWith(sessionSuffix)) {
@@ -4111,14 +4137,25 @@ const memoryLanceDBProPlugin = {
                   autoCaptureRecentPairTurns.delete(windowKey);
                 }
               }
+              if (finalPass) {
+                // Every in-flight run for the key has settled, so the epoch
+                // counters have no store left to guard: the teardown can
+                // DELETE them instead of leaving a bumped entry behind for
+                // every session that ever held a window.
+                for (const epochKey of [...autoCapturePairWindowEpoch.keys()]) {
+                  if (epochKey.endsWith(sessionSuffix)) {
+                    autoCapturePairWindowEpoch.delete(epochKey);
+                  }
+                }
+              }
             };
             // Synchronous teardown first (a next capture must never see the
             // ended session's windows), then a second pass once every
             // in-flight run for the key has settled: a straggler that read
             // its window before this boundary may only re-store between the
             // two passes, and the epoch bump makes its store a no-op anyway.
-            sweepSessionWindows();
-            void awaitSessionCaptureRuns(endedSessionKey).then(sweepSessionWindows);
+            sweepSessionWindows(false);
+            void awaitSessionCaptureRuns(endedSessionKey).then(() => sweepSessionWindows(true));
           }
         },
         { priority: 10 },
@@ -4478,7 +4515,14 @@ const memoryLanceDBProPlugin = {
           if (isTerminalBoundary) {
             autoCaptureRecentTurns.delete(rememberWindowKey(agentId, sessionKey));
             const terminalPairKey = rememberWindowKey(agentId, sessionKey);
-            autoCapturePairWindowEpoch.set(terminalPairKey, (autoCapturePairWindowEpoch.get(terminalPairKey) ?? 0) + 1);
+            // The epoch guard only has stores to invalidate while the pair
+            // window feature is ON; bumping under the disabled default would
+            // allocate an entry per agent/session with nothing to guard.
+            if ((config.autoCaptureContextTurns ?? 0) > 0) {
+              autoCapturePairWindowEpoch.set(terminalPairKey, (autoCapturePairWindowEpoch.get(terminalPairKey) ?? 0) + 1);
+            } else {
+              autoCapturePairWindowEpoch.delete(terminalPairKey);
+            }
             autoCaptureRecentPairTurns.delete(terminalPairKey);
           } else if (newTexts.length > 0) {
             const newRecentTurns = thisCallTurns.slice(rememberPrependedTurns.length);
@@ -4743,7 +4787,14 @@ const memoryLanceDBProPlugin = {
                 );
               }
               if (contextTurns === 0 && pairWindowKey) {
-                autoCapturePairWindowEpoch.set(pairWindowKey, pairWindowEpochAtRead + 1);
+                // Disabled is the default: never ALLOCATE epoch state here.
+                // An entry that already exists (config just flipped off with
+                // an enabled-era run possibly in flight) is bumped so that
+                // run's store stays a no-op; teardown and the coupled prune
+                // remove it once its window is gone.
+                if (autoCapturePairWindowEpoch.has(pairWindowKey)) {
+                  autoCapturePairWindowEpoch.set(pairWindowKey, pairWindowEpochAtRead + 1);
+                }
                 autoCaptureRecentPairTurns.delete(pairWindowKey);
               } else if (contextTurns > 0 && pairWindowKey && thisCallTurns.length > 0) {
                 // Deliberately retained across successful extractions:
@@ -4763,7 +4814,11 @@ const memoryLanceDBProPlugin = {
                   autoCapturePairWindowEpoch.set(pairWindowKey, pairWindowEpochAtRead + 1);
                   autoCaptureRecentPairTurns.set(pairWindowKey, nextStoredWindow);
                   pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
-                  pruneMapIfOver(autoCapturePairWindowEpoch, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                  prunePairWindowEpochsCoupled(
+                    autoCapturePairWindowEpoch,
+                    autoCaptureRecentPairTurns,
+                    AUTO_CAPTURE_MAP_MAX_ENTRIES,
+                  );
                 }
               }
               // The referent is the OLDEST turn of the prepended window, which is
@@ -4786,13 +4841,14 @@ const memoryLanceDBProPlugin = {
               // Reconciliation returns the same turn objects, so identity counts
               // how many referent turns actually survived into the transcript.
               const referentTurnSet = new Set(rememberPrependedTurns.slice(0, referentRunLength));
-              let protectedPrefixTurns = 0;
-              while (
-                protectedPrefixTurns < finalConversationTurns.length &&
-                referentTurnSet.has(finalConversationTurns[protectedPrefixTurns])
-              ) {
-                protectedPrefixTurns++;
-              }
+              // Context-only turns woven into the transcript are transparent
+              // to this scan: the prefix protects the leading run of REFERENT
+              // SOURCE turns, so a null-anchored context reply at position
+              // zero cannot void the referent's budget guarantee.
+              const protectedPrefixTurns = countProtectedReferentPrefix(
+                finalConversationTurns,
+                referentTurnSet,
+              );
               // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
               let stats: Awaited<ReturnType<typeof smartExtractor.extractAndPersist>> | null = null;
               try {
@@ -7459,6 +7515,25 @@ export function resetRegistration() {
   _singletonState = null;
   _hookEventDedup.clear();
   getReflectionEmptyEventGuardMap().clear();
+}
+
+/**
+ * Sizes of the auto-capture retention maps, for tests and diagnostics: the
+ * pair-window feature must not leak epoch entries under its disabled
+ * default, and teardown must remove them once in-flight runs settle.
+ * @public
+ */
+export function debugAutoCaptureWindowStateSizes(): {
+  recentTurns: number;
+  pairWindows: number;
+  pairWindowEpochs: number;
+} | null {
+  if (!_singletonState) return null;
+  return {
+    recentTurns: _singletonState.autoCaptureRecentTurns.size,
+    pairWindows: _singletonState.autoCaptureRecentPairTurns.size,
+    pairWindowEpochs: _singletonState.autoCapturePairWindowEpoch.size,
+  };
 }
 
 export default memoryLanceDBProPlugin;

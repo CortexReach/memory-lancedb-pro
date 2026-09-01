@@ -512,3 +512,168 @@ describe("pair-window review regressions: assistant context, current repeats, re
     );
   });
 });
+
+describe("round-3 regressions: same-call repeats, epoch hygiene, provenance, leading context", () => {
+  const RPT = "please redeploy the cobalt fixture build";
+  let workspaceDir;
+  let embeddingServer;
+  let llmServer;
+  let extractionPrompts;
+
+  beforeEach(async () => {
+    resetRegistration();
+    workspaceDir = mkdtempSync(path.join(tmpdir(), "pair-window-r3-"));
+    extractionPrompts = [];
+    embeddingServer = createEmbeddingServer();
+    llmServer = createLlmServer(extractionPrompts);
+    await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+  });
+
+  afterEach(async () => {
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  function registerWithHandlers(overrides) {
+    resetRegistration();
+    const harness = createPluginApiHarness({
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "memory-db"),
+        autoCapture: true,
+        autoRecall: false,
+        smartExtraction: true,
+        extractMinMessages: 2,
+        autoCaptureContextTurns: 2,
+        extractionThrottle: { skipLowValue: false, maxExtractionsPerHour: 200 },
+        sessionCompression: { enabled: false },
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+        embedding: {
+          apiKey: "test-key",
+          model: "mock-embedding-model",
+          baseURL: `http://127.0.0.1:${embeddingServer.address().port}/v1`,
+          dimensions: EMBEDDING_DIMENSIONS,
+        },
+        llm: {
+          apiKey: "test-key",
+          model: "mock-memory-model",
+          baseURL: `http://127.0.0.1:${llmServer.address().port}`,
+        },
+        ...overrides,
+      },
+      resolveRoot: workspaceDir,
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    return { hook: getAutoCaptureHook(harness.eventHandlers), eventHandlers: harness.eventHandlers };
+  }
+
+  async function fireSessionEnd(eventHandlers, sessionKey, sessionId) {
+    for (const entry of eventHandlers.get("session_end") || []) {
+      await entry.handler({ sessionId }, { sessionKey });
+    }
+    for (let i = 0; i < 4; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  it("keeps a genuinely repeated same-call user turn as its own newest source occurrence", async () => {
+    const { hook } = registerWithHandlers({});
+    const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+    await fireAgentEnd(hook, [
+      { role: "user", content: RPT },
+      { role: "assistant", content: "starting the cobalt redeploy now" },
+      { role: "user", content: RPT },
+    ], ctx);
+    assert.equal(extractionPrompts.length, 1, "the same-call repeat batch should extract");
+    const occurrences = extractionPrompts[0].split(`<user_message>\n${RPT}`).length - 1;
+    assert.equal(
+      occurrences,
+      2,
+      `a same-call repeat is real input, not replay noise: both occurrences must reach the transcript as source turns (got ${occurrences})`,
+    );
+  });
+
+  it("allocates no pair-window epoch state under the disabled default", async () => {
+    const { hook } = registerWithHandlers({ autoCaptureContextTurns: 0 });
+    await fireAgentEnd(hook, [
+      { role: "user", content: "synthetic disabled-path fact about the walnut tray" },
+      { role: "assistant", content: "walnut tray noted" },
+      { role: "user", content: "synthetic disabled-path fact about the pewter hook" },
+    ], { sessionKey: "agent:agent-one:main", agentId: "agent-one" });
+    await fireAgentEnd(hook, [
+      { role: "user", content: "synthetic disabled-path fact about the willow rack" },
+      { role: "assistant", content: "willow rack noted" },
+      { role: "user", content: "synthetic disabled-path fact about the copper stand" },
+    ], { sessionKey: "agent:agent-two:main", agentId: "agent-two" });
+    assert.equal(extractionPrompts.length, 2, "both disabled-config captures should extract (the cleanup branch must actually run)");
+    const sizes = pluginModule.debugAutoCaptureWindowStateSizes();
+    assert.ok(sizes, "singleton state should exist after captures");
+    assert.equal(sizes.pairWindowEpochs, 0, "contextTurns=0 must not allocate epoch entries");
+    assert.equal(sizes.pairWindows, 0, "contextTurns=0 must not retain pair windows");
+  });
+
+  it("deletes epoch entries at session teardown once in-flight runs settle", async () => {
+    const { hook, eventHandlers } = registerWithHandlers({});
+    const sessionKey = "agent:test-agent:main";
+    await fireAgentEnd(hook, [
+      { role: "user", content: "synthetic teardown fact about the juniper crate" },
+      { role: "assistant", content: "juniper crate noted" },
+      { role: "user", content: "synthetic teardown fact about the cedar hamper" },
+    ], { sessionKey, agentId: "test-agent" });
+    assert.equal(extractionPrompts.length, 1, "the enabled capture should extract (the store path must run)");
+    let sizes = pluginModule.debugAutoCaptureWindowStateSizes();
+    assert.ok(sizes && sizes.pairWindowEpochs >= 1, "an enabled capture should create epoch state");
+    await fireSessionEnd(eventHandlers, sessionKey, "session-r3-teardown");
+    sizes = pluginModule.debugAutoCaptureWindowStateSizes();
+    assert.equal(sizes.pairWindowEpochs, 0, "teardown must delete epoch entries after in-flight runs settle");
+    assert.equal(sizes.pairWindows, 0, "teardown must delete the retained window");
+  });
+
+  it("keeps context_only tags and the non-source rule in the grounding rejudge prompt", () => {
+    const { buildGroundingRejudgePrompt } = jiti("../src/extraction-prompts.ts");
+    const CTX_FACT = "the amber shelf holds the tin whistle";
+    const conversationText = [
+      "<context_only_user_turn>",
+      CTX_FACT,
+      "</context_only_user_turn>",
+      "<user_message>",
+      "what did I say about that shelf?",
+      "</user_message>",
+    ].join("\n");
+    const prompt = buildGroundingRejudgePrompt(conversationText, "real", [
+      { index: 1, category: "facts", abstract: "shelf", content: CTX_FACT, grounding: "real" },
+    ]);
+    assert.ok(
+      prompt.includes(`<context_only_user_turn>\n${CTX_FACT}`),
+      "the rejudge transcript must keep the context_only wrapper instead of normalizing it away",
+    );
+    assert.ok(
+      !prompt.includes(`<user_message>\n${CTX_FACT}`),
+      "a context-wrapped turn must not be re-tagged as an ordinary user message for the judge",
+    );
+    assert.ok(
+      prompt.includes("NEVER a source for a memory"),
+      "the rejudge doctrine must carry the context-is-not-a-source rule",
+    );
+  });
+
+  it("protects the referent when a null-anchored context reply is woven ahead of it", () => {
+    const cleanup = jiti("../src/auto-capture-cleanup.ts");
+    const referent = { role: "user", text: "remember the onyx cabinet combination is stored offline", messageId: 1 };
+    const reply = { role: "assistant", text: "y".repeat(400), messageId: 2 };
+    const woven = cleanup.weaveContextOnlyAssistantTurns(
+      [referent, reply],
+      [{ anchorMessageId: null, turn: { role: "assistant", text: "z".repeat(400), messageId: 99, contextOnly: true } }],
+    );
+    assert.equal(woven[0].contextOnly, true, "the null-anchored context reply weaves at the front");
+    const protectedCount = cleanup.countProtectedReferentPrefix(woven, new Set([referent]));
+    assert.equal(protectedCount, 1, "context turns are transparent to the protected-prefix scan");
+    const bounded = cleanup.buildBoundedTranscriptWithStats(woven, 220, { protectedPrefixTurns: protectedCount });
+    assert.ok(
+      bounded.transcript.includes(referent.text),
+      "the referent must survive an over-budget transcript even with a leading context block",
+    );
+    assert.equal(bounded.protectedPrefixKept, true);
+  });
+});

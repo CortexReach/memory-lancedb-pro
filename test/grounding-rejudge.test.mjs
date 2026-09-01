@@ -66,8 +66,10 @@ const { buildGroundingRejudgePrompt } = jiti("../src/extraction-prompts.ts");
     const order = ["## Conversation", "## First-pass register", "## Candidate memories"].map((h) => user.indexOf(h));
     assert.ok(order[0] < order[1] && order[1] < order[2], "user sections keep the prescribed order");
 }
-// The reviewer must never see the extractor's context concept: context tags in
-// the incoming transcript are normalized to the plain speaker tags.
+// The reviewer sees the SAME tagged transcript the extractor saw: stripping
+// the context_only wrappers would erase the source-isolation contract for
+// exactly the pass that can rescue a candidate to "real". The doctrine must
+// also carry the context-is-never-a-source rule.
 {
     const tagged = [
         "<context_only_user_turn>\nolder user turn\n</context_only_user_turn>",
@@ -78,10 +80,13 @@ const { buildGroundingRejudgePrompt } = jiti("../src/extraction-prompts.ts");
         { index: 1, category: "events", abstract: "a", content: "c", grounding: "real" },
     ]);
     const user = typeof built === "string" ? built : built.user;
-    assert.ok(!user.includes("context_only_"), "no context tag may reach the reviewer");
-    assert.ok(user.includes("<user_message>\nolder user turn\n</user_message>"), "context user turns become plain user_message blocks");
-    assert.ok(user.includes("<assistant_message>\nassistant reply\n</assistant_message>"), "context assistant turns become plain assistant_message blocks");
+    const system = typeof built === "string" ? built : built.system;
+    assert.ok(user.includes("<context_only_user_turn>\nolder user turn\n</context_only_user_turn>"), "context user turns keep their wrapper for the judge");
+    assert.ok(user.includes("<context_only_assistant_turn>\nassistant reply\n</context_only_assistant_turn>"), "context assistant turns keep their wrapper for the judge");
+    assert.ok(!user.includes("<user_message>\nolder user turn"), "a context turn must not be re-tagged as an ordinary user message");
     assert.ok(user.includes("<user_message>\nnewest turn\n</user_message>"), "the newest turn is untouched");
+    assert.ok(system.includes("NEVER a source for a memory"), "the doctrine carries the context-is-never-a-source rule");
+    assert.ok(system.includes("can never be the named stretch"), "the real-tag definition excludes context stretches");
 }
 
 
