@@ -401,14 +401,11 @@ export function buildGroundingRejudgePrompt(
     grounding: string;
   }>,
 ): string {
-  // The reviewer judges the conversation as one whole; the extractor's
-  // context-vs-new distinction is noise here. Normalize the context tags to
-  // the plain speaker tags so no "context" concept reaches the judge.
-  const reviewTranscript = conversationText
-    .replaceAll("<context_only_user_turn>", "<user_message>")
-    .replaceAll("</context_only_user_turn>", "</user_message>")
-    .replaceAll("<context_only_assistant_turn>", "<assistant_message>")
-    .replaceAll("</context_only_assistant_turn>", "</assistant_message>");
+  // The judge sees the SAME tagged transcript the extractor saw: stripping
+  // the context_only wrappers here would erase the source-isolation contract
+  // for exactly the pass that can rescue a candidate to "real", letting a
+  // claim grounded only in retained context slip through the second judge.
+  const reviewTranscript = conversationText;
   const candidateList = candidates
     .map(
       (c) =>
@@ -420,6 +417,8 @@ export function buildGroundingRejudgePrompt(
 
 Factual content is actual, real, and certain — it describes the actual user and the real world. Hypothetical content is supposed, imagined, speculative, conjectural, or fictional — it holds only inside a "what if", a premise, a thought experiment, or a made-up situation.
 
+Some turns are wrapped in <context_only_user_turn> or <context_only_assistant_turn> instead of the plain speaker tags. Those are PRIOR-CONTEXT turns, retained only so the current exchange reads coherently; they are NEVER a source for a memory. A candidate whose claim rests only on context-wrapped turns has no stretch of THIS conversation to stand on: tag it "constructed", whatever the context turns say.
+
 ## How to judge
 
 1. Re-judge the register of the WHOLE conversation:
@@ -429,7 +428,7 @@ Factual content is actual, real, and certain — it describes the actual user an
    Mark to yourself which stretches of the conversation are hypothetical and which are factual. A stretch turns hypothetical the moment the user pretends, imagines a situation, supposes a premise, or speaks as if from inside a made-up situation; it turns factual again only when the user drops that frame.
 
 2. Re-tag each candidate's grounding by the stretch its claim comes from:
-   - "real": the claim comes from a factual stretch — the user said it as themselves, about the real world. Name that stretch to yourself; if you cannot, the tag is "constructed".
+   - "real": the claim comes from a factual stretch — the user said it as themselves, about the real world. Name that stretch to yourself; if you cannot, the tag is "constructed". A stretch inside context_only wrappers can never be the named stretch.
    - "constructed": the claim comes from a hypothetical stretch — including the premise of a what-if question, and everyday-sounding details spoken from inside a made-up situation.
    One-line rule: about-the-hypothetical is real; within-the-hypothetical is constructed. A note THAT the user explored a hypothetical is "real"; every claim living INSIDE the hypothetical is "constructed".
    If you are genuinely unsure about an item, tag it "constructed" — a wrongly stored fact is worse than a missed one.
