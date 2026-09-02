@@ -151,6 +151,49 @@ describe("isNearIdenticalEcho", () => {
     );
   });
 
+  it("keeps a candidate that swaps a semantic predicate (wants against has)", () => {
+    assert.equal(
+      isNearIdenticalEcho(
+        "User wants a golden retriever named Max",
+        "User has a golden retriever named Max",
+      ),
+      false,
+      "has/wants/likes/prefers decide what a sentence asserts; they are content, not glue",
+    );
+  });
+
+  it("keeps a candidate that drops the distinguishing part of a preference", () => {
+    assert.equal(
+      isNearIdenticalEcho(
+        "User prefers Python",
+        "User prefers Go over Python for backend services",
+      ),
+      false,
+      "an ordered subsequence of the manual content is a different assertion, not an echo",
+    );
+  });
+
+  it("keeps a candidate with a different predicate and object against a fuller manual text", () => {
+    assert.equal(
+      isNearIdenticalEcho(
+        "User likes tea",
+        "User prefers coffee over tea in the morning",
+      ),
+      false,
+    );
+  });
+
+  it("still collapses the same-order wrap echo when the fact carries a predicate", () => {
+    assert.equal(
+      isNearIdenticalEcho(
+        "User mentioned that Alice prefers Go for backend services",
+        "alice prefers go for backend services",
+      ),
+      true,
+      "reporting glue around an otherwise identical assertion is still an echo",
+    );
+  });
+
   it("rejects unrelated candidates", () => {
     assert.equal(
       isNearIdenticalEcho("user's dog is named Biscuit", manual),
@@ -326,26 +369,6 @@ describe("ManualEchoLedger", () => {
       ledger.match("agent-one", "the office plant needs watering every friday"),
       "the other live entry must survive the first consume",
     );
-  });
-
-  it("invalidateEverywhere() drops the text from every agent bucket", () => {
-    const ledger = new ManualEchoLedger();
-    ledger.record("agent-one", "favorite teacup: the red one");
-    ledger.record("agent-two", "favorite teacup: the red one");
-    ledger.record("agent-two", "the office plant needs watering every friday");
-    ledger.invalidateEverywhere("Favorite Teacup: the RED one");
-    assert.equal(ledger.match("agent-one", "favorite teacup: the red one"), null);
-    assert.equal(ledger.match("agent-two", "favorite teacup: the red one"), null);
-    assert.ok(ledger.match("agent-two", "the office plant needs watering every friday"));
-  });
-
-  it("clearAll() empties every bucket (bulk-delete lane)", () => {
-    const ledger = new ManualEchoLedger();
-    ledger.record("agent-one", "favorite teacup: the red one");
-    ledger.record("agent-two", "the office plant needs watering every friday");
-    ledger.clearAll();
-    assert.equal(ledger.match("agent-one", "favorite teacup: the red one"), null);
-    assert.equal(ledger.match("agent-two", "the office plant needs watering every friday"), null);
   });
 
   it("clear() empties one agent's ring only", () => {
@@ -592,6 +615,7 @@ describe("echo guard through the full auto-capture path", () => {
       context,
       { enableManagementTools: true },
     );
+    ledger.record("main", ORIGINAL);
     const update = creators.get("memory_update")({});
     const updated = await update.execute(null, { memoryId: EXISTING_ID, text: UPDATED });
     assert.equal(
@@ -603,5 +627,75 @@ describe("echo guard through the full auto-capture path", () => {
       ledger.match("main", UPDATED),
       "the successful temporal supersede must record the NEW text in the echo ledger before its early return",
     );
+    assert.equal(
+      ledger.match("main", ORIGINAL),
+      null,
+      "the replaced text must be invalidated: a reversal back to it is new information once the store no longer holds it",
+    );
+  });
+
+  it("invalidates the replaced text on the plain (non-temporal) memory_update path too", async () => {
+    const { registerAllMemoryTools } = jiti("../src/tools.ts");
+    const ledger = new ManualEchoLedger();
+    const EXISTING_ID = "21111111-2222-4333-8444-555555555555";
+    const ORIGINAL = "rehearsal warm-up routine: scales for ten minutes";
+    const UPDATED = "rehearsal warm-up routine: long tones for ten minutes";
+    const existingEntry = {
+      id: EXISTING_ID,
+      text: ORIGINAL,
+      category: "fact",
+      scope: "agent:main",
+      importance: 0.7,
+      timestamp: Date.now() - 60_000,
+      metadata: JSON.stringify({
+        memory_category: "patterns",
+        l0_abstract: ORIGINAL,
+        l1_overview: `- ${ORIGINAL}`,
+        l2_content: ORIGINAL,
+        source: "manual",
+        state: "confirmed",
+      }),
+    };
+    const context = {
+      agentId: "main",
+      workspaceDir: workspaceDir,
+      mdMirror: null,
+      manualEchoLedger: ledger,
+      scopeManager: {
+        getAccessibleScopes: (agentId) => ["global", `agent:${agentId}`],
+        getScopeFilter: (agentId) => ["global", `agent:${agentId}`],
+        isAccessible: (scope, agentId) => ["global", `agent:${agentId}`].includes(scope),
+        getDefaultScope: (agentId) => `agent:${agentId}`,
+      },
+      retriever: { getConfig() { return { mode: "hybrid" }; } },
+      store: {
+        async getById(id) { return id === EXISTING_ID ? existingEntry : null; },
+        async vectorSearch() { return []; },
+        async list() { return [existingEntry]; },
+        async listFactKeyCandidates() { return [existingEntry]; },
+        async store(entry) { return { ...entry, id: "99999999-8888-4777-8666-555555555553", timestamp: Date.now() }; },
+        async update(id, patch) { return { ...existingEntry, ...patch, id }; },
+      },
+      embedder: { async embedPassage() { return [0.1, 0.2, 0.3]; } },
+    };
+    const creators = new Map();
+    registerAllMemoryTools(
+      {
+        registerTool(factory, meta) { creators.set(meta.name, factory); },
+        logger: { info() {}, warn() {}, debug() {} },
+      },
+      context,
+      { enableManagementTools: true },
+    );
+    ledger.record("main", ORIGINAL);
+    const update = creators.get("memory_update")({});
+    const updated = await update.execute(null, { memoryId: EXISTING_ID, text: UPDATED });
+    assert.notEqual(
+      updated?.details?.action,
+      "superseded",
+      `a patterns row must take the plain update path (got ${JSON.stringify(updated?.details)})`,
+    );
+    assert.ok(ledger.match("main", UPDATED), "the new text is recorded");
+    assert.equal(ledger.match("main", ORIGINAL), null, "the replaced text is invalidated on the plain update path");
   });
 });

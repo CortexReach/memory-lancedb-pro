@@ -2701,8 +2701,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   // its own.
   let smartExtractor: SmartExtractor | null = null;
   // Echo guard: shared between the manual store/update tools (record side)
-  // and the smart extractor (drop side); lives here so the tools keep
-  // recording even when smart extraction is disabled.
+  // and the smart extractor (drop side). Constructed unconditionally, but
+  // wired into the tools only when a smart extractor exists: an echo can
+  // only arise when extraction is able to re-mint the dictated text.
   const manualEchoLedger = new ManualEchoLedger();
   let admissionController: AdmissionController | null = null;
   let admissionControllerReflectionLane: AdmissionController | null = null;
@@ -3559,7 +3560,6 @@ const memoryLanceDBProPlugin = {
         store,
         retriever,
         scopeManager,
-        manualEchoLedger: smartExtractor ? manualEchoLedger : undefined,
         onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
         migrator,
         embedder,

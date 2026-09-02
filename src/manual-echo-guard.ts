@@ -8,25 +8,38 @@
  * and drops near-identical extraction candidates BEFORE the admission judge:
  * deterministic, string-only, no LLM calls, no vector search.
  *
- * Matching is deliberately ONE-SIDED and conservative: a candidate is an
- * echo only when it adds NOTHING substantive beyond the recorded manual
- * text (exact match, the manual text containing the candidate, or every
- * candidate content token already present in the manual text). A candidate
+ * Matching is deliberately conservative: a candidate is an echo only when
+ * it asserts NOTHING beyond, and nothing different from, the recorded
+ * manual text: an exact match, the manual text containing the candidate
+ * verbatim, or the candidate carrying exactly the manual text's content
+ * tokens in the same order once reporting glue is stripped. A candidate
  * carrying extra content — a negation ("no longer"), a changed value, a
  * temporal qualifier ("until friday"), or additional facts — is new
- * information and always survives; the worst case of the guard staying
- * quiet is the pre-guard status quo (one duplicate row for dedup).
+ * information and always survives, and so is one that swaps or drops a
+ * semantic predicate ("wants" against "has", "prefers Python" against
+ * "prefers Go over Python"). The worst case of the guard staying quiet is
+ * the pre-guard status quo (one duplicate row for dedup); the worst case of
+ * it firing wrongly is a silently lost memory, so every ambiguity resolves
+ * toward keeping the candidate.
  *
  * Entries are short-lived and consumed: each recorded manual text expires
  * after MANUAL_ECHO_TTL_MS and suppresses at most ONE candidate (the
  * immediate re-extraction of the same turn). A later identical statement is
- * a deliberate user re-assertion, not an echo.
+ * a deliberate user re-assertion, not an echo. A statement that gets
+ * replaced (memory_update, supersede) or forgotten is invalidated at once,
+ * so a reversal back to it is never mistaken for an echo of a fact the
+ * store no longer holds.
  *
  * Scoped per agent (not per session): the store tool and the auto-capture
  * hook derive their session keys differently, but both resolve the same
  * agent id, and an echo of ANY recent manual text of the same agent is a
  * correct drop regardless of session boundaries. TTL + consumption bound
  * staleness; the ring bounds size.
+ *
+ * The ledger is in-memory and per process: only the gateway that recorded
+ * a text can invalidate it. Deletions made from another process (the
+ * memory-pro CLI) are not visible here; the TTL bounds that window to
+ * MANUAL_ECHO_TTL_MS, after which the stale entry expires on its own.
  */
 
 export const MANUAL_ECHO_RING_SIZE = 8;
@@ -38,9 +51,12 @@ const MAX_CJK_WRAPPER_RESIDUAL_CHARS = 8;
 const DEFAULT_AGENT_BUCKET = "main";
 
 /**
- * Glue vocabulary the extractor wraps a dictated fact in ("User stated
- * that ..."). Stripped before token containment so the canonical wrap echo
- * still collapses; negation and temporal markers are deliberately NOT here.
+ * Reporting glue the extractor wraps a dictated fact in ("User stated
+ * that ..."): articles, copulas, pronouns, prepositions, and reporting
+ * verbs. Stripped before token comparison so the canonical wrap echo still
+ * collapses. Semantic predicates (has, wants, likes, prefers, ...) are NOT
+ * glue: they decide what a sentence asserts, so they stay content tokens.
+ * Negation and temporal markers are deliberately not here either.
  */
 const ECHO_STOPWORDS = new Set([
   "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
@@ -48,8 +64,7 @@ const ECHO_STOPWORDS = new Set([
   "with", "and", "or", "as", "by", "from", "it", "its", "their", "they",
   "he", "she", "his", "her", "them", "i", "my", "me", "we", "our", "you",
   "your", "user", "users", "stated", "said", "says", "saying", "mentioned",
-  "noted", "prefers", "prefer", "likes", "like", "wants", "want", "has",
-  "have", "had", "also",
+  "noted", "also",
 ]);
 
 /**
@@ -184,29 +199,19 @@ export function isNearIdenticalEcho(candidateText: string, manualText: string): 
 
   // Wrap echo: the extractor sentence-wraps the dictated fact ("favorite
   // teacup: the red one" -> "User stated their favorite teacup is the red
-  // one"). After glue-word stripping, the candidate's content tokens must
-  // appear in the manual text IN THE SAME RELATIVE ORDER (an ordered
-  // subsequence, not a bag-of-words subset): set membership alone would
-  // collapse "alice reports to bob" onto "bob reports to alice" and discard
-  // the reversed relationship. One-sided by design either way — a candidate
-  // with any extra content token (changed value, qualifier, added fact) is
-  // new information and survives.
+  // one"). After glue-word stripping, the candidate must carry EXACTLY the
+  // manual text's content tokens, in the same order. Adding a token (a
+  // changed value, a qualifier, a new fact) is new information; dropping
+  // one is a different assertion ("User prefers Python" against "User
+  // prefers Go over Python for backend services" reverses the preference),
+  // so a subsequence match is not enough. Order matters too: bag-of-words
+  // equality would collapse "alice reports to bob" onto "bob reports to
+  // alice". The manual-side minimum above doubles as the candidate floor,
+  // since equal sequences have equal length.
   const candidateContentList = orderedContentTokens(candidate);
-  if (candidateContentList.length === 0) return false;
   const manualContentList = orderedContentTokens(manual);
-  let cursor = 0;
-  for (const token of candidateContentList) {
-    let found = -1;
-    for (let i = cursor; i < manualContentList.length; i++) {
-      if (manualContentList[i] === token) {
-        found = i;
-        break;
-      }
-    }
-    if (found < 0) return false;
-    cursor = found + 1;
-  }
-  return true;
+  if (candidateContentList.length !== manualContentList.length) return false;
+  return candidateContentList.every((token, i) => token === manualContentList[i]);
 }
 
 interface ManualEchoEntry {
@@ -285,30 +290,5 @@ export class ManualEchoLedger {
 
   clear(agentId: string | undefined): void {
     this.byAgent.delete(agentId?.trim() || DEFAULT_AGENT_BUCKET);
-  }
-
-  /**
-   * Deletion-lane invalidation when the deleter cannot name the writing
-   * agent (CLI delete by id): the fact is gone from the store, so no bucket
-   * may keep suppressing its re-statement.
-   */
-  invalidateEverywhere(text: string): void {
-    if (typeof text !== "string" || text.trim().length === 0) return;
-    const target = normalizeEchoText(text);
-    for (const [key, ring] of [...this.byAgent.entries()]) {
-      const kept = ring.filter((e) => normalizeEchoText(e.text) !== target);
-      if (kept.length === 0) this.byAgent.delete(key);
-      else if (kept.length !== ring.length) this.byAgent.set(key, kept);
-    }
-  }
-
-  /**
-   * Wholesale reset for bulk deletion lanes, where pre-fetching every
-   * deleted row's text would defeat the point of a bulk delete. Clearing is
-   * fail-open: the worst case is one uncaught echo (a duplicate row for
-   * dedup), never a lost memory.
-   */
-  clearAll(): void {
-    this.byAgent.clear();
   }
 }

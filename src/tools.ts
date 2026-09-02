@@ -1699,6 +1699,14 @@ export function registerMemoryStoreTool(
               );
             }
 
+            // The replaced statements leave the echo ledger with the rows:
+            // a reversal back to a superseded text is new information once
+            // the store no longer holds that fact.
+            for (const target of lastDiscovery.targets) {
+              if (supersededIds.includes(target.entry.id)) {
+                context.manualEchoLedger?.invalidate(agentId, target.entry.text);
+              }
+            }
             context.manualEchoLedger?.record(agentId, text);
 
             // Dual-write to Markdown mirror if enabled
@@ -2191,7 +2199,9 @@ export function registerMemoryUpdateTool(
                 // The superseding write succeeded: this text will echo through
                 // the same turn's auto-capture extraction exactly like a plain
                 // manual store, so it must be recorded on this early-return
-                // path too.
+                // path too, and the replaced text must stop suppressing its
+                // own re-statement.
+                context.manualEchoLedger?.invalidate(agentId, existing.text);
                 context.manualEchoLedger?.record(agentId, text);
                 return {
                   content: [
@@ -2271,6 +2281,9 @@ export function registerMemoryUpdateTool(
             };
           }
 
+          if (text && existing) {
+            context.manualEchoLedger?.invalidate(agentId, existing.text);
+          }
           context.manualEchoLedger?.record(agentId, updated.text);
 
           return {
