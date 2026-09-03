@@ -74,6 +74,10 @@ interface ToolContext {
   mdMirror?: MdMirrorWriter | null;
   workspaceBoundary?: WorkspaceBoundaryConfig;
   selfImprovementMaxEntries?: number;
+  // Manual-priority store lane: a memory_store that finds a similar existing
+  // row supersedes it instead of being rejected as a duplicate; the manual
+  // text always lands verbatim.
+  manualStoreSupersede?: boolean;
   // Mirrors MemoryCliContext's onMemoriesDeleted (cli.ts): lets the host invalidate
   // in-process reflection caches after a live delete, not just CLI delete/delete-bulk.
   onMemoriesDeleted?: (info: { scopeFilter?: string[] }) => void;
@@ -240,10 +244,22 @@ function hasExplicitMetadataField(entry: MemoryEntry, field: string): boolean {
   return Object.prototype.hasOwnProperty.call(parseMetadataObject(entry.metadata), field);
 }
 
+/**
+ * The one normalization rule for comparing fact keys: explicit keys are stored
+ * trimmed but case-preserved while derived keys are lowercased, so every
+ * comparison site must apply the same trim+lowercase rule or a mixed-case
+ * explicit key ("Preferences:Theme") diverges from its query-equivalent
+ * derived form ("preferences:theme").
+ */
+function normalizeFactKeyForComparison(key: string | undefined): string | undefined {
+  const normalized = key?.trim().toLowerCase();
+  return normalized ? normalized : undefined;
+}
+
 function factQueryMatches(entry: MemoryEntry, query: string | undefined, factKey: string | undefined): boolean {
   const meta = parseSmartMetadata(entry.metadata, entry);
-  const normalizedFactKey = factKey?.trim().toLowerCase();
-  if (normalizedFactKey && meta.fact_key?.toLowerCase() !== normalizedFactKey) return false;
+  const normalizedFactKey = normalizeFactKeyForComparison(factKey);
+  if (normalizedFactKey && normalizeFactKeyForComparison(meta.fact_key) !== normalizedFactKey) return false;
 
   const normalizedQuery = query?.trim().toLowerCase();
   if (!normalizedQuery) return true;
@@ -290,6 +306,76 @@ function serializeFactEntry(entry: MemoryEntry, atMs: number) {
 }
 
 const FACT_QUERY_PAGE_SIZE = 500;
+
+/**
+ * Hard ceiling on candidate rows a fact-key collision scan will accept from
+ * the store's bounded candidate query (see
+ * MemoryStore.listFactKeyCandidates). The scan runs inside
+ * storeSuperseding()'s cross-process write lock, so its work must stay
+ * bounded; a candidate set past this ceiling cannot guarantee a complete
+ * collision set, and an opted-in supersede write is REJECTED explicitly
+ * (FactKeyScanOverBoundError) rather than silently leaving the old same-key
+ * value active alongside the new one.
+ */
+const FACT_KEY_SCAN_MAX_ROWS = 20_000;
+
+/**
+ * An opted-in manual supersede write was rejected because the fact-key
+ * collision scan could not be completed within its bound. Callers surface
+ * this to the agent explicitly; `force: true` stores without superseding.
+ */
+export class FactKeyScanOverBoundError extends Error {
+  constructor(bound: number) {
+    super(
+      `manual supersede rejected: the scope holds more than ${bound} fact-key candidate rows, so a complete collision scan cannot be guaranteed. Retry with force: true to store without superseding, or reduce the scope's row count.`,
+    );
+    this.name = "FactKeyScanOverBoundError";
+  }
+}
+
+/**
+ * Complete, scope-aware lookup of ACTIVE rows holding a fact key. The vector
+ * top-K is the wrong tool for key collisions: a same-key row ranked behind
+ * closer unrelated neighbors, or below the similarity floor, is exactly the
+ * stale value a manual update must supersede. The store performs a bounded,
+ * scope-only candidate query (hard limit push-down, no sort, no content
+ * narrowing: effective keys hide in any valid JSON layout or derive from the
+ * storage category column, so a serialization-layout pattern can exclude a
+ * valid candidate); exact normalized-key and active-row filtering happen
+ * here. An over-bound candidate set throws FactKeyScanOverBoundError —
+ * never a silently incomplete collision set.
+ */
+async function findActiveFactKeyEntries(
+  store: MemoryStore,
+  scopeFilter: string[],
+  factKey: string,
+): Promise<MemoryEntry[]> {
+  const matches: MemoryEntry[] = [];
+  const targetKey = normalizeFactKeyForComparison(factKey);
+  if (!targetKey) return matches;
+  const now = Date.now();
+  const rows = await store.listFactKeyCandidates(
+    scopeFilter,
+    FACT_KEY_SCAN_MAX_ROWS,
+  );
+  if (rows.length > FACT_KEY_SCAN_MAX_ROWS) {
+    throw new FactKeyScanOverBoundError(FACT_KEY_SCAN_MAX_ROWS);
+  }
+  for (const entry of rows) {
+    // Exact scope match: store reads mask legacy NULL scopes as "global" and
+    // store-level filters have passed legacy rows through before; a
+    // supersede scan must never treat a row outside the requested scopes
+    // as a collision target.
+    if (!scopeFilter.includes(entry.scope)) continue;
+    const meta = parseSmartMetadata(entry.metadata, entry);
+    if (!isMemoryActiveAt(meta, now) || isMemoryExpired(meta, now)) continue;
+    const entryKey = normalizeFactKeyForComparison(
+      meta.fact_key ?? deriveFactKey(meta.memory_category, entry.text),
+    );
+    if (entryKey === targetKey) matches.push(entry);
+  }
+  return matches;
+}
 
 type FactQueryCandidate = {
   entry: MemoryEntry;
@@ -457,15 +543,18 @@ function formatIgnoredScopeNotice(resolvedScopes: {
   return `Ignored inaccessible scope "${resolvedScopes.ignoredScope}" and searched accessible scopes instead: ${scopes}.`;
 }
 
-async function resolveMemoryId(
+export async function resolveMemoryId(
   context: ToolContext,
   memoryRef: string,
   scopeFilter: string[],
+  options?: { requireExactRef?: boolean },
 ): Promise<
   | { ok: true; id: string }
   | { ok: false; message: string; details?: Record<string, unknown> }
 > {
-  const trimmed = memoryRef.trim();
+  // Agents copy ids out of injected context, which truncates them and often
+  // appends an ellipsis ("407dec9c..."); strip that before classifying.
+  const trimmed = memoryRef.trim().replace(/[.…]+$/u, "");
   if (!trimmed) {
     return {
       ok: false,
@@ -474,9 +563,59 @@ async function resolveMemoryId(
     };
   }
 
-  const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(trimmed);
-  if (uuidLike) {
+  const isFullUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed);
+  if (isFullUuid) {
     return { ok: true, id: trimmed };
+  }
+
+  // Documented contract: "full UUID or 8+ char prefix". A hex-shaped ref
+  // that is not a complete UUID resolves as an id prefix within accessible
+  // scopes — unique match wins, multiple matches list candidates, and zero
+  // matches is an honest not-found (never a scan-match or a semantic guess).
+  const isIdPrefix = /^[0-9a-f][0-9a-f-]{7,35}$/i.test(trimmed);
+  if (isIdPrefix) {
+    const matches = await context.store.findByIdPrefix(trimmed, scopeFilter);
+    if (matches.length === 1) {
+      return { ok: true, id: matches[0].id };
+    }
+    if (matches.length > 1) {
+      const list = matches
+        .map(
+          (entry) =>
+            `- [${entry.id.slice(0, 8)}] ${entry.text.slice(0, 60)}${entry.text.length > 60 ? "..." : ""}`,
+        )
+        .join("\n");
+      return {
+        ok: false,
+        message: `Id prefix "${trimmed}" matches multiple memories. Use a longer prefix or the full id:\n${list}`,
+        details: { error: "ambiguous_id_prefix", prefix: trimmed },
+      };
+    }
+    return {
+      ok: false,
+      message: `Memory ${trimmed} not found or access denied.`,
+      details: { error: "not_found", id: trimmed },
+    };
+  }
+
+  // Supported legacy ids (older memory-lancedb-pro versions) pass through
+  // untouched: MemoryStore.delete/getById carry exact handling for this shape,
+  // and routing them into semantic retrieval let a sole low-score result
+  // resolve to an unrelated row.
+  if (/^mem-md-\d+$/i.test(trimmed)) {
+    return { ok: true, id: trimmed };
+  }
+
+  // Destructive callers pass a DIRECT id reference; anything that is not a
+  // full UUID, a validated prefix, or a supported legacy id is malformed for
+  // them, never a semantic query. Semantic resolution stays reserved for the
+  // query flow with its confidence and confirmation safeguards.
+  if (options?.requireExactRef) {
+    return {
+      ok: false,
+      message: `"${trimmed}" is not a memory id. Pass a full UUID, an 8+ character id prefix, or search by content via the query flow.`,
+      details: { error: "invalid_memory_ref", ref: trimmed },
+    };
   }
 
   const results = await retrieveWithRetry(context.retriever, {
@@ -1288,19 +1427,122 @@ export function registerMemoryStoreTool(
           // Align with TEMPORAL_VERSIONED_CATEGORIES at the smart-category
           // layer so legacy storage categories like "fact" don't cross-match
           // unrelated profile/case memories.
-          let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
-          try {
-            existing = await runtimeContext.store.vectorSearch(vector, 3, 0.1, [
-              targetScope,
-            ], { excludeInactive: true });
-          } catch (err) {
-            console.warn(
-              `memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`,
-            );
-          }
+          const manualSupersede = runtimeContext.manualStoreSupersede === true;
+          const newFactKey = deriveFactKey(memoryCategory, stripped);
 
-          const duplicateCandidate = existing[0]?.score > 0.98 ? existing[0] : undefined;
-          if (duplicateCandidate && !force) {
+          // One discovery routine serves both passes: the ADVISORY pass below
+          // decides whether to enter the supersede path at all, and the store's
+          // atomic commit re-runs it under the write lock so the target set
+          // that actually commits reflects concurrent writers' work.
+          const runSupersedeDiscovery = async (): Promise<{
+            neighbors: Awaited<ReturnType<MemoryStore["vectorSearch"]>>;
+            duplicateCandidate: Awaited<ReturnType<MemoryStore["vectorSearch"]>>[number] | undefined;
+            manual: boolean;
+            targets: Array<{ entry: MemoryEntry; score?: number }>;
+          }> => {
+            // Check for duplicates / supersede candidates using raw vector
+            // similarity (bypasses importance/recency weighting).
+            // Fail-open by design: dedup must never block a legitimate write.
+            // excludeInactive: superseded historical records must not block
+            // new writes.
+            let neighbors: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
+            try {
+              neighbors = await runtimeContext.store.vectorSearch(vector, 3, 0.1, [
+                targetScope,
+              ], { excludeInactive: true });
+            } catch (err) {
+              console.warn(
+                `memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`,
+              );
+            }
+            const duplicateCandidate = neighbors[0]?.score > 0.98 ? neighbors[0] : undefined;
+            // Key collisions resolve through a COMPLETE scope lookup, never the
+            // vector top-K: a same-key row ranked behind closer unrelated
+            // neighbors, or below the similarity floor, is exactly the stale
+            // value this path exists to supersede. Fail-open like the duplicate
+            // pre-check: a lookup error stores alongside instead of blocking.
+            let activeFactKeyEntries: MemoryEntry[] = [];
+            if (manualSupersede && !force && newFactKey) {
+              try {
+                activeFactKeyEntries = await findActiveFactKeyEntries(
+                  runtimeContext.store,
+                  [targetScope],
+                  newFactKey,
+                );
+              } catch (err) {
+                // An over-bound candidate set is NOT the fail-open class: a
+                // store-alongside here silently abandons the supersession
+                // invariant, so the write is rejected explicitly instead.
+                if (err instanceof FactKeyScanOverBoundError) {
+                  throw err;
+                }
+                console.warn(
+                  `memory-lancedb-pro: fact-key lookup failed, continue store: ${String(err)}`,
+                );
+              }
+            }
+            const manualPriorityTargets: Array<{ entry: MemoryEntry; score?: number }> = [];
+            if (manualSupersede && !force) {
+              if (duplicateCandidate) {
+                manualPriorityTargets.push(duplicateCandidate);
+              }
+              for (const entry of activeFactKeyEntries) {
+                if (!manualPriorityTargets.some((target) => target.entry.id === entry.id)) {
+                  manualPriorityTargets.push({ entry });
+                }
+              }
+            }
+            // Auto-supersede band: similar memory (0.95-0.98), same
+            // storage-layer category, eligible category.
+            const bandCandidate = neighbors.find(
+              (r) =>
+                r.score > 0.95 &&
+                r.score <= 0.98 &&
+                TEMPORAL_VERSIONED_CATEGORIES.has(memoryCategory) &&
+                matchesMemoryCategoryFilter(r.entry.category, memoryCategory, r.entry.metadata),
+            );
+            const targets = manualPriorityTargets.length > 0
+              ? manualPriorityTargets
+              : bandCandidate
+                ? [bandCandidate]
+                : [];
+            return {
+              neighbors,
+              duplicateCandidate,
+              manual: manualPriorityTargets.length > 0,
+              targets,
+            };
+          };
+
+          // An over-bound fact-key scan rejects the opted-in write explicitly:
+          // storing alongside would silently leave the old same-key value
+          // active, and pretending "created" hides exactly the failure the
+          // supersede contract exists to prevent. force: true bypasses the
+          // scan entirely and stores without superseding.
+          const buildOverBoundRejection = (err: FactKeyScanOverBoundError) => ({
+            content: [
+              {
+                type: "text",
+                text: err.message,
+              },
+            ],
+            details: {
+              action: "rejected",
+              reason: "fact-key-scan-over-bound",
+            },
+          });
+
+          let discovery: Awaited<ReturnType<typeof runSupersedeDiscovery>>;
+          try {
+            discovery = await runSupersedeDiscovery();
+          } catch (err) {
+            if (err instanceof FactKeyScanOverBoundError) {
+              return buildOverBoundRejection(err);
+            }
+            throw err;
+          }
+          const duplicateCandidate = discovery.duplicateCandidate;
+          if (duplicateCandidate && !force && !manualSupersede) {
             return {
               content: [
                 {
@@ -1318,78 +1560,135 @@ export function registerMemoryStoreTool(
             };
           }
 
-          // Auto-supersede: if a similar memory exists (0.95-0.98 similarity),
-          // same storage-layer category, and category is eligible, mark the old
-          // one as superseded and store the new one with a supersedes link.
-          const supersedeCandidate = existing.find(
-            (r) =>
-              r.score > 0.95 &&
-              r.score <= 0.98 &&
-              TEMPORAL_VERSIONED_CATEGORIES.has(memoryCategory) &&
-              matchesMemoryCategoryFilter(r.entry.category, memoryCategory, r.entry.metadata),
-          );
-
-          if (supersedeCandidate) {
-            const oldEntry = supersedeCandidate.entry;
-            const oldMeta = parseSmartMetadata(oldEntry.metadata, oldEntry);
-            const now = Date.now();
-            const factKey =
-              oldMeta.fact_key ?? deriveFactKey(oldMeta.memory_category, text);
-
-            // Store new memory with supersedes link, preserving canonical fields
-            // from the old entry (aligns with memory_update supersede path).
-            const newMeta = buildSmartMetadata(
-              { text, category: storageCategory, importance: safeImportance },
-              {
-                l0_abstract: text,
-                l1_overview: oldMeta.l1_overview || `- ${text}`,
-                l2_content: text,
-                memory_category: oldMeta.memory_category,
-                tier: oldMeta.tier,
-                source: "manual",
-                state: "confirmed",
-                memory_layer: deriveManualMemoryLayer(oldMeta.memory_category),
-                last_confirmed_use_at: now,
-                bad_recall_count: 0,
-                suppressed_until_turn: 0,
-                valid_from: now,
-                fact_key: factKey,
-                supersedes: oldEntry.id,
-                relations: appendRelation([], {
-                  type: "supersedes",
-                  targetId: oldEntry.id,
-                }),
-              },
-            );
-
-            const newEntry = await runtimeContext.store.store({
-              text,
-              vector,
-              importance: safeImportance,
-              category: storageCategory,
-              scope: targetScope,
-              metadata: stringifySmartMetadata(newMeta),
-            });
-
-            // Invalidate old record
-            try {
-              await runtimeContext.store.patchMetadata(
-                oldEntry.id,
+          // Manual-priority supersede (manualStoreSupersede): a manual store
+          // always takes priority — its text lands verbatim, and a similar
+          // existing row yields to it. Targets, in order: the near-identical
+          // neighbor the duplicate check used to reject, then an active
+          // neighbor holding the same fact key at any similarity (the
+          // update/contradiction shape, e.g. a new value for a versioned
+          // fact). Anything else falls through to the versioned-band check,
+          // and past that stores alongside: a wrong supersede destroys a real
+          // fact, while a duplicate is fixable noise.
+          // A manual-priority write with an EMPTY advisory still enters the
+          // locked path: two first-time same-key writers otherwise both see
+          // nothing and both plain-store, leaving two active rows for one
+          // fact key. The locked rediscovery is authoritative; when it also
+          // finds nothing, the commit is a plain create.
+          const manualPriorityWrite = manualSupersede && !force;
+          if (discovery.targets.length > 0 || manualPriorityWrite) {
+            // Canonical identity comes from the REQUESTED store, never from a
+            // near-duplicate donor: the new row's category and fact key are the
+            // requested ones, and overview/tier inherit only from a
+            // category-verified target (the band shape). Temporal expiry is
+            // preserved exactly like the plain-store path.
+            const buildSupersedeMetadata = (targets: MemoryEntry[], manualPriority: boolean): string => {
+              const now = Date.now();
+              const verified = targets
+                .map((target) => ({ target, meta: parseSmartMetadata(target.metadata, target) }))
+                .find(({ target }) =>
+                  matchesMemoryCategoryFilter(target.category, memoryCategory, target.metadata),
+                );
+              // The band keeps the verified target's ESTABLISHED key: deriving
+              // one from the replacement's wording would split the fact's
+              // history across two canonical identities. Requested-key
+              // precedence is the opt-in manual-priority contract only.
+              const factKey = manualPriority
+                ? newFactKey ?? verified?.meta.fact_key ?? undefined
+                : verified?.meta.fact_key ?? newFactKey ?? undefined;
+              const primary = targets[0];
+              return stringifySmartMetadata(buildSmartMetadata(
+                { text, category: storageCategory, importance: safeImportance },
                 {
-                  fact_key: factKey,
-                  invalidated_at: now,
-                  superseded_by: newEntry.id,
-                  relations: appendRelation(oldMeta.relations, {
-                    type: "superseded_by",
-                    targetId: newEntry.id,
-                  }),
+                  l0_abstract: text,
+                  // A manual-priority supersede replaces the fact's VALUE, so
+                  // the old row's overview is stale by definition; the band
+                  // case keeps the richer overview of its category-verified
+                  // target as before.
+                  l1_overview: manualPriority ? `- ${text}` : verified?.meta.l1_overview || `- ${text}`,
+                  l2_content: text,
+                  memory_category: memoryCategory,
+                  tier: verified?.meta.tier,
+                  source: "manual",
+                  state: "confirmed",
+                  memory_layer: deriveManualMemoryLayer(memoryCategory),
+                  last_confirmed_use_at: now,
+                  bad_recall_count: 0,
+                  suppressed_until_turn: 0,
+                  valid_from: now,
+                  memory_temporal_type: temporalType,
+                  valid_until: validUntil,
+                  ...(factKey ? { fact_key: factKey } : {}),
+                  ...(primary ? { supersedes: primary.id } : {}),
+                  relations: targets.reduce(
+                    (relations, target) =>
+                      appendRelation(relations, {
+                        type: "supersedes",
+                        targetId: target.id,
+                      }),
+                    [] as ReturnType<typeof appendRelation>,
+                  ),
                 },
-                [targetScope],
-              );
-            } catch (patchErr) {
-              // New record is already the source of truth; log but don't fail
+              ));
+            };
+
+            const buildInvalidationPatch = (target: MemoryEntry, newEntryId: string) => {
+              const targetMeta = parseSmartMetadata(target.metadata, target);
+              const sameCategory = matchesMemoryCategoryFilter(target.category, memoryCategory, target.metadata);
+              return {
+                // Backfill a missing fact key only on a category-verified
+                // target: stamping the new key onto a foreign-category
+                // near-duplicate would misfile it.
+                ...(!targetMeta.fact_key && sameCategory && newFactKey ? { fact_key: newFactKey } : {}),
+                invalidated_at: Date.now(),
+                superseded_by: newEntryId,
+                relations: appendRelation(targetMeta.relations, {
+                  type: "superseded_by",
+                  targetId: newEntryId,
+                }),
+              };
+            };
+
+            // Commit atomically at the store layer: recheck, insert, and
+            // invalidate run under one write lock, so concurrent same-key
+            // writers converge on a single active row instead of leaving two
+            // replacements standing.
+            let lastDiscovery = discovery;
+            let committed: Awaited<ReturnType<MemoryStore["storeSuperseding"]>>;
+            try {
+              committed = await runtimeContext.store.storeSuperseding({
+                entry: {
+                  text,
+                  vector,
+                  importance: safeImportance,
+                  category: storageCategory,
+                  scope: targetScope,
+                  metadata: "{}",
+                },
+                scopeFilter: [targetScope],
+                discoverTargets: async () => {
+                  lastDiscovery = await runSupersedeDiscovery();
+                  return lastDiscovery.targets.map((target) => target.entry);
+                },
+                finalizeEntryMetadata: (targets) =>
+                  buildSupersedeMetadata(targets, lastDiscovery.manual),
+                buildTargetPatch: buildInvalidationPatch,
+              });
+            } catch (err) {
+              // The locked recheck hit the scan bound (the scope crossed it
+              // after the advisory pass): the write aborts before the insert,
+              // so rejecting here leaves no partial state behind.
+              if (err instanceof FactKeyScanOverBoundError) {
+                return buildOverBoundRejection(err);
+              }
+              throw err;
+            }
+            const newEntry = committed.entry;
+            const { supersededIds, invalidationFailures } = committed;
+            for (const failure of invalidationFailures) {
+              // The new record is already stored; surface the unconfirmed
+              // invalidation instead of silently reporting it as superseded.
               console.warn(
-                `memory-pro: failed to patch superseded record ${oldEntry.id.slice(0, 8)}: ${patchErr}`,
+                `memory-pro: failed to invalidate superseded record ${failure.id.slice(0, 8)}: ${failure.reason}`,
               );
             }
 
@@ -1401,22 +1700,54 @@ export function registerMemoryStoreTool(
               );
             }
 
+            if (lastDiscovery.targets.length === 0) {
+              // First writer of this fact: the authoritative locked discovery
+              // found nothing to supersede, so this commit was a plain create
+              // and must report as one, not as "superseded no memories".
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Stored: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}" in scope '${targetScope}'`,
+                  },
+                ],
+                details: {
+                  action: "created",
+                  id: newEntry.id,
+                  scope: newEntry.scope,
+                  category: memoryCategory,
+                  rawCategory: newEntry.category,
+                  importance: newEntry.importance,
+                },
+              };
+            }
+
+            const supersededLabel = supersededIds.length > 1
+              ? `${supersededIds.length} memories (${supersededIds.map((id) => id.slice(0, 8)).join(", ")})`
+              : supersededIds.length === 1
+                ? `memory ${supersededIds[0].slice(0, 8)}...`
+                : "no memories";
+            const failureSuffix = invalidationFailures.length > 0
+              ? ` (${invalidationFailures.length} invalidation(s) failed; those rows may still be active)`
+              : "";
             return {
               content: [
                 {
                   type: "text",
-                  text: `Superseded memory ${oldEntry.id.slice(0, 8)}... → new version ${newEntry.id.slice(0, 8)}...: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`,
+                  text: `Superseded ${supersededLabel} → new version ${newEntry.id.slice(0, 8)}...: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"${failureSuffix}`,
                 },
               ],
               details: {
                 action: "superseded",
                 id: newEntry.id,
-                supersededId: oldEntry.id,
+                supersededId: supersededIds[0] ?? null,
+                supersededIds,
+                ...(invalidationFailures.length > 0 ? { invalidationFailures } : {}),
                 scope: newEntry.scope,
                 category: memoryCategory,
                 rawCategory: newEntry.category,
                 importance: newEntry.importance,
-                similarity: supersedeCandidate.score,
+                similarity: lastDiscovery.targets[0]?.score,
               },
             };
           }
@@ -1555,24 +1886,31 @@ export function registerMemoryForgetTool(
           }
 
           if (memoryId) {
-            const deleted = await context.store.delete(memoryId, scopeFilter);
+            const resolved = await resolveMemoryId(context, memoryId, scopeFilter, { requireExactRef: true });
+            if (resolved.ok === false) {
+              return {
+                content: [{ type: "text", text: resolved.message }],
+                details: resolved.details ?? { error: "not_found", id: memoryId },
+              };
+            }
+            const deleted = await context.store.delete(resolved.id, scopeFilter);
             if (deleted) {
               context.onMemoriesDeleted?.({ scopeFilter });
               return {
                 content: [
-                  { type: "text", text: `Memory ${memoryId} forgotten.` },
+                  { type: "text", text: `Memory ${resolved.id} forgotten.` },
                 ],
-                details: { action: "deleted", id: memoryId },
+                details: { action: "deleted", id: resolved.id },
               };
             } else {
               return {
                 content: [
                   {
                     type: "text",
-                    text: `Memory ${memoryId} not found or access denied.`,
+                    text: `Memory ${resolved.id} not found or access denied.`,
                   },
                 ],
-                details: { error: "not_found", id: memoryId },
+                details: { error: "not_found", id: resolved.id },
               };
             }
           }
@@ -1719,50 +2057,21 @@ export function registerMemoryUpdateTool(
           const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
           const scopeFilter = resolveScopeFilter(runtimeContext.scopeManager, agentId);
 
-          // Resolve memoryId: if it doesn't look like a UUID, try search
-          let resolvedId = memoryId;
-          const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(memoryId);
-          if (!uuidLike) {
-            // Treat as search query
-            const results = await retrieveWithRetry(context.retriever, {
-              query: memoryId,
-              limit: 3,
-              scopeFilter,
-            }, () => context.store.count());
-            if (results.length === 0) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `No memory found matching "${memoryId}".`,
-                  },
-                ],
-                details: { error: "not_found", query: memoryId },
-              };
-            }
-            if (results.length === 1 || results[0].score > 0.85) {
-              resolvedId = results[0].entry.id;
-            } else {
-              const list = results
-                .map(
-                  (r) =>
-                    `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
-                )
-                .join("\n");
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Multiple matches. Specify memoryId:\n${list}`,
-                  },
-                ],
-                details: {
-                  action: "candidates",
-                  candidates: sanitizeMemoryForSerialization(results),
-                },
-              };
-            }
+          // memoryId promises a UUID or an 8+ char id prefix; both resolve
+          // exactly. Anything else is rejected instead of falling through to
+          // semantic retrieval: update mutates (and can supersede) whatever
+          // row it resolves, so a malformed id-shaped input must never be
+          // allowed to select an unrelated row by low-score similarity.
+          const resolution = await resolveMemoryId(context, memoryId, scopeFilter, {
+            requireExactRef: true,
+          });
+          if (resolution.ok === false) {
+            return {
+              content: [{ type: "text", text: resolution.message }],
+              details: resolution.details ?? { error: "not_found", id: memoryId },
+            };
           }
+          const resolvedId = resolution.id;
 
           // If text changed, re-embed; reject noise
           let newVector: number[] | undefined;
@@ -2405,10 +2714,14 @@ export function registerMemoryPromoteTool(
             scopeFilter = [scope];
           }
 
+          // Dual selector: memoryId is the exact reference (UUID or 8+ char
+          // prefix, resolved exactly — this path mutates state); query is the
+          // explicit semantic selector and keeps retrieval-based resolution.
           const resolved = await resolveMemoryId(
             runtimeContext,
             memoryId ?? query ?? "",
             scopeFilter,
+            memoryId ? { requireExactRef: true } : undefined,
           );
           if (resolved.ok === false) {
             return {
@@ -2512,10 +2825,14 @@ export function registerMemoryArchiveTool(
             scopeFilter = [scope];
           }
 
+          // Dual selector: memoryId is the exact reference (UUID or 8+ char
+          // prefix, resolved exactly — this path mutates state); query is the
+          // explicit semantic selector and keeps retrieval-based resolution.
           const resolved = await resolveMemoryId(
             runtimeContext,
             memoryId ?? query ?? "",
             scopeFilter,
+            memoryId ? { requireExactRef: true } : undefined,
           );
           if (resolved.ok === false) {
             return {

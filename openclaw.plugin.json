@@ -297,6 +297,11 @@
         "default": false,
         "description": "Enable management/debug tools such as memory_list, memory_stats, and governance-oriented self-improvement review/extract actions"
       },
+      "manualStoreSupersede": {
+        "type": "boolean",
+        "default": false,
+        "description": "Manual-priority store lane: a memory_store that finds a similar existing memory supersedes it instead of being rejected as a duplicate; the manual text always lands verbatim. Off by default to preserve the classic duplicate check."
+      },
       "sessionStrategy": {
         "type": "string",
         "enum": [
@@ -433,6 +438,13 @@
         "default": 4,
         "description": "Minimum conversation messages required before smart extraction runs."
       },
+      "batchChunkSize": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50,
+        "default": 10,
+        "description": "Per-call chunk bound for the batched pipeline LLM stages: admission utility, dedup decider, and merge writer. Larger bursts split into ceil(N/batchChunkSize) calls. Values above 50 are clamped."
+      },
       "extractMaxChars": {
         "type": "integer",
         "minimum": 256,
@@ -459,13 +471,28 @@
             "default": "balanced",
             "description": "Named admission tuning preset. Explicit admissionControl fields still override the selected preset."
           },
+          "model": {
+            "type": "string",
+            "description": "Optional absolute override: when set, every admission LLM call uses this model, regardless of modelAffinity."
+          },
+          "modelAffinity": {
+            "type": "string",
+            "enum": [
+              "global",
+              "lane"
+            ],
+            "default": "global",
+            "description": "lane routes reflection-mapped admission calls to memoryReflection.model instead of the global llm model; global uses the plugin's global llm model for every lane."
+          },
           "utilityMode": {
             "type": "string",
             "enum": [
               "standalone",
-              "off"
+              "off",
+              "batch"
             ],
-            "default": "standalone"
+            "default": "standalone",
+            "description": "standalone scores each candidate with its own LLM call; batch scores a whole extraction's candidates with one call per chunk of up to 10; off disables utility scoring entirely."
           },
           "rejectThreshold": {
             "type": "number",
@@ -478,6 +505,13 @@
             "minimum": 0,
             "maximum": 1,
             "default": 0.6
+          },
+          "utilityVetoThreshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.25,
+            "description": "Utility scores at or below this are rejected regardless of the weighted composite (0 disables the veto)"
           },
           "noveltyCandidatePoolSize": {
             "type": "integer",
@@ -1472,6 +1506,11 @@
               "type": "string"
             },
             "description": "Agent/session patterns excluded from reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
+          },
+          "includeGroupChats": {
+            "type": "boolean",
+            "default": true,
+            "description": "Run the reflection distiller for group-chat sessions (session keys carrying a :group: or :channel: segment). Default true; set false to skip reflection generation on group channels."
           }
         }
       },
@@ -1569,6 +1608,19 @@
             "type": "integer",
             "minimum": 500,
             "default": 30000
+          },
+          "thinkLevel": {
+            "type": "string",
+            "description": "Reasoning effort requested from the model, e.g. low, medium, high. Host transport: always sent with a default of medium, a level that never disables reasoning, because omitting it has been observed to fall through to a disabled/no-reasoning default further down the host-managed runtime stack, silently degrading reasoning-capable models. Direct transport: sent only when explicitly configured; when unset, no reasoning parameter is sent and the provider's own default applies. Deliberately no JSON-schema default here: a schema default gets materialized into the plugin config upstream on at least one OpenClaw host config-loading path, indistinguishably from a genuine user value (the medium default lives in code -- DEFAULT_HOST_REASONING_EFFORT in src/llm-client.ts -- applied only on the host transport when unconfigured)."
+          },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "direct",
+              "host"
+            ],
+            "default": "direct",
+            "description": "Completion transport for the LLM lane. direct posts straight to llm.baseURL via the bundled OpenAI-compatible client (default; works standalone and in the CLI). host routes through OpenClaw's host-managed runtime LLM catalog so provider routing, auth profiles, and app attribution apply automatically; falls back to direct with a warning when the host runtime does not expose that surface."
           }
         }
       },
@@ -2224,6 +2276,11 @@
       "help": "Max concurrent reflection runs across all agents (reflections queue in per-agent lanes). Default 1 keeps reflections serialized; raise to allow parallel reflections.",
       "advanced": true
     },
+    "memoryReflection.includeGroupChats": {
+      "label": "Reflect Group Chats",
+      "help": "Run the reflection distiller for group-chat sessions (:group:/:channel: session keys). Default true; set false to skip reflection generation on group channels.",
+      "advanced": true
+    },
     "memoryReflection.messageCount": {
       "label": "Reflection Message Count",
       "help": "Recent messages included in reflection input",
@@ -2273,6 +2330,9 @@
       "label": "Management Tools",
       "help": "Enable management/debug tools such as memory_list, memory_stats, and governance-oriented self-improvement review/extract actions.",
       "advanced": true
+    },
+    "manualStoreSupersede": {
+      "help": "Manual memory_store always lands; a similar existing memory is superseded by it instead of blocking the write (fact-key aware). Default off."
     },
     "mdMirror.enabled": {
       "label": "Markdown Mirror",

@@ -176,6 +176,7 @@ interface ReflectionStoreDeps {
     scopeFilter?: string[]
   ) => Promise<MemorySearchResult[]>;
   store: (entry: Omit<MemoryEntry, "id" | "timestamp">) => Promise<MemoryEntry>;
+  onPersisted?: (entry: MemoryEntry, kind: ReflectionStoreKind) => Promise<void> | void;
 }
 
 interface StoreReflectionToLanceDBParams extends BuildReflectionStorePayloadsParams, ReflectionStoreDeps {
@@ -202,7 +203,7 @@ export async function storeReflectionToLanceDB(params: StoreReflectionToLanceDBP
       }
     }
 
-    await params.store({
+    const storedEntry = await params.store({
       text: payload.text,
       vector,
       category: "reflection",
@@ -211,6 +212,14 @@ export async function storeReflectionToLanceDB(params: StoreReflectionToLanceDBP
       metadata: JSON.stringify(payload.metadata),
     });
     storedKinds.push(payload.kind);
+
+    if (params.onPersisted && payload.kind !== "combined-legacy") {
+      try {
+        await params.onPersisted(storedEntry, payload.kind);
+      } catch {
+        // mirror/notification failures must never abort reflection persistence
+      }
+    }
   }
 
   return { stored: storedKinds.length > 0, eventId, slices, storedKinds };

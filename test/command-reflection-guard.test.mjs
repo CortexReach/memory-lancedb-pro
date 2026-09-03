@@ -365,3 +365,137 @@ describe("Unattributable sessionKey — no main masquerade, no mirroring", () =>
     );
   });
 });
+
+describe("Group-chat reflection toggle (memoryReflection.includeGroupChats)", () => {
+  let workDir;
+
+  beforeEach(() => {
+    workDir = mkdtempSync(path.join(tmpdir(), "cmd-reflect-group-"));
+    resetRegistration();
+  });
+
+  afterEach(() => {
+    resetRegistration();
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  function setupHarness(includeGroupChats) {
+    const pluginConfig = makePluginConfig(workDir);
+    if (includeGroupChats !== undefined) {
+      pluginConfig.memoryReflection.includeGroupChats = includeGroupChats;
+    }
+    const harness = createPluginApiHarness({ resolveRoot: workDir, pluginConfig });
+    memoryLanceDBProPlugin.register(harness.api);
+    return harness;
+  }
+
+  async function fireCommandNew(harness, sessionKey) {
+    const hooks = harness.eventHandlers.get("command:new") || [];
+    assert.ok(hooks.length > 0, "expected a command:new hook");
+    const event = {
+      sessionKey,
+      action: "command:new",
+      context: {
+        cfg: harness.api.pluginConfig,
+        sessionEntry: { sessionId: "test-session", sessionFile: undefined },
+      },
+    };
+    Object.defineProperty(event.context, "agentId", {
+      value: "main",
+      writable: true,
+      enumerable: true,
+    });
+    for (const hook of hooks) {
+      await hook.handler(event, { sessionKey, agentId: "main" });
+    }
+  }
+
+  async function invokeWithConfig(sessionKey, includeGroupChats) {
+    const harness = setupHarness(includeGroupChats);
+    await fireCommandNew(harness, sessionKey);
+    return harness.logs;
+  }
+
+  // The generation pipeline logs "hook start" only after every skip gate has
+  // passed -- its presence/absence is the downstream signal that reflection
+  // work actually began (or provably never did).
+  const startedGeneration = (logs) => logs.some(([, msg]) => msg.includes("command:command:new hook start") || msg.includes("command:new hook start"));
+  const loggedToggleSkip = (logs) => logs.some(([, msg]) => msg.includes("group-chat reflection disabled"));
+
+  it("skips reflection generation for a :group: session when disabled", async () => {
+    const logs = await invokeWithConfig("agent:main:slack:group:g0example1", false);
+    assert.ok(loggedToggleSkip(logs), "the hook must log the group-chat toggle skip");
+    assert.ok(!startedGeneration(logs), "no generation work may start for a disabled group session");
+  });
+
+  it("skips reflection generation for a :channel: session when disabled", async () => {
+    const logs = await invokeWithConfig("agent:main:slack:channel:c0example2", false);
+    assert.ok(loggedToggleSkip(logs), "the hook must log the group-chat toggle skip for channel keys");
+    assert.ok(!startedGeneration(logs), "no generation work may start for a disabled channel session");
+  });
+
+  it("skips a room-kind session when disabled (docs list ...:room:<id> forms)", async () => {
+    const logs = await invokeWithConfig("agent:main:matrix:room:!r0example3:homeserver.example", false);
+    assert.ok(loggedToggleSkip(logs), "room keys are multi-party and must honor the toggle");
+    assert.ok(!startedGeneration(logs), "no generation work may start for a disabled room session");
+  });
+
+  it("skips a thread under a channel when disabled (thread suffix stripped)", async () => {
+    const logs = await invokeWithConfig("agent:main:slack:channel:c0example4:thread:171200:9", false);
+    assert.ok(loggedToggleSkip(logs), "a thread within a channel is that channel's context");
+    assert.ok(!startedGeneration(logs), "no generation work may start for a disabled channel thread");
+  });
+
+  it("still reflects non-group sessions when the toggle is disabled", async () => {
+    const logs = await invokeWithConfig("agent:main:main", false);
+    assert.ok(!loggedToggleSkip(logs), "a non-group session must not trip the group-chat toggle");
+    assert.ok(startedGeneration(logs), "the generation pipeline must actually start for an allowed session");
+  });
+
+  it("never misreads an opaque direct-route peer id as a group marker", async () => {
+    // Structural kind position is "direct"; the ":channel:" segment belongs
+    // to the opaque peer id tail (core's parseSessionDeliveryRoute contract).
+    const logs = await invokeWithConfig("agent:main:discord:direct:user:channel:1", false);
+    assert.ok(!loggedToggleSkip(logs), "a direct route must never be suppressed by the group toggle");
+    assert.ok(startedGeneration(logs), "the generation pipeline must actually start for a direct session");
+  });
+
+  it("keeps group-chat reflection enabled by default", async () => {
+    const logs = await invokeWithConfig("agent:main:slack:group:g0example5", undefined);
+    assert.ok(!loggedToggleSkip(logs), "the default (toggle absent) must not skip group sessions");
+    assert.ok(startedGeneration(logs), "the generation pipeline must actually start under the default");
+  });
+
+  it("clears pre-boundary tool-error state when a boundary command skips a disabled group session", async () => {
+    const sessionKey = "agent:main:slack:group:g0example6";
+    const harness = setupHarness(false);
+
+    const toolHooks = harness.eventHandlers.get("after_tool_call") || [];
+    assert.ok(toolHooks.length > 0, "expected an after_tool_call hook");
+    for (const hook of toolHooks) {
+      await hook.handler(
+        { toolName: "probe-tool", error: "synthetic failure: fixture probe for boundary cleanup" },
+        { sessionKey, agentId: "main" },
+      );
+    }
+
+    await fireCommandNew(harness, sessionKey);
+
+    const promptHooks = harness.eventHandlers.get("before_prompt_build") || [];
+    assert.ok(promptHooks.length > 0, "expected before_prompt_build hooks");
+    const injected = [];
+    for (const hook of promptHooks) {
+      try {
+        const out = await hook.handler({}, { sessionKey, agentId: "main" });
+        if (out && typeof out.prependContext === "string") injected.push(out.prependContext);
+      } catch {
+        // Handlers needing richer fixtures may bail; only the injection
+        // content matters here.
+      }
+    }
+    assert.ok(
+      !injected.join("\n").includes("<error-detected>"),
+      "a pre-boundary tool error must not leak an error reminder across a skipped boundary",
+    );
+  });
+});

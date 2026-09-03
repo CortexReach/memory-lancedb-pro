@@ -77,10 +77,10 @@ async function runTest() {
         const chunks = [];
         for await (const chunk of req) chunks.push(chunk);
         const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-        const prompt = payload.messages?.[1]?.content || "";
+        const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
         let content;
 
-        if (prompt.includes("Analyze the following session context")) {
+        if (prompt.includes("You are a memory extraction agent")) {
             content = JSON.stringify({
                 memories: [{
                     category: "preferences",
@@ -89,13 +89,31 @@ async function runTest() {
                     content: "用户喜欢乌龙茶。",
                 }],
             });
-        } else if (prompt.includes("Determine how to handle this candidate memory")) {
-            content = JSON.stringify({
+        } else if (
+            prompt.includes("You are a memory dedup judge.") ||
+            prompt.includes("Decide every candidate independently")
+        ) {
+            const verdict = {
                 decision: dedupDecision,
                 match_index: 1,
                 reason: `test ${dedupDecision}`,
                 context_label: dedupContextLabel,
-            });
+            };
+            content = prompt.includes("Decide every candidate independently")
+                ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
+                : JSON.stringify(verdict);
+        } else if (
+            prompt.includes("You are a memory merge writer.") ||
+            prompt.includes("For each job, merge every")
+        ) {
+            const merged = {
+                abstract: "饮品偏好：乌龙茶",
+                overview: "## Preference\n- 喜欢乌龙茶",
+                content: "用户喜欢乌龙茶。",
+            };
+            content = prompt.includes("For each job, merge every")
+                ? JSON.stringify({ results: [{ index: 1, ...merged }] })
+                : JSON.stringify(merged);
         } else {
             content = JSON.stringify({ memories: [] });
         }

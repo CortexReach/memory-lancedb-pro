@@ -223,6 +223,32 @@ describe("buildMergedEntry", () => {
     assert.ok(typeof meta.compactedAt === "number");
   });
 
+  it("reconstructs a correct memory_category from sources that carry six-category values in the column", () => {
+    // Rows written by builds that put the six-category vocabulary straight
+    // into the legacy-typed column must not collapse into the "patterns"
+    // default when a merged row is reconstructed from them.
+    const a = entry({ category: "cases", text: "Runbook: restart the ingest worker" });
+    const b = entry({ category: "cases", text: "Runbook: rotate the API key" });
+    const merged = buildMergedEntry([a, b]);
+    const meta = JSON.parse(merged.metadata);
+    assert.equal(meta.memory_category, "cases");
+    assert.notEqual(meta.memory_category, "patterns");
+  });
+
+  it("reconstructs preferences sources as preferences, not patterns", () => {
+    const a = entry({ category: "preferences", text: "prefers dark roast" });
+    const b = entry({ category: "preferences", text: "prefers window seats" });
+    const merged = buildMergedEntry([a, b]);
+    assert.equal(JSON.parse(merged.metadata).memory_category, "preferences");
+  });
+
+  it("maps a bare legacy decision plurality to events under the canonical mapping", () => {
+    const a = entry({ category: "decision", text: "Chose LanceDB for local dev" });
+    const b = entry({ category: "decision", text: "Chose npm over pnpm here" });
+    const merged = buildMergedEntry([a, b]);
+    assert.equal(JSON.parse(merged.metadata).memory_category, "events");
+  });
+
   it("builds searchable L0/L1/L2 metadata from source full content", () => {
     const a = entry({
       text: "OpenClaw incident 786 retrieval structure.",

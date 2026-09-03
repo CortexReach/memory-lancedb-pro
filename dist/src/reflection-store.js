@@ -113,7 +113,7 @@ export async function storeReflectionToLanceDB(params) {
                 continue;
             }
         }
-        await params.store({
+        const storedEntry = await params.store({
             text: payload.text,
             vector,
             category: "reflection",
@@ -122,6 +122,14 @@ export async function storeReflectionToLanceDB(params) {
             metadata: JSON.stringify(payload.metadata),
         });
         storedKinds.push(payload.kind);
+        if (params.onPersisted && payload.kind !== "combined-legacy") {
+            try {
+                await params.onPersisted(storedEntry, payload.kind);
+            }
+            catch {
+                // mirror/notification failures must never abort reflection persistence
+            }
+        }
     }
     return { stored: storedKinds.length > 0, eventId, slices, storedKinds };
 }

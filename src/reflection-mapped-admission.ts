@@ -19,31 +19,25 @@
  * topology differs.
  */
 
-import type { AdmissionEvaluation } from "./admission-control.js";
-import type { CandidateMemory, MemoryCategory } from "./memory-categories.js";
+import type { AdmissionEvaluation, AdmissionController } from "./admission-control.js";
 
 /**
- * Admission typePriors are keyed by the six smart registers, but mapped rows
- * carry legacy store categories. Score them under the smart register that
- * matches their shape: user-model/agent-model deltas are preference-shaped
- * statements about the human or the assistant ("preference"), lessons are
- * symptom/cause/fix/prevention pairs ("fact" here, cases-shaped), and
- * decisions are episodic records of something decided ("events").
+ * Which AdmissionController gates a mapped reflection row: the dedicated
+ * reflection-lane controller when lane affinity built one, otherwise the
+ * base controller shared with extraction. Both may be null (admission
+ * disabled), which the gate treats as passthrough.
  */
-export function mapReflectionMappedCategoryToSmartRegister(
-  category: string,
-): MemoryCategory {
-  switch (category) {
-    case "preference":
-      return "preferences";
-    case "fact":
-      return "cases";
-    case "decision":
-      return "events";
-    default:
-      return "events";
-  }
+export function resolveMappedRowAdmissionController(
+  reflectionLaneController: AdmissionController | null,
+  baseController: AdmissionController | null,
+): AdmissionController | null {
+  return reflectionLaneController ?? baseController;
 }
+import type { CandidateMemory } from "./memory-categories.js";
+import {
+  getReflectionMappedMemoryCategory,
+  type ReflectionMappedKind,
+} from "./reflection-mapped-metadata.js";
 
 interface MappedReflectionGateItem {
   candidate: CandidateMemory;
@@ -75,7 +69,7 @@ export interface MappedReflectionGateResult {
 /** One mapped row's gate-relevant fields, in distillate order. */
 export interface MappedReflectionEntryInput {
   text: string;
-  category: string;
+  mappedKind: ReflectionMappedKind;
   heading: string;
   vector: number[];
 }
@@ -87,7 +81,11 @@ function buildGateItem(
 ): MappedReflectionGateItem {
   return {
     candidate: {
-      category: mapReflectionMappedCategoryToSmartRegister(row.category),
+      // Admission typePriors are keyed by the six smart registers. Scoring
+      // reads the SAME kind→category table the persisted memory_category
+      // stamp comes from (reflection-mapped-metadata.ts) so the register a
+      // row is judged under always matches the register it is stored under.
+      category: getReflectionMappedMemoryCategory(row.mappedKind),
       abstract: row.text,
       overview: `## ${row.heading}`,
       content: row.text,
@@ -153,6 +151,8 @@ function buildGateResult(
  */
 export async function gateMappedReflectionEntries(params: {
   admissionController: MappedReflectionAdmissionGate | null;
+  /** True when admissionControl.enabled is set: a missing controller then means init failed, not "disabled". */
+  admissionRequired?: boolean;
   attachAudit: boolean;
   rows: MappedReflectionEntryInput[];
   /**
@@ -170,6 +170,14 @@ export async function gateMappedReflectionEntries(params: {
     return [];
   }
   if (!admissionController) {
+    if (params.admissionRequired) {
+      // Enabled-but-unavailable is an init failure, not "disabled": failing
+      // open here would silently restore the ungated writer-1 bypass for
+      // every burst until restart.
+      const reason = "admission control is enabled but no controller is available (initialization failed); failing closed";
+      params.warnLog?.(`memory-reflection: mapped-row burst rejected: ${reason}`);
+      return rows.map(() => ({ admit: false, reason }));
+    }
     return rows.map(() => ({ admit: true }));
   }
 
@@ -218,9 +226,11 @@ export async function gateMappedReflectionEntries(params: {
  */
 export async function gateMappedReflectionEntry(params: {
   admissionController: MappedReflectionAdmissionGate | null;
+  /** True when admissionControl.enabled is set: a missing controller then means init failed, not "disabled". */
+  admissionRequired?: boolean;
   attachAudit: boolean;
   text: string;
-  category: string;
+  mappedKind: ReflectionMappedKind;
   heading: string;
   vector: number[];
   /**
@@ -234,11 +244,12 @@ export async function gateMappedReflectionEntry(params: {
 }): Promise<MappedReflectionGateResult> {
   const [result] = await gateMappedReflectionEntries({
     admissionController: params.admissionController,
+    admissionRequired: params.admissionRequired,
     attachAudit: params.attachAudit,
     rows: [
       {
         text: params.text,
-        category: params.category,
+        mappedKind: params.mappedKind,
         heading: params.heading,
         vector: params.vector,
       },

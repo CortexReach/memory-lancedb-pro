@@ -166,12 +166,16 @@ describe("SmartExtractor onPersisted callback (mdMirror integration)", () => {
         if (mode === "dedup-decision") {
           return { decision: "merge", match_index: 1, reason: "same preference" };
         }
-        if (mode === "merge-memory") {
-          return {
+        if (mode === "dedup-decision-batch") {
+          return { results: [{ index: 1, decision: "merge", match_index: 1, reason: "same preference" }] };
+        }
+        if (mode === "merge-memory" || mode === "merge-memory-batch") {
+          const merged = {
             abstract: "Tea preference: oolong tea, prefers it strong",
             overview: "## Preference\n- Likes strong oolong tea",
             content: "The user likes strong oolong tea.",
           };
+          return mode === "merge-memory-batch" ? { results: [{ index: 1, ...merged }] } : merged;
         }
         throw new Error(`unexpected mode: ${mode}`);
       },

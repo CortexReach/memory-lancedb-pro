@@ -28,10 +28,10 @@ const jiti = jitiFactory(import.meta.url, {
 });
 
 const {
-  mapReflectionMappedCategoryToSmartRegister,
   gateMappedReflectionEntry,
   gateMappedReflectionEntries,
 } = jiti("../src/reflection-mapped-admission.ts");
+const { getReflectionMappedMemoryCategory, getReflectionMappedStorageCategory } = jiti("../src/reflection-mapped-metadata.ts");
 const { AdmissionController, ADMISSION_CONTROL_PRESETS } = jiti("../src/admission-control.ts");
 
 const REFLECTION_TEXT = [
@@ -41,19 +41,19 @@ const REFLECTION_TEXT = [
   "- Decision: keep the deploy branch cut from a fresh master.",
 ].join("\n");
 
-describe("mapReflectionMappedCategoryToSmartRegister", () => {
-  it("maps legacy mapped categories onto the smart registers admission priors use", () => {
-    assert.equal(mapReflectionMappedCategoryToSmartRegister("preference"), "preferences");
-    assert.equal(mapReflectionMappedCategoryToSmartRegister("fact"), "cases");
-    assert.equal(mapReflectionMappedCategoryToSmartRegister("decision"), "events");
-    assert.equal(mapReflectionMappedCategoryToSmartRegister("unknown-legacy"), "events", "unknown categories take the lowest-prior durable-free register");
+describe("admission register derivation (single source with the persisted stamp)", () => {
+  it("scores every mapped kind under exactly the register its memory_category stamp uses", () => {
+    assert.equal(getReflectionMappedMemoryCategory("user-model"), "preferences");
+    assert.equal(getReflectionMappedMemoryCategory("agent-model"), "patterns");
+    assert.equal(getReflectionMappedMemoryCategory("lesson"), "cases");
+    assert.equal(getReflectionMappedMemoryCategory("decision"), "cases");
   });
 });
 
 describe("gateMappedReflectionEntry", () => {
   const baseParams = {
     text: "Operator prefers streaming test reporters for long suites.",
-    category: "preference",
+    mappedKind: "user-model",
     heading: "User model deltas (about the human)",
     vector: [1, 0, 0],
     conversationText: REFLECTION_TEXT,
@@ -199,19 +199,19 @@ describe("gateMappedReflectionEntries (batched burst)", () => {
   const rows = [
     {
       text: "Operator prefers streaming test reporters for long suites.",
-      category: "preference",
+      mappedKind: "user-model",
       heading: "User model deltas (about the human)",
       vector: [1, 0, 0],
     },
     {
       text: "Symptom: flaky port bind. Cause: parallel suites. Fix: ephemeral ports.",
-      category: "fact",
+      mappedKind: "lesson",
       heading: "Lessons & pitfalls",
       vector: [0, 1, 0],
     },
     {
       text: "Decision: keep the deploy branch cut from a fresh master.",
-      category: "decision",
+      mappedKind: "decision",
       heading: "Decisions (durable)",
       vector: [0, 0, 1],
     },
@@ -257,7 +257,11 @@ describe("gateMappedReflectionEntries (batched burst)", () => {
     assert.equal(seenItems.length, 3);
     assert.equal(seenItems[0].candidate.category, "preferences");
     assert.equal(seenItems[1].candidate.category, "cases");
-    assert.equal(seenItems[2].candidate.category, "events");
+    assert.equal(
+      seenItems[2].candidate.category,
+      "cases",
+      "decision rows are judged under the same register their memory_category stamp uses",
+    );
     for (const item of seenItems) {
       assert.equal(item.conversationText, REFLECTION_TEXT);
       assert.deepEqual(item.scopeFilter, ["global"]);
@@ -410,14 +414,15 @@ describe("gateMappedReflectionEntries (batched burst)", () => {
   });
 });
 
-describe("production pipeline: parse distillate -> gate -> bulkStore (end to end)", () => {
+describe("production pipeline: parse distillate -> gate -> persist (end to end)", () => {
   // Mirrors index.ts's runMemoryReflection loop shape exactly: parse mapped items from
-  // the distillate, gate each one, skip on reject, push admitted rows to bulkStore.
-  // A change to that orchestration (e.g. the item-2 bug this PR itself fixed, where
-  // pass_to_dedup was silently treated as unconditional admit with no way to reject)
-  // would be caught here without needing to drive the full agent_end hook and mock an
-  // embedded reflection LLM run just to reach this loop.
-  async function runMappedRowPipeline({ reflectionText, admissionController, conversationText }) {
+  // the distillate, gate each one, skip on reject, then persist admitted rows through
+  // SmartExtractor.persistGatedCandidates when smart extraction is on, or through the
+  // exclusive bulkStore fallback when it is off. A change to that orchestration (e.g.
+  // the item-2 bug an earlier revision fixed, where pass_to_dedup was silently treated
+  // as unconditional admit with no way to reject) would be caught here without needing
+  // to drive the full agent_end hook and mock an embedded reflection LLM run.
+  async function runMappedRowPipeline({ reflectionText, admissionController, conversationText, smartExtractor = null }) {
     const { extractInjectableReflectionMappedMemoryItems } = jiti("../src/reflection-slices.ts");
     const bulkStoreCalls = [];
     const store = {
@@ -433,7 +438,7 @@ describe("production pipeline: parse distillate -> gate -> bulkStore (end to end
     const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
     const gateRows = mappedReflectionMemories.map((mapped) => ({
       text: mapped.text,
-      category: mapped.category,
+      mappedKind: mapped.mappedKind,
       heading: mapped.heading,
       vector: [1, 0, 0],
     }));
@@ -446,6 +451,7 @@ describe("production pipeline: parse distillate -> gate -> bulkStore (end to end
     });
 
     const mappedEntries = [];
+    const mappedGatedItems = [];
     const rejections = [];
     for (let i = 0; i < mappedReflectionMemories.length; i++) {
       const mapped = mappedReflectionMemories[i];
@@ -454,7 +460,24 @@ describe("production pipeline: parse distillate -> gate -> bulkStore (end to end
         rejections.push({ text: mapped.text, reason: gate.reason });
         continue;
       }
-      mappedEntries.push({ text: mapped.text, category: mapped.category, metadata: JSON.stringify({ admission_audit: gate.auditJson }) });
+      const metadata = JSON.stringify({ admission_audit: gate.auditJson });
+      if (smartExtractor) {
+        mappedGatedItems.push({
+          candidate: {
+            category: getReflectionMappedMemoryCategory(mapped.mappedKind),
+            abstract: mapped.text,
+            overview: `## ${mapped.heading}`,
+            content: mapped.text,
+          },
+          vector: [1, 0, 0],
+          buildEntry: (v) => ({ text: mapped.text, vector: v, category: getReflectionMappedStorageCategory(mapped.mappedKind), metadata }),
+        });
+      } else {
+        mappedEntries.push({ text: mapped.text, category: getReflectionMappedStorageCategory(mapped.mappedKind), metadata });
+      }
+    }
+    if (smartExtractor && mappedGatedItems.length > 0) {
+      await smartExtractor.persistGatedCandidates(mappedGatedItems, { targetScope: "global", scopeFilter: ["global"] });
     }
     if (mappedEntries.length > 0) {
       await store.bulkStore(mappedEntries);
@@ -462,7 +485,7 @@ describe("production pipeline: parse distillate -> gate -> bulkStore (end to end
     return { bulkStoreCalls, rejections };
   }
 
-  it("a rejected mapped row is never passed to store.bulkStore, an admitted sibling still is", async () => {
+  it("no-extractor fallback: a rejected mapped row is never passed to store.bulkStore, an admitted sibling still is", async () => {
     const realConversation = "User: I mostly work on backend Python services.\nAssistant: noted.";
     const distillate = [
       "## User model deltas (about the human)",
@@ -501,7 +524,7 @@ describe("production pipeline: parse distillate -> gate -> bulkStore (end to end
     );
   });
 
-  it("when every mapped row is rejected, bulkStore is never called at all", async () => {
+  it("no-extractor fallback: when every mapped row is rejected, bulkStore is never called at all", async () => {
     const distillate = [
       "## User model deltas (about the human)",
       "- User lives on Mars.",
@@ -521,13 +544,53 @@ describe("production pipeline: parse distillate -> gate -> bulkStore (end to end
     assert.equal(rejections.length, 1);
     assert.equal(bulkStoreCalls.length, 0, "bulkStore must not be called when nothing was admitted");
   });
+
+  it("routes admitted rows through the extractor's uniform pipeline and never calls bulkStore directly when smart extraction is on", async () => {
+    const distillate = [
+      "## User model deltas (about the human)",
+      "- Operator prefers streaming test reporters for long suites.",
+      "## Decisions (durable)",
+      "- Decision: keep the deploy branch cut from a fresh master.",
+    ].join("\n");
+    const controller = {
+      async evaluate() {
+        return { decision: "pass_to_dedup", audit: { decision: "pass_to_dedup", reason: "grounded" } };
+      },
+    };
+    const persistCalls = [];
+    const smartExtractor = {
+      async persistGatedCandidates(items, options) {
+        persistCalls.push({ items, options });
+        return { stats: { created: items.length, merged: 0, skipped: 0, boundarySkipped: 0 }, createdEntries: [] };
+      },
+    };
+
+    const { bulkStoreCalls, rejections } = await runMappedRowPipeline({
+      reflectionText: distillate,
+      admissionController: controller,
+      conversationText: "User: I prefer streaming test reporters, and let's keep cutting deploy branches from a fresh master.",
+      smartExtractor,
+    });
+
+    assert.equal(rejections.length, 0);
+    assert.equal(persistCalls.length, 1, "one uniform-pipeline call per admitted burst");
+    assert.equal(persistCalls[0].items.length, 2, "every admitted row rides the same burst");
+    const first = persistCalls[0].items[0];
+    assert.equal(first.candidate.category, getReflectionMappedMemoryCategory("user-model"));
+    assert.equal(typeof first.buildEntry, "function");
+    const built = first.buildEntry([1, 0, 0]);
+    assert.equal(built.category, getReflectionMappedStorageCategory("user-model"));
+    assert.ok(JSON.parse(built.metadata).admission_audit, "the gate audit must survive into the built entry");
+    assert.equal(bulkStoreCalls.length, 0, "the uniform route must never call store.bulkStore directly");
+  });
 });
 
 describe("buildReflectionPrompt grounding discipline", () => {
   it("instructs the distiller to keep in-fiction claims out of the mapped (durable) sections", () => {
     const { buildReflectionPrompt } = jiti("../index.ts");
     assert.equal(typeof buildReflectionPrompt, "function", "buildReflectionPrompt must be exported for prompt-content tests");
-    const prompt = buildReflectionPrompt("conversation text", 4000, []);
+    const built = buildReflectionPrompt("conversation text", 4000, []);
+    const prompt = typeof built === "string" ? built : `${built.system}\n\n${built.user}`;
 
     assert.match(prompt, /roleplay/i);
     assert.match(prompt, /not real/i);
