@@ -26,6 +26,7 @@ let dualMemoryHintLogged = false;
 
 // Import core components
 import { MemoryStore, normalizeStoragePath, type MemoryEntry } from "./src/store.js";
+import { resolveOpenClawConfigPath, resolveOpenClawStateDir } from "./src/openclaw-paths.js";
 import {
   createEmbedder,
   getEffectiveVectorDimensions,
@@ -384,18 +385,15 @@ type ReflectionInjectMode = "inheritance-only" | "inheritance+derived";
 // ============================================================================
 
 function getDefaultDbPath(): string {
-  const home = homedir();
-  return join(home, ".openclaw", "memory", "lancedb-pro");
+  return join(resolveOpenClawStateDir(), "memory", "lancedb-pro");
 }
 
 function getDefaultWorkspaceDir(): string {
-  const home = homedir();
-  return join(home, ".openclaw", "workspace");
+  return join(resolveOpenClawStateDir(), "workspace");
 }
 
 function getDefaultMdMirrorDir(): string {
-  const home = homedir();
-  return join(home, ".openclaw", "memory", "md-mirror");
+  return join(resolveOpenClawStateDir(), "memory", "md-mirror");
 }
 
 function resolveWorkspaceDirFromContext(context: Record<string, unknown> | undefined): string {
@@ -2208,35 +2206,37 @@ async function findPreviousSessionFile(
 
 type AgentWorkspaceMap = Record<string, string>;
 
+function collectAgentWorkspaces(agents: unknown, map: AgentWorkspaceMap): void {
+  if (Array.isArray(agents)) {
+    for (const agent of agents) {
+      if (agent?.id && typeof agent.workspace === "string") {
+        map[String(agent.id)] = agent.workspace;
+      }
+    }
+    return;
+  }
+  if (agents && typeof agents === "object") {
+    for (const [id, agent] of Object.entries(agents as Record<string, any>)) {
+      if (agent && typeof agent.workspace === "string") {
+        map[id] = agent.workspace;
+      }
+    }
+  }
+}
+
 function resolveAgentWorkspaceMap(api: OpenClawPluginApi): AgentWorkspaceMap {
   const map: AgentWorkspaceMap = {};
 
-  // Try api.config first (runtime config)
-  const agents = Array.isArray((api as any).config?.agents?.list)
-    ? (api as any).config.agents.list
-    : [];
+  const runtimeAgents = (api as any).config?.agents;
+  collectAgentWorkspaces(runtimeAgents?.list, map);
+  collectAgentWorkspaces(runtimeAgents?.entries, map);
 
-  for (const agent of agents) {
-    if (agent?.id && typeof agent.workspace === "string") {
-      map[String(agent.id)] = agent.workspace;
-    }
-  }
-
-  // Fallback: read from openclaw.json (respect OPENCLAW_HOME if set)
   if (Object.keys(map).length === 0) {
     try {
-      const openclawHome = process.env.OPENCLAW_HOME || join(homedir(), ".openclaw");
-      const configPath = join(openclawHome, "openclaw.json");
-      const raw = readFileSync(configPath, "utf8");
+      const raw = readFileSync(resolveOpenClawConfigPath(), "utf8");
       const parsed = JSON.parse(raw);
-      const list = parsed?.agents?.list;
-      if (Array.isArray(list)) {
-        for (const agent of list) {
-          if (agent?.id && typeof agent.workspace === "string") {
-            map[String(agent.id)] = agent.workspace;
-          }
-        }
-      }
+      collectAgentWorkspaces(parsed?.agents?.list, map);
+      collectAgentWorkspaces(parsed?.agents?.entries, map);
     } catch {
       /* silent */
     }
@@ -7267,7 +7267,14 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   };
 }
 
-export { getDefaultMdMirrorDir };
+export {
+  getDefaultMdMirrorDir,
+  getDefaultDbPath,
+  getDefaultWorkspaceDir,
+  resolveOpenClawStateDir,
+  resolveOpenClawConfigPath,
+  resolveAgentWorkspaceMap,
+};
 
 /**
  * Resets the registration state — primarily intended for use in tests that need

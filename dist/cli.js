@@ -3,11 +3,11 @@
  */
 import { readFileSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import path from "node:path";
 import * as readline from "node:readline";
 import JSON5 from "json5";
 import { loadLanceDB } from "./src/store.js";
+import { resolveOpenClawStateDir } from "./src/openclaw-paths.js";
 import { createRetriever } from "./src/retriever.js";
 import { createMemoryUpgrader, isCurrentReflectionMemory } from "./src/memory-upgrader.js";
 import { getDefaultOauthModelForProvider, getOAuthProviderLabel, isOauthModelSupported, listOAuthProviders, normalizeOauthModel, normalizeOAuthProviderId, performOAuthLogin, } from "./src/llm-oauth.js";
@@ -51,9 +51,7 @@ function resolveOpenClawConfigPath(explicit) {
     return path.join(openclawHome, "openclaw.json");
 }
 function resolveOpenClawHome() {
-    return process.env.OPENCLAW_HOME?.trim()
-        ? path.resolve(process.env.OPENCLAW_HOME.trim())
-        : path.join(homedir(), ".openclaw");
+    return path.resolve(resolveOpenClawStateDir());
 }
 function resolveDefaultOauthPath() {
     return path.join(resolveOpenClawHome(), ".memory-lancedb-pro", "oauth.json");
@@ -422,7 +420,7 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
     const startMs = Date.now();
     const openclawHome = options.openclawHome
         ? path.resolve(options.openclawHome)
-        : path.join(homedir(), ".openclaw");
+        : resolveOpenClawHome();
     const workspaceDir = path.join(openclawHome, "workspace");
     let imported = 0;
     let skipped = 0;
@@ -882,7 +880,7 @@ export function registerMemoryCLI(program, context) {
         .option("--config <path>", "OpenClaw config file to update")
         .option("--provider <provider>", `OAuth provider to use (${OAUTH_PROVIDER_CHOICES})`)
         .option("--model <model>", "Override the model saved into llm.model")
-        .option("--oauth-path <path>", "OAuth file path (default: ~/.openclaw/.memory-lancedb-pro/oauth.json)")
+        .option("--oauth-path <path>", "OAuth file path (default: <openclaw home>/.memory-lancedb-pro/oauth.json)")
         .option("--timeout <seconds>", "OAuth callback timeout in seconds", "120")
         .option("--no-browser", "Do not auto-open the browser; print the authorization URL only")
         .action(async (options) => {
@@ -1486,7 +1484,7 @@ export function registerMemoryCLI(program, context) {
         .description("Import memories from Markdown files (MEMORY.md, memory/YYYY-MM-DD.md) into the plugin store")
         .option("--dry-run", "Show what would be imported without importing")
         .option("--scope <scope>", "Import into specific scope (default: auto-discovered from workspace)")
-        .option("--openclaw-home <path>", "OpenClaw home directory (default: ~/.openclaw)")
+        .option("--openclaw-home <path>", "OpenClaw home directory (default: $OPENCLAW_STATE_DIR, else ~/.openclaw)")
         .option("--dedup", "Skip entries already in store (scope-aware exact match, requires store.bm25Search)")
         .option("--min-text-length <n>", "Minimum text length to import (default: 5)", "5")
         .option("--importance <n>", "Importance score for imported entries, 0.0-1.0 (default: 0.7)", "0.7")

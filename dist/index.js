@@ -2,7 +2,7 @@
  * Memory LanceDB Pro Plugin
  * Enhanced LanceDB-backed long-term memory with hybrid retrieval and multi-scope isolation
  */
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join, dirname, basename, win32 as winPath } from "node:path";
 import { readFile, readdir, writeFile, mkdir, appendFile, unlink, stat } from "node:fs/promises";
 import { readFileSync } from "node:fs";
@@ -21,6 +21,7 @@ const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 let dualMemoryHintLogged = false;
 // Import core components
 import { MemoryStore, normalizeStoragePath } from "./src/store.js";
+import { resolveOpenClawConfigPath, resolveOpenClawStateDir } from "./src/openclaw-paths.js";
 import { createEmbedder, getEffectiveVectorDimensions, } from "./src/embedder.js";
 import { createRetriever, normalizeRetrievalConfig, } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
@@ -63,16 +64,13 @@ const SUPPORTED_SECRET_REF_SOURCES = ["env", "file"];
 // Default Configuration
 // ============================================================================
 function getDefaultDbPath() {
-    const home = homedir();
-    return join(home, ".openclaw", "memory", "lancedb-pro");
+    return join(resolveOpenClawStateDir(), "memory", "lancedb-pro");
 }
 function getDefaultWorkspaceDir() {
-    const home = homedir();
-    return join(home, ".openclaw", "workspace");
+    return join(resolveOpenClawStateDir(), "workspace");
 }
 function getDefaultMdMirrorDir() {
-    const home = homedir();
-    return join(home, ".openclaw", "memory", "md-mirror");
+    return join(resolveOpenClawStateDir(), "memory", "md-mirror");
 }
 function resolveWorkspaceDirFromContext(context) {
     const runtimePath = typeof context?.workspaceDir === "string" ? context.workspaceDir.trim() : "";
@@ -1620,32 +1618,34 @@ async function findPreviousSessionFile(sessionsDir, currentSessionFile, sessionI
     }
     catch { }
 }
-function resolveAgentWorkspaceMap(api) {
-    const map = {};
-    // Try api.config first (runtime config)
-    const agents = Array.isArray(api.config?.agents?.list)
-        ? api.config.agents.list
-        : [];
-    for (const agent of agents) {
-        if (agent?.id && typeof agent.workspace === "string") {
-            map[String(agent.id)] = agent.workspace;
+function collectAgentWorkspaces(agents, map) {
+    if (Array.isArray(agents)) {
+        for (const agent of agents) {
+            if (agent?.id && typeof agent.workspace === "string") {
+                map[String(agent.id)] = agent.workspace;
+            }
+        }
+        return;
+    }
+    if (agents && typeof agents === "object") {
+        for (const [id, agent] of Object.entries(agents)) {
+            if (agent && typeof agent.workspace === "string") {
+                map[id] = agent.workspace;
+            }
         }
     }
-    // Fallback: read from openclaw.json (respect OPENCLAW_HOME if set)
+}
+function resolveAgentWorkspaceMap(api) {
+    const map = {};
+    const runtimeAgents = api.config?.agents;
+    collectAgentWorkspaces(runtimeAgents?.list, map);
+    collectAgentWorkspaces(runtimeAgents?.entries, map);
     if (Object.keys(map).length === 0) {
         try {
-            const openclawHome = process.env.OPENCLAW_HOME || join(homedir(), ".openclaw");
-            const configPath = join(openclawHome, "openclaw.json");
-            const raw = readFileSync(configPath, "utf8");
+            const raw = readFileSync(resolveOpenClawConfigPath(), "utf8");
             const parsed = JSON.parse(raw);
-            const list = parsed?.agents?.list;
-            if (Array.isArray(list)) {
-                for (const agent of list) {
-                    if (agent?.id && typeof agent.workspace === "string") {
-                        map[String(agent.id)] = agent.workspace;
-                    }
-                }
-            }
+            collectAgentWorkspaces(parsed?.agents?.list, map);
+            collectAgentWorkspaces(parsed?.agents?.entries, map);
         }
         catch {
             /* silent */
@@ -5835,7 +5835,7 @@ export function parsePluginConfig(value) {
             : undefined,
     };
 }
-export { getDefaultMdMirrorDir };
+export { getDefaultMdMirrorDir, getDefaultDbPath, getDefaultWorkspaceDir, resolveOpenClawStateDir, resolveOpenClawConfigPath, resolveAgentWorkspaceMap, };
 /**
  * Resets the registration state — primarily intended for use in tests that need
  * to unload/reload the plugin without restarting the process.
