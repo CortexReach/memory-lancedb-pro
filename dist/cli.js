@@ -2088,7 +2088,7 @@ function registerConsolidateCommand(memory, context) {
         .requiredOption("--agent <agentId>", "Agent whose memory to consolidate (scope agent:<agentId>; journal-mirror writes route to this agent's workspace)")
         .option("--category <category>", "Limit to one smart category (profile|preferences|entities|events|cases|patterns)")
         .option("--since <iso>", "Only consider rows stored at or after this ISO timestamp")
-        .option("--apply", "Apply the consolidation plan immediately and record settled clusters (default is a dry-run preview with an interactive apply prompt; a dry-run never writes the store or the settled ledger)", false)
+        .option("--apply", "Apply the consolidation plan immediately and record settled clusters (default is a dry-run preview with an interactive apply prompt; a dry-run never writes the store or the settled ledger); exits with status 1 when any cluster failed or was only partially applied", false)
         .option("--yes", "Skip the LLM-cost confirmation prompt. Automation needs BOTH --yes and --apply: without --apply a non-interactive run pays for a plan it can never apply", false)
         .option("--include-reflection-slices", "Include reflection writer-2 slice rows in the scan (excluded by default)", false)
         .option("--scan-limit <n>", `Maximum rows to scan before clustering (default ${DEFAULT_SCAN_LIMIT}; clustering is O(n^2), raise deliberately)`)
@@ -2238,6 +2238,12 @@ function registerConsolidateCommand(memory, context) {
             }
             for (const failed of result.applyFailed) {
                 console.log(`  failed: cluster of ${pluralCount(failed.memberIds.length, "row")} (${failed.action}) — ${failed.error}`);
+            }
+            if (partial.length > 0 || result.applyFailed.length > 0) {
+                // An incomplete apply must not look like success to cron, CI, or scripts:
+                // exit non-zero, but via exitCode so the report above is fully flushed.
+                console.error(`consolidate: apply incomplete (${pluralCount(partial.length, "cluster")} partially applied, ${pluralCount(result.applyFailed.length, "cluster")} failed); exiting with status 1.`);
+                process.exitCode = 1;
             }
         }
         catch (error) {

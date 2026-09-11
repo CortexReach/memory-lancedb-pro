@@ -155,6 +155,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/memory-consolidate-admission-independence.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-consolidate-polish.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/consolidate-cli-settled-persistence.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/consolidate-cli-apply-exit-status.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/invalidated-rows-visibility.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/store-excludeinactive-default.test.mjs", args: ["--test"] },
 ];
