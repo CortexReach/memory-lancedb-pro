@@ -11,8 +11,12 @@
  * Matching is deliberately conservative: a candidate is an echo only when
  * it asserts NOTHING beyond, and nothing different from, the recorded
  * manual text: an exact match, the manual text containing the candidate
- * verbatim, or the candidate carrying exactly the manual text's content
- * tokens in the same order once reporting glue is stripped. A candidate
+ * as a whole-token run (never a raw substring: "has a cat" is not inside
+ * "has a catalog"), or the candidate carrying exactly the manual text's
+ * content tokens in the same order once reporting glue is stripped, with
+ * the relation-bearing words (copulas, prepositions, conjunctions) agreeing
+ * too, since "is" against "was", "with" against "for" and "or" against
+ * "and" are different assertions. A candidate
  * carrying extra content — a negation ("no longer"), a changed value, a
  * temporal qualifier ("until friday"), or additional facts — is new
  * information and always survives, and so is one that swaps or drops a
@@ -50,20 +54,35 @@ const MAX_CJK_WRAPPER_RESIDUAL_CHARS = 8;
 const DEFAULT_AGENT_BUCKET = "main";
 /**
  * Reporting glue the extractor wraps a dictated fact in ("User stated
- * that ..."): articles, copulas, pronouns, prepositions, and reporting
- * verbs. Stripped before token comparison so the canonical wrap echo still
- * collapses. Semantic predicates (has, wants, likes, prefers, ...) are NOT
- * glue: they decide what a sentence asserts, so they stay content tokens.
- * Negation and temporal markers are deliberately not here either.
+ * that ..."): articles, demonstratives, pronouns, and reporting verbs.
+ * Stripped before token comparison so the canonical wrap echo still
+ * collapses. Only words that carry no assertion of their own belong here.
+ * Semantic predicates (has, wants, likes, prefers, ...) decide what a
+ * sentence asserts and stay content tokens; copulas, prepositions and
+ * conjunctions carry tense, relation and logic and are compared separately
+ * (ECHO_RELATION_TOKENS). Negation and temporal markers are handled by
+ * NEGATION_AND_TEMPORAL_MARKERS.
  */
-const ECHO_STOPWORDS = new Set([
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-    "that", "this", "these", "those", "to", "of", "in", "on", "at", "for",
-    "with", "and", "or", "as", "by", "from", "it", "its", "their", "they",
-    "he", "she", "his", "her", "them", "i", "my", "me", "we", "our", "you",
-    "your", "user", "users", "stated", "said", "says", "saying", "mentioned",
-    "noted", "also",
+const ECHO_GLUE = new Set([
+    "the", "a", "an", "that", "this", "these", "those", "it", "its", "their",
+    "they", "he", "she", "his", "her", "them", "i", "my", "me", "we", "our",
+    "you", "your", "user", "users", "stated", "said", "says", "saying",
+    "mentioned", "noted", "also",
 ]);
+/**
+ * Relation-bearing function words. They are not content (a wrap echo may
+ * legitimately add "is" when it turns "teacup: the red one" into "teacup is
+ * the red one"), but they are not glue either: swapping one changes the
+ * assertion ("is" / "was" is a tense change, "with" / "for" a different
+ * relation, "or" / "and" different logic). Both sides' sequences must
+ * agree, except that the candidate may insert a present-tense copula.
+ */
+const ECHO_RELATION_TOKENS = new Set([
+    "is", "are", "was", "were", "be", "been", "being", "to", "of", "in", "on",
+    "at", "for", "with", "and", "or", "as", "by", "from",
+]);
+/** The only relation tokens a sentence wrapper may add to a dictated fact. */
+const WRAP_INSERTABLE_COPULAS = new Set(["is", "are"]);
 /**
  * A marker on exactly one side of the pair means the two texts assert
  * different things (a correction, a retraction, a bounded validity): never
@@ -96,11 +115,45 @@ function orderedContentTokens(normalized) {
     for (const token of tokenList(normalized)) {
         if (token.length <= 1 && !CJK_RE.test(token))
             continue;
-        if (ECHO_STOPWORDS.has(token))
+        if (ECHO_GLUE.has(token) || ECHO_RELATION_TOKENS.has(token))
             continue;
         out.push(token);
     }
     return out;
+}
+function orderedRelationTokens(normalized) {
+    return tokenList(normalized).filter((token) => ECHO_RELATION_TOKENS.has(token));
+}
+/**
+ * The manual text's relation tokens must all appear in the candidate, in
+ * order; whatever the candidate adds on top must be a copula a sentence
+ * wrapper inserts. Anything else (a dropped, swapped or extra relation
+ * word) is a different assertion.
+ */
+function relationTokensAgree(candidateRelations, manualRelations) {
+    let m = 0;
+    for (const token of candidateRelations) {
+        if (m < manualRelations.length && token === manualRelations[m]) {
+            m++;
+            continue;
+        }
+        if (!WRAP_INSERTABLE_COPULAS.has(token))
+            return false;
+    }
+    return m === manualRelations.length;
+}
+/** Whole-token containment: every needle token, contiguous, in the haystack. */
+function containsTokenRun(haystack, needle) {
+    if (needle.length === 0 || needle.length > haystack.length)
+        return false;
+    outer: for (let start = 0; start + needle.length <= haystack.length; start++) {
+        for (let i = 0; i < needle.length; i++) {
+            if (haystack[start + i] !== needle[i])
+                continue outer;
+        }
+        return true;
+    }
+    return false;
 }
 function contentTokens(normalized) {
     return new Set(orderedContentTokens(normalized));
@@ -186,9 +239,15 @@ export function isNearIdenticalEcho(candidateText, manualText) {
     const manualContent = contentTokens(manual);
     if (manualContent.size < MIN_CONTAINMENT_TOKENS)
         return false;
-    // Shortened echo: the manual text contains the whole candidate.
-    if (manual.includes(candidate))
+    // Shortened echo: the manual text contains the whole candidate as a run of
+    // whole tokens. A raw substring test would accept "has a cat" inside "has
+    // a catalog of vinyl records"; the candidate also needs enough content of
+    // its own before a partial restatement counts.
+    const candidateContentList = orderedContentTokens(candidate);
+    if (candidateContentList.length >= MIN_CONTAINMENT_TOKENS &&
+        containsTokenRun(manualTokenList, candidateTokenList)) {
         return true;
+    }
     // Wrap echo: the extractor sentence-wraps the dictated fact ("favorite
     // teacup: the red one" -> "User stated their favorite teacup is the red
     // one"). After glue-word stripping, the candidate must carry EXACTLY the
@@ -199,12 +258,15 @@ export function isNearIdenticalEcho(candidateText, manualText) {
     // so a subsequence match is not enough. Order matters too: bag-of-words
     // equality would collapse "alice reports to bob" onto "bob reports to
     // alice". The manual-side minimum above doubles as the candidate floor,
-    // since equal sequences have equal length.
-    const candidateContentList = orderedContentTokens(candidate);
+    // since equal sequences have equal length. Relation words are compared as
+    // their own sequence: "tea or coffee" is not "tea and coffee", and "is"
+    // is not "was", even though the content tokens agree.
     const manualContentList = orderedContentTokens(manual);
     if (candidateContentList.length !== manualContentList.length)
         return false;
-    return candidateContentList.every((token, i) => token === manualContentList[i]);
+    if (!candidateContentList.every((token, i) => token === manualContentList[i]))
+        return false;
+    return relationTokensAgree(orderedRelationTokens(candidate), orderedRelationTokens(manual));
 }
 export class ManualEchoLedger {
     byAgent = new Map();

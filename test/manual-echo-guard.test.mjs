@@ -12,10 +12,11 @@
  * search.
  *
  * Match test is ONE-SIDED and conservative: exact match, the manual text
- * containing the candidate, or every candidate content token (after glue-word
- * stripping) already present in the manual text. A candidate carrying ANY
- * extra content — negation, changed value, temporal qualifier, added facts —
- * always survives. Entries expire (TTL), are consumed on match, and are
+ * containing the candidate as a run of whole tokens, or the candidate carrying
+ * exactly the manual text's content tokens in order (after glue-word
+ * stripping) with the relation words (copulas, prepositions, conjunctions)
+ * agreeing. A candidate carrying ANY extra content — negation, changed value,
+ * temporal qualifier, added facts, a swapped relation word — always survives. Entries expire (TTL), are consumed on match, and are
  * invalidated when their memory is forgotten.
  *
  * Fixtures are entirely synthetic; no real fleet data.
@@ -697,5 +698,150 @@ describe("echo guard through the full auto-capture path", () => {
     );
     assert.ok(ledger.match("main", UPDATED), "the new text is recorded");
     assert.equal(ledger.match("main", ORIGINAL), null, "the replaced text is invalidated on the plain update path");
+  });
+});
+
+describe("review round 4: whole-token containment and relation words", () => {
+  it("does not treat a token prefix as containment (cat inside catalog)", () => {
+    assert.equal(
+      isNearIdenticalEcho("User has a cat", "User has a catalog of vinyl records"),
+      false,
+      "a raw substring match would drop a distinct fact",
+    );
+  });
+
+  it("requires a candidate-side content floor before a partial restatement counts", () => {
+    assert.equal(
+      isNearIdenticalEcho("User has a cat", "User has a cat and a dog named Rex"),
+      false,
+      "two content tokens are not enough to call a shortened restatement an echo",
+    );
+    assert.equal(
+      isNearIdenticalEcho("adopted a cat named Miso", "User adopted a cat named Miso last spring"),
+      true,
+      "a whole-token run with enough content of its own still collapses",
+    );
+  });
+
+  it("keeps a tense change (is against was), in both directions", () => {
+    assert.equal(isNearIdenticalEcho("Alice is in Paris this month", "Alice was in Paris this month"), false);
+    assert.equal(isNearIdenticalEcho("Alice was in Paris this month", "Alice is in Paris this month"), false);
+    assert.equal(isNearIdenticalEcho("User said Alice was in Paris this month", "Alice is in Paris this month"), false);
+  });
+
+  it("keeps a changed relation (with against for)", () => {
+    assert.equal(isNearIdenticalEcho("Alice works with Bob", "Alice works for Bob"), false);
+    assert.equal(isNearIdenticalEcho("User mentioned Alice works for Bob", "Alice works with Bob"), false);
+  });
+
+  it("keeps changed logic (or against and)", () => {
+    assert.equal(
+      isNearIdenticalEcho("Alice likes tea or coffee daily", "Alice likes tea and coffee daily"),
+      false,
+    );
+    assert.equal(
+      isNearIdenticalEcho("User noted Alice likes tea and coffee daily", "Alice likes tea or coffee daily"),
+      false,
+    );
+  });
+
+  it("keeps a dropped or added relation word", () => {
+    assert.equal(isNearIdenticalEcho("Alice in Paris this month", "Alice is in Paris this month"), false, "dropped copula");
+    assert.equal(
+      isNearIdenticalEcho("Alice works with Bob for now", "Alice works with Bob"),
+      false,
+      "an added qualifier changes the assertion",
+    );
+  });
+
+  it("still collapses wrap echoes whose relation words agree, and tolerates the wrapper's inserted copula", () => {
+    assert.equal(isNearIdenticalEcho("User said Alice is in Paris this month", "Alice is in Paris this month"), true);
+    assert.equal(
+      isNearIdenticalEcho("User stated that Alice works with Bob on the roadmap", "Alice works with Bob on the roadmap"),
+      true,
+    );
+    assert.equal(
+      isNearIdenticalEcho("User's favorite colors are red and blue", "favorite colors: red and blue"),
+      true,
+      "the wrapper may turn 'x: y' into 'x are y'",
+    );
+    assert.equal(
+      isNearIdenticalEcho("User mentioned that Alice likes tea and coffee daily", "Alice likes tea and coffee daily"),
+      true,
+    );
+  });
+});
+
+describe("review round 4: memory_update records the echo ledger only for a supplied text", () => {
+  it("a metadata-only update neither records nor invalidates the ledger", async () => {
+    const { registerAllMemoryTools } = jiti("../src/tools.ts");
+    const ledger = new ManualEchoLedger();
+    const EXISTING_ID = "31111111-2222-4333-8444-555555555555";
+    const ORIGINAL = "rehearsal warm-up routine: scales for ten minutes";
+    const existingEntry = {
+      id: EXISTING_ID,
+      text: ORIGINAL,
+      category: "fact",
+      scope: "agent:main",
+      importance: 0.7,
+      timestamp: Date.now() - 60_000,
+      metadata: JSON.stringify({
+        memory_category: "patterns",
+        l0_abstract: ORIGINAL,
+        l1_overview: `- ${ORIGINAL}`,
+        l2_content: ORIGINAL,
+        source: "manual",
+        state: "confirmed",
+      }),
+    };
+    const metaWorkspace = mkdtempSync(path.join(tmpdir(), "echo-guard-meta-update-"));
+    try {
+      const context = {
+        agentId: "main",
+        workspaceDir: metaWorkspace,
+        mdMirror: null,
+        manualEchoLedger: ledger,
+        scopeManager: {
+          getAccessibleScopes: (agentId) => ["global", `agent:${agentId}`],
+          getScopeFilter: (agentId) => ["global", `agent:${agentId}`],
+          isAccessible: (scope, agentId) => ["global", `agent:${agentId}`].includes(scope),
+          getDefaultScope: (agentId) => `agent:${agentId}`,
+        },
+        retriever: { getConfig() { return { mode: "hybrid" }; } },
+        store: {
+          async getById(id) { return id === EXISTING_ID ? existingEntry : null; },
+          async vectorSearch() { return []; },
+          async list() { return [existingEntry]; },
+          async listFactKeyCandidates() { return [existingEntry]; },
+          async store(entry) { return { ...entry, id: "99999999-8888-4777-8666-555555555554", timestamp: Date.now() }; },
+          async update(id, patch) { return { ...existingEntry, ...patch, id }; },
+        },
+        embedder: { async embedPassage() { return [0.1, 0.2, 0.3]; } },
+      };
+      const creators = new Map();
+      registerAllMemoryTools(
+        {
+          registerTool(factory, meta) { creators.set(meta.name, factory); },
+          logger: { info() {}, warn() {}, debug() {} },
+        },
+        context,
+        { enableManagementTools: true },
+      );
+      const update = creators.get("memory_update")({});
+
+      const metaOnly = await update.execute(null, { memoryId: EXISTING_ID, importance: 0.9 });
+      assert.ok(!metaOnly?.details?.error, `metadata-only update must succeed (got ${JSON.stringify(metaOnly?.details)})`);
+      assert.equal(ledger.match("main", ORIGINAL), null, "no text was supplied, so nothing is armed for suppression");
+
+      ledger.record("main", ORIGINAL);
+      await update.execute(null, { memoryId: EXISTING_ID, importance: 0.5 });
+      assert.ok(ledger.match("main", ORIGINAL), "a metadata-only update leaves an existing ledger entry alone");
+
+      const textUpdate = await update.execute(null, { memoryId: EXISTING_ID, text: "rehearsal warm-up routine: long tones" });
+      assert.ok(!textUpdate?.details?.error);
+      assert.ok(ledger.match("main", "rehearsal warm-up routine: long tones"), "a supplied text is recorded");
+    } finally {
+      rmSync(metaWorkspace, { recursive: true, force: true });
+    }
   });
 });

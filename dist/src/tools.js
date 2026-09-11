@@ -1806,10 +1806,15 @@ export function registerMemoryUpdateTool(api, context) {
                             details: { error: "not_found", id: resolvedId },
                         };
                     }
+                    // Only a manually supplied text arms the echo guard: a metadata-only
+                    // update (importance, category) restates nothing, so it must not
+                    // suppress a later extraction of the unchanged fact.
                     if (text && existing) {
-                        context.manualEchoLedger?.invalidate(agentId, existing.text);
+                        if (updated.text !== existing.text) {
+                            context.manualEchoLedger?.invalidate(agentId, existing.text);
+                        }
+                        context.manualEchoLedger?.record(agentId, updated.text);
                     }
-                    context.manualEchoLedger?.record(agentId, updated.text);
                     return {
                         content: [
                             {
