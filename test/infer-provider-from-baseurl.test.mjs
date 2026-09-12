@@ -19,9 +19,24 @@ const { inferProviderFromBaseURL } = indexModule;
 describe("inferProviderFromBaseURL - PR #713 regression", () => {
 
   describe("URL hostname inference", () => {
-    it("baseURL with minimax.io returns minimax-portal", () => {
+    it("baseURL with minimax.io returns minimax", () => {
       const result = inferProviderFromBaseURL("https://api.minimax.io/v1");
-      assert.strictEqual(result, "minimax-portal");
+      assert.strictEqual(result, "minimax");
+    });
+
+    it("baseURL with minimax.io anthropic endpoint returns minimax", () => {
+      const result = inferProviderFromBaseURL("https://api.minimax.io/anthropic");
+      assert.strictEqual(result, "minimax");
+    });
+
+    it("baseURL with minimaxi.com (regional endpoint) returns minimax", () => {
+      const result = inferProviderFromBaseURL("https://api.minimaxi.com/v1");
+      assert.strictEqual(result, "minimax");
+    });
+
+    it("baseURL with minimaxi.com anthropic endpoint returns minimax", () => {
+      const result = inferProviderFromBaseURL("https://api.minimaxi.com/anthropic");
+      assert.strictEqual(result, "minimax");
     });
 
     it("baseURL with openai.com returns openai", () => {
@@ -41,6 +56,11 @@ describe("inferProviderFromBaseURL - PR #713 regression", () => {
       assert.strictEqual(result, undefined);
     });
 
+    it("fake-minimaxi.com should NOT match (subdomain spoofing protection)", () => {
+      const result = inferProviderFromBaseURL("https://fake-minimaxi.com");
+      assert.strictEqual(result, undefined);
+    });
+
     it("null returns undefined", () => {
       assert.strictEqual(inferProviderFromBaseURL(null), undefined);
     });
@@ -57,7 +77,7 @@ describe("inferProviderFromBaseURL - PR #713 regression", () => {
   describe("URL path variations", () => {
     it("handles baseURL with deep path", () => {
       const result = inferProviderFromBaseURL("https://api.minimax.io/v1/chat/completions");
-      assert.strictEqual(result, "minimax-portal");
+      assert.strictEqual(result, "minimax");
     });
 
     it("handles baseURL without path", () => {
