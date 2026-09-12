@@ -895,19 +895,30 @@ export function getExtensionApiImportSpecifiers(
 }
 
 /**
- * Layer 1: 新 SDK API — api.runtime.agent.runEmbeddedPiAgent (4.22+)
+ * Layer 1: SDK API — api.runtime.agent.runEmbeddedAgent (hosts before the
+ *          rename expose runEmbeddedPiAgent; both names are accepted)
  * Layer 2: 舊 extensionAPI.js dynamic import（4.24-4.26 SDK 仍保留）
  * Layer 3: CLI fallback
  *
  * 遷移自 Bug 2（Issue #606）：原本只使用 Layer 2，現改為 Try-New-First。
  */
+const EMBEDDED_RUNNER_EXPORT_NAMES = ["runEmbeddedAgent", "runEmbeddedPiAgent"] as const;
+type EmbeddedRunnerExportName = (typeof EMBEDDED_RUNNER_EXPORT_NAMES)[number];
+
+export function resolveEmbeddedRunnerExportName(candidate: unknown): EmbeddedRunnerExportName | undefined {
+  if (!candidate || typeof candidate !== "object") return undefined;
+  const record = candidate as Record<string, unknown>;
+  return EMBEDDED_RUNNER_EXPORT_NAMES.find((name) => typeof record[name] === "function");
+}
+
 // eslint-disable-next-line import/export
 export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<EmbeddedPiRunner> {
   // Layer 1: 嘗試新 SDK API (with circuit breaker)
   if (!isLayer1CircuitOpen()) {
     const newApi = ((api as unknown as { runtime?: { agent?: Record<string, unknown> } }).runtime?.agent);
-    if (typeof newApi?.runEmbeddedPiAgent === "function") {
-      const runner = newApi.runEmbeddedPiAgent.bind(newApi);
+    const runnerName = resolveEmbeddedRunnerExportName(newApi);
+    if (newApi && runnerName) {
+      const runner = (newApi[runnerName] as EmbeddedPiRunner).bind(newApi);
       // Bug 2 fix: 將 Layer 1 結果寫入 cache，避免後續並發呼叫時 Layer 2 覆蓋掉 Layer 1
       embeddedPiRunnerPromise ??= Promise.resolve(runner as EmbeddedPiRunner);
       return embeddedPiRunnerPromise;
@@ -921,9 +932,9 @@ export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<Embe
       for (const specifier of getExtensionApiImportSpecifiers()) {
         try {
           const mod = await import(specifier);
-          const runner = (mod as Record<string, unknown>).runEmbeddedPiAgent;
-          if (typeof runner === "function") return runner as EmbeddedPiRunner;
-          importErrors.push(`${specifier}: runEmbeddedPiAgent export not found`);
+          const runnerName = resolveEmbeddedRunnerExportName(mod);
+          if (runnerName) return (mod as Record<string, unknown>)[runnerName] as EmbeddedPiRunner;
+          importErrors.push(`${specifier}: runEmbeddedAgent export not found`);
         } catch (err) {
           importErrors.push(`${specifier}: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -949,6 +960,23 @@ function clipDiagnostic(text: string, maxLen = 400): string {
   const oneLine = text.replace(/\s+/g, " ").trim();
   if (oneLine.length <= maxLen) return oneLine;
   return `${oneLine.slice(0, maxLen - 3)}...`;
+}
+
+const ANSI_ESCAPE_RE = /\u001b\[[0-9;]*[A-Za-z]/g;
+const CLI_STARTUP_NOISE_LINE_RE = /^\s*\[state-migrations\]/;
+
+function stripAnsi(text: string): string {
+  return text.replace(ANSI_ESCAPE_RE, "");
+}
+
+// CLI failures print the reason last, after startup banners; keep the tail.
+export function clipDiagnosticTail(text: string, maxLen = 400): string {
+  const lines = stripAnsi(text)
+    .split(/\r?\n/)
+    .filter((line) => line.trim().length > 0 && !CLI_STARTUP_NOISE_LINE_RE.test(line));
+  const oneLine = lines.join(" ").replace(/\s+/g, " ").trim();
+  if (oneLine.length <= maxLen) return oneLine;
+  return `...${oneLine.slice(oneLine.length - (maxLen - 3))}`;
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -1000,7 +1028,7 @@ function extractJsonObjectFromOutput(stdout: string): Record<string, unknown> {
   throw new Error(`unable to parse JSON from CLI output: ${clipDiagnostic(trimmed, 280)}`);
 }
 
-function extractReflectionTextFromCliResult(resultObj: Record<string, unknown>): string | null {
+export function extractReflectionTextFromCliResult(resultObj: Record<string, unknown>): string | null {
   const result = resultObj.result as Record<string, unknown> | undefined;
   const payloads = Array.isArray(resultObj.payloads)
     ? resultObj.payloads
@@ -1011,43 +1039,88 @@ function extractReflectionTextFromCliResult(resultObj: Record<string, unknown>):
     (p) => p && typeof p === "object" && typeof (p as Record<string, unknown>).text === "string" && ((p as Record<string, unknown>).text as string).trim().length
   ) as Record<string, unknown> | undefined;
   const text = typeof firstWithText?.text === "string" ? firstWithText.text.trim() : "";
-  return text || null;
+  if (text) return text;
+  const finalText = typeof resultObj.final === "string" ? resultObj.final.trim() : "";
+  return finalText || null;
 }
 
-async function runReflectionViaCli(params: {
-  prompt: string;
-  agentId: string;
-  workspaceDir: string;
-  timeoutMs: number;
-  thinkLevel: ReflectionThinkLevel;
-}): Promise<string> {
-  const cliBin = process.env.OPENCLAW_CLI_BIN?.trim() || "openclaw";
-  const outerTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
-  const agentTimeoutSec = Math.max(1, Math.ceil(params.timeoutMs / 1000));
-  const sessionId = `memory-reflection-cli-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+type ReflectionCliMode = "exec" | "legacy-local";
 
+type ReflectionCliRun = {
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  timedOut: boolean;
+};
+
+// Hosts without `agent exec` reject its argument shape before doing any work.
+const LEGACY_CLI_SHAPE_REJECTION_RE = /unknown command|does not recognize|unknown option|too many arguments/i;
+
+export function buildReflectionCliArgs(params: {
+  mode: ReflectionCliMode;
+  agentId: string;
+  prompt: string;
+  workspaceDir: string;
+  thinkLevel: ReflectionThinkLevel;
+  agentTimeoutSec: number;
+  sessionId: string;
+  modelRef?: string;
+}): string[] {
+  if (params.mode === "legacy-local") {
+    return [
+      "agent",
+      "--local",
+      "--agent",
+      params.agentId,
+      "--message",
+      params.prompt,
+      "--json",
+      "--thinking",
+      params.thinkLevel,
+      "--timeout",
+      String(params.agentTimeoutSec),
+      "--session-id",
+      params.sessionId,
+    ];
+  }
   const args = [
     "agent",
-    "--local",
-    "--agent",
-    params.agentId,
-    "--message",
-    params.prompt,
+    "exec",
+    "--message-file",
+    "-",
+    "--cwd",
+    params.workspaceDir,
     "--json",
     "--thinking",
     params.thinkLevel,
     "--timeout",
-    String(agentTimeoutSec),
-    "--session-id",
-    sessionId,
+    String(params.agentTimeoutSec),
   ];
+  if (params.modelRef) args.push("--model", params.modelRef);
+  return args;
+}
 
-  return await new Promise<string>((resolve, reject) => {
-    const spawnCommand = buildReflectionCliSpawnCommand(cliBin, args);
+export function shouldRetryReflectionCliAsLegacyLocal(
+  run: Pick<ReflectionCliRun, "code" | "signal" | "timedOut" | "stderr">,
+): boolean {
+  if (run.timedOut || run.signal || run.code === 0) return false;
+  return LEGACY_CLI_SHAPE_REJECTION_RE.test(stripAnsi(run.stderr));
+}
+
+async function spawnReflectionCli(params: {
+  cliBin: string;
+  args: string[];
+  cwd: string;
+  outerTimeoutMs: number;
+  stdinText?: string;
+}): Promise<ReflectionCliRun> {
+  return await new Promise<ReflectionCliRun>((resolve, reject) => {
+    const spawnCommand = buildReflectionCliSpawnCommand(params.cliBin, params.args);
     const child = spawn(spawnCommand.command, spawnCommand.args, {
-      cwd: params.workspaceDir,
+      cwd: params.cwd,
       env: { ...process.env, NO_COLOR: "1" },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [params.stdinText === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
 
     let stdout = "";
@@ -1059,7 +1132,7 @@ async function runReflectionViaCli(params: {
       timedOut = true;
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 1500).unref();
-    }, outerTimeoutMs);
+    }, params.outerTimeoutMs);
 
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
@@ -1071,44 +1144,73 @@ async function runReflectionViaCli(params: {
       stderr += chunk;
     });
 
+    if (params.stdinText !== undefined && child.stdin) {
+      child.stdin.on("error", () => { });
+      child.stdin.end(params.stdinText);
+    }
+
     child.once("error", (err) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      reject(new Error(`spawn ${cliBin} failed: ${err.message}`));
+      reject(new Error(`spawn ${params.cliBin} failed: ${err.message}`));
     });
 
     child.once("close", (code, signal) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-
-      if (timedOut) {
-        reject(new Error(`${cliBin} timed out after ${outerTimeoutMs}ms`));
-        return;
-      }
-      if (signal) {
-        reject(new Error(`${cliBin} exited by signal ${signal}. stderr=${clipDiagnostic(stderr)}`));
-        return;
-      }
-      if (code !== 0) {
-        reject(new Error(`${cliBin} exited with code ${code}. stderr=${clipDiagnostic(stderr)}`));
-        return;
-      }
-
-      try {
-        const parsed = extractJsonObjectFromOutput(stdout);
-        const text = extractReflectionTextFromCliResult(parsed);
-        if (!text) {
-          reject(new Error(`CLI JSON returned no text payload. stdout=${clipDiagnostic(stdout)}`));
-          return;
-        }
-        resolve(text);
-      } catch (err) {
-        reject(err instanceof Error ? err : new Error(String(err)));
-      }
+      resolve({ stdout, stderr, code, signal, timedOut });
     });
   });
+}
+
+async function runReflectionViaCli(params: {
+  prompt: string;
+  agentId: string;
+  workspaceDir: string;
+  timeoutMs: number;
+  thinkLevel: ReflectionThinkLevel;
+  modelRef?: string;
+}): Promise<string> {
+  const cliBin = process.env.OPENCLAW_CLI_BIN?.trim() || "openclaw";
+  const outerTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
+  const agentTimeoutSec = Math.max(1, Math.ceil(params.timeoutMs / 1000));
+  const sessionId = `memory-reflection-cli-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const argParams = {
+    agentId: params.agentId,
+    prompt: params.prompt,
+    workspaceDir: params.workspaceDir,
+    thinkLevel: params.thinkLevel,
+    agentTimeoutSec,
+    sessionId,
+    modelRef: params.modelRef,
+  };
+
+  let run = await spawnReflectionCli({
+    cliBin,
+    args: buildReflectionCliArgs({ ...argParams, mode: "exec" }),
+    cwd: params.workspaceDir,
+    outerTimeoutMs,
+    stdinText: params.prompt,
+  });
+  if (shouldRetryReflectionCliAsLegacyLocal(run)) {
+    run = await spawnReflectionCli({
+      cliBin,
+      args: buildReflectionCliArgs({ ...argParams, mode: "legacy-local" }),
+      cwd: params.workspaceDir,
+      outerTimeoutMs,
+    });
+  }
+
+  if (run.timedOut) throw new Error(`${cliBin} timed out after ${outerTimeoutMs}ms`);
+  if (run.signal) throw new Error(`${cliBin} exited by signal ${run.signal}. stderr=${clipDiagnosticTail(run.stderr)}`);
+  if (run.code !== 0) throw new Error(`${cliBin} exited with code ${run.code}. stderr=${clipDiagnosticTail(run.stderr)}`);
+
+  const parsed = extractJsonObjectFromOutput(run.stdout);
+  const text = extractReflectionTextFromCliResult(parsed);
+  if (!text) throw new Error(`CLI JSON returned no text payload. stdout=${clipDiagnostic(run.stdout)}`);
+  return text;
 }
 
 export function buildReflectionCliSpawnCommand(
@@ -1820,6 +1922,24 @@ type GenerateReflectionTextResult = {
   runner: "embedded" | "cli" | "fallback";
 };
 
+// Model resolution chain: explicit param > agent-specific primary model ref > global llm.model.
+// Provider: parsed from the ref (e.g. "minimax/MiniMax-M2.7") > inferred from baseURL
+// (inferProviderFromBaseURL uses .endsWith(".suffix") to prevent subdomain spoofing).
+function resolveReflectionModelTarget(
+  params: Pick<GenerateReflectionTextParams, "cfg" | "agentId" | "model">,
+): { provider?: string; model?: string } {
+  const cfg = params.cfg as Record<string, unknown> | undefined;
+  const llmConfig = cfg?.llm as Record<string, unknown> | undefined;
+  const modelRefFromConfig = llmConfig?.model;
+  const modelRef =
+    params.model
+    ?? (resolveAgentPrimaryModelRef(params.cfg, params.agentId) as string | undefined)
+    ?? (typeof modelRefFromConfig === "string" ? modelRefFromConfig : undefined);
+  const split = modelRef ? splitProviderModel(modelRef) : { provider: undefined, model: undefined };
+  const provider = split.provider ?? inferProviderFromBaseURL(llmConfig?.baseURL as string | undefined);
+  return { provider, model: split.model };
+}
+
 type ReflectionRunSlotState = { active: number; waiters: Array<() => void> };
 
 const REFLECTION_RUN_SLOTS = Symbol.for("openclaw.memory-lancedb-pro.reflection-run-slots");
@@ -1882,6 +2002,8 @@ async function generateReflectionTextUnbounded(
     if (level === "warn") params.logger?.warn?.(message);
     else params.logger?.info?.(message);
   };
+  const { provider, model } = resolveReflectionModelTarget(params);
+  const cliModelRef = provider && model ? `${provider}/${model}` : undefined;
 
   try {
     const result: unknown = await runWithReflectionTransientRetryOnce({
@@ -1891,28 +2013,14 @@ async function generateReflectionTextUnbounded(
       onLog: onRetryLog,
       execute: async () => {
         const runEmbeddedPiAgent = await loadEmbeddedPiRunner(params.api);
-        const cfg = params.cfg as Record<string, unknown>;
-        const llmConfig = cfg?.llm as Record<string, unknown> | undefined;
-        const modelRefFromConfig = llmConfig?.model;
-
-        // Model resolution chain: agent-specific primary model ref > global llm.model fallback.
-        // The typeof guard ensures a non-string value (e.g. number) does not reach splitProviderModel as-is.
-        const modelRef =
-          params.model
-          ?? (resolveAgentPrimaryModelRef(params.cfg, params.agentId) as string | undefined)
-          ?? (typeof modelRefFromConfig === "string" ? modelRefFromConfig : undefined);
-
-        // Provider resolution chain: parsed from modelRef (e.g. "minimax/MiniMax-M2.7") > inferred from baseURL.
-        // inferProviderFromBaseURL uses .endsWith(".suffix") to prevent subdomain spoofing.
-        const split = modelRef ? splitProviderModel(modelRef) : { provider: undefined, model: undefined };
-        const provider = split.provider ?? inferProviderFromBaseURL(llmConfig?.baseURL as string | undefined);
-        const model = split.model;
         const embeddedTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
 
         return await withTimeout(
           runEmbeddedPiAgent({
             sessionId: `reflection-${Date.now()}`,
             sessionKey: `temp:memory-reflection:${params.agentId}`,
+            // The distiller run is throwaway: keep it out of the host session store.
+            sessionPersistence: "detached",
             agentId: params.agentId,
             sessionFile: tempSessionFile,
             workspaceDir: params.workspaceDir,
@@ -1975,6 +2083,7 @@ async function generateReflectionTextUnbounded(
         workspaceDir: params.workspaceDir,
         timeoutMs: params.timeoutMs,
         thinkLevel: params.thinkLevel,
+        modelRef: cliModelRef,
       }),
     });
   } catch (err) {
