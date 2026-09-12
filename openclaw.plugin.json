@@ -14,6 +14,13 @@
       "cliCommand": "memory"
     }
   ],
+  "cliCommands": [
+    {
+      "name": "memory-pro",
+      "description": "Enhanced memory management commands (LanceDB Pro)",
+      "hasSubcommands": true
+    }
+  ],
   "hooks": {
     "allowConversationAccess": true
   },
