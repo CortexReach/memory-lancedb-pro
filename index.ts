@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 // Detect CLI mode: when running as a CLI subcommand (e.g. `openclaw memory-pro stats`),
 // OpenClaw sets OPENCLAW_CLI=1 in the process environment. Registration and
@@ -5862,6 +5863,14 @@ const memoryLanceDBProPlugin = {
         pendingBeforeResetReflections.delete(key);
         return Date.now() - pending.at > REFLECTION_PENDING_BEFORE_RESET_TTL_MS ? undefined : pending;
       };
+      // Captured at registration, outside any command's root-work context. The
+      // before_reset continuation would otherwise inherit the released /new root,
+      // and core refuses embedded sub-runs from a released root (subordinate work
+      // admission), which would push every /new reflection to the CLI runner.
+      const runOutsideCommandRootWork: <R>(fn: () => R) => R =
+        typeof (AsyncLocalStorage as { snapshot?: unknown }).snapshot === "function"
+          ? (AsyncLocalStorage as unknown as { snapshot: () => <R>(fn: () => R) => R }).snapshot()
+          : (fn) => fn();
 
       type ReflectionRunOptions = { beforeResetConversation?: string | null };
       const runMemoryReflectionWith = async (event: any, options?: ReflectionRunOptions) => {
@@ -6511,7 +6520,9 @@ const memoryLanceDBProPlugin = {
         // The command hook that parked this entry ran no reflection, so its serial-guard
         // stamp must not count against the continuation.
         getSerialGuardMap().delete(sessionKey);
-        await runMemoryReflectionWith(pending.event, { beforeResetConversation: conversation });
+        await runOutsideCommandRootWork(() =>
+          runMemoryReflectionWith(pending.event, { beforeResetConversation: conversation }),
+        );
       };
 
       api.registerHook("command:new", runMemoryReflection, {
