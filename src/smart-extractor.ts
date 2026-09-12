@@ -18,6 +18,7 @@ import {
   buildBatchMergePrompt,
 } from "./extraction-prompts.js";
 import { formatExistingMemoryEntry } from "./prompt-blocks.js";
+import { completeJsonWithTransientRetry } from "./extraction-transient-retry.js";
 import {
   AdmissionController,
   type AdmissionAuditRecord,
@@ -179,6 +180,7 @@ type PendingSupersedeInvalidation = {
 type ExtractCandidatesResult =
   | { status: "ok"; candidates: CandidateMemory[]; rawCandidateCount: number; groundingOrPolicyDropped?: boolean }
   | { status: "llm_failure"; candidates: [] }
+  | { status: "llm_unavailable"; candidates: [] }
   | { status: "malformed"; candidates: [] }
   | { status: "empty_input"; candidates: [] };
 
@@ -553,6 +555,8 @@ export interface SmartExtractorConfig {
   defaultScope?: string;
   /** Logger function. */
   log?: (msg: string) => void;
+  /** Test seam: backoff sleep for the transient model-call retry. */
+  transientRetrySleep?: (ms: number) => Promise<void>;
   /** Debug logger function. */
   debugLog?: (msg: string) => void;
   /** Optional embedding-based noise prototype bank for language-agnostic noise filtering. */
@@ -751,6 +755,9 @@ export class SmartExtractor {
           `memory-pro: smart-extractor: skipping noise-bank learning (status=${extraction.status})`,
         );
         stats.extractionFailed = true;
+        if (extraction.status === "llm_unavailable") {
+          stats.llmUnavailable = true;
+        }
       }
       return stats;
     }
@@ -1779,7 +1786,7 @@ export class SmartExtractor {
       assistantEligible: this.config.captureAssistantEligible === true,
     });
 
-    const result = await this.llm.completeJson<{
+    const extractCall = await completeJsonWithTransientRetry<{
       conversation_register?: string;
       memories: Array<{
         category: string;
@@ -1788,7 +1795,18 @@ export class SmartExtractor {
         content: string;
         grounding?: string;
       }>;
-    }>(userPrompt, "extract-candidates", system);
+    }>({
+      llm: this.llm,
+      prompt: userPrompt,
+      label: "extract-candidates",
+      systemPrompt: system,
+      log: this.log,
+      sleep: this.config.transientRetrySleep,
+    });
+    if (extractCall.unavailable) {
+      return { status: "llm_unavailable", candidates: [] };
+    }
+    const result = extractCall.value;
 
     if (!result) {
       this.debugLog(
@@ -1930,10 +1948,25 @@ export class SmartExtractor {
           grounding: isRawConstructed(m) ? "constructed" : "real",
         })),
       );
-      const verdict = await this.llm.completeJson<{
+      const rejudgeCall = await completeJsonWithTransientRetry<{
         conversation_register?: string;
         results?: Array<{ index?: number; grounding?: string; reason?: string }>;
-      }>(rejudgePrompt, "grounding-rejudge");
+      }>({
+        llm: this.llm,
+        prompt: rejudgePrompt,
+        label: "grounding-rejudge",
+        log: this.log,
+        sleep: this.config.transientRetrySleep,
+      });
+      if (rejudgeCall.unavailable) {
+        // Silence is not a verdict: the batch is handed back for a later
+        // run instead of demoting every durable in it.
+        this.log(
+          `memory-lancedb-pro: smart-extractor: grounding-rejudge unavailable (upstream failure after retry) — deferring the batch instead of failing closed`,
+        );
+        return { status: "llm_unavailable", candidates: [] };
+      }
+      const verdict = rejudgeCall.value;
       const verdictResults =
         verdict && Array.isArray(verdict.results) ? verdict.results : null;
       if (!verdictResults) {
