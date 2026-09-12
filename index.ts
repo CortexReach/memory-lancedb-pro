@@ -19,6 +19,18 @@ import { spawn } from "node:child_process";
 // so we downgrade them to debug level when running in CLI mode.
 const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 
+// The host registers plugins in "cli-metadata" mode to collect the CLI command
+// tree before any runtime exists; nothing registered there ever executes.
+export function isCliMetadataRegistration(api: OpenClawPluginApi): boolean {
+  return (api as unknown as { registrationMode?: unknown }).registrationMode === "cli-metadata";
+}
+
+export const MEMORY_PRO_CLI_DESCRIPTOR = {
+  name: "memory-pro",
+  description: "Enhanced memory management commands (LanceDB Pro)",
+  hasSubcommands: true,
+} as const;
+
 // register() can run several times per gateway boot (one per registration
 // context) and once per CLI command; the dual-memory hint only needs to be
 // taught once per process.
@@ -1230,7 +1242,13 @@ function asNonEmptyString(value: unknown): string | undefined {
  * expose it yet, so callers can fall back to the direct/oauth transport.
  */
 export function resolveRuntimeLlmComplete(api: OpenClawPluginApi): RuntimeLlmCompleteFn | undefined {
-  const runtimeLlm = (api as unknown as { runtime?: { llm?: { complete?: unknown } } }).runtime?.llm;
+  let runtimeLlm: { complete?: unknown } | undefined;
+  try {
+    runtimeLlm = (api as unknown as { runtime?: { llm?: { complete?: unknown } } }).runtime?.llm;
+  } catch {
+    // Metadata-only registrations hand out a runtime that throws on access.
+    return undefined;
+  }
   return typeof runtimeLlm?.complete === "function"
     ? (runtimeLlm.complete.bind(runtimeLlm) as RuntimeLlmCompleteFn)
     : undefined;
@@ -2700,7 +2718,13 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   let smartExtractor: SmartExtractor | null = null;
   let admissionController: AdmissionController | null = null;
   let admissionControllerReflectionLane: AdmissionController | null = null;
-  if (config.smartExtraction !== false || config.admissionControl?.enabled === true) {
+  const cliMetadataRegistration = isCliMetadataRegistration(api);
+  if (cliMetadataRegistration) {
+    api.logger.debug(
+      "memory-lancedb-pro: cli-metadata registration; LLM client, smart extraction and admission wiring wait for the runtime registration",
+    );
+  }
+  if (!cliMetadataRegistration && (config.smartExtraction !== false || config.admissionControl?.enabled === true)) {
     try {
       const { llmClient, llmModel, llmModelExplicit, llmTimeoutMs, makeClientForModel } = buildMemoryLlmClient();
 
@@ -3590,7 +3614,7 @@ const memoryLanceDBProPlugin = {
           } catch { return undefined; }
         })() : undefined,
       }),
-      { commands: ["memory-pro"] },
+      { commands: [MEMORY_PRO_CLI_DESCRIPTOR.name], descriptors: [MEMORY_PRO_CLI_DESCRIPTOR] },
     );
 
     // ========================================================================
