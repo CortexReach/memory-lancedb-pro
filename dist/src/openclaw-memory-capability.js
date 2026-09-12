@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { readdir, stat } from "node:fs/promises";
+import { resolveOpenClawStateDir } from "./openclaw-paths.js";
 import { parseCanonicalCorpusMetadata, } from "./corpus-indexer.js";
 const DEFAULT_FLUSH_SOFT_THRESHOLD_TOKENS = 4000;
 const DEFAULT_FLUSH_TRANSCRIPT_BYTES = 2 * 1024 * 1024;
@@ -94,7 +95,7 @@ function resolveWorkspacePath(value) {
     return resolve(expandUserPath(value));
 }
 function defaultWorkspaceDir() {
-    return join(homedir(), ".openclaw", "workspace");
+    return join(resolveOpenClawStateDir(), "workspace");
 }
 function collectConfiguredWorkspaces(cfg) {
     const byWorkspace = new Map();
