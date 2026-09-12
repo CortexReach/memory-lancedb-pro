@@ -1515,6 +1515,37 @@ function summarizeRecentConversationMessages(
   return formatConversationTranscript(recent);
 }
 
+const SESSION_MEMORY_RECORD_RE = /^(user|assistant): (".*")$/;
+
+/**
+ * Hosts on SQLite session storage no longer expose a transcript file to plugins;
+ * the command:new / command:reset hook context carries the departing session's
+ * recent messages instead (`previousSessionMemory`, one `role: "<json text>"`
+ * record per line). Parse those records back into turns so the same reflection
+ * pipeline runs on either host generation.
+ */
+function conversationFromHookSessionMemory(
+  memory: unknown,
+  messageCount: number,
+  format: ConversationTranscriptFormat = "tagged",
+): string | null {
+  if (!memory || typeof memory !== "object") return null;
+  const record = memory as Record<string, unknown>;
+  if (record.status !== "available" || typeof record.content !== "string") return null;
+  const messages: Array<{ role: string; content: string }> = [];
+  for (const line of record.content.split("\n")) {
+    const matched = line.match(SESSION_MEMORY_RECORD_RE);
+    if (!matched) continue;
+    try {
+      const text = JSON.parse(matched[2]);
+      if (typeof text === "string") messages.push({ role: matched[1], content: text });
+    } catch {
+      // a malformed record is skipped; the remaining lines still count
+    }
+  }
+  return summarizeRecentConversationMessages(messages, messageCount, format);
+}
+
 async function readSessionConversationForReflection(filePath: string, messageCount: number, format: ConversationTranscriptFormat = "tagged"): Promise<string | null> {
   try {
     const lines = (await readFile(filePath, "utf-8")).trim().split("\n");
@@ -5834,48 +5865,57 @@ const memoryLanceDBProPlugin = {
             `memory-reflection: command:${action} hook start; sessionKey=${sessionKey || "(none)"}; source=${commandSource || "(unknown)"}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`
           );
 
-          if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
-            const searchDirs = resolveReflectionSessionSearchDirs({
-              context,
-              cfg,
-              workspaceDir,
-              currentSessionFile,
-              sourceAgentId,
-            });
+          // Hosts with SQLite session storage hand the departing transcript to the
+          // hook itself; the session-file lookup below is the legacy path.
+          let conversation = conversationFromHookSessionMemory(context.previousSessionMemory, reflectionMessageCount);
+          if (conversation) {
             api.logger.info(
-              `memory-reflection: command:${action} session recovery start for session ${currentSessionId}; initial=${currentSessionFile || "(none)"}; dirs=${searchDirs.join(" | ") || "(none)"}`
+              `memory-reflection: command:${action} using the hook-provided transcript for session ${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`
             );
-            for (const sessionsDir of searchDirs) {
-              const recovered = await findPreviousSessionFile(sessionsDir, currentSessionFile, currentSessionId);
-              if (recovered) {
-                api.logger.info(
-                  `memory-reflection: command:${action} recovered session file ${recovered} from ${sessionsDir}`
-                );
-                currentSessionFile = recovered;
-                break;
+          } else {
+            if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
+              const searchDirs = resolveReflectionSessionSearchDirs({
+                context,
+                cfg,
+                workspaceDir,
+                currentSessionFile,
+                sourceAgentId,
+              });
+              api.logger.info(
+                `memory-reflection: command:${action} session recovery start for session ${currentSessionId}; initial=${currentSessionFile || "(none)"}; dirs=${searchDirs.join(" | ") || "(none)"}`
+              );
+              for (const sessionsDir of searchDirs) {
+                const recovered = await findPreviousSessionFile(sessionsDir, currentSessionFile, currentSessionId);
+                if (recovered) {
+                  api.logger.info(
+                    `memory-reflection: command:${action} recovered session file ${recovered} from ${sessionsDir}`
+                  );
+                  currentSessionFile = recovered;
+                  break;
+                }
               }
             }
-          }
 
-          if (!currentSessionFile) {
-            const searchDirs = resolveReflectionSessionSearchDirs({
-              context,
-              cfg,
-              workspaceDir,
-              currentSessionFile,
-              sourceAgentId,
-            });
-            api.logger.warn(
-              `memory-reflection: command:${action} missing session file after recovery for session ${currentSessionId}; dirs=${searchDirs.join(" | ") || "(none)"}`
-            );
-            await rememberEmptyReflectionEvent("missing-session-file");
-            return;
-          }
+            if (!currentSessionFile) {
+              const searchDirs = resolveReflectionSessionSearchDirs({
+                context,
+                cfg,
+                workspaceDir,
+                currentSessionFile,
+                sourceAgentId,
+              });
+              api.logger.warn(
+                `memory-reflection: command:${action} missing session file after recovery for session ${currentSessionId}; dirs=${searchDirs.join(" | ") || "(none)"}`
+              );
+              await rememberEmptyReflectionEvent("missing-session-file");
+              return;
+            }
 
-          const conversation = await readSessionConversationWithResetFallback(currentSessionFile, reflectionMessageCount);
+            conversation = await readSessionConversationWithResetFallback(currentSessionFile, reflectionMessageCount);
+          }
           if (!conversation) {
             api.logger.warn(
-              `memory-reflection: command:${action} conversation empty/unusable for session ${currentSessionId}; file=${currentSessionFile}`
+              `memory-reflection: command:${action} conversation empty/unusable for session ${currentSessionId}; file=${currentSessionFile || "(none)"}`
             );
             await rememberEmptyReflectionEvent("empty-conversation");
             return;
