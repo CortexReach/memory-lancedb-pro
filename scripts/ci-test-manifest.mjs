@@ -100,6 +100,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/agentid-validation.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/command-reflection-guard.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/reflection-hook-session-memory.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/reflection-runner-embedded-agent.test.mjs", args: ["--test"] },
   // Tier 1 memory counter fix
   { group: "core-regression", runner: "node", file: "test/tier1-counters.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-subsession-prompt-hooks.test.mjs", args: ["--test"] },
