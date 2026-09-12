@@ -15,6 +15,16 @@ import { spawn } from "node:child_process";
 // lifecycle logs are noisy in CLI context (printed to stderr before command output),
 // so we downgrade them to debug level when running in CLI mode.
 const isCliMode = () => process.env.OPENCLAW_CLI === "1";
+// The host registers plugins in "cli-metadata" mode to collect the CLI command
+// tree before any runtime exists; nothing registered there ever executes.
+export function isCliMetadataRegistration(api) {
+    return api.registrationMode === "cli-metadata";
+}
+export const MEMORY_PRO_CLI_DESCRIPTOR = {
+    name: "memory-pro",
+    description: "Enhanced memory management commands (LanceDB Pro)",
+    hasSubcommands: true,
+};
 // register() can run several times per gateway boot (one per registration
 // context) and once per CLI command; the dual-memory hint only needs to be
 // taught once per process.
@@ -784,7 +794,14 @@ function asNonEmptyString(value) {
  * expose it yet, so callers can fall back to the direct/oauth transport.
  */
 export function resolveRuntimeLlmComplete(api) {
-    const runtimeLlm = api.runtime?.llm;
+    let runtimeLlm;
+    try {
+        runtimeLlm = api.runtime?.llm;
+    }
+    catch {
+        // Metadata-only registrations hand out a runtime that throws on access.
+        return undefined;
+    }
     return typeof runtimeLlm?.complete === "function"
         ? runtimeLlm.complete.bind(runtimeLlm)
         : undefined;
@@ -1991,7 +2008,11 @@ function _initPluginState(api) {
     let smartExtractor = null;
     let admissionController = null;
     let admissionControllerReflectionLane = null;
-    if (config.smartExtraction !== false || config.admissionControl?.enabled === true) {
+    const cliMetadataRegistration = isCliMetadataRegistration(api);
+    if (cliMetadataRegistration) {
+        api.logger.debug("memory-lancedb-pro: cli-metadata registration; LLM client, smart extraction and admission wiring wait for the runtime registration");
+    }
+    if (!cliMetadataRegistration && (config.smartExtraction !== false || config.admissionControl?.enabled === true)) {
         try {
             const { llmClient, llmModel, llmModelExplicit, llmTimeoutMs, makeClientForModel } = buildMemoryLlmClient();
             // Model resolution for admission calls: explicit admissionControl.model
@@ -2702,7 +2723,7 @@ const memoryLanceDBProPlugin = {
                     return undefined;
                 }
             })() : undefined,
-        }), { commands: ["memory-pro"] });
+        }), { commands: [MEMORY_PRO_CLI_DESCRIPTOR.name], descriptors: [MEMORY_PRO_CLI_DESCRIPTOR] });
         // ========================================================================
         // Lifecycle Hooks
         // ========================================================================
