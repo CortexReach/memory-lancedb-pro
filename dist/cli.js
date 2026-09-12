@@ -1803,6 +1803,27 @@ export function registerMemoryCLI(program, context) {
             process.exit(1);
         }
     });
+    // backfill-search-text: the BM25 source column is derived from the abstract
+    // plus the summary layers; report rows where it is missing or stale, and
+    // rewrite them with --apply (the schema migration does this once on open,
+    // this command is the repair path).
+    memory
+        .command("backfill-search-text")
+        .description("Report memories whose search_text column (BM25 source: abstract + overview + content) is missing or stale; rewrite them with --apply")
+        .option("--apply", "Rewrite stale rows (default: report only)", false)
+        .action(async (options) => {
+        try {
+            const result = await context.store.backfillSearchText({ dryRun: !options.apply });
+            console.log(`search_text: scanned=${result.scanned} stale=${result.stale} updated=${result.updated}`);
+            if (!options.apply && result.stale > 0) {
+                console.log("Re-run with --apply to rewrite the stale rows.");
+            }
+        }
+        catch (error) {
+            console.error("backfill-search-text failed:", error);
+            process.exit(1);
+        }
+    });
     // Judge the RAW stored metadata: parseSmartMetadata backfills missing
     // levels from the text, which would hide exactly the rows the repair
     // exists to fix. Accept only a non-null, non-array object: JSON.parse
