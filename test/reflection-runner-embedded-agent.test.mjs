@@ -98,6 +98,37 @@ describe("reflection distiller on a renamed-runner host", () => {
     assert.equal(seenParams.disableTools, true);
     assert.equal(seenParams.provider, "openrouter");
     assert.equal(seenParams.model, "example/model-one");
+    assert.equal(seenParams.sessionFile, undefined, "current hosts refuse a non-key sessionFile for plugin runs");
+  });
+
+  it("still hands the legacy runner a transcript file path", async () => {
+    const { generateReflectionText } = loadFreshIndex();
+    let seenParams = null;
+    const api = {
+      runtime: {
+        agent: {
+          runEmbeddedPiAgent: async (params) => {
+            seenParams = params;
+            return { payloads: [{ text: "legacy reflection" }] };
+          },
+        },
+      },
+    };
+
+    const result = await generateReflectionText({
+      conversation: "user: the build is green\nassistant: noted",
+      maxInputChars: 1000,
+      cfg: {},
+      agentId: "agent-one",
+      workspaceDir: "/tmp",
+      timeoutMs: 2000,
+      thinkLevel: "off",
+      api,
+    });
+
+    assert.equal(result.runner, "embedded");
+    assert.equal(typeof seenParams.sessionFile, "string");
+    assert.ok(seenParams.sessionFile.endsWith(".jsonl"), seenParams.sessionFile);
   });
 });
 
