@@ -5828,10 +5828,32 @@ const memoryLanceDBProPlugin = {
         return g[REFLECTION_SERIAL_GUARD] as Map<string, number>;
       };
       // SERIAL_GUARD_COOLDOWN_MS moved to DEFAULT_SERIAL_GUARD_COOLDOWN_MS
+      // A command:new / command:reset hook that finds neither a hook transcript nor a
+      // session file parks here; the typed before_reset hook, which core fires right
+      // after the command hooks on every command path, carries the departing messages
+      // and finishes the reflection from this entry.
+      const REFLECTION_PENDING_BEFORE_RESET_TTL_MS = 60_000;
+      type PendingBeforeResetReflection = { event: any; sessionId: string; action: string; at: number };
+      const pendingBeforeResetReflections = new Map<string, PendingBeforeResetReflection>();
+      const rememberPendingBeforeResetReflection = (key: string, entry: Omit<PendingBeforeResetReflection, "at">) => {
+        const now = Date.now();
+        for (const [pendingKey, pending] of pendingBeforeResetReflections) {
+          if (now - pending.at > REFLECTION_PENDING_BEFORE_RESET_TTL_MS) pendingBeforeResetReflections.delete(pendingKey);
+        }
+        pendingBeforeResetReflections.set(key, { ...entry, at: now });
+      };
+      const takePendingBeforeResetReflection = (key: string): PendingBeforeResetReflection | undefined => {
+        const pending = pendingBeforeResetReflections.get(key);
+        if (!pending) return undefined;
+        pendingBeforeResetReflections.delete(key);
+        return Date.now() - pending.at > REFLECTION_PENDING_BEFORE_RESET_TTL_MS ? undefined : pending;
+      };
 
-      const runMemoryReflection = async (event: any) => {
+      type ReflectionRunOptions = { beforeResetConversation?: string | null };
+      const runMemoryReflectionWith = async (event: any, options?: ReflectionRunOptions) => {
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
         const action = String(event?.action || "unknown");
+        const resumedFromBeforeReset = options !== undefined && "beforeResetConversation" in options;
 
         // Validate sessionKey BEFORE dedup — invalid/empty keys must NOT pollute the dedup set
         if (!sessionKey) {
@@ -5839,7 +5861,7 @@ const memoryLanceDBProPlugin = {
           return;
         }
 
-        if (_dedupHookEvent("reflection", event)) return;
+        if (!resumedFromBeforeReset && _dedupHookEvent("reflection", event)) return;
         const context = (event.context || {}) as Record<string, unknown>;
         const cfg = context.cfg;
         const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<string, unknown>;
@@ -5978,8 +6000,14 @@ const memoryLanceDBProPlugin = {
 
           // Hosts with SQLite session storage hand the departing transcript to the
           // hook itself; the session-file lookup below is the legacy path.
-          let conversation = conversationFromHookSessionMemory(context.previousSessionMemory, reflectionMessageCount);
-          if (conversation) {
+          let conversation = resumedFromBeforeReset
+            ? options?.beforeResetConversation ?? null
+            : conversationFromHookSessionMemory(context.previousSessionMemory, reflectionMessageCount);
+          if (resumedFromBeforeReset) {
+            api.logger.info(
+              `memory-reflection: command:${action} using the before_reset transcript for session ${currentSessionId}; messages=${conversation ? "present" : "empty"}`
+            );
+          } else if (conversation) {
             api.logger.info(
               `memory-reflection: command:${action} using the hook-provided transcript for session ${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`
             );
@@ -6015,6 +6043,13 @@ const memoryLanceDBProPlugin = {
                 currentSessionFile,
                 sourceAgentId,
               });
+              if (isBoundaryAction) {
+                rememberPendingBeforeResetReflection(sessionKey, { event, sessionId: currentSessionId, action });
+                api.logger.info(
+                  `memory-reflection: command:${action} no transcript in the hook context or on disk for session ${currentSessionId}; waiting for the typed before_reset messages`
+                );
+                return;
+              }
               api.logger.warn(
                 `memory-reflection: command:${action} missing session file after recovery for session ${currentSessionId}; dirs=${searchDirs.join(" | ") || "(none)"}`
               );
@@ -6447,6 +6482,23 @@ const memoryLanceDBProPlugin = {
           pruneReflectionSessionState();
         }
       };
+      const runMemoryReflection = async (event: any) => runMemoryReflectionWith(event);
+      const runMemoryReflectionFromBeforeReset = async (event: any, ctx: any) => {
+        const reason = getCommandActionName(event?.reason);
+        if (reason !== "new" && reason !== "reset") return;
+        const sessionKey = typeof ctx?.sessionKey === "string" ? ctx.sessionKey : "";
+        if (!sessionKey) return;
+        const pending = takePendingBeforeResetReflection(sessionKey);
+        if (!pending) return;
+        const conversation = summarizeRecentConversationMessages(
+          Array.isArray(event?.messages) ? event.messages : [],
+          reflectionMessageCount,
+        );
+        // The command hook that parked this entry ran no reflection, so its serial-guard
+        // stamp must not count against the continuation.
+        getSerialGuardMap().delete(sessionKey);
+        await runMemoryReflectionWith(pending.event, { beforeResetConversation: conversation });
+      };
 
       api.registerHook("command:new", runMemoryReflection, {
         name: "memory-lancedb-pro.memory-reflection.command-new",
@@ -6456,8 +6508,9 @@ const memoryLanceDBProPlugin = {
         name: "memory-lancedb-pro.memory-reflection.command-reset",
         description: "Generate reflection log before /reset",
       });
+      api.on("before_reset", runMemoryReflectionFromBeforeReset);
       (isCliMode() ? api.logger.debug : api.logger.info)(
-        "memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_prompt_build, session_end)"
+        "memory-reflection: integrated hooks registered (command:new, command:reset, before_reset, after_tool_call, before_prompt_build, session_end)"
       );
     }
 

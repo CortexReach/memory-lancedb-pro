@@ -155,7 +155,7 @@ describe("runMemoryReflection reads the transcript the hook already carries", ()
       },
       "empty-hook",
     );
-    assert.ok(logs.some((m) => m.includes("missing session file after recovery for session empty-hook")), `got ${JSON.stringify(logs)}`);
+    assert.ok(logs.some((m) => m.includes("no transcript in the hook context or on disk for session empty-hook")), `got ${JSON.stringify(logs)}`);
     assert.ok(!logs.some((m) => m.includes("reflection generation start")), "nothing to reflect on");
 
     const unavailable = await invoke(
@@ -165,7 +165,7 @@ describe("runMemoryReflection reads the transcript the hook already carries", ()
       },
       "unavailable-hook",
     );
-    assert.ok(unavailable.some((m) => m.includes("missing session file after recovery for session unavailable-hook")), `got ${JSON.stringify(unavailable)}`);
+    assert.ok(unavailable.some((m) => m.includes("no transcript in the hook context or on disk for session unavailable-hook")), `got ${JSON.stringify(unavailable)}`);
   });
 });
 
