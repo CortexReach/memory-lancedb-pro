@@ -912,6 +912,18 @@ export function resolveEmbeddedRunnerExportName(candidate: unknown): EmbeddedRun
   return EMBEDDED_RUNNER_EXPORT_NAMES.find((name) => typeof record[name] === "function");
 }
 
+let embeddedRunnerExportName: EmbeddedRunnerExportName | undefined;
+
+export function getEmbeddedRunnerExportName(): EmbeddedRunnerExportName | undefined {
+  return embeddedRunnerExportName;
+}
+
+// Legacy hosts read the distiller transcript from a file path; current hosts
+// treat a non-key sessionFile as a foreign transcript and refuse the run.
+function embeddedRunnerTakesSessionFile(): boolean {
+  return embeddedRunnerExportName !== "runEmbeddedAgent";
+}
+
 // eslint-disable-next-line import/export
 export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<EmbeddedPiRunner> {
   // Layer 1: 嘗試新 SDK API (with circuit breaker)
@@ -919,6 +931,7 @@ export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<Embe
     const newApi = ((api as unknown as { runtime?: { agent?: Record<string, unknown> } }).runtime?.agent);
     const runnerName = resolveEmbeddedRunnerExportName(newApi);
     if (newApi && runnerName) {
+      embeddedRunnerExportName = runnerName;
       const runner = (newApi[runnerName] as EmbeddedPiRunner).bind(newApi);
       // Bug 2 fix: 將 Layer 1 結果寫入 cache，避免後續並發呼叫時 Layer 2 覆蓋掉 Layer 1
       embeddedPiRunnerPromise ??= Promise.resolve(runner as EmbeddedPiRunner);
@@ -934,7 +947,10 @@ export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<Embe
         try {
           const mod = await import(specifier);
           const runnerName = resolveEmbeddedRunnerExportName(mod);
-          if (runnerName) return (mod as Record<string, unknown>)[runnerName] as EmbeddedPiRunner;
+          if (runnerName) {
+            embeddedRunnerExportName = runnerName;
+            return (mod as Record<string, unknown>)[runnerName] as EmbeddedPiRunner;
+          }
           importErrors.push(`${specifier}: runEmbeddedAgent export not found`);
         } catch (err) {
           importErrors.push(`${specifier}: ${err instanceof Error ? err.message : String(err)}`);
@@ -2023,7 +2039,7 @@ async function generateReflectionTextUnbounded(
             // The distiller run is throwaway: keep it out of the host session store.
             sessionPersistence: "detached",
             agentId: params.agentId,
-            sessionFile: tempSessionFile,
+            ...(embeddedRunnerTakesSessionFile() ? { sessionFile: tempSessionFile } : {}),
             workspaceDir: params.workspaceDir,
             config: params.cfg,
             prompt,

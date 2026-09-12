@@ -488,6 +488,15 @@ export function resolveEmbeddedRunnerExportName(candidate) {
     const record = candidate;
     return EMBEDDED_RUNNER_EXPORT_NAMES.find((name) => typeof record[name] === "function");
 }
+let embeddedRunnerExportName;
+export function getEmbeddedRunnerExportName() {
+    return embeddedRunnerExportName;
+}
+// Legacy hosts read the distiller transcript from a file path; current hosts
+// treat a non-key sessionFile as a foreign transcript and refuse the run.
+function embeddedRunnerTakesSessionFile() {
+    return embeddedRunnerExportName !== "runEmbeddedAgent";
+}
 // eslint-disable-next-line import/export
 export async function loadEmbeddedPiRunner(api) {
     // Layer 1: 嘗試新 SDK API (with circuit breaker)
@@ -495,6 +504,7 @@ export async function loadEmbeddedPiRunner(api) {
         const newApi = (api.runtime?.agent);
         const runnerName = resolveEmbeddedRunnerExportName(newApi);
         if (newApi && runnerName) {
+            embeddedRunnerExportName = runnerName;
             const runner = newApi[runnerName].bind(newApi);
             // Bug 2 fix: 將 Layer 1 結果寫入 cache，避免後續並發呼叫時 Layer 2 覆蓋掉 Layer 1
             embeddedPiRunnerPromise ??= Promise.resolve(runner);
@@ -509,8 +519,10 @@ export async function loadEmbeddedPiRunner(api) {
                 try {
                     const mod = await import(specifier);
                     const runnerName = resolveEmbeddedRunnerExportName(mod);
-                    if (runnerName)
+                    if (runnerName) {
+                        embeddedRunnerExportName = runnerName;
                         return mod[runnerName];
+                    }
                     importErrors.push(`${specifier}: runEmbeddedAgent export not found`);
                 }
                 catch (err) {
@@ -1466,7 +1478,7 @@ async function generateReflectionTextUnbounded(params) {
                     // The distiller run is throwaway: keep it out of the host session store.
                     sessionPersistence: "detached",
                     agentId: params.agentId,
-                    sessionFile: tempSessionFile,
+                    ...(embeddedRunnerTakesSessionFile() ? { sessionFile: tempSessionFile } : {}),
                     workspaceDir: params.workspaceDir,
                     config: params.cfg,
                     prompt,
