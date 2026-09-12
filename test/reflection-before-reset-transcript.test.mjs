@@ -18,6 +18,7 @@ import { tmpdir } from "os";
 import path from "path";
 import { fileURLToPath } from "node:url";
 import jitiFactory from "jiti";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const pluginSdkStubPath = path.resolve(testDir, "helpers", "openclaw-plugin-sdk-stub.mjs");
@@ -199,5 +200,45 @@ describe("reflection finishes from the typed before_reset messages", () => {
     assert.ok(!logs.some((m) => m.includes("using the before_reset transcript")), JSON.stringify(logs));
     await fireBeforeReset(setup, sessionKey, "idle");
     assert.ok(logs.some((m) => m.includes("using the before_reset transcript for session idle; messages=present")), "the boundary reason finishes it");
+  });
+
+  it("runs the continuation outside the command's async context so the embedded runner is admitted", async () => {
+    // Core refuses embedded sub-runs enqueued from a released root-work context
+    // (the /new command's), which is exactly where the fire-and-forget
+    // before_reset hook runs. The continuation must not inherit that context.
+    const callerContext = new AsyncLocalStorage();
+    // The embedded-runner loader caches its result per module instance, and the
+    // earlier cases ran without a runtime; load a fresh plugin module here.
+    const freshModule = jitiFactory(import.meta.url, {
+      interopDefault: true,
+      moduleCache: false,
+      alias: { "openclaw/plugin-sdk": pluginSdkStubPath },
+    })("../index.ts");
+    const freshPlugin = freshModule.default || freshModule;
+    const pluginConfig = makePluginConfig(workDir);
+    const harness = createPluginApiHarness({ resolveRoot: workDir, pluginConfig });
+    let storeSeenByRunner = "not invoked";
+    harness.api.runtime = {
+      agent: {
+        runEmbeddedAgent: async () => {
+          storeSeenByRunner = callerContext.getStore();
+          throw new Error("synthetic runner stop");
+        },
+      },
+    };
+    (freshModule.resetRegistration ?? (() => {}))();
+    freshPlugin.register(harness.api);
+    const setup = {
+      harness,
+      pluginConfig,
+      commandHook: harness.eventHandlers.get("command:new")[0].handler,
+      beforeResetHook: harness.eventHandlers.get("before_reset")[0].handler,
+    };
+    await callerContext.run({ released: true }, async () => {
+      const sessionKey = await fireCommandNew(setup, "escaped");
+      await fireBeforeReset(setup, sessionKey, "escaped");
+    });
+    assert.equal(storeSeenByRunner, undefined, "the embedded runner must not see the caller's released root context");
+    assert.ok(harness.logs.some((m) => m.includes("reflection generation start for session escaped")), JSON.stringify(harness.logs));
   });
 });
