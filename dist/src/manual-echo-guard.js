@@ -54,21 +54,33 @@ const MAX_CJK_WRAPPER_RESIDUAL_CHARS = 8;
 const DEFAULT_AGENT_BUCKET = "main";
 /**
  * Reporting glue the extractor wraps a dictated fact in ("User stated
- * that ..."): articles, demonstratives, pronouns, and reporting verbs.
- * Stripped before token comparison so the canonical wrap echo still
- * collapses. Only words that carry no assertion of their own belong here.
- * Semantic predicates (has, wants, likes, prefers, ...) decide what a
- * sentence asserts and stay content tokens; copulas, prepositions and
- * conjunctions carry tense, relation and logic and are compared separately
- * (ECHO_RELATION_TOKENS). Negation and temporal markers are handled by
- * NEGATION_AND_TEMPORAL_MARKERS.
+ * that ..."): articles, demonstratives and reporting verbs. Stripped before
+ * token comparison so the canonical wrap echo still collapses. Only words
+ * that carry no assertion of their own belong here. Semantic predicates
+ * (has, wants, likes, prefers, ...) decide what a sentence asserts and stay
+ * content tokens; copulas, prepositions and conjunctions carry tense,
+ * relation and logic and are compared separately (ECHO_RELATION_TOKENS).
+ * Pronouns carry a referent and are content too, except for the one
+ * perspective transform the wrap performs (see SELF_REFERENCE_TOKENS).
+ * Negation and temporal markers are handled by NEGATION_AND_TEMPORAL_MARKERS.
  */
 const ECHO_GLUE = new Set([
-    "the", "a", "an", "that", "this", "these", "those", "it", "its", "their",
-    "they", "he", "she", "his", "her", "them", "i", "my", "me", "we", "our",
-    "you", "your", "user", "users", "stated", "said", "says", "saying",
-    "mentioned", "noted", "also",
+    "the", "a", "an", "that", "this", "these", "those",
+    "stated", "said", "says", "saying", "mentioned", "noted", "also",
 ]);
+/**
+ * The wrap rewrites the speaker as "User" ("my laptop" -> "User's laptop",
+ * "I like tea" -> "User stated they like tea"): the speaker is implicit on
+ * both sides, so first-person references and the user label are dropped.
+ * Any other pronoun names a referent of its own and stays content, except
+ * inside a User-wrapped text, where it is the wrap's back-reference to the
+ * user ("User stated their favorite teacup ..."). Swapping a referent
+ * anywhere else ("his manager" against "her manager", "their laptop"
+ * against "my laptop") is a different fact, never an echo.
+ */
+const SPEAKER_TOKENS = new Set(["i", "me", "my", "mine", "we", "us", "our", "ours", "user", "users"]);
+const REFERENT_PRONOUNS = new Set(["he", "she", "his", "her", "hers", "they", "them", "their", "theirs", "it", "its", "you", "your", "yours"]);
+const USER_WRAP_TOKENS = new Set(["user", "users"]);
 /**
  * Relation-bearing function words. They are not content (a wrap echo may
  * legitimately add "is" when it turns "teacup: the red one" into "teacup is
@@ -93,12 +105,6 @@ const NEGATION_AND_TEMPORAL_MARKERS = new Set([
     "former", "formerly", "anymore", "longer", "until", "till", "unless",
     "except", "without", "before", "after", "used",
 ]);
-/** Conservative CJK marker fragments (negation / bounded validity). */
-const CJK_MARKER_FRAGMENTS = [
-    "不", "没", "别", "未", "无", "非", "勿", "直到", "之前", "以前", "除非",
-    "ない", "じゃない", "ではない", "まで", "もう",
-    "않", "안", "까지", "전에",
-];
 const CJK_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 export function normalizeEchoText(text) {
     return text
@@ -111,10 +117,20 @@ function tokenList(normalized) {
     return normalized.split(" ").filter((t) => t.length > 0);
 }
 function orderedContentTokens(normalized) {
+    const tokens = tokenList(normalized);
+    const userWrapped = tokens.some((token) => USER_WRAP_TOKENS.has(token));
     const out = [];
-    for (const token of tokenList(normalized)) {
+    for (const token of tokens) {
         if (token.length <= 1 && !CJK_RE.test(token))
             continue;
+        if (SPEAKER_TOKENS.has(token))
+            continue;
+        if (REFERENT_PRONOUNS.has(token)) {
+            if (userWrapped)
+                continue;
+            out.push(token);
+            continue;
+        }
         if (ECHO_GLUE.has(token) || ECHO_RELATION_TOKENS.has(token))
             continue;
         out.push(token);
@@ -167,9 +183,6 @@ function markerAsymmetry(aTokens, bTokens) {
     }
     return false;
 }
-function containsCjkMarker(fragment) {
-    return CJK_MARKER_FRAGMENTS.some((marker) => fragment.includes(marker));
-}
 /**
  * The ONLY residual a wrapped CJK echo may carry: reporting glue and
  * particles. Anything else in the residual — a marker, a verb, a new fact
@@ -201,21 +214,19 @@ function isCjkEcho(candidate, manual) {
         return false;
     if (cand === man)
         return true;
-    // Shortened echo: the candidate re-states a piece of the manual text. The
-    // REMOVED part must carry no marker: stripping 用户不 off 用户不喜欢喝茶和咖啡
-    // yields the OPPOSITE claim, not an echo of it.
-    if (cand.length >= MIN_CJK_CONTAINMENT_CHARS && man.includes(cand)) {
-        const removed = man.replace(cand, "");
-        return !containsCjkMarker(removed);
-    }
     // Wrapped echo: the candidate is the manual text plus reporting glue
-    // (用户说…). The residual must consist ONLY of known glue fragments —
+    // (用户说…). The residual must consist ONLY of known glue fragments;
     // being short and marker-free is not enough, since a three-character
     // residual can be a brand-new fact (并养猫).
     if (man.length >= MIN_CJK_CONTAINMENT_CHARS && cand.includes(man)) {
         const residual = cand.replace(man, "");
         return residual.length <= MAX_CJK_WRAPPER_RESIDUAL_CHARS && isCjkGlueOnly(residual);
     }
+    // A candidate contained inside the manual text is ambiguous without word
+    // boundaries: 用户喜欢机器学习 inside 用户喜欢机器学习课程 drops the object,
+    // and with whitespace removed a Latin fragment matches inside a longer
+    // word (cat inside catalog). Partial CJK containment therefore fails open:
+    // a duplicate is left for the dedup lane, a different fact is never lost.
     return false;
 }
 export function isNearIdenticalEcho(candidateText, manualText) {

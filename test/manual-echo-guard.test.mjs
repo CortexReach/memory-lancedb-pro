@@ -195,6 +195,32 @@ describe("isNearIdenticalEcho", () => {
     );
   });
 
+  it("keeps a candidate that swaps a third-person referent", () => {
+    assert.equal(
+      isNearIdenticalEcho("her manager approved the budget increase", "his manager approved the budget increase"),
+      false,
+      "his and her name different people",
+    );
+    assert.equal(
+      isNearIdenticalEcho("my laptop runs the nightly job", "their laptop runs the nightly job"),
+      false,
+      "their laptop is somebody else's laptop",
+    );
+  });
+
+  it("still collapses the first-person to User perspective transform", () => {
+    assert.equal(
+      isNearIdenticalEcho("User's laptop runs the nightly job", "my laptop runs the nightly job"),
+      true,
+      "the wrap rewrites the speaker as User; that is the one referent change it may make",
+    );
+    assert.equal(
+      isNearIdenticalEcho("User stated that user prefers oat milk in coffee", "I prefer oat milk in coffee"),
+      false,
+      "an inflection change is still a different token sequence (conservative by design)",
+    );
+  });
+
   it("rejects unrelated candidates", () => {
     assert.equal(
       isNearIdenticalEcho("user's dog is named Biscuit", manual),
@@ -231,8 +257,24 @@ describe("isNearIdenticalEcho", () => {
       assert.equal(isNearIdenticalEcho(`用户说${manualCjk}`, manualCjk), true);
     });
 
-    it("matches a shortened CJK echo", () => {
-      assert.equal(isNearIdenticalEcho("最喜欢的茶杯是红色", manualCjk), true);
+    it("fails open on a shortened CJK candidate (partial containment has no word boundary to trust)", () => {
+      assert.equal(isNearIdenticalEcho("最喜欢的茶杯是红色", manualCjk), false);
+    });
+
+    it("keeps a pure-CJK candidate that drops the object of the manual fact", () => {
+      assert.equal(
+        isNearIdenticalEcho("用户喜欢机器学习", "用户喜欢机器学习课程"),
+        false,
+        "liking machine learning is not liking the machine learning course",
+      );
+    });
+
+    it("keeps a mixed-script candidate whose Latin word is a prefix of the manual word", () => {
+      assert.equal(
+        isNearIdenticalEcho("用户 likes cat", "用户 likes catalog"),
+        false,
+        "with whitespace removed, cat sits inside catalog; that is not an echo",
+      );
     });
 
     it("keeps a temporally qualified CJK candidate", () => {

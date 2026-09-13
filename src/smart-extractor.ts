@@ -3423,6 +3423,8 @@ export class SmartExtractor {
     );
 
     if (invalidated) {
+      // The superseded text can no longer echo; keep the manual ledger honest.
+      this.config.manualEchoLedger?.invalidate(agentId, existing.text);
       this.log(
         `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`,
       );

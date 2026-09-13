@@ -2483,6 +2483,8 @@ export class SmartExtractor {
         const invalidated = await this.invalidateSupersededMemory(matchId, existing, factKey, created, scopeFilter);
         await this.notifyPersisted({ text: created.text, category: created.category, scope: created.scope, timestamp: created.timestamp }, "smart-extraction", agentId);
         if (invalidated) {
+            // The superseded text can no longer echo; keep the manual ledger honest.
+            this.config.manualEchoLedger?.invalidate(agentId, existing.text);
             this.log(`memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`);
             return "superseded";
         }
