@@ -154,7 +154,9 @@ export class MemoryUpgrader {
      * Scan and count legacy memories without modifying them.
      */
     async countLegacy(scopeFilter) {
-        const allMemories = await this.store.list(scopeFilter, undefined, 10000, 0);
+        // excludeInactive:false -- the upgrader must see EVERY row (invalidated
+        // ones included): historical rows are still read through the new schema.
+        const allMemories = await this.store.list(scopeFilter, undefined, 10000, 0, { excludeInactive: false });
         let legacy = 0;
         const byCategory = {};
         for (const entry of allMemories) {
@@ -191,7 +193,7 @@ export class MemoryUpgrader {
         // the stamped metadata value and the legacy-vocabulary storage column.
         const targets = [];
         for (let offset = 0;; offset += pageSize) {
-            const page = await this.store.list(scopeFilter, undefined, pageSize, offset);
+            const page = await this.store.list(scopeFilter, undefined, pageSize, offset, { excludeInactive: false });
             for (const entry of page) {
                 const meta = parseMetadata(entry.metadata);
                 if (!meta || meta.type !== "memory-reflection-mapped")
@@ -286,7 +288,7 @@ export class MemoryUpgrader {
         };
         // Load all memories
         this.log("memory-upgrader: scanning memories...");
-        const allMemories = await this.store.list(options.scopeFilter ?? this.options.scopeFilter, undefined, 10000, 0);
+        const allMemories = await this.store.list(options.scopeFilter ?? this.options.scopeFilter, undefined, 10000, 0, { excludeInactive: false });
         // Filter legacy memories
         const legacyMemories = allMemories.filter((m) => this.isLegacyMemory(m));
         result.totalLegacy = legacyMemories.length;

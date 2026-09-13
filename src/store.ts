@@ -1880,6 +1880,10 @@ export class MemoryStore {
     const safeLimit = clampInt(limit, 1, 20);
     // Over-fetch more aggressively when filtering inactive records,
     // because superseded historical rows can crowd out active ones.
+    // excludeInactive preserves the pre-#946 API default (false): live-only
+    // reads are an explicit per-caller opt-in (retriever, dedup prefilter,
+    // consolidate), so existing whole-store callers keep their population.
+    // invisible unless a caller opts out explicitly (item 6, PR #946).
     const inactiveFilter = options?.excludeInactive ?? false;
     const overFetchMultiplier = inactiveFilter ? 20 : 10;
     const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
@@ -1976,6 +1980,7 @@ export class MemoryStore {
     if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
     const safeLimit = clampInt(limit, 1, 20);
+    // excludeInactive keeps the pre-#946 default (false): see vectorSearch above.
     const inactiveFilter = options?.excludeInactive ?? false;
     // Over-fetch when filtering inactive records to avoid crowding
     const fetchLimit = inactiveFilter ? Math.min(safeLimit * 20, 200) : safeLimit;
@@ -2100,8 +2105,9 @@ export class MemoryStore {
 
       const metadata = parseSmartMetadata(entry.metadata, entry);
 
-      // Skip inactive (superseded) records when requested
-      if (options?.excludeInactive && !isMemoryActiveAt(metadata)) {
+      // Skip inactive (superseded) records unless explicitly opted out
+      // (excludeInactive keeps the pre-#946 default: false).
+      if ((options?.excludeInactive ?? false) && !isMemoryActiveAt(metadata)) {
         continue;
       }
 
@@ -2186,6 +2192,7 @@ export class MemoryStore {
     category?: string,
     limit = 20,
     offset = 0,
+    options?: { excludeInactive?: boolean },
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
 
@@ -2241,11 +2248,20 @@ export class MemoryStore {
         }),
       );
 
+    // excludeInactive preserves the pre-#946 API default (false): live-only
+    // reads are an explicit per-caller opt-in (retriever, dedup prefilter,
+    // consolidate), so existing whole-store callers keep their population.
+    // invisible to list() unless a caller opts out explicitly (item 6, PR #946).
+    const excludeInactive = options?.excludeInactive ?? false;
+    const activeEntries = excludeInactive
+      ? entries.filter((entry) => isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry)))
+      : entries;
+
     return (category
-      ? entries.filter((entry) =>
+      ? activeEntries.filter((entry) =>
           matchesMemoryCategoryFilter(entry.category, category, entry.metadata),
         )
-      : entries)
+      : activeEntries)
       .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
       .slice(offset, offset + limit);
   }
@@ -2333,8 +2349,24 @@ export class MemoryStore {
     return await applyFilters(this.table!.query()).toArray();
   }
 
+  /**
+   * Liveness for stats() without a full metadata parse where the answer is
+   * already determined: a blob carrying neither activity key parses to
+   * valid_from = the row timestamp and no invalidated_at, so it is live iff
+   * that timestamp is not in the future. Any blob that mentions either key
+   * (a substring hit inside a text value merely takes the slow path) is
+   * parsed and judged exactly as before.
+   */
+  private isLiveRow(rawMetadata: string, timestamp: number, at: number): boolean {
+    if (!rawMetadata.includes('"invalidated_at"') && !rawMetadata.includes('"valid_from"')) {
+      return timestamp <= at;
+    }
+    return isMemoryActiveAt(parseSmartMetadata(rawMetadata, { timestamp }), at);
+  }
+
   async stats(scopeFilter?: string[]): Promise<{
     totalCount: number;
+    liveCount: number;
     scopeCounts: Record<string, number>;
     categoryCounts: Record<string, number>;
   }> {
@@ -2344,6 +2376,7 @@ export class MemoryStore {
     if (isExplicitDenyAllScopeFilter(scopeFilter)) {
       return {
         totalCount: 0,
+        liveCount: 0,
         scopeCounts: {},
         categoryCounts: {},
       };
@@ -2362,13 +2395,19 @@ export class MemoryStore {
     const applyConditions = (query: any) =>
       conditions.length > 0 ? query.where(conditions.join(" AND ")) : query;
 
+    // scopeCounts/categoryCounts stay blended (total, historical record
+    // included) -- only the top-level total/live split is added here, per
+    // item 6 (PR #946): "report a live vs total split rather than one
+    // blended count."
     const results = await this.queryRowsWithProjectionFallback(
       applyConditions,
-      ["scope", "category"],
+      ["scope", "category", "metadata", "timestamp"],
     );
 
     const scopeCounts: Record<string, number> = {};
     const categoryCounts: Record<string, number> = {};
+    let liveCount = 0;
+    const now = Date.now();
 
     for (const row of results) {
       const scope = (row.scope as string | undefined) ?? "global";
@@ -2376,10 +2415,15 @@ export class MemoryStore {
 
       scopeCounts[scope] = (scopeCounts[scope] || 0) + 1;
       categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+
+      if (this.isLiveRow((row.metadata as string) || "{}", normalizeMemoryTimestamp(row.timestamp, 0), now)) {
+        liveCount += 1;
+      }
     }
 
     return {
       totalCount: results.length,
+      liveCount,
       scopeCounts,
       categoryCounts,
     };
@@ -3470,6 +3514,7 @@ export class MemoryStore {
     maxTimestamp: number,
     scopeFilter?: string[],
     limit = 200,
+    options?: { excludeInactive?: boolean },
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
 
@@ -3490,26 +3535,72 @@ export class MemoryStore {
 
     const whereClause = conditions.join(" AND ");
 
-    const results = await this.table!
-      .query()
-      .where(whereClause)
-      .toArray();
+    // Two-phase read so the scan limit actually bounds materialization: the
+    // full-table pass fetches ONLY the light columns needed to rank and
+    // filter (no vector column crosses the wire), and the heavy rows --
+    // vectors included -- are fetched afterwards for just the `limit` newest
+    // survivors. A full .toArray() with vectors converted for every matching
+    // row spikes the heap on exactly the large stores the limit exists for.
+    // Routed through the same projection fallback as list()/stats(): on the
+    // LanceDB versions that return an empty projected metadata read for a
+    // populated table, a bare .select() here makes consolidate report
+    // "Scanned 0 rows" and silently do nothing.
+    const lightRows = await this.queryRowsWithProjectionFallback(
+      (query: any) => query.where(whereClause),
+      ["id", "timestamp", "metadata"],
+    );
 
-    return results
-      .map(
-        (row): MemoryEntry => ({
-          id: row.id as string,
+    // excludeInactive keeps the pre-#946 default (false); the consolidate
+    // CLI opts in to live-only explicitly.
+    const excludeInactive = options?.excludeInactive ?? false;
+    const ranked = lightRows
+      .map((row) => ({
+        id: row.id as string,
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+        metadata: (row.metadata as string) || "{}",
+      }))
+      .filter((row) =>
+        excludeInactive ? isMemoryActiveAt(parseSmartMetadata(row.metadata, { id: row.id } as MemoryEntry)) : true,
+      )
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, limit);
+
+    if (ranked.length === 0) return [];
+
+    const entriesById = new Map<string, MemoryEntry>();
+    const ID_CHUNK = 500;
+    for (let i = 0; i < ranked.length; i += ID_CHUNK) {
+      const chunk = ranked.slice(i, i + ID_CHUNK);
+      const idList = chunk.map((row) => `'${escapeSqlLiteral(row.id)}'`).join(", ");
+      const fullRows = await this.table!
+        .query()
+        .where(`${whereClause} AND id IN (${idList})`)
+        .toArray();
+      for (const row of fullRows) {
+        const id = row.id as string;
+        const timestamp = normalizeMemoryTimestamp(row.timestamp, 0);
+        const metadata = (row.metadata as string) || "{}";
+        // Re-judged on the FRESH metadata: a row invalidated between the two
+        // passes cleared the light filter but must not enter consolidation live.
+        if (excludeInactive && !isMemoryActiveAt(parseSmartMetadata(metadata, { id, timestamp } as MemoryEntry))) continue;
+        entriesById.set(id, {
+          id,
           text: row.text as string,
           vector: toNumberVector(row.vector),
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
           importance: clampImportance(Number(row.importance)),
-          timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-          metadata: (row.metadata as string) || "{}",
-        }),
-      )
-      .sort((a, b) => b.timestamp - a.timestamp)
-      .slice(0, limit);
+          timestamp,
+          metadata,
+        });
+      }
+    }
+
+    // Order and membership come from the ranked light pass; a row deleted (or,
+    // under excludeInactive, invalidated) between the two passes simply drops out.
+    return ranked
+      .map((row) => entriesById.get(row.id))
+      .filter((entry): entry is MemoryEntry => entry !== undefined);
   }
 
   /**

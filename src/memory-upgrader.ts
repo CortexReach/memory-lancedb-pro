@@ -263,7 +263,9 @@ export class MemoryUpgrader {
     legacy: number;
     byCategory: Record<string, number>;
   }> {
-    const allMemories = await this.store.list(scopeFilter, undefined, 10000, 0);
+    // excludeInactive:false -- the upgrader must see EVERY row (invalidated
+    // ones included): historical rows are still read through the new schema.
+    const allMemories = await this.store.list(scopeFilter, undefined, 10000, 0, { excludeInactive: false });
     let legacy = 0;
     const byCategory: Record<string, number> = {};
 
@@ -307,7 +309,7 @@ export class MemoryUpgrader {
     // the stamped metadata value and the legacy-vocabulary storage column.
     const targets: Array<{ entry: MemoryEntry; meta: Record<string, unknown> }> = [];
     for (let offset = 0; ; offset += pageSize) {
-      const page = await this.store.list(scopeFilter, undefined, pageSize, offset);
+      const page = await this.store.list(scopeFilter, undefined, pageSize, offset, { excludeInactive: false });
       for (const entry of page) {
         const meta = parseMetadata(entry.metadata);
         if (!meta || meta.type !== "memory-reflection-mapped") continue;
@@ -413,6 +415,7 @@ export class MemoryUpgrader {
       undefined,
       10000,
       0,
+      { excludeInactive: false },
     );
 
     // Filter legacy memories

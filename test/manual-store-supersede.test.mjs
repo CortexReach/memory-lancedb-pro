@@ -567,7 +567,7 @@ describe("manual supersede commits atomically at the store layer (real store)", 
       assert.equal(resA.details.action, "superseded");
       assert.equal(resB.details.action, "superseded");
 
-      const rows = await store.list(undefined, undefined, 100, 0);
+      const rows = await store.list(undefined, undefined, 100, 0, { excludeInactive: false });
       const now = Date.now();
       const activeSameKey = rows.filter((row) => {
         const meta = parseSmartMetadata(row.metadata, row);
@@ -628,7 +628,7 @@ describe("manual supersede commits atomically at the store layer (real store)", 
         "one writer creates, the other's locked recheck must supersede that row",
       );
 
-      const rows = await store.list(undefined, undefined, 100, 0);
+      const rows = await store.list(undefined, undefined, 100, 0, { excludeInactive: false });
       const now = Date.now();
       const activeSameKey = rows.filter((row) => {
         const meta = parseSmartMetadata(row.metadata, row);
@@ -751,7 +751,7 @@ describe("manual supersede commits atomically at the store layer (real store)", 
       const result = await storeTool.execute(null, { text: "favorite drink: tea", category: "preference" });
       assert.equal(result.details.action, "superseded");
 
-      const rows = await store.list(undefined, undefined, 100, 0);
+      const rows = await store.list(undefined, undefined, 100, 0, { excludeInactive: false });
       const now = Date.now();
       const factKey = deriveFactKey("preferences", "favorite drink: cola");
       const activeSameKey = rows.filter((row) => {
@@ -801,7 +801,7 @@ describe("manual supersede commits atomically at the store layer (real store)", 
       const result = await storeTool.execute(null, { text: "favorite drink: tea", category: "preference" });
       assert.equal(result.details.action, "superseded");
 
-      const rows = await store.list(undefined, undefined, 100, 0);
+      const rows = await store.list(undefined, undefined, 100, 0, { excludeInactive: false });
       const now = Date.now();
       const activeSameKey = rows.filter((row) => {
         const meta = parseSmartMetadata(row.metadata, row);

@@ -675,7 +675,10 @@ export class AdmissionController {
         if (!Array.isArray(candidateVector) || candidateVector.length === 0) {
             return [];
         }
-        const rawMatches = await this.store.vectorSearch(candidateVector, this.config.noveltyCandidatePoolSize, 0, scopeFilter);
+        const rawMatches = await this.store.vectorSearch(candidateVector, this.config.noveltyCandidatePoolSize, 0, scopeFilter, 
+        // Live-only is this gate's explicit requirement (novelty is judged
+        // against the CURRENT corpus), not a store-wide default.
+        { excludeInactive: true });
         if (rawMatches.length === 0) {
             return [];
         }

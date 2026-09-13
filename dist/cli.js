@@ -10,6 +10,7 @@ import JSON5 from "json5";
 import { loadLanceDB } from "./src/store.js";
 import { createRetriever } from "./src/retriever.js";
 import { createMemoryUpgrader, isCurrentReflectionMemory } from "./src/memory-upgrader.js";
+import { runConsolidate, formatConsolidateCostPreview, formatConsolidatePlanForDisplay, pluralCount, DEFAULT_SCAN_LIMIT, loadConsolidateSettledLedger, saveConsolidateSettledLedger } from "./src/consolidate.js";
 import { getDefaultOauthModelForProvider, getOAuthProviderLabel, isOauthModelSupported, listOAuthProviders, normalizeOauthModel, normalizeOAuthProviderId, performOAuthLogin, } from "./src/llm-oauth.js";
 // ============================================================================
 // Utility Functions
@@ -1046,6 +1047,7 @@ export function registerMemoryCLI(program, context) {
         .option("--limit <n>", "Maximum number of results", "20")
         .option("--offset <n>", "Number of results to skip", "0")
         .option("--json", "Output as JSON")
+        .option("--include-invalidated", "Include invalidated/superseded rows (excluded by default)", false)
         .action(async (options) => {
         try {
             const limit = parseInt(options.limit) || 20;
@@ -1054,7 +1056,7 @@ export function registerMemoryCLI(program, context) {
             if (options.scope) {
                 scopeFilter = [options.scope];
             }
-            const memories = await context.store.list(scopeFilter, options.category, limit, offset);
+            const memories = await context.store.list(scopeFilter, options.category, limit, offset, { excludeInactive: !options.includeInvalidated });
             if (options.json) {
                 writeJson(memories);
             }
@@ -1164,6 +1166,7 @@ export function registerMemoryCLI(program, context) {
             }
             else {
                 console.log(`Memory Statistics:`);
+                console.log(`• Live memories: ${stats.liveCount}`);
                 console.log(`• Total memories: ${stats.totalCount}`);
                 console.log(`• Available scopes: ${scopeStats.totalScopes}`);
                 console.log(`• Retrieval mode: ${retrievalConfig.mode}`);
@@ -1268,8 +1271,12 @@ export function registerMemoryCLI(program, context) {
             if (options.scope) {
                 scopeFilter = [options.scope];
             }
-            const memories = await context.store.list(scopeFilter, options.category, 1000 // Large limit for export
-            );
+            const memories = await context.store.list(scopeFilter, options.category, 
+            // excludeInactive:false -- export is a backup/forensic view and must
+            // keep full-dump semantics, including invalidated/superseded rows
+            // (item 6, PR #946).
+            1000, // Large limit for export
+            0, { excludeInactive: false });
             const exportData = {
                 version: "1.0",
                 exportedAt: new Date().toISOString(),
@@ -1309,11 +1316,12 @@ export function registerMemoryCLI(program, context) {
         .option("--category <category>", "Export specific category")
         .option("--limit <number>", "Maximum memories to export", "1000")
         .option("--dry-run", "Show what would be written without creating files")
+        .option("--include-invalidated", "Include invalidated/superseded rows (excluded by default)", false)
         .action(async (options) => {
         try {
             const limit = clampInt(Number(options.limit), 1, 10000);
             const scopeFilter = options.scope ? [String(options.scope)] : undefined;
-            const memories = await context.store.list(scopeFilter, options.category, limit);
+            const memories = await context.store.list(scopeFilter, options.category, limit, 0, { excludeInactive: !options.includeInvalidated });
             const vault = path.resolve(String(options.vault));
             const root = path.join(vault, "00-AI-Memory");
             let created = 0;
@@ -2039,6 +2047,207 @@ export function registerMemoryCLI(program, context) {
         }
         catch (error) {
             console.error("repair-scopes failed:", error);
+            process.exit(1);
+        }
+    });
+    // consolidate: reconcile duplicate/contradictory rows already in the store
+    registerConsolidateCommand(memory, context);
+}
+// ============================================================================
+// Factory Function
+// ============================================================================
+/**
+ * Item 7: the real confirm implementation wired to a real CLI invocation.
+ * Fails closed -- non-interactive (either stream not a TTY) resolves false
+ * without ever reading anything, so a scripted/piped invocation without
+ * --yes aborts cleanly instead of hanging on stdin or silently proceeding.
+ * Streams are injectable so tests can drive both branches deterministically.
+ */
+export function createConsolidateConfirm(streams) {
+    const stdin = streams?.stdin ?? process.stdin;
+    const stdout = streams?.stdout ?? process.stdout;
+    return async (promptText) => {
+        if (!stdin.isTTY || !stdout.isTTY) {
+            return false;
+        }
+        const rl = readline.createInterface({ input: stdin, output: stdout });
+        try {
+            const answer = await new Promise((resolve) => rl.question(promptText, resolve));
+            return answer.trim() === "YES";
+        }
+        finally {
+            rl.close();
+        }
+    };
+}
+/** Item 8: renders the full plan (verdict, member ids, survivor, exact merge content) for user review before the apply prompt. */
+function registerConsolidateCommand(memory, context) {
+    memory
+        .command("consolidate")
+        .description("Reconcile duplicate or contradictory memories already in the store across write lanes (dry-run by default)")
+        .requiredOption("--agent <agentId>", "Agent whose memory to consolidate (scope agent:<agentId>; journal-mirror writes route to this agent's workspace)")
+        .option("--category <category>", "Limit to one smart category (profile|preferences|entities|events|cases|patterns)")
+        .option("--since <iso>", "Only consider rows stored at or after this ISO timestamp")
+        .option("--apply", "Apply the consolidation plan immediately and record settled clusters (default is a dry-run preview with an interactive apply prompt; a dry-run never writes the store or the settled ledger); exits with status 1 when any cluster failed or was only partially applied", false)
+        .option("--yes", "Skip the LLM-cost confirmation prompt. Automation needs BOTH --yes and --apply: without --apply a non-interactive run pays for a plan it can never apply", false)
+        .option("--include-reflection-slices", "Include reflection writer-2 slice rows in the scan (excluded by default)", false)
+        .option("--scan-limit <n>", `Maximum rows to scan before clustering (default ${DEFAULT_SCAN_LIMIT}; clustering is O(n^2), raise deliberately)`)
+        .action(async (options) => {
+        try {
+            if (!context.llmClient) {
+                console.error("consolidate: no LLM client configured, cannot make consolidation decisions");
+                process.exit(1);
+            }
+            if (!context.embedder) {
+                console.error("consolidate: no embedder configured, cannot re-embed merged rows");
+                process.exit(1);
+            }
+            const llmClient = context.llmClient;
+            const embedder = context.embedder;
+            let sinceMs;
+            if (options.since) {
+                const parsed = Date.parse(options.since);
+                if (Number.isNaN(parsed)) {
+                    console.error(`consolidate: invalid --since timestamp "${options.since}"`);
+                    process.exit(1);
+                }
+                sinceMs = parsed;
+            }
+            let scanLimit;
+            if (options.scanLimit !== undefined) {
+                scanLimit = Number.parseInt(options.scanLimit, 10);
+                if (!Number.isInteger(scanLimit) || scanLimit < 1) {
+                    console.error(`consolidate: invalid --scan-limit "${options.scanLimit}" (positive integer required)`);
+                    process.exit(1);
+                }
+            }
+            const mdMirror = context.mdMirror;
+            const confirm = createConsolidateConfirm();
+            const scope = `agent:${options.agent}`;
+            const settledLedgerPath = typeof context.store.dbPath === "string" && context.store.dbPath.length > 0
+                ? path.join(context.store.dbPath, "consolidate-settled.json")
+                : undefined;
+            const settledLedger = settledLedgerPath ? await loadConsolidateSettledLedger(settledLedgerPath) : {};
+            const result = await runConsolidate({
+                fetchRows: (scopeFilter, maxTimestamp, limit) => 
+                // Live-only is this feature's explicit choice, not a store-wide
+                // default: consolidate must never cluster already-dead rows.
+                context.store.fetchForCompaction(maxTimestamp, scopeFilter, limit, { excludeInactive: true }),
+                update: (id, patch, scopeFilter) => context.store.update(id, patch, scopeFilter),
+                getById: (id, scopeFilter) => context.store.getById(id, scopeFilter),
+                embed: (text) => embedder.embedPassage(text),
+                completeJson: (prompt, label, system, temperature) => llmClient.completeJson(prompt, label, system, temperature),
+                log: (message) => console.warn(message),
+                confirmCost: async (message) => {
+                    console.log(`\n${message}`);
+                    return confirm("Proceed with these LLM calls? Type YES to continue: ");
+                },
+                confirmApply: async (message, clusters) => {
+                    console.log(`\n${formatConsolidatePlanForDisplay(clusters)}`);
+                    console.log(`\n${message}`);
+                    return confirm("Type YES to apply: ");
+                },
+                onAudit: mdMirror
+                    ? async (audit) => {
+                        const summary = `${audit.action} survivor=${audit.survivorId.slice(0, 8)} absorbed=${audit.absorbedIds.map((id) => id.slice(0, 8)).join(",")} reason="${audit.reason}"`;
+                        await mdMirror({ text: summary, category: "consolidation", scope: audit.scope, timestamp: Date.now() }, { source: `memory-consolidate:${audit.action}`, agentId: options.agent });
+                    }
+                    : undefined,
+            }, {
+                scope,
+                category: options.category,
+                sinceMs,
+                includeReflectionSlices: options.includeReflectionSlices,
+                apply: options.apply === true,
+                autoConfirm: options.yes === true,
+                settledFingerprints: new Set((settledLedger[scope] ?? []).map((e) => e.fp)),
+                scanLimit,
+            });
+            if (result.status === "aborted") {
+                const declined = (result.abortReason ?? "").includes("cost gate declined");
+                if (declined) {
+                    console.log(`consolidate: cancelled at the cost gate — no LLM calls were made.`);
+                    console.log(`Pass --yes to skip this prompt (automation: --yes together with --apply).`);
+                }
+                else {
+                    console.error(`consolidate: aborted -- ${result.abortReason}`);
+                    if (result.costPreview) {
+                        console.error(formatConsolidateCostPreview(result.costPreview));
+                    }
+                    console.error(`Pass --yes to skip this prompt (automation: --yes together with --apply), or re-run interactively and type YES.`);
+                }
+                process.exit(1);
+            }
+            console.log(`Scanned ${pluralCount(result.scanned, "row")}, ${result.eligible} eligible for consolidation.`);
+            const settledNote = result.settledSkipped > 0 ? ` (${result.settledSkipped} settled in previous runs)` : "";
+            if (result.clusters.length === 0) {
+                console.log(`0 candidates${settledNote} — nothing to consolidate.\n`);
+            }
+            else {
+                console.log(`Decided ${pluralCount(result.clusters.length, "cluster")}${settledNote}:\n`);
+            }
+            for (const cluster of result.clusters) {
+                if (cluster.malformed) {
+                    const label = cluster.failure === "call-failed" ? "undecided: LLM call failed" : "skipped: malformed verdict";
+                    console.log(`  [${label}] ${pluralCount(cluster.memberIds.length, "row")}`);
+                    for (const text of cluster.memberTexts)
+                        console.log(`    - "${text}"`);
+                    continue;
+                }
+                const blockedNote = cluster.blocked === "append-only-shield" ? " — BLOCKED by append-only shield (not applied)" : "";
+                console.log(`  [${cluster.verdict.verdict}] ${pluralCount(cluster.memberIds.length, "row")} — ${cluster.verdict.reason}${blockedNote}`);
+                for (const text of cluster.memberTexts)
+                    console.log(`    - "${text}"`);
+            }
+            if (result.staleSkipped.length > 0) {
+                console.log(`\n${pluralCount(result.staleSkipped.length, "cluster")} skipped: changed since the plan was built (stale).`);
+            }
+            // Settlement is durable state, so only a run that COMMITTED (--apply,
+            // or an interactive YES) writes it. A dry-run that judged a cluster
+            // "skip" must not hide that cluster from every later preview and apply.
+            if (result.status === "completed" && result.executed && settledLedgerPath) {
+                await saveConsolidateSettledLedger(settledLedgerPath, scope, result.newlySettled);
+            }
+            if (result.scanTruncated) {
+                console.log(`\nNote: the scan stopped at the row limit; rerun with a higher --scan-limit to cover the whole scope.`);
+            }
+            if (!result.executed) {
+                if (!options.apply) {
+                    console.log(`\nNo changes applied.`);
+                }
+                if (result.newlySettled.length > 0) {
+                    console.log(`${pluralCount(result.newlySettled.length, "skip verdict")} not recorded as settled: a dry-run never writes the settled ledger. Rerun with --apply to commit them so later runs skip these clusters.`);
+                }
+                return;
+            }
+            const failureNotes = [];
+            if (result.skippedMalformed > 0)
+                failureNotes.push(`${pluralCount(result.skippedMalformed, "cluster")} skipped due to malformed verdicts`);
+            if (result.undecidedCallFailed > 0)
+                failureNotes.push(`${pluralCount(result.undecidedCallFailed, "cluster")} undecided because the decide call failed`);
+            const partial = result.applied.filter((a) => a.partialFailures?.length);
+            if (partial.length > 0)
+                failureNotes.push(`${pluralCount(partial.length, "cluster")} PARTIALLY applied (failed rows stay active; rerun retries them)`);
+            if (result.applyFailed.length > 0)
+                failureNotes.push(`${pluralCount(result.applyFailed.length, "cluster")} FAILED to apply (nothing written; rerun retries them)`);
+            console.log(`\nApplied ${pluralCount(result.applied.length, "action")}${failureNotes.length ? "; " + failureNotes.join("; ") : ""}.`);
+            for (const cluster of partial) {
+                for (const failure of cluster.partialFailures) {
+                    console.log(`  partial: ${failure.step} ${failure.id.slice(0, 8)} — ${failure.error}`);
+                }
+            }
+            for (const failed of result.applyFailed) {
+                console.log(`  failed: cluster of ${pluralCount(failed.memberIds.length, "row")} (${failed.action}) — ${failed.error}`);
+            }
+            if (partial.length > 0 || result.applyFailed.length > 0) {
+                // An incomplete apply must not look like success to cron, CI, or scripts:
+                // exit non-zero, but via exitCode so the report above is fully flushed.
+                console.error(`consolidate: apply incomplete (${pluralCount(partial.length, "cluster")} partially applied, ${pluralCount(result.applyFailed.length, "cluster")} failed); exiting with status 1.`);
+                process.exitCode = 1;
+            }
+        }
+        catch (error) {
+            console.error("consolidate failed:", error);
             process.exit(1);
         }
     });
