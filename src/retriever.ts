@@ -1347,20 +1347,25 @@ export class MemoryRetriever {
       // BM25 hit acts as a bonus (keyword match confirms relevance).
       const vectorScore = vectorResult ? vectorResult.score : 0;
       const bm25Score = bm25Result ? bm25Result.score : 0;
-      // Weighted fusion: vectorWeight/bm25Weight directly control score blending.
-      // BM25 high-score floor (>= 0.75) preserves exact keyword matches
-      // (e.g. API keys, ticket numbers) that may have low vector similarity.
+      // Weighted fusion: vectorWeight/bm25Weight directly control score blending,
+      // applied identically to every candidate. Previously the BM25-only branch
+      // used the normalised BM25 score directly, bypassing bm25Weight — so a
+      // keyword-only candidate kept its full sigmoid-normalised score (floor 0.5
+      // by construction) while a semantic-only candidate was capped at
+      // vectorWeight, and keyword noise systematically outranked strong semantic
+      // matches regardless of configured weights (#978).
+      //
+      // The exact-keyword floor preserves identifier-like matches (API keys,
+      // ticket numbers) above minScore even with weak vector similarity. Its
+      // threshold is calibrated to the sigmoid normalisation in
+      // store.bm25Search (1/(1+e^(-raw/5))): the old 0.75 threshold maps to a
+      // raw BM25 of ~5.5, which almost every FTS hit clears — making the floor
+      // re-create the bypass it was meant to bound. 0.95 maps to raw ~14.7,
+      // i.e. genuinely exceptional keyword matches.
       const weightedFusion = (vectorScore * this.config.vectorWeight)
                            + (bm25Score * this.config.bm25Weight);
-      const fusedScore = vectorResult
-        ? clamp01(
-          Math.max(
-            weightedFusion,
-            bm25Score >= 0.75 ? bm25Score * 0.92 : 0,
-          ),
-          0.1,
-        )
-        : clamp01(bm25Result!.score, 0.1);
+      const keywordFloor = bm25Score >= 0.95 ? bm25Score * 0.92 : 0;
+      const fusedScore = clamp01(Math.max(weightedFusion, keywordFloor), 0.1);
 
       fusedResults.push({
         entry: baseResult.entry,
