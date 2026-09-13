@@ -236,6 +236,11 @@ describe("runMemoryReflection — invalid agentId guard", () => {
         hook.meta?.name === "memory-lancedb-pro.memory-reflection.command-new"
       );
       assert.ok(reflectionHook, "expected memory reflection command:new hook");
+      // An empty transcript file parks the boundary for the typed before_reset
+      // hook; the empty guard is recorded when that hook brings no messages.
+      const beforeResetHooks = harness.eventHandlers.get("before_reset") || [];
+      assert.equal(beforeResetHooks.length, 1, "expected the reflection before_reset listener");
+      const beforeResetHook = beforeResetHooks[0];
 
       const emptySessionFile = path.join(workDir, "fresh-empty.jsonl");
       writeFileSync(emptySessionFile, "", "utf-8");
@@ -258,14 +263,20 @@ describe("runMemoryReflection — invalid agentId guard", () => {
               },
             },
           }, { sessionKey: "agent:main:session:fresh", agentId: "main" });
+          await beforeResetHook.handler(
+            { sessionFile: emptySessionFile, messages: [], reason: "new" },
+            { agentId: "main", sessionKey: "agent:main:session:fresh", sessionId: "fresh-empty", workspaceDir: workDir },
+          );
           now += 10;
         }
       } finally {
         Date.now = originalDateNow;
       }
 
+      const parkedLogs = harness.logs.filter(([, msg]) => msg.includes("waiting for the typed before_reset messages"));
+      assert.equal(parkedLogs.length, 1, `only the first empty event should park for before_reset; got ${JSON.stringify(parkedLogs)}`);
       const emptyLogs = harness.logs.filter(([, msg]) => msg.includes("conversation empty/unusable"));
-      assert.equal(emptyLogs.length, 1, `only the first empty event should read the session; got ${JSON.stringify(emptyLogs)}`);
+      assert.equal(emptyLogs.length, 1, `only the first before_reset continuation should judge the session empty; got ${JSON.stringify(emptyLogs)}`);
 
       const skippedLogs = harness.logs.filter(([, msg]) => msg.includes("skipped repeated empty/unusable session"));
       assert.equal(skippedLogs.length, 2, `expected repeated empty events to hit the guard; got ${JSON.stringify(harness.logs)}`);

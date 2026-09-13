@@ -293,6 +293,36 @@ function createHostClient(config, runtimeLlmComplete, log, warnLog) {
                 return null;
             }
         },
+        async completeText(prompt, label = "generic", systemPrompt, temperature) {
+            lastError = null;
+            const messages = [];
+            if (systemPrompt !== undefined)
+                messages.push({ role: "system", content: systemPrompt });
+            messages.push({ role: "user", content: prompt });
+            try {
+                const result = await raceWithTimeout(runtimeLlmComplete({
+                    messages,
+                    ...(config.modelExplicit ? { model: config.model } : {}),
+                    temperature: temperature ?? 0.1,
+                    purpose: `memory-lancedb-pro:${label}`,
+                    reasoning: config.thinkLevel?.trim() || DEFAULT_HOST_REASONING_EFFORT,
+                }), config.timeoutMs);
+                const text = typeof result?.text === "string" ? result.text.trim() : "";
+                if (!text) {
+                    lastError =
+                        `memory-lancedb-pro: llm-client [${label}] empty host-transport response content from model ${config.model}`;
+                    log(lastError);
+                    return null;
+                }
+                return text;
+            }
+            catch (err) {
+                lastError =
+                    `memory-lancedb-pro: llm-client [${label}] host-transport request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
+                (warnLog ?? log)(lastError);
+                return null;
+            }
+        },
         getLastError() {
             return lastError;
         },
@@ -394,6 +424,40 @@ function createApiKeyClient(config, log, warnLog) {
                 return null;
             }
         },
+        async completeText(prompt, label = "generic", systemPrompt, temperature) {
+            lastError = null;
+            try {
+                const request = {
+                    model: config.model,
+                    messages: [
+                        ...(systemPrompt !== undefined ? [{ role: "system", content: systemPrompt }] : []),
+                        { role: "user", content: prompt },
+                    ],
+                    temperature: temperature ?? 0.1,
+                    ...(config.thinkLevel?.trim()
+                        ? { reasoning: { effort: config.thinkLevel.trim() } }
+                        : {}),
+                };
+                const response = await client.chat.completions.create(request, {
+                    headers: { "x-memory-call-label": sanitizeLabelHeader(label) },
+                });
+                const raw = response.choices?.[0]?.message?.content;
+                const text = typeof raw === "string" ? raw.trim() : "";
+                if (!text) {
+                    lastError =
+                        `memory-lancedb-pro: llm-client [${label}] empty response content from model ${config.model}`;
+                    log(lastError);
+                    return null;
+                }
+                return text;
+            }
+            catch (err) {
+                lastError =
+                    `memory-lancedb-pro: llm-client [${label}] request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
+                (warnLog ?? log)(lastError);
+                return null;
+            }
+        },
         getLastError() {
             return lastError;
         },
@@ -464,26 +528,7 @@ function createOauthClient(config, log, warnLog) {
                         const detail = await response.text().catch(() => "");
                         throw new Error(`HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 500)}`);
                     }
-                    const bodyText = await response.text();
-                    const raw = (response.headers.get("content-type")?.includes("text/event-stream") ||
-                        looksLikeSseResponse(bodyText))
-                        ? extractOutputTextFromSse(bodyText)
-                        : (() => {
-                            try {
-                                const parsed = JSON.parse(bodyText);
-                                const output = Array.isArray(parsed.output) ? parsed.output : [];
-                                const first = output.find((item) => item &&
-                                    typeof item === "object" &&
-                                    Array.isArray(item.content));
-                                if (!first)
-                                    return null;
-                                const content = first.content.find((part) => part?.type === "output_text" && typeof part.text === "string");
-                                return typeof content?.text === "string" ? content.text : null;
-                            }
-                            catch {
-                                return null;
-                            }
-                        })();
+                    const raw = extractOauthOutputText(response, await response.text());
                     if (!raw) {
                         lastError =
                             `memory-lancedb-pro: llm-client [${label}] empty OAuth response content from model ${config.model}`;
@@ -532,10 +577,78 @@ function createOauthClient(config, log, warnLog) {
                 return null;
             }
         },
+        async completeText(prompt, label = "generic", systemPrompt, _temperature) {
+            lastError = null;
+            try {
+                const session = await getSession();
+                const { signal, dispose } = createTimeoutSignal(config.timeoutMs);
+                const endpoint = buildOauthEndpoint(config.baseURL, config.oauthProvider);
+                try {
+                    const response = await fetch(endpoint, {
+                        method: "POST",
+                        headers: {
+                            Authorization: `Bearer ${session.accessToken}`,
+                            "Content-Type": "application/json",
+                            Accept: "text/event-stream",
+                            "OpenAI-Beta": "responses=experimental",
+                            "chatgpt-account-id": session.accountId,
+                            originator: "codex_cli_rs",
+                        },
+                        signal,
+                        body: JSON.stringify({
+                            model: normalizeOauthModel(config.model),
+                            ...(systemPrompt !== undefined ? { instructions: systemPrompt } : {}),
+                            input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }],
+                            store: false,
+                            stream: true,
+                            text: { format: { type: "text" } },
+                        }),
+                    });
+                    if (!response.ok) {
+                        const detail = await response.text().catch(() => "");
+                        throw new Error(`HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 500)}`);
+                    }
+                    const text = (extractOauthOutputText(response, await response.text()) ?? "").trim();
+                    if (!text) {
+                        lastError =
+                            `memory-lancedb-pro: llm-client [${label}] empty OAuth response content from model ${config.model}`;
+                        log(lastError);
+                        return null;
+                    }
+                    return text;
+                }
+                finally {
+                    dispose();
+                }
+            }
+            catch (err) {
+                lastError =
+                    `memory-lancedb-pro: llm-client [${label}] OAuth request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
+                (warnLog ?? log)(lastError);
+                return null;
+            }
+        },
         getLastError() {
             return lastError;
         },
     };
+}
+function extractOauthOutputText(response, bodyText) {
+    if (response.headers.get("content-type")?.includes("text/event-stream") || looksLikeSseResponse(bodyText)) {
+        return extractOutputTextFromSse(bodyText);
+    }
+    try {
+        const parsed = JSON.parse(bodyText);
+        const output = Array.isArray(parsed.output) ? parsed.output : [];
+        const first = output.find((item) => item && typeof item === "object" && Array.isArray(item.content));
+        if (!first)
+            return null;
+        const content = first.content.find((part) => part?.type === "output_text" && typeof part.text === "string");
+        return typeof content?.text === "string" ? content.text : null;
+    }
+    catch {
+        return null;
+    }
 }
 /** OpenRouter's direct API base URL, used as the host->direct fallback's default when llm.baseURL is not configured. */
 // Module-level (not per-client) so the "runtime surface unavailable"

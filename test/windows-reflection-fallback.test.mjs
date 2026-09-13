@@ -16,7 +16,6 @@ const jiti = jitiFactory(import.meta.url, {
 const {
   toImportSpecifier,
   getExtensionApiImportSpecifiers,
-  buildReflectionCliSpawnCommand,
 } = jiti("../index.ts");
 
 describe("Windows reflection fallback helpers", () => {
@@ -58,20 +57,5 @@ describe("Windows reflection fallback helpers", () => {
     assert.ok(specifiers.some((s) => s.includes("Program%20Files/nodejs")), `Expected Program Files fallback: ${JSON.stringify(specifiers)}`);
   });
 
-  it("spawns the OpenClaw CLI directly on POSIX platforms", () => {
-    const command = buildReflectionCliSpawnCommand("openclaw", ["agent", "--json"], "linux");
-    assert.equal(command.command, "openclaw");
-    assert.deepEqual(command.args, ["agent", "--json"]);
-  });
 
-  it("resolves the OpenClaw CLI through cmd on Windows", () => {
-    const command = buildReflectionCliSpawnCommand(
-      "openclaw",
-      ["agent", "--json"],
-      "win32",
-      "C:\\Windows\\System32\\cmd.exe",
-    );
-    assert.equal(command.command, "C:\\Windows\\System32\\cmd.exe");
-    assert.deepEqual(command.args, ["/c", "openclaw", "agent", "--json"]);
-  });
 });
