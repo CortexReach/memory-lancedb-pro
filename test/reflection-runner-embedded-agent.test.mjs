@@ -29,13 +29,7 @@ function loadFreshIndex() {
   return jiti("../index.ts");
 }
 
-const {
-  resolveEmbeddedRunnerExportName,
-  buildReflectionCliArgs,
-  shouldRetryReflectionCliAsLegacyLocal,
-  clipDiagnosticTail,
-  extractReflectionTextFromCliResult,
-} = loadFreshIndex();
+const { resolveEmbeddedRunnerExportName } = loadFreshIndex();
 
 const noop = async () => ({ payloads: [{ text: "noop" }] });
 
@@ -132,100 +126,115 @@ describe("reflection distiller on a renamed-runner host", () => {
   });
 });
 
-describe("CLI fallback argument shape", () => {
-  const base = {
-    agentId: "agent-one",
-    prompt: "line one\nline two",
-    workspaceDir: "/tmp/workspace-one",
-    thinkLevel: "low",
-    agentTimeoutSec: 30,
-    sessionId: "memory-reflection-cli-1",
+describe("tool-free completion fallback", () => {
+  const conversation = "user: the build is green\nassistant: noted";
+  const failingApi = {
+    runtime: {
+      agent: {
+        runEmbeddedAgent: async () => {
+          throw new Error("embedded runner refused");
+        },
+      },
+    },
   };
 
-  it("drives a headless exec turn and never asks for --local", () => {
-    const args = buildReflectionCliArgs({ ...base, mode: "exec", modelRef: "openrouter/example/model-one" });
-    assert.deepEqual(args.slice(0, 2), ["agent", "exec"]);
-    assert.ok(!args.includes("--local"), `--local must be absent: ${JSON.stringify(args)}`);
-    assert.ok(!args.includes("--agent"), "exec has no agent selector");
-    assert.ok(!args.includes(base.prompt), "the prompt travels over stdin, not argv");
-    assert.deepEqual(args.slice(args.indexOf("--message-file"), args.indexOf("--message-file") + 2), ["--message-file", "-"]);
-    assert.deepEqual(args.slice(args.indexOf("--cwd"), args.indexOf("--cwd") + 2), ["--cwd", base.workspaceDir]);
-    assert.ok(args.includes("--json"));
-    assert.deepEqual(args.slice(args.indexOf("--thinking"), args.indexOf("--thinking") + 2), ["--thinking", "low"]);
-    assert.deepEqual(args.slice(args.indexOf("--timeout"), args.indexOf("--timeout") + 2), ["--timeout", "30"]);
-    assert.deepEqual(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2), ["--model", "openrouter/example/model-one"]);
+  it("hands the reflection prompts to the completion when the embedded runner fails", async () => {
+    const { generateReflectionText } = loadFreshIndex();
+    const seen = [];
+    const result = await generateReflectionText({
+      conversation,
+      maxInputChars: 1000,
+      cfg: {},
+      agentId: "agent-one",
+      workspaceDir: "/tmp",
+      timeoutMs: 2000,
+      thinkLevel: "off",
+      api: failingApi,
+      completeText: async (systemPrompt, userPrompt) => {
+        seen.push({ systemPrompt, userPrompt });
+        return "  distilled by completion  ";
+      },
+    });
+    assert.equal(result.runner, "completion");
+    assert.equal(result.usedFallback, false);
+    assert.equal(result.text, "  distilled by completion  ");
+    assert.equal(seen.length, 1, "one completion call");
+    assert.ok(seen[0].systemPrompt.length > 0, "the distiller system prompt travels as the system message");
+    assert.ok(seen[0].userPrompt.includes("the build is green"), "the transcript travels in the user prompt");
+    assert.match(result.error ?? "", /embedded runner refused/);
   });
 
-  it("omits --model when no provider-qualified ref resolved", () => {
-    const args = buildReflectionCliArgs({ ...base, mode: "exec" });
-    assert.ok(!args.includes("--model"));
+  it("falls through to the static fallback text when the completion returns nothing", async () => {
+    const { generateReflectionText } = loadFreshIndex();
+    const result = await generateReflectionText({
+      conversation,
+      maxInputChars: 1000,
+      cfg: {},
+      agentId: "agent-one",
+      workspaceDir: "/tmp",
+      timeoutMs: 2000,
+      thinkLevel: "off",
+      api: failingApi,
+      completeText: async () => null,
+    });
+    assert.equal(result.runner, "fallback");
+    assert.equal(result.usedFallback, true);
+    assert.match(result.error ?? "", /completion returned no text/);
   });
 
-  it("keeps the legacy --local shape for hosts that predate agent exec", () => {
-    const args = buildReflectionCliArgs({ ...base, mode: "legacy-local" });
-    assert.deepEqual(args, [
-      "agent",
-      "--local",
-      "--agent",
-      "agent-one",
-      "--message",
-      base.prompt,
-      "--json",
-      "--thinking",
-      "low",
-      "--timeout",
-      "30",
-      "--session-id",
-      "memory-reflection-cli-1",
-    ]);
-  });
-});
-
-describe("legacy retry decision", () => {
-  const run = (stderr, code = 1) => ({ stderr, code, signal: null, timedOut: false });
-
-  it("retries only when the host rejected the exec argument shape", () => {
-    assert.equal(shouldRetryReflectionCliAsLegacyLocal(run("error: unknown command 'exec'")), true);
-    assert.equal(shouldRetryReflectionCliAsLegacyLocal(run("error: too many arguments for 'agent'. Expected 0 arguments but got 1.")), true);
-    assert.equal(shouldRetryReflectionCliAsLegacyLocal(run('\u001b[31mOpenClaw does not recognize option "--message-file".\u001b[39m')), true);
-  });
-
-  it("does not retry runtime failures, successes, signals or timeouts", () => {
-    assert.equal(shouldRetryReflectionCliAsLegacyLocal(run("A Gateway is running for this state directory (pid 1, port 2).")), false);
-    assert.equal(shouldRetryReflectionCliAsLegacyLocal(run("error: unknown command 'exec'", 0)), false);
-    assert.equal(shouldRetryReflectionCliAsLegacyLocal({ stderr: "error: unknown command 'exec'", code: null, signal: "SIGTERM", timedOut: false }), false);
-    assert.equal(shouldRetryReflectionCliAsLegacyLocal({ stderr: "error: unknown command 'exec'", code: null, signal: null, timedOut: true }), false);
-  });
-});
-
-describe("CLI diagnostic clipping", () => {
-  it("drops state-migration banners and ANSI noise, keeping the failure reason", () => {
-    const stderr = [
-      "\u001b[33m[state-migrations]\u001b[39m legacy allowFrom file left in place: /tmp/one.json",
-      "[state-migrations] legacy allowFrom file left in place: /tmp/two.json",
-      "",
-      "A Gateway is running for this state directory (pid 1, port 2). Run without --local to use it.",
-    ].join("\n");
-    const clipped = clipDiagnosticTail(stderr);
-    assert.ok(!clipped.includes("state-migrations"), clipped);
-    assert.ok(!clipped.includes("\u001b["), clipped);
-    assert.ok(clipped.includes("Run without --local to use it."), clipped);
-  });
-
-  it("keeps the tail when the text is longer than the budget", () => {
-    const filler = "banner ".repeat(200);
-    const clipped = clipDiagnosticTail(`${filler}final reason here`, 60);
-    assert.ok(clipped.startsWith("..."), clipped);
-    assert.ok(clipped.endsWith("final reason here"), clipped);
-    assert.equal(clipped.length, 60);
+  it("reports the missing completion client instead of reaching for a CLI", async () => {
+    const { generateReflectionText } = loadFreshIndex();
+    const result = await generateReflectionText({
+      conversation,
+      maxInputChars: 1000,
+      cfg: {},
+      agentId: "agent-one",
+      workspaceDir: "/tmp",
+      timeoutMs: 2000,
+      thinkLevel: "off",
+      api: failingApi,
+    });
+    assert.equal(result.runner, "fallback");
+    assert.match(result.error ?? "", /no tool-free completion client/);
   });
 });
 
-describe("CLI result extraction", () => {
-  it("reads the exec envelope payloads and falls back to final", () => {
-    assert.equal(extractReflectionTextFromCliResult({ ok: true, payloads: [{ text: " from payloads " }], final: "from final" }), "from payloads");
-    assert.equal(extractReflectionTextFromCliResult({ ok: true, payloads: [], final: " from final " }), "from final");
-    assert.equal(extractReflectionTextFromCliResult({ result: { payloads: [{ text: "legacy envelope" }] } }), "legacy envelope");
-    assert.equal(extractReflectionTextFromCliResult({ ok: true, payloads: [] }), null);
+describe("embedded runner cache", () => {
+  it("keeps the runner and its kind together across host surfaces", async () => {
+    const { generateReflectionText, getEmbeddedRunnerExportName } = loadFreshIndex();
+    const legacyParams = [];
+    let currentCalls = 0;
+    const legacyApi = {
+      runtime: {
+        agent: {
+          runEmbeddedPiAgent: async (params) => {
+            legacyParams.push(params);
+            return { payloads: [{ text: "legacy" }] };
+          },
+        },
+      },
+    };
+    const currentApi = {
+      runtime: {
+        agent: {
+          runEmbeddedAgent: async () => {
+            currentCalls += 1;
+            return { payloads: [{ text: "current" }] };
+          },
+        },
+      },
+    };
+    const base = { conversation: "user: hi\nassistant: hello", maxInputChars: 1000, cfg: {}, agentId: "agent-one", workspaceDir: "/tmp", timeoutMs: 2000, thinkLevel: "off" };
+
+    const first = await generateReflectionText({ ...base, api: legacyApi });
+    assert.equal(first.text, "legacy");
+    assert.equal(getEmbeddedRunnerExportName(), "runEmbeddedPiAgent");
+    assert.equal(typeof legacyParams[0].sessionFile, "string", "the legacy runner gets its transcript file");
+
+    const second = await generateReflectionText({ ...base, api: currentApi });
+    assert.equal(second.text, "legacy", "the cached runner keeps serving");
+    assert.equal(currentCalls, 0, "a later host surface does not replace the cached runner");
+    assert.equal(getEmbeddedRunnerExportName(), "runEmbeddedPiAgent", "the cached kind stays with the cached runner");
+    assert.equal(typeof legacyParams[1].sessionFile, "string", "the second run is still labeled legacy and keeps the transcript file");
   });
 });

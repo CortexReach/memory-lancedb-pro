@@ -13,7 +13,7 @@
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "os";
 import path from "path";
 import { fileURLToPath } from "node:url";
@@ -240,5 +240,21 @@ describe("reflection finishes from the typed before_reset messages", () => {
     });
     assert.equal(storeSeenByRunner, undefined, "the embedded runner must not see the caller's released root context");
     assert.ok(harness.logs.some((m) => m.includes("reflection generation start for session escaped")), JSON.stringify(harness.logs));
+  });
+
+  it("parks when the recovered transcript file holds no usable conversation, then finishes from before_reset", async () => {
+    const setup = registered();
+    const staleFile = path.join(workDir, "stale-session.jsonl");
+    writeFileSync(staleFile, JSON.stringify({ type: "session-meta", version: 1 }) + "\n", "utf-8");
+    const sessionKey = await fireCommandNew(setup, "stalefile", { previousSessionEntry: { sessionId: "stalefile", sessionFile: staleFile } });
+    const { logs } = setup.harness;
+    assert.ok(
+      logs.some((m) => m.includes("holds no usable conversation for session stalefile; waiting for the typed before_reset messages")),
+      `got ${JSON.stringify(logs)}`,
+    );
+    assert.ok(!logs.some((m) => m.includes("empty/unusable guard recorded")), "a stale artifact must not record the empty guard");
+    await fireBeforeReset(setup, sessionKey, "stalefile");
+    assert.ok(logs.some((m) => m.includes("using the before_reset transcript for session stalefile; messages=present")), JSON.stringify(logs));
+    assert.equal(logs.filter((m) => m.includes("reflection generation start for session stalefile")).length, 1, JSON.stringify(logs));
   });
 });

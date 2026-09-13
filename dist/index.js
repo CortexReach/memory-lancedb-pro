@@ -9,7 +9,6 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
-import { spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 // Detect CLI mode: when running as a CLI subcommand (e.g. `openclaw memory-pro stats`),
 // OpenClaw sets OPENCLAW_CLI=1 in the process environment. Registration and
@@ -489,27 +488,23 @@ export function resolveEmbeddedRunnerExportName(candidate) {
     const record = candidate;
     return EMBEDDED_RUNNER_EXPORT_NAMES.find((name) => typeof record[name] === "function");
 }
-let embeddedRunnerExportName;
+let resolvedEmbeddedRunnerKind;
 export function getEmbeddedRunnerExportName() {
-    return embeddedRunnerExportName;
+    return resolvedEmbeddedRunnerKind;
 }
-// Legacy hosts read the distiller transcript from a file path; current hosts
-// treat a non-key sessionFile as a foreign transcript and refuse the run.
-function embeddedRunnerTakesSessionFile() {
-    return embeddedRunnerExportName !== "runEmbeddedAgent";
-}
+// The runner and its kind are cached together: a host surface seen later must
+// not relabel an already cached runner (a legacy runner needs the transcript
+// file, a current one refuses it).
 // eslint-disable-next-line import/export
 export async function loadEmbeddedPiRunner(api) {
     // Layer 1: 嘗試新 SDK API (with circuit breaker)
-    if (!isLayer1CircuitOpen()) {
+    if (!embeddedPiRunnerPromise && !isLayer1CircuitOpen()) {
         const newApi = (api.runtime?.agent);
         const runnerName = resolveEmbeddedRunnerExportName(newApi);
         if (newApi && runnerName) {
-            embeddedRunnerExportName = runnerName;
             const runner = newApi[runnerName].bind(newApi);
-            // Bug 2 fix: 將 Layer 1 結果寫入 cache，避免後續並發呼叫時 Layer 2 覆蓋掉 Layer 1
-            embeddedPiRunnerPromise ??= Promise.resolve(runner);
-            return embeddedPiRunnerPromise;
+            resolvedEmbeddedRunnerKind = runnerName;
+            embeddedPiRunnerPromise = Promise.resolve({ runner, exportName: runnerName });
         }
     }
     // Layer 2: Fallback 舊 extensionAPI.js
@@ -521,8 +516,8 @@ export async function loadEmbeddedPiRunner(api) {
                     const mod = await import(specifier);
                     const runnerName = resolveEmbeddedRunnerExportName(mod);
                     if (runnerName) {
-                        embeddedRunnerExportName = runnerName;
-                        return mod[runnerName];
+                        resolvedEmbeddedRunnerKind = runnerName;
+                        return { runner: mod[runnerName], exportName: runnerName };
                     }
                     importErrors.push(`${specifier}: runEmbeddedAgent export not found`);
                 }
@@ -541,29 +536,9 @@ export async function loadEmbeddedPiRunner(api) {
     }
     catch (err) {
         embeddedPiRunnerPromise = null;
+        resolvedEmbeddedRunnerKind = undefined;
         throw err;
     }
-}
-function clipDiagnostic(text, maxLen = 400) {
-    const oneLine = text.replace(/\s+/g, " ").trim();
-    if (oneLine.length <= maxLen)
-        return oneLine;
-    return `${oneLine.slice(0, maxLen - 3)}...`;
-}
-const ANSI_ESCAPE_RE = /\u001b\[[0-9;]*[A-Za-z]/g;
-const CLI_STARTUP_NOISE_LINE_RE = /^\s*\[state-migrations\]/;
-function stripAnsi(text) {
-    return text.replace(ANSI_ESCAPE_RE, "");
-}
-// CLI failures print the reason last, after startup banners; keep the tail.
-export function clipDiagnosticTail(text, maxLen = 400) {
-    const lines = stripAnsi(text)
-        .split(/\r?\n/)
-        .filter((line) => line.trim().length > 0 && !CLI_STARTUP_NOISE_LINE_RE.test(line));
-    const oneLine = lines.join(" ").replace(/\s+/g, " ").trim();
-    if (oneLine.length <= maxLen)
-        return oneLine;
-    return `...${oneLine.slice(oneLine.length - (maxLen - 3))}`;
 }
 function withTimeout(promise, timeoutMs, label) {
     return new Promise((resolve, reject) => {
@@ -578,187 +553,6 @@ function withTimeout(promise, timeoutMs, label) {
             reject(err);
         });
     });
-}
-function tryParseJsonObject(raw) {
-    try {
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            return parsed;
-        }
-    }
-    catch {
-        // ignore
-    }
-    return null;
-}
-function extractJsonObjectFromOutput(stdout) {
-    const trimmed = stdout.trim();
-    if (!trimmed)
-        throw new Error("empty stdout");
-    const direct = tryParseJsonObject(trimmed);
-    if (direct)
-        return direct;
-    const lines = trimmed.split(/\r?\n/);
-    for (let i = 0; i < lines.length; i++) {
-        if (!lines[i].trim().startsWith("{"))
-            continue;
-        const candidate = lines.slice(i).join("\n");
-        const parsed = tryParseJsonObject(candidate);
-        if (parsed)
-            return parsed;
-    }
-    throw new Error(`unable to parse JSON from CLI output: ${clipDiagnostic(trimmed, 280)}`);
-}
-export function extractReflectionTextFromCliResult(resultObj) {
-    const result = resultObj.result;
-    const payloads = Array.isArray(resultObj.payloads)
-        ? resultObj.payloads
-        : Array.isArray(result?.payloads)
-            ? result.payloads
-            : [];
-    const firstWithText = payloads.find((p) => p && typeof p === "object" && typeof p.text === "string" && p.text.trim().length);
-    const text = typeof firstWithText?.text === "string" ? firstWithText.text.trim() : "";
-    if (text)
-        return text;
-    const finalText = typeof resultObj.final === "string" ? resultObj.final.trim() : "";
-    return finalText || null;
-}
-// Hosts without `agent exec` reject its argument shape before doing any work.
-const LEGACY_CLI_SHAPE_REJECTION_RE = /unknown command|does not recognize|unknown option|too many arguments/i;
-export function buildReflectionCliArgs(params) {
-    if (params.mode === "legacy-local") {
-        return [
-            "agent",
-            "--local",
-            "--agent",
-            params.agentId,
-            "--message",
-            params.prompt,
-            "--json",
-            "--thinking",
-            params.thinkLevel,
-            "--timeout",
-            String(params.agentTimeoutSec),
-            "--session-id",
-            params.sessionId,
-        ];
-    }
-    const args = [
-        "agent",
-        "exec",
-        "--message-file",
-        "-",
-        "--cwd",
-        params.workspaceDir,
-        "--json",
-        "--thinking",
-        params.thinkLevel,
-        "--timeout",
-        String(params.agentTimeoutSec),
-    ];
-    if (params.modelRef)
-        args.push("--model", params.modelRef);
-    return args;
-}
-export function shouldRetryReflectionCliAsLegacyLocal(run) {
-    if (run.timedOut || run.signal || run.code === 0)
-        return false;
-    return LEGACY_CLI_SHAPE_REJECTION_RE.test(stripAnsi(run.stderr));
-}
-async function spawnReflectionCli(params) {
-    return await new Promise((resolve, reject) => {
-        const spawnCommand = buildReflectionCliSpawnCommand(params.cliBin, params.args);
-        const child = spawn(spawnCommand.command, spawnCommand.args, {
-            cwd: params.cwd,
-            env: { ...process.env, NO_COLOR: "1" },
-            stdio: [params.stdinText === undefined ? "ignore" : "pipe", "pipe", "pipe"],
-        });
-        let stdout = "";
-        let stderr = "";
-        let settled = false;
-        let timedOut = false;
-        const timer = setTimeout(() => {
-            timedOut = true;
-            child.kill("SIGTERM");
-            setTimeout(() => child.kill("SIGKILL"), 1500).unref();
-        }, params.outerTimeoutMs);
-        child.stdout.setEncoding("utf8");
-        child.stdout.on("data", (chunk) => {
-            stdout += chunk;
-        });
-        child.stderr.setEncoding("utf8");
-        child.stderr.on("data", (chunk) => {
-            stderr += chunk;
-        });
-        if (params.stdinText !== undefined && child.stdin) {
-            child.stdin.on("error", () => { });
-            child.stdin.end(params.stdinText);
-        }
-        child.once("error", (err) => {
-            if (settled)
-                return;
-            settled = true;
-            clearTimeout(timer);
-            reject(new Error(`spawn ${params.cliBin} failed: ${err.message}`));
-        });
-        child.once("close", (code, signal) => {
-            if (settled)
-                return;
-            settled = true;
-            clearTimeout(timer);
-            resolve({ stdout, stderr, code, signal, timedOut });
-        });
-    });
-}
-async function runReflectionViaCli(params) {
-    const cliBin = process.env.OPENCLAW_CLI_BIN?.trim() || "openclaw";
-    const outerTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
-    const agentTimeoutSec = Math.max(1, Math.ceil(params.timeoutMs / 1000));
-    const sessionId = `memory-reflection-cli-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const argParams = {
-        agentId: params.agentId,
-        prompt: params.prompt,
-        workspaceDir: params.workspaceDir,
-        thinkLevel: params.thinkLevel,
-        agentTimeoutSec,
-        sessionId,
-        modelRef: params.modelRef,
-    };
-    let run = await spawnReflectionCli({
-        cliBin,
-        args: buildReflectionCliArgs({ ...argParams, mode: "exec" }),
-        cwd: params.workspaceDir,
-        outerTimeoutMs,
-        stdinText: params.prompt,
-    });
-    if (shouldRetryReflectionCliAsLegacyLocal(run)) {
-        run = await spawnReflectionCli({
-            cliBin,
-            args: buildReflectionCliArgs({ ...argParams, mode: "legacy-local" }),
-            cwd: params.workspaceDir,
-            outerTimeoutMs,
-        });
-    }
-    if (run.timedOut)
-        throw new Error(`${cliBin} timed out after ${outerTimeoutMs}ms`);
-    if (run.signal)
-        throw new Error(`${cliBin} exited by signal ${run.signal}. stderr=${clipDiagnosticTail(run.stderr)}`);
-    if (run.code !== 0)
-        throw new Error(`${cliBin} exited with code ${run.code}. stderr=${clipDiagnosticTail(run.stderr)}`);
-    const parsed = extractJsonObjectFromOutput(run.stdout);
-    const text = extractReflectionTextFromCliResult(parsed);
-    if (!text)
-        throw new Error(`CLI JSON returned no text payload. stdout=${clipDiagnostic(run.stdout)}`);
-    return text;
-}
-export function buildReflectionCliSpawnCommand(cliBin, args, platform = process.platform, comSpec = process.env.ComSpec?.trim()) {
-    if (platform === "win32") {
-        return {
-            command: comSpec || "cmd.exe",
-            args: ["/c", cliBin, ...args],
-        };
-    }
-    return { command: cliBin, args };
 }
 async function loadSelfImprovementReminderContent(workspaceDir) {
     const baseDir = typeof workspaceDir === "string" && workspaceDir.trim().length ? workspaceDir.trim() : "";
@@ -1463,7 +1257,6 @@ async function generateReflectionTextUnbounded(params) {
             params.logger?.info?.(message);
     };
     const { provider, model } = resolveReflectionModelTarget(params);
-    const cliModelRef = provider && model ? `${provider}/${model}` : undefined;
     try {
         const result = await runWithReflectionTransientRetryOnce({
             scope: "reflection",
@@ -1471,7 +1264,8 @@ async function generateReflectionTextUnbounded(params) {
             retryState,
             onLog: onRetryLog,
             execute: async () => {
-                const runEmbeddedPiAgent = await loadEmbeddedPiRunner(params.api);
+                const embedded = await loadEmbeddedPiRunner(params.api);
+                const runEmbeddedPiAgent = embedded.runner;
                 const embeddedTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
                 return await withTimeout(runEmbeddedPiAgent({
                     sessionId: `reflection-${Date.now()}`,
@@ -1479,7 +1273,7 @@ async function generateReflectionTextUnbounded(params) {
                     // The distiller run is throwaway: keep it out of the host session store.
                     sessionPersistence: "detached",
                     agentId: params.agentId,
-                    ...(embeddedRunnerTakesSessionFile() ? { sessionFile: tempSessionFile } : {}),
+                    ...(embedded.exportName !== "runEmbeddedAgent" ? { sessionFile: tempSessionFile } : {}),
                     workspaceDir: params.workspaceDir,
                     config: params.cfg,
                     prompt,
@@ -1525,24 +1319,28 @@ async function generateReflectionTextUnbounded(params) {
     if (reflectionText) {
         return { text: reflectionText, usedFallback: false, promptHash, error: errors[0], runner: "embedded" };
     }
-    try {
-        reflectionText = await runWithReflectionTransientRetryOnce({
-            scope: "reflection",
-            runner: "cli",
-            retryState,
-            onLog: onRetryLog,
-            execute: async () => await runReflectionViaCli({
-                prompt,
-                agentId: params.agentId,
-                workspaceDir: params.workspaceDir,
-                timeoutMs: params.timeoutMs,
-                thinkLevel: params.thinkLevel,
-                modelRef: cliModelRef,
-            }),
-        });
+    if (params.completeText) {
+        const completeText = params.completeText;
+        try {
+            reflectionText = await runWithReflectionTransientRetryOnce({
+                scope: "reflection",
+                runner: "completion",
+                retryState,
+                onLog: onRetryLog,
+                execute: async () => {
+                    const text = await completeText(reflectionSystemPrompt, reflectionUserPrompt);
+                    if (!text)
+                        throw new Error("completion returned no text");
+                    return text;
+                },
+            });
+        }
+        catch (err) {
+            errors.push(`completion: ${err instanceof Error ? err.message : String(err)}`);
+        }
     }
-    catch (err) {
-        errors.push(`cli: ${err instanceof Error ? err.message : String(err)}`);
+    else {
+        errors.push("completion: no tool-free completion client on this host");
     }
     if (reflectionText) {
         return {
@@ -1550,7 +1348,7 @@ async function generateReflectionTextUnbounded(params) {
             usedFallback: false,
             promptHash,
             error: errors.length > 0 ? errors.join(" | ") : undefined,
-            runner: "cli",
+            runner: "completion",
         };
     }
     return {
@@ -2217,6 +2015,10 @@ function _initPluginState(api) {
     const captureAdmissionController = () => admissionController;
     const captureAdmissionAudit = () => admissionController !== null && config.admissionControl?.auditMetadata !== false;
     const captureReflectionAdmissionController = () => admissionControllerReflectionLane;
+    const makeLaneLlmClient = (model, thinkLevel, modelExplicit) => {
+        const { makeClientForModel, llmModelExplicit } = buildMemoryLlmClient();
+        return makeClientForModel(model, thinkLevel, modelExplicit ?? llmModelExplicit);
+    };
     const extractionRateLimiter = createExtractionRateLimiter({
         maxExtractionsPerHour: config.extractionThrottle?.maxExtractionsPerHour,
     });
@@ -2274,6 +2076,7 @@ function _initPluginState(api) {
         captureAdmissionController,
         captureAdmissionAudit,
         captureReflectionAdmissionController,
+        makeLaneLlmClient,
         admissionRejectionAuditWriter,
     };
 }
@@ -2383,7 +2186,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, manualEchoLedger, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, admissionRejectionAuditWriter, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, manualEchoLedger, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, makeLaneLlmClient, admissionRejectionAuditWriter, } = singleton;
         const learnAutoCaptureSessionAlias = (sessionId, sessionKey) => {
             if (typeof sessionId !== "string" || !sessionId
                 || typeof sessionKey !== "string" || !sessionKey
@@ -4416,6 +4219,27 @@ const memoryLanceDBProPlugin = {
             const reflectionMaxConcurrentRuns = config.memoryReflection?.maxConcurrentRuns ?? DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS;
             const reflectionAgentId = asNonEmptyString(config.memoryReflection?.agentId);
             const reflectionModel = asNonEmptyString(config.memoryReflection?.model);
+            // Tool-free fallback for the distiller when the embedded runner is
+            // unavailable: a plain completion on the plugin's own LLM lane, so the
+            // transcript never reaches an agent turn that could invoke tools.
+            let reflectionCompletionClient;
+            const reflectionCompleteText = async (systemPrompt, userPrompt) => {
+                if (reflectionCompletionClient === undefined) {
+                    const model = reflectionModel ?? asNonEmptyString(config.llm?.model);
+                    try {
+                        reflectionCompletionClient = model
+                            ? makeLaneLlmClient(config.llm?.transport === "host" ? model.trim() : normalizeDirectModelRef(model), reflectionThinkLevel, reflectionModel ? true : undefined)
+                            : null;
+                    }
+                    catch (err) {
+                        api.logger.warn(`memory-reflection: completion fallback unavailable: ${err instanceof Error ? err.message : String(err)}`);
+                        reflectionCompletionClient = null;
+                    }
+                }
+                if (!reflectionCompletionClient)
+                    return null;
+                return reflectionCompletionClient.completeText(userPrompt, "memory-reflection", systemPrompt);
+            };
             const reflectionErrorReminderMaxEntries = parsePositiveInt(config.memoryReflection?.errorReminderMaxEntries) ?? DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES;
             const reflectionDedupeErrorSignals = config.memoryReflection?.dedupeErrorSignals !== false;
             const reflectionInjectMode = config.memoryReflection?.injectMode ?? "inheritance+derived";
@@ -4714,7 +4538,7 @@ const memoryLanceDBProPlugin = {
                         sessionFile: currentSessionFile,
                     });
                     const guarded = getReflectionEmptyEventGuardMap().get(emptyEventGuardKey);
-                    if (guarded && Date.now() - guarded.updatedAt <= DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS) {
+                    if (!resumedFromBeforeReset && guarded && Date.now() - guarded.updatedAt <= DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS) {
                         api.logger.info(`memory-reflection: command:${action} skipped repeated empty/unusable session; sessionKey=${sessionKey}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}; reason=${guarded.reason}`);
                         return;
                     }
@@ -4813,6 +4637,13 @@ const memoryLanceDBProPlugin = {
                         conversation = await readSessionConversationWithResetFallback(currentSessionFile, reflectionMessageCount);
                     }
                     if (!conversation) {
+                        if (isBoundaryAction && !resumedFromBeforeReset) {
+                            // A stale transcript artifact on a migrated host must not hide the
+                            // messages the typed hook is about to supply.
+                            rememberPendingBeforeResetReflection(sessionKey, { event, sessionId: currentSessionId, action });
+                            api.logger.info(`memory-reflection: command:${action} transcript ${currentSessionFile || "(none)"} holds no usable conversation for session ${currentSessionId}; waiting for the typed before_reset messages`);
+                            return;
+                        }
                         api.logger.warn(`memory-reflection: command:${action} conversation empty/unusable for session ${currentSessionId}; file=${currentSessionFile || "(none)"}`);
                         await rememberEmptyReflectionEvent("empty-conversation");
                         return;
@@ -4850,11 +4681,12 @@ const memoryLanceDBProPlugin = {
                         toolErrorSignals,
                         logger: api.logger,
                         api, // SDK migration Bug 2: pass api for new runtime.agent API
+                        completeText: reflectionCompleteText,
                     });
                     api.logger.info(`memory-reflection: command:${action} reflection generation done for session ${currentSessionId}; runner=${reflectionGenerated.runner}; usedFallback=${reflectionGenerated.usedFallback ? "yes" : "no"}`);
                     const reflectionText = reflectionGenerated.text;
-                    if (reflectionGenerated.runner === "cli") {
-                        api.logger.warn(`memory-reflection: embedded runner unavailable, used openclaw CLI fallback for session ${currentSessionId}` +
+                    if (reflectionGenerated.runner === "completion") {
+                        api.logger.warn(`memory-reflection: embedded runner unavailable, used the tool-free completion fallback for session ${currentSessionId}` +
                             (reflectionGenerated.error ? ` (${reflectionGenerated.error})` : ""));
                     }
                     else if (reflectionGenerated.usedFallback) {
