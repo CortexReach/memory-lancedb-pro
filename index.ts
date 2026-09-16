@@ -11,7 +11,7 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
-import { spawn } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 // Detect CLI mode: when running as a CLI subcommand (e.g. `openclaw memory-pro stats`),
 // OpenClaw sets OPENCLAW_CLI=1 in the process environment. Registration and
@@ -86,7 +86,7 @@ import { SmartExtractor, createExtractionRateLimiter, stripEnvelopeMetadata } fr
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
 import { NoisePrototypeBank } from "./src/noise-prototypes.js";
 import { createLlmClient, normalizeDirectModelRef } from "./src/llm-client.js";
-import type { RuntimeLlmCompleteFn } from "./src/llm-client.js";
+import type { LlmClient, RuntimeLlmCompleteFn } from "./src/llm-client.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
 import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
@@ -792,7 +792,8 @@ type ReflectionEmptyEventGuardEntry = {
 type EmbeddedPiRunner = (params: Record<string, unknown>) => Promise<unknown>;
 
 const requireFromHere = createRequire(import.meta.url);
-let embeddedPiRunnerPromise: Promise<EmbeddedPiRunner> | null = null;
+type ResolvedEmbeddedRunner = { runner: EmbeddedPiRunner; exportName: EmbeddedRunnerExportName };
+let embeddedPiRunnerPromise: Promise<ResolvedEmbeddedRunner> | null = null;
 
 // Circuit breaker for Layer 1: after 3 consecutive failures within 5min, skip Layer 1
 const layer1FailureTimestamps: number[] = [];
@@ -895,22 +896,41 @@ export function getExtensionApiImportSpecifiers(
 }
 
 /**
- * Layer 1: 新 SDK API — api.runtime.agent.runEmbeddedPiAgent (4.22+)
+ * Layer 1: SDK API — api.runtime.agent.runEmbeddedAgent (hosts before the
+ *          rename expose runEmbeddedPiAgent; both names are accepted)
  * Layer 2: 舊 extensionAPI.js dynamic import（4.24-4.26 SDK 仍保留）
  * Layer 3: CLI fallback
  *
  * 遷移自 Bug 2（Issue #606）：原本只使用 Layer 2，現改為 Try-New-First。
  */
+const EMBEDDED_RUNNER_EXPORT_NAMES = ["runEmbeddedAgent", "runEmbeddedPiAgent"] as const;
+type EmbeddedRunnerExportName = (typeof EMBEDDED_RUNNER_EXPORT_NAMES)[number];
+
+export function resolveEmbeddedRunnerExportName(candidate: unknown): EmbeddedRunnerExportName | undefined {
+  if (!candidate || typeof candidate !== "object") return undefined;
+  const record = candidate as Record<string, unknown>;
+  return EMBEDDED_RUNNER_EXPORT_NAMES.find((name) => typeof record[name] === "function");
+}
+
+let resolvedEmbeddedRunnerKind: EmbeddedRunnerExportName | undefined;
+
+export function getEmbeddedRunnerExportName(): EmbeddedRunnerExportName | undefined {
+  return resolvedEmbeddedRunnerKind;
+}
+
+// The runner and its kind are cached together: a host surface seen later must
+// not relabel an already cached runner (a legacy runner needs the transcript
+// file, a current one refuses it).
 // eslint-disable-next-line import/export
-export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<EmbeddedPiRunner> {
+export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<ResolvedEmbeddedRunner> {
   // Layer 1: 嘗試新 SDK API (with circuit breaker)
-  if (!isLayer1CircuitOpen()) {
+  if (!embeddedPiRunnerPromise && !isLayer1CircuitOpen()) {
     const newApi = ((api as unknown as { runtime?: { agent?: Record<string, unknown> } }).runtime?.agent);
-    if (typeof newApi?.runEmbeddedPiAgent === "function") {
-      const runner = newApi.runEmbeddedPiAgent.bind(newApi);
-      // Bug 2 fix: 將 Layer 1 結果寫入 cache，避免後續並發呼叫時 Layer 2 覆蓋掉 Layer 1
-      embeddedPiRunnerPromise ??= Promise.resolve(runner as EmbeddedPiRunner);
-      return embeddedPiRunnerPromise;
+    const runnerName = resolveEmbeddedRunnerExportName(newApi);
+    if (newApi && runnerName) {
+      const runner = (newApi[runnerName] as EmbeddedPiRunner).bind(newApi);
+      resolvedEmbeddedRunnerKind = runnerName;
+      embeddedPiRunnerPromise = Promise.resolve({ runner, exportName: runnerName });
     }
   }
 
@@ -921,9 +941,12 @@ export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<Embe
       for (const specifier of getExtensionApiImportSpecifiers()) {
         try {
           const mod = await import(specifier);
-          const runner = (mod as Record<string, unknown>).runEmbeddedPiAgent;
-          if (typeof runner === "function") return runner as EmbeddedPiRunner;
-          importErrors.push(`${specifier}: runEmbeddedPiAgent export not found`);
+          const runnerName = resolveEmbeddedRunnerExportName(mod);
+          if (runnerName) {
+            resolvedEmbeddedRunnerKind = runnerName;
+            return { runner: (mod as Record<string, unknown>)[runnerName] as EmbeddedPiRunner, exportName: runnerName };
+          }
+          importErrors.push(`${specifier}: runEmbeddedAgent export not found`);
         } catch (err) {
           importErrors.push(`${specifier}: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -941,14 +964,9 @@ export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<Embe
     return await embeddedPiRunnerPromise;
   } catch (err) {
     embeddedPiRunnerPromise = null;
+    resolvedEmbeddedRunnerKind = undefined;
     throw err;
   }
-}
-
-function clipDiagnostic(text: string, maxLen = 400): string {
-  const oneLine = text.replace(/\s+/g, " ").trim();
-  if (oneLine.length <= maxLen) return oneLine;
-  return `${oneLine.slice(0, maxLen - 3)}...`;
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -968,163 +986,6 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
       }
     );
   });
-}
-
-function tryParseJsonObject(raw: string): Record<string, unknown> | null {
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    // ignore
-  }
-  return null;
-}
-
-function extractJsonObjectFromOutput(stdout: string): Record<string, unknown> {
-  const trimmed = stdout.trim();
-  if (!trimmed) throw new Error("empty stdout");
-
-  const direct = tryParseJsonObject(trimmed);
-  if (direct) return direct;
-
-  const lines = trimmed.split(/\r?\n/);
-  for (let i = 0; i < lines.length; i++) {
-    if (!lines[i].trim().startsWith("{")) continue;
-    const candidate = lines.slice(i).join("\n");
-    const parsed = tryParseJsonObject(candidate);
-    if (parsed) return parsed;
-  }
-
-  throw new Error(`unable to parse JSON from CLI output: ${clipDiagnostic(trimmed, 280)}`);
-}
-
-function extractReflectionTextFromCliResult(resultObj: Record<string, unknown>): string | null {
-  const result = resultObj.result as Record<string, unknown> | undefined;
-  const payloads = Array.isArray(resultObj.payloads)
-    ? resultObj.payloads
-    : Array.isArray(result?.payloads)
-      ? result.payloads
-      : [];
-  const firstWithText = payloads.find(
-    (p) => p && typeof p === "object" && typeof (p as Record<string, unknown>).text === "string" && ((p as Record<string, unknown>).text as string).trim().length
-  ) as Record<string, unknown> | undefined;
-  const text = typeof firstWithText?.text === "string" ? firstWithText.text.trim() : "";
-  return text || null;
-}
-
-async function runReflectionViaCli(params: {
-  prompt: string;
-  agentId: string;
-  workspaceDir: string;
-  timeoutMs: number;
-  thinkLevel: ReflectionThinkLevel;
-}): Promise<string> {
-  const cliBin = process.env.OPENCLAW_CLI_BIN?.trim() || "openclaw";
-  const outerTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
-  const agentTimeoutSec = Math.max(1, Math.ceil(params.timeoutMs / 1000));
-  const sessionId = `memory-reflection-cli-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-  const args = [
-    "agent",
-    "--local",
-    "--agent",
-    params.agentId,
-    "--message",
-    params.prompt,
-    "--json",
-    "--thinking",
-    params.thinkLevel,
-    "--timeout",
-    String(agentTimeoutSec),
-    "--session-id",
-    sessionId,
-  ];
-
-  return await new Promise<string>((resolve, reject) => {
-    const spawnCommand = buildReflectionCliSpawnCommand(cliBin, args);
-    const child = spawn(spawnCommand.command, spawnCommand.args, {
-      cwd: params.workspaceDir,
-      env: { ...process.env, NO_COLOR: "1" },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    let timedOut = false;
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 1500).unref();
-    }, outerTimeoutMs);
-
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-
-    child.once("error", (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(new Error(`spawn ${cliBin} failed: ${err.message}`));
-    });
-
-    child.once("close", (code, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-
-      if (timedOut) {
-        reject(new Error(`${cliBin} timed out after ${outerTimeoutMs}ms`));
-        return;
-      }
-      if (signal) {
-        reject(new Error(`${cliBin} exited by signal ${signal}. stderr=${clipDiagnostic(stderr)}`));
-        return;
-      }
-      if (code !== 0) {
-        reject(new Error(`${cliBin} exited with code ${code}. stderr=${clipDiagnostic(stderr)}`));
-        return;
-      }
-
-      try {
-        const parsed = extractJsonObjectFromOutput(stdout);
-        const text = extractReflectionTextFromCliResult(parsed);
-        if (!text) {
-          reject(new Error(`CLI JSON returned no text payload. stdout=${clipDiagnostic(stdout)}`));
-          return;
-        }
-        resolve(text);
-      } catch (err) {
-        reject(err instanceof Error ? err : new Error(String(err)));
-      }
-    });
-  });
-}
-
-export function buildReflectionCliSpawnCommand(
-  cliBin: string,
-  args: string[],
-  platform: NodeJS.Platform = process.platform,
-  comSpec = process.env.ComSpec?.trim(),
-): { command: string; args: string[] } {
-  if (platform === "win32") {
-    return {
-      command: comSpec || "cmd.exe",
-      args: ["/c", cliBin, ...args],
-    };
-  }
-
-  return { command: cliBin, args };
 }
 
 async function loadSelfImprovementReminderContent(workspaceDir?: string): Promise<string> {
@@ -1514,6 +1375,37 @@ function summarizeRecentConversationMessages(
   return formatConversationTranscript(recent);
 }
 
+const SESSION_MEMORY_RECORD_RE = /^(user|assistant): (".*")$/;
+
+/**
+ * Hosts on SQLite session storage no longer expose a transcript file to plugins;
+ * the command:new / command:reset hook context carries the departing session's
+ * recent messages instead (`previousSessionMemory`, one `role: "<json text>"`
+ * record per line). Parse those records back into turns so the same reflection
+ * pipeline runs on either host generation.
+ */
+function conversationFromHookSessionMemory(
+  memory: unknown,
+  messageCount: number,
+  format: ConversationTranscriptFormat = "tagged",
+): string | null {
+  if (!memory || typeof memory !== "object") return null;
+  const record = memory as Record<string, unknown>;
+  if (record.status !== "available" || typeof record.content !== "string") return null;
+  const messages: Array<{ role: string; content: string }> = [];
+  for (const line of record.content.split("\n")) {
+    const matched = line.match(SESSION_MEMORY_RECORD_RE);
+    if (!matched) continue;
+    try {
+      const text = JSON.parse(matched[2]);
+      if (typeof text === "string") messages.push({ role: matched[1], content: text });
+    } catch {
+      // a malformed record is skipped; the remaining lines still count
+    }
+  }
+  return summarizeRecentConversationMessages(messages, messageCount, format);
+}
+
 async function readSessionConversationForReflection(filePath: string, messageCount: number, format: ConversationTranscriptFormat = "tagged"): Promise<string | null> {
   try {
     const lines = (await readFile(filePath, "utf-8")).trim().split("\n");
@@ -1779,6 +1671,8 @@ type GenerateReflectionTextParams = {
   toolErrorSignals?: ReflectionErrorSignal[];
   logger?: { info?: (message: string) => void; warn?: (message: string) => void };
   api: OpenClawPluginApi;  // SDK migration Bug 2: pass api to use new runtime.agent API
+  /** Tool-free completion used when the embedded runner is unavailable. */
+  completeText?: (systemPrompt: string, userPrompt: string) => Promise<string | null>;
 };
 
 type GenerateReflectionTextResult = {
@@ -1786,8 +1680,26 @@ type GenerateReflectionTextResult = {
   usedFallback: boolean;
   promptHash: string;
   error?: string;
-  runner: "embedded" | "cli" | "fallback";
+  runner: "embedded" | "completion" | "fallback";
 };
+
+// Model resolution chain: explicit param > agent-specific primary model ref > global llm.model.
+// Provider: parsed from the ref (e.g. "minimax/MiniMax-M2.7") > inferred from baseURL
+// (inferProviderFromBaseURL uses .endsWith(".suffix") to prevent subdomain spoofing).
+function resolveReflectionModelTarget(
+  params: Pick<GenerateReflectionTextParams, "cfg" | "agentId" | "model">,
+): { provider?: string; model?: string } {
+  const cfg = params.cfg as Record<string, unknown> | undefined;
+  const llmConfig = cfg?.llm as Record<string, unknown> | undefined;
+  const modelRefFromConfig = llmConfig?.model;
+  const modelRef =
+    params.model
+    ?? (resolveAgentPrimaryModelRef(params.cfg, params.agentId) as string | undefined)
+    ?? (typeof modelRefFromConfig === "string" ? modelRefFromConfig : undefined);
+  const split = modelRef ? splitProviderModel(modelRef) : { provider: undefined, model: undefined };
+  const provider = split.provider ?? inferProviderFromBaseURL(llmConfig?.baseURL as string | undefined);
+  return { provider, model: split.model };
+}
 
 type ReflectionRunSlotState = { active: number; waiters: Array<() => void> };
 
@@ -1851,6 +1763,7 @@ async function generateReflectionTextUnbounded(
     if (level === "warn") params.logger?.warn?.(message);
     else params.logger?.info?.(message);
   };
+  const { provider, model } = resolveReflectionModelTarget(params);
 
   try {
     const result: unknown = await runWithReflectionTransientRetryOnce({
@@ -1859,31 +1772,18 @@ async function generateReflectionTextUnbounded(
       retryState,
       onLog: onRetryLog,
       execute: async () => {
-        const runEmbeddedPiAgent = await loadEmbeddedPiRunner(params.api);
-        const cfg = params.cfg as Record<string, unknown>;
-        const llmConfig = cfg?.llm as Record<string, unknown> | undefined;
-        const modelRefFromConfig = llmConfig?.model;
-
-        // Model resolution chain: agent-specific primary model ref > global llm.model fallback.
-        // The typeof guard ensures a non-string value (e.g. number) does not reach splitProviderModel as-is.
-        const modelRef =
-          params.model
-          ?? (resolveAgentPrimaryModelRef(params.cfg, params.agentId) as string | undefined)
-          ?? (typeof modelRefFromConfig === "string" ? modelRefFromConfig : undefined);
-
-        // Provider resolution chain: parsed from modelRef (e.g. "minimax/MiniMax-M2.7") > inferred from baseURL.
-        // inferProviderFromBaseURL uses .endsWith(".suffix") to prevent subdomain spoofing.
-        const split = modelRef ? splitProviderModel(modelRef) : { provider: undefined, model: undefined };
-        const provider = split.provider ?? inferProviderFromBaseURL(llmConfig?.baseURL as string | undefined);
-        const model = split.model;
+        const embedded = await loadEmbeddedPiRunner(params.api);
+        const runEmbeddedPiAgent = embedded.runner;
         const embeddedTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
 
         return await withTimeout(
           runEmbeddedPiAgent({
             sessionId: `reflection-${Date.now()}`,
             sessionKey: `temp:memory-reflection:${params.agentId}`,
+            // The distiller run is throwaway: keep it out of the host session store.
+            sessionPersistence: "detached",
             agentId: params.agentId,
-            sessionFile: tempSessionFile,
+            ...(embedded.exportName !== "runEmbeddedAgent" ? { sessionFile: tempSessionFile } : {}),
             workspaceDir: params.workspaceDir,
             config: params.cfg,
             prompt,
@@ -1932,22 +1832,25 @@ async function generateReflectionTextUnbounded(
     return { text: reflectionText, usedFallback: false, promptHash, error: errors[0], runner: "embedded" };
   }
 
-  try {
-    reflectionText = await runWithReflectionTransientRetryOnce({
-      scope: "reflection",
-      runner: "cli",
-      retryState,
-      onLog: onRetryLog,
-      execute: async () => await runReflectionViaCli({
-        prompt,
-        agentId: params.agentId,
-        workspaceDir: params.workspaceDir,
-        timeoutMs: params.timeoutMs,
-        thinkLevel: params.thinkLevel,
-      }),
-    });
-  } catch (err) {
-    errors.push(`cli: ${err instanceof Error ? err.message : String(err)}`);
+  if (params.completeText) {
+    const completeText = params.completeText;
+    try {
+      reflectionText = await runWithReflectionTransientRetryOnce({
+        scope: "reflection",
+        runner: "completion",
+        retryState,
+        onLog: onRetryLog,
+        execute: async () => {
+          const text = await completeText(reflectionSystemPrompt, reflectionUserPrompt);
+          if (!text) throw new Error("completion returned no text");
+          return text;
+        },
+      });
+    } catch (err) {
+      errors.push(`completion: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  } else {
+    errors.push("completion: no tool-free completion client on this host");
   }
 
   if (reflectionText) {
@@ -1956,7 +1859,7 @@ async function generateReflectionTextUnbounded(
       usedFallback: false,
       promptHash,
       error: errors.length > 0 ? errors.join(" | ") : undefined,
-      runner: "cli",
+      runner: "completion",
     };
   }
 
@@ -2511,6 +2414,7 @@ interface PluginSingletonState {
   captureAdmissionController: () => AdmissionController | null;
   captureAdmissionAudit: () => boolean;
   captureReflectionAdmissionController: () => AdmissionController | null;
+  makeLaneLlmClient: (model: string, thinkLevel?: string, modelExplicit?: boolean) => LlmClient;
   admissionRejectionAuditWriter: ((entry: AdmissionRejectionAuditEntry) => Promise<void>) | null;
 }
 
@@ -2821,6 +2725,10 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const captureAdmissionAudit = () =>
     admissionController !== null && config.admissionControl?.auditMetadata !== false;
   const captureReflectionAdmissionController = () => admissionControllerReflectionLane;
+  const makeLaneLlmClient = (model: string, thinkLevel?: string, modelExplicit?: boolean) => {
+    const { makeClientForModel, llmModelExplicit } = buildMemoryLlmClient();
+    return makeClientForModel(model, thinkLevel, modelExplicit ?? llmModelExplicit);
+  };
 
   const extractionRateLimiter = createExtractionRateLimiter({
     maxExtractionsPerHour: config.extractionThrottle?.maxExtractionsPerHour,
@@ -2880,6 +2788,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     captureAdmissionController,
     captureAdmissionAudit,
     captureReflectionAdmissionController,
+    makeLaneLlmClient,
     admissionRejectionAuditWriter,
   };
 }
@@ -3040,6 +2949,7 @@ const memoryLanceDBProPlugin = {
       captureAdmissionController,
       captureAdmissionAudit,
       captureReflectionAdmissionController,
+      makeLaneLlmClient,
       admissionRejectionAuditWriter,
     } = singleton;
 
@@ -5473,6 +5383,29 @@ const memoryLanceDBProPlugin = {
       const reflectionMaxConcurrentRuns = config.memoryReflection?.maxConcurrentRuns ?? DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS;
       const reflectionAgentId = asNonEmptyString(config.memoryReflection?.agentId);
       const reflectionModel = asNonEmptyString(config.memoryReflection?.model);
+      // Tool-free fallback for the distiller when the embedded runner is
+      // unavailable: a plain completion on the plugin's own LLM lane, so the
+      // transcript never reaches an agent turn that could invoke tools.
+      let reflectionCompletionClient: LlmClient | null | undefined;
+      const reflectionCompleteText = async (systemPrompt: string, userPrompt: string): Promise<string | null> => {
+        if (reflectionCompletionClient === undefined) {
+          const model = reflectionModel ?? asNonEmptyString(config.llm?.model);
+          try {
+            reflectionCompletionClient = model
+              ? makeLaneLlmClient(
+                  config.llm?.transport === "host" ? model.trim() : normalizeDirectModelRef(model),
+                  reflectionThinkLevel,
+                  reflectionModel ? true : undefined,
+                )
+              : null;
+          } catch (err) {
+            api.logger.warn(`memory-reflection: completion fallback unavailable: ${err instanceof Error ? err.message : String(err)}`);
+            reflectionCompletionClient = null;
+          }
+        }
+        if (!reflectionCompletionClient) return null;
+        return reflectionCompletionClient.completeText(userPrompt, "memory-reflection", systemPrompt);
+      };
       const reflectionErrorReminderMaxEntries =
         parsePositiveInt(config.memoryReflection?.errorReminderMaxEntries) ?? DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES;
       const reflectionDedupeErrorSignals = config.memoryReflection?.dedupeErrorSignals !== false;
@@ -5672,10 +5605,40 @@ const memoryLanceDBProPlugin = {
         return g[REFLECTION_SERIAL_GUARD] as Map<string, number>;
       };
       // SERIAL_GUARD_COOLDOWN_MS moved to DEFAULT_SERIAL_GUARD_COOLDOWN_MS
+      // A command:new / command:reset hook that finds neither a hook transcript nor a
+      // session file parks here; the typed before_reset hook, which core fires right
+      // after the command hooks on every command path, carries the departing messages
+      // and finishes the reflection from this entry.
+      const REFLECTION_PENDING_BEFORE_RESET_TTL_MS = 60_000;
+      type PendingBeforeResetReflection = { event: any; sessionId: string; action: string; at: number };
+      const pendingBeforeResetReflections = new Map<string, PendingBeforeResetReflection>();
+      const rememberPendingBeforeResetReflection = (key: string, entry: Omit<PendingBeforeResetReflection, "at">) => {
+        const now = Date.now();
+        for (const [pendingKey, pending] of pendingBeforeResetReflections) {
+          if (now - pending.at > REFLECTION_PENDING_BEFORE_RESET_TTL_MS) pendingBeforeResetReflections.delete(pendingKey);
+        }
+        pendingBeforeResetReflections.set(key, { ...entry, at: now });
+      };
+      const takePendingBeforeResetReflection = (key: string): PendingBeforeResetReflection | undefined => {
+        const pending = pendingBeforeResetReflections.get(key);
+        if (!pending) return undefined;
+        pendingBeforeResetReflections.delete(key);
+        return Date.now() - pending.at > REFLECTION_PENDING_BEFORE_RESET_TTL_MS ? undefined : pending;
+      };
+      // Captured at registration, outside any command's root-work context. The
+      // before_reset continuation would otherwise inherit the released /new root,
+      // and core refuses embedded sub-runs from a released root (subordinate work
+      // admission), which would push every /new reflection to the CLI runner.
+      const runOutsideCommandRootWork: <R>(fn: () => R) => R =
+        typeof (AsyncLocalStorage as { snapshot?: unknown }).snapshot === "function"
+          ? (AsyncLocalStorage as unknown as { snapshot: () => <R>(fn: () => R) => R }).snapshot()
+          : (fn) => fn();
 
-      const runMemoryReflection = async (event: any) => {
+      type ReflectionRunOptions = { beforeResetConversation?: string | null };
+      const runMemoryReflectionWith = async (event: any, options?: ReflectionRunOptions) => {
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
         const action = String(event?.action || "unknown");
+        const resumedFromBeforeReset = options !== undefined && "beforeResetConversation" in options;
 
         // Validate sessionKey BEFORE dedup — invalid/empty keys must NOT pollute the dedup set
         if (!sessionKey) {
@@ -5683,7 +5646,7 @@ const memoryLanceDBProPlugin = {
           return;
         }
 
-        if (_dedupHookEvent("reflection", event)) return;
+        if (!resumedFromBeforeReset && _dedupHookEvent("reflection", event)) return;
         const context = (event.context || {}) as Record<string, unknown>;
         const cfg = context.cfg;
         const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<string, unknown>;
@@ -5764,7 +5727,7 @@ const memoryLanceDBProPlugin = {
             sessionFile: currentSessionFile,
           });
           const guarded = getReflectionEmptyEventGuardMap().get(emptyEventGuardKey);
-          if (guarded && Date.now() - guarded.updatedAt <= DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS) {
+          if (!resumedFromBeforeReset && guarded && Date.now() - guarded.updatedAt <= DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS) {
             api.logger.info(
               `memory-reflection: command:${action} skipped repeated empty/unusable session; sessionKey=${sessionKey}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}; reason=${guarded.reason}`
             );
@@ -5820,48 +5783,79 @@ const memoryLanceDBProPlugin = {
             `memory-reflection: command:${action} hook start; sessionKey=${sessionKey || "(none)"}; source=${commandSource || "(unknown)"}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`
           );
 
-          if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
-            const searchDirs = resolveReflectionSessionSearchDirs({
-              context,
-              cfg,
-              workspaceDir,
-              currentSessionFile,
-              sourceAgentId,
-            });
+          // Hosts with SQLite session storage hand the departing transcript to the
+          // hook itself; the session-file lookup below is the legacy path.
+          let conversation = resumedFromBeforeReset
+            ? options?.beforeResetConversation ?? null
+            : conversationFromHookSessionMemory(context.previousSessionMemory, reflectionMessageCount);
+          if (resumedFromBeforeReset) {
             api.logger.info(
-              `memory-reflection: command:${action} session recovery start for session ${currentSessionId}; initial=${currentSessionFile || "(none)"}; dirs=${searchDirs.join(" | ") || "(none)"}`
+              `memory-reflection: command:${action} using the before_reset transcript for session ${currentSessionId}; messages=${conversation ? "present" : "empty"}`
             );
-            for (const sessionsDir of searchDirs) {
-              const recovered = await findPreviousSessionFile(sessionsDir, currentSessionFile, currentSessionId);
-              if (recovered) {
-                api.logger.info(
-                  `memory-reflection: command:${action} recovered session file ${recovered} from ${sessionsDir}`
-                );
-                currentSessionFile = recovered;
-                break;
+          } else if (conversation) {
+            api.logger.info(
+              `memory-reflection: command:${action} using the hook-provided transcript for session ${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`
+            );
+          } else {
+            if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
+              const searchDirs = resolveReflectionSessionSearchDirs({
+                context,
+                cfg,
+                workspaceDir,
+                currentSessionFile,
+                sourceAgentId,
+              });
+              api.logger.info(
+                `memory-reflection: command:${action} session recovery start for session ${currentSessionId}; initial=${currentSessionFile || "(none)"}; dirs=${searchDirs.join(" | ") || "(none)"}`
+              );
+              for (const sessionsDir of searchDirs) {
+                const recovered = await findPreviousSessionFile(sessionsDir, currentSessionFile, currentSessionId);
+                if (recovered) {
+                  api.logger.info(
+                    `memory-reflection: command:${action} recovered session file ${recovered} from ${sessionsDir}`
+                  );
+                  currentSessionFile = recovered;
+                  break;
+                }
               }
             }
-          }
 
-          if (!currentSessionFile) {
-            const searchDirs = resolveReflectionSessionSearchDirs({
-              context,
-              cfg,
-              workspaceDir,
-              currentSessionFile,
-              sourceAgentId,
-            });
-            api.logger.warn(
-              `memory-reflection: command:${action} missing session file after recovery for session ${currentSessionId}; dirs=${searchDirs.join(" | ") || "(none)"}`
-            );
-            await rememberEmptyReflectionEvent("missing-session-file");
-            return;
-          }
+            if (!currentSessionFile) {
+              const searchDirs = resolveReflectionSessionSearchDirs({
+                context,
+                cfg,
+                workspaceDir,
+                currentSessionFile,
+                sourceAgentId,
+              });
+              if (isBoundaryAction) {
+                rememberPendingBeforeResetReflection(sessionKey, { event, sessionId: currentSessionId, action });
+                api.logger.info(
+                  `memory-reflection: command:${action} no transcript in the hook context or on disk for session ${currentSessionId}; waiting for the typed before_reset messages`
+                );
+                return;
+              }
+              api.logger.warn(
+                `memory-reflection: command:${action} missing session file after recovery for session ${currentSessionId}; dirs=${searchDirs.join(" | ") || "(none)"}`
+              );
+              await rememberEmptyReflectionEvent("missing-session-file");
+              return;
+            }
 
-          const conversation = await readSessionConversationWithResetFallback(currentSessionFile, reflectionMessageCount);
+            conversation = await readSessionConversationWithResetFallback(currentSessionFile, reflectionMessageCount);
+          }
           if (!conversation) {
+            if (isBoundaryAction && !resumedFromBeforeReset) {
+              // A stale transcript artifact on a migrated host must not hide the
+              // messages the typed hook is about to supply.
+              rememberPendingBeforeResetReflection(sessionKey, { event, sessionId: currentSessionId, action });
+              api.logger.info(
+                `memory-reflection: command:${action} transcript ${currentSessionFile || "(none)"} holds no usable conversation for session ${currentSessionId}; waiting for the typed before_reset messages`
+              );
+              return;
+            }
             api.logger.warn(
-              `memory-reflection: command:${action} conversation empty/unusable for session ${currentSessionId}; file=${currentSessionFile}`
+              `memory-reflection: command:${action} conversation empty/unusable for session ${currentSessionId}; file=${currentSessionFile || "(none)"}`
             );
             await rememberEmptyReflectionEvent("empty-conversation");
             return;
@@ -5904,14 +5898,15 @@ const memoryLanceDBProPlugin = {
             toolErrorSignals,
             logger: api.logger,
             api,  // SDK migration Bug 2: pass api for new runtime.agent API
+            completeText: reflectionCompleteText,
           });
           api.logger.info(
             `memory-reflection: command:${action} reflection generation done for session ${currentSessionId}; runner=${reflectionGenerated.runner}; usedFallback=${reflectionGenerated.usedFallback ? "yes" : "no"}`
           );
           const reflectionText = reflectionGenerated.text;
-          if (reflectionGenerated.runner === "cli") {
+          if (reflectionGenerated.runner === "completion") {
             api.logger.warn(
-              `memory-reflection: embedded runner unavailable, used openclaw CLI fallback for session ${currentSessionId}` +
+              `memory-reflection: embedded runner unavailable, used the tool-free completion fallback for session ${currentSessionId}` +
               (reflectionGenerated.error ? ` (${reflectionGenerated.error})` : "")
             );
           } else if (reflectionGenerated.usedFallback) {
@@ -6282,6 +6277,25 @@ const memoryLanceDBProPlugin = {
           pruneReflectionSessionState();
         }
       };
+      const runMemoryReflection = async (event: any) => runMemoryReflectionWith(event);
+      const runMemoryReflectionFromBeforeReset = async (event: any, ctx: any) => {
+        const reason = getCommandActionName(event?.reason);
+        if (reason !== "new" && reason !== "reset") return;
+        const sessionKey = typeof ctx?.sessionKey === "string" ? ctx.sessionKey : "";
+        if (!sessionKey) return;
+        const pending = takePendingBeforeResetReflection(sessionKey);
+        if (!pending) return;
+        const conversation = summarizeRecentConversationMessages(
+          Array.isArray(event?.messages) ? event.messages : [],
+          reflectionMessageCount,
+        );
+        // The command hook that parked this entry ran no reflection, so its serial-guard
+        // stamp must not count against the continuation.
+        getSerialGuardMap().delete(sessionKey);
+        await runOutsideCommandRootWork(() =>
+          runMemoryReflectionWith(pending.event, { beforeResetConversation: conversation }),
+        );
+      };
 
       api.registerHook("command:new", runMemoryReflection, {
         name: "memory-lancedb-pro.memory-reflection.command-new",
@@ -6291,8 +6305,9 @@ const memoryLanceDBProPlugin = {
         name: "memory-lancedb-pro.memory-reflection.command-reset",
         description: "Generate reflection log before /reset",
       });
+      api.on("before_reset", runMemoryReflectionFromBeforeReset);
       (isCliMode() ? api.logger.debug : api.logger.info)(
-        "memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_prompt_build, session_end)"
+        "memory-reflection: integrated hooks registered (command:new, command:reset, before_reset, after_tool_call, before_prompt_build, session_end)"
       );
     }
 

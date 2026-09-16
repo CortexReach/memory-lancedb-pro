@@ -299,7 +299,7 @@ describe("memory reflection", () => {
       await assert.rejects(
         runWithReflectionTransientRetryOnce({
           scope: "reflection",
-          runner: "cli",
+          runner: "completion",
           retryState,
           execute: async () => {
             attempts += 1;
@@ -322,7 +322,7 @@ describe("memory reflection", () => {
       await assert.rejects(
         runWithReflectionTransientRetryOnce({
           scope: "distiller",
-          runner: "cli",
+          runner: "completion",
           retryState,
           execute: async () => {
             attempts += 1;
