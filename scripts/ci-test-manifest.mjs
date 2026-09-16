@@ -170,6 +170,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/manual-echo-guard.test.mjs", args: ["--test"] },
   { group: "llm-clients-and-auth", runner: "node", file: "test/host-runtime-lifecycle-error.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-agent-end-owned-run.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/memory-runtime-provenance-classification.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
