@@ -4092,6 +4092,38 @@ const memoryLanceDBProPlugin = {
         );
         return !(isRolloverReason || announcesSuccessor);
       };
+      // A session_end context cannot name the agent that wrote the window:
+      // the host rebuilds its agentId from the session key and falls back to
+      // the DEFAULT agent on unparseable keys (the shared literal "global"
+      // key among them), so a targeted delete misses the writer. A terminal
+      // boundary ends the session for every agent riding the key; sweep
+      // every window under it. Synchronous teardown first (a next capture
+      // must never see the ended session's windows), then a final pass once
+      // every in-flight run for the key has settled: a straggler that read
+      // its window before the boundary may only re-store between the two
+      // passes, and the epoch bump makes its store a no-op anyway. The final
+      // pass DELETES the epoch counters, which have no store left to guard.
+      const sweepSessionPairWindows = (endedSessionKey: string, finalPass: boolean) => {
+        const sessionSuffix = REMEMBER_WINDOW_KEY_SEPARATOR + endedSessionKey;
+        for (const windowKey of [...autoCaptureRecentTurns.keys()]) {
+          if (windowKey.endsWith(sessionSuffix)) {
+            autoCaptureRecentTurns.delete(windowKey);
+          }
+        }
+        for (const windowKey of [...autoCaptureRecentPairTurns.keys()]) {
+          if (windowKey.endsWith(sessionSuffix)) {
+            autoCapturePairWindowEpoch.set(windowKey, (autoCapturePairWindowEpoch.get(windowKey) ?? 0) + 1);
+            autoCaptureRecentPairTurns.delete(windowKey);
+          }
+        }
+        if (finalPass) {
+          for (const epochKey of [...autoCapturePairWindowEpoch.keys()]) {
+            if (epochKey.endsWith(sessionSuffix)) {
+              autoCapturePairWindowEpoch.delete(epochKey);
+            }
+          }
+        }
+      };
       api.on(
         "session_end",
         (event: any, ctx: any) => {
@@ -4117,45 +4149,8 @@ const memoryLanceDBProPlugin = {
             (typeof endedSessionId === "string" ? autoCaptureSessionIdToKey.get(endedSessionId) : undefined) ||
             "";
           if (endedSessionKey) {
-            // A session_end context cannot name the agent that wrote the
-            // window: the host rebuilds its agentId from the session key
-            // and falls back to the DEFAULT agent on unparseable keys
-            // (the shared literal "global" key among them), so a
-            // targeted delete misses the writer. A terminal boundary
-            // ends the session for every agent riding the key; sweep
-            // every window under it.
-            const sweepSessionWindows = (finalPass: boolean) => {
-              const sessionSuffix = REMEMBER_WINDOW_KEY_SEPARATOR + endedSessionKey;
-              for (const windowKey of [...autoCaptureRecentTurns.keys()]) {
-                if (windowKey.endsWith(sessionSuffix)) {
-                  autoCaptureRecentTurns.delete(windowKey);
-                }
-              }
-              for (const windowKey of [...autoCaptureRecentPairTurns.keys()]) {
-                if (windowKey.endsWith(sessionSuffix)) {
-                  autoCapturePairWindowEpoch.set(windowKey, (autoCapturePairWindowEpoch.get(windowKey) ?? 0) + 1);
-                  autoCaptureRecentPairTurns.delete(windowKey);
-                }
-              }
-              if (finalPass) {
-                // Every in-flight run for the key has settled, so the epoch
-                // counters have no store left to guard: the teardown can
-                // DELETE them instead of leaving a bumped entry behind for
-                // every session that ever held a window.
-                for (const epochKey of [...autoCapturePairWindowEpoch.keys()]) {
-                  if (epochKey.endsWith(sessionSuffix)) {
-                    autoCapturePairWindowEpoch.delete(epochKey);
-                  }
-                }
-              }
-            };
-            // Synchronous teardown first (a next capture must never see the
-            // ended session's windows), then a second pass once every
-            // in-flight run for the key has settled: a straggler that read
-            // its window before this boundary may only re-store between the
-            // two passes, and the epoch bump makes its store a no-op anyway.
-            sweepSessionWindows(false);
-            void awaitSessionCaptureRuns(endedSessionKey).then(() => sweepSessionWindows(true));
+            sweepSessionPairWindows(endedSessionKey, false);
+            void awaitSessionCaptureRuns(endedSessionKey).then(() => sweepSessionPairWindows(endedSessionKey, true));
           }
         },
         { priority: 10 },
@@ -4251,6 +4246,15 @@ const memoryLanceDBProPlugin = {
           // session_end may deliver only the lifecycle sessionId; record the
           // alias so the terminal flush resolves to the same buckets.
           learnAutoCaptureSessionAlias(hookSessionId, sessionKey);
+          // The rolling pair window is keyed by agent AND session (the shared
+          // literal keys "global"/"unknown" otherwise bleed one agent's
+          // transcript into another agent's extraction and its scope). A
+          // capture without an attributable agent OR session identity gets no
+          // retention at all: a known agent's turns from unrelated unidentified
+          // sessions would otherwise pool under one key.
+          const pairWindowKey = agentId !== "unknown" && sessionKey !== "unknown"
+            ? rememberWindowKey(agentId, sessionKey)
+            : null;
 
           api.logger.debug(
             `memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`,
@@ -4514,16 +4518,17 @@ const memoryLanceDBProPlugin = {
           }
           if (isTerminalBoundary) {
             autoCaptureRecentTurns.delete(rememberWindowKey(agentId, sessionKey));
-            const terminalPairKey = rememberWindowKey(agentId, sessionKey);
-            // The epoch guard only has stores to invalidate while the pair
-            // window feature is ON; bumping under the disabled default would
-            // allocate an entry per agent/session with nothing to guard.
-            if ((config.autoCaptureContextTurns ?? 0) > 0) {
-              autoCapturePairWindowEpoch.set(terminalPairKey, (autoCapturePairWindowEpoch.get(terminalPairKey) ?? 0) + 1);
-            } else {
-              autoCapturePairWindowEpoch.delete(terminalPairKey);
+            if (pairWindowKey) {
+              // The epoch guard only has stores to invalidate while the pair
+              // window feature is ON; bumping under the disabled default would
+              // allocate an entry per agent/session with nothing to guard.
+              if ((config.autoCaptureContextTurns ?? 0) > 0) {
+                autoCapturePairWindowEpoch.set(pairWindowKey, (autoCapturePairWindowEpoch.get(pairWindowKey) ?? 0) + 1);
+              } else {
+                autoCapturePairWindowEpoch.delete(pairWindowKey);
+              }
+              autoCaptureRecentPairTurns.delete(pairWindowKey);
             }
-            autoCaptureRecentPairTurns.delete(terminalPairKey);
           } else if (newTexts.length > 0) {
             const newRecentTurns = thisCallTurns.slice(rememberPrependedTurns.length);
             const combinedRecentTurns = [...priorRecentTurns, ...newRecentTurns];
@@ -4757,11 +4762,6 @@ const memoryLanceDBProPlugin = {
               // call: the extractor's protected-prefix contract counts
               // referent turns from position zero.
               const contextTurns = config.autoCaptureContextTurns ?? 0;
-              // The rolling window is keyed by agent AND session (the shared
-              // literal keys "global"/"unknown" otherwise bleed one agent's
-              // transcript into another agent's extraction and its scope).
-              // Unattributable captures get no retention at all.
-              const pairWindowKey = agentId && agentId !== "unknown" ? rememberWindowKey(agentId, sessionKey) : null;
               const pairWindowEpochAtRead = pairWindowKey ? (autoCapturePairWindowEpoch.get(pairWindowKey) ?? 0) : 0;
               // Retained turns re-enter later transcripts as CONTEXT ONLY:
               // they render as context_only blocks the extraction prompt
@@ -4796,9 +4796,11 @@ const memoryLanceDBProPlugin = {
                   autoCapturePairWindowEpoch.set(pairWindowKey, pairWindowEpochAtRead + 1);
                 }
                 autoCaptureRecentPairTurns.delete(pairWindowKey);
-              } else if (contextTurns > 0 && pairWindowKey && thisCallTurns.length > 0) {
-                // Deliberately retained across successful extractions:
-                // deleting it here would mean steady-state captures (one
+              } else if (contextTurns > 0 && pairWindowKey && thisCallTurns.length > 0 && !isTerminalBoundary) {
+                // Deliberately retained across successful extractions, never
+                // by a terminal-boundary run (its flush transcript would
+                // recreate the window this run tore down): deleting it here
+                // would mean steady-state captures (one
                 // extraction per turn) always see a bare current pair. The
                 // set-time trim bounds it; the watermark keeps retained
                 // turns from re-becoming sources. The epoch guard skips the
@@ -5290,7 +5292,14 @@ const memoryLanceDBProPlugin = {
             );
             return awaitSessionCaptureRuns(flushSessionKey);
           })
-          .then(() => {});
+          .then(() => {
+            // The window sweep hook may have run its final pass before this
+            // flush registered its run; a terminal boundary repeats it once
+            // the flush has settled so no epoch entry outlives the session.
+            if (isTerminalSessionBoundary(event)) {
+              sweepSessionPairWindows(flushSessionKey, true);
+            }
+          });
         // Test-synchronization seam only (see the agent_end tail).
         agentEndAutoCaptureHook.__lastRun = flushRun;
         // Returned, not detached: a host that awaits its session_end hooks
