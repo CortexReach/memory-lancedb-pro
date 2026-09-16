@@ -147,7 +147,15 @@ export function nextAutoCaptureMessageId() {
  * covers attribute-bearing and self-closing forms like
  * <assistant_message id="x"> and <user_message/>.
  */
-const SPEAKER_TAG_SPOOF_NAMES = ["user_message", "assistant_message"];
+// The context_only wrappers are structural too: retained window turns render
+// through this same path, so a literal wrapper typed into an earlier message
+// could otherwise close the context block and open a fake source block.
+const SPEAKER_TAG_SPOOF_NAMES = [
+    "user_message",
+    "assistant_message",
+    "context_only_user_turn",
+    "context_only_assistant_turn",
+];
 function isSpoofWhitespaceCode(code) {
     return ((code >= 9 && code <= 13) ||
         code === 32 ||
