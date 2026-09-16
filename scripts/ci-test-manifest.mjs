@@ -162,6 +162,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/invalidated-rows-visibility.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/store-excludeinactive-default.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/manual-echo-guard.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/memory-runtime-provenance-classification.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
