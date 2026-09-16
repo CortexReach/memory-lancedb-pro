@@ -45,6 +45,7 @@ import {
   type WorkspaceBoundaryConfig,
 } from "./workspace-boundary.js";
 import { isSuppressed as isTier1Suppressed } from "./auto-recall-tier1.js";
+import type { ManualEchoLedger } from "./manual-echo-guard.js";
 import { enqueueManualRecallMetadata } from "./manual-recall-metadata-queue.js";
 
 // ============================================================================
@@ -78,6 +79,9 @@ interface ToolContext {
   // row supersedes it instead of being rejected as a duplicate; the manual
   // text always lands verbatim.
   manualStoreSupersede?: boolean;
+  // Echo guard: manual store/update texts are recorded here so
+  // auto-capture extraction can drop near-identical echo candidates.
+  manualEchoLedger?: ManualEchoLedger;
   // Mirrors MemoryCliContext's onMemoriesDeleted (cli.ts): lets the host invalidate
   // in-process reflection caches after a live delete, not just CLI delete/delete-bulk.
   onMemoriesDeleted?: (info: { scopeFilter?: string[] }) => void;
@@ -1695,6 +1699,16 @@ export function registerMemoryStoreTool(
               );
             }
 
+            // The replaced statements leave the echo ledger with the rows:
+            // a reversal back to a superseded text is new information once
+            // the store no longer holds that fact.
+            for (const target of lastDiscovery.targets) {
+              if (supersededIds.includes(target.entry.id)) {
+                context.manualEchoLedger?.invalidate(agentId, target.entry.text);
+              }
+            }
+            context.manualEchoLedger?.record(agentId, text);
+
             // Dual-write to Markdown mirror if enabled
             if (context.mdMirror) {
               await context.mdMirror(
@@ -1785,6 +1799,8 @@ export function registerMemoryStoreTool(
               ),
             ),
           });
+
+          context.manualEchoLedger?.record(agentId, text);
 
           // Dual-write to Markdown mirror if enabled
           if (context.mdMirror) {
@@ -1896,8 +1912,16 @@ export function registerMemoryForgetTool(
                 details: resolved.details ?? { error: "not_found", id: memoryId },
               };
             }
+            const forgottenRow = context.manualEchoLedger
+              ? await context.store.getById(resolved.id, scopeFilter).catch(() => null)
+              : null;
             const deleted = await context.store.delete(resolved.id, scopeFilter);
             if (deleted) {
+              // A forgotten fact must not keep suppressing its own
+              // re-statement through the echo ledger.
+              if (forgottenRow?.text) {
+                context.manualEchoLedger?.invalidate(agentId, forgottenRow.text);
+              }
               context.onMemoriesDeleted?.({ scopeFilter });
               return {
                 content: [
@@ -1940,6 +1964,7 @@ export function registerMemoryForgetTool(
                 scopeFilter,
               );
               if (deleted) {
+                context.manualEchoLedger?.invalidate(agentId, results[0].entry.text);
                 context.onMemoriesDeleted?.({ scopeFilter });
                 return {
                   content: [
@@ -2171,6 +2196,13 @@ export function registerMemoryUpdateTool(
                   );
                 }
 
+                // The superseding write succeeded: this text will echo through
+                // the same turn's auto-capture extraction exactly like a plain
+                // manual store, so it must be recorded on this early-return
+                // path too, and the replaced text must stop suppressing its
+                // own re-statement.
+                context.manualEchoLedger?.invalidate(agentId, existing.text);
+                context.manualEchoLedger?.record(agentId, text);
                 return {
                   content: [
                     {
@@ -2247,6 +2279,16 @@ export function registerMemoryUpdateTool(
               ],
               details: { error: "not_found", id: resolvedId },
             };
+          }
+
+          // Only a manually supplied text arms the echo guard: a metadata-only
+          // update (importance, category) restates nothing, so it must not
+          // suppress a later extraction of the unchanged fact.
+          if (text && existing) {
+            if (updated.text !== existing.text) {
+              context.manualEchoLedger?.invalidate(agentId, existing.text);
+            }
+            context.manualEchoLedger?.record(agentId, updated.text);
           }
 
           return {

@@ -17,6 +17,7 @@ import {
   buildBatchDedupPrompt,
   buildBatchMergePrompt,
 } from "./extraction-prompts.js";
+import type { ManualEchoLedger } from "./manual-echo-guard.js";
 import { formatExistingMemoryEntry } from "./prompt-blocks.js";
 import {
   AdmissionController,
@@ -545,6 +546,8 @@ export interface SmartExtractorConfig {
   user?: string;
   /** Minimum conversation messages before extraction triggers. */
   extractMinMessages?: number;
+  /** Echo guard: drops candidates near-identical to a recent manual memory_store/memory_update text, pre-judge. */
+  manualEchoLedger?: ManualEchoLedger;
   /** Maximum characters of conversation text to process. */
   extractMaxChars?: number;
   /** Per-call chunk bound for the batched dedup decider and merge writer (1-50, default 10). */
@@ -726,10 +729,38 @@ export class SmartExtractor {
       options.conversationTurns,
       options.protectedPrefixTurns,
     );
-    const candidates = extraction.candidates;
+    let candidates = extraction.candidates;
+
+    // Echo guard: candidates near-identical to a recent manual
+    // memory_store/memory_update text are echoes of a row that already
+    // exists verbatim -- drop them before any judge/dedup/merge spend.
+    const echoLedger = this.config.manualEchoLedger;
+    let echoDropped = 0;
+    if (echoLedger && candidates.length > 0) {
+      const kept: CandidateMemory[] = [];
+      for (const candidate of candidates) {
+        if (echoLedger.match(agentId, candidate.content)) {
+          // An echo drop is a SETTLED outcome (the fact already exists as
+          // the manual row), so it counts as skipped: an echo-only batch
+          // must consume its input instead of deferring for a retry that
+          // would re-run the same extraction.
+          echoDropped += 1;
+          stats.skipped += 1;
+          this.log(
+            `memory-pro: smart-extractor: manual-echo guard dropped candidate (near-identical to a recent manual store) category=${candidate.category} abstract=${JSON.stringify(candidate.abstract.slice(0, 120))}`,
+          );
+        } else {
+          kept.push(candidate);
+        }
+      }
+      candidates = kept;
+    }
 
     if (candidates.length === 0) {
       this.log("memory-pro: smart-extractor: no memories extracted");
+      if (echoDropped > 0) {
+        stats.settledOutcomes = true;
+      }
       if (extraction.status === "empty_input") {
         // No LLM call was made, so the caller's rate limiter must not be charged.
         stats.skippedNoInput = true;
@@ -3392,6 +3423,8 @@ export class SmartExtractor {
     );
 
     if (invalidated) {
+      // The superseded text can no longer echo; keep the manual ledger honest.
+      this.config.manualEchoLedger?.invalidate(agentId, existing.text);
       this.log(
         `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`,
       );

@@ -26,6 +26,7 @@ import { createRetriever, normalizeRetrievalConfig, } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
+import { ManualEchoLedger } from "./src/manual-echo-guard.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { parseClawteamScopes, applyClawteamScopes } from "./src/clawteam-scope.js";
@@ -1989,6 +1990,11 @@ function _initPluginState(api) {
     // enabled. admissionControl.enabled remains a supported configuration on
     // its own.
     let smartExtractor = null;
+    // Echo guard: shared between the manual store/update tools (record side)
+    // and the smart extractor (drop side). Constructed unconditionally, but
+    // wired into the tools only when a smart extractor exists: an echo can
+    // only arise when extraction is able to re-mint the dictated text.
+    const manualEchoLedger = new ManualEchoLedger();
     let admissionController = null;
     let admissionControllerReflectionLane = null;
     if (config.smartExtraction !== false || config.admissionControl?.enabled === true) {
@@ -2056,6 +2062,7 @@ function _initPluginState(api) {
                 noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
                 smartExtractor = new SmartExtractor(store, embedder, llmClient, {
                     user: "User",
+                    manualEchoLedger,
                     captureAssistantEligible: config.captureAssistant === true,
                     extractMinMessages: config.extractMinMessages ?? 4,
                     extractMaxChars: config.extractMaxChars ?? 8000,
@@ -2126,6 +2133,7 @@ function _initPluginState(api) {
         scopeManager,
         migrator,
         smartExtractor,
+        manualEchoLedger,
         mdMirror,
         extractionRateLimiter,
         reflectionErrorStateBySession,
@@ -2254,7 +2262,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, admissionRejectionAuditWriter, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, manualEchoLedger, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, admissionRejectionAuditWriter, } = singleton;
         const learnAutoCaptureSessionAlias = (sessionId, sessionKey) => {
             if (typeof sessionId !== "string" || !sessionId
                 || typeof sessionKey !== "string" || !sessionKey
@@ -2614,6 +2622,10 @@ const memoryLanceDBProPlugin = {
             workspaceBoundary: config.workspaceBoundary,
             selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
             manualStoreSupersede: config.manualStoreSupersede === true,
+            // The echo ledger only ever matters when smart extraction can echo a
+            // manual store back; leaving it out otherwise also spares
+            // memory_forget its pre-delete getById fetch.
+            manualEchoLedger: smartExtractor ? manualEchoLedger : undefined,
             // Mirrors the CLI context wiring below: keep in-process reflection caches
             // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
             onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),

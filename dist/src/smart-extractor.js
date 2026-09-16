@@ -455,9 +455,35 @@ export class SmartExtractor {
         }
         // Step 1: LLM extraction
         const extraction = await this.extractCandidates(conversationText, policyMode, options.conversationTurns, options.protectedPrefixTurns);
-        const candidates = extraction.candidates;
+        let candidates = extraction.candidates;
+        // Echo guard: candidates near-identical to a recent manual
+        // memory_store/memory_update text are echoes of a row that already
+        // exists verbatim -- drop them before any judge/dedup/merge spend.
+        const echoLedger = this.config.manualEchoLedger;
+        let echoDropped = 0;
+        if (echoLedger && candidates.length > 0) {
+            const kept = [];
+            for (const candidate of candidates) {
+                if (echoLedger.match(agentId, candidate.content)) {
+                    // An echo drop is a SETTLED outcome (the fact already exists as
+                    // the manual row), so it counts as skipped: an echo-only batch
+                    // must consume its input instead of deferring for a retry that
+                    // would re-run the same extraction.
+                    echoDropped += 1;
+                    stats.skipped += 1;
+                    this.log(`memory-pro: smart-extractor: manual-echo guard dropped candidate (near-identical to a recent manual store) category=${candidate.category} abstract=${JSON.stringify(candidate.abstract.slice(0, 120))}`);
+                }
+                else {
+                    kept.push(candidate);
+                }
+            }
+            candidates = kept;
+        }
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
+            if (echoDropped > 0) {
+                stats.settledOutcomes = true;
+            }
             if (extraction.status === "empty_input") {
                 // No LLM call was made, so the caller's rate limiter must not be charged.
                 stats.skippedNoInput = true;
@@ -2457,6 +2483,8 @@ export class SmartExtractor {
         const invalidated = await this.invalidateSupersededMemory(matchId, existing, factKey, created, scopeFilter);
         await this.notifyPersisted({ text: created.text, category: created.category, scope: created.scope, timestamp: created.timestamp }, "smart-extraction", agentId);
         if (invalidated) {
+            // The superseded text can no longer echo; keep the manual ledger honest.
+            this.config.manualEchoLedger?.invalidate(agentId, existing.text);
             this.log(`memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`);
             return "superseded";
         }
