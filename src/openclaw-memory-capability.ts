@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { readdir, stat } from "node:fs/promises";
+import { resolveOpenClawStateDir } from "./openclaw-paths.js";
 import {
   parseCanonicalCorpusMetadata,
   type CanonicalCorpusConfig,
@@ -239,7 +240,7 @@ function resolveWorkspacePath(value: string): string {
 }
 
 function defaultWorkspaceDir(): string {
-  return join(homedir(), ".openclaw", "workspace");
+  return join(resolveOpenClawStateDir(), "workspace");
 }
 
 function collectConfiguredWorkspaces(cfg: OpenClawConfigLike | undefined): Array<{ workspaceDir: string; agentIds: string[] }> {
