@@ -1318,6 +1318,15 @@ export function registerMemoryStoreTool(api, context) {
                             // invalidation instead of silently reporting it as superseded.
                             console.warn(`memory-pro: failed to invalidate superseded record ${failure.id.slice(0, 8)}: ${failure.reason}`);
                         }
+                        // The replaced statements leave the echo ledger with the rows:
+                        // a reversal back to a superseded text is new information once
+                        // the store no longer holds that fact.
+                        for (const target of lastDiscovery.targets) {
+                            if (supersededIds.includes(target.entry.id)) {
+                                context.manualEchoLedger?.invalidate(agentId, target.entry.text);
+                            }
+                        }
+                        context.manualEchoLedger?.record(agentId, text);
                         // Dual-write to Markdown mirror if enabled
                         if (context.mdMirror) {
                             await context.mdMirror({ text, category: storageCategory, scope: targetScope, timestamp: newEntry.timestamp }, { source: "memory_store", agentId });
@@ -1397,6 +1406,7 @@ export function registerMemoryStoreTool(api, context) {
                             valid_until: validUntil,
                         })),
                     });
+                    context.manualEchoLedger?.record(agentId, text);
                     // Dual-write to Markdown mirror if enabled
                     if (context.mdMirror) {
                         await context.mdMirror({ text, category: storageCategory, scope: targetScope, timestamp: entry.timestamp }, { source: "memory_store", agentId });
@@ -1485,8 +1495,16 @@ export function registerMemoryForgetTool(api, context) {
                                 details: resolved.details ?? { error: "not_found", id: memoryId },
                             };
                         }
+                        const forgottenRow = context.manualEchoLedger
+                            ? await context.store.getById(resolved.id, scopeFilter).catch(() => null)
+                            : null;
                         const deleted = await context.store.delete(resolved.id, scopeFilter);
                         if (deleted) {
+                            // A forgotten fact must not keep suppressing its own
+                            // re-statement through the echo ledger.
+                            if (forgottenRow?.text) {
+                                context.manualEchoLedger?.invalidate(agentId, forgottenRow.text);
+                            }
                             context.onMemoriesDeleted?.({ scopeFilter });
                             return {
                                 content: [
@@ -1524,6 +1542,7 @@ export function registerMemoryForgetTool(api, context) {
                         if (results.length === 1 && results[0].score > 0.9) {
                             const deleted = await context.store.delete(results[0].entry.id, scopeFilter);
                             if (deleted) {
+                                context.manualEchoLedger?.invalidate(agentId, results[0].entry.text);
                                 context.onMemoriesDeleted?.({ scopeFilter });
                                 return {
                                     content: [
@@ -1709,6 +1728,13 @@ export function registerMemoryUpdateTool(api, context) {
                                 // New record is already the source of truth; log but don't fail
                                 console.warn(`memory-pro: failed to patch superseded record ${resolvedId.slice(0, 8)}: ${patchErr}`);
                             }
+                            // The superseding write succeeded: this text will echo through
+                            // the same turn's auto-capture extraction exactly like a plain
+                            // manual store, so it must be recorded on this early-return
+                            // path too, and the replaced text must stop suppressing its
+                            // own re-statement.
+                            context.manualEchoLedger?.invalidate(agentId, existing.text);
+                            context.manualEchoLedger?.record(agentId, text);
                             return {
                                 content: [
                                     {
@@ -1779,6 +1805,15 @@ export function registerMemoryUpdateTool(api, context) {
                             ],
                             details: { error: "not_found", id: resolvedId },
                         };
+                    }
+                    // Only a manually supplied text arms the echo guard: a metadata-only
+                    // update (importance, category) restates nothing, so it must not
+                    // suppress a later extraction of the unchanged fact.
+                    if (text && existing) {
+                        if (updated.text !== existing.text) {
+                            context.manualEchoLedger?.invalidate(agentId, existing.text);
+                        }
+                        context.manualEchoLedger?.record(agentId, updated.text);
                     }
                     return {
                         content: [

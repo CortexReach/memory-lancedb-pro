@@ -33,6 +33,7 @@ const { registerAllMemoryTools } = jiti("../src/tools.ts");
 const { MemoryStore } = jiti("../src/store.ts");
 const { parseSmartMetadata, isMemoryActiveAt, deriveFactKey } = jiti("../src/smart-metadata.ts");
 const { classifyTemporal, inferExpiry } = jiti("../src/temporal-classifier.ts");
+const { ManualEchoLedger } = jiti("../src/manual-echo-guard.ts");
 
 function createToolSet(context) {
   const creators = new Map();
@@ -168,6 +169,29 @@ function makeContext({ neighbors = [], rows, manualStoreSupersede, patchBehavior
 }
 
 describe("manual memory_store always-store supersede semantics", () => {
+  it("invalidates the superseded rows' text in the echo ledger and records the new text (knob on)", async () => {
+    const OLD = "favorite rehearsal drink is sparkling water";
+    const NEW = "favorite rehearsal drink is mint tea";
+    const { context, storedEntries } = makeContext({
+      neighbors: [neighborRow({ id: "old-1", text: OLD, score: 0.99 })],
+      manualStoreSupersede: true,
+    });
+    const ledger = new ManualEchoLedger();
+    context.manualEchoLedger = ledger;
+    ledger.record("main", OLD);
+
+    const result = await createToolSet(context).get("memory_store").execute("call-1", { text: NEW });
+
+    assert.equal(result.details.action, "superseded", JSON.stringify(result.details));
+    assert.equal(storedEntries.length, 1);
+    assert.ok(ledger.match("main", NEW), "the superseding text is recorded for the same turn's echo");
+    assert.equal(
+      ledger.match("main", OLD),
+      null,
+      "the replaced text must be invalidated: the store no longer holds it, so its re-statement is not an echo",
+    );
+  });
+
   it("supersedes instead of rejecting when a near-identical memory exists (knob on)", async () => {
     const { context, storedEntries, patchCalls } = makeContext({
       manualStoreSupersede: true,
