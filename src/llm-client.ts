@@ -127,6 +127,13 @@ export interface LlmClient {
    * and ignores this argument.
    */
   completeJson<T>(prompt: string, label?: string, systemPrompt?: string, temperature?: number): Promise<T | null>;
+  /**
+   * Send a prompt and return the model's answer as trimmed text. No JSON
+   * expectation is attached and `systemPrompt` is sent verbatim (no system
+   * message at all when omitted). Returns null on a transport failure or an
+   * empty answer; `getLastError` carries the reason.
+   */
+  completeText(prompt: string, label?: string, systemPrompt?: string, temperature?: number): Promise<string | null>;
   /** Best-effort diagnostics for the most recent failure, if any. */
   getLastError(): string | null;
 }
@@ -425,6 +432,37 @@ function createHostClient(
         return null;
       }
     },
+    async completeText(prompt: string, label = "generic", systemPrompt?: string, temperature?: number): Promise<string | null> {
+      lastError = null;
+      const messages: RuntimeLlmCompleteMessage[] = [];
+      if (systemPrompt !== undefined) messages.push({ role: "system", content: systemPrompt });
+      messages.push({ role: "user", content: prompt });
+      try {
+        const result = await raceWithTimeout(
+          runtimeLlmComplete({
+            messages,
+            ...(config.modelExplicit ? { model: config.model } : {}),
+            temperature: temperature ?? 0.1,
+            purpose: `memory-lancedb-pro:${label}`,
+            reasoning: config.thinkLevel?.trim() || DEFAULT_HOST_REASONING_EFFORT,
+          }),
+          config.timeoutMs,
+        );
+        const text = typeof result?.text === "string" ? result.text.trim() : "";
+        if (!text) {
+          lastError =
+            `memory-lancedb-pro: llm-client [${label}] empty host-transport response content from model ${config.model}`;
+          log(lastError);
+          return null;
+        }
+        return text;
+      } catch (err) {
+        lastError =
+          `memory-lancedb-pro: llm-client [${label}] host-transport request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
+        (warnLog ?? log)(lastError);
+        return null;
+      }
+    },
     getLastError(): string | null {
       return lastError;
     },
@@ -534,6 +572,39 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
         return null;
       }
     },
+    async completeText(prompt: string, label = "generic", systemPrompt?: string, temperature?: number): Promise<string | null> {
+      lastError = null;
+      try {
+        const request = {
+          model: config.model,
+          messages: [
+            ...(systemPrompt !== undefined ? [{ role: "system", content: systemPrompt }] : []),
+            { role: "user", content: prompt },
+          ],
+          temperature: temperature ?? 0.1,
+          ...(config.thinkLevel?.trim()
+            ? { reasoning: { effort: config.thinkLevel.trim() } }
+            : {}),
+        };
+        const response = await client.chat.completions.create(request as any, {
+          headers: { "x-memory-call-label": sanitizeLabelHeader(label) },
+        });
+        const raw = response.choices?.[0]?.message?.content;
+        const text = typeof raw === "string" ? raw.trim() : "";
+        if (!text) {
+          lastError =
+            `memory-lancedb-pro: llm-client [${label}] empty response content from model ${config.model}`;
+          log(lastError);
+          return null;
+        }
+        return text;
+      } catch (err) {
+        lastError =
+          `memory-lancedb-pro: llm-client [${label}] request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
+        (warnLog ?? log)(lastError);
+        return null;
+      }
+    },
     getLastError(): string | null {
       return lastError;
     },
@@ -610,31 +681,7 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
             throw new Error(`HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 500)}`);
           }
 
-          const bodyText = await response.text();
-          const raw = (
-            response.headers.get("content-type")?.includes("text/event-stream") ||
-            looksLikeSseResponse(bodyText)
-          )
-            ? extractOutputTextFromSse(bodyText)
-            : (() => {
-                try {
-                  const parsed = JSON.parse(bodyText) as Record<string, unknown>;
-                  const output = Array.isArray(parsed.output) ? parsed.output : [];
-                  const first = output.find(
-                    (item) =>
-                      item &&
-                      typeof item === "object" &&
-                      Array.isArray((item as Record<string, unknown>).content),
-                  ) as Record<string, unknown> | undefined;
-                  if (!first) return null;
-                  const content = (first.content as Array<Record<string, unknown>>).find(
-                    (part) => part?.type === "output_text" && typeof part.text === "string",
-                  );
-                  return typeof content?.text === "string" ? content.text : null;
-                } catch {
-                  return null;
-                }
-              })();
+          const raw = extractOauthOutputText(response, await response.text());
 
           if (!raw) {
             lastError =
@@ -684,10 +731,79 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
         return null;
       }
     },
+    async completeText(prompt: string, label = "generic", systemPrompt?: string, _temperature?: number): Promise<string | null> {
+      lastError = null;
+      try {
+        const session = await getSession();
+        const { signal, dispose } = createTimeoutSignal(config.timeoutMs);
+        const endpoint = buildOauthEndpoint(config.baseURL, config.oauthProvider);
+        try {
+          const response = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${session.accessToken}`,
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+              "OpenAI-Beta": "responses=experimental",
+              "chatgpt-account-id": session.accountId,
+              originator: "codex_cli_rs",
+            },
+            signal,
+            body: JSON.stringify({
+              model: normalizeOauthModel(config.model),
+              ...(systemPrompt !== undefined ? { instructions: systemPrompt } : {}),
+              input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }],
+              store: false,
+              stream: true,
+              text: { format: { type: "text" } },
+            }),
+          });
+          if (!response.ok) {
+            const detail = await response.text().catch(() => "");
+            throw new Error(`HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 500)}`);
+          }
+          const text = (extractOauthOutputText(response, await response.text()) ?? "").trim();
+          if (!text) {
+            lastError =
+              `memory-lancedb-pro: llm-client [${label}] empty OAuth response content from model ${config.model}`;
+            log(lastError);
+            return null;
+          }
+          return text;
+        } finally {
+          dispose();
+        }
+      } catch (err) {
+        lastError =
+          `memory-lancedb-pro: llm-client [${label}] OAuth request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
+        (warnLog ?? log)(lastError);
+        return null;
+      }
+    },
     getLastError(): string | null {
       return lastError;
     },
   };
+}
+
+function extractOauthOutputText(response: Response, bodyText: string): string | null {
+  if (response.headers.get("content-type")?.includes("text/event-stream") || looksLikeSseResponse(bodyText)) {
+    return extractOutputTextFromSse(bodyText);
+  }
+  try {
+    const parsed = JSON.parse(bodyText) as Record<string, unknown>;
+    const output = Array.isArray(parsed.output) ? parsed.output : [];
+    const first = output.find(
+      (item) => item && typeof item === "object" && Array.isArray((item as Record<string, unknown>).content),
+    ) as Record<string, unknown> | undefined;
+    if (!first) return null;
+    const content = (first.content as Array<Record<string, unknown>>).find(
+      (part) => part?.type === "output_text" && typeof part.text === "string",
+    );
+    return typeof content?.text === "string" ? content.text : null;
+  } catch {
+    return null;
+  }
 }
 
 /** OpenRouter's direct API base URL, used as the host->direct fallback's default when llm.baseURL is not configured. */

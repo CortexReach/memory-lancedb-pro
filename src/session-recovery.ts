@@ -29,23 +29,43 @@ function deriveOpenClawHomeFromSessionFilePath(sessionFilePath: string): string 
   return home.length ? home : undefined;
 }
 
-function listConfiguredAgentIds(cfg: unknown): string[] {
+/**
+ * Agent definitions come as `agents.list` (an array of `{id, workspace}`) on
+ * older hosts and as `agents.entries` (an object keyed by agent id) on newer
+ * ones; both shapes are read so neither generation loses its sessions dirs.
+ */
+function listConfiguredAgents(cfg: unknown): Array<{ id?: string; workspace?: string }> {
   try {
     const root = cfg as Record<string, unknown>;
     const agents = root.agents as Record<string, unknown> | undefined;
+    const out: Array<{ id?: string; workspace?: string }> = [];
     const list = agents?.list as unknown;
-    if (!Array.isArray(list)) return [];
-
-    const ids: string[] = [];
-    for (const item of list) {
-      if (!item || typeof item !== "object") continue;
-      const id = asNonEmptyString((item as Record<string, unknown>).id);
-      if (id) ids.push(id);
+    if (Array.isArray(list)) {
+      for (const item of list) {
+        if (!item || typeof item !== "object") continue;
+        const record = item as Record<string, unknown>;
+        out.push({ id: asNonEmptyString(record.id), workspace: asNonEmptyString(record.workspace) });
+      }
     }
-    return ids;
+    const entries = agents?.entries as unknown;
+    if (entries && typeof entries === "object" && !Array.isArray(entries)) {
+      for (const [key, item] of Object.entries(entries as Record<string, unknown>)) {
+        const record = item && typeof item === "object" ? (item as Record<string, unknown>) : {};
+        out.push({ id: asNonEmptyString(record.id) ?? asNonEmptyString(key), workspace: asNonEmptyString(record.workspace) });
+      }
+    }
+    return out;
   } catch {
     return [];
   }
+}
+
+function listConfiguredAgentIds(cfg: unknown): string[] {
+  const ids: string[] = [];
+  for (const agent of listConfiguredAgents(cfg)) {
+    if (agent.id && !ids.includes(agent.id)) ids.push(agent.id);
+  }
+  return ids;
 }
 
 export function resolveReflectionSessionSearchDirs(params: {
@@ -104,13 +124,8 @@ export function resolveReflectionSessionSearchDirs(params: {
     const defaultWorkspace = asNonEmptyString(defaults?.workspace);
     if (defaultWorkspace) addHome(openclawHomes, deriveOpenClawHomeFromWorkspacePath(defaultWorkspace));
 
-    const list = agents?.list as unknown;
-    if (Array.isArray(list)) {
-      for (const item of list) {
-        if (!item || typeof item !== "object") continue;
-        const workspace = asNonEmptyString((item as Record<string, unknown>).workspace);
-        if (workspace) addHome(openclawHomes, deriveOpenClawHomeFromWorkspacePath(workspace));
-      }
+    for (const agent of listConfiguredAgents(params.cfg)) {
+      if (agent.workspace) addHome(openclawHomes, deriveOpenClawHomeFromWorkspacePath(agent.workspace));
     }
   } catch {
     // ignore
