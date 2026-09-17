@@ -1244,8 +1244,7 @@ export async function generateReflectionText(params) {
 }
 async function generateReflectionTextUnbounded(params) {
     const { system: reflectionSystemPrompt, user: reflectionUserPrompt } = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
-    const prompt = `${reflectionSystemPrompt}\n\n${reflectionUserPrompt}`;
-    const promptHash = sha256Hex(prompt);
+    const promptHash = sha256Hex(`${reflectionSystemPrompt}\n\n${reflectionUserPrompt}`);
     const tempSessionFile = join(tmpdir(), `memory-reflection-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
     let reflectionText = null;
     const errors = [];
@@ -1276,7 +1275,8 @@ async function generateReflectionTextUnbounded(params) {
                     ...(embedded.exportName !== "runEmbeddedAgent" ? { sessionFile: tempSessionFile } : {}),
                     workspaceDir: params.workspaceDir,
                     config: params.cfg,
-                    prompt,
+                    prompt: reflectionUserPrompt,
+                    extraSystemPrompt: reflectionSystemPrompt,
                     promptMode: "minimal",
                     disableTools: true,
                     disableMessageTool: true,

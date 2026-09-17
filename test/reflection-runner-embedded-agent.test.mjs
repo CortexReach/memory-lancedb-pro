@@ -238,3 +238,62 @@ describe("embedded runner cache", () => {
     assert.equal(typeof legacyParams[1].sessionFile, "string", "the second run is still labeled legacy and keeps the transcript file");
   });
 });
+
+describe("distiller prompt split on the embedded runner", () => {
+  const systemOpening = "You are a memory reflection distiller agent";
+  const baseParams = {
+    conversation: "user: the build is green\nassistant: noted",
+    maxInputChars: 1000,
+    cfg: {},
+    agentId: "agent-one",
+    workspaceDir: "/tmp",
+    timeoutMs: 2000,
+    thinkLevel: "off",
+  };
+
+  function assertSplit(seenParams) {
+    assert.ok(seenParams, "the runner must have been invoked");
+    assert.equal(typeof seenParams.extraSystemPrompt, "string", "the distiller instructions travel as extraSystemPrompt");
+    assert.ok(seenParams.extraSystemPrompt.startsWith(systemOpening), "extraSystemPrompt carries the distiller identity");
+    assert.ok(seenParams.prompt.includes("the build is green"), "the transcript travels in the user prompt");
+    assert.ok(!seenParams.prompt.includes(systemOpening), "the user prompt must not repeat the system instructions");
+    assert.ok(!seenParams.prompt.includes("Use these headings exactly once"), "section rules stay in the system prompt");
+    assert.equal(seenParams.promptMode, "minimal", "the host keeps extraSystemPrompt only in minimal mode (mode none drops it)");
+  }
+
+  it("hands the distiller instructions to runEmbeddedAgent as extraSystemPrompt and keeps the user prompt to the transcript", async () => {
+    const { generateReflectionText } = loadFreshIndex();
+    let seenParams = null;
+    const api = {
+      runtime: {
+        agent: {
+          runEmbeddedAgent: async (params) => {
+            seenParams = params;
+            return { payloads: [{ text: "distilled reflection" }] };
+          },
+        },
+      },
+    };
+    const result = await generateReflectionText({ ...baseParams, api });
+    assert.equal(result.runner, "embedded");
+    assertSplit(seenParams);
+  });
+
+  it("splits the prompts the same way for the legacy runEmbeddedPiAgent runner", async () => {
+    const { generateReflectionText } = loadFreshIndex();
+    let seenParams = null;
+    const api = {
+      runtime: {
+        agent: {
+          runEmbeddedPiAgent: async (params) => {
+            seenParams = params;
+            return { payloads: [{ text: "legacy reflection" }] };
+          },
+        },
+      },
+    };
+    const result = await generateReflectionText({ ...baseParams, api });
+    assert.equal(result.runner, "embedded");
+    assertSplit(seenParams);
+  });
+});
