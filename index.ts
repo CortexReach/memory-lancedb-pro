@@ -4086,7 +4086,7 @@ const memoryLanceDBProPlugin = {
       );
 
       type AgentEndAutoCaptureHook = {
-        (event: any, ctx: any): void;
+        (event: any, ctx: any): void | Promise<void>;
         __lastRun?: Promise<void>;
       };
 
@@ -4117,6 +4117,7 @@ const memoryLanceDBProPlugin = {
         return turns.filter((turn) => wantedTexts.has(turn.text));
       };
 
+      const AUTO_CAPTURE_HOOK_TIMEOUT_MS = 120_000;
       const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = (event, ctx) => {
         const isTerminalFlush = (event as any).__autoCaptureTerminalFlush === true;
         // The flush runs for EVERY session_end reason (continuation rollovers
@@ -5061,10 +5062,12 @@ const memoryLanceDBProPlugin = {
         // Test-synchronization seam only: flush coordination reads
         // autoCaptureInFlightRuns for the session's own key, never this slot.
         agentEndAutoCaptureHook.__lastRun = trackedRun;
-        void backgroundRun;
+        // Returned, not detached: the host tracks a returned hook promise in its
+        // async work scope, so the runtime LLM transport stays open for the run.
+        return trackedRun;
       };
 
-      api.on("agent_end", agentEndAutoCaptureHook);
+      api.on("agent_end", agentEndAutoCaptureHook, { timeoutMs: AUTO_CAPTURE_HOOK_TIMEOUT_MS });
 
       // A session that ends below extractMinMessages would otherwise strand its
       // deferred texts (requeued ingress or rolled-back history) forever, losing
