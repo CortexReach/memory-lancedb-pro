@@ -73,6 +73,7 @@ const REFLECTION_NON_RETRY_PATTERNS: RegExp[] = [
   /\bbilling\b/i,
   /\bquota exceeded\b/i,
   /payment required/i,
+  /async work scope is closed/i,
   /model .*not found/i,
   /no such model/i,
   /unknown model/i,
