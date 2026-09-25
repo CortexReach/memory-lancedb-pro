@@ -636,7 +636,7 @@ async function runTest() {
                     category: "events",
                     abstract: "Ran a three-hour tabletop session on Sunday",
                     overview: "## Event\n- Three-hour tabletop session",
-                    content: "Ran a three-hour tabletop session on Sunday evening.",
+                    content: "Ran a three-hour tabletop session on Thursday morning.",
                     grounding: "real",
                 },
                 {
