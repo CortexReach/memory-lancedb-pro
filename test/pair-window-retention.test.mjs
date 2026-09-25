@@ -55,12 +55,17 @@ function oneHot(text) {
   return v;
 }
 
-function createEmbeddingServer() {
+function createEmbeddingServer(control = {}) {
   return http.createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     const inputs = Array.isArray(payload.input) ? payload.input : [payload.input];
+    // A held text parks its embedding request until the test releases it, so
+    // two captures of one session can be forced to overlap in a chosen order.
+    if (control.hold && inputs.some((input) => String(input).includes(control.hold.text))) {
+      await control.hold.released;
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       object: "list",
@@ -71,7 +76,7 @@ function createEmbeddingServer() {
   });
 }
 
-function createLlmServer(extractionPrompts) {
+function createLlmServer(extractionPrompts, control = {}) {
   let calls = 0;
   return http.createServer(async (req, res) => {
     const chunks = [];
@@ -82,6 +87,39 @@ function createLlmServer(extractionPrompts) {
       extractionPrompts.push(prompt);
     }
     calls += 1;
+    // A held prompt parks its completion until the test releases it, so two
+    // captures of one session can be forced to finish in a chosen order.
+    if (control.hold && prompt.includes(control.hold.text)) {
+      await control.hold.released;
+    }
+    if (control.emptyFor && prompt.includes(control.emptyFor)) {
+      // A capture that persists nothing: it still retires its texts and
+      // stores its pair window, without a LanceDB write that could collide
+      // with another capture's flush in this harness.
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl-test",
+        object: "chat.completion",
+        created: 1,
+        model: "mock-memory-model",
+        choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: JSON.stringify({ memories: [] }) } }],
+      }));
+      return;
+    }
+    if (control.malformedNext > 0) {
+      // An unusable completion: the extractor reports extractionFailed and
+      // the capture rolls its consumed texts back for a retry.
+      control.malformedNext -= 1;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl-test",
+        object: "chat.completion",
+        created: 1,
+        model: "mock-memory-model",
+        choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "not a memory payload" } }],
+      }));
+      return;
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       id: "chatcmpl-test",
@@ -607,7 +645,7 @@ describe("round-3 regressions: same-call repeats, epoch hygiene, provenance, lea
       { role: "user", content: "synthetic disabled-path fact about the copper stand" },
     ], { sessionKey: "agent:agent-two:main", agentId: "agent-two" });
     assert.equal(extractionPrompts.length, 2, "both disabled-config captures should extract (the cleanup branch must actually run)");
-    const sizes = pluginModule.debugAutoCaptureWindowStateSizes();
+    const sizes = hook.__windowStateSizes();
     assert.ok(sizes, "singleton state should exist after captures");
     assert.equal(sizes.pairWindowEpochs, 0, "contextTurns=0 must not allocate epoch entries");
     assert.equal(sizes.pairWindows, 0, "contextTurns=0 must not retain pair windows");
@@ -622,10 +660,10 @@ describe("round-3 regressions: same-call repeats, epoch hygiene, provenance, lea
       { role: "user", content: "synthetic teardown fact about the cedar hamper" },
     ], { sessionKey, agentId: "test-agent" });
     assert.equal(extractionPrompts.length, 1, "the enabled capture should extract (the store path must run)");
-    let sizes = pluginModule.debugAutoCaptureWindowStateSizes();
+    let sizes = hook.__windowStateSizes();
     assert.ok(sizes && sizes.pairWindowEpochs >= 1, "an enabled capture should create epoch state");
     await fireSessionEnd(eventHandlers, sessionKey, "session-r3-teardown");
-    sizes = pluginModule.debugAutoCaptureWindowStateSizes();
+    sizes = hook.__windowStateSizes();
     assert.equal(sizes.pairWindowEpochs, 0, "teardown must delete epoch entries after in-flight runs settle");
     assert.equal(sizes.pairWindows, 0, "teardown must delete the retained window");
   });
@@ -757,7 +795,7 @@ describe("round-4 regressions: terminal flush teardown, unattributable sessions,
       extractionPrompts[0].includes(`<user_message>\n${DEFERRED}`),
       "the flushed turn is a source turn of the flush transcript",
     );
-    let sizes = pluginModule.debugAutoCaptureWindowStateSizes();
+    let sizes = hook.__windowStateSizes();
     assert.equal(sizes.pairWindows, 0, "a terminal flush must not store pair-window state for the ended session");
     assert.equal(sizes.pairWindowEpochs, 0, "no epoch entry may outlive the session once the flush has settled");
     await fireAgentEnd(hook, [
@@ -770,7 +808,7 @@ describe("round-4 regressions: terminal flush teardown, unattributable sessions,
       !extractionPrompts[1].includes(DEFERRED),
       "flushed deferred turns must not resurface as context under the reused session key",
     );
-    sizes = pluginModule.debugAutoCaptureWindowStateSizes();
+    sizes = hook.__windowStateSizes();
     assert.equal(sizes.pairWindows, 1, "the reused key starts a fresh window from its own turns");
   });
 
@@ -782,7 +820,7 @@ describe("round-4 regressions: terminal flush teardown, unattributable sessions,
       { role: "user", content: "synthetic unattributed fact about the pewter sconce" },
     ], { agentId: "agent-one" });
     assert.equal(extractionPrompts.length, 1, "the capture itself still extracts");
-    const sizes = pluginModule.debugAutoCaptureWindowStateSizes();
+    const sizes = hook.__windowStateSizes();
     assert.equal(sizes.pairWindows, 0, "no session identity means no retained window");
     assert.equal(sizes.pairWindowEpochs, 0, "and no epoch allocation");
   });
@@ -802,5 +840,152 @@ describe("round-4 regressions: terminal flush teardown, unattributable sessions,
     assert.ok(!rendered.includes("<context_only_assistant_turn>"), "a literal context wrapper cannot open a fake context block either");
     assert.ok(rendered.includes("‹/context_only_user_turn›"), "the literal tag is rewritten with guillemets, not deleted");
     assert.ok(rendered.startsWith("<context_only_user_turn>\n"), "the structural open tag is untouched");
+  });
+});
+
+describe("round-5 regressions: store after success, overlapping captures", () => {
+  let workspaceDir;
+  let embeddingServer;
+  let llmServer;
+  let extractionPrompts;
+  let embeddingControl;
+  let llmControl;
+
+  beforeEach(async () => {
+    resetRegistration();
+    workspaceDir = mkdtempSync(path.join(tmpdir(), "pair-window-r5-"));
+    extractionPrompts = [];
+    embeddingControl = {};
+    llmControl = { malformedNext: 0 };
+    embeddingServer = createEmbeddingServer(embeddingControl);
+    llmServer = createLlmServer(extractionPrompts, llmControl);
+    await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+  });
+
+  afterEach(async () => {
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  function registerWith(overrides) {
+    resetRegistration();
+    const harness = createPluginApiHarness({
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "memory-db"),
+        autoCapture: true,
+        autoRecall: false,
+        smartExtraction: true,
+        extractMinMessages: 2,
+        autoCaptureContextTurns: 2,
+        extractionThrottle: { skipLowValue: false, maxExtractionsPerHour: 200 },
+        sessionCompression: { enabled: false },
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+        embedding: {
+          apiKey: "test-key",
+          model: "mock-embedding-model",
+          baseURL: `http://127.0.0.1:${embeddingServer.address().port}/v1`,
+          dimensions: EMBEDDING_DIMENSIONS,
+        },
+        llm: {
+          apiKey: "test-key",
+          model: "mock-memory-model",
+          baseURL: `http://127.0.0.1:${llmServer.address().port}`,
+        },
+        ...overrides,
+      },
+      resolveRoot: workspaceDir,
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    return getAutoCaptureHook(harness.eventHandlers);
+  }
+
+  const F_U1 = "synthetic retry fact about the obsidian planter";
+  const F_A1 = "obsidian planter noted";
+  const F_U2 = "synthetic retry fact about the garnet trellis";
+  const F_A2 = "garnet trellis noted";
+  const F_U3 = "synthetic retry fact about the sandstone birdbath";
+
+  it("leaves the retained window untouched when extraction fails, so retried turns return as sources only", async () => {
+    const hook = registerWith({});
+    const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+    llmControl.malformedNext = 1;
+    await fireAgentEnd(hook, [
+      { role: "user", content: F_U1 },
+      { role: "assistant", content: F_A1 },
+      { role: "user", content: F_U2 },
+    ], ctx);
+    assert.equal(extractionPrompts.length, 1, "the first capture reaches the model");
+    assert.equal(hook.__windowStateSizes().pairWindows, 0, "a failed extraction must not advance the retained window");
+    await fireAgentEnd(hook, [
+      { role: "user", content: F_U1 },
+      { role: "assistant", content: F_A1 },
+      { role: "user", content: F_U2 },
+      { role: "assistant", content: F_A2 },
+      { role: "user", content: F_U3 },
+    ], ctx);
+    assert.equal(extractionPrompts.length, 2, "the retry extracts");
+    const retry = extractionPrompts[1];
+    assert.ok(retry.includes(`<user_message>\n${F_U1}`), "a rolled-back turn comes back as a source turn");
+    assert.ok(!retry.includes(`<context_only_user_turn>\n${F_U1}`), "and never additionally as retained context");
+    assert.equal(hook.__windowStateSizes().pairWindows, 1, "the successful retry stores the window");
+  });
+
+  const O_UA1 = "synthetic overlap fact about the copper weathervane";
+  const O_AA1 = "copper weathervane noted";
+  const O_UA2 = "synthetic overlap fact about the tin windmill";
+  const O_UB1 = "synthetic overlap fact about the brass sundial";
+  const O_AB1 = "brass sundial noted";
+  const O_UB2 = "synthetic overlap fact about the iron gnomon";
+  const O_UC1 = "synthetic overlap fact about the zinc rain gauge";
+  const O_AC1 = "zinc rain gauge noted";
+  const O_UC2 = "synthetic overlap fact about the lead downspout";
+
+  it("lets the newer capture's window win when an older capture stores after it", async () => {
+    // The noise bank is off in this harness, so a capture reads its window
+    // synchronously at hook entry and the only await before the store is the
+    // extraction itself. Parking the older capture's completion makes the
+    // newer one store first; the older one then finds the epoch moved and
+    // must leave the newer window alone (the chronological compose covers
+    // the other interleaving, see the auto-capture-cleanup unit tests).
+    const hook = registerWith({ autoCaptureContextTurns: 6 });
+    const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+    let release;
+    llmControl.hold = { text: O_UA1, released: new Promise((resolve) => { release = resolve; }) };
+    llmControl.emptyFor = O_UB1;
+    const olderMessages = [
+      { role: "user", content: O_UA1 },
+      { role: "assistant", content: O_AA1 },
+      { role: "user", content: O_UA2 },
+    ];
+    hook({ success: true, messages: olderMessages }, ctx);
+    const olderRun = hook.__lastRun;
+    assert.ok(olderRun && typeof olderRun.then === "function", "the older capture is in flight");
+    const newerMessages = [
+      ...olderMessages,
+      { role: "user", content: O_UB1 },
+      { role: "assistant", content: O_AB1 },
+      { role: "user", content: O_UB2 },
+    ];
+    await fireAgentEnd(hook, newerMessages, ctx);
+    assert.equal(hook.__windowStateSizes().pairWindows, 1, "the newer capture stored its window while the older one was parked");
+    release();
+    await olderRun;
+    assert.equal(extractionPrompts.length, 2, "both captures extracted");
+    const older = extractionPrompts.find((prompt) => prompt.includes(`<user_message>\n${O_UA1}`));
+    assert.ok(older, "the older capture keeps its own turns as sources");
+    assert.ok(!older.includes(O_UB1), "the older capture never saw the newer turns as context");
+    await fireAgentEnd(hook, [
+      ...newerMessages,
+      { role: "user", content: O_UC1 },
+      { role: "assistant", content: O_AC1 },
+      { role: "user", content: O_UC2 },
+    ], ctx);
+    assert.equal(extractionPrompts.length, 3);
+    const next = extractionPrompts[2];
+    assert.ok(next.includes(`<context_only_user_turn>\n${O_UB1}`), "the newer capture's window survived the older capture's late finish");
+    assert.ok(!next.includes(O_UA1), "the older capture's late store was skipped rather than overwriting the newer window");
+    assert.ok(next.indexOf(O_UB2) < next.indexOf(O_UC1), "retained context precedes the current sources");
   });
 });
