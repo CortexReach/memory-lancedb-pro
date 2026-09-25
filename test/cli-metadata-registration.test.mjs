@@ -82,8 +82,19 @@ function makePluginConfig(workDir, overrides = {}) {
 }
 
 describe("runtime LLM probe", () => {
-  it("reads a throwing runtime as unavailable", () => {
-    assert.equal(resolveRuntimeLlmComplete({ runtime: createThrowingRuntime() }), undefined);
+  it("reads the metadata-only registration's throwing runtime as unavailable", () => {
+    assert.equal(
+      resolveRuntimeLlmComplete({ registrationMode: "cli-metadata", runtime: createThrowingRuntime() }),
+      undefined,
+    );
+  });
+
+  it("surfaces a throwing runtime in every other registration mode", () => {
+    assert.throws(
+      () => resolveRuntimeLlmComplete({ registrationMode: "full", runtime: createThrowingRuntime() }),
+      /intentionally unavailable/,
+    );
+    assert.throws(() => resolveRuntimeLlmComplete({ runtime: createThrowingRuntime() }), /intentionally unavailable/);
   });
 
   it("still binds the host completion surface when it exists", async () => {
@@ -131,6 +142,32 @@ describe("register() under cli-metadata registration", () => {
     assert.deepEqual(opts.commands, ["memory-pro"]);
     assert.equal(opts.descriptors?.[0]?.name, "memory-pro");
     assert.equal(opts.descriptors?.[0]?.hasSubcommands, true);
+  });
+
+  it("rebuilds the runtime wiring when a full registration follows a metadata pass in one process", () => {
+    const metadata = createPluginApiHarness({
+      resolveRoot: workDir,
+      pluginConfig: makePluginConfig(workDir, { smartExtraction: true }),
+      registrationMode: "cli-metadata",
+      runtime: createThrowingRuntime(),
+    });
+    memoryLanceDBProPlugin.register(metadata.api);
+    const metadataMessages = metadata.logs.map(([, message]) => message);
+    assert.ok(!metadataMessages.some((m) => m.includes("admission control constructed")), metadataMessages.join("\n"));
+
+    const full = createPluginApiHarness({
+      resolveRoot: workDir,
+      pluginConfig: makePluginConfig(workDir, { smartExtraction: false, admissionControl: { enabled: true } }),
+      registrationMode: "full",
+      runtime: { llm: { complete: async () => ({ text: "{}" }) } },
+    });
+    memoryLanceDBProPlugin.register(full.api);
+    const fullMessages = full.logs.map(([, message]) => message);
+    assert.ok(
+      fullMessages.some((m) => m.includes("admission control constructed for capture fallbacks")),
+      "the runtime registration must not inherit the metadata pass's unwired singleton:\n" + fullMessages.join("\n"),
+    );
+    assert.ok(!fullMessages.some((m) => m.includes("init failed")), fullMessages.join("\n"));
   });
 
   it("keeps the full registration wiring intact", () => {

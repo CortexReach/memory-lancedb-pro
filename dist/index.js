@@ -672,14 +672,12 @@ function asNonEmptyString(value) {
  * expose it yet, so callers can fall back to the direct/oauth transport.
  */
 export function resolveRuntimeLlmComplete(api) {
-    let runtimeLlm;
-    try {
-        runtimeLlm = api.runtime?.llm;
-    }
-    catch {
-        // Metadata-only registrations hand out a runtime that throws on access.
+    // A metadata-only registration hands out a runtime that throws on access,
+    // and the mode says so up front; in every other mode a throwing runtime is
+    // a real host failure that must surface, not read as "no surface".
+    if (isCliMetadataRegistration(api))
         return undefined;
-    }
+    const runtimeLlm = api.runtime?.llm;
     return typeof runtimeLlm?.complete === "function"
         ? runtimeLlm.complete.bind(runtimeLlm)
         : undefined;
@@ -2087,6 +2085,7 @@ function _initPluginState(api) {
         reflectionByAgentCacheGeneration,
         recallHistory,
         turnCounter,
+        builtForCliMetadata: cliMetadataRegistration,
         autoCaptureSeenTextCount,
         autoCapturePendingIngressTexts,
         autoCaptureCountedPendingCount,
@@ -2193,10 +2192,14 @@ const memoryLanceDBProPlugin = {
         _registeredApis.add(api); // claim before init (Phase 2 singleton guard)
         _registeredApisMap.set(api, true); // dual-track: explicit claim for rollback
         let registrationStopped = false;
-        const isFirstRegistration = !_singletonState;
+        // A singleton built by a metadata-only pass carries no runtime wiring;
+        // a runtime registration served by the same module instance rebuilds it
+        // instead of inheriting the unwired state.
+        const rebuildAfterMetadataPass = _singletonState?.builtForCliMetadata === true && !isCliMetadataRegistration(api);
+        const isFirstRegistration = !_singletonState || rebuildAfterMetadataPass;
         let singleton;
         try {
-            if (!_singletonState) {
+            if (!_singletonState || rebuildAfterMetadataPass) {
                 _singletonState = _initPluginState(api);
             }
             singleton = _singletonState;
