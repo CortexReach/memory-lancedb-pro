@@ -12,6 +12,9 @@ import { buildOauthEndpoint, extractOutputTextFromSse, loadOAuthSession, needsRe
  * admission-control.ts's per-lane model resolution, so both paths agree on
  * exactly one definition of "what a direct client can accept."
  */
+export function isHostRuntimeLifecycleError(message) {
+    return typeof message === "string" && /async work scope is closed/i.test(message);
+}
 export function normalizeDirectModelRef(modelRef) {
     const trimmed = modelRef.trim();
     const idx = trimmed.indexOf("/");
@@ -287,8 +290,10 @@ function createHostClient(config, runtimeLlmComplete, log, warnLog) {
                 }
             }
             catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                const lifecycle = isHostRuntimeLifecycleError(message) ? " [host runtime lifecycle]" : "";
                 lastError =
-                    `memory-lancedb-pro: llm-client [${label}] host-transport request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
+                    `memory-lancedb-pro: llm-client [${label}] host-transport request failed for model ${config.model}: ${message}${lifecycle}`;
                 (warnLog ?? log)(lastError);
                 return null;
             }
@@ -317,8 +322,10 @@ function createHostClient(config, runtimeLlmComplete, log, warnLog) {
                 return text;
             }
             catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                const lifecycle = isHostRuntimeLifecycleError(message) ? " [host runtime lifecycle]" : "";
                 lastError =
-                    `memory-lancedb-pro: llm-client [${label}] host-transport request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
+                    `memory-lancedb-pro: llm-client [${label}] host-transport request failed for model ${config.model}: ${message}${lifecycle}`;
                 (warnLog ?? log)(lastError);
                 return null;
             }
