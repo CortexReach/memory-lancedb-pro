@@ -1,8 +1,32 @@
 import { homedir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { readdir, stat } from "node:fs/promises";
 import { resolveOpenClawStateDir } from "./openclaw-paths.js";
 import { parseCanonicalCorpusMetadata, } from "./corpus-indexer.js";
+const CURATED_MEMORY_ROOT_FILES = new Set(["MEMORY.md", "memory.md", "USER.md"]);
+const SYSTEM_MEMORY_ROOT_FILES = new Set(["DREAMS.md"]);
+const SYSTEM_MEMORY_SUBDIRS = new Set(["dreaming", ".dreams"]);
+export function classifyWorkspaceMemoryPath(workspaceDir, relativePath) {
+    const workspaceRoot = resolve(workspaceDir);
+    const insideWorkspace = relative(workspaceRoot, resolve(workspaceRoot, relativePath));
+    if (!insideWorkspace || insideWorkspace === ".." || insideWorkspace.startsWith(`..${sep}`)) {
+        return "untrusted";
+    }
+    const segments = insideWorkspace.split(sep);
+    const [first, second] = segments;
+    if (segments.length === 1) {
+        if (CURATED_MEMORY_ROOT_FILES.has(first))
+            return "agent";
+        if (SYSTEM_MEMORY_ROOT_FILES.has(first))
+            return "system";
+        return "untrusted";
+    }
+    if (first !== "memory")
+        return "untrusted";
+    if (SYSTEM_MEMORY_SUBDIRS.has(second))
+        return "system";
+    return insideWorkspace.endsWith(".md") ? "agent" : "untrusted";
+}
 const DEFAULT_FLUSH_SOFT_THRESHOLD_TOKENS = 4000;
 const DEFAULT_FLUSH_TRANSCRIPT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_FLUSH_RESERVE_TOKENS_FLOOR = 20000;
@@ -498,6 +522,12 @@ export function createOpenClawMemoryCapability(params) {
             },
             resolveMemoryBackendConfig() {
                 return { backend: "builtin" };
+            },
+            async classifyWorkspaceMemoryPaths(runtimeParams) {
+                return runtimeParams.relativePaths.map((relativePath) => ({
+                    relativePath,
+                    originClass: classifyWorkspaceMemoryPath(runtimeParams.workspaceDir, relativePath),
+                }));
             },
             async closeAllMemorySearchManagers() {
                 await Promise.all([...managers].map(async (manager) => {
