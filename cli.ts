@@ -10,6 +10,7 @@ import path from "node:path";
 import * as readline from "node:readline";
 import JSON5 from "json5";
 import { loadLanceDB, type MemoryEntry, type MemoryStore } from "./src/store.js";
+import { resolveOpenClawStateDir } from "./src/openclaw-paths.js";
 import { createRetriever, type MemoryRetriever } from "./src/retriever.js";
 import type { MemoryScopeManager } from "./src/scopes.js";
 import type { MemoryMigrator } from "./src/migrate.js";
@@ -103,9 +104,7 @@ function resolveOpenClawConfigPath(explicit?: string): string {
 }
 
 function resolveOpenClawHome(): string {
-  return process.env.OPENCLAW_HOME?.trim()
-    ? path.resolve(process.env.OPENCLAW_HOME.trim())
-    : path.join(homedir(), ".openclaw");
+  return path.resolve(resolveOpenClawStateDir());
 }
 
 function resolveDefaultOauthPath(): string {
@@ -609,7 +608,7 @@ export async function runImportMarkdown(
   const startMs = Date.now();
   const openclawHome = options.openclawHome
     ? path.resolve(options.openclawHome)
-    : path.join(homedir(), ".openclaw");
+    : resolveOpenClawHome();
 
   const workspaceDir = path.join(openclawHome, "workspace");
   let imported = 0;
@@ -1127,7 +1126,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .option("--config <path>", "OpenClaw config file to update")
     .option("--provider <provider>", `OAuth provider to use (${OAUTH_PROVIDER_CHOICES})`)
     .option("--model <model>", "Override the model saved into llm.model")
-    .option("--oauth-path <path>", "OAuth file path (default: ~/.openclaw/.memory-lancedb-pro/oauth.json)")
+    .option("--oauth-path <path>", "OAuth file path (default: <openclaw home>/.memory-lancedb-pro/oauth.json)")
     .option("--timeout <seconds>", "OAuth callback timeout in seconds", "120")
     .option("--no-browser", "Do not auto-open the browser; print the authorization URL only")
     .action(async (options) => {
@@ -1814,7 +1813,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .option("--scope <scope>", "Import into specific scope (default: auto-discovered from workspace)")
     .option(
       "--openclaw-home <path>",
-      "OpenClaw home directory (default: ~/.openclaw)",
+      "OpenClaw home directory (default: $OPENCLAW_STATE_DIR, else ~/.openclaw)",
     )
     .option(
       "--dedup",
