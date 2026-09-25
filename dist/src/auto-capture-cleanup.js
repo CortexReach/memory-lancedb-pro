@@ -475,6 +475,39 @@ function keepRenderedTail(blocks, rendered, start, end, budget) {
     return kept;
 }
 /**
+ * The retained turns that precede one capture's own turns. Two captures of one
+ * session can overlap, and the newer one can store its window before the
+ * older one reads it: turns newer than the reader's own (message ids are
+ * assigned at hook entry, monotonic across the process) are not context for
+ * its transcript, they are the other capture's sources.
+ */
+export function turnsOlderThan(retained, own) {
+    const ownIds = own.map((turn) => turn.messageId).filter((id) => typeof id === "number");
+    if (ownIds.length === 0)
+        return retained;
+    const ownOldest = Math.min(...ownIds);
+    return retained.filter((turn) => typeof turn.messageId !== "number" || turn.messageId < ownOldest);
+}
+/**
+ * Composes a pair window from a retained window and one capture's own turns:
+ * double-preserved exchanges collapse (dedupePairWindow), the union is put in
+ * chronological order by message id so an overlapping newer capture's turns
+ * never sit ahead of older ones, and the cap keeps the newest pairs while
+ * always retaining every one of this capture's own user turns.
+ */
+export function composePairWindow(retained, own, contextTurns) {
+    const merged = dedupePairWindow([...retained, ...own], retained.length);
+    const ordered = merged
+        .map((turn, index) => ({ turn, index }))
+        .sort((a, b) => {
+        const aId = typeof a.turn.messageId === "number" ? a.turn.messageId : Number.MAX_SAFE_INTEGER;
+        const bId = typeof b.turn.messageId === "number" ? b.turn.messageId : Number.MAX_SAFE_INTEGER;
+        return aId === bId ? a.index - b.index : aId - bId;
+    })
+        .map((entry) => entry.turn);
+    return trimTurnsToUserCap(ordered, Math.max(contextTurns, own.filter((turn) => turn.role === "user").length));
+}
+/**
  * Bounds a rolling pair window to at most `maxUserTurns` user turns, keeping
  * the newest ones with their interleaved assistant replies, and never leaving
  * an orphan assistant turn ahead of the window's first user turn. The caller

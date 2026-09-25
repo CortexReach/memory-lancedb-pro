@@ -9,6 +9,8 @@ const {
   stripAutoCaptureInjectedPrefix,
   trimTurnsToUserCap,
   dedupePairWindow,
+  turnsOlderThan,
+  composePairWindow,
 } = jiti("../src/auto-capture-cleanup.ts");
 
 describe("auto-capture cleanup", () => {
@@ -177,5 +179,52 @@ describe("dedupePairWindow (deferral double-include repair)", () => {
     ];
     assert.deepEqual(dedupePairWindow(turns), turns);
     assert.deepEqual(dedupePairWindow([]), []);
+  });
+});
+
+describe("overlapping captures: chronological pair-window composition", () => {
+  const retainedNewer = [
+    { role: "user", text: "u3", messageId: 5, contextOnly: true },
+    { role: "assistant", text: "a3", messageId: 6, contextOnly: true },
+  ];
+  const ownOlder = [
+    { role: "user", text: "u1", messageId: 1 },
+    { role: "assistant", text: "a1", messageId: 2 },
+    { role: "user", text: "u2", messageId: 3 },
+  ];
+
+  it("excludes retained turns newer than the capture's own from its transcript context", () => {
+    assert.deepEqual(turnsOlderThan(retainedNewer, ownOlder), []);
+    const retainedOlder = [{ role: "user", text: "u0", messageId: 0, contextOnly: true }];
+    assert.deepEqual(turnsOlderThan([...retainedOlder, ...retainedNewer], ownOlder), retainedOlder);
+    assert.deepEqual(turnsOlderThan(retainedNewer, []), retainedNewer);
+  });
+
+  it("orders a newer retained window behind the older capture's own turns instead of trimming it out", () => {
+    const window = composePairWindow(retainedNewer, ownOlder, 2);
+    assert.deepEqual(window.map((turn) => turn.text), ["u2", "u3", "a3"]);
+  });
+
+  it("keeps every own user turn under the cap and the newest pairs of the retained window", () => {
+    const retainedOlder = [
+      { role: "user", text: "u0", messageId: 0, contextOnly: true },
+      { role: "assistant", text: "a0", messageId: 1, contextOnly: true },
+    ];
+    const own = [
+      { role: "user", text: "u1", messageId: 2 },
+      { role: "assistant", text: "a1", messageId: 3 },
+      { role: "user", text: "u2", messageId: 4 },
+    ];
+    assert.deepEqual(composePairWindow(retainedOlder, own, 3).map((turn) => turn.text), ["u0", "a0", "u1", "a1", "u2"]);
+    assert.deepEqual(composePairWindow(retainedOlder, own, 1).map((turn) => turn.text), ["u1", "a1", "u2"]);
+  });
+
+  it("keeps turns without a message id in their given order behind the identified ones", () => {
+    const window = composePairWindow(
+      [{ role: "user", text: "u9", messageId: 9, contextOnly: true }],
+      [{ role: "user", text: "ux" }, { role: "assistant", text: "ax" }],
+      4,
+    );
+    assert.deepEqual(window.map((turn) => turn.text), ["u9", "ux", "ax"]);
   });
 });

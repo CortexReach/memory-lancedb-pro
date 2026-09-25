@@ -76,7 +76,7 @@ import { isNoise } from "./src/noise-filter.js";
 import {
   type ConversationTurn,
   buildConversationTurnsForExtraction,
-  dedupePairWindow,
+  composePairWindow,
   weaveContextOnlyAssistantTurns,
   countProtectedReferentPrefix,
   formatConversationTranscript,
@@ -84,7 +84,7 @@ import {
   nextAutoCaptureMessageId,
   normalizeAutoCaptureText,
   reconcileTurnsWithKeptTexts,
-  trimTurnsToUserCap,
+  turnsOlderThan,
 } from "./src/auto-capture-cleanup.js";
 
 // Import smart extraction & lifecycle components
@@ -4076,7 +4076,14 @@ const memoryLanceDBProPlugin = {
       // always end the conversation, known rollover reasons always continue
       // it, and an unrecognized or absent reason ends it only when no
       // successor is announced.
-      const isTerminalSessionBoundary = (event: any): boolean => {
+      type SessionEndEvent = {
+        reason?: string;
+        sessionId?: string;
+        nextSessionId?: string;
+        nextSessionKey?: string;
+      };
+      type SessionEndCtx = { sessionKey?: string; sessionId?: string };
+      const isTerminalSessionBoundary = (event: SessionEndEvent | undefined): boolean => {
         const reason = typeof event?.reason === "string" ? event.reason : "";
         const isTerminalReason =
           reason === "new" ||
@@ -4126,7 +4133,7 @@ const memoryLanceDBProPlugin = {
       };
       api.on(
         "session_end",
-        (event: any, ctx: any) => {
+        (event: SessionEndEvent, ctx: SessionEndCtx) => {
           // The host rolls sessions mid-conversation (idle/daily budgets,
           // compaction) under the SAME sessionKey: those emissions carry a
           // rollover reason plus the successor's nextSessionId, and wiping
@@ -4143,7 +4150,7 @@ const memoryLanceDBProPlugin = {
           // may deliver only the lifecycle sessionId; the alias map learned
           // at capture time maps it back to the sessionKey the windows were
           // written under.
-          const endedSessionId = ctx?.sessionId || (event as any)?.sessionId;
+          const endedSessionId = ctx?.sessionId || event?.sessionId;
           const endedSessionKey =
             ctx?.sessionKey ||
             (typeof endedSessionId === "string" ? autoCaptureSessionIdToKey.get(endedSessionId) : undefined) ||
@@ -4159,6 +4166,7 @@ const memoryLanceDBProPlugin = {
       type AgentEndAutoCaptureHook = {
         (event: any, ctx: any): void;
         __lastRun?: Promise<void>;
+        __windowStateSizes?: () => { recentTurns: number; pairWindows: number; pairWindowEpochs: number };
       };
 
       const awaitSessionCaptureRuns = (key: string): Promise<void> => {
@@ -4780,12 +4788,21 @@ const memoryLanceDBProPlugin = {
               const currentCallWindowTurns = rememberPrependedTurns.length === 0
                 ? finalConversationTurns
                 : finalConversationTurns.filter((turn) => !rememberPrependedIds.has(turn.messageId));
+              // Two agent_end runs of one session can overlap, and the newer
+              // one can store its window before this run reads its own: only
+              // retained turns OLDER than this run's turns are context for its
+              // transcript (message ids are assigned at hook entry, monotonic
+              // across the process). The newer turns still reach the stored
+              // window below, in chronological order.
+              const contextPairTurns = turnsOlderThan(priorPairTurns, currentCallWindowTurns);
               if (contextTurns > 0 && pairWindowKey && rememberPrependedTurns.length === 0) {
-                finalConversationTurns = trimTurnsToUserCap(
-                  dedupePairWindow([...priorPairTurns, ...finalConversationTurns], priorPairTurns.length),
-                  Math.max(contextTurns, finalConversationTurns.filter((turn) => turn.role === "user").length),
-                );
+                finalConversationTurns = composePairWindow(contextPairTurns, finalConversationTurns, contextTurns);
               }
+              // Stored only after a successful extraction (below the
+              // extraction call): a failed extraction rolls its texts back to
+              // be sources again, so a window advanced here would hand the
+              // same exchange back as context AND source on the retry.
+              let pendingPairWindow: ConversationTurn[] | null = null;
               if (contextTurns === 0 && pairWindowKey) {
                 // Disabled is the default: never ALLOCATE epoch state here.
                 // An entry that already exists (config just flipped off with
@@ -4803,25 +4820,10 @@ const memoryLanceDBProPlugin = {
                 // would mean steady-state captures (one
                 // extraction per turn) always see a bare current pair. The
                 // set-time trim bounds it; the watermark keeps retained
-                // turns from re-becoming sources. The epoch guard skips the
-                // store when a newer capture or a terminal cleanup won the
-                // race since this run read its window.
-                const nextStoredWindow = rememberPrependedTurns.length === 0
-                  ? finalConversationTurns
-                  : trimTurnsToUserCap(
-                      dedupePairWindow([...priorPairTurns, ...currentCallWindowTurns], priorPairTurns.length),
-                      Math.max(contextTurns, currentCallWindowTurns.filter((turn) => turn.role === "user").length),
-                    );
-                if ((autoCapturePairWindowEpoch.get(pairWindowKey) ?? 0) === pairWindowEpochAtRead) {
-                  autoCapturePairWindowEpoch.set(pairWindowKey, pairWindowEpochAtRead + 1);
-                  autoCaptureRecentPairTurns.set(pairWindowKey, nextStoredWindow);
-                  pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
-                  prunePairWindowEpochsCoupled(
-                    autoCapturePairWindowEpoch,
-                    autoCaptureRecentPairTurns,
-                    AUTO_CAPTURE_MAP_MAX_ENTRIES,
-                  );
-                }
+                // turns from re-becoming sources. The chronological merge
+                // keeps an overlapping newer capture's turns behind this
+                // run's older ones instead of trimming them out.
+                pendingPairWindow = composePairWindow(priorPairTurns, currentCallWindowTurns, contextTurns);
               }
               // The referent is the OLDEST turn of the prepended window, which is
               // exactly what the extractor's newest-first budget walk sacrifices
@@ -4902,6 +4904,23 @@ const memoryLanceDBProPlugin = {
                   autoCaptureDeferredFlushTurns.set(sessionKey, remainingDeferred);
                 }
               }
+              if (pendingPairWindow && pairWindowKey && (persistedSomething || !admittedOnlyByExplicitRemember)) {
+                // The epoch guard is load-bearing across the extraction await:
+                // a terminal teardown or a newer capture that stored meanwhile
+                // bumped it, and this run's older window overwrites neither
+                // (the newer window wins outright; a torn-down session is
+                // never recreated).
+                if ((autoCapturePairWindowEpoch.get(pairWindowKey) ?? 0) === pairWindowEpochAtRead) {
+                  autoCapturePairWindowEpoch.set(pairWindowKey, pairWindowEpochAtRead + 1);
+                  autoCaptureRecentPairTurns.set(pairWindowKey, pendingPairWindow);
+                  pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                  prunePairWindowEpochsCoupled(
+                    autoCapturePairWindowEpoch,
+                    autoCaptureRecentPairTurns,
+                    AUTO_CAPTURE_MAP_MAX_ENTRIES,
+                  );
+                }
+              }
               if (stats.created > 0 || stats.merged > 0) {
                 api.logger.info(
                   `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`,
@@ -4915,9 +4934,15 @@ const memoryLanceDBProPlugin = {
                 // turn re-read and re-extract the entire history. Record the
                 // consumed history length there instead, so the next turn
                 // only sees the delta.
+                // Monotonic for history-carrying sessions: an overlapping
+                // older run that finishes last must not roll the cursor back
+                // below a newer run's advance, or the newer run's texts are
+                // re-sliced as sources on the next turn.
                 autoCaptureSeenTextCount.set(
                   sessionKey,
-                  pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length,
+                  pendingIngressTexts.length > 0
+                    ? 0
+                    : Math.max(autoCaptureSeenTextCount.get(sessionKey) ?? 0, eligibleTexts.length),
                 );
                 return; // Smart extraction handled everything
               }
@@ -4938,7 +4963,9 @@ const memoryLanceDBProPlugin = {
                   );
                   autoCaptureSeenTextCount.set(
                     sessionKey,
-                    pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length,
+                    pendingIngressTexts.length > 0
+                      ? 0
+                      : Math.max(autoCaptureSeenTextCount.get(sessionKey) ?? 0, eligibleTexts.length),
                   );
                   return;
                 }
@@ -5257,6 +5284,16 @@ const memoryLanceDBProPlugin = {
       };
 
       api.on("agent_end", agentEndAutoCaptureHook);
+      // Diagnostics seam for the lifecycle tests, reached through the
+      // registered hook like __lastRun rather than the package's export list:
+      // the pair-window feature must not leak epoch entries under its
+      // disabled default, and teardown must remove them once in-flight runs
+      // settle.
+      agentEndAutoCaptureHook.__windowStateSizes = () => ({
+        recentTurns: autoCaptureRecentTurns.size,
+        pairWindows: autoCaptureRecentPairTurns.size,
+        pairWindowEpochs: autoCapturePairWindowEpoch.size,
+      });
 
       // A session that ends below extractMinMessages would otherwise strand its
       // deferred texts (requeued ingress or rolled-back history) forever, losing
@@ -7526,23 +7563,5 @@ export function resetRegistration() {
   getReflectionEmptyEventGuardMap().clear();
 }
 
-/**
- * Sizes of the auto-capture retention maps, for tests and diagnostics: the
- * pair-window feature must not leak epoch entries under its disabled
- * default, and teardown must remove them once in-flight runs settle.
- * @public
- */
-export function debugAutoCaptureWindowStateSizes(): {
-  recentTurns: number;
-  pairWindows: number;
-  pairWindowEpochs: number;
-} | null {
-  if (!_singletonState) return null;
-  return {
-    recentTurns: _singletonState.autoCaptureRecentTurns.size,
-    pairWindows: _singletonState.autoCaptureRecentPairTurns.size,
-    pairWindowEpochs: _singletonState.autoCapturePairWindowEpoch.size,
-  };
-}
 
 export default memoryLanceDBProPlugin;
