@@ -76,11 +76,15 @@ import { isNoise } from "./src/noise-filter.js";
 import {
   type ConversationTurn,
   buildConversationTurnsForExtraction,
+  composePairWindow,
+  weaveContextOnlyAssistantTurns,
+  countProtectedReferentPrefix,
   formatConversationTranscript,
   neutralizeSpeakerTagSpoof,
   nextAutoCaptureMessageId,
   normalizeAutoCaptureText,
   reconcileTurnsWithKeptTexts,
+  turnsOlderThan,
 } from "./src/auto-capture-cleanup.js";
 
 // Import smart extraction & lifecycle components
@@ -282,6 +286,8 @@ interface PluginConfig {
     thinkLevel?: string;
   };
   extractMinMessages?: number;
+  /** Rolling extraction context window in retained user turns (0 = disabled, max 10). */
+  autoCaptureContextTurns?: number;
   extractMaxChars?: number;
   batchChunkSize?: number;
   scopes?: {
@@ -1212,6 +1218,31 @@ function pruneMapIfOver<K, V>(map: Map<K, V>, maxEntries: number): void {
   for (let i = 0; i < excess; i++) {
     const key = iter.next().value;
     if (key !== undefined) map.delete(key);
+  }
+}
+
+/**
+ * Coupled eviction for the pair-window epoch map. An epoch entry may only
+ * leave once its window is gone: deleting the counter while a retained
+ * window survives would reset the generation and let a stale in-flight
+ * store pass the epoch guard. Window-less entries evict first (oldest
+ * first); only if the map is somehow still over do oldest window+epoch
+ * pairs leave TOGETHER, so guard and guarded state always go in one step.
+ */
+function prunePairWindowEpochsCoupled(
+  epochs: Map<string, number>,
+  windows: Map<string, unknown>,
+  maxEntries: number,
+): void {
+  if (epochs.size <= maxEntries) return;
+  for (const key of [...epochs.keys()]) {
+    if (epochs.size <= maxEntries) return;
+    if (!windows.has(key)) epochs.delete(key);
+  }
+  for (const key of [...epochs.keys()]) {
+    if (epochs.size <= maxEntries) return;
+    windows.delete(key);
+    epochs.delete(key);
   }
 }
 
@@ -2412,6 +2443,9 @@ interface PluginSingletonState {
   autoCaptureRecentTurns: Map<string, ConversationTurn[]>;
   autoCaptureDeferredFlushTurns: Map<string, ConversationTurn[]>;
   autoCaptureSessionIdToKey: Map<string, string>;
+
+  autoCaptureRecentPairTurns: Map<string, ConversationTurn[]>;
+  autoCapturePairWindowEpoch: Map<string, number>;
   autoCaptureInFlightRuns: Map<string, Set<Promise<void>>>;
   captureAdmissionController: () => AdmissionController | null;
   captureAdmissionAudit: () => boolean;
@@ -2760,6 +2794,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const autoCaptureRecentTurns = new Map<string, ConversationTurn[]>();
   const autoCaptureDeferredFlushTurns = new Map<string, ConversationTurn[]>();
   const autoCaptureSessionIdToKey = new Map<string, string>();
+
+  const autoCaptureRecentPairTurns = new Map<string, ConversationTurn[]>();
+  const autoCapturePairWindowEpoch = new Map<string, number>();
   const autoCaptureInFlightRuns = new Map<string, Set<Promise<void>>>();
 
   return {
@@ -2793,6 +2830,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCaptureRecentTurns,
     autoCaptureDeferredFlushTurns,
     autoCaptureSessionIdToKey,
+
+    autoCaptureRecentPairTurns,
+    autoCapturePairWindowEpoch,
     autoCaptureInFlightRuns,
     captureAdmissionController,
     captureAdmissionAudit,
@@ -2954,7 +2994,9 @@ const memoryLanceDBProPlugin = {
       autoCaptureCountedPendingCount,
       autoCaptureRecentTurns,
       autoCaptureDeferredFlushTurns,
-    autoCaptureSessionIdToKey,
+      autoCaptureSessionIdToKey,
+      autoCaptureRecentPairTurns,
+      autoCapturePairWindowEpoch,
       autoCaptureInFlightRuns,
       captureAdmissionController,
       captureAdmissionAudit,
@@ -4034,7 +4076,14 @@ const memoryLanceDBProPlugin = {
       // always end the conversation, known rollover reasons always continue
       // it, and an unrecognized or absent reason ends it only when no
       // successor is announced.
-      const isTerminalSessionBoundary = (event: any): boolean => {
+      type SessionEndEvent = {
+        reason?: string;
+        sessionId?: string;
+        nextSessionId?: string;
+        nextSessionKey?: string;
+      };
+      type SessionEndCtx = { sessionKey?: string; sessionId?: string };
+      const isTerminalSessionBoundary = (event: SessionEndEvent | undefined): boolean => {
         const reason = typeof event?.reason === "string" ? event.reason : "";
         const isTerminalReason =
           reason === "new" ||
@@ -4050,9 +4099,41 @@ const memoryLanceDBProPlugin = {
         );
         return !(isRolloverReason || announcesSuccessor);
       };
+      // A session_end context cannot name the agent that wrote the window:
+      // the host rebuilds its agentId from the session key and falls back to
+      // the DEFAULT agent on unparseable keys (the shared literal "global"
+      // key among them), so a targeted delete misses the writer. A terminal
+      // boundary ends the session for every agent riding the key; sweep
+      // every window under it. Synchronous teardown first (a next capture
+      // must never see the ended session's windows), then a final pass once
+      // every in-flight run for the key has settled: a straggler that read
+      // its window before the boundary may only re-store between the two
+      // passes, and the epoch bump makes its store a no-op anyway. The final
+      // pass DELETES the epoch counters, which have no store left to guard.
+      const sweepSessionPairWindows = (endedSessionKey: string, finalPass: boolean) => {
+        const sessionSuffix = REMEMBER_WINDOW_KEY_SEPARATOR + endedSessionKey;
+        for (const windowKey of [...autoCaptureRecentTurns.keys()]) {
+          if (windowKey.endsWith(sessionSuffix)) {
+            autoCaptureRecentTurns.delete(windowKey);
+          }
+        }
+        for (const windowKey of [...autoCaptureRecentPairTurns.keys()]) {
+          if (windowKey.endsWith(sessionSuffix)) {
+            autoCapturePairWindowEpoch.set(windowKey, (autoCapturePairWindowEpoch.get(windowKey) ?? 0) + 1);
+            autoCaptureRecentPairTurns.delete(windowKey);
+          }
+        }
+        if (finalPass) {
+          for (const epochKey of [...autoCapturePairWindowEpoch.keys()]) {
+            if (epochKey.endsWith(sessionSuffix)) {
+              autoCapturePairWindowEpoch.delete(epochKey);
+            }
+          }
+        }
+      };
       api.on(
         "session_end",
-        (event: any, ctx: any) => {
+        (event: SessionEndEvent, ctx: SessionEndCtx) => {
           // The host rolls sessions mid-conversation (idle/daily budgets,
           // compaction) under the SAME sessionKey: those emissions carry a
           // rollover reason plus the successor's nextSessionId, and wiping
@@ -4065,21 +4146,18 @@ const memoryLanceDBProPlugin = {
           if (!isTerminalSessionBoundary(event)) {
             return;
           }
-          const endedSessionKey = ctx?.sessionKey || "";
+          // Resolve the same logical key the flush resolves: a session_end
+          // may deliver only the lifecycle sessionId; the alias map learned
+          // at capture time maps it back to the sessionKey the windows were
+          // written under.
+          const endedSessionId = ctx?.sessionId || event?.sessionId;
+          const endedSessionKey =
+            ctx?.sessionKey ||
+            (typeof endedSessionId === "string" ? autoCaptureSessionIdToKey.get(endedSessionId) : undefined) ||
+            "";
           if (endedSessionKey) {
-            // A session_end context cannot name the agent that wrote the
-            // window: the host rebuilds its agentId from the session key
-            // and falls back to the DEFAULT agent on unparseable keys
-            // (the shared literal "global" key among them), so a
-            // targeted delete misses the writer. A terminal boundary
-            // ends the session for every agent riding the key; sweep
-            // every window under it.
-            const sessionSuffix = REMEMBER_WINDOW_KEY_SEPARATOR + endedSessionKey;
-            for (const windowKey of [...autoCaptureRecentTurns.keys()]) {
-              if (windowKey.endsWith(sessionSuffix)) {
-                autoCaptureRecentTurns.delete(windowKey);
-              }
-            }
+            sweepSessionPairWindows(endedSessionKey, false);
+            void awaitSessionCaptureRuns(endedSessionKey).then(() => sweepSessionPairWindows(endedSessionKey, true));
           }
         },
         { priority: 10 },
@@ -4088,6 +4166,7 @@ const memoryLanceDBProPlugin = {
       type AgentEndAutoCaptureHook = {
         (event: any, ctx: any): void;
         __lastRun?: Promise<void>;
+        __windowStateSizes?: () => { recentTurns: number; pairWindows: number; pairWindowEpochs: number };
       };
 
       const awaitSessionCaptureRuns = (key: string): Promise<void> => {
@@ -4175,6 +4254,15 @@ const memoryLanceDBProPlugin = {
           // session_end may deliver only the lifecycle sessionId; record the
           // alias so the terminal flush resolves to the same buckets.
           learnAutoCaptureSessionAlias(hookSessionId, sessionKey);
+          // The rolling pair window is keyed by agent AND session (the shared
+          // literal keys "global"/"unknown" otherwise bleed one agent's
+          // transcript into another agent's extraction and its scope). A
+          // capture without an attributable agent OR session identity gets no
+          // retention at all: a known agent's turns from unrelated unidentified
+          // sessions would otherwise pool under one key.
+          const pairWindowKey = agentId !== "unknown" && sessionKey !== "unknown"
+            ? rememberWindowKey(agentId, sessionKey)
+            : null;
 
           api.logger.debug(
             `memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`,
@@ -4184,6 +4272,14 @@ const memoryLanceDBProPlugin = {
           // message-loop order alongside the flat eligible-text list.
           const eligibleTexts: string[] = [];
           const messageLoopTurns: ConversationTurn[] = [];
+          // Assistant replies collected as CONTEXT when captureAssistant is
+          // off but the rolling pair window is on: they ride the transcript
+          // and the retained window (the prompt's source-eligibility rules
+          // already restrict extraction to <user_message> blocks in that
+          // mode) without ever entering eligibleTexts, so every
+          // watermark/count invariant over eligible texts is untouched.
+          const contextOnlyAssistantReplies: Array<{ anchorMessageId: ConversationTurn["messageId"] | null; turn: ConversationTurn }> = [];
+          const contextWindowOn = (config.autoCaptureContextTurns ?? 0) > 0;
           let skippedAutoCaptureTexts = 0;
           for (const msg of event.messages ?? []) {
             if (!msg || typeof msg !== "object") {
@@ -4193,9 +4289,12 @@ const memoryLanceDBProPlugin = {
 
             const role = msgObj.role;
             const captureAssistant = config.captureAssistant === true;
+            const assistantAsContextOnly =
+              role === "assistant" && !captureAssistant && contextWindowOn;
             if (
               role !== "user" &&
-              !(captureAssistant && role === "assistant")
+              !(captureAssistant && role === "assistant") &&
+              !assistantAsContextOnly
             ) {
               continue;
             }
@@ -4207,6 +4306,11 @@ const memoryLanceDBProPlugin = {
               const normalized = normalizeAutoCaptureText(role, content, shouldSkipReflectionMessage);
               if (!normalized) {
                 skippedAutoCaptureTexts++;
+              } else if (assistantAsContextOnly) {
+                contextOnlyAssistantReplies.push({
+                  anchorMessageId: messageLoopTurns.length > 0 ? messageLoopTurns[messageLoopTurns.length - 1].messageId : null,
+                  turn: { role: "assistant", text: normalized, messageId, contextOnly: true },
+                });
               } else {
                 eligibleTexts.push(normalized);
                 messageLoopTurns.push({ role: role as "user" | "assistant", text: normalized, messageId });
@@ -4228,6 +4332,11 @@ const memoryLanceDBProPlugin = {
                   const normalized = normalizeAutoCaptureText(role, text, shouldSkipReflectionMessage);
                   if (!normalized) {
                     skippedAutoCaptureTexts++;
+                  } else if (assistantAsContextOnly) {
+                    contextOnlyAssistantReplies.push({
+                      anchorMessageId: messageLoopTurns.length > 0 ? messageLoopTurns[messageLoopTurns.length - 1].messageId : null,
+                      turn: { role: "assistant", text: normalized, messageId, contextOnly: true },
+                    });
                   } else {
                     eligibleTexts.push(normalized);
                     messageLoopTurns.push({ role: role as "user" | "assistant", text: normalized, messageId });
@@ -4417,6 +4526,17 @@ const memoryLanceDBProPlugin = {
           }
           if (isTerminalBoundary) {
             autoCaptureRecentTurns.delete(rememberWindowKey(agentId, sessionKey));
+            if (pairWindowKey) {
+              // The epoch guard only has stores to invalidate while the pair
+              // window feature is ON; bumping under the disabled default would
+              // allocate an entry per agent/session with nothing to guard.
+              if ((config.autoCaptureContextTurns ?? 0) > 0) {
+                autoCapturePairWindowEpoch.set(pairWindowKey, (autoCapturePairWindowEpoch.get(pairWindowKey) ?? 0) + 1);
+              } else {
+                autoCapturePairWindowEpoch.delete(pairWindowKey);
+              }
+              autoCaptureRecentPairTurns.delete(pairWindowKey);
+            }
           } else if (newTexts.length > 0) {
             const newRecentTurns = thisCallTurns.slice(rememberPrependedTurns.length);
             const combinedRecentTurns = [...priorRecentTurns, ...newRecentTurns];
@@ -4631,7 +4751,80 @@ const memoryLanceDBProPlugin = {
               // texts the selectors dropped back into extraction. Kept indices
               // pin each surviving copy to its own turn; occurrence counting
               // stays as the fallback when positional alignment is unavailable.
-              const finalConversationTurns = reconcileTurnsWithKeptTexts(thisCallTurns, cleanTexts, cleanTurnIndices);
+              let finalConversationTurns = reconcileTurnsWithKeptTexts(thisCallTurns, cleanTexts, cleanTurnIndices);
+              // Context-only assistant replies rejoin the reconciled sequence
+              // right after their surviving anchor turns, so the transcript
+              // (and the retained window below) carries the assistant side of
+              // each pair even under the default captureAssistant=false.
+              finalConversationTurns = weaveContextOnlyAssistantTurns(finalConversationTurns, contextOnlyAssistantReplies);
+              // Rolling PAIR window sized by autoCaptureContextTurns (0 =
+              // disabled: each extraction sees only its own call's turns, and
+              // nothing is retained between calls). When enabled, this call's
+              // reconciled pairs extend what earlier calls buffered, bounded
+              // to autoCaptureContextTurns user turns (or this call's own
+              // new-user count when larger, so unextracted user turns are
+              // never trimmed out of their own transcript). The buffer holds
+              // the FILTERED window, so selector-dropped texts can never
+              // re-enter a later transcript as retained context. A remember
+              // flow (prepended referent) bypasses the prepend for its own
+              // call: the extractor's protected-prefix contract counts
+              // referent turns from position zero.
+              const contextTurns = config.autoCaptureContextTurns ?? 0;
+              const pairWindowEpochAtRead = pairWindowKey ? (autoCapturePairWindowEpoch.get(pairWindowKey) ?? 0) : 0;
+              // Retained turns re-enter later transcripts as CONTEXT ONLY:
+              // they render as context_only blocks the extraction prompt
+              // forbids sourcing candidates from, so an old fact cannot be
+              // re-extracted or crowd the candidate limit.
+              const priorPairTurns = contextTurns > 0 && pairWindowKey
+                ? (autoCaptureRecentPairTurns.get(pairWindowKey) || []).map((turn) => ({ ...turn, contextOnly: true }))
+                : [];
+              // A remember flow bypasses the window prepend for its own
+              // transcript (the protected-prefix contract counts referent
+              // turns from position zero), but the ACCUMULATED window must
+              // survive it: its stored update always composes the prior
+              // window with this call's own turns, never with the
+              // remember-shaped transcript.
+              const rememberPrependedIds = new Set(rememberPrependedTurns.map((turn) => turn.messageId));
+              const currentCallWindowTurns = rememberPrependedTurns.length === 0
+                ? finalConversationTurns
+                : finalConversationTurns.filter((turn) => !rememberPrependedIds.has(turn.messageId));
+              // Two agent_end runs of one session can overlap, and the newer
+              // one can store its window before this run reads its own: only
+              // retained turns OLDER than this run's turns are context for its
+              // transcript (message ids are assigned at hook entry, monotonic
+              // across the process). The newer turns still reach the stored
+              // window below, in chronological order.
+              const contextPairTurns = turnsOlderThan(priorPairTurns, currentCallWindowTurns);
+              if (contextTurns > 0 && pairWindowKey && rememberPrependedTurns.length === 0) {
+                finalConversationTurns = composePairWindow(contextPairTurns, finalConversationTurns, contextTurns);
+              }
+              // Stored only after a successful extraction (below the
+              // extraction call): a failed extraction rolls its texts back to
+              // be sources again, so a window advanced here would hand the
+              // same exchange back as context AND source on the retry.
+              let pendingPairWindow: ConversationTurn[] | null = null;
+              if (contextTurns === 0 && pairWindowKey) {
+                // Disabled is the default: never ALLOCATE epoch state here.
+                // An entry that already exists (config just flipped off with
+                // an enabled-era run possibly in flight) is bumped so that
+                // run's store stays a no-op; teardown and the coupled prune
+                // remove it once its window is gone.
+                if (autoCapturePairWindowEpoch.has(pairWindowKey)) {
+                  autoCapturePairWindowEpoch.set(pairWindowKey, pairWindowEpochAtRead + 1);
+                }
+                autoCaptureRecentPairTurns.delete(pairWindowKey);
+              } else if (contextTurns > 0 && pairWindowKey && thisCallTurns.length > 0 && !isTerminalBoundary) {
+                // Deliberately retained across successful extractions, never
+                // by a terminal-boundary run (its flush transcript would
+                // recreate the window this run tore down): deleting it here
+                // would mean steady-state captures (one
+                // extraction per turn) always see a bare current pair. The
+                // set-time trim bounds it; the watermark keeps retained
+                // turns from re-becoming sources. The chronological merge
+                // keeps an overlapping newer capture's turns behind this
+                // run's older ones instead of trimming them out.
+                pendingPairWindow = composePairWindow(priorPairTurns, currentCallWindowTurns, contextTurns);
+              }
               // The referent is the OLDEST turn of the prepended window, which is
               // exactly what the extractor's newest-first budget walk sacrifices
               // first, so it needs a guaranteed share. Only the referent RUN gets
@@ -4652,13 +4845,14 @@ const memoryLanceDBProPlugin = {
               // Reconciliation returns the same turn objects, so identity counts
               // how many referent turns actually survived into the transcript.
               const referentTurnSet = new Set(rememberPrependedTurns.slice(0, referentRunLength));
-              let protectedPrefixTurns = 0;
-              while (
-                protectedPrefixTurns < finalConversationTurns.length &&
-                referentTurnSet.has(finalConversationTurns[protectedPrefixTurns])
-              ) {
-                protectedPrefixTurns++;
-              }
+              // Context-only turns woven into the transcript are transparent
+              // to this scan: the prefix protects the leading run of REFERENT
+              // SOURCE turns, so a null-anchored context reply at position
+              // zero cannot void the referent's budget guarantee.
+              const protectedPrefixTurns = countProtectedReferentPrefix(
+                finalConversationTurns,
+                referentTurnSet,
+              );
               // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
               let stats: Awaited<ReturnType<typeof smartExtractor.extractAndPersist>> | null = null;
               try {
@@ -4710,6 +4904,23 @@ const memoryLanceDBProPlugin = {
                   autoCaptureDeferredFlushTurns.set(sessionKey, remainingDeferred);
                 }
               }
+              if (pendingPairWindow && pairWindowKey && (persistedSomething || !admittedOnlyByExplicitRemember)) {
+                // The epoch guard is load-bearing across the extraction await:
+                // a terminal teardown or a newer capture that stored meanwhile
+                // bumped it, and this run's older window overwrites neither
+                // (the newer window wins outright; a torn-down session is
+                // never recreated).
+                if ((autoCapturePairWindowEpoch.get(pairWindowKey) ?? 0) === pairWindowEpochAtRead) {
+                  autoCapturePairWindowEpoch.set(pairWindowKey, pairWindowEpochAtRead + 1);
+                  autoCaptureRecentPairTurns.set(pairWindowKey, pendingPairWindow);
+                  pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                  prunePairWindowEpochsCoupled(
+                    autoCapturePairWindowEpoch,
+                    autoCaptureRecentPairTurns,
+                    AUTO_CAPTURE_MAP_MAX_ENTRIES,
+                  );
+                }
+              }
               if (stats.created > 0 || stats.merged > 0) {
                 api.logger.info(
                   `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`,
@@ -4723,9 +4934,15 @@ const memoryLanceDBProPlugin = {
                 // turn re-read and re-extract the entire history. Record the
                 // consumed history length there instead, so the next turn
                 // only sees the delta.
+                // Monotonic for history-carrying sessions: an overlapping
+                // older run that finishes last must not roll the cursor back
+                // below a newer run's advance, or the newer run's texts are
+                // re-sliced as sources on the next turn.
                 autoCaptureSeenTextCount.set(
                   sessionKey,
-                  pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length,
+                  pendingIngressTexts.length > 0
+                    ? 0
+                    : Math.max(autoCaptureSeenTextCount.get(sessionKey) ?? 0, eligibleTexts.length),
                 );
                 return; // Smart extraction handled everything
               }
@@ -4746,7 +4963,9 @@ const memoryLanceDBProPlugin = {
                   );
                   autoCaptureSeenTextCount.set(
                     sessionKey,
-                    pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length,
+                    pendingIngressTexts.length > 0
+                      ? 0
+                      : Math.max(autoCaptureSeenTextCount.get(sessionKey) ?? 0, eligibleTexts.length),
                   );
                   return;
                 }
@@ -5065,6 +5284,16 @@ const memoryLanceDBProPlugin = {
       };
 
       api.on("agent_end", agentEndAutoCaptureHook);
+      // Diagnostics seam for the lifecycle tests, reached through the
+      // registered hook like __lastRun rather than the package's export list:
+      // the pair-window feature must not leak epoch entries under its
+      // disabled default, and teardown must remove them once in-flight runs
+      // settle.
+      agentEndAutoCaptureHook.__windowStateSizes = () => ({
+        recentTurns: autoCaptureRecentTurns.size,
+        pairWindows: autoCaptureRecentPairTurns.size,
+        pairWindowEpochs: autoCapturePairWindowEpoch.size,
+      });
 
       // A session that ends below extractMinMessages would otherwise strand its
       // deferred texts (requeued ingress or rolled-back history) forever, losing
@@ -5100,7 +5329,14 @@ const memoryLanceDBProPlugin = {
             );
             return awaitSessionCaptureRuns(flushSessionKey);
           })
-          .then(() => {});
+          .then(() => {
+            // The window sweep hook may have run its final pass before this
+            // flush registered its run; a terminal boundary repeats it once
+            // the flush has settled so no epoch entry outlives the session.
+            if (isTerminalSessionBoundary(event)) {
+              sweepSessionPairWindows(flushSessionKey, true);
+            }
+          });
         // Test-synchronization seam only (see the agent_end tail).
         agentEndAutoCaptureHook.__lastRun = flushRun;
         // Returned, not detached: a host that awaits its session_end hooks
@@ -7153,6 +7389,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       })()
       : undefined,
     extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+    autoCaptureContextTurns: Math.min(10, Math.max(0, Math.floor(Number(cfg.autoCaptureContextTurns)) || 0)),
     extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
     batchChunkSize: (() => { const raw = parsePositiveInt(cfg.batchChunkSize); return raw === undefined ? undefined : Math.min(50, raw); })(),
     scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,
@@ -7325,5 +7562,6 @@ export function resetRegistration() {
   _hookEventDedup.clear();
   getReflectionEmptyEventGuardMap().clear();
 }
+
 
 export default memoryLanceDBProPlugin;

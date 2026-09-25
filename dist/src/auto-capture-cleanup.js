@@ -118,6 +118,14 @@ export function normalizeAutoCaptureText(role, text, shouldSkipMessage) {
         return null;
     return normalized;
 }
+function turnTags(turn) {
+    if (turn.contextOnly === true) {
+        const tag = turn.role === "user" ? "context_only_user_turn" : "context_only_assistant_turn";
+        return { open: `<${tag}>`, close: `</${tag}>` };
+    }
+    const tag = turn.role === "user" ? "user_message" : "assistant_message";
+    return { open: `<${tag}>`, close: `</${tag}>` };
+}
 let autoCaptureMessageIdCounter = 0;
 /** Monotonic across the process so ids from different capture calls mixed in
  *  one recents window can never collide. */
@@ -139,7 +147,15 @@ export function nextAutoCaptureMessageId() {
  * covers attribute-bearing and self-closing forms like
  * <assistant_message id="x"> and <user_message/>.
  */
-const SPEAKER_TAG_SPOOF_NAMES = ["user_message", "assistant_message"];
+// The context_only wrappers are structural too: retained window turns render
+// through this same path, so a literal wrapper typed into an earlier message
+// could otherwise close the context block and open a fake source block.
+const SPEAKER_TAG_SPOOF_NAMES = [
+    "user_message",
+    "assistant_message",
+    "context_only_user_turn",
+    "context_only_assistant_turn",
+];
 function isSpoofWhitespaceCode(code) {
     return ((code >= 9 && code <= 13) ||
         code === 32 ||
@@ -257,8 +273,8 @@ export function neutralizeSpeakerTagSpoof(text) {
 export function formatConversationTranscript(turns, _userLabel = "User") {
     return turns
         .map((turn) => {
-        const tag = turn.role === "user" ? "user_message" : "assistant_message";
-        return `<${tag}>\n${neutralizeSpeakerTagSpoof(turn.text)}\n</${tag}>`;
+        const { open, close } = turnTags(turn);
+        return `${open}\n${neutralizeSpeakerTagSpoof(turn.text)}\n${close}`;
     })
         .join("\n");
 }
@@ -280,15 +296,89 @@ export function buildBoundedTranscript(turns, maxChars) {
  * untruncated render here is byte-identical to `formatConversationTranscript`).
  */
 export function buildBoundedTranscriptWithStats(turns, maxChars, options = {}) {
-    const blocks = turns.map((turn) => ({
-        open: turn.role === "user" ? "<user_message>" : "<assistant_message>",
-        close: turn.role === "user" ? "</user_message>" : "</assistant_message>",
-        text: neutralizeSpeakerTagSpoof(turn.text),
-    }));
+    const blocks = turns.map((turn) => {
+        const tags = turnTags(turn);
+        return {
+            open: tags.open,
+            close: tags.close,
+            text: neutralizeSpeakerTagSpoof(turn.text),
+            contextOnly: turn.contextOnly === true,
+        };
+    });
     const rendered = blocks.map((block) => `${block.open}\n${block.text}\n${block.close}`);
     const full = rendered.join("\n");
     if (full.length <= maxChars) {
         return { transcript: full, fullLength: full.length, protectedPrefixKept: true };
+    }
+    // Source turns own the budget: an over-budget transcript first keeps as
+    // many SOURCE turns as fit (newest-first, the pre-context behavior), and
+    // only the leftover goes to context-only blocks. A single oversized
+    // trailing context reply can therefore never evict the current user turn
+    // it was meant to contextualize.
+    if (blocks.some((block) => block.contextOnly)) {
+        const prefixCount = Math.min(Math.max(Math.trunc(options.protectedPrefixTurns ?? 0), 0), blocks.length);
+        const protectedSourceIndices = [];
+        const tailSourceIndices = [];
+        const contextIndices = [];
+        // The protected prefix counts SOURCE turns: woven context blocks are
+        // transparent to it, so a null-anchored context reply sitting at index 0
+        // can never absorb (and thereby void) the referent's protected slot.
+        let sourceSeen = 0;
+        blocks.forEach((block, i) => {
+            if (block.contextOnly) {
+                contextIndices.push(i);
+            }
+            else if (sourceSeen++ < prefixCount) {
+                protectedSourceIndices.push(i);
+            }
+            else {
+                tailSourceIndices.push(i);
+            }
+        });
+        // A protected referent prefix keeps its fair-share guarantee against the
+        // OTHER source turns; context blocks never bid for either share.
+        let keptSources;
+        if (protectedSourceIndices.length > 0 && tailSourceIndices.length > 0) {
+            const available = maxChars - 1;
+            const half = Math.floor(available / 2);
+            const prefixLength = protectedSourceIndices.map((i) => rendered[i]).join("\n").length;
+            const tailLength = tailSourceIndices.map((i) => rendered[i]).join("\n").length;
+            let prefixBudget;
+            let tailBudget;
+            if (prefixLength <= half) {
+                prefixBudget = prefixLength;
+                tailBudget = available - prefixLength;
+            }
+            else if (tailLength <= available - half) {
+                tailBudget = tailLength;
+                prefixBudget = available - tailLength;
+            }
+            else {
+                prefixBudget = half;
+                tailBudget = available - half;
+            }
+            keptSources = new Map([
+                ...keepRenderedTailByIndices(blocks, rendered, protectedSourceIndices, prefixBudget),
+                ...keepRenderedTailByIndices(blocks, rendered, tailSourceIndices, tailBudget),
+            ]);
+        }
+        else {
+            keptSources = keepRenderedTailByIndices(blocks, rendered, [...protectedSourceIndices, ...tailSourceIndices], maxChars);
+        }
+        let used = 0;
+        for (const renderedBlock of keptSources.values()) {
+            used += renderedBlock.length + (used > 0 ? 1 : 0);
+        }
+        const keptContext = keepRenderedTailByIndices(blocks, rendered, contextIndices, Math.max(0, maxChars - used - (keptSources.size > 0 ? 1 : 0)));
+        const orderedKept = [...keptSources, ...keptContext]
+            .sort((a, b) => a[0] - b[0])
+            .map(([, renderedBlock]) => renderedBlock);
+        const keptProtected = protectedSourceIndices.some((i) => keptSources.has(i));
+        return {
+            transcript: orderedKept.join("\n"),
+            fullLength: full.length,
+            protectedPrefixKept: protectedSourceIndices.length === 0 ? keptSources.size > 0 || blocks.every((b) => b.contextOnly) : keptProtected,
+        };
     }
     const protectedCount = Math.min(Math.max(Math.trunc(options.protectedPrefixTurns ?? 0), 0), blocks.length);
     const separatorCost = 1;
@@ -333,6 +423,33 @@ export function buildBoundedTranscriptWithStats(turns, maxChars, options = {}) {
     };
 }
 /**
+ * keepRenderedTail generalized to an arbitrary ascending index subset:
+ * keeps the maximal TAIL of the subset (newest-first walk) within `budget`,
+ * tail-slicing the oldest kept block's text, and returns kept index →
+ * rendered block so the caller can re-interleave subsets in original order.
+ */
+function keepRenderedTailByIndices(blocks, rendered, indices, budget) {
+    const kept = new Map();
+    let total = 0;
+    for (let k = indices.length - 1; k >= 0; k--) {
+        const i = indices[k];
+        const joinCost = kept.size > 0 ? 1 : 0;
+        if (total + rendered[i].length + joinCost <= budget) {
+            kept.set(i, rendered[i]);
+            total += rendered[i].length + joinCost;
+            continue;
+        }
+        const envelope = blocks[i].open.length + blocks[i].close.length + 2 + joinCost;
+        const room = budget - total - envelope;
+        if (room > 0) {
+            const tail = blocks[i].text.slice(blocks[i].text.length - room);
+            kept.set(i, `${blocks[i].open}\n${tail}\n${blocks[i].close}`);
+        }
+        break;
+    }
+    return kept;
+}
+/**
  * Keeps the maximal tail of `blocks[start, end)` whose rendered length fits
  * `budget`: whole blocks from the end, tail-slicing the TEXT of the oldest
  * block that only partially fits so its tags stay intact.
@@ -356,6 +473,209 @@ function keepRenderedTail(blocks, rendered, start, end, budget) {
         break;
     }
     return kept;
+}
+/**
+ * The retained turns that precede one capture's own turns. Two captures of one
+ * session can overlap, and the newer one can store its window before the
+ * older one reads it: turns newer than the reader's own (message ids are
+ * assigned at hook entry, monotonic across the process) are not context for
+ * its transcript, they are the other capture's sources.
+ */
+export function turnsOlderThan(retained, own) {
+    const ownIds = own.map((turn) => turn.messageId).filter((id) => typeof id === "number");
+    if (ownIds.length === 0)
+        return retained;
+    const ownOldest = Math.min(...ownIds);
+    return retained.filter((turn) => typeof turn.messageId !== "number" || turn.messageId < ownOldest);
+}
+/**
+ * Composes a pair window from a retained window and one capture's own turns:
+ * double-preserved exchanges collapse (dedupePairWindow), the union is put in
+ * chronological order by message id so an overlapping newer capture's turns
+ * never sit ahead of older ones, and the cap keeps the newest pairs while
+ * always retaining every one of this capture's own user turns.
+ */
+export function composePairWindow(retained, own, contextTurns) {
+    const merged = dedupePairWindow([...retained, ...own], retained.length);
+    const ordered = merged
+        .map((turn, index) => ({ turn, index }))
+        .sort((a, b) => {
+        const aId = typeof a.turn.messageId === "number" ? a.turn.messageId : Number.MAX_SAFE_INTEGER;
+        const bId = typeof b.turn.messageId === "number" ? b.turn.messageId : Number.MAX_SAFE_INTEGER;
+        return aId === bId ? a.index - b.index : aId - bId;
+    })
+        .map((entry) => entry.turn);
+    return trimTurnsToUserCap(ordered, Math.max(contextTurns, own.filter((turn) => turn.role === "user").length));
+}
+/**
+ * Bounds a rolling pair window to at most `maxUserTurns` user turns, keeping
+ * the newest ones with their interleaved assistant replies, and never leaving
+ * an orphan assistant turn ahead of the window's first user turn. The caller
+ * passes max(autoCaptureContextTurns, this call's new user turns), so the
+ * transcript always contains every not-yet-extracted user turn, padded with
+ * earlier still-buffered pairs up to the configured window.
+ */
+export function trimTurnsToUserCap(turns, maxUserTurns) {
+    const cap = Math.max(1, maxUserTurns);
+    let userCount = 0;
+    let start = turns.length;
+    for (let i = turns.length - 1; i >= 0; i--) {
+        if (turns[i].role === "user") {
+            userCount++;
+            if (userCount > cap)
+                break;
+            start = i;
+        }
+    }
+    if (userCount === 0) {
+        // All-assistant window (possible under captureAssistant=true when the
+        // delta carries only assistant turns): no user anchor exists, so keep
+        // the newest `cap` turns instead of silently dropping everything.
+        return turns.slice(-cap);
+    }
+    return turns.slice(start);
+}
+/**
+ * Repairs a pair window that double-preserved deferred turns. A below-threshold
+ * deferral keeps content alive on two independent paths -- the rolling pair
+ * buffer, and the watermark rollback (or pending-ingress re-queue) whose next
+ * slice re-includes the same turns -- so the assembled window can carry the
+ * same exchange twice. Collapse duplicates by user text at pair granularity:
+ * a pair-shaped copy (user turn plus its replies) beats a flat re-queued copy,
+ * copies of an identical exchange collapse to the latest, and a repeated user
+ * text whose replies differ is a real conversation and is kept whole.
+ */
+export function dedupePairWindow(turns, priorBoundary = turns.length) {
+    const groups = [];
+    let current = null;
+    for (let index = 0; index < turns.length; index++) {
+        const turn = turns[index];
+        if (turn.role === "user") {
+            current = { turns: [turn], userText: turn.text, replies: "", fromPriorWindow: index < priorBoundary };
+            groups.push(current);
+        }
+        else if (current) {
+            current.turns.push(turn);
+            current.replies = JSON.stringify(current.turns.slice(1).map((t) => t.text));
+        }
+        else {
+            groups.push({ turns: [turn], userText: null, replies: "", fromPriorWindow: index < priorBoundary });
+        }
+    }
+    const kept = [];
+    for (const group of groups) {
+        if (group.userText === null) {
+            kept.push(group);
+            continue;
+        }
+        let prevIndex = -1;
+        for (let i = kept.length - 1; i >= 0; i--) {
+            if (kept[i].userText === group.userText) {
+                prevIndex = i;
+                break;
+            }
+        }
+        if (prevIndex < 0) {
+            kept.push(group);
+            continue;
+        }
+        const prev = kept[prevIndex];
+        const prevPaired = prev.turns.length > 1;
+        const currPaired = group.turns.length > 1;
+        if (currPaired && prevPaired) {
+            if (prev.replies === group.replies) {
+                kept.splice(prevIndex, 1);
+                kept.push(group);
+            }
+            else {
+                kept.push(group);
+            }
+        }
+        else if (currPaired && !prevPaired) {
+            kept.splice(prevIndex, 1);
+            kept.push(group);
+        }
+        else if (!currPaired && prevPaired) {
+            // A reply-less repeat is only replay noise when it is itself a PRIOR-
+            // window copy (the double-preserve class this repair exists for). A
+            // CURRENT-call repeat is a human intentionally saying the same thing
+            // again -- whether the earlier pair sits in the prior window or in this
+            // same call -- and the watermark advances through its text either way,
+            // so dropping it would silently delete the newest input from its own
+            // extraction. The messageId guard still collapses a literal echo of
+            // the SAME turn replayed twice into one slice.
+            if (!group.fromPriorWindow &&
+                (prev.fromPriorWindow || group.turns[0].messageId !== prev.turns[0].messageId)) {
+                kept.push(group);
+            }
+            continue;
+        }
+        else {
+            kept.splice(prevIndex, 1);
+            kept.push(group);
+        }
+    }
+    return kept.flatMap((group) => group.turns);
+}
+/**
+ * Weaves context-only assistant replies (collected when captureAssistant is
+ * off but the rolling pair window is on) back into the reconciled turn
+ * sequence, directly after the surviving turn they replied to. A context
+ * reply whose anchor turn was dropped by an upstream selector is dropped with
+ * it: a reply without its user turn is noise, never context. Entries with a
+ * null anchor (a leading reply with no prior turn in the payload) weave at
+ * the front in arrival order.
+ */
+export function weaveContextOnlyAssistantTurns(turns, contextReplies) {
+    if (contextReplies.length === 0) {
+        return turns;
+    }
+    const result = [...turns];
+    let frontCursor = 0;
+    const insertAfterByAnchor = new Map();
+    for (const { anchorMessageId, turn } of contextReplies) {
+        if (anchorMessageId === null) {
+            result.splice(frontCursor, 0, turn);
+            frontCursor++;
+            continue;
+        }
+        let insertAt = insertAfterByAnchor.get(anchorMessageId);
+        if (insertAt === undefined) {
+            let anchorIndex = -1;
+            for (let i = result.length - 1; i >= 0; i--) {
+                if (result[i].messageId === anchorMessageId) {
+                    anchorIndex = i;
+                    break;
+                }
+            }
+            if (anchorIndex < 0) {
+                continue;
+            }
+            insertAt = anchorIndex + 1;
+        }
+        result.splice(insertAt, 0, turn);
+        insertAfterByAnchor.set(anchorMessageId, insertAt + 1);
+    }
+    return result;
+}
+/**
+ * Counts the protected referent prefix over SOURCE turns only. The referent
+ * run a remember flow prepends must keep its budget guarantee even when
+ * `weaveContextOnlyAssistantTurns` placed a context-only block ahead of or
+ * between referent turns -- context blocks are transparent here, mirroring
+ * how `buildBoundedTranscriptWithStats` spends the protected count on source
+ * blocks alone. The scan still stops at the first non-referent SOURCE turn.
+ */
+export function countProtectedReferentPrefix(turns, referentTurns) {
+    let count = 0;
+    for (const turn of turns) {
+        if (turn.contextOnly === true)
+            continue;
+        if (!referentTurns.has(turn))
+            break;
+        count++;
+    }
+    return count;
 }
 /**
  * Assembles the ordered turn sequence for the extraction prompt's transcript
