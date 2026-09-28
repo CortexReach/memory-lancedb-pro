@@ -136,6 +136,18 @@ describe("cli subcommand attachment", () => {
     );
   });
 
+  it("makes backfill-search-text reachable as memory-pro backfill-search-text", () => {
+    const program = buildRegisteredProgram();
+    const memoryPro = program.commands.find((c) => c.name() === "memory-pro");
+    assert.ok(memoryPro, "memory-pro group must be registered");
+
+    const groupNames = memoryPro.commands.map((c) => c.name());
+    assert.ok(
+      groupNames.includes("backfill-search-text"),
+      `expected "backfill-search-text" under the memory-pro group, got: ${groupNames.join(", ")}`
+    );
+  });
+
   it("makes repair-summaries reachable as memory-pro repair-summaries", () => {
     const program = buildRegisteredProgram();
     const memoryPro = program.commands.find((c) => c.name() === "memory-pro");

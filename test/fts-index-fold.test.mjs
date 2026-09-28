@@ -28,10 +28,10 @@ async function ftsIndexStats(dir) {
   const table = await db.openTable("memories");
   const indices = await table.listIndices();
   const fts = indices.find(
-    (idx) => idx.indexType === "FTS" || (idx.columns ?? []).includes("text"),
+    (idx) => idx.indexType === "FTS" || (idx.columns ?? []).some((column) => column === "search_text" || column === "text"),
   );
   if (!fts) return null;
-  return await table.indexStats(fts.name ?? "text_idx");
+  return await table.indexStats(fts.name ?? "search_text_idx");
 }
 
 async function waitFor(probe, timeoutMs = 30_000, stepMs = 250) {

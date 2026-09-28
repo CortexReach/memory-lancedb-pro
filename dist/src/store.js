@@ -11,6 +11,7 @@ import { matchesMemoryCategoryFilter, resolveCategoryFilterCandidates } from "./
 import { drainManualRecallMetadata, ManualRecallMetadataBatchSettledError, } from "./manual-recall-metadata-queue.js";
 import { RedisLockAcquisitionError, RedisLockLeaseIntegrityError, RedisLockManager, RedisLockUnavailableError, } from "./redis-lock.js";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import { LEGACY_FTS_COLUMN, SEARCH_TEXT_COLUMN, buildSearchText } from "./search-text.js";
 // ============================================================================
 // LanceDB Dynamic Import
 // ============================================================================
@@ -235,9 +236,34 @@ function isRowScopeAccessible(realScope, scopeFilter) {
         return false;
     return scopeFilter.includes(realScope);
 }
+function ftsIndexColumn(idx) {
+    const candidate = idx;
+    const columns = Array.isArray(candidate?.columns) ? candidate.columns.map(String) : [];
+    if (columns.includes(SEARCH_TEXT_COLUMN))
+        return SEARCH_TEXT_COLUMN;
+    if (columns.includes(LEGACY_FTS_COLUMN))
+        return LEGACY_FTS_COLUMN;
+    if (candidate?.indexType === "FTS")
+        return columns[0] ?? LEGACY_FTS_COLUMN;
+    return null;
+}
+function isFtsIndex(idx) {
+    return ftsIndexColumn(idx) !== null;
+}
+function ftsIndexName(idx) {
+    const name = idx?.name;
+    return typeof name === "string" && name ? name : `${ftsIndexColumn(idx) ?? LEGACY_FTS_COLUMN}_idx`;
+}
 function hasFtsIndex(indices) {
-    return Array.isArray(indices) && indices.some((idx) => idx?.indexType === "FTS" ||
-        (Array.isArray(idx?.columns) && idx.columns.includes("text")));
+    return Array.isArray(indices) && indices.some(isFtsIndex);
+}
+function preferredFtsColumn(indices) {
+    if (!Array.isArray(indices))
+        return null;
+    const columns = indices.map(ftsIndexColumn).filter((column) => column !== null);
+    if (columns.includes(SEARCH_TEXT_COLUMN))
+        return SEARCH_TEXT_COLUMN;
+    return columns[0] ?? null;
 }
 function scoreLexicalHit(query, candidates) {
     const normalizedQuery = normalizeSearchText(query);
@@ -478,6 +504,8 @@ export class MemoryStore {
     // optimize() after ~20 data modification operations so indices fold in
     // newly written rows instead of leaving them in the brute-force-scanned tail.
     static INDEX_FOLD_OP_THRESHOLD = 20;
+    ftsColumn = SEARCH_TEXT_COLUMN;
+    searchTextColumnReady = false;
     config;
     disableNativeCosine;
     redisLock = null;
@@ -710,10 +738,10 @@ export class MemoryStore {
             if (!table || typeof table.indexStats !== "function")
                 return;
             const indices = await table.listIndices();
-            const fts = indices.find((idx) => idx.indexType === "FTS" || idx.columns?.includes("text"));
+            const fts = indices.find(isFtsIndex);
             if (!fts)
                 return;
-            const stats = await table.indexStats(fts.name ?? "text_idx");
+            const stats = await table.indexStats(ftsIndexName(fts));
             const backlog = stats?.numUnindexedRows ?? 0;
             if (backlog >= MemoryStore.INDEX_FOLD_OP_THRESHOLD) {
                 console.log(`[memory-lancedb-pro] FTS index has ${backlog} unindexed rows; scheduling catch-up fold`);
@@ -761,6 +789,7 @@ export class MemoryStore {
                 `  Fix: Verify the path exists and is writable. Check parent directory permissions.`);
         }
         const table = await this.openOrCreateMemoryTable(db);
+        this.searchTextColumnReady = await this.tableHasSearchTextColumn(table);
         await this.backfillLegacySecondTimestamps(table);
         // Validate vector dimensions
         // Note: LanceDB returns Arrow Vector objects, not plain JS arrays.
@@ -805,6 +834,11 @@ export class MemoryStore {
         if (!fieldNames.has("metadata")) {
             missingColumns.push({ name: "metadata", valueSql: "'{}'" });
         }
+        if (!fieldNames.has(SEARCH_TEXT_COLUMN)) {
+            // Seeded with the abstract so BM25 keeps answering until the backfill
+            // below folds the summary layers in.
+            missingColumns.push({ name: SEARCH_TEXT_COLUMN, valueSql: LEGACY_FTS_COLUMN });
+        }
         return missingColumns;
     }
     async readMissingLegacyColumns(table) {
@@ -824,6 +858,10 @@ export class MemoryStore {
                 console.warn(`memory-lancedb-pro: migrating legacy table — adding columns: ${currentMissingColumns.map((c) => c.name).join(", ")}`);
                 await table.addColumns(currentMissingColumns);
                 console.log(`memory-lancedb-pro: migration complete — ${currentMissingColumns.length} column(s) added`);
+                if (currentMissingColumns.some((column) => column.name === SEARCH_TEXT_COLUMN)) {
+                    const backfill = await this.backfillSearchTextRows(table);
+                    console.log(`memory-lancedb-pro: ${SEARCH_TEXT_COLUMN} backfill — ${backfill.updated} of ${backfill.scanned} row(s) rewritten from their summary layers`);
+                }
             };
             if (alreadyLocked) {
                 await applyMigration();
@@ -871,6 +909,7 @@ export class MemoryStore {
                         importance: 0,
                         timestamp: 0,
                         metadata: "{}",
+                        search_text: "",
                     };
                     try {
                         lockedTable = await db.createTable(TABLE_NAME, [schemaEntry]);
@@ -990,15 +1029,24 @@ export class MemoryStore {
     }
     async createFtsIndex(table) {
         try {
-            // Check if FTS index already exists
             const indices = await table.listIndices();
-            if (!hasFtsIndex(indices)) {
-                // LanceDB @lancedb/lancedb >=0.26: use Index.fts() config
-                const lancedb = await loadLanceDB();
-                await table.createIndex("text", {
-                    config: lancedb.Index.fts({ withPosition: true }),
-                });
+            const column = (await this.tableHasSearchTextColumn(table)) ? SEARCH_TEXT_COLUMN : LEGACY_FTS_COLUMN;
+            const existing = indices.filter(isFtsIndex);
+            if (existing.some((idx) => ftsIndexColumn(idx) === column)) {
+                this.ftsColumn = column;
+                return;
             }
+            // An index left on the abstract column would make a bare FTS query
+            // ambiguous once the search_text index exists; the move replaces it.
+            for (const idx of existing) {
+                await table.dropIndex(ftsIndexName(idx));
+            }
+            // LanceDB @lancedb/lancedb >=0.26: use Index.fts() config
+            const lancedb = await loadLanceDB();
+            await table.createIndex(column, {
+                config: lancedb.Index.fts({ withPosition: true }),
+            });
+            this.ftsColumn = column;
         }
         catch (err) {
             throw new Error(`FTS index creation failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -1051,7 +1099,7 @@ export class MemoryStore {
                 metadata: entry.metadata || "{}",
                 importance: clampImportance(entry.importance),
             };
-            await this.table.add([normalizedEntry]);
+            await this.table.add([this.toRow(normalizedEntry)]);
             return normalizedEntry;
         }));
         this.noteDataModification();
@@ -1222,7 +1270,7 @@ export class MemoryStore {
                 const chunkIdx = Math.floor(i / MemoryStore.MAX_BATCH_SIZE);
                 try {
                     await this.runWithWriteLock(async () => {
-                        await this.table.add(chunk);
+                        await this.table.add(chunk.map((entry) => this.toRow(entry)));
                     });
                     this.noteDataModification();
                 }
@@ -1436,7 +1484,7 @@ export class MemoryStore {
             metadata: entry.metadata || "{}",
         };
         return this.runWithWriteLock(async () => {
-            await this.table.add([full]);
+            await this.table.add([this.toRow(full)]);
             return full;
         });
     }
@@ -1651,7 +1699,7 @@ export class MemoryStore {
         }
         try {
             // Use FTS query type explicitly
-            let searchQuery = this.table.search(query, "fts").limit(fetchLimit);
+            let searchQuery = this.table.search(query, "fts", this.ftsColumn).limit(fetchLimit);
             // Apply scope filter if provided
             if (scopeFilter && scopeFilter.length > 0) {
                 const scopeConditions = scopeFilter
@@ -2211,7 +2259,7 @@ export class MemoryStore {
                         where: "target.scope = source.scope OR " +
                             "(target.scope IS NULL AND source.scope = 'global')",
                     })
-                        .execute(updatedEntries);
+                        .execute(updatedEntries.map((entry) => this.toRow(entry)));
                     if (mergeResult.numUpdatedRows !== updatedEntries.length) {
                         await classifyUncertainMerge(`updated ${mergeResult.numUpdatedRows} of ${updatedEntries.length} expected rows`);
                         continue;
@@ -2362,7 +2410,7 @@ export class MemoryStore {
                 try {
                     await this.table.delete(`(${deleteWhereClause})`);
                     deleted = true;
-                    await this.table.add(persistedUpdates);
+                    await this.table.add(persistedUpdates.map((entry) => this.toRow(entry)));
                     this.noteDataModification();
                     for (let index = 0; index < updatedEntries.length; index++) {
                         results.set(updatedInputIndices[index], {
@@ -2392,7 +2440,7 @@ export class MemoryStore {
                     const originalsToRestore = originals.filter((entry) => !preservedIds.has(entry.id));
                     try {
                         if (originalsToRestore.length > 0) {
-                            await this.table.add(originalsToRestore);
+                            await this.table.add(originalsToRestore.map((entry) => this.toRow(entry)));
                         }
                     }
                     catch (rollbackError) {
@@ -2529,7 +2577,7 @@ export class MemoryStore {
         const resolvedId = escapeSqlLiteral(row.id);
         await this.table.delete(`id = '${resolvedId}'`);
         try {
-            await this.table.add([{ ...updated, scope: persistedScope }]);
+            await this.table.add([this.toRow({ ...updated, scope: persistedScope })]);
         }
         catch (addError) {
             const current = await this.getById(original.id).catch(() => null);
@@ -2538,7 +2586,7 @@ export class MemoryStore {
                     `Write error: ${addError instanceof Error ? addError.message : String(addError)}`);
             }
             try {
-                await this.table.add([rollbackCandidate]);
+                await this.table.add([this.toRow(rollbackCandidate)]);
             }
             catch (rollbackError) {
                 throw new Error(`Failed to update memory ${id}: write failed after delete, and rollback also failed. ` +
@@ -2680,7 +2728,7 @@ export class MemoryStore {
                     const replacement = { ...row, scope: targetScope.trim() };
                     await this.table.delete(`id = '${safeId}'`);
                     try {
-                        await this.table.add([replacement]);
+                        await this.table.add([this.toRow(replacement)]);
                     }
                     catch (addError) {
                         // Commit-then-reject: the add can persist and STILL surface an
@@ -2701,7 +2749,7 @@ export class MemoryStore {
                         }
                         if (landed === null) {
                             try {
-                                await this.table.add([{ ...row }]);
+                                await this.table.add([this.toRow({ ...row })]);
                             }
                             catch {
                                 // The rollback write shares the replacement add's
@@ -2802,7 +2850,7 @@ export class MemoryStore {
                     : options.entry.metadata || "{}",
                 importance: clampImportance(Number(options.entry.importance)),
             };
-            await this.table.add([fullEntry]);
+            await this.table.add([this.toRow(fullEntry)]);
             const supersededIds = [];
             const invalidationFailures = [];
             for (const target of targets) {
@@ -2876,6 +2924,7 @@ export class MemoryStore {
             const indices = await this.table.listIndices();
             const available = hasFtsIndex(indices);
             this.ftsIndexCreated = available;
+            this.ftsColumn = preferredFtsColumn(indices) ?? this.ftsColumn;
             if (available)
                 this._lastFtsError = null;
             return available;
@@ -2891,6 +2940,70 @@ export class MemoryStore {
         return this.refreshFtsSupportFromTable();
     }
     /** Get FTS index health status */
+    async tableHasSearchTextColumn(table) {
+        try {
+            const schema = await table.schema();
+            return schema.fields.some((field) => field.name === SEARCH_TEXT_COLUMN);
+        }
+        catch {
+            return false;
+        }
+    }
+    // Every row reaching the table gets its BM25 source recomputed from the
+    // abstract and the summary layers, so no rewrite path can let it drift.
+    toRow(entry) {
+        if (!this.searchTextColumnReady) {
+            if (!(SEARCH_TEXT_COLUMN in entry))
+                return entry;
+            const stripped = { ...entry };
+            delete stripped[SEARCH_TEXT_COLUMN];
+            return stripped;
+        }
+        return { ...entry, [SEARCH_TEXT_COLUMN]: buildSearchText(entry.text, entry.metadata) };
+    }
+    async backfillSearchTextRows(table, options = {}) {
+        const dryRun = options.dryRun ?? false;
+        const batchSize = clampInt(options.batchSize ?? 200, 1, 1000);
+        const summaries = await table.query().select(["id", "text", "metadata", SEARCH_TEXT_COLUMN]).toArray();
+        const staleIds = [];
+        for (const row of summaries) {
+            const expected = buildSearchText(String(row.text ?? ""), row.metadata);
+            if (row[SEARCH_TEXT_COLUMN] !== expected)
+                staleIds.push(String(row.id));
+        }
+        let updated = 0;
+        if (!dryRun) {
+            for (let start = 0; start < staleIds.length; start += batchSize) {
+                const ids = staleIds.slice(start, start + batchSize);
+                const where = ids.map((id) => `id = '${escapeSqlLiteral(id)}'`).join(" OR ");
+                const rows = await table.query().where(`(${where})`).toArray();
+                const rewritten = rows.map((row) => ({
+                    ...row,
+                    vector: Array.from(row.vector),
+                    [SEARCH_TEXT_COLUMN]: buildSearchText(String(row.text ?? ""), row.metadata),
+                }));
+                if (rewritten.length === 0)
+                    continue;
+                await table.mergeInsert("id").whenMatchedUpdateAll().execute(rewritten);
+                updated += rewritten.length;
+            }
+        }
+        return { scanned: summaries.length, stale: staleIds.length, updated };
+    }
+    /** Report (or with dryRun=false rewrite) rows whose BM25 source column is missing or stale. */
+    async backfillSearchText(options = {}) {
+        await this.ensureInitialized();
+        if (!this.searchTextColumnReady) {
+            throw new Error(`${SEARCH_TEXT_COLUMN} column is missing: the table schema migration did not run`);
+        }
+        const result = await this.runWithWriteLock(async () => {
+            await this.checkoutLatestTableForWrite();
+            return this.backfillSearchTextRows(this.table, options);
+        });
+        if (result.updated > 0)
+            this.noteDataModification();
+        return result;
+    }
     getFtsStatus() {
         return {
             available: this.ftsIndexCreated,
@@ -2910,10 +3023,10 @@ export class MemoryStore {
                 // index before the error propagates, so a partial drop can never
                 // leave the store without full-text search.
                 const indices = await this.table.listIndices();
-                const matching = indices.filter((idx) => idx.indexType === "FTS" || idx.columns?.includes("text"));
+                const matching = indices.filter(isFtsIndex);
                 let dropped = 0;
                 for (const idx of matching) {
-                    const indexName = idx.name || "text";
+                    const indexName = ftsIndexName(idx);
                     try {
                         await this.table.dropIndex(indexName);
                         dropped += 1;
