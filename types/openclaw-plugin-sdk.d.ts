@@ -19,3 +19,15 @@ declare module "openclaw/plugin-sdk" {
     [key: string]: any;
   }
 }
+
+declare module "openclaw/plugin-sdk/memory-recall" {
+  export function recordMemoryRecall(params: {
+    config: unknown;
+    workspaceDir: string;
+    sessionKey: string;
+    runId: string;
+    assertActive: () => void;
+    query: string;
+    results: Array<{ path: string; startLine: number; endLine: number; score: number; snippet: string; source: "memory" }>;
+  }): Promise<void>;
+}

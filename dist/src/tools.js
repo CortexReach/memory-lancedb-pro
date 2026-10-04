@@ -17,6 +17,7 @@ import { getDisplayCategoryTag, parseReflectionMetadata } from "./reflection-met
 import { filterUserMdExclusiveRecallResults, isUserMdExclusiveMemory, } from "./workspace-boundary.js";
 import { isSuppressed as isTier1Suppressed } from "./auto-recall-tier1.js";
 import { enqueueManualRecallMetadata } from "./manual-recall-metadata-queue.js";
+import { recordSurfacedRecall } from "./native-recall.js";
 // ============================================================================
 // Types
 // ============================================================================
@@ -806,6 +807,7 @@ function createMemoryRecallTool(runtimeContext, options) {
                         },
                     };
                 }));
+                const surfaced = [];
                 const text = results
                     .map((r, i) => {
                     const categoryTag = getDisplayCategoryTag(r.entry);
@@ -822,6 +824,9 @@ function createMemoryRecallTool(runtimeContext, options) {
                     const rendered = includeFullText
                         ? `${inline}${neighborText}`
                         : truncateText(`${inline}${neighborText}`, safeCharsPerItem);
+                    const withoutEllipsis = !includeFullText && inline.length + neighborText.length > safeCharsPerItem
+                        ? rendered.slice(0, -1).trimEnd() : rendered;
+                    surfaced.push({ result: r, sourceText: base, format: "manual", text: withoutEllipsis.slice(0, inline.length) });
                     return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${rendered}`;
                 })
                     .join("\n");
@@ -833,6 +838,7 @@ function createMemoryRecallTool(runtimeContext, options) {
                             metadata.l2_content || metadata.l1_overview || results[i].entry.text;
                     }
                 }
+                await recordSurfacedRecall(options.api, options.invocation, query, surfaced);
                 return {
                     content: [
                         {
@@ -873,6 +879,11 @@ export function registerMemoryRecallTool(api, context) {
     api.registerTool((toolCtx) => {
         const runtimeContext = resolveToolContext(context, toolCtx);
         return createMemoryRecallTool(runtimeContext, {
+            api,
+            invocation: {
+                workspaceDir: toolCtx.workspaceDir, sessionKey: toolCtx.sessionKey, runId: toolCtx.runId,
+                assertActive: toolCtx.assertInvocationCurrent?.bind(toolCtx),
+            },
             name: "memory_recall",
             label: "Memory Recall",
             description: "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
@@ -887,6 +898,11 @@ export function registerMemoryRecallAliasTool(api, context, alias) {
     api.registerTool((toolCtx) => {
         const runtimeContext = resolveToolContext(context, toolCtx);
         return createMemoryRecallTool(runtimeContext, {
+            api,
+            invocation: {
+                workspaceDir: toolCtx.workspaceDir, sessionKey: toolCtx.sessionKey, runId: toolCtx.runId,
+                assertActive: toolCtx.assertInvocationCurrent?.bind(toolCtx),
+            },
             name: alias,
             label,
             description,
