@@ -168,6 +168,21 @@ OpenClaw hosts receive:
 
 Dreaming compatibility is configured under the same plugin entry. If `dreaming.enabled` is true while this plugin owns `plugins.slots.memory`, OpenClaw can use the memory-core dreaming sidecar against this plugin's memory capability and public artifacts.
 
+On hosts exposing `openclaw/plugin-sdk/memory-recall`, interactive `memory_recall`
+(including the `memory_search`/`memory_get` aliases) and successful auto-recall
+injections also report surfaced canonical-file excerpts to native dreaming.
+This requires canonical-corpus metadata for the current workspace, matching
+content hashes, and the host's live tool/hook run context. The host validates the
+excerpt against the source file, applies its existing dreaming eligibility rules,
+and deduplicates repeated recalls within the same run. Only literal displayed
+primary text counts; generated abstracts, neighbor text, virtual LanceDB IDs,
+session transcripts, and late/failed injections do not become file evidence.
+Auto-context markup transformations are conservatively excluded. Daily corpus
+ingestion does not produce interactive signals. Older hosts without the API or
+invocation context continue normal retrieval without this additional recording.
+No native dreaming thresholds, promotion budgets, or provenance labels are
+changed by this bridge; it does not write native state directly.
+
 Validate & restart:
 
 ```bash
