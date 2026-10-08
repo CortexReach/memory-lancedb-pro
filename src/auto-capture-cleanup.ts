@@ -598,15 +598,40 @@ export function turnsOlderThan(
  * double-preserved exchanges collapse (dedupePairWindow), the union is put in
  * chronological order by message id so an overlapping newer capture's turns
  * never sit ahead of older ones, and the cap keeps the newest pairs while
- * always retaining every one of this capture's own user turns.
+ * always retaining every one of this capture's own user turns. This is the
+ * window kept for later captures; the capture's own transcript comes from
+ * composeCaptureTranscript.
  */
 export function composePairWindow(
   retained: ConversationTurn[],
   own: ConversationTurn[],
   contextTurns: number,
 ): ConversationTurn[] {
-  const merged = dedupePairWindow([...retained, ...own], retained.length);
-  const ordered = merged
+  const ordered = orderPairWindow(retained, own);
+  return ordered.slice(userCapStart(ordered, pairWindowUserCap(own, contextTurns)));
+}
+
+/**
+ * One capture's extraction transcript: the composed pair window, widened so
+ * every one of the capture's own source turns stays in. The user-turn cap
+ * bounds retained context only. A source it cut (under captureAssistant=true,
+ * the reply that precedes the capture's first user turn) would still count as
+ * consumed by the seen-text cursor and never reach the extractor.
+ */
+export function composeCaptureTranscript(
+  retained: ConversationTurn[],
+  own: ConversationTurn[],
+  contextTurns: number,
+): ConversationTurn[] {
+  const ordered = orderPairWindow(retained, own);
+  const sources = new Set(own.filter((turn) => turn.contextOnly !== true));
+  const firstSource = ordered.findIndex((turn) => sources.has(turn));
+  const capStart = userCapStart(ordered, pairWindowUserCap(own, contextTurns));
+  return ordered.slice(firstSource < 0 ? capStart : Math.min(capStart, firstSource));
+}
+
+function orderPairWindow(retained: ConversationTurn[], own: ConversationTurn[]): ConversationTurn[] {
+  return dedupePairWindow([...retained, ...own], retained.length)
     .map((turn, index) => ({ turn, index }))
     .sort((a, b) => {
       const aId = typeof a.turn.messageId === "number" ? a.turn.messageId : Number.MAX_SAFE_INTEGER;
@@ -614,10 +639,10 @@ export function composePairWindow(
       return aId === bId ? a.index - b.index : aId - bId;
     })
     .map((entry) => entry.turn);
-  return trimTurnsToUserCap(
-    ordered,
-    Math.max(contextTurns, own.filter((turn) => turn.role === "user").length),
-  );
+}
+
+function pairWindowUserCap(own: ConversationTurn[], contextTurns: number): number {
+  return Math.max(contextTurns, own.filter((turn) => turn.role === "user").length);
 }
 
 /**
@@ -632,6 +657,10 @@ export function trimTurnsToUserCap(
   turns: ConversationTurn[],
   maxUserTurns: number,
 ): ConversationTurn[] {
+  return turns.slice(userCapStart(turns, maxUserTurns));
+}
+
+function userCapStart(turns: ConversationTurn[], maxUserTurns: number): number {
   const cap = Math.max(1, maxUserTurns);
   let userCount = 0;
   let start = turns.length;
@@ -646,9 +675,9 @@ export function trimTurnsToUserCap(
     // All-assistant window (possible under captureAssistant=true when the
     // delta carries only assistant turns): no user anchor exists, so keep
     // the newest `cap` turns instead of silently dropping everything.
-    return turns.slice(-cap);
+    return Math.max(0, turns.length - cap);
   }
-  return turns.slice(start);
+  return start;
 }
 
 /**

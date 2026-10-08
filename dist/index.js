@@ -43,7 +43,7 @@ import { buildFallbackCandidate, gateRegexFallbackCapture } from "./src/autocapt
 import { gateMappedReflectionEntries, resolveMappedRowAdmissionController } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { buildConversationTurnsForExtraction, composePairWindow, weaveContextOnlyAssistantTurns, countProtectedReferentPrefix, formatConversationTranscript, neutralizeSpeakerTagSpoof, nextAutoCaptureMessageId, normalizeAutoCaptureText, reconcileTurnsWithKeptTexts, turnsOlderThan, } from "./src/auto-capture-cleanup.js";
+import { buildConversationTurnsForExtraction, composePairWindow, composeCaptureTranscript, weaveContextOnlyAssistantTurns, countProtectedReferentPrefix, formatConversationTranscript, neutralizeSpeakerTagSpoof, nextAutoCaptureMessageId, normalizeAutoCaptureText, reconcileTurnsWithKeptTexts, turnsOlderThan, } from "./src/auto-capture-cleanup.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter, stripEnvelopeMetadata } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -2059,6 +2059,7 @@ function _initPluginState(api) {
     const recallHistory = new Map();
     const turnCounter = new Map();
     const autoCaptureSeenTextCount = new Map();
+    const autoCaptureSeenTextGeneration = new Map();
     const autoCapturePendingIngressTexts = new Map();
     const autoCaptureCountedPendingCount = new Map();
     const autoCaptureRecentTurns = new Map();
@@ -2093,6 +2094,7 @@ function _initPluginState(api) {
         recallHistory,
         turnCounter,
         autoCaptureSeenTextCount,
+        autoCaptureSeenTextGeneration,
         autoCapturePendingIngressTexts,
         autoCaptureCountedPendingCount,
         autoCaptureRecentTurns,
@@ -2214,7 +2216,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, manualEchoLedger, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureRecentPairTurns, autoCapturePairWindowEpoch, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, makeLaneLlmClient, admissionRejectionAuditWriter, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, manualEchoLedger, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCaptureSeenTextGeneration, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureRecentPairTurns, autoCapturePairWindowEpoch, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, makeLaneLlmClient, admissionRejectionAuditWriter, } = singleton;
         const learnAutoCaptureSessionAlias = (sessionId, sessionKey) => {
             if (typeof sessionId !== "string" || !sessionId
                 || typeof sessionKey !== "string" || !sessionKey
@@ -3334,7 +3336,23 @@ const memoryLanceDBProPlugin = {
                             autoCapturePendingIngressTexts.delete(conversationKey);
                             autoCaptureCountedPendingCount.delete(conversationKey);
                         }
-                        const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
+                        // A same-key snapshot shorter than the cursor is a rewound history
+                        // (rollover, compaction, replaced transcript): the cursor indexes
+                        // texts that are gone. Re-baseline it, and open a new generation so
+                        // runs that read the old history cannot write the cursor back.
+                        const recordedSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
+                        const historyRewound = pendingIngressTexts.length === 0 && eligibleTexts.length < recordedSeenCount;
+                        if (historyRewound) {
+                            autoCaptureSeenTextGeneration.set(sessionKey, (autoCaptureSeenTextGeneration.get(sessionKey) ?? 0) + 1);
+                            pruneMapIfOver(autoCaptureSeenTextGeneration, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        }
+                        const seenTextGenerationAtEntry = autoCaptureSeenTextGeneration.get(sessionKey) ?? 0;
+                        const previousSeenCount = historyRewound ? 0 : recordedSeenCount;
+                        const writeSeenCursor = (count) => {
+                            if ((autoCaptureSeenTextGeneration.get(sessionKey) ?? 0) === seenTextGenerationAtEntry) {
+                                autoCaptureSeenTextCount.set(sessionKey, count);
+                            }
+                        };
                         let newTexts = eligibleTexts;
                         let newlyObservedCount = eligibleTexts.length;
                         if (pendingIngressTexts.length > 0) {
@@ -3586,7 +3604,7 @@ const memoryLanceDBProPlugin = {
                                 return;
                             }
                             if (pendingIngressTexts.length === 0) {
-                                autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
+                                writeSeenCursor(previousSeenCount);
                                 return;
                             }
                             if (conversationKey) {
@@ -3705,7 +3723,7 @@ const memoryLanceDBProPlugin = {
                                 // window below, in chronological order.
                                 const contextPairTurns = turnsOlderThan(priorPairTurns, currentCallWindowTurns);
                                 if (contextTurns > 0 && pairWindowKey && rememberPrependedTurns.length === 0) {
-                                    finalConversationTurns = composePairWindow(contextPairTurns, finalConversationTurns, contextTurns);
+                                    finalConversationTurns = composeCaptureTranscript(contextPairTurns, finalConversationTurns, contextTurns);
                                 }
                                 // Stored only after a successful extraction (below the
                                 // extraction call): a failed extraction rolls its texts back to
@@ -3830,8 +3848,9 @@ const memoryLanceDBProPlugin = {
                                     // Monotonic for history-carrying sessions: an overlapping
                                     // older run that finishes last must not roll the cursor back
                                     // below a newer run's advance, or the newer run's texts are
-                                    // re-sliced as sources on the next turn.
-                                    autoCaptureSeenTextCount.set(sessionKey, pendingIngressTexts.length > 0
+                                    // re-sliced as sources on the next turn. A run that read a
+                                    // history since rewound writes nothing (writeSeenCursor).
+                                    writeSeenCursor(pendingIngressTexts.length > 0
                                         ? 0
                                         : Math.max(autoCaptureSeenTextCount.get(sessionKey) ?? 0, eligibleTexts.length));
                                     return; // Smart extraction handled everything
@@ -3848,7 +3867,7 @@ const memoryLanceDBProPlugin = {
                                         api.logger.info(`memory-lancedb-pro: smart extraction settled with no persisted rows for agent ${agentId} ` +
                                             `(rejected=${stats.rejected ?? 0}, skipped=${stats.skipped}, supported=${stats.supported ?? 0}, ` +
                                             `superseded=${stats.superseded ?? 0}); consuming texts without retry`);
-                                        autoCaptureSeenTextCount.set(sessionKey, pendingIngressTexts.length > 0
+                                        writeSeenCursor(pendingIngressTexts.length > 0
                                             ? 0
                                             : Math.max(autoCaptureSeenTextCount.get(sessionKey) ?? 0, eligibleTexts.length));
                                         return;
@@ -3877,7 +3896,7 @@ const memoryLanceDBProPlugin = {
                                 // already gone.
                                 const retainedCap = autoCaptureRetainedTextCap(minMessages);
                                 if (pendingIngressTexts.length === 0) {
-                                    autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
+                                    writeSeenCursor(previousSeenCount);
                                     // History content lives in the session transcript, which is gone
                                     // once the session ends: retain the deferred texts so a terminal
                                     // flush can still consume them.

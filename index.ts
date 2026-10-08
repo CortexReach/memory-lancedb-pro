@@ -77,6 +77,7 @@ import {
   type ConversationTurn,
   buildConversationTurnsForExtraction,
   composePairWindow,
+  composeCaptureTranscript,
   weaveContextOnlyAssistantTurns,
   countProtectedReferentPrefix,
   formatConversationTranscript,
@@ -2438,6 +2439,7 @@ interface PluginSingletonState {
   recallHistory: Map<string, Map<string, number>>;
   turnCounter: Map<string, number>;
   autoCaptureSeenTextCount: Map<string, number>;
+  autoCaptureSeenTextGeneration: Map<string, number>;
   autoCapturePendingIngressTexts: Map<string, string[]>;
   autoCaptureCountedPendingCount: Map<string, number>;
   autoCaptureRecentTurns: Map<string, ConversationTurn[]>;
@@ -2789,6 +2791,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const recallHistory = new Map<string, Map<string, number>>();
   const turnCounter = new Map<string, number>();
   const autoCaptureSeenTextCount = new Map<string, number>();
+  const autoCaptureSeenTextGeneration = new Map<string, number>();
   const autoCapturePendingIngressTexts = new Map<string, string[]>();
   const autoCaptureCountedPendingCount = new Map<string, number>();
   const autoCaptureRecentTurns = new Map<string, ConversationTurn[]>();
@@ -2825,6 +2828,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     recallHistory,
     turnCounter,
     autoCaptureSeenTextCount,
+    autoCaptureSeenTextGeneration,
     autoCapturePendingIngressTexts,
     autoCaptureCountedPendingCount,
     autoCaptureRecentTurns,
@@ -2990,6 +2994,7 @@ const memoryLanceDBProPlugin = {
       recallHistory,
       turnCounter,
       autoCaptureSeenTextCount,
+      autoCaptureSeenTextGeneration,
       autoCapturePendingIngressTexts,
       autoCaptureCountedPendingCount,
       autoCaptureRecentTurns,
@@ -4361,7 +4366,23 @@ const memoryLanceDBProPlugin = {
             autoCaptureCountedPendingCount.delete(conversationKey);
           }
 
-          const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
+          // A same-key snapshot shorter than the cursor is a rewound history
+          // (rollover, compaction, replaced transcript): the cursor indexes
+          // texts that are gone. Re-baseline it, and open a new generation so
+          // runs that read the old history cannot write the cursor back.
+          const recordedSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
+          const historyRewound = pendingIngressTexts.length === 0 && eligibleTexts.length < recordedSeenCount;
+          if (historyRewound) {
+            autoCaptureSeenTextGeneration.set(sessionKey, (autoCaptureSeenTextGeneration.get(sessionKey) ?? 0) + 1);
+            pruneMapIfOver(autoCaptureSeenTextGeneration, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          }
+          const seenTextGenerationAtEntry = autoCaptureSeenTextGeneration.get(sessionKey) ?? 0;
+          const previousSeenCount = historyRewound ? 0 : recordedSeenCount;
+          const writeSeenCursor = (count: number) => {
+            if ((autoCaptureSeenTextGeneration.get(sessionKey) ?? 0) === seenTextGenerationAtEntry) {
+              autoCaptureSeenTextCount.set(sessionKey, count);
+            }
+          };
           let newTexts = eligibleTexts;
           let newlyObservedCount = eligibleTexts.length;
           if (pendingIngressTexts.length > 0) {
@@ -4662,7 +4683,7 @@ const memoryLanceDBProPlugin = {
               return;
             }
             if (pendingIngressTexts.length === 0) {
-              autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
+              writeSeenCursor(previousSeenCount);
               return;
             }
             if (conversationKey) {
@@ -4796,7 +4817,7 @@ const memoryLanceDBProPlugin = {
               // window below, in chronological order.
               const contextPairTurns = turnsOlderThan(priorPairTurns, currentCallWindowTurns);
               if (contextTurns > 0 && pairWindowKey && rememberPrependedTurns.length === 0) {
-                finalConversationTurns = composePairWindow(contextPairTurns, finalConversationTurns, contextTurns);
+                finalConversationTurns = composeCaptureTranscript(contextPairTurns, finalConversationTurns, contextTurns);
               }
               // Stored only after a successful extraction (below the
               // extraction call): a failed extraction rolls its texts back to
@@ -4937,9 +4958,9 @@ const memoryLanceDBProPlugin = {
                 // Monotonic for history-carrying sessions: an overlapping
                 // older run that finishes last must not roll the cursor back
                 // below a newer run's advance, or the newer run's texts are
-                // re-sliced as sources on the next turn.
-                autoCaptureSeenTextCount.set(
-                  sessionKey,
+                // re-sliced as sources on the next turn. A run that read a
+                // history since rewound writes nothing (writeSeenCursor).
+                writeSeenCursor(
                   pendingIngressTexts.length > 0
                     ? 0
                     : Math.max(autoCaptureSeenTextCount.get(sessionKey) ?? 0, eligibleTexts.length),
@@ -4961,8 +4982,7 @@ const memoryLanceDBProPlugin = {
                     `(rejected=${stats.rejected ?? 0}, skipped=${stats.skipped}, supported=${stats.supported ?? 0}, ` +
                     `superseded=${stats.superseded ?? 0}); consuming texts without retry`,
                   );
-                  autoCaptureSeenTextCount.set(
-                    sessionKey,
+                  writeSeenCursor(
                     pendingIngressTexts.length > 0
                       ? 0
                       : Math.max(autoCaptureSeenTextCount.get(sessionKey) ?? 0, eligibleTexts.length),
@@ -5002,7 +5022,7 @@ const memoryLanceDBProPlugin = {
               // already gone.
               const retainedCap = autoCaptureRetainedTextCap(minMessages);
               if (pendingIngressTexts.length === 0) {
-                autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
+                writeSeenCursor(previousSeenCount);
                 // History content lives in the session transcript, which is gone
                 // once the session ends: retain the deferred texts so a terminal
                 // flush can still consume them.

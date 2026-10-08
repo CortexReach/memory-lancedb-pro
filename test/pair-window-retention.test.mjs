@@ -989,3 +989,142 @@ describe("round-5 regressions: store after success, overlapping captures", () =>
     assert.ok(next.indexOf(O_UB2) < next.indexOf(O_UC1), "retained context precedes the current sources");
   });
 });
+
+describe("round-6 regressions: source replies under the user cap, rewound histories", () => {
+  let workspaceDir;
+  let embeddingServer;
+  let llmServer;
+  let extractionPrompts;
+  let llmControl;
+
+  beforeEach(async () => {
+    resetRegistration();
+    workspaceDir = mkdtempSync(path.join(tmpdir(), "pair-window-r6-"));
+    extractionPrompts = [];
+    llmControl = { malformedNext: 0 };
+    embeddingServer = createEmbeddingServer({});
+    llmServer = createLlmServer(extractionPrompts, llmControl);
+    await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+  });
+
+  afterEach(async () => {
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  function registerWith(overrides) {
+    resetRegistration();
+    const harness = createPluginApiHarness({
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "memory-db"),
+        autoCapture: true,
+        autoRecall: false,
+        smartExtraction: true,
+        extractMinMessages: 2,
+        autoCaptureContextTurns: 2,
+        extractionThrottle: { skipLowValue: false, maxExtractionsPerHour: 200 },
+        sessionCompression: { enabled: false },
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+        embedding: {
+          apiKey: "test-key",
+          model: "mock-embedding-model",
+          baseURL: `http://127.0.0.1:${embeddingServer.address().port}/v1`,
+          dimensions: EMBEDDING_DIMENSIONS,
+        },
+        llm: {
+          apiKey: "test-key",
+          model: "mock-memory-model",
+          baseURL: `http://127.0.0.1:${llmServer.address().port}`,
+        },
+        ...overrides,
+      },
+      resolveRoot: workspaceDir,
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    return getAutoCaptureHook(harness.eventHandlers);
+  }
+
+  const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+  const user = (content) => ({ role: "user", content });
+  const assistant = (content) => ({ role: "assistant", content });
+
+  const C_U1 = "synthetic cap fact about the walnut music stand";
+  const C_A1 = "the walnut music stand sits by the north window";
+  const C_U2 = "synthetic cap fact about the maple bookend";
+  const C_A2 = "the maple bookend pairs well with the cedar reading lamp";
+  const C_U3 = "synthetic cap fact about the birch coat rack";
+  const C_A3 = "the birch coat rack holds four hooks";
+  const C_U4 = "synthetic cap fact about the pine shoe bench";
+
+  it("keeps a source reply that opens the capture's delta when its own user turns fill the cap", async () => {
+    const hook = registerWith({ captureAssistant: true });
+    const first = [user(C_U1), assistant(C_A1), user(C_U2)];
+    await fireAgentEnd(hook, first, ctx);
+    assert.equal(extractionPrompts.length, 1, "the first capture extracts");
+    await fireAgentEnd(hook, [...first, assistant(C_A2), user(C_U3), assistant(C_A3), user(C_U4)], ctx);
+    assert.equal(extractionPrompts.length, 2, "the second capture extracts");
+    const second = extractionPrompts[1];
+    assert.ok(
+      second.includes(`<assistant_message>\n${C_A2}`),
+      "the reply that precedes the capture's first user turn reaches its transcript as a source",
+    );
+    assert.ok(second.includes(`<user_message>\n${C_U3}`) && second.includes(`<user_message>\n${C_U4}`));
+  });
+
+  const R_U1 = "synthetic rollover fact about the teak plant stand";
+  const R_A1 = "teak plant stand noted";
+  const R_U2 = "synthetic rollover fact about the ash umbrella holder";
+  const R_A2 = "ash umbrella holder noted";
+  const R_U3 = "synthetic rollover fact about the elm magazine rack";
+  const N_U1 = "synthetic fresh-history fact about the oak key hook";
+  const N_A1 = "oak key hook noted";
+  const N_U2 = "synthetic fresh-history fact about the beech serving tray";
+
+  it("re-baselines the seen-text cursor when a same-key history comes back shorter", async () => {
+    const hook = registerWith({ extractMinMessages: 1 });
+    await fireAgentEnd(hook, [user(R_U1), assistant(R_A1), user(R_U2), assistant(R_A2), user(R_U3)], ctx);
+    assert.equal(extractionPrompts.length, 1);
+    // The host rolled the session over under the same key: the next
+    // snapshot is a fresh history, shorter than the recorded cursor.
+    await fireAgentEnd(hook, [user(N_U1)], ctx);
+    assert.equal(extractionPrompts.length, 2, "the rewound history's first turn extracts");
+    assert.ok(extractionPrompts[1].includes(`<user_message>\n${N_U1}`));
+    await fireAgentEnd(hook, [user(N_U1), assistant(N_A1), user(N_U2)], ctx);
+    assert.equal(extractionPrompts.length, 3);
+    const third = extractionPrompts[2];
+    assert.ok(third.includes(`<user_message>\n${N_U2}`), "the new turn is a source");
+    assert.ok(!third.includes(`<user_message>\n${N_U1}`), "the turn the rewound run already extracted is not re-sourced");
+  });
+
+  const G_U1 = "synthetic straggler fact about the cherry spice rack";
+  const G_A1 = "cherry spice rack noted";
+  const G_U2 = "synthetic straggler fact about the mahogany bread box";
+  const G_A2 = "mahogany bread box noted";
+  const G_U3 = "synthetic straggler fact about the rosewood napkin ring";
+  const H_U1 = "synthetic successor fact about the bamboo fruit bowl";
+  const H_A1 = "bamboo fruit bowl noted";
+  const H_U2 = "synthetic successor fact about the cork trivet";
+
+  it("leaves the cursor alone when a run that read the pre-rewind history finishes last", async () => {
+    const hook = registerWith({ extractMinMessages: 1 });
+    const settled = [user(G_U1), assistant(G_A1), user(G_U2)];
+    await fireAgentEnd(hook, settled, ctx);
+    let release;
+    llmControl.hold = { text: G_U3, released: new Promise((resolve) => { release = resolve; }) };
+    hook({ success: true, messages: [...settled, assistant(G_A2), user(G_U3)] }, ctx);
+    const straggler = hook.__lastRun;
+    assert.ok(straggler && typeof straggler.then === "function", "the pre-rewind capture is in flight");
+    await fireAgentEnd(hook, [user(H_U1)], ctx);
+    // The straggler fails once released, and a failed run hands its slice
+    // back by restoring the cursor it read at entry: a pre-rewind value.
+    llmControl.malformedNext = 1;
+    release();
+    await straggler;
+    await fireAgentEnd(hook, [user(H_U1), assistant(H_A1), user(H_U2)], ctx);
+    const last = extractionPrompts[extractionPrompts.length - 1];
+    assert.ok(last.includes(`<user_message>\n${H_U2}`), "the new turn is a source");
+    assert.ok(!last.includes(`<user_message>\n${H_U1}`), "the straggler's rollback did not restore the pre-rewind cursor");
+  });
+});

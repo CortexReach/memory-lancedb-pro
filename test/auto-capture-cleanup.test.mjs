@@ -11,6 +11,7 @@ const {
   dedupePairWindow,
   turnsOlderThan,
   composePairWindow,
+  composeCaptureTranscript,
 } = jiti("../src/auto-capture-cleanup.ts");
 
 describe("auto-capture cleanup", () => {
@@ -226,5 +227,53 @@ describe("overlapping captures: chronological pair-window composition", () => {
       4,
     );
     assert.deepEqual(window.map((turn) => turn.text), ["u9", "ux", "ax"]);
+  });
+});
+
+describe("capture transcript: own source turns survive the user-turn cap", () => {
+  const retained = [
+    { role: "user", text: "u0", messageId: 0, contextOnly: true },
+    { role: "assistant", text: "a0", messageId: 1, contextOnly: true },
+  ];
+
+  it("keeps a source reply that precedes the capture's first user turn when its own users fill the cap", () => {
+    const own = [
+      { role: "assistant", text: "a1", messageId: 2 },
+      { role: "user", text: "u1", messageId: 3 },
+      { role: "assistant", text: "a2", messageId: 4 },
+      { role: "user", text: "u2", messageId: 5 },
+    ];
+    assert.deepEqual(composeCaptureTranscript(retained, own, 2).map((turn) => turn.text), ["a1", "u1", "a2", "u2"]);
+    assert.deepEqual(
+      composePairWindow(retained, own, 2).map((turn) => turn.text),
+      ["u1", "a2", "u2"],
+      "the retained window keeps its user-anchored trim",
+    );
+  });
+
+  it("keeps a leading source reply when nothing is retained yet", () => {
+    const own = [
+      { role: "assistant", text: "a1", messageId: 2 },
+      { role: "user", text: "u1", messageId: 3 },
+      { role: "assistant", text: "a2", messageId: 4 },
+    ];
+    assert.deepEqual(composeCaptureTranscript([], own, 1).map((turn) => turn.text), ["a1", "u1", "a2"]);
+  });
+
+  it("keeps every source turn of an all-assistant capture over a smaller cap", () => {
+    const own = [
+      { role: "assistant", text: "a1", messageId: 2 },
+      { role: "assistant", text: "a2", messageId: 3 },
+      { role: "assistant", text: "a3", messageId: 4 },
+    ];
+    assert.deepEqual(composeCaptureTranscript([], own, 2).map((turn) => turn.text), ["a1", "a2", "a3"]);
+  });
+
+  it("still trims a leading context-only reply like retained context", () => {
+    const own = [
+      { role: "assistant", text: "a1", messageId: 2, contextOnly: true },
+      { role: "user", text: "u1", messageId: 3 },
+    ];
+    assert.deepEqual(composeCaptureTranscript(retained, own, 1).map((turn) => turn.text), ["u1"]);
   });
 });
