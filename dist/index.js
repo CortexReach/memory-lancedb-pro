@@ -2096,7 +2096,7 @@ function _initPluginState(api) {
     const autoCaptureRecentPairTurns = new Map();
     const autoCapturePairWindowEpoch = new Map();
     const autoCaptureInFlightRuns = new Map();
-    const autoCaptureTerminalFlushRetryTimers = new Map();
+    const autoCaptureTerminalFlushRetries = new Map();
     return {
         config,
         resolvedDbPath,
@@ -2133,7 +2133,7 @@ function _initPluginState(api) {
         autoCaptureRecentPairTurns,
         autoCapturePairWindowEpoch,
         autoCaptureInFlightRuns,
-        autoCaptureTerminalFlushRetryTimers,
+        autoCaptureTerminalFlushRetries,
         captureAdmissionController,
         captureAdmissionAudit,
         captureReflectionAdmissionController,
@@ -2251,7 +2251,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, manualEchoLedger, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCaptureSeenTextGeneration, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureRecentPairTurns, autoCapturePairWindowEpoch, autoCaptureInFlightRuns, autoCaptureTerminalFlushRetryTimers, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, makeLaneLlmClient, admissionRejectionAuditWriter, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, manualEchoLedger, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCaptureSeenTextGeneration, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureRecentPairTurns, autoCapturePairWindowEpoch, autoCaptureInFlightRuns, autoCaptureTerminalFlushRetries, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, makeLaneLlmClient, admissionRejectionAuditWriter, } = singleton;
         const learnAutoCaptureSessionAlias = (sessionId, sessionKey) => {
             if (typeof sessionId !== "string" || !sessionId
                 || typeof sessionKey !== "string" || !sessionKey
@@ -3223,40 +3223,57 @@ const memoryLanceDBProPlugin = {
                 return Promise.allSettled([...runs]).then(() => { });
             };
             const cancelTerminalFlushRetry = (sessionKey) => {
-                const timer = autoCaptureTerminalFlushRetryTimers.get(sessionKey);
-                if (!timer)
+                const retry = autoCaptureTerminalFlushRetries.get(sessionKey);
+                if (!retry)
                     return;
-                clearTimeout(timer);
-                autoCaptureTerminalFlushRetryTimers.delete(sessionKey);
+                autoCaptureTerminalFlushRetries.delete(sessionKey);
+                retry.cancelled = true;
+                retry.wake?.();
             };
-            // One unref()ed retry per session key: the session already ended, so
-            // nothing else consumes what a failed terminal flush handed back.
-            const scheduleTerminalFlushRetry = (sessionKey, ctx, terminalBoundary) => {
-                if (autoCaptureTerminalFlushRetryTimers.has(sessionKey)) {
+            // The session already ended, so nothing else consumes what a failed
+            // terminal flush handed back; it gets exactly one delayed retry. The
+            // retry runs inside the session_end run that owns the flush rather than
+            // on a timer of its own: the host keeps tracking that run, while a
+            // detached timer outlives the hook's async work scope, and core
+            // 2026.9.5+ rejects completions made after that scope is drained.
+            const requestTerminalFlushRetry = (sessionKey) => {
+                if (autoCaptureTerminalFlushRetries.has(sessionKey))
+                    return;
+                autoCaptureTerminalFlushRetries.set(sessionKey, { claimed: false, cancelled: false, wake: null });
+                api.logger.info(`memory-lancedb-pro: terminal flush extraction failed for session ${sessionKey}; one retry in ${autoCaptureTerminalFlushRetryDelayMs}ms`);
+            };
+            const runRequestedTerminalFlushRetry = async (sessionKey, ctx, terminalBoundary) => {
+                const retry = autoCaptureTerminalFlushRetries.get(sessionKey);
+                if (!retry || retry.claimed)
+                    return;
+                retry.claimed = true;
+                await new Promise((resolve) => {
+                    const timer = setTimeout(resolve, autoCaptureTerminalFlushRetryDelayMs);
+                    timer.unref?.();
+                    retry.wake = () => {
+                        clearTimeout(timer);
+                        resolve();
+                    };
+                });
+                if (retry.cancelled)
+                    return;
+                autoCaptureTerminalFlushRetries.delete(sessionKey);
+                await awaitSessionCaptureRuns(sessionKey);
+                const pendingTurns = autoCaptureDeferredFlushTurns.get(sessionKey) || [];
+                if (pendingTurns.length === 0) {
+                    api.logger.debug(`memory-lancedb-pro: terminal flush retry skipped for session ${sessionKey}: nothing left to flush`);
                     return;
                 }
-                const timer = setTimeout(() => {
-                    autoCaptureTerminalFlushRetryTimers.delete(sessionKey);
-                    const pendingTurns = autoCaptureDeferredFlushTurns.get(sessionKey) || [];
-                    if (pendingTurns.length === 0) {
-                        api.logger.debug(`memory-lancedb-pro: terminal flush retry skipped for session ${sessionKey}: nothing left to flush`);
-                        return;
-                    }
-                    api.logger.info(`memory-lancedb-pro: retrying the terminal flush for session ${sessionKey} (${pendingTurns.length} restored turn(s))`);
-                    void awaitSessionCaptureRuns(sessionKey).then(() => {
-                        agentEndAutoCaptureHook({
-                            success: true,
-                            messages: [],
-                            sessionKey,
-                            __autoCaptureTerminalFlush: true,
-                            __autoCaptureTerminalBoundary: terminalBoundary,
-                            __autoCaptureTerminalFlushRetry: true,
-                        }, ctx);
-                    });
-                }, autoCaptureTerminalFlushRetryDelayMs);
-                timer.unref?.();
-                autoCaptureTerminalFlushRetryTimers.set(sessionKey, timer);
-                api.logger.info(`memory-lancedb-pro: terminal flush extraction failed for session ${sessionKey}; one retry scheduled in ${autoCaptureTerminalFlushRetryDelayMs}ms`);
+                api.logger.info(`memory-lancedb-pro: retrying the terminal flush for session ${sessionKey} (${pendingTurns.length} restored turn(s))`);
+                agentEndAutoCaptureHook({
+                    success: true,
+                    messages: [],
+                    sessionKey,
+                    __autoCaptureTerminalFlush: true,
+                    __autoCaptureTerminalBoundary: terminalBoundary,
+                    __autoCaptureTerminalFlushRetry: true,
+                }, ctx);
+                await awaitSessionCaptureRuns(sessionKey);
             };
             // Deferred-flush state carries role-bearing turns, not flat strings: a
             // terminal flush rebuilds its extraction transcript from these, and the
@@ -3717,7 +3734,7 @@ const memoryLanceDBProPlugin = {
                                 api.logger.info(`memory-lancedb-pro: terminal flush retry failed for session ${sessionKey}; giving up on the restored texts`);
                                 return;
                             }
-                            scheduleTerminalFlushRetry(sessionKey, ctx, isTerminalBoundary);
+                            requestTerminalFlushRetry(sessionKey);
                         };
                         // A completed-but-barren run (zero candidates, or every candidate
                         // rejected downstream) also consumed its inputs, but must not rewind
@@ -4270,6 +4287,7 @@ const memoryLanceDBProPlugin = {
                     }, ctx);
                     return awaitSessionCaptureRuns(flushSessionKey);
                 })
+                    .then(() => runRequestedTerminalFlushRetry(flushSessionKey, ctx, isTerminalSessionBoundary(event)))
                     .then(() => {
                     // The window sweep hook may have run its final pass before this
                     // flush registered its run; a terminal boundary repeats it once
@@ -4281,9 +4299,9 @@ const memoryLanceDBProPlugin = {
                 // Test-synchronization seam only (see the agent_end tail).
                 agentEndAutoCaptureHook.__lastRun = flushRun;
                 // Returned, not detached: a host that awaits its session_end hooks
-                // then has a bounded guarantee that the terminal flush completed
-                // before it tears the session (or the process) down. Hosts that
-                // ignore the return value are unaffected.
+                // then has a bounded guarantee that the terminal flush, and its one
+                // retry, completed before it tears the session (or the process) down.
+                // Hosts that ignore the return value are unaffected.
                 return flushRun;
             });
         }
