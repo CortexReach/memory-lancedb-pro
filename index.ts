@@ -4199,7 +4199,7 @@ const memoryLanceDBProPlugin = {
       );
 
       type AgentEndAutoCaptureHook = {
-        (event: any, ctx: any): void;
+        (event: any, ctx: any): void | Promise<void>;
         __lastRun?: Promise<void>;
         __windowStateSizes?: () => { recentTurns: number; pairWindows: number; pairWindowEpochs: number };
       };
@@ -4231,6 +4231,7 @@ const memoryLanceDBProPlugin = {
         return turns.filter((turn) => wantedTexts.has(turn.text));
       };
 
+      const AUTO_CAPTURE_HOOK_TIMEOUT_MS = 120_000;
       const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = (event, ctx) => {
         const isTerminalFlush = (event as any).__autoCaptureTerminalFlush === true;
         // The flush runs for EVERY session_end reason (continuation rollovers
@@ -5330,10 +5331,12 @@ const memoryLanceDBProPlugin = {
         // Test-synchronization seam only: flush coordination reads
         // autoCaptureInFlightRuns for the session's own key, never this slot.
         agentEndAutoCaptureHook.__lastRun = trackedRun;
-        void backgroundRun;
+        // Returned, not detached: the host tracks a returned hook promise in its
+        // async work scope, so the runtime LLM transport stays open for the run.
+        return trackedRun;
       };
 
-      api.on("agent_end", agentEndAutoCaptureHook);
+      api.on("agent_end", agentEndAutoCaptureHook, { timeoutMs: AUTO_CAPTURE_HOOK_TIMEOUT_MS });
       // Diagnostics seam for the lifecycle tests, reached through the
       // registered hook like __lastRun rather than the package's export list:
       // the pair-window feature must not leak epoch entries under its
