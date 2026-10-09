@@ -1207,6 +1207,11 @@ export function _setAutoCaptureTerminalFlushRetryDelayMsForTest(ms?: number): vo
     typeof ms === "number" && Number.isFinite(ms) && ms >= 0 ? ms : AUTO_CAPTURE_TERMINAL_FLUSH_RETRY_DELAY_MS;
 }
 
+// Requested by a failed terminal flush, claimed and run by the session_end run
+// that owns that flush, cancelled (and its wait woken) by a later run that
+// consumes the bucket first.
+type TerminalFlushRetry = { claimed: boolean; cancelled: boolean; wake: (() => void) | null };
+
 // The remember window is agent-scoped even when the host hands multiple
 // agents the same literal session key (session.scope="global"), so one
 // agent's recents never feed another agent's extraction prompt.
@@ -2476,7 +2481,7 @@ interface PluginSingletonState {
   autoCaptureRecentPairTurns: Map<string, ConversationTurn[]>;
   autoCapturePairWindowEpoch: Map<string, number>;
   autoCaptureInFlightRuns: Map<string, Set<Promise<void>>>;
-  autoCaptureTerminalFlushRetryTimers: Map<string, ReturnType<typeof setTimeout>>;
+  autoCaptureTerminalFlushRetries: Map<string, TerminalFlushRetry>;
   captureAdmissionController: () => AdmissionController | null;
   captureAdmissionAudit: () => boolean;
   captureReflectionAdmissionController: () => AdmissionController | null;
@@ -2835,7 +2840,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const autoCaptureRecentPairTurns = new Map<string, ConversationTurn[]>();
   const autoCapturePairWindowEpoch = new Map<string, number>();
   const autoCaptureInFlightRuns = new Map<string, Set<Promise<void>>>();
-  const autoCaptureTerminalFlushRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const autoCaptureTerminalFlushRetries = new Map<string, TerminalFlushRetry>();
 
   return {
     config,
@@ -2874,7 +2879,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCaptureRecentPairTurns,
     autoCapturePairWindowEpoch,
     autoCaptureInFlightRuns,
-    autoCaptureTerminalFlushRetryTimers,
+    autoCaptureTerminalFlushRetries,
     captureAdmissionController,
     captureAdmissionAudit,
     captureReflectionAdmissionController,
@@ -3045,7 +3050,7 @@ const memoryLanceDBProPlugin = {
       autoCaptureRecentPairTurns,
       autoCapturePairWindowEpoch,
       autoCaptureInFlightRuns,
-      autoCaptureTerminalFlushRetryTimers,
+      autoCaptureTerminalFlushRetries,
       captureAdmissionController,
       captureAdmissionAudit,
       captureReflectionAdmissionController,
@@ -4226,49 +4231,64 @@ const memoryLanceDBProPlugin = {
       };
 
       const cancelTerminalFlushRetry = (sessionKey: string) => {
-        const timer = autoCaptureTerminalFlushRetryTimers.get(sessionKey);
-        if (!timer) return;
-        clearTimeout(timer);
-        autoCaptureTerminalFlushRetryTimers.delete(sessionKey);
+        const retry = autoCaptureTerminalFlushRetries.get(sessionKey);
+        if (!retry) return;
+        autoCaptureTerminalFlushRetries.delete(sessionKey);
+        retry.cancelled = true;
+        retry.wake?.();
       };
 
-      // One unref()ed retry per session key: the session already ended, so
-      // nothing else consumes what a failed terminal flush handed back.
-      const scheduleTerminalFlushRetry = (sessionKey: string, ctx: any, terminalBoundary: boolean) => {
-        if (autoCaptureTerminalFlushRetryTimers.has(sessionKey)) {
+      // The session already ended, so nothing else consumes what a failed
+      // terminal flush handed back; it gets exactly one delayed retry. The
+      // retry runs inside the session_end run that owns the flush rather than
+      // on a timer of its own: the host keeps tracking that run, while a
+      // detached timer outlives the hook's async work scope, and core
+      // 2026.9.5+ rejects completions made after that scope is drained.
+      const requestTerminalFlushRetry = (sessionKey: string) => {
+        if (autoCaptureTerminalFlushRetries.has(sessionKey)) return;
+        autoCaptureTerminalFlushRetries.set(sessionKey, { claimed: false, cancelled: false, wake: null });
+        api.logger.info(
+          `memory-lancedb-pro: terminal flush extraction failed for session ${sessionKey}; one retry in ${autoCaptureTerminalFlushRetryDelayMs}ms`,
+        );
+      };
+
+      const runRequestedTerminalFlushRetry = async (sessionKey: string, ctx: any, terminalBoundary: boolean) => {
+        const retry = autoCaptureTerminalFlushRetries.get(sessionKey);
+        if (!retry || retry.claimed) return;
+        retry.claimed = true;
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, autoCaptureTerminalFlushRetryDelayMs);
+          timer.unref?.();
+          retry.wake = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+        });
+        if (retry.cancelled) return;
+        autoCaptureTerminalFlushRetries.delete(sessionKey);
+        await awaitSessionCaptureRuns(sessionKey);
+        const pendingTurns = autoCaptureDeferredFlushTurns.get(sessionKey) || [];
+        if (pendingTurns.length === 0) {
+          api.logger.debug(
+            `memory-lancedb-pro: terminal flush retry skipped for session ${sessionKey}: nothing left to flush`,
+          );
           return;
         }
-        const timer = setTimeout(() => {
-          autoCaptureTerminalFlushRetryTimers.delete(sessionKey);
-          const pendingTurns = autoCaptureDeferredFlushTurns.get(sessionKey) || [];
-          if (pendingTurns.length === 0) {
-            api.logger.debug(
-              `memory-lancedb-pro: terminal flush retry skipped for session ${sessionKey}: nothing left to flush`,
-            );
-            return;
-          }
-          api.logger.info(
-            `memory-lancedb-pro: retrying the terminal flush for session ${sessionKey} (${pendingTurns.length} restored turn(s))`,
-          );
-          void awaitSessionCaptureRuns(sessionKey).then(() => {
-            agentEndAutoCaptureHook(
-              {
-                success: true,
-                messages: [],
-                sessionKey,
-                __autoCaptureTerminalFlush: true,
-                __autoCaptureTerminalBoundary: terminalBoundary,
-                __autoCaptureTerminalFlushRetry: true,
-              },
-              ctx,
-            );
-          });
-        }, autoCaptureTerminalFlushRetryDelayMs);
-        timer.unref?.();
-        autoCaptureTerminalFlushRetryTimers.set(sessionKey, timer);
         api.logger.info(
-          `memory-lancedb-pro: terminal flush extraction failed for session ${sessionKey}; one retry scheduled in ${autoCaptureTerminalFlushRetryDelayMs}ms`,
+          `memory-lancedb-pro: retrying the terminal flush for session ${sessionKey} (${pendingTurns.length} restored turn(s))`,
         );
+        agentEndAutoCaptureHook(
+          {
+            success: true,
+            messages: [],
+            sessionKey,
+            __autoCaptureTerminalFlush: true,
+            __autoCaptureTerminalBoundary: terminalBoundary,
+            __autoCaptureTerminalFlushRetry: true,
+          },
+          ctx,
+        );
+        await awaitSessionCaptureRuns(sessionKey);
       };
 
       // Deferred-flush state carries role-bearing turns, not flat strings: a
@@ -4804,7 +4824,7 @@ const memoryLanceDBProPlugin = {
               );
               return;
             }
-            scheduleTerminalFlushRetry(sessionKey, ctx, isTerminalBoundary);
+            requestTerminalFlushRetry(sessionKey);
           };
 
           // A completed-but-barren run (zero candidates, or every candidate
@@ -5458,6 +5478,7 @@ const memoryLanceDBProPlugin = {
             );
             return awaitSessionCaptureRuns(flushSessionKey);
           })
+          .then(() => runRequestedTerminalFlushRetry(flushSessionKey, ctx, isTerminalSessionBoundary(event)))
           .then(() => {
             // The window sweep hook may have run its final pass before this
             // flush registered its run; a terminal boundary repeats it once
@@ -5469,9 +5490,9 @@ const memoryLanceDBProPlugin = {
         // Test-synchronization seam only (see the agent_end tail).
         agentEndAutoCaptureHook.__lastRun = flushRun;
         // Returned, not detached: a host that awaits its session_end hooks
-        // then has a bounded guarantee that the terminal flush completed
-        // before it tears the session (or the process) down. Hosts that
-        // ignore the return value are unaffected.
+        // then has a bounded guarantee that the terminal flush, and its one
+        // retry, completed before it tears the session (or the process) down.
+        // Hosts that ignore the return value are unaffected.
         return flushRun;
       });
     }

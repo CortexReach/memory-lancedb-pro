@@ -3,16 +3,18 @@
  *
  * When a terminal flush's extraction fails, the consumed turns are handed
  * back to the deferred-flush bucket, but the session has already ended and
- * nothing else consumes that bucket. The plugin now schedules exactly one
- * unref()ed retry per session key, cancels it when a later run consumes the
- * bucket, and gives up after the retry. The tests drive the failure and let
- * the timer fire instead of emitting a second session_end by hand. Fixtures
- * are synthetic.
+ * nothing else consumes that bucket. The plugin now runs exactly one delayed
+ * retry per session key inside the session_end run that owns the flush, so a
+ * host that awaits (and scopes) that run covers the retry too. A later run
+ * that consumes the bucket cancels the retry, and the retry gives up after
+ * one attempt. The tests drive the failure and let the retry run instead of
+ * emitting a second session_end by hand. Fixtures are synthetic.
  *
  * Run: node --test test/autocapture-terminal-flush-retry.test.mjs
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { AsyncLocalStorage } from "node:async_hooks";
 import http from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -110,11 +112,12 @@ function createLlmServer(state) {
   });
 }
 
-function createPluginApiHarness({ pluginConfig, resolveRoot }) {
+function createPluginApiHarness({ pluginConfig, resolveRoot, runtime }) {
   const eventHandlers = new Map();
   const logs = { info: [], warn: [], debug: [], error: [] };
   const api = {
     pluginConfig,
+    ...(runtime ? { runtime } : {}),
     resolvePath(target) {
       if (typeof target !== "string") return target;
       return path.isAbsolute(target) ? target : path.join(resolveRoot, target);
@@ -206,9 +209,10 @@ describe("terminal flush retry", () => {
     rmSync(workspaceDir, { recursive: true, force: true });
   });
 
-  function buildHarness() {
+  function buildHarness({ hostComplete } = {}) {
     return createPluginApiHarness({
       resolveRoot: workspaceDir,
+      runtime: hostComplete ? { llm: { complete: hostComplete } } : undefined,
       pluginConfig: {
         dbPath: path.join(workspaceDir, "db"),
         autoCapture: true,
@@ -224,11 +228,13 @@ describe("terminal flush retry", () => {
           baseURL: `http://127.0.0.1:${embeddingServer.address().port}/v1`,
           dimensions: EMBEDDING_DIMENSIONS,
         },
-        llm: {
-          apiKey: "test-api-key",
-          model: "mock-memory-model",
-          baseURL: `http://127.0.0.1:${llmServer.address().port}`,
-        },
+        llm: hostComplete
+          ? { transport: "host", model: "mock-memory-model" }
+          : {
+              apiKey: "test-api-key",
+              model: "mock-memory-model",
+              baseURL: `http://127.0.0.1:${llmServer.address().port}`,
+            },
       },
     });
   }
@@ -241,32 +247,30 @@ describe("terminal flush retry", () => {
     return hook;
   }
 
-  it("retries a failed terminal flush once from its own timer and persists on the retry", async () => {
+  it("retries a failed terminal flush once inside its own session_end run and persists on the retry", async () => {
     llmState.failures = 1;
     const harness = buildHarness();
     memoryLanceDBProPlugin.register(harness.api);
     await deferOneTurnThenEnd(harness);
 
-    assert.equal(llmState.extractionCalls, 1, "the terminal flush extracted once and failed");
+    // The session_end run the host awaited already covers the retry.
+    assert.equal(llmState.extractionCalls, 2, "the failed terminal flush and its one retry");
     assert.ok(
       harness.logs.warn.some((m) => m.includes("model unavailable after one retry")),
       harness.logs.warn.join("\n"),
     );
     assert.ok(
-      harness.logs.info.some((m) => m.includes("one retry scheduled")),
+      harness.logs.info.some((m) => m.includes("one retry in")),
       harness.logs.info.join("\n"),
     );
-
-    const retried = await waitFor(() => llmState.extractionCalls >= 2);
-    assert.ok(retried, "the retry timer must re-run the terminal flush without a second session_end");
     assert.ok(
       harness.logs.info.some((m) => m.includes("retrying the terminal flush")),
       harness.logs.info.join("\n"),
     );
-    const persisted = await waitFor(() =>
+    assert.ok(
       harness.logs.info.some((m) => /smart-extracted 1 created/.test(m)),
+      `the retried flush must persist the restored turn: ${harness.logs.info.join("\n")}`,
     );
-    assert.ok(persisted, `the retried flush must persist the restored turn: ${harness.logs.info.join("\n")}`);
   });
 
   it("gives up after the single retry instead of looping", async () => {
@@ -275,37 +279,89 @@ describe("terminal flush retry", () => {
     memoryLanceDBProPlugin.register(harness.api);
     await deferOneTurnThenEnd(harness);
 
-    const retried = await waitFor(() => llmState.extractionCalls >= 2);
-    assert.ok(retried, "the retry must fire once");
-    const gaveUp = await waitFor(() =>
+    assert.equal(llmState.extractionCalls, 2, "the retry ran once inside the session_end run");
+    assert.ok(
       harness.logs.info.some((m) => m.includes("terminal flush retry failed") && m.includes("giving up")),
+      harness.logs.info.join("\n"),
     );
-    assert.ok(gaveUp, harness.logs.info.join("\n"));
     await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * 3));
     assert.equal(llmState.extractionCalls, 2, "no third attempt");
     assert.equal(
-      harness.logs.info.filter((m) => m.includes("one retry scheduled")).length,
+      harness.logs.info.filter((m) => m.includes("one retry in")).length,
       1,
-      "exactly one retry is ever scheduled per failed flush",
+      "exactly one retry is ever requested per failed flush",
     );
   });
 
-  it("cancels the pending retry when a later flush consumes the bucket", async () => {
+  it("cancels the pending retry and releases its wait when a later flush consumes the bucket", async () => {
+    setRetryDelay(5_000);
     llmState.failures = 1;
     const harness = buildHarness();
     memoryLanceDBProPlugin.register(harness.api);
-    await deferOneTurnThenEnd(harness);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    await fireAgentEnd(hook, [{ role: "user", content: FACT_TEXT }], CTX);
+    const firstEnd = fireSessionEnd(harness.eventHandlers, { reason: "reset" }, CTX);
+    const requested = await waitFor(() => harness.logs.info.some((m) => m.includes("one retry in")));
+    assert.ok(requested, harness.logs.info.join("\n"));
     assert.equal(llmState.extractionCalls, 1);
 
     // A second terminal boundary for the same key consumes the restored
-    // bucket before the timer fires; the retry must not run a third flush.
+    // bucket while the first run waits; the first run must not flush again.
     await fireSessionEnd(harness.eventHandlers, { reason: "reset" }, CTX);
-    assert.equal(llmState.extractionCalls, 2, "the manual flush consumed the restored turn");
-    await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * 3));
+    assert.equal(llmState.extractionCalls, 2, "the later flush consumed the restored turn");
+    const startedAt = Date.now();
+    await firstEnd;
+    assert.ok(Date.now() - startedAt < 2_000, "the cancelled retry released its wait early");
     assert.equal(llmState.extractionCalls, 2, "the cancelled retry ran no extraction");
     assert.ok(
       !harness.logs.info.some((m) => m.includes("retrying the terminal flush")),
       harness.logs.info.join("\n"),
+    );
+  });
+
+  it("runs the retry while the host still tracks the session_end run", async () => {
+    // Stand-in for core's async work scope: completions made from a scope the
+    // host has already drained reject the way core 2026.9.5+ does.
+    const scopes = new AsyncLocalStorage();
+    const hostCalls = { extraction: 0 };
+    const hostComplete = async (params) => {
+      if (scopes.getStore()?.closed) throw new Error("Async work scope is closed");
+      const prompt = String(params.messages?.map((m) => m.content).join("\n") ?? "");
+      if (!prompt.includes("extract memories worth long-term preservation")) {
+        return { text: JSON.stringify({ decision: "create", reason: "test create" }) };
+      }
+      hostCalls.extraction += 1;
+      if (hostCalls.extraction === 1) throw new Error("401 Unauthorized");
+      return {
+        text: JSON.stringify({
+          memories: [{
+            category: "preferences",
+            abstract: "Synthetic scoped flush marker",
+            overview: "## Preference\n- Scoped flush marker",
+            content: "User stated a synthetic scoped flush marker.",
+          }],
+        }),
+      };
+    };
+    const harness = buildHarness({ hostComplete });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    await fireAgentEnd(hook, [{ role: "user", content: FACT_TEXT }], CTX);
+
+    const scope = { closed: false };
+    await scopes.run(scope, () => fireSessionEnd(harness.eventHandlers, { reason: "reset" }, CTX));
+    // The host drains the hook's scope once the returned run settles.
+    scope.closed = true;
+    await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * 3));
+
+    assert.equal(hostCalls.extraction, 2, "the failed terminal flush and its one retry");
+    assert.ok(
+      !harness.logs.warn.some((m) => m.includes("Async work scope is closed")),
+      harness.logs.warn.join("\n"),
+    );
+    assert.ok(
+      harness.logs.info.some((m) => /smart-extracted 1 created/.test(m)),
+      `the retry must persist before the host closes the scope: ${harness.logs.info.join("\n")}`,
     );
   });
 });
