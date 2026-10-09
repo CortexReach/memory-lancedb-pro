@@ -1722,6 +1722,13 @@ export class MemoryStore {
     }
 
     await this.closeLockResources();
+    if (this.db) {
+      try {
+        this.db.close();
+      } catch {}
+      this.db = null;
+      this.table = null;
+    }
     if (destroyError) {
       throw destroyError;
     }
