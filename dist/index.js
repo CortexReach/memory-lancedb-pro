@@ -53,7 +53,7 @@ import { buildFallbackCandidate, gateRegexFallbackCapture } from "./src/autocapt
 import { gateMappedReflectionEntries, resolveMappedRowAdmissionController } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { buildConversationTurnsForExtraction, composePairWindow, composeCaptureTranscript, weaveContextOnlyAssistantTurns, countProtectedReferentPrefix, formatConversationTranscript, neutralizeSpeakerTagSpoof, nextAutoCaptureMessageId, normalizeAutoCaptureText, reconcileTurnsWithKeptTexts, turnsOlderThan, } from "./src/auto-capture-cleanup.js";
+import { buildConversationTurnsForExtraction, capUnknownWatermarkWindow, composePairWindow, composeCaptureTranscript, weaveContextOnlyAssistantTurns, countProtectedReferentPrefix, formatConversationTranscript, neutralizeSpeakerTagSpoof, nextAutoCaptureMessageId, normalizeAutoCaptureText, reconcileTurnsWithKeptTexts, turnsOlderThan, } from "./src/auto-capture-cleanup.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter, stripEnvelopeMetadata } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -3405,6 +3405,16 @@ const memoryLanceDBProPlugin = {
                                 newTexts = [];
                                 newlyObservedCount = 0;
                             }
+                        }
+                        else if (recordedSeenCount === 0 &&
+                            eligibleTexts.length > Math.max((config.extractMinMessages ?? 4) * 4, 12)) {
+                            // No cursor at all (the session's first run here, or state lost
+                            // across a restart) meeting a pathological backlog: extract only
+                            // the newest batch and count the whole history as seen, rather
+                            // than handing the entire transcript to one extraction. Ordinary
+                            // first turns with a handful of texts stay whole; compression and
+                            // extractMaxChars govern those.
+                            newTexts = capUnknownWatermarkWindow(eligibleTexts, config.extractMinMessages ?? 4, config.extractMaxChars ?? 8000);
                         }
                         // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
                         const cumulativeCount = previousSeenCount + newlyObservedCount;
