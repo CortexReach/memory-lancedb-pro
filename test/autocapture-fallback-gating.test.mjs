@@ -1202,9 +1202,10 @@ describe("terminal flush of deferred captures at session_end", () => {
     await new Promise((resolve) => llmServer.close(resolve));
     llmServer = createLlmServer({
       extractionPrompts,
-      // Call 1 returns a malformed extraction payload (memories: null), the
-      // shape a null/exhausted LLM completion produces; call 2 succeeds.
-      extractMemories: (n) => (n === 1 ? null : [{
+      // Calls 1 and 2 return a malformed extraction payload (memories: null),
+      // the shape a null/exhausted LLM completion produces, so the terminal
+      // flush and its one in-run retry both fail; call 3 succeeds.
+      extractMemories: (n) => (n <= 2 ? null : [{
         category: "preferences",
         abstract: "Synthetic retry marker",
         overview: "## Preference\n- Retry marker",
@@ -1212,28 +1213,33 @@ describe("terminal flush of deferred captures at session_end", () => {
       }]),
     });
     await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+    pluginModule._setAutoCaptureTerminalFlushRetryDelayMsForTest(20);
 
-    const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: flushConfig() });
-    memoryLanceDBProPlugin.register(harness.api);
-    const hook = getAutoCaptureHook(harness.eventHandlers);
-    const ctx = { sessionKey: "agent:agent-two:main", agentId: "agent-two" };
+    try {
+      const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: flushConfig() });
+      memoryLanceDBProPlugin.register(harness.api);
+      const hook = getAutoCaptureHook(harness.eventHandlers);
+      const ctx = { sessionKey: "agent:agent-two:main", agentId: "agent-two" };
 
-    await fireAgentEnd(hook, userMessages(PREFERENCE_TEXT, SECOND_TEXT), ctx);
-    assert.equal(extractionPrompts.length, 0, "two texts stay below minMessages=4");
+      await fireAgentEnd(hook, userMessages(PREFERENCE_TEXT, SECOND_TEXT), ctx);
+      assert.equal(extractionPrompts.length, 0, "two texts stay below minMessages=4");
 
-    await fireSessionEnd(harness, hook, ctx);
-    assert.equal(extractionPrompts.length, 1, "the first flush must reach the extractor");
+      await fireSessionEnd(harness, hook, ctx);
+      assert.equal(extractionPrompts.length, 2, "the first flush and its one in-run retry must reach the extractor");
 
-    await fireSessionEnd(harness, hook, ctx);
-    assert.equal(
-      extractionPrompts.length,
-      2,
-      "a failed flush extraction must restore the deferred texts so the next flush retries them",
-    );
-    assert.ok(
-      extractionPrompts[1].includes(PREFERENCE_TEXT),
-      "the retried flush must carry the texts the failed attempt consumed",
-    );
+      await fireSessionEnd(harness, hook, ctx);
+      assert.equal(
+        extractionPrompts.length,
+        3,
+        "a failed flush extraction must restore the deferred texts so the next flush retries them",
+      );
+      assert.ok(
+        extractionPrompts[2].includes(PREFERENCE_TEXT),
+        "the retried flush must carry the texts the failed attempts consumed",
+      );
+    } finally {
+      pluginModule._setAutoCaptureTerminalFlushRetryDelayMsForTest();
+    }
   });
 });
 
