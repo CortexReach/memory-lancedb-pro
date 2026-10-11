@@ -32,6 +32,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/openclaw-paths.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/category-filter-normalization.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/update-consistency-lancedb.test.mjs" },
+  { group: "storage-and-schema", runner: "node", file: "test/store-destroy-resources.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/strip-envelope-metadata.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/auto-recall-timeout.test.mjs", args: ["--test"] },
   { group: "cli-smoke", runner: "node", file: "test/import-markdown/import-markdown.test.mjs", args: ["--test"] },
