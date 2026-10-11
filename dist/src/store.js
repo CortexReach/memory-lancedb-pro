@@ -648,7 +648,12 @@ export class MemoryStore {
             }
         }
     }
-    async runWithWriteLock(fn) {
+    async runWithWriteLock(fn, options = {}) {
+        // 【MR2 fix】destroy() 之後拒絕新的寫入，給出明確錯誤而非 null-dereference。
+        // destroy() 自己的 flush/teardown 透過 allowDestroyed 繞過此檢查。
+        if (this.destroyed && options.allowDestroyed !== true) {
+            throw new Error("MemoryStore instance has been destroyed");
+        }
         if (!this.redisLock) {
             return this.runWithFileLock(fn);
         }
@@ -662,6 +667,25 @@ export class MemoryStore {
         }
         catch (err) {
             this.config.onLockWarning?.(`memory-lancedb-pro: failed to close Redis lock client: ${String(err)}`);
+        }
+    }
+    /**
+     * 【MR1/MR3 fix】Explicitly close the native LanceDB table and connection so
+     * their resources are released immediately instead of waiting for GC, and
+     * surface failures instead of swallowing them in an empty catch block.
+     */
+    closeNativeResources(table, db) {
+        try {
+            table?.close();
+        }
+        catch (err) {
+            console.warn(`[memory-lancedb-pro] failed to close LanceDB table: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        try {
+            db.close();
+        }
+        catch (err) {
+            console.warn(`[memory-lancedb-pro] failed to close LanceDB connection: ${err instanceof Error ? err.message : String(err)}`);
         }
     }
     get dbPath() {
@@ -755,6 +779,11 @@ export class MemoryStore {
     /** Public so callers can warm the one-time table open / FTS index build
      *  outside latency-sensitive windows (startup health probes do this). */
     async ensureInitialized() {
+        // 【MR2 fix】destroy() 之後給出明確錯誤，而不是讓後續呼叫在
+        // this.table === null 時拋出難以理解的 null-dereference。
+        if (this.destroyed) {
+            throw new Error("MemoryStore instance has been destroyed");
+        }
         if (this.table) {
             return;
         }
@@ -1245,7 +1274,7 @@ export class MemoryStore {
      * @returns {hasError: boolean, lastError?: Error} — error info so callers
      *   (flush/destroy) can rethrow without relying on shared instance state.
      */
-    async doFlush() {
+    async doFlush(options = {}) {
         const prevLock = this.flushLock;
         let releaseLock;
         this.flushLock = new Promise((resolve) => { releaseLock = resolve; });
@@ -1271,7 +1300,7 @@ export class MemoryStore {
                 try {
                     await this.runWithWriteLock(async () => {
                         await this.table.add(chunk.map((entry) => this.toRow(entry)));
-                    });
+                    }, options);
                     this.noteDataModification();
                 }
                 catch (err) {
@@ -1406,7 +1435,8 @@ export class MemoryStore {
         }
         // 【MR4 fix】設定 destroyed flag，阻止後續 bulkStore() 呼叫
         this.destroyed = true;
-        const result = await this.doFlush();
+        // destroy() 自己的收尾 flush 必須繞過 destroyed 寫入守衛。
+        const result = await this.doFlush({ allowDestroyed: true });
         // 【F1 fix】等待所有已排程的 timer callback 完成
         // 透過 await flushLock 確保排隊中的 doFlush 都結束
         // 防止：timer callback 已排程 → destroy() 清除 timer → destroy() 返回
@@ -1442,6 +1472,27 @@ export class MemoryStore {
             destroyError = err;
         }
         await this.closeLockResources();
+        if (this.db) {
+            const db = this.db;
+            const table = this.table;
+            // 【F2 fix】在釋放 native 連線前先取得 write lock，確保任何 in-flight 寫入
+            // （特別是 update 的 delete + re-add / rollback）先完成。update() 全程持有
+            // write lock；若 destroy() 在 delete 與 rollback 之間把 this.table 設為 null
+            // 或關閉 connection，rollback 會失敗並造成資料遺失。
+            try {
+                await this.runWithWriteLock(async () => {
+                    await this.updateQueue;
+                }, { allowDestroyed: true });
+            }
+            catch (err) {
+                console.warn(`[memory-lancedb-pro] failed to quiesce writes before destroy: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            // 【MR1 fix】明確關閉 table/connection handle，讓 native 資源立即釋放，
+            // 而不是僅解除 JS 參考、等 GC 回收。【MR3 fix】close error 不再被靜默吞掉。
+            this.closeNativeResources(table, db);
+            this.db = null;
+            this.table = null;
+        }
         if (destroyError) {
             throw destroyError;
         }
@@ -2490,6 +2541,12 @@ export class MemoryStore {
      * supersede commit path calls it from inside its own atomic section.
      */
     async performUpdateLocked(id, updates, scopeFilter) {
+        // 【F2 fix】此方法在 write lock 內執行。若 destroy() 於 update() 通過
+        // ensureInitialized() 之後、取得鎖之前完成，這裡會給出明確錯誤，
+        // 而不是在已關閉的連線上做 delete/re-add。
+        if (this.destroyed) {
+            throw new Error("MemoryStore instance has been destroyed");
+        }
         // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
         // from older stores (for example "mem-md-..." or "data-pointer-...").
         const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
