@@ -47,6 +47,7 @@ import {
 import { isSuppressed as isTier1Suppressed } from "./auto-recall-tier1.js";
 import type { ManualEchoLedger } from "./manual-echo-guard.js";
 import { enqueueManualRecallMetadata } from "./manual-recall-metadata-queue.js";
+import { recordSurfacedRecall, type RecallInvocation, type SurfacedRecall } from "./native-recall.js";
 
 // ============================================================================
 // Types
@@ -981,6 +982,8 @@ function createMemoryRecallTool(
     name: string;
     label: string;
     description: string;
+    api: OpenClawPluginApi;
+    invocation: RecallInvocation;
   },
 ) {
   return {
@@ -1067,6 +1070,7 @@ function createMemoryRecallTool(
             }),
           );
 
+          const surfaced: SurfacedRecall[] = [];
           const text = results
             .map((r, i) => {
               const categoryTag = getDisplayCategoryTag(r.entry);
@@ -1083,6 +1087,9 @@ function createMemoryRecallTool(
               const rendered = includeFullText
                 ? `${inline}${neighborText}`
                 : truncateText(`${inline}${neighborText}`, safeCharsPerItem);
+              const withoutEllipsis = !includeFullText && inline.length + neighborText.length > safeCharsPerItem
+                ? rendered.slice(0, -1).trimEnd() : rendered;
+              surfaced.push({ result: r, sourceText: base, format: "manual", text: withoutEllipsis.slice(0, inline.length) });
               return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${rendered}`;
             })
             .join("\n");
@@ -1096,6 +1103,7 @@ function createMemoryRecallTool(
             }
           }
 
+          await recordSurfacedRecall(options.api, options.invocation, query, surfaced);
           return {
             content: [
               {
@@ -1140,6 +1148,11 @@ export function registerMemoryRecallTool(
     (toolCtx) => {
       const runtimeContext = resolveToolContext(context, toolCtx);
       return createMemoryRecallTool(runtimeContext, {
+        api,
+        invocation: {
+          workspaceDir: toolCtx.workspaceDir, sessionKey: toolCtx.sessionKey, runId: toolCtx.runId,
+          assertActive: toolCtx.assertInvocationCurrent?.bind(toolCtx),
+        },
         name: "memory_recall",
         label: "Memory Recall",
         description:
@@ -1164,6 +1177,11 @@ export function registerMemoryRecallAliasTool(
     (toolCtx) => {
       const runtimeContext = resolveToolContext(context, toolCtx);
       return createMemoryRecallTool(runtimeContext, {
+        api,
+        invocation: {
+          workspaceDir: toolCtx.workspaceDir, sessionKey: toolCtx.sessionKey, runId: toolCtx.runId,
+          assertActive: toolCtx.assertInvocationCurrent?.bind(toolCtx),
+        },
         name: alias,
         label,
         description,
