@@ -169,6 +169,13 @@ export type ExtractionStats = {
    */
   extractionFailed?: boolean;
   /**
+   * True when a model call in the extraction path never answered (an upstream
+   * request failure, retried once when transient). Always paired with
+   * extractionFailed: the input is deferrable, the quota must not be charged,
+   * and no candidate was judged.
+   */
+  llmUnavailable?: boolean;
+  /**
    * True when at least one candidate reached a definitive pipeline verdict
    * (create, merge, admission reject, dedup skip, support, or supersede).
    * A zero-persisted run with settled outcomes is CONSUMED input, not a
