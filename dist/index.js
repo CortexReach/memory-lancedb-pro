@@ -578,9 +578,22 @@ async function loadSelfImprovementReminderContent(workspaceDir) {
     }
 }
 function resolveAgentPrimaryModelRef(cfg, agentId) {
+    const primaryModelRef = (value) => {
+        const primary = typeof value === "string"
+            ? value
+            : value && typeof value === "object" ? value.primary : undefined;
+        return typeof primary === "string" && primary.trim() ? primary.trim() : undefined;
+    };
     try {
         const root = cfg;
         const agents = root.agents;
+        const entries = agents?.entries;
+        if (entries && typeof entries === "object" && !Array.isArray(entries) && Object.hasOwn(entries, agentId)) {
+            const entry = entries[agentId];
+            const primary = primaryModelRef(entry && typeof entry === "object" ? entry.model : undefined);
+            if (primary)
+                return primary;
+        }
         const list = agents?.list;
         if (Array.isArray(list)) {
             const found = list.find((x) => {
@@ -588,16 +601,12 @@ function resolveAgentPrimaryModelRef(cfg, agentId) {
                     return false;
                 return x.id === agentId;
             });
-            const model = found?.model;
-            const primary = model?.primary;
-            if (typeof primary === "string" && primary.trim())
-                return primary.trim();
+            const primary = primaryModelRef(found?.model);
+            if (primary)
+                return primary;
         }
         const defaults = agents?.defaults;
-        const defModel = defaults?.model;
-        const defPrimary = defModel?.primary;
-        if (typeof defPrimary === "string" && defPrimary.trim())
-            return defPrimary.trim();
+        return primaryModelRef(defaults?.model);
     }
     catch {
         // ignore
