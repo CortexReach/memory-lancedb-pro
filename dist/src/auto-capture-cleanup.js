@@ -789,3 +789,20 @@ export function reconcileTurnsWithKeptTexts(turns, keptTexts, keptIndices) {
     }
     return reconciled;
 }
+/**
+ * Bounds the extraction input when a session has no watermark at all (its
+ * first run here, or state lost across a restart) and its eligible history
+ * is larger than one batch: keep the most recent `batchSize` texts, then trim
+ * from the front while the window exceeds `maxChars`. Always keeps at least
+ * the most recent text, even when it alone exceeds `maxChars`.
+ */
+export function capUnknownWatermarkWindow(eligibleTexts, batchSize, maxChars) {
+    const window = eligibleTexts.slice(-Math.max(1, batchSize));
+    let start = 0;
+    let totalChars = window.reduce((sum, text) => sum + text.length, 0);
+    while (totalChars > maxChars && start < window.length - 1) {
+        totalChars -= window[start].length;
+        start++;
+    }
+    return window.slice(start);
+}
