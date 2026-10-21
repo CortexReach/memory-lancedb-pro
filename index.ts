@@ -1022,9 +1022,21 @@ async function loadSelfImprovementReminderContent(workspaceDir?: string): Promis
 }
 
 function resolveAgentPrimaryModelRef(cfg: unknown, agentId: string): string | undefined {
+  const primaryModelRef = (value: unknown): string | undefined => {
+    const primary = typeof value === "string"
+      ? value
+      : value && typeof value === "object" ? (value as Record<string, unknown>).primary : undefined;
+    return typeof primary === "string" && primary.trim() ? primary.trim() : undefined;
+  };
   try {
     const root = cfg as Record<string, unknown>;
     const agents = root.agents as Record<string, unknown> | undefined;
+    const entries = agents?.entries;
+    if (entries && typeof entries === "object" && !Array.isArray(entries) && Object.hasOwn(entries, agentId)) {
+      const entry = (entries as Record<string, unknown>)[agentId];
+      const primary = primaryModelRef(entry && typeof entry === "object" ? (entry as Record<string, unknown>).model : undefined);
+      if (primary) return primary;
+    }
     const list = agents?.list as unknown;
 
     if (Array.isArray(list)) {
@@ -1032,15 +1044,12 @@ function resolveAgentPrimaryModelRef(cfg: unknown, agentId: string): string | un
         if (!x || typeof x !== "object") return false;
         return (x as Record<string, unknown>).id === agentId;
       }) as Record<string, unknown> | undefined;
-      const model = found?.model as Record<string, unknown> | undefined;
-      const primary = model?.primary;
-      if (typeof primary === "string" && primary.trim()) return primary.trim();
+      const primary = primaryModelRef(found?.model);
+      if (primary) return primary;
     }
 
     const defaults = agents?.defaults as Record<string, unknown> | undefined;
-    const defModel = defaults?.model as Record<string, unknown> | undefined;
-    const defPrimary = defModel?.primary;
-    if (typeof defPrimary === "string" && defPrimary.trim()) return defPrimary.trim();
+    return primaryModelRef(defaults?.model);
   } catch {
     // ignore
   }
