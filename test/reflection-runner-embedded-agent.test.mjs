@@ -238,3 +238,61 @@ describe("embedded runner cache", () => {
     assert.equal(typeof legacyParams[1].sessionFile, "string", "the second run is still labeled legacy and keeps the transcript file");
   });
 });
+
+describe("reflection agent model routing", () => {
+  const defaultModel = { primary: "default-provider/default-model" };
+  const fixtures = [
+    ["keyed object model", {
+      agents: { entries: { "agent-one": { model: { primary: "entry-provider/entry-model" } } }, defaults: { model: defaultModel } },
+    }, undefined, "entry-provider", "entry-model"],
+    ["keyed string model", {
+      agents: { entries: { "agent-one": { model: "entry-provider/entry-model" } }, defaults: { model: defaultModel } },
+    }, undefined, "entry-provider", "entry-model"],
+    ["exact requested keyed agent instead of another entry", {
+      agents: { ownership: "explicit", entries: {
+        "agent-two": { model: "other-provider/other-model" },
+        "agent-one": { model: "entry-provider/entry-model" },
+      }, defaults: { model: defaultModel } },
+    }, undefined, "entry-provider", "entry-model"],
+    ["explicit reflection override before the keyed model", {
+      agents: { entries: { "agent-one": { model: "entry-provider/entry-model" } }, defaults: { model: defaultModel } },
+    }, "override-provider/override-model", "override-provider", "override-model"],
+    ["default object when the keyed agent has no model", {
+      agents: { entries: { "agent-one": {} }, defaults: { model: defaultModel } },
+    }, undefined, "default-provider", "default-model"],
+    ["default string model", {
+      agents: { entries: { "agent-one": {} }, defaults: { model: "default-provider/default-model" } },
+    }, undefined, "default-provider", "default-model"],
+    ["legacy array with an object model", {
+      agents: { list: [{ id: "agent-one", model: { primary: "legacy-provider/legacy-model" } }], defaults: { model: defaultModel } },
+    }, undefined, "legacy-provider", "legacy-model"],
+    ["legacy array with a string model", {
+      agents: { list: [{ id: "agent-one", model: "legacy-provider/legacy-model" }], defaults: { model: defaultModel } },
+    }, undefined, "legacy-provider", "legacy-model"],
+    ["blank keyed model falls back to the default", {
+      agents: { entries: { "agent-one": { model: "  " } }, defaults: { model: defaultModel } },
+    }, undefined, "default-provider", "default-model"],
+    ["existing llm model fallback without an agent model", {
+      agents: { entries: { "agent-one": {} } }, llm: { model: "llm-provider/llm-model" },
+    }, undefined, "llm-provider", "llm-model"],
+  ];
+
+  for (const [name, cfg, model, provider, modelId] of fixtures) {
+    it(`uses ${name}`, async () => {
+      const { generateReflectionText } = loadFreshIndex();
+      let seen;
+      const result = await generateReflectionText({
+        conversation: "user: synthetic routing input\nassistant: acknowledged",
+        maxInputChars: 1000, cfg, model, agentId: "agent-one",
+        workspaceDir: "/tmp", timeoutMs: 2000, thinkLevel: "off",
+        api: { runtime: { agent: { runEmbeddedAgent: async (params) => {
+          seen = params;
+          return { payloads: [{ text: "synthetic reflection" }] };
+        } } } },
+      });
+      assert.equal(result.runner, "embedded");
+      assert.equal(seen.provider, provider);
+      assert.equal(seen.model, modelId);
+    });
+  }
+});
