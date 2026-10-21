@@ -238,3 +238,107 @@ describe("embedded runner cache", () => {
     assert.equal(typeof legacyParams[1].sessionFile, "string", "the second run is still labeled legacy and keeps the transcript file");
   });
 });
+
+describe("embedded reflection terminal results", () => {
+  const base = {
+    conversation: "user: synthetic reflection input\nassistant: acknowledged",
+    maxInputChars: 1000,
+    cfg: {},
+    agentId: "agent-one",
+    workspaceDir: "/tmp",
+    timeoutMs: 2000,
+    thinkLevel: "off",
+  };
+  const errorText = "synthetic host error, not a reflection";
+  const unsuccessfulResults = [
+    ["native terminal timeout even when aborted is false", {
+      payloads: [{ text: errorText, isError: true }],
+      meta: {
+        modelFallbackStopReason: "agent_run_terminal_timeout",
+        aborted: false,
+        error: { kind: "incomplete_turn", message: errorText, fallbackSafe: false },
+      },
+    }],
+    ["structured error with otherwise ordinary text", {
+      payloads: [{ text: errorText }],
+      meta: { error: { kind: "hook_block", message: errorText } },
+    }],
+    ["aborted result with text", {
+      payloads: [{ text: errorText }], meta: { aborted: true },
+    }],
+    ["terminal timeout marker without an error object", {
+      payloads: [{ text: errorText }],
+      meta: { modelFallbackStopReason: "agent_run_terminal_timeout", aborted: false },
+    }],
+    ["error payload after partial text", {
+      payloads: [{ text: "partial text" }, { text: errorText, isError: true }],
+    }],
+  ];
+
+  for (const [name, hostResult] of unsuccessfulResults) {
+    it(`uses the existing completion fallback for ${name}`, async () => {
+      const { generateReflectionText } = loadFreshIndex();
+      let embeddedCalls = 0;
+      let completionCalls = 0;
+      const result = await generateReflectionText({
+        ...base,
+        api: { runtime: { agent: { runEmbeddedAgent: async () => {
+          embeddedCalls += 1;
+          return hostResult;
+        } } } },
+        completeText: async () => {
+          completionCalls += 1;
+          return "valid completion reflection";
+        },
+      });
+      assert.equal(result.runner, "completion");
+      assert.equal(result.usedFallback, false);
+      assert.equal(result.text, "valid completion reflection");
+      assert.equal(embeddedCalls, 1, "a resolved terminal failure is not retried as a transport failure");
+      assert.equal(completionCalls, 1);
+      assert.match(result.error ?? "", /unsuccessful terminal result/);
+      assert.ok(!result.error.includes(errorText), "host error text is not copied into the diagnostic");
+    });
+  }
+
+  it("uses the diagnostic fallback if an unsuccessful legacy result has no completion", async () => {
+    const { generateReflectionText } = loadFreshIndex();
+    const result = await generateReflectionText({
+      ...base,
+      api: { runtime: { agent: { runEmbeddedPiAgent: async () => ({
+        payloads: [{ text: errorText, isError: true }],
+      }) } } },
+    });
+    assert.equal(result.runner, "fallback");
+    assert.equal(result.usedFallback, true);
+    assert.notEqual(result.text, errorText);
+    assert.match(result.error ?? "", /unsuccessful terminal result/);
+  });
+
+  it("accepts a legacy success without optional failure metadata", async () => {
+    const { generateReflectionText } = loadFreshIndex();
+    const result = await generateReflectionText({
+      ...base,
+      api: { runtime: { agent: { runEmbeddedPiAgent: async () => ({
+        payloads: [{ text: "valid legacy reflection" }],
+      }) } } },
+      completeText: async () => { throw new Error("completion must not run"); },
+    });
+    assert.equal(result.runner, "embedded");
+    assert.equal(result.text, "valid legacy reflection");
+  });
+
+  it("accepts false failure flags and an unrelated stop reason", async () => {
+    const { generateReflectionText } = loadFreshIndex();
+    const result = await generateReflectionText({
+      ...base,
+      api: { runtime: { agent: { runEmbeddedAgent: async () => ({
+        payloads: [{ text: "valid reflection", isError: false }],
+        meta: { aborted: false, modelFallbackStopReason: "provider_review_continuation" },
+      }) } } },
+      completeText: async () => { throw new Error("completion must not run"); },
+    });
+    assert.equal(result.runner, "embedded");
+    assert.equal(result.text, "valid reflection");
+  });
+});

@@ -1874,6 +1874,17 @@ async function generateReflectionTextUnbounded(
       return Array.isArray(maybePayloads) ? maybePayloads : [];
     })();
 
+    // The host can resolve a failed run with visible error/partial text.
+    // Reject that terminal result before treating any payload as a reflection.
+    const meta = result && typeof result === "object"
+      ? (result as Record<string, unknown>).meta as Record<string, unknown> | undefined
+      : undefined;
+    if (meta?.error || meta?.aborted === true ||
+        meta?.modelFallbackStopReason === "agent_run_terminal_timeout" ||
+        payloads.some((payload) => payload && typeof payload === "object" && payload.isError === true)) {
+      throw new Error("Embedded reflection returned an unsuccessful terminal result");
+    }
+
     if (payloads.length > 0) {
       const firstWithText = payloads.find((p) => {
         if (!p || typeof p !== "object") return false;
