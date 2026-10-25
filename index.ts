@@ -813,15 +813,36 @@ type EmbeddedPiRunner = (params: Record<string, unknown>) => Promise<unknown>;
 
 const requireFromHere = createRequire(import.meta.url);
 type ResolvedEmbeddedRunner = { runner: EmbeddedPiRunner; exportName: EmbeddedRunnerExportName };
-let embeddedPiRunnerPromise: Promise<ResolvedEmbeddedRunner> | null = null;
+type EmbeddedRunnerState = {
+  embeddedPiRunnerPromise: Promise<ResolvedEmbeddedRunner> | null;
+  resolvedEmbeddedRunnerKind?: EmbeddedRunnerExportName;
+  layer1FailureTimestamps: number[];
+};
+
+// A plugin module can serve several register() contexts. SDK runners are bound
+// to their host API and must not outlive that owner through a module-wide cache.
+const embeddedRunnerStates = new WeakMap<OpenClawPluginApi, EmbeddedRunnerState>();
+const unscopedEmbeddedRunnerState: EmbeddedRunnerState = {
+  embeddedPiRunnerPromise: null, layer1FailureTimestamps: [],
+};
+function getEmbeddedRunnerState(api?: OpenClawPluginApi): EmbeddedRunnerState {
+  // Preserve the no-argument diagnostic helpers; runtime callers pass their API.
+  if (!api) return unscopedEmbeddedRunnerState;
+  let state = embeddedRunnerStates.get(api);
+  if (!state) {
+    state = { embeddedPiRunnerPromise: null, layer1FailureTimestamps: [] };
+    embeddedRunnerStates.set(api, state);
+  }
+  return state;
+}
 
 // Circuit breaker for Layer 1: after 3 consecutive failures within 5min, skip Layer 1
-const layer1FailureTimestamps: number[] = [];
 const LAYER1_FAILURE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 const LAYER1_FAILURE_THRESHOLD = 3;
 
 /** Reports a Layer 1 runner execution failure. Called by the caller when Layer 1 runner throws. */
-export function reportLayer1Failure(): void {
+export function reportLayer1Failure(api?: OpenClawPluginApi): void {
+  const { layer1FailureTimestamps } = getEmbeddedRunnerState(api);
   const now = Date.now();
   layer1FailureTimestamps.push(now);
   // Keep only failures within the window
@@ -831,7 +852,8 @@ export function reportLayer1Failure(): void {
   }
 }
 
-export function isLayer1CircuitOpen(): boolean {
+export function isLayer1CircuitOpen(api?: OpenClawPluginApi): boolean {
+  const { layer1FailureTimestamps } = getEmbeddedRunnerState(api);
   const now = Date.now();
   const cutoff = now - LAYER1_FAILURE_WINDOW_MS;
   const recentFailures = layer1FailureTimestamps.filter((t) => t >= cutoff);
@@ -932,38 +954,36 @@ export function resolveEmbeddedRunnerExportName(candidate: unknown): EmbeddedRun
   return EMBEDDED_RUNNER_EXPORT_NAMES.find((name) => typeof record[name] === "function");
 }
 
-let resolvedEmbeddedRunnerKind: EmbeddedRunnerExportName | undefined;
-
-export function getEmbeddedRunnerExportName(): EmbeddedRunnerExportName | undefined {
-  return resolvedEmbeddedRunnerKind;
+export function getEmbeddedRunnerExportName(api?: OpenClawPluginApi): EmbeddedRunnerExportName | undefined {
+  return getEmbeddedRunnerState(api).resolvedEmbeddedRunnerKind;
 }
 
-// The runner and its kind are cached together: a host surface seen later must
-// not relabel an already cached runner (a legacy runner needs the transcript
-// file, a current one refuses it).
+// Cache the runner and its kind together within the owning host API. A legacy
+// runner needs the transcript file; a current runner refuses it.
 // eslint-disable-next-line import/export
 export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<ResolvedEmbeddedRunner> {
+  const state = getEmbeddedRunnerState(api);
   // Layer 1: 嘗試新 SDK API (with circuit breaker)
-  if (!embeddedPiRunnerPromise && !isLayer1CircuitOpen()) {
+  if (!state.embeddedPiRunnerPromise && !isLayer1CircuitOpen(api)) {
     const newApi = ((api as unknown as { runtime?: { agent?: Record<string, unknown> } }).runtime?.agent);
     const runnerName = resolveEmbeddedRunnerExportName(newApi);
     if (newApi && runnerName) {
       const runner = (newApi[runnerName] as EmbeddedPiRunner).bind(newApi);
-      resolvedEmbeddedRunnerKind = runnerName;
-      embeddedPiRunnerPromise = Promise.resolve({ runner, exportName: runnerName });
+      state.resolvedEmbeddedRunnerKind = runnerName;
+      state.embeddedPiRunnerPromise = Promise.resolve({ runner, exportName: runnerName });
     }
   }
 
   // Layer 2: Fallback 舊 extensionAPI.js
-  if (!embeddedPiRunnerPromise) {
-    embeddedPiRunnerPromise = (async () => {
+  if (!state.embeddedPiRunnerPromise) {
+    state.embeddedPiRunnerPromise = (async () => {
       const importErrors: string[] = [];
       for (const specifier of getExtensionApiImportSpecifiers()) {
         try {
           const mod = await import(specifier);
           const runnerName = resolveEmbeddedRunnerExportName(mod);
           if (runnerName) {
-            resolvedEmbeddedRunnerKind = runnerName;
+            state.resolvedEmbeddedRunnerKind = runnerName;
             return { runner: (mod as Record<string, unknown>)[runnerName] as EmbeddedPiRunner, exportName: runnerName };
           }
           importErrors.push(`${specifier}: runEmbeddedAgent export not found`);
@@ -980,11 +1000,14 @@ export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<Reso
   }
 
   // F2 fix: restore retry-on-failure semantics removed in PR716
+  const pending = state.embeddedPiRunnerPromise;
   try {
-    return await embeddedPiRunnerPromise;
+    return await pending;
   } catch (err) {
-    embeddedPiRunnerPromise = null;
-    resolvedEmbeddedRunnerKind = undefined;
+    if (state.embeddedPiRunnerPromise === pending) {
+      state.embeddedPiRunnerPromise = null;
+      state.resolvedEmbeddedRunnerKind = undefined;
+    }
     throw err;
   }
 }
@@ -1885,7 +1908,7 @@ async function generateReflectionTextUnbounded(
     }
   } catch (err) {
     // F1 fix: report Layer 1 runner execution failure to open circuit breaker
-    reportLayer1Failure();
+    reportLayer1Failure(params.api);
     errors.push(`embedded: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
   } finally {
     await unlink(tempSessionFile).catch(() => { });

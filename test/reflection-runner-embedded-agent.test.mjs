@@ -14,7 +14,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { registerHooks } from "node:module";
 import jitiFactory from "jiti";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -228,13 +231,143 @@ describe("embedded runner cache", () => {
 
     const first = await generateReflectionText({ ...base, api: legacyApi });
     assert.equal(first.text, "legacy");
-    assert.equal(getEmbeddedRunnerExportName(), "runEmbeddedPiAgent");
+    assert.equal(getEmbeddedRunnerExportName(legacyApi), "runEmbeddedPiAgent");
     assert.equal(typeof legacyParams[0].sessionFile, "string", "the legacy runner gets its transcript file");
 
     const second = await generateReflectionText({ ...base, api: currentApi });
-    assert.equal(second.text, "legacy", "the cached runner keeps serving");
-    assert.equal(currentCalls, 0, "a later host surface does not replace the cached runner");
-    assert.equal(getEmbeddedRunnerExportName(), "runEmbeddedPiAgent", "the cached kind stays with the cached runner");
-    assert.equal(typeof legacyParams[1].sessionFile, "string", "the second run is still labeled legacy and keeps the transcript file");
+    assert.equal(second.text, "current", "the second host must use its own runner");
+    assert.equal(currentCalls, 1, "the later host resolves a separate runner");
+    assert.equal(getEmbeddedRunnerExportName(legacyApi), "runEmbeddedPiAgent", "the cached kind stays with the cached runner");
+    assert.equal(legacyParams.length, 1, "the second host must never call the first host runner");
+    assert.equal(getEmbeddedRunnerExportName(currentApi), "runEmbeddedAgent");
   });
 });
+
+// Keep the host boundary tests on both the source entry and the published native
+// ESM entry: multiple register() contexts share one imported plugin module.
+for (const target of ["source", "published dist"]) {
+  describe(`host-scoped reflection runners (${target})`, () => {
+    let instance = 0;
+    async function loadModule() {
+      if (target === "source") return loadFreshIndex();
+      const url = pathToFileURL(path.resolve(testDir, "../dist/index.js"));
+      url.searchParams.set("host-cache-test", String(++instance));
+      return import(url.href);
+    }
+    const base = {
+      conversation: "user: the build is green\nassistant: noted",
+      maxInputChars: 1000, cfg: {}, agentId: "test-agent",
+      workspaceDir: tmpdir(), timeoutMs: 2000, thinkLevel: "off",
+    };
+    function host(label, exportName = "runEmbeddedAgent") {
+      const calls = [];
+      const agent = {
+        label,
+        async [exportName](params) {
+          assert.equal(this, agent, "the host runner retains its receiver");
+          calls.push(params);
+          return { payloads: [{ text: this.label }] };
+        },
+      };
+      return { api: { runtime: { agent } }, calls };
+    }
+
+    it("uses each current host's runner even when a retired host was resolved first", async () => {
+      const mod = await loadModule();
+      const first = host("first");
+      const second = host("second");
+      assert.equal((await mod.generateReflectionText({ ...base, api: first.api })).text, "first");
+      first.api.runtime.agent.label = "retired";
+      assert.equal((await mod.generateReflectionText({ ...base, api: second.api })).text, "second");
+      assert.equal(first.calls.length, 1, "the retired host must not run again");
+      assert.equal(second.calls.length, 1);
+    });
+
+    for (const firstKind of ["runEmbeddedAgent", "runEmbeddedPiAgent"]) {
+      it(`keeps each runner's transcript contract when ${firstKind} resolves first`, async () => {
+        const mod = await loadModule();
+        const current = host("current");
+        const legacy = host("legacy", "runEmbeddedPiAgent");
+        const ordered = firstKind === "runEmbeddedAgent" ? [current, legacy] : [legacy, current];
+        for (const item of ordered) {
+          const result = await mod.generateReflectionText({ ...base, api: item.api });
+          assert.equal(result.text, item.api.runtime.agent.label);
+          assert.equal(result.runner, "embedded");
+        }
+        assert.equal(current.calls[0].sessionFile, undefined);
+        assert.equal(typeof legacy.calls[0].sessionFile, "string");
+        assert.equal(current.calls[0].sessionPersistence, "detached");
+        assert.equal(mod.getEmbeddedRunnerExportName(current.api), "runEmbeddedAgent");
+        assert.equal(mod.getEmbeddedRunnerExportName(legacy.api), "runEmbeddedPiAgent");
+      });
+    }
+
+    it("keeps concurrent hosts separate while reusing a resolution within one host", async () => {
+      const mod = await loadModule();
+      const current = host("current");
+      const legacy = host("legacy", "runEmbeddedPiAgent");
+      const [one, same, other] = await Promise.all([
+        mod.loadEmbeddedPiRunner(current.api), mod.loadEmbeddedPiRunner(current.api),
+        mod.loadEmbeddedPiRunner(legacy.api),
+      ]);
+      assert.equal(one, same, "a host shares its resolved runner");
+      assert.notEqual(one, other, "different hosts cannot share a bound runner");
+      const results = await Promise.all([current, legacy].map(({ api }) =>
+        mod.generateReflectionText({ ...base, api, maxConcurrentRuns: 2 })));
+      assert.deepEqual(results.map(r => r.text), ["current", "legacy"]);
+      assert.equal(current.calls[0].sessionFile, undefined);
+      assert.equal(typeof legacy.calls[0].sessionFile, "string");
+    });
+
+    it("does not let another host's circuit failures suppress a healthy SDK runner", async () => {
+      const mod = await loadModule();
+      const failing = host("failing");
+      failing.api.runtime.agent.runEmbeddedAgent = async () => { throw new Error("host unavailable"); };
+      for (let i = 0; i < 3; i++) {
+        const result = await mod.generateReflectionText({ ...base, api: failing.api });
+        assert.equal(result.runner, "fallback");
+      }
+      assert.equal(mod.isLayer1CircuitOpen(failing.api), true);
+      const healthy = host("healthy");
+      assert.equal(mod.isLayer1CircuitOpen(healthy.api), false);
+      assert.equal((await mod.generateReflectionText({ ...base, api: healthy.api })).text, "healthy");
+      assert.equal(healthy.calls.length, 1);
+    });
+
+    if (target === "published dist") it("retries a rejected resolution without clearing another host's cached runner", async () => {
+      const mod = await loadModule();
+      const missing = {};
+      // Reject every extension fallback in this fixture, including a developer's
+      // globally installed host. Exercise the real rejected-promise cache path.
+      const directory = await mkdtemp(path.join(tmpdir(), "reflection-runner-cache-"));
+      const previous = process.env.OPENCLAW_EXTENSION_API_PATH;
+      const hooks = registerHooks({
+        resolve(specifier, context, nextResolve) {
+          if (specifier.includes("extensionAPI.js") || specifier.endsWith("missing.mjs")) {
+            throw Object.assign(new Error("fixture: extension API unavailable"), { code: "ERR_MODULE_NOT_FOUND" });
+          }
+          return nextResolve(specifier, context);
+        },
+      });
+      try {
+        process.env.OPENCLAW_EXTENSION_API_PATH = path.join(directory, "missing.mjs");
+        const rejected = await Promise.allSettled([
+          mod.loadEmbeddedPiRunner(missing), mod.loadEmbeddedPiRunner(missing),
+        ]);
+        assert.deepEqual(rejected.map(r => r.status), ["rejected", "rejected"]);
+        const healthy = host("healthy");
+        const cached = await mod.loadEmbeddedPiRunner(healthy.api);
+        const repaired = host("repaired");
+        missing.runtime = repaired.api.runtime;
+        assert.equal((await mod.generateReflectionText({ ...base, api: missing })).text, "repaired");
+        assert.equal(await mod.loadEmbeddedPiRunner(healthy.api), cached);
+        assert.equal((await mod.generateReflectionText({ ...base, api: healthy.api })).text, "healthy");
+      } finally {
+        hooks.deregister();
+        if (previous === undefined) delete process.env.OPENCLAW_EXTENSION_API_PATH;
+        else process.env.OPENCLAW_EXTENSION_API_PATH = previous;
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+  });
+}
