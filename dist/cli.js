@@ -1830,12 +1830,36 @@ export function registerMemoryCLI(program, context) {
             process.exit(1);
         }
     });
+    // Bounded set of unsubstituted template placeholders. A layer is flagged
+    // only when its ENTIRE trimmed value is one of these tokens: the short
+    // layer names (l0/l1/l2) or the stored metadata field names
+    // (l0_abstract/l1_overview/l2_content), in single-brace `{name}` or
+    // double-brace `{{name}}` form. No repo prompt template emits brace
+    // placeholders, so the field names are the only names a template could
+    // have meant; anything else (braces mid-text, other words, short or
+    // punctuated summaries) is legitimate content and is never matched.
+    const SUMMARY_PLACEHOLDER_NAMES = new Set([
+        "l0",
+        "l1",
+        "l2",
+        "l0_abstract",
+        "l1_overview",
+        "l2_content",
+    ]);
+    function isSummaryTemplatePlaceholder(value) {
+        const match = /^\{\{([a-z0-9_]+)\}\}$|^\{([a-z0-9_]+)\}$/.exec(value);
+        if (!match)
+            return false;
+        return SUMMARY_PLACEHOLDER_NAMES.has(match[1] ?? match[2]);
+    }
     // Judge the RAW stored metadata: parseSmartMetadata backfills missing
     // levels from the text, which would hide exactly the rows the repair
     // exists to fix. Accept only a non-null, non-array object: JSON.parse
     // ("null") and primitives/arrays succeed, so the catch alone cannot
     // normalize a damaged row, and one bad row must not abort a scan. Shared
     // by the scan and the locked apply-time recheck so both judge identically.
+    // Returned levels have placeholder layers blanked, so the repair fills
+    // them exactly like missing layers and keeps every genuine layer.
     function judgeSummaryLevels(entry) {
         let rawMeta = {};
         try {
@@ -1850,25 +1874,39 @@ export function registerMemoryCLI(program, context) {
         const l0 = (typeof rawMeta.l0_abstract === "string" ? rawMeta.l0_abstract : "").trim();
         const l1 = (typeof rawMeta.l1_overview === "string" ? rawMeta.l1_overview : "").trim();
         const l2 = (typeof rawMeta.l2_content === "string" ? rawMeta.l2_content : "").trim();
+        const raw = { l0, l1, l2 };
+        const placeholderLayers = ["l0", "l1", "l2"].filter((key) => isSummaryTemplatePlaceholder(raw[key]));
+        if (placeholderLayers.length > 0) {
+            const levels = { ...raw };
+            for (const key of placeholderLayers)
+                levels[key] = "";
+            return {
+                kind: "placeholder",
+                reason: `unsubstituted template placeholder in ${placeholderLayers.map((k) => k.toUpperCase()).join("/")}`,
+                levels,
+                raw,
+            };
+        }
         if (!l0 || !l1 || !l2) {
-            return { reason: "missing summary level(s)", levels: { l0, l1, l2 } };
+            return { kind: "missing", reason: "missing summary level(s)", levels: raw, raw };
         }
         if (l0 === l1 && l1 === l2) {
             // Legacy parse-fallback signature: all three levels collapsed to one
             // identical string. A generated set always differs by level.
-            return { reason: "degenerate identical levels", levels: { l0, l1, l2 } };
+            return { kind: "degenerate", reason: "degenerate identical levels", levels: raw, raw };
         }
         return null;
     }
-    // repair-summaries: report memories whose L0/L1/L2 summaries are missing or
-    // degenerate; --apply fills them with the truncation fallback. Detection is
+    // repair-summaries: report memories whose L0/L1/L2 summaries are missing,
+    // degenerate, or unsubstituted template placeholders; --apply fills them
+    // with the truncation fallback. Detection is
     // limited to mechanically reliable shapes: a healthy generated L0 is a
     // concise abstract that legitimately differs from the raw text, so
     // text-vs-L0 prefix comparison cannot distinguish stale from generated and
     // is deliberately not used.
     memory
         .command("repair-summaries")
-        .description("Report memories with missing or degenerate L0/L1/L2 summaries; --apply fills them from the source text (default is report-only)")
+        .description("Report memories with missing, degenerate, or unsubstituted-placeholder ({l0}, {{l1}}, {l2_content}, ...) L0/L1/L2 summaries; --apply fills them from the source text (default is report-only)")
         .option("--scope <scope>", "Filter by scope (e.g. agent:assistant)")
         .option("--apply", "Write the repairs (without this flag the command only reports)", false)
         .option("--dry-run", "Deprecated: report-only is already the default", false)
@@ -1901,17 +1939,37 @@ export function registerMemoryCLI(program, context) {
                 }
                 const verdict = judgeSummaryLevels(entry);
                 if (verdict) {
-                    staleEntries.push({ entry, reason: verdict.reason, levels: verdict.levels });
+                    staleEntries.push({ entry, kind: verdict.kind, reason: verdict.reason, raw: verdict.raw });
                 }
             }
             if (staleEntries.length === 0) {
-                console.log("No repairable summaries found (no missing or degenerate L0/L1/L2).");
+                console.log("No repairable summaries found (no missing, degenerate, or placeholder L0/L1/L2).");
                 return;
             }
             console.log(`Found ${staleEntries.length} repairable entries:\n`);
-            for (const { entry, reason } of staleEntries) {
-                console.log(`  [${entry.id.slice(0, 8)}] scope=${entry.scope} (${reason})`);
-                console.log(`    text: "${entry.text.slice(0, 60).trim()}..."`);
+            // Report each category separately so operators can review the
+            // placeholder rows (a distinct failure shape) before any repair.
+            const categories = [
+                { kind: "missing", title: "Missing summary levels" },
+                { kind: "degenerate", title: "Degenerate identical levels" },
+                { kind: "placeholder", title: "Unsubstituted template placeholders (review before repair)" },
+            ];
+            for (const { kind, title } of categories) {
+                const group = staleEntries.filter((item) => item.kind === kind);
+                if (group.length === 0)
+                    continue;
+                console.log(`${title}: ${group.length}`);
+                for (const { entry, reason, raw } of group) {
+                    console.log(`  [${entry.id.slice(0, 8)}] scope=${entry.scope} (${reason})`);
+                    console.log(`    text: "${entry.text.slice(0, 60).trim()}..."`);
+                    if (kind === "placeholder") {
+                        const shown = ["l0", "l1", "l2"]
+                            .map((key) => `${key.toUpperCase()}=${JSON.stringify(raw[key].slice(0, 40))}`)
+                            .join(" ");
+                        console.log(`    layers: ${shown}`);
+                    }
+                }
+                console.log("");
             }
             if (!options.apply || options.dryRun) {
                 console.log(`\nReport only — no data was modified. Re-run with --apply to fill ${staleEntries.length} entr${staleEntries.length === 1 ? "y" : "ies"} from source text.`);
@@ -1938,7 +1996,9 @@ export function registerMemoryCLI(program, context) {
                         // A degenerate set (all three collapsed to one string) is
                         // replaced whole; otherwise fill ONLY the missing levels so
                         // valid generated summaries survive the repair.
-                        const replaceAll = verdict.reason === "degenerate identical levels";
+                        // Placeholder layers arrive blanked in verdict.levels, so
+                        // they are filled like missing ones.
+                        const replaceAll = verdict.kind === "degenerate";
                         return {
                             l0_abstract: replaceAll ? current.text : verdict.levels.l0 || current.text,
                             l1_overview: replaceAll ? `- ${current.text}` : verdict.levels.l1 || `- ${current.text}`,
