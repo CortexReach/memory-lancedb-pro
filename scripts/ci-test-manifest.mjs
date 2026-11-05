@@ -159,6 +159,7 @@ export const CI_TEST_MANIFEST = [
   { group: "llm-clients-and-auth", runner: "node", file: "test/llm-host-transport-composition.test.mjs", args: ["--test"] },
   { group: "llm-clients-and-auth", runner: "node", file: "test/admission-control-host-transport.test.mjs", args: ["--test"] },
   { group: "llm-clients-and-auth", runner: "node", file: "test/llm-transport-credential-hygiene.test.mjs", args: ["--test"] },
+  { group: "llm-clients-and-auth", runner: "node", file: "test/llm-json-error-redaction.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-consolidate.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-consolidate-cost-gate.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-consolidate-two-phase-apply.test.mjs", args: ["--test"] },

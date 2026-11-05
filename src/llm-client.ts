@@ -217,10 +217,41 @@ function sanitizeLabelHeader(label: string): string {
   return cleaned || "generic";
 }
 
-function previewText(value: string, maxLen = 200): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxLen) return normalized;
-  return `${normalized.slice(0, maxLen - 3)}...`;
+/**
+ * Content-free summary of a JSON.parse failure. Engine messages quote the
+ * input they failed on (e.g. V8's `Unexpected token 'N', "No JSON: ..." is
+ * not valid JSON`), so only the error class and the numeric position survive.
+ */
+function describeJsonParseError(err: unknown): string {
+  const name = err instanceof Error && /^[A-Za-z]{1,64}$/.test(err.name) ? err.name : "Error";
+  const message = err instanceof Error ? err.message : String(err);
+  const position = /\bposition (\d+)/i.exec(message)?.[1];
+  return position !== undefined ? `${name} at position ${position}` : name;
+}
+
+type JsonFailure =
+  | { category: "non-json"; chars: number }
+  | { category: "parse-failure"; chars: number; jsonChars: number; error: unknown }
+  | { category: "repair-failure"; chars: number; jsonChars: number; error: unknown; repairError: unknown };
+
+/**
+ * Builds the completeJson() failure diagnostic (log line and getLastError()).
+ * The response may carry the conversation or memory being extracted, and the
+ * default log sink is the host debug logger, so this deliberately records
+ * only the stage label, the failure category, sizes and parse-error class /
+ * position -- never response text or raw JSON.parse messages.
+ */
+function formatJsonFailure(label: string, transportTag: string | null, failure: JsonFailure): string {
+  const prefix = `memory-lancedb-pro: llm-client [${label}]`;
+  const tag = transportTag ? `${transportTag} ` : "";
+  switch (failure.category) {
+    case "non-json":
+      return `${prefix} no JSON object found${transportTag ? ` in ${transportTag} response` : ""} (category=non-json, chars=${failure.chars})`;
+    case "parse-failure":
+      return `${prefix} ${tag}JSON.parse failed (category=parse-failure, error=${describeJsonParseError(failure.error)}, chars=${failure.chars}, jsonChars=${failure.jsonChars})`;
+    case "repair-failure":
+      return `${prefix} ${tag}JSON.parse failed; heuristic repair failed (category=repair-failure, error=${describeJsonParseError(failure.error)}, repairError=${describeJsonParseError(failure.repairError)}, chars=${failure.chars}, jsonChars=${failure.jsonChars})`;
+  }
 }
 
 function nextNonWhitespaceChar(text: string, start: number): string | undefined {
@@ -400,8 +431,7 @@ function createHostClient(
 
         const jsonStr = extractJsonFromResponse(raw);
         if (!jsonStr) {
-          lastError =
-            `memory-lancedb-pro: llm-client [${label}] no JSON object found in host-transport response (chars=${raw.length}, preview=${JSON.stringify(previewText(raw))})`;
+          lastError = formatJsonFailure(label, "host-transport", { category: "non-json", chars: raw.length });
           log(lastError);
           return null;
         }
@@ -418,14 +448,23 @@ function createHostClient(
               );
               return repaired;
             } catch (repairErr) {
-              lastError =
-                `memory-lancedb-pro: llm-client [${label}] host-transport JSON.parse failed: ${err instanceof Error ? err.message : String(err)}; repair failed: ${repairErr instanceof Error ? repairErr.message : String(repairErr)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
+              lastError = formatJsonFailure(label, "host-transport", {
+                category: "repair-failure",
+                chars: raw.length,
+                jsonChars: jsonStr.length,
+                error: err,
+                repairError: repairErr,
+              });
               log(lastError);
               return null;
             }
           }
-          lastError =
-            `memory-lancedb-pro: llm-client [${label}] host-transport JSON.parse failed: ${err instanceof Error ? err.message : String(err)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
+          lastError = formatJsonFailure(label, "host-transport", {
+            category: "parse-failure",
+            chars: raw.length,
+            jsonChars: jsonStr.length,
+            error: err,
+          });
           log(lastError);
           return null;
         }
@@ -544,8 +583,7 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
 
         const jsonStr = extractJsonFromResponse(raw);
         if (!jsonStr) {
-          lastError =
-            `memory-lancedb-pro: llm-client [${label}] no JSON object found (chars=${raw.length}, preview=${JSON.stringify(previewText(raw))})`;
+          lastError = formatJsonFailure(label, null, { category: "non-json", chars: raw.length });
           log(lastError);
           return null;
         }
@@ -562,14 +600,23 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
               );
               return repaired;
             } catch (repairErr) {
-              lastError =
-                `memory-lancedb-pro: llm-client [${label}] JSON.parse failed: ${err instanceof Error ? err.message : String(err)}; repair failed: ${repairErr instanceof Error ? repairErr.message : String(repairErr)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
+              lastError = formatJsonFailure(label, null, {
+                category: "repair-failure",
+                chars: raw.length,
+                jsonChars: jsonStr.length,
+                error: err,
+                repairError: repairErr,
+              });
               log(lastError);
               return null;
             }
           }
-          lastError =
-            `memory-lancedb-pro: llm-client [${label}] JSON.parse failed: ${err instanceof Error ? err.message : String(err)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
+          lastError = formatJsonFailure(label, null, {
+            category: "parse-failure",
+            chars: raw.length,
+            jsonChars: jsonStr.length,
+            error: err,
+          });
           log(lastError);
           return null;
         }
@@ -700,8 +747,7 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
 
           const jsonStr = extractJsonFromResponse(raw);
           if (!jsonStr) {
-            lastError =
-              `memory-lancedb-pro: llm-client [${label}] no JSON object found in OAuth response (chars=${raw.length}, preview=${JSON.stringify(previewText(raw))})`;
+            lastError = formatJsonFailure(label, "OAuth", { category: "non-json", chars: raw.length });
             log(lastError);
             return null;
           }
@@ -718,14 +764,23 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
                 );
                 return repaired;
               } catch (repairErr) {
-                lastError =
-                  `memory-lancedb-pro: llm-client [${label}] OAuth JSON.parse failed: ${err instanceof Error ? err.message : String(err)}; repair failed: ${repairErr instanceof Error ? repairErr.message : String(repairErr)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
+                lastError = formatJsonFailure(label, "OAuth", {
+                  category: "repair-failure",
+                  chars: raw.length,
+                  jsonChars: jsonStr.length,
+                  error: err,
+                  repairError: repairErr,
+                });
                 log(lastError);
                 return null;
               }
             }
-            lastError =
-              `memory-lancedb-pro: llm-client [${label}] OAuth JSON.parse failed: ${err instanceof Error ? err.message : String(err)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
+            lastError = formatJsonFailure(label, "OAuth", {
+              category: "parse-failure",
+              chars: raw.length,
+              jsonChars: jsonStr.length,
+              error: err,
+            });
             log(lastError);
             return null;
           }

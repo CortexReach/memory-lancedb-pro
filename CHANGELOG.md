@@ -9,6 +9,17 @@
 
 ## Unreleased
 
+### Fix: keep response text out of LLM JSON error diagnostics (#1014)
+
+**Bug**: When `completeJson()` received a response that was not JSON, could not be parsed, or could not be repaired, the diagnostic passed to the `log` callback (wired to `api.logger.debug`) and returned by `getLastError()` copied response text, both via `preview` / `jsonPreview` fields and via raw `JSON.parse` error messages, which quote their input. That text can contain the conversation or memory being extracted.
+
+**Changes**:
+- Host, direct API and OAuth transports now build these diagnostics with one shared formatter that records only the stage label, `category` (`non-json` / `parse-failure` / `repair-failure`), `chars` (response length), `jsonChars` (extracted candidate length) and the parse error class (e.g. `error=SyntaxError`, plus `at position N` when the engine's message reports a numeric position). No response text is recorded, and no opt-in raw preview is added.
+- Valid JSON responses, and the heuristic-repair success log line, are unchanged.
+- **Test**: `test/llm-json-error-redaction.test.mjs` drives the real `createLlmClient()` through all three transports with a synthetic marker.
+
+---
+
 ### Fix: cumulative turn counting for auto-capture smart extraction (#417, PR #549)
 
 **Bug**: With `extractMinMessages: 2` + `smartExtraction: true`, single-turn DM conversations always fell through to regex fallback, writing dirty data (`l0_abstract == text`, no LLM distillation).
