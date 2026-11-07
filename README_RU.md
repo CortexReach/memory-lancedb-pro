@@ -1,3 +1,5 @@
+# 🚀 [Смотреть видеоурок](https://www.bilibili.com/video/BV1iWwtztEQf/)
+
 <div align="center">
 
 # 🧠 memory-lancedb-pro · 🦞OpenClaw Plugin
