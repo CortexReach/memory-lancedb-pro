@@ -416,10 +416,18 @@ export async function runCompaction(
   // Filter out entries without vectors (shouldn't happen but be safe)
   const valid = entries.filter((e) => e.vector && e.vector.length > 0);
 
-  const plans = buildClusters(
-    valid,
-    config.similarityThreshold,
-    config.minClusterSize,
+  const byScope = new Map<string, CompactionEntry[]>();
+  for (const entry of valid) {
+    const group = byScope.get(entry.scope) ?? [];
+    group.push(entry);
+    byScope.set(entry.scope, group);
+  }
+  // Clusters must share a scope before merged rows can replace their members.
+  const plans = Array.from(byScope.values()).flatMap((group) =>
+    buildClusters(group, config.similarityThreshold, config.minClusterSize).map((plan) => ({
+      ...plan,
+      members: plan.memberIndices.map((index) => group[index]),
+    })),
   );
 
   if (config.dryRun) {
@@ -439,7 +447,7 @@ export async function runCompaction(
     plans,
     MAX_CLUSTER_COMPACTION_CONCURRENCY,
     async (plan) => {
-      const members = plan.memberIndices.map((i) => valid[i]);
+      const members = plan.members;
 
       try {
         // Embed the merged text
