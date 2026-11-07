@@ -303,8 +303,8 @@ git clone https://github.com/CortexReach/memory-lancedb-pro-skill.git ~/.opencla
 [![YouTube Video](https://img.shields.io/badge/YouTube-Watch%20Now-red?style=for-the-badge&logo=youtube)](https://youtu.be/MtukF1C8epQ)
 **https://youtu.be/MtukF1C8epQ**
 
-[![Bilibili Video](https://img.shields.io/badge/Bilibili-Watch%20Now-00A1D6?style=for-the-badge&logo=bilibili&logoColor=white)](https://www.bilibili.com/video/BV1zUf2BGEgn/)
-**https://www.bilibili.com/video/BV1zUf2BGEgn/**
+[![Bilibili Video](https://img.shields.io/badge/Bilibili-Watch%20Now-00A1D6?style=for-the-badge&logo=bilibili&logoColor=white)](https://www.bilibili.com/video/BV1iWwtztEQf/)
+**https://www.bilibili.com/video/BV1iWwtztEQf/**
 
 ---
 
