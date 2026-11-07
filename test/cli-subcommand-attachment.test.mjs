@@ -339,6 +339,158 @@ describe("repair-summaries action safety", () => {
   });
 });
 
+describe("repair-summaries detects unsubstituted template placeholders (#1015)", () => {
+  const sourceText = "The synthetic release needs two independent checks before publication.";
+  const genuineRow = summaryRow({
+    id: "genuine-1",
+    text: sourceText,
+    l0: "Release gate: two independent checks",
+    l1: "## Release policy\n- Two independent checks required before publication",
+    l2: sourceText,
+  });
+  const missingRow = summaryRow({ id: "missing-2", text: sourceText });
+  const identicalRow = summaryRow({ id: "identical-1", text: sourceText, l0: sourceText, l1: sourceText, l2: sourceText });
+  const placeholderRow = summaryRow({ id: "placeholder-1", text: sourceText, l0: "{l0}", l1: "{l1}", l2: "{l2}" });
+  const writeSucceeds = {
+    async update(id) {
+      return { id };
+    },
+  };
+
+  it("reports the issue's four cases with the right verdicts in report-only mode, never mutating", async () => {
+    const { updateCalls, logs } = await runRepairSummaries([genuineRow, missingRow, identicalRow, placeholderRow]);
+
+    assert.equal(updateCalls.length, 0, "report-only must never call the mutation callback");
+    assert.match(logs, /Found 3 repairable entries/);
+    assert.doesNotMatch(logs, /genuine-/, "distinct genuine layers must not be flagged");
+    assert.match(logs, /\[missing-\] scope=agent:main \(missing summary level\(s\)\)/);
+    assert.match(logs, /\[identica\] scope=agent:main \(degenerate identical levels\)/);
+    assert.match(logs, /\[placehol\] scope=agent:main \(unsubstituted template placeholder in L0\/L1\/L2\)/);
+    assert.match(logs, /Unsubstituted template placeholders \(review before repair\): 1/);
+    assert.match(logs, /layers: L0="\{l0\}" L1="\{l1\}" L2="\{l2\}"/);
+    assert.match(logs, /Report only/);
+  });
+
+  it("reports placeholder rows in their own category, separate from missing and degenerate ones", async () => {
+    const { logs } = await runRepairSummaries([missingRow, identicalRow, placeholderRow]);
+    const missingAt = logs.indexOf("Missing summary levels: 1");
+    const degenerateAt = logs.indexOf("Degenerate identical levels: 1");
+    const placeholderAt = logs.indexOf("Unsubstituted template placeholders (review before repair): 1");
+    assert.ok(missingAt >= 0 && degenerateAt > missingAt && placeholderAt > degenerateAt, logs);
+    assert.ok(logs.indexOf("[placehol]") > placeholderAt, "the placeholder row is listed under its own heading");
+  });
+
+  it("flags only the bounded token set: double braces and stored field names, in any single layer", async () => {
+    const rows = [
+      summaryRow({ id: "dbl-brace-1", text: sourceText, l0: "{{l0}}", l1: "## Policy\n- Two checks", l2: sourceText }),
+      summaryRow({ id: "field-name-1", text: sourceText, l0: "Release gate", l1: "{l1_overview}", l2: sourceText }),
+      summaryRow({ id: "padded-1", text: sourceText, l0: "Release gate", l1: "## Policy\n- Two checks", l2: "  {{l2_content}}\n" }),
+    ];
+    const { logs, updateCalls } = await runRepairSummaries(rows);
+
+    assert.equal(updateCalls.length, 0);
+    assert.match(logs, /Found 3 repairable entries/);
+    assert.match(logs, /\[dbl-brac\] .*placeholder in L0\)/);
+    assert.match(logs, /\[field-na\] .*placeholder in L1\)/);
+    assert.match(logs, /\[padded-1\] .*placeholder in L2\)/);
+  });
+
+  it("never flags braces inside real text, other brace words, or short punctuated summaries", async () => {
+    const rows = [
+      summaryRow({
+        id: "braces-mid-1",
+        text: "User formats release notes with a {version} token and an {l0} example inline.",
+        l0: "Release notes use a {version} token",
+        l1: "## Formatting\n- Template string: `Release {version}`\n- Mentions {l0} inline",
+        l2: "User formats release notes with a {version} token and an {l0} example inline.",
+      }),
+      summaryRow({ id: "other-word-1", text: sourceText, l0: "{version}", l1: "{abstract}", l2: "{name}" }),
+      summaryRow({ id: "short-1", text: sourceText, l0: "OK.", l1: "- Yes!", l2: "Two checks; done." }),
+      summaryRow({ id: "near-miss-1", text: sourceText, l0: "{l0} pending", l1: "{ l1 }", l2: "{L2}" }),
+      summaryRow({ id: "json-1", text: sourceText, l0: "{}", l1: '{"l1": 1}', l2: "{l3}" }),
+    ];
+    const { logs, updateCalls } = await runRepairSummaries(rows, ["--apply"], writeSucceeds);
+
+    assert.equal(updateCalls.length, 0, "legitimate brace content must not be rewritten");
+    assert.match(logs, /No repairable summaries found/);
+  });
+
+  it("under --apply repairs placeholder layers through the locked recheck, keeping genuine layers", async () => {
+    const mixedRow = summaryRow({
+      id: "mixed-1",
+      text: sourceText,
+      l0: "Release gate: two independent checks",
+      l1: "{l1}",
+      l2: "{{l2}}",
+    });
+    const { updateCalls, logs, exitCode } = await runRepairSummaries(
+      [genuineRow, placeholderRow, mixedRow],
+      ["--apply"],
+      writeSucceeds,
+    );
+
+    assert.deepEqual(updateCalls.map((call) => call.id).sort(), ["mixed-1", "placeholder-1"]);
+    const byId = Object.fromEntries(updateCalls.map((call) => [call.id, JSON.parse(call.patch.metadata)]));
+    assert.equal(byId["placeholder-1"].l0_abstract, sourceText);
+    assert.equal(byId["placeholder-1"].l1_overview, `- ${sourceText}`);
+    assert.equal(byId["placeholder-1"].l2_content, sourceText);
+    assert.equal(byId["mixed-1"].l0_abstract, "Release gate: two independent checks", "a genuine layer must survive");
+    assert.equal(byId["mixed-1"].l1_overview, `- ${sourceText}`);
+    assert.equal(byId["mixed-1"].l2_content, sourceText);
+    assert.match(logs, /2 fixed, 0 failed/);
+    assert.notEqual(exitCode, 1);
+  });
+
+  it("skips a placeholder row that was healed between scan and the locked apply-time recheck", async () => {
+    const rows = [summaryRow({ id: "healed-1", text: sourceText, l0: "{l0}", l1: "{l1}", l2: "{l2}" })];
+    let listed = false;
+    const { updateCalls, logs } = await runRepairSummaries(rows, ["--apply"], {
+      ...writeSucceeds,
+      async list(scopeFilter, category, limit = 200, offset = 0) {
+        const page = rows.slice(offset, offset + limit);
+        if (!listed) {
+          listed = true;
+          // A concurrent writer substitutes the layers after the scan.
+          rows[0] = { ...genuineRow, id: "healed-1" };
+        }
+        return page;
+      },
+    });
+
+    assert.equal(updateCalls.length, 0, "the recheck must judge the fresh row, not the scan snapshot");
+    assert.match(logs, /Skipped healed-1: healthy at apply time/);
+  });
+
+  it("passes the --scope filter to both the scan and the locked placeholder repair", async () => {
+    const listScopes = [];
+    const transformScopes = [];
+    await runRepairSummaries([placeholderRow], ["--apply", "--scope", "agent:main"], {
+      async list(scopeFilter, category, limit = 200, offset = 0) {
+        listScopes.push(scopeFilter);
+        return [placeholderRow].slice(offset, offset + limit);
+      },
+      async transformMetadata(id, transform, scopeFilter) {
+        transformScopes.push(scopeFilter);
+        const patch = transform(placeholderRow);
+        assert.ok(patch, "the recheck must still judge the placeholder row repairable");
+        return { outcome: "updated", entry: placeholderRow };
+      },
+    });
+    assert.deepEqual(listScopes[0], ["agent:main"]);
+    assert.deepEqual(transformScopes, [["agent:main"]]);
+  });
+
+  it("keeps excluding reflection rows even when their metadata holds placeholder-shaped layers", async () => {
+    const reflectionRow = {
+      ...summaryRow({ id: "reflection-ph-1", text: sourceText, l0: "{l0}", l1: "{l1}", l2: "{l2}" }),
+      metadata: JSON.stringify({ type: "memory-reflection", l0_abstract: "{l0}", l1_overview: "{l1}", l2_content: "{l2}" }),
+    };
+    const { updateCalls, logs } = await runRepairSummaries([reflectionRow], ["--apply"], writeSucceeds);
+    assert.equal(updateCalls.length, 0);
+    assert.match(logs, /No repairable summaries found/);
+  });
+});
+
 describe("rebuildFtsIndex drop-failure propagation", () => {
   function makeFtsHarness({ dropError, indices, dropErrorOnCall } = {}) {
     const { MemoryStore } = jiti(path.join(testDir, "..", "src", "store.ts"));

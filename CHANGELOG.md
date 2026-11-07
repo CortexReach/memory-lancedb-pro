@@ -9,6 +9,14 @@
 
 ## Unreleased
 
+### Feature: `memory-pro repair-summaries` reports unsubstituted template placeholders (#1015)
+
+Rows whose L0/L1/L2 layers were distinct but never substituted (for example L0 `{l0}`, L1 `{l1}`, L2 `{l2}`) used to look healthy, because the detector only checked missing layers and all-three-identical layers.
+
+- A layer is now flagged when its **entire trimmed value** is one of a bounded set of tokens: `{l0}`, `{l1}`, `{l2}`, `{l0_abstract}`, `{l1_overview}`, `{l2_content}`, or the same names in double braces (`{{l0}}`, ...). Braces inside real text, other brace words (`{version}`, `{abstract}`), whitespace or case variants, and short or punctuated summaries are not matched.
+- The report lists these rows under their own heading, "Unsubstituted template placeholders (review before repair)", with the offending layer values, separate from missing and degenerate rows.
+- Report-only stays the default. With `--apply`, only the placeholder layers are filled from the source text (genuine layers are kept), through the same locked apply-time recheck, scope filter, and reflection-row exclusion as other repairable rows.
+
 ### Fix: cumulative turn counting for auto-capture smart extraction (#417, PR #549)
 
 **Bug**: With `extractMinMessages: 2` + `smartExtraction: true`, single-turn DM conversations always fell through to regex fallback, writing dirty data (`l0_abstract == text`, no LLM distillation).
