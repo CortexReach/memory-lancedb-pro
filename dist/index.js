@@ -1737,7 +1737,7 @@ export function _getRegisteredApisForTest() {
 //
 // We cannot guard at registration time because clearInternalHooks() is called
 // between the first and subsequent register() calls. Guard at handler invocation
-// instead, keyed on (handlerName, sessionKey, timestamp).
+// instead, keyed on (handlerName, sessionKey, runId, event identity).
 //
 /** Dedup guard: Set of already-processed hook event keys. */
 const _hookEventDedup = new Set();
@@ -1754,8 +1754,10 @@ function _dedupHookEvent(handlerName, event, ctx) {
         ? event.timestamp.getTime()
         : (typeof event?.timestamp === "number"
             ? event.timestamp
-            : (typeof event?.prompt === "string" ? event.prompt : Date.now()));
-    const key = `${handlerName}:${sk}:${ts}`;
+            : (typeof event?.prompt === "string" ? sha256Hex(event.prompt) : Date.now()));
+    // shortcut: Hosts without runId still deduplicate repeated session/prompt pairs until they expose invocation IDs.
+    const runId = typeof ctx?.runId === "string" ? ctx.runId : "";
+    const key = JSON.stringify([handlerName, sk, runId, ts]);
     if (_hookEventDedup.has(key))
         return true; // duplicate — skip
     _hookEventDedup.add(key);

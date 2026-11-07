@@ -290,6 +290,7 @@ describe("register() re-registration hardening", () => {
     const hook = getAutoRecallHook(harness.eventHandlers);
 
     const ctx = {
+      runId: "two-prompts-in-one-run",
       sessionId: "two-turns-test",
       sessionKey: "agent:main:session:two-turns-test",
       agentId: "main",
@@ -305,5 +306,43 @@ describe("register() re-registration hardening", () => {
       2,
       "two distinct prompt-build events in the same session must each run the recall pipeline",
     );
+  });
+
+  it("recalls an identical prompt again when the host starts a different run", async () => {
+    const retrieveCallCounter = { count: 0 };
+    activeCreateRetriever = mockCreateRetriever(retrieveCallCounter);
+    activeCreateEmbedder = mockCreateEmbedder();
+    MemoryStore.prototype.patchMetadata = async (id, patch) => ({ id, ...patch });
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: {
+        ...baseScopeConfig(workspaceDir),
+        // Permit consecutive recalls while testing the separate event dedup guard.
+        autoRecallMinRepeated: 1,
+      },
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoRecallHook(harness.eventHandlers);
+    const ctx = {
+      sessionId: "repeated-prompt-test",
+      sessionKey: "agent:main:session:repeated-prompt-test",
+      agentId: "main",
+    };
+
+    for (const runId of ["first-run", "second-run"]) {
+      const runContext = { ...ctx, runId };
+      const result = await hook(
+        { prompt: "Please recall what I mentioned before about this task." },
+        runContext,
+      );
+      assert.match(result?.prependContext ?? "", /<relevant-memories>/);
+      const duplicate = await hook(
+        { prompt: "Please recall what I mentioned before about this task." },
+        runContext,
+      );
+      assert.equal(duplicate, undefined, "duplicate handlers in the same run still collapse");
+    }
+    assert.equal(retrieveCallCounter.count, 2, "each admitted run must perform its own recall");
   });
 });
