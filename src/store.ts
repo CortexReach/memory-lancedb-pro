@@ -364,6 +364,23 @@ function escapeSqlLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
 
+// Null-aware SQL equality matcher for a string column: a NULL group value must
+// match with IS NULL, never with "= NULL".
+function sqlStringMatcher(column: string, value: string | null | undefined): string {
+  return value === null || value === undefined
+    ? `${column} IS NULL`
+    : `${column} = '${escapeSqlLiteral(value)}'`;
+}
+
+// JS-side counterpart used to classify persisted rows against those matchers
+// (string columns and the numeric timestamp literal alike).
+function nullAwareValueEquals(value: unknown, expected: string | number | null | undefined): boolean {
+  if (expected === null || expected === undefined) {
+    return value === null || value === undefined;
+  }
+  return value === expected;
+}
+
 function normalizeSearchText(value: string): string {
   return value.toLowerCase().trim();
 }
@@ -2562,22 +2579,272 @@ export class MemoryStore {
           }
           continue;
         }
-        const rowsById = new Map<string, any>();
-        for (const row of rows) rowsById.set(row.id as string, row);
+        // Keep EVERY fetched row per id: duplicate-ID rows must each keep
+        // their own vector, so they can never collapse into one merge source.
+        const rowsById = new Map<string, any[]>();
+        for (const row of rows) {
+          const group = rowsById.get(row.id as string);
+          if (group) group.push(row);
+          else rowsById.set(row.id as string, [row]);
+        }
 
         const originals: MemoryEntry[] = [];
         const updatedEntries: MemoryEntry[] = [];
         const updatedInputIndices: number[] = [];
+        let updatePathWrote = false;
+
+        const candidateCounts = new Map<string, number>();
+        for (const candidate of chunk) {
+          candidateCounts.set(candidate.id, (candidateCounts.get(candidate.id) ?? 0) + 1);
+        }
+
+        // Mirrors the per-row merge block below so every duplicate-group row
+        // derives its own metadata snapshot from its own persisted state.
+        const buildRecallMetadataUpdate = (
+          row: any,
+          candidate: ManualRecallMetadataUpdate,
+        ): { original: MemoryEntry; updatedEntry: MemoryEntry } => {
+          const rowScope = (row.scope as string | undefined) ?? "global";
+          const original: MemoryEntry = {
+            id: row.id as string,
+            text: row.text as string,
+            vector: Array.from(row.vector as Iterable<number>),
+            category: row.category as MemoryEntry["category"],
+            scope: rowScope,
+            importance: clampImportance(Number(row.importance)),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+            metadata: (row.metadata as string) || "{}",
+          };
+          const current = parseSmartMetadata(original.metadata, original);
+          const accessedAt = Math.max(current.last_accessed_at, candidate.accessedAt);
+          const confirmedAt = Math.max(
+            current.last_confirmed_use_at ?? 0,
+            candidate.accessedAt,
+          );
+          const snapshot = candidate.governanceSnapshot;
+          const governanceUnchanged = snapshot !== undefined &&
+            current.bad_recall_count === snapshot.badRecallCount &&
+            current.suppressed_until_turn === snapshot.suppressedUntilTurn &&
+            current.suppressed_until_ms === snapshot.suppressedUntilMs;
+          const governanceReset = governanceUnchanged
+            ? {
+                bad_recall_count: 0,
+                suppressed_until_turn: 0,
+                suppressed_until_ms: 0,
+              }
+            : {};
+          const metadata = stringifySmartMetadata(buildSmartMetadata(original, {
+            access_count: current.access_count + candidate.accessCountDelta,
+            last_accessed_at: accessedAt,
+            last_confirmed_use_at: confirmedAt,
+            ...governanceReset,
+          }));
+          return { original, updatedEntry: { ...original, metadata } };
+        };
+
+        // Duplicate-ID groups cannot go through mergeInsert: multiple source
+        // rows matching one target key raise "Ambiguous merge insert", and
+        // whenMatchedUpdateAll would stamp one chosen vector onto every
+        // sibling row. Scoped per-subgroup updates touch only metadata (plus
+        // the derived search_text), so vectors cannot collapse by construction.
+        const applyDuplicateGroupUpdate = async (
+          candidate: ManualRecallMetadataUpdate & { inputIndex: number },
+          matchingRows: any[],
+        ): Promise<void> => {
+          // parseSmartMetadata derives valid_from/last_accessed_at and
+          // memory_category/fact_key from EACH row's own timestamp/category
+          // columns, so rows sharing (text, old metadata) can still derive
+          // different new metadata — the subgroup key and its WHERE must
+          // select exactly the rows whose raw derivation inputs match.
+          // Within one subgroup the derivation is fully deterministic:
+          // normalizeMemoryTimestamp(row.timestamp, 0) keeps the finite
+          // fallback, and the candidate's validated accessedAt shadows the
+          // last_accessed_at fallback, so Date.now() is unreachable here.
+          const derivationKey = (row: any): string => JSON.stringify([
+            row.text ?? null,
+            row.metadata ?? null,
+            // int64 timestamps arrive as BigInt (JSON cannot serialize them);
+            // Number() keeps epoch-ms values distinct and matches the literal.
+            row.timestamp === null || row.timestamp === undefined ? null : Number(row.timestamp),
+            row.category ?? null,
+          ]);
+          const builtRows = matchingRows.map((row) => ({
+            row,
+            ...buildRecallMetadataUpdate(row, candidate),
+          }));
+          const subgroups = new Map<string, {
+            text: string | null;
+            metadata: string | null;
+            timestamp: number | null;
+            category: string | null;
+            rows: MemoryEntry[];
+          }>();
+          for (const built of builtRows) {
+            const key = derivationKey(built.row);
+            const subgroup = subgroups.get(key);
+            if (subgroup) subgroup.rows.push(built.updatedEntry);
+            else {
+              subgroups.set(key, {
+                text: built.row.text ?? null,
+                metadata: built.row.metadata ?? null,
+                timestamp: built.row.timestamp === null || built.row.timestamp === undefined
+                  ? null
+                  : Number(built.row.timestamp),
+                category: built.row.category ?? null,
+                rows: [built.updatedEntry],
+              });
+            }
+          }
+
+          let reason: string | null = null;
+          let rowsWritten = 0;
+          try {
+            for (const subgroup of subgroups.values()) {
+              // The scope guard is required: same-id siblings can hold the
+              // same text and old metadata under a different scope, and this
+              // write must never leak onto them.
+              const scopeGuard =
+                `(scope = '${escapeSqlLiteral(candidate.expectedScope)}' OR ` +
+                `(scope IS NULL AND '${escapeSqlLiteral(candidate.expectedScope)}' = 'global'))`;
+              const where = [
+                `id = '${escapeSqlLiteral(candidate.id)}'`,
+                sqlStringMatcher("text", subgroup.text),
+                sqlStringMatcher("metadata", subgroup.metadata),
+                subgroup.timestamp === null
+                  ? "timestamp IS NULL"
+                  : `timestamp = ${subgroup.timestamp}`,
+                sqlStringMatcher("category", subgroup.category),
+                scopeGuard,
+              ].join(" AND ");
+              const values: Record<string, string> = { metadata: subgroup.rows[0].metadata };
+              if (this.searchTextColumnReady) {
+                values[SEARCH_TEXT_COLUMN] = buildSearchText(
+                  subgroup.rows[0].text,
+                  subgroup.rows[0].metadata,
+                );
+              }
+              const updateResult = await this.table!.update({ where, values });
+              rowsWritten += updateResult.rowsUpdated;
+              if (updateResult.rowsUpdated !== subgroup.rows.length) {
+                reason = `updated ${updateResult.rowsUpdated} of ${subgroup.rows.length} expected rows`;
+                break;
+              }
+            }
+          } catch (writeError) {
+            reason = writeError instanceof Error ? writeError.message : String(writeError);
+          }
+
+          if (rowsWritten > 0) updatePathWrote = true;
+          if (reason === null) {
+            // Preserve the last-row-wins result shape of the merge path.
+            results.set(candidate.inputIndex, {
+              id: candidate.id,
+              entry: builtRows[builtRows.length - 1].updatedEntry,
+            });
+            return;
+          }
+
+          let rowsAfterFailure: any[];
+          try {
+            await this.checkoutLatestTableForWrite();
+            rowsAfterFailure = await this.table!.query()
+              .where(`(id = '${escapeSqlLiteral(candidate.id)}')`)
+              .toArray();
+          } catch (recoveryError) {
+            this.noteDataModification();
+            const recoveryMessage = recoveryError instanceof Error
+              ? recoveryError.message
+              : String(recoveryError);
+            results.set(candidate.inputIndex, {
+              id: candidate.id,
+              entry: null,
+              error:
+                `Atomic recall metadata update failed for ${candidate.id}: ` +
+                `${reason}. Commit state could not be verified: ${recoveryMessage}`,
+              retryable: false,
+            });
+            return;
+          }
+
+          let succeededCount = 0;
+          let pendingCount = 0;
+          let unknownCount = 0;
+          const subgroupList = Array.from(subgroups.values());
+          for (const row of rowsAfterFailure) {
+            if (((row.scope as string | undefined) ?? "global") !== candidate.expectedScope) continue;
+            const rowText = row.text ?? null;
+            const rowMetadata = typeof row.metadata === "string" ? row.metadata : "{}";
+            const rowTimestamp = row.timestamp === null || row.timestamp === undefined
+              ? null
+              : Number(row.timestamp);
+            const rowCategory = row.category ?? null;
+            if (subgroupList.some((subgroup) =>
+              nullAwareValueEquals(rowText, subgroup.text) &&
+              nullAwareValueEquals(rowTimestamp, subgroup.timestamp) &&
+              nullAwareValueEquals(rowCategory, subgroup.category) &&
+              rowMetadata === subgroup.rows[0].metadata,
+            )) {
+              succeededCount++;
+              continue;
+            }
+            if (subgroups.has(derivationKey(row))) {
+              // Still holding its old metadata — the write never landed here.
+              pendingCount++;
+              continue;
+            }
+            unknownCount++;
+          }
+          const accountedRows = succeededCount + pendingCount + unknownCount;
+          if (matchingRows.length > accountedRows) {
+            unknownCount += matchingRows.length - accountedRows;
+          }
+
+          // Committed or unverifiable rows still count toward index folding,
+          // mirroring classifyUncertainMerge. Route through updatePathWrote so
+          // the chunk-level note fires exactly once even when some subgroup
+          // statements already committed before the failure.
+          if (succeededCount > 0 || unknownCount > 0) updatePathWrote = true;
+
+          if (pendingCount === 0 && unknownCount === 0) {
+            results.set(candidate.inputIndex, {
+              id: candidate.id,
+              entry: builtRows[builtRows.length - 1].updatedEntry,
+            });
+            return;
+          }
+          if (unknownCount === 0) {
+            // Every non-updated row still holds its old metadata, so a retry
+            // starts from a clean state.
+            results.set(candidate.inputIndex, {
+              id: candidate.id,
+              entry: null,
+              error: `Atomic recall metadata update failed for ${candidate.id}: ${reason}`,
+              retryable: true,
+            });
+            return;
+          }
+          results.set(candidate.inputIndex, {
+            id: candidate.id,
+            entry: null,
+            error:
+              `Atomic recall metadata update failed for ${candidate.id}: ${reason}. ` +
+              `Persisted state no longer matches either the original or updated row`,
+            retryable: false,
+          });
+        };
 
         for (const candidate of chunk) {
-          const row = rowsById.get(candidate.id);
-          if (!row) {
+          const group = rowsById.get(candidate.id);
+          if (!group) {
             results.set(candidate.inputIndex, { id: candidate.id, entry: null });
             continue;
           }
 
-          const rowScope = (row.scope as string | undefined) ?? "global";
-          if (rowScope !== candidate.expectedScope) {
+          const matchingRows = group.filter(
+            (row) => ((row.scope as string | undefined) ?? "global") === candidate.expectedScope,
+          );
+          if (matchingRows.length === 0) {
+            const rowScope = (group[0].scope as string | undefined) ?? "global";
             results.set(candidate.inputIndex, {
               id: candidate.id,
               entry: null,
@@ -2588,6 +2855,18 @@ export class MemoryStore {
             });
             continue;
           }
+
+          // More than one matching row, or the same id claimed by several
+          // candidates in this chunk: mergeInsert would either throw on the
+          // ambiguous key or collapse sibling vectors, so take the scoped
+          // update path instead.
+          if (matchingRows.length > 1 || (candidateCounts.get(candidate.id) ?? 0) > 1) {
+            await applyDuplicateGroupUpdate(candidate, matchingRows);
+            continue;
+          }
+
+          const row = matchingRows[0];
+          const rowScope = (row.scope as string | undefined) ?? "global";
 
           const original: MemoryEntry = {
             id: row.id as string,
@@ -2629,6 +2908,7 @@ export class MemoryStore {
           updatedInputIndices.push(candidate.inputIndex);
         }
 
+        if (updatePathWrote) this.noteDataModification();
         if (updatedEntries.length === 0) continue;
 
         const mergeWhereClause = updatedEntries
@@ -3528,18 +3808,84 @@ export class MemoryStore {
     }
     let updated = 0;
     if (!dryRun) {
-      for (let start = 0; start < staleIds.length; start += batchSize) {
-        const ids = staleIds.slice(start, start + batchSize);
+      // Batches are cut from the DISTINCT stale ids: a duplicate id must land
+      // in exactly one batch, otherwise a second pass would re-process an
+      // already-repaired group and break the updated-vs-stale accounting.
+      const distinctStaleIds = Array.from(new Set(staleIds));
+      for (let start = 0; start < distinctStaleIds.length; start += batchSize) {
+        const ids = distinctStaleIds.slice(start, start + batchSize);
         const where = ids.map((id) => `id = '${escapeSqlLiteral(id)}'`).join(" OR ");
         const rows = await table.query().where(`(${where})`).toArray();
-        const rewritten = rows.map((row) => ({
-          ...row,
-          vector: Array.from(row.vector as Iterable<number>),
-          [SEARCH_TEXT_COLUMN]: buildSearchText(String(row.text ?? ""), row.metadata as string | null | undefined),
-        }));
-        if (rewritten.length === 0) continue;
-        await table.mergeInsert("id").whenMatchedUpdateAll().execute(rewritten);
-        updated += rewritten.length;
+        // Regroup the FETCHED rows by id: mergeInsert cannot take two source
+        // rows with the same key ("Ambiguous merge insert"), and
+        // whenMatchedUpdateAll would stamp one chosen vector onto every
+        // sibling row. This regrouping also rechecks for duplicates that
+        // appeared after the initial scan.
+        const rowsById = new Map<string, any[]>();
+        for (const row of rows) {
+          const id = String(row.id);
+          const group = rowsById.get(id);
+          if (group) group.push(row);
+          else rowsById.set(id, [row]);
+        }
+        const rewritten: any[] = [];
+        for (const [id, group] of rowsById) {
+          if (group.length === 1) {
+            const row = group[0];
+            rewritten.push({
+              ...row,
+              vector: Array.from(row.vector as Iterable<number>),
+              [SEARCH_TEXT_COLUMN]: buildSearchText(String(row.text ?? ""), row.metadata as string | null | undefined),
+            });
+            continue;
+          }
+          // Duplicate group: only search_text may change, so each
+          // (text, metadata) subgroup gets one scoped update with its own
+          // expected value — buildSearchText is a pure function of those two.
+          const subgroups = new Map<string, {
+            text: string | null;
+            metadata: string | null;
+            expected: string;
+            staleRows: number;
+          }>();
+          for (const row of group) {
+            const expected = buildSearchText(String(row.text ?? ""), row.metadata as string | null | undefined);
+            if (row[SEARCH_TEXT_COLUMN] === expected) continue;
+            const key = JSON.stringify([row.text ?? null, row.metadata ?? null]);
+            const subgroup = subgroups.get(key);
+            if (subgroup) subgroup.staleRows++;
+            else {
+              subgroups.set(key, {
+                text: row.text ?? null,
+                metadata: row.metadata ?? null,
+                expected,
+                staleRows: 1,
+              });
+            }
+          }
+          for (const subgroup of subgroups.values()) {
+            const staleWhere = [
+              `id = '${escapeSqlLiteral(id)}'`,
+              sqlStringMatcher("text", subgroup.text),
+              sqlStringMatcher("metadata", subgroup.metadata),
+              `(${SEARCH_TEXT_COLUMN} IS NULL OR ${SEARCH_TEXT_COLUMN} != '${escapeSqlLiteral(subgroup.expected)}')`,
+            ].join(" AND ");
+            const result = await table.update({
+              where: staleWhere,
+              values: { [SEARCH_TEXT_COLUMN]: subgroup.expected },
+            });
+            updated += result.rowsUpdated;
+            if (result.rowsUpdated < subgroup.staleRows) {
+              console.warn(
+                `memory-lancedb-pro: duplicate-ID group ${id} — updated ${result.rowsUpdated} of ${subgroup.staleRows} stale row(s)`,
+              );
+            }
+          }
+        }
+        if (rewritten.length > 0) {
+          await table.mergeInsert("id").whenMatchedUpdateAll().execute(rewritten);
+          updated += rewritten.length;
+        }
       }
     }
     return { scanned: summaries.length, stale: staleIds.length, updated };
