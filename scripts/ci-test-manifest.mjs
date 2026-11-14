@@ -26,6 +26,8 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/read-consistency-interval.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/fts-index-fold.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/fts-search-text-column.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/backfill-search-text-duplicate-ids.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/manual-recall-duplicate-ids.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/store-list-stats-projection-fallback.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/recall-text-cleanup.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/native-recall.test.mjs", args: ["--test"] },

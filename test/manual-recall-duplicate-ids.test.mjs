@@ -42,6 +42,11 @@ const DUP_ID_SINGLE = "7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
 const DUP_ID_UPDATE_FAIL = "9b8c7d6e-5f4a-4b3c-8d2e-1f0a9b8c7d6e";
 const DUP_ID_TWO_CANDIDATES = "1e2f3a4b-5c6d-4e7f-8a9b-0c1d2e3f4a5b";
 const DUP_ID_DERIVED_FIELDS = "2b3c4d5e-6f7a-4b8c-9d0e-3f4a5b6c7d8e";
+const LEGACY_INT64_SEED_ID = "3d5a7f9b-2c4e-4a6d-8b1f-5e7c9a0d3f2b";
+const LEGACY_INT64_DUP_ID = "7f9b3d5a-4e2c-4d6a-9b1f-8c5e7a9d2f3b";
+const SEQ_COLLISION_ID = "9c1e5f7a-3b4d-4e8f-a2c6-7d8e9f0a1b2c";
+const PARTIAL_FAILURE_ID = "a2b4c6d8-1e3f-4a5b-8c7d-9e0f1a2b3c5d";
+const MERGE_SCOPE_COLLAPSE_ID = "b3d5e7f9-2a4c-4b6d-9e8f-0a1b2c3d4e6f";
 
 const RECALL_LAYERS = {
   l1_overview: "## Recall\n- shared overview layer",
@@ -519,6 +524,337 @@ describe("applyManualRecallMetadataBatch duplicate-ID write path (real LanceDB)"
         rowB[SEARCH_TEXT_COLUMN],
         buildSearchText(rowB.text, rowB.metadata),
         "row B search_text matches its own new metadata",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("Int64 legacy table: exact raw-timestamp matching updates every same-id row", async () => {
+    // Legacy tables store the timestamp column as Int64 (BigInt in JS), not
+    // Float64 like the current schema — normalizeMemoryTimestamp explicitly
+    // handles BigInt for them. A 2^53+1 timestamp loses precision through
+    // Number() (9007199254740993 -> 9007199254740992), so the pre-fix
+    // subgroup matcher built from the rounded number matched ZERO rows
+    // ("updated 0 of 2") and the candidate stayed retryable forever. The fix
+    // matches on the RAW value's exact decimal string instead.
+    const dir = tempDir();
+    try {
+      const db = await lancedb.connect(dir);
+      await db.createTable("memories", [{
+        id: LEGACY_INT64_SEED_ID,
+        text: "seed row",
+        vector: [0.1, 0.2, 0.3],
+        category: "fact",
+        scope: "global",
+        importance: 0.6,
+        timestamp: 1_700_000_000_000n, // BigInt makes Arrow infer Int64
+        metadata: JSON.stringify({ access_count: 3 }),
+      }]);
+
+      // Opening the store on the legacy layout runs the schema migration
+      // (adds search_text; a migration console warning is expected here).
+      const store = new MemoryStore({ dbPath: dir, vectorDim: 3 });
+      await store.ensureInitialized();
+
+      const table = await rawTable(dir);
+      assert.match(
+        String(await table.schema()),
+        /timestamp:\s*int64/i,
+        "the legacy timestamp column must stay Int64 after the migration",
+      );
+      await table.add([
+        {
+          id: LEGACY_INT64_DUP_ID,
+          text: "big int64 timestamp row",
+          vector: VECTOR_A,
+          category: "fact",
+          scope: "global",
+          importance: 0.6,
+          timestamp: 9007199254740993n,
+          metadata: JSON.stringify({ access_count: 3 }),
+        },
+        {
+          id: LEGACY_INT64_DUP_ID,
+          text: "big int64 timestamp row",
+          vector: VECTOR_B,
+          category: "fact",
+          scope: "global",
+          importance: 0.6,
+          timestamp: 9007199254740993n,
+          metadata: JSON.stringify({ access_count: 3 }),
+        },
+      ]);
+
+      const results = await store.applyManualRecallMetadataBatch([
+        recallUpdate({ id: LEGACY_INT64_DUP_ID, accessCountDelta: 1 }),
+      ]);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].error, undefined, `unexpected error: ${results[0].error}`);
+      assert.ok(results[0].entry, "the result carries a non-null entry");
+
+      // Read the rows RAW (not through canonicalRow) for the timestamp:
+      // Int64 values come back as BigInt and must be compared as
+      // BigInt/string — never through Number(), which is exactly the
+      // rounding this case guards against.
+      const afterTable = await rawTable(dir);
+      const rawAfter = await afterTable.query()
+        .where(`id = '${LEGACY_INT64_DUP_ID}'`)
+        .toArray();
+      assert.equal(rawAfter.length, 2, "still exactly two physical rows");
+      assert.deepEqual(
+        rawAfter.map((row) => String(row.timestamp)).sort(),
+        ["9007199254740993", "9007199254740993"],
+        "the persisted Int64 timestamp is untouched by the update (exact raw value, never rounded)",
+      );
+      const canonicalAfter = rawAfter.map(canonicalRow);
+      assert.deepEqual(
+        canonicalAfter.map((row) => JSON.parse(row.metadata).access_count),
+        [4, 4],
+        "both same-id rows incremented from their own base (old code updated 0 of 2)",
+      );
+      assert.deepEqual(
+        canonicalAfter.map((row) => JSON.stringify(row.vector)).sort(),
+        [JSON.stringify(VECTOR_A), JSON.stringify(VECTOR_B)],
+        "both vectors unchanged and distinct",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("sequential subgroup statements must not re-update an earlier subgroup's output", async () => {
+    const dir = tempDir();
+    const store = new MemoryStore({ dbPath: dir, vectorDim: 3 });
+    try {
+      // FULL normalized smart-metadata: the siblings differ ONLY by
+      // access_count, so subgroup A's derived output (access_count 4,
+      // everything else identical) byte-equals subgroup B's OLD metadata
+      // string. With statements in insertion order, B's later statement
+      // re-updates A's already-written row ([3,4] -> [5,5] reported
+      // success), so the fix executes subgroups in DESCENDING old
+      // access_count order: any collision X.output == Y.old implies
+      // Y.old.access_count > X.old.access_count, making every later
+      // statement's old-metadata matcher unreachable by earlier outputs.
+      const T = 1_700_050_000_000;
+      const norm = (ac) => JSON.stringify({
+        access_count: ac,
+        last_accessed_at: T,
+        last_confirmed_use_at: T,
+        bad_recall_count: 0,
+        suppressed_until_turn: 0,
+        l0_abstract: "shared",
+        l1_overview: "- shared",
+        l2_content: "shared",
+        memory_category: "cases",
+        tier: "working",
+        confidence: 0.7,
+        valid_from: 1_700_000_000_000,
+        state: "confirmed",
+        source: "legacy",
+        memory_layer: "working",
+        injected_count: 0,
+        suppressed_until_ms: 0,
+      });
+      await importRow(store, {
+        id: SEQ_COLLISION_ID,
+        text: "shared",
+        vector: VECTOR_A,
+        timestamp: TS_A,
+        metadata: norm(3),
+      });
+      await importRow(store, {
+        id: SEQ_COLLISION_ID,
+        text: "shared",
+        vector: VECTOR_B,
+        timestamp: TS_A,
+        metadata: norm(4),
+      });
+
+      const results = await store.applyManualRecallMetadataBatch([
+        recallUpdate({ id: SEQ_COLLISION_ID, accessCountDelta: 1, accessedAt: T }),
+      ]);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].error, undefined, `unexpected error: ${results[0].error}`);
+      assert.ok(results[0].entry, "the result carries a non-null entry");
+
+      const rows = await rawRows(dir, SEQ_COLLISION_ID);
+      assert.equal(rows.length, 2, "still exactly two physical rows");
+      assert.deepEqual(
+        rows.map((row) => JSON.parse(row.metadata).access_count).sort((a, b) => a - b),
+        [4, 5],
+        "access counts [4, 5]: each row bumped exactly once (old code produced [5, 5] and reported success)",
+      );
+      assert.deepEqual(
+        rows.map((row) => JSON.stringify(row.vector)).sort(),
+        [JSON.stringify(VECTOR_A), JSON.stringify(VECTOR_B)],
+        "both vectors unchanged and distinct",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("partially applied duplicate update is not retried", async () => {
+    const dir = tempDir();
+    const store = new MemoryStore({ dbPath: dir, vectorDim: 3 });
+    try {
+      // Plain (NOT normalized) metadata, so each subgroup's derived output
+      // stays distinct and the two subgroups run as two separate UPDATE
+      // statements. The second statement fails mid-application AFTER the
+      // first one committed: a mixed partial state must NOT be retryable,
+      // because the queue's retry would re-apply the full delta to the
+      // already-updated row (old code returned retryable:true here).
+      await importRow(store, {
+        id: PARTIAL_FAILURE_ID,
+        text: "shared partial-commit abstract",
+        vector: VECTOR_A,
+        timestamp: TS_A,
+        metadata: JSON.stringify({ access_count: 3, tag: "A" }),
+      });
+      await importRow(store, {
+        id: PARTIAL_FAILURE_ID,
+        text: "shared partial-commit abstract",
+        vector: VECTOR_B,
+        timestamp: TS_A,
+        metadata: JSON.stringify({ access_count: 7, tag: "B" }),
+      });
+
+      let updateCalls = 0;
+      const restore = wrapTableMethod(store, "update", (original) => async (...args) => {
+        updateCalls += 1;
+        if (updateCalls === 2) {
+          throw new Error("injected second-subgroup failure");
+        }
+        return original(...args);
+      });
+      let results;
+      try {
+        results = await store.applyManualRecallMetadataBatch([
+          recallUpdate({ id: PARTIAL_FAILURE_ID, accessCountDelta: 1 }),
+        ]);
+      } finally {
+        restore();
+      }
+
+      assert.equal(results.length, 1);
+      assert.ok(results[0].error, "the partially applied update reports an error, not a success");
+      assert.match(
+        results[0].error,
+        /partial/i,
+        "the error names the partial application (old code reported a plain retryable failure)",
+      );
+      assert.equal(
+        results[0].retryable,
+        false,
+        "a mixed partial state (one subgroup committed, one pending) must not be retried",
+      );
+
+      const rows = await rawRows(dir, PARTIAL_FAILURE_ID);
+      assert.equal(rows.length, 2, "still exactly two physical rows");
+      // Exactly one subgroup committed (+1) before the injected failure and
+      // the failed subgroup keeps its own base. Which physical row landed
+      // depends on the subgroup execution order (descending old access_count
+      // after the collision fix), so accept either partial split.
+      const counts = rows
+        .map((row) => JSON.parse(row.metadata).access_count)
+        .sort((a, b) => a - b);
+      assert.ok(
+        (counts[0] === 3 && counts[1] === 8) || (counts[0] === 4 && counts[1] === 7),
+        `expected one committed subgroup (+1) and one left at its own base, got ${JSON.stringify(counts)}`,
+      );
+      assert.deepEqual(
+        rows.map((row) => JSON.stringify(row.vector)).sort(),
+        [JSON.stringify(VECTOR_A), JSON.stringify(VECTOR_B)],
+        "vectors intact",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("merge-path recovery classifies by scope, not last sibling", async () => {
+    const dir = tempDir();
+    const store = new MemoryStore({ dbPath: dir, vectorDim: 3 });
+    try {
+      // Duplicate id across scopes with the candidate targeting the GLOBAL
+      // row. The merge-failure recovery used to re-read by id only (last
+      // physical row wins) and here misread the agent:test sibling, wrongly
+      // classifying the untouched targeted global row as non-retryable. The
+      // fix keys the re-read rows by (id, scope) and looks them up with the
+      // entry's own scope.
+      await importRow(store, {
+        id: MERGE_SCOPE_COLLAPSE_ID,
+        text: "global row for the mixed-scope merge failure",
+        vector: VECTOR_A,
+        timestamp: TS_A,
+        scope: "global",
+        metadata: JSON.stringify({ access_count: 3 }),
+      });
+      await importRow(store, {
+        id: MERGE_SCOPE_COLLAPSE_ID,
+        text: "agent row for the mixed-scope merge failure",
+        vector: VECTOR_B,
+        timestamp: TS_B,
+        scope: "agent:test",
+        metadata: JSON.stringify({ access_count: 5 }),
+      });
+      const rowsBefore = await rawRows(dir, MERGE_SCOPE_COLLAPSE_ID);
+      const beforeAgent = rowsBefore.find((row) => row.scope === "agent:test");
+      assert.ok(beforeAgent, "fixture: one agent:test sibling row");
+
+      let failed = false;
+      // mergeInsert starts a builder chain (see the single-row merge-failure
+      // case): the injection must throw synchronously at the call site, not
+      // return a rejected promise that orphans the builder chain.
+      const restore = wrapTableMethod(store, "mergeInsert", (original) => (...args) => {
+        if (!failed) {
+          failed = true;
+          throw new Error("injected merge failure");
+        }
+        return original(...args);
+      });
+      let results;
+      try {
+        results = await store.applyManualRecallMetadataBatch([
+          recallUpdate({
+            id: MERGE_SCOPE_COLLAPSE_ID,
+            expectedScope: "global",
+            accessCountDelta: 1,
+          }),
+        ]);
+      } finally {
+        restore();
+      }
+
+      assert.equal(results.length, 1);
+      assert.ok(results[0].error, "the failed merge is reported as an error result, not a throw");
+      assert.match(
+        results[0].error,
+        /Atomic recall metadata merge failed/,
+        "the error keeps the retryable merge-failure wording",
+      );
+      assert.equal(
+        results[0].retryable,
+        true,
+        "the untouched targeted global row is retryable (old code misread the agent:test sibling)",
+      );
+      assert.equal(results[0].entry, null);
+
+      const rowsAfter = await rawRows(dir, MERGE_SCOPE_COLLAPSE_ID);
+      assert.equal(rowsAfter.length, 2, "still exactly two physical rows");
+      const afterGlobal = rowsAfter.find((row) => row.scope === "global");
+      const afterAgent = rowsAfter.find((row) => row.scope === "agent:test");
+      assert.equal(
+        JSON.parse(afterGlobal.metadata).access_count,
+        3,
+        "the targeted global row's access_count is untouched",
+      );
+      assert.deepEqual(afterGlobal.vector, VECTOR_A, "the global row's vector is intact");
+      assert.deepEqual(
+        afterAgent,
+        beforeAgent,
+        "the agent:test row stays byte-identical (whole-row comparison)",
       );
     } finally {
       rmSync(dir, { recursive: true, force: true });

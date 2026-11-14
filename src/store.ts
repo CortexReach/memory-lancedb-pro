@@ -372,8 +372,22 @@ function sqlStringMatcher(column: string, value: string | null | undefined): str
     : `${column} = '${escapeSqlLiteral(value)}'`;
 }
 
+// Exact decimal string of a stored timestamp column value. Legacy Int64
+// columns arrive as BigInt, and Number() rounds past 2^53, so a matcher
+// derived from the rounded double could never equal the stored value again
+// (retryable forever). Both Int64 and Double decimals parse exactly as
+// unquoted SQL literals, so grouping and matching use the raw value's own
+// decimal string; numbers are the identity conversion (String of the stored
+// double). Metadata derivation keeps normalizeMemoryTimestamp's deterministic
+// clamp — only identity matching needs the exact value.
+function exactTimestampString(raw: unknown): string | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === "bigint") return raw.toString();
+  return String(Number(raw));
+}
+
 // JS-side counterpart used to classify persisted rows against those matchers
-// (string columns and the numeric timestamp literal alike).
+// (string columns and the exact-decimal timestamp literal alike).
 function nullAwareValueEquals(value: unknown, expected: string | number | null | undefined): boolean {
   if (expected === null || expected === undefined) {
     return value === null || value === undefined;
@@ -2603,7 +2617,11 @@ export class MemoryStore {
         const buildRecallMetadataUpdate = (
           row: any,
           candidate: ManualRecallMetadataUpdate,
-        ): { original: MemoryEntry; updatedEntry: MemoryEntry } => {
+        ): {
+          original: MemoryEntry;
+          updatedEntry: MemoryEntry;
+          current: ReturnType<typeof parseSmartMetadata>;
+        } => {
           const rowScope = (row.scope as string | undefined) ?? "global";
           const original: MemoryEntry = {
             id: row.id as string,
@@ -2639,7 +2657,7 @@ export class MemoryStore {
             last_confirmed_use_at: confirmedAt,
             ...governanceReset,
           }));
-          return { original, updatedEntry: { ...original, metadata } };
+          return { original, updatedEntry: { ...original, metadata }, current };
         };
 
         // Duplicate-ID groups cannot go through mergeInsert: multiple source
@@ -2663,9 +2681,10 @@ export class MemoryStore {
           const derivationKey = (row: any): string => JSON.stringify([
             row.text ?? null,
             row.metadata ?? null,
-            // int64 timestamps arrive as BigInt (JSON cannot serialize them);
-            // Number() keeps epoch-ms values distinct and matches the literal.
-            row.timestamp === null || row.timestamp === undefined ? null : Number(row.timestamp),
+            // Int64 timestamps arrive as BigInt: Number() rounds past 2^53, so
+            // grouping and the WHERE literal share the raw value's exact
+            // decimal string (DataFusion parses Int64/Double decimals exactly).
+            exactTimestampString(row.timestamp),
             row.category ?? null,
           ]);
           const builtRows = matchingRows.map((row) => ({
@@ -2673,10 +2692,12 @@ export class MemoryStore {
             ...buildRecallMetadataUpdate(row, candidate),
           }));
           const subgroups = new Map<string, {
+            key: string;
             text: string | null;
             metadata: string | null;
-            timestamp: number | null;
+            timestampRaw: string | null;
             category: string | null;
+            accessCount: number;
             rows: MemoryEntry[];
           }>();
           for (const built of builtRows) {
@@ -2685,12 +2706,14 @@ export class MemoryStore {
             if (subgroup) subgroup.rows.push(built.updatedEntry);
             else {
               subgroups.set(key, {
+                key,
                 text: built.row.text ?? null,
                 metadata: built.row.metadata ?? null,
-                timestamp: built.row.timestamp === null || built.row.timestamp === undefined
-                  ? null
-                  : Number(built.row.timestamp),
+                timestampRaw: exactTimestampString(built.row.timestamp),
                 category: built.row.category ?? null,
+                // Rows sharing the derivation key share the same old metadata
+                // string, hence the same parsed access_count.
+                accessCount: built.current.access_count,
                 rows: [built.updatedEntry],
               });
             }
@@ -2698,8 +2721,29 @@ export class MemoryStore {
 
           let reason: string | null = null;
           let rowsWritten = 0;
+          // A subgroup's outcome: "succeeded" iff its statement executed
+          // without throwing AND reported rowsUpdated === subgroup.rows.length.
+          // A throw, a mismatch break, or never being reached (execution stops
+          // at the first failure) leaves the subgroup out of this set, so its
+          // output can never credit a persisted row below.
+          const succeededSubgroupKeys = new Set<string>();
           try {
-            for (const subgroup of subgroups.values()) {
+            // Subgroups execute in DESCENDING old access_count order. Each
+            // statement matches rows by their OLD metadata and rewrites that
+            // same metadata field, so an earlier subgroup's OUTPUT string
+            // could otherwise equal a later subgroup's OLD metadata and
+            // re-update its rows. Any full-string collision X.output == Y.old
+            // forces equal access_count values, and X.output carries
+            // old access_count + validated delta (delta >= 1, clampCount has
+            // no upper cap), so Y.old.access_count > X.old.access_count —
+            // descending order makes every later statement's old-metadata
+            // matcher unreachable by earlier statements' outputs. Subgroups
+            // with equal access_count are inherently collision-free: outputs
+            // carry old + delta, which no equal-count old metadata equals.
+            const executionOrder = Array.from(subgroups.values()).sort(
+              (a, b) => b.accessCount - a.accessCount,
+            );
+            for (const subgroup of executionOrder) {
               // The scope guard is required: same-id siblings can hold the
               // same text and old metadata under a different scope, and this
               // write must never leak onto them.
@@ -2710,9 +2754,9 @@ export class MemoryStore {
                 `id = '${escapeSqlLiteral(candidate.id)}'`,
                 sqlStringMatcher("text", subgroup.text),
                 sqlStringMatcher("metadata", subgroup.metadata),
-                subgroup.timestamp === null
+                subgroup.timestampRaw === null
                   ? "timestamp IS NULL"
-                  : `timestamp = ${subgroup.timestamp}`,
+                  : `timestamp = ${subgroup.timestampRaw}`,
                 sqlStringMatcher("category", subgroup.category),
                 scopeGuard,
               ].join(" AND ");
@@ -2729,6 +2773,7 @@ export class MemoryStore {
                 reason = `updated ${updateResult.rowsUpdated} of ${subgroup.rows.length} expected rows`;
                 break;
               }
+              succeededSubgroupKeys.add(subgroup.key);
             }
           } catch (writeError) {
             reason = writeError instanceof Error ? writeError.message : String(writeError);
@@ -2774,13 +2819,17 @@ export class MemoryStore {
             if (((row.scope as string | undefined) ?? "global") !== candidate.expectedScope) continue;
             const rowText = row.text ?? null;
             const rowMetadata = typeof row.metadata === "string" ? row.metadata : "{}";
-            const rowTimestamp = row.timestamp === null || row.timestamp === undefined
-              ? null
-              : Number(row.timestamp);
+            const rowTimestamp = exactTimestampString(row.timestamp);
             const rowCategory = row.category ?? null;
+            // Outcome-aware credit: a row counts as succeeded only through a
+            // subgroup whose statement actually succeeded. Rows matching only
+            // failed/mismatched/never-executed subgroups' outputs fall through
+            // to the pending derivationKey check and otherwise count as
+            // unknown (conservative).
             if (subgroupList.some((subgroup) =>
+              succeededSubgroupKeys.has(subgroup.key) &&
               nullAwareValueEquals(rowText, subgroup.text) &&
-              nullAwareValueEquals(rowTimestamp, subgroup.timestamp) &&
+              nullAwareValueEquals(rowTimestamp, subgroup.timestampRaw) &&
               nullAwareValueEquals(rowCategory, subgroup.category) &&
               rowMetadata === subgroup.rows[0].metadata,
             )) {
@@ -2813,13 +2862,27 @@ export class MemoryStore {
             return;
           }
           if (unknownCount === 0) {
-            // Every non-updated row still holds its old metadata, so a retry
-            // starts from a clean state.
+            if (succeededCount === 0) {
+              // Nothing was applied: every non-updated row still holds its old
+              // metadata, so a retry starts from a clean state.
+              results.set(candidate.inputIndex, {
+                id: candidate.id,
+                entry: null,
+                error: `Atomic recall metadata update failed for ${candidate.id}: ${reason}`,
+                retryable: true,
+              });
+              return;
+            }
+            // Partially applied: the queue's retry would re-apply the full
+            // delta to the rows that already committed, so refuse to retry.
             results.set(candidate.inputIndex, {
               id: candidate.id,
               entry: null,
-              error: `Atomic recall metadata update failed for ${candidate.id}: ${reason}`,
-              retryable: true,
+              error:
+                `Atomic recall metadata update failed for ${candidate.id}: ${reason}. ` +
+                `Partially applied — ${succeededCount} of ${matchingRows.length} matching row(s) were updated; ` +
+                `not retrying to avoid double-counting the access-count delta`,
+              retryable: false,
             });
             return;
           }
@@ -2941,11 +3004,21 @@ export class MemoryStore {
           }
 
           const rowsAfterFailureById = new Map<string, any>();
-          for (const row of rowsAfterFailure) rowsAfterFailureById.set(row.id as string, row);
+          for (const row of rowsAfterFailure) {
+            // Duplicate-ID rows share the id column, so the row scope
+            // disambiguates which sibling this classification must read; an
+            // id-only last-row-wins map would classify an untouched targeted
+            // row against the wrong sibling.
+            rowsAfterFailureById.set(
+              `${row.id as string}\u0000${(row.scope as string | undefined) ?? "global"}`,
+              row,
+            );
+          }
           for (let index = 0; index < updatedEntries.length; index++) {
             const original = originals[index];
             const updatedEntry = updatedEntries[index];
-            const row = rowsAfterFailureById.get(updatedEntry.id);
+            const row = rowsAfterFailureById.get(`${updatedEntry.id}\u0000${updatedEntry.scope}`);
+            const originalRow = rowsAfterFailureById.get(`${original.id}\u0000${original.scope}`);
             const rowScope = (row?.scope as string | undefined) ?? "global";
             const persistedMetadata = typeof row?.metadata === "string" ? row.metadata : "{}";
             if (row && rowScope === updatedEntry.scope && persistedMetadata === updatedEntry.metadata) {
@@ -2956,7 +3029,14 @@ export class MemoryStore {
               });
               continue;
             }
-            if (row && rowScope === original.scope && persistedMetadata === original.metadata) {
+            const originalRowScope = (originalRow?.scope as string | undefined) ?? "global";
+            const originalRowMetadata =
+              typeof originalRow?.metadata === "string" ? originalRow.metadata : "{}";
+            if (
+              originalRow &&
+              originalRowScope === original.scope &&
+              originalRowMetadata === original.metadata
+            ) {
               results.set(updatedInputIndices[index], {
                 id: original.id,
                 entry: null,
