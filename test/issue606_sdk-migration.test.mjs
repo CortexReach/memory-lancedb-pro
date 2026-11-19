@@ -304,7 +304,7 @@ describe("loadEmbeddedPiRunner — F1/F2 behavioral integration", () => {
     // and loadEmbeddedPiRunner will NOT swallow errors.
     const content = readFileSync(INDEX_PATH, "utf-8");
     // Verify the retry pattern is restored: try/catch around the final return
-    const tryCatchPattern = /try\s*\{[\s\S]{0,200}return await embeddedPiRunnerPromise;[\s\S]{0,200}catch[\s\S]{0,200}embeddedPiRunnerPromise\s*=\s*null/s;
+    const tryCatchPattern = /try\s*\{[\s\S]{0,200}return await pending;[\s\S]{0,200}catch[\s\S]{0,200}state\.embeddedPiRunnerPromise\s*=\s*null/s;
     assert.match(
       content,
       tryCatchPattern,
